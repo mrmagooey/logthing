@@ -1,7 +1,6 @@
-use crate::config::{DestinationConfig, ForwardProtocol, KerberosConfig};
+use crate::config::{DestinationConfig, ForwardProtocol};
 use crate::models::WindowsEvent;
-use anyhow::{Context, Result};
-use curl::easy::{Auth, Easy, List};
+use anyhow::Result;
 use reqwest::Client;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
@@ -9,7 +8,6 @@ use tracing::{debug, error, info};
 pub mod parquet_s3;
 
 pub struct Forwarder {
-    pending_configs: Vec<DestinationConfig>,
     destinations: Vec<Destination>,
     client: Client,
 }
@@ -20,14 +18,13 @@ struct Destination {
 }
 
 impl Forwarder {
-    pub fn new(destinations: Vec<DestinationConfig>) -> Self {
+    pub fn new(_destinations: Vec<DestinationConfig>) -> Self {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("Failed to build HTTP client");
 
         Self {
-            pending_configs: destinations,
             destinations: Vec::new(),
             client,
         }
@@ -36,34 +33,29 @@ impl Forwarder {
     pub async fn initialize(mut self) -> Self {
         let mut new_destinations = Vec::new();
 
-        for config in std::mem::take(&mut self.pending_configs) {
+        for config in std::mem::take(&mut self.destinations)
+            .into_iter()
+            .map(|d| d.config)
+            .chain(vec![])
+        {
             if !config.enabled {
                 continue;
             }
 
-            let spawn_config = config.clone();
             let (tx, mut rx) = mpsc::channel::<WindowsEvent>(1000);
             let client = self.client.clone();
-            let url = spawn_config.url.clone();
-            let name = spawn_config.name.clone();
-            let protocol = spawn_config.protocol.clone();
-            let headers = spawn_config.headers.clone();
-            let kerberos = spawn_config.kerberos.clone();
+            let url = config.url.clone();
+            let name = config.name.clone();
+            let protocol = config.protocol.clone();
+            let headers = config.headers.clone();
 
             // Spawn forwarding task for this destination
             tokio::spawn(async move {
                 info!("Starting forwarder for destination: {}", name);
 
                 while let Some(event) = rx.recv().await {
-                    if let Err(e) = Self::forward_event(
-                        &client,
-                        &event,
-                        &url,
-                        &protocol,
-                        &headers,
-                        kerberos.as_ref(),
-                    )
-                    .await
+                    if let Err(e) =
+                        Self::forward_event(&client, &event, &url, &protocol, &headers).await
                     {
                         error!("Failed to forward event to {}: {}", name, e);
                     }
@@ -93,11 +85,10 @@ impl Forwarder {
         url: &str,
         protocol: &ForwardProtocol,
         headers: &std::collections::HashMap<String, String>,
-        kerberos: Option<&KerberosConfig>,
     ) -> Result<()> {
         match protocol {
             ForwardProtocol::Http | ForwardProtocol::Https => {
-                Self::forward_http(client, event, url, headers, kerberos).await
+                Self::forward_http(client, event, url, headers).await
             }
             ForwardProtocol::Tcp => Self::forward_tcp(event, url).await,
             ForwardProtocol::Udp => Self::forward_udp(event, url).await,
@@ -110,11 +101,7 @@ impl Forwarder {
         event: &WindowsEvent,
         url: &str,
         headers: &std::collections::HashMap<String, String>,
-        kerberos: Option<&KerberosConfig>,
     ) -> Result<()> {
-        if let Some(config) = kerberos.filter(|cfg| cfg.is_enabled()) {
-            return Self::forward_http_with_kerberos(event, url, headers, config).await;
-        }
         let mut request = client.post(url).json(&event);
 
         for (key, value) in headers {
@@ -128,90 +115,6 @@ impl Forwarder {
         }
 
         debug!("Successfully forwarded event {} to {}", event.id, url);
-        Ok(())
-    }
-
-    async fn forward_http_with_kerberos(
-        event: &WindowsEvent,
-        url: &str,
-        headers: &std::collections::HashMap<String, String>,
-        config: &KerberosConfig,
-    ) -> Result<()> {
-        let payload = serde_json::to_vec(event)?;
-        let headers = headers.clone();
-        let url = url.to_string();
-        let log_target = url.clone();
-        let config = config.clone();
-
-        tokio::task::spawn_blocking(move || {
-            Self::run_kinit_if_needed(&config)?;
-            Self::perform_curl_request(&url, headers, payload)
-        })
-        .await??;
-
-        debug!(
-            "Successfully forwarded event {} to {} via Kerberos",
-            event.id, log_target
-        );
-        Ok(())
-    }
-
-    fn run_kinit_if_needed(config: &KerberosConfig) -> Result<()> {
-        if let (Some(principal), Some(keytab)) = (&config.principal, &config.keytab) {
-            let executable = config
-                .kinit_path
-                .clone()
-                .unwrap_or_else(|| std::path::PathBuf::from("kinit"));
-
-            let status = std::process::Command::new(&executable)
-                .arg("-k")
-                .arg("-t")
-                .arg(keytab)
-                .arg(principal)
-                .status()
-                .with_context(|| format!("failed to execute {:?}", executable))?;
-
-            if !status.success() {
-                anyhow::bail!("kinit exited with status {}", status);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn perform_curl_request(
-        url: &str,
-        headers: std::collections::HashMap<String, String>,
-        payload: Vec<u8>,
-    ) -> Result<()> {
-        let mut easy = Easy::new();
-        easy.url(url)?;
-        easy.post(true)?;
-        let mut auth = Auth::new();
-        auth.gssnegotiate(true);
-        easy.http_auth(&auth)?;
-        easy.username("")?;
-        easy.password("")?;
-
-        let mut header_list = List::new();
-        let mut has_content_type = false;
-        for (key, value) in headers {
-            if key.eq_ignore_ascii_case("content-type") {
-                has_content_type = true;
-            }
-            header_list.append(&format!("{}: {}", key, value))?;
-        }
-        if !has_content_type {
-            header_list.append("Content-Type: application/json")?;
-        }
-        easy.http_headers(header_list)?;
-        easy.post_fields_copy(&payload)?;
-        easy.perform()?;
-        let status = easy.response_code()?;
-        if !(200..300).contains(&status) {
-            anyhow::bail!("HTTP error {}", status);
-        }
-
         Ok(())
     }
 
@@ -296,7 +199,6 @@ impl Forwarder {
 impl Clone for Forwarder {
     fn clone(&self) -> Self {
         Self {
-            pending_configs: self.pending_configs.clone(),
             destinations: Vec::new(), // Can't clone senders
             client: self.client.clone(),
         }
