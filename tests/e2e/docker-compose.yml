@@ -51,8 +51,10 @@ services:
     environment:
       - WEF_ENDPOINT=http://wef-server:5985
       - WEF_STATS_ENDPOINT=http://wef-server:5985/stats/throughput
-      - EVENTS_FIXTURE=/app/fixtures/wef/events_batch.xml
-      - EXPECTED_EVENT_IDS=4624,4668
+      - PARSER_DIR=/app/parsers
+      - EXPECTED_EVENT_IDS=4624,4625,4634,4647,4648,4649,4656,4657,4658,4660,4661,4662,4663,4670,4672,4673,4674,4688,4689,4697,4698,4699,4700,4702,4719,4720,4722,4723,4724,4725,4726,4727,4728,4729,4730,4731,4732,4733,4735,4737,4740,4741,4742,4743,4756,4757,4767,4768,4769,4770
+    volumes:
+      - ../../config/event_parsers:/app/parsers:ro
     networks:
       - e2e
 
@@ -80,7 +82,7 @@ services:
       - AWS_ACCESS_KEY_ID=miniouser
       - AWS_SECRET_ACCESS_KEY=miniopassword
       - WEF_STATS_ENDPOINT=http://wef-server:5985/stats/throughput
-      - EXPECTED_EVENT_TOTAL=2
+      - EXPECTED_EVENT_TOTAL=50
     networks:
       - e2e
 
