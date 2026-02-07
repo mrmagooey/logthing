@@ -433,7 +433,6 @@ mod tests {
             protocol: ForwardProtocol::Http,
             enabled: true,
             headers,
-            kerberos: None,
         }
     }
 

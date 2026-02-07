@@ -8,6 +8,8 @@ use crate::protocol::{
 };
 use crate::stats::{ThroughputSnapshot, ThroughputStats};
 use crate::syslog::SyslogMessage;
+#[cfg(feature = "kerberos-auth")]
+use anyhow::anyhow;
 use axum::{
     Json, Router,
     body::Bytes,
@@ -17,6 +19,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+#[cfg(feature = "kerberos-auth")]
+use axum_negotiate::NegotiateAuthLayer;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -47,6 +51,31 @@ impl Server {
         let forwarder = Forwarder::new(config.forwarding.destinations.clone())
             .initialize()
             .await;
+
+        #[cfg(feature = "kerberos-auth")]
+        {
+            if config.security.kerberos.enabled {
+                let spn = config.security.kerberos.spn.clone().ok_or_else(|| {
+                    anyhow!("security.kerberos.spn must be set when Kerberos auth is enabled")
+                })?;
+
+                if let Some(keytab) = &config.security.kerberos.keytab {
+                    std::env::set_var("KRB5_KTNAME", keytab);
+                    info!("KRB5_KTNAME set to {:?}", keytab);
+                }
+
+                info!("Kerberos authentication enabled for SPN {}", spn);
+            }
+        }
+
+        #[cfg(not(feature = "kerberos-auth"))]
+        {
+            if config.security.kerberos.enabled {
+                warn!(
+                    "Kerberos authentication requested but the 'kerberos-auth' feature is not enabled; requests will NOT be authenticated"
+                );
+            }
+        }
 
         // Load event parser configuration if available
         let parser_dir = std::path::Path::new("config/event_parsers");
@@ -145,7 +174,7 @@ impl Server {
             IpWhitelist::new(self.config.security.allowed_ips.clone())?
         };
 
-        let app = self.create_router(ip_whitelist);
+        let app = self.create_router(ip_whitelist)?;
 
         // Start HTTP server
         let addr = self.config.bind_address;
@@ -169,8 +198,8 @@ impl Server {
         Ok(())
     }
 
-    fn create_router(&self, ip_whitelist: IpWhitelist) -> Router {
-        Router::new()
+    fn create_router(&self, ip_whitelist: IpWhitelist) -> anyhow::Result<Router> {
+        let router = Router::new()
             .route("/wsman", post(handle_wef_request))
             .route("/wsman/subscriptions", post(handle_subscription))
             .route("/wsman/events", post(handle_events))
@@ -185,7 +214,9 @@ impl Server {
                 ip_whitelist_middleware,
             ))
             .layer(axum::Extension(ip_whitelist))
-            .with_state(self.state.clone())
+            .with_state(self.state.clone());
+
+        self.apply_kerberos_layer(router)
     }
 
     pub async fn run_tls(self) -> anyhow::Result<()> {
@@ -199,7 +230,7 @@ impl Server {
             IpWhitelist::new(self.config.security.allowed_ips.clone())?
         };
 
-        let app = self.create_router(ip_whitelist);
+        let app = self.create_router(ip_whitelist)?;
 
         // Load TLS configuration
         let tls_config = self.load_tls_config()?;
@@ -272,6 +303,34 @@ impl Server {
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
         Ok(config)
+    }
+
+    #[cfg(feature = "kerberos-auth")]
+    fn apply_kerberos_layer(&self, router: Router) -> anyhow::Result<Router> {
+        let kerberos = &self.config.security.kerberos;
+
+        if !kerberos.enabled {
+            return Ok(router);
+        }
+
+        let spn = kerberos.spn.as_ref().ok_or_else(|| {
+            anyhow!("security.kerberos.spn must be set when Kerberos auth is enabled")
+        })?;
+
+        let layer = NegotiateAuthLayer::new(spn.clone())
+            .map_err(|err| anyhow!("failed to initialize Kerberos layer: {err}"))?;
+
+        Ok(router.layer(layer))
+    }
+
+    #[cfg(not(feature = "kerberos-auth"))]
+    fn apply_kerberos_layer(&self, router: Router) -> anyhow::Result<Router> {
+        if self.config.security.kerberos.enabled {
+            warn!(
+                "Kerberos authentication requested but the 'kerberos-auth' feature is not enabled; requests will NOT be authenticated"
+            );
+        }
+        Ok(router)
     }
 }
 

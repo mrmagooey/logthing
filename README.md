@@ -57,12 +57,6 @@ url = "https://elasticsearch:9200/events"
 protocol = "https"
 enabled = true
 
-  [forwarding.destinations.kerberos]
-  enabled = true
-  principal = "wef/forwarder@EXAMPLE.COM"
-  keytab = "/etc/krb5.keytab"
-  kinit_path = "/usr/bin/kinit"
-
 [[forwarding.destinations]]
 name = "syslog"
 url = "syslog://log-server:514"
@@ -74,52 +68,49 @@ enabled = true
 port = 9090
 ```
 
-### Kerberos-Authenticated HTTP Forwarding
+### Kerberos Client Authentication
 
-For destinations protected by SPNEGO/Negotiate (e.g., IIS, Apache with mod_auth_gssapi), enable the per-destination Kerberos block. The server will run `kinit -k -t <keytab> <principal>` before forwarding (if both are supplied) and uses libcurl to perform the HTTP request via `AUTH_NEGOTIATE`.
+Require inbound clients (e.g., Windows Event Forwarding collectors) to authenticate with SPNEGO/Negotiate.
 
 ```toml
-[[forwarding.destinations]]
-name = "kerberos-http"
-url = "https://kerb.example.com/wef"
-protocol = "https"
+[security.kerberos]
 enabled = true
-
-  [forwarding.destinations.kerberos]
-  enabled = true
-  principal = "wef/forwarder@EXAMPLE.COM"
-  keytab = "/etc/krb5.keytab"
-  # optional: override `kinit` binary
-  kinit_path = "/usr/bin/kinit"
+spn = "HTTP/wef.contoso.com@CONTOSO.COM"
+keytab = "/etc/wef/krb5.keytab"
 ```
 
-If `keytab`/`principal` are omitted, the agent uses whatever Kerberos credentials already exist in the environment. Ensure `kinit` and the relevant krb5 libraries are installed inside the container/host where WEF runs.
+- Build the binary or container with `--features kerberos-auth` so the Kerberos middleware is compiled in. (Without the feature the server will log a warning and continue without enforcing Negotiate.)
+- When `enabled = true`, every HTTP endpoint (`/wsman`, `/syslog`, admin API, etc.) enforces Kerberos authentication before any route logic runs.
+- `spn` must match the service principal registered in Active Directory (format `HTTP/hostname@REALM`).
+- `keytab` (optional) points to the keytab that contains the service principal’s keys. If provided, WEF sets `KRB5_KTNAME` automatically so `libgssapi` can decrypt tickets.
+- Handlers can read the authenticated user principal via the `axum_negotiate::Upn` extractor if you need per-user auditing.
 
-#### Active Directory Setup (Kerberos)
+#### Active Directory Setup (Kerberos clients → WEF)
 
-1. **Create a service account** that will own the HTTP SPN used by your downstream collector (IIS/Apache/etc.). In AD Users & Computers: `wef-forwarder` in `CONTOSO.COM`.
-2. **Register the SPN** so AD knows which account can decrypt the ticket:
+1. **Create a service account** that represents the WEF server itself, e.g., `CONTOSO\wef-appliance`.
+2. **Register the HTTP SPN** so KDCs know which account owns the hostname clients connect to:
    ```powershell
-   setspn -S HTTP/forwarder.contoso.com CONTOSO\wef-forwarder
+   setspn -S HTTP/wef.contoso.com CONTOSO\wef-appliance
    ```
-3. **Generate a keytab** on a domain controller (requires Domain Admin):
+3. **Generate a keytab** for that account (Domain Admin privilege required):
    ```powershell
-   ktpass /princ HTTP/forwarder.contoso.com@CONTOSO.COM ^
-          /mapuser CONTOSO\wef-forwarder ^
+   ktpass /princ HTTP/wef.contoso.com@CONTOSO.COM ^
+          /mapuser CONTOSO\wef-appliance ^
           /pass * ^
           /ptype KRB5_NT_PRINCIPAL ^
           /crypto AES256-SHA1 ^
-          /out C:\temp\wef-forwarder.keytab
+          /out C:\temp\wef.keytab
    ```
-   Transfer the resulting keytab to the Linux host/container that runs WEF and store it securely (e.g., `/etc/krb5.keytab` with `chmod 600`).
-4. **Configure Kerberos on the WEF host** (`/etc/krb5.conf`) with your AD realm and KDC addresses.
-5. **Verify tickets manually** before enabling forwarding:
+   Copy the resulting keytab to the Linux host/container that runs WEF and guard it (`chmod 600`).
+4. **Configure `/etc/krb5.conf`** with your AD realm and KDCs.
+5. **Sanity check Kerberos locally** before enabling the server:
    ```bash
-   kinit -k -t /etc/krb5.keytab wef-forwarder@CONTOSO.COM
-   curl --negotiate -u : https://forwarder.contoso.com/wef -d '{}'
+   export KRB5_KTNAME=/etc/wef/krb5.keytab
+   kinit -k -t "$KRB5_KTNAME" HTTP/wef.contoso.com@CONTOSO.COM
+   curl --negotiate -u : https://wef.contoso.com/wsman -d '' -k
    ```
-6. **Update `wef-server.toml`** with the `kerberos` block shown above, pointing to the same principal/keytab. If WEF runs in Docker, mount the keytab into the container and ensure `kinit` is available (e.g., install `krb5-user`).
-7. **Restart WEF**; it will run `kinit` automatically (when principal+keytab are provided) before forwarding each batch and will authenticate to the downstream collector using SPNEGO/Negotiate.
+   (The curl call should return `401` until you pass a valid SOAP payload, but it proves SPNEGO works.)
+6. **Update `wef-server.toml`** as shown above, restart the service, and ensure the keytab is mounted into any containers. Clients will now need valid Kerberos tickets to reach the API.
 
 ### Syslog Listener
 

@@ -54,6 +54,9 @@ pub struct SecurityConfig {
 
     #[serde(default = "default_connection_timeout_secs")]
     pub connection_timeout_secs: u64,
+
+    #[serde(default)]
+    pub kerberos: KerberosSecurityConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -78,18 +81,14 @@ pub struct DestinationConfig {
     pub enabled: bool,
     #[serde(default)]
     pub headers: std::collections::HashMap<String, String>,
-    #[serde(default)]
-    pub kerberos: Option<KerberosConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct KerberosConfig {
+pub struct KerberosSecurityConfig {
     #[serde(default)]
     pub enabled: bool,
-    pub principal: Option<String>,
+    pub spn: Option<String>,
     pub keytab: Option<PathBuf>,
-    #[serde(default)]
-    pub kinit_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
@@ -188,6 +187,7 @@ impl Default for SecurityConfig {
             allowed_ips: Vec::new(),
             max_connections: default_max_connections(),
             connection_timeout_secs: default_connection_timeout_secs(),
+            kerberos: KerberosSecurityConfig::default(),
         }
     }
 }
@@ -304,12 +304,6 @@ impl Config {
 
         let config = builder.build()?;
         Ok(config.try_deserialize()?)
-    }
-}
-
-impl KerberosConfig {
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
     }
 }
 
