@@ -1,0 +1,21 @@
+event_id: 4672
+name: "Admin Logon"
+description: "Special privileges were assigned to a new logon"
+fields:
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+  - name: "SubjectDomainName"
+    source: EventData
+    xpath: "Data[@Name='SubjectDomainName']"
+    required: true
+    type: string
+  - name: "PrivilegeList"
+    source: EventData
+    xpath: "Data[@Name='PrivilegeList']"
+    required: true
+    type: string
+output_format: |
+  {SubjectUserName}@{SubjectDomainName} logged on with {PrivilegeList}

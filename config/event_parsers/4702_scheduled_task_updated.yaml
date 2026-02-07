@@ -1,0 +1,21 @@
+event_id: 4702
+name: "Scheduled Task Updated"
+description: "A scheduled task was updated"
+fields:
+  - name: "TaskName"
+    source: EventData
+    xpath: "Data[@Name='TaskName']"
+    required: true
+    type: string
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+  - name: "TaskContent"
+    source: EventData
+    xpath: "Data[@Name='TaskContent']"
+    required: false
+    type: string
+output_format: |
+  Task {TaskName} updated by {SubjectUserName}

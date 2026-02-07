@@ -48,11 +48,29 @@ impl Server {
             .await;
         
         // Load event parser configuration if available
-        let event_parser = if std::path::Path::new("config/event_parsers.yaml").exists() {
-            match GenericEventParser::from_file("config/event_parsers.yaml") {
+        let parser_dir = std::path::Path::new("config/event_parsers");
+        let parser_file = std::path::Path::new("config/event_parsers.yaml");
+        let event_parser = if parser_dir.exists() {
+            match GenericEventParser::from_file(parser_dir) {
                 Ok(parser) => {
-                    info!("Loaded event parser configuration with {} parsers", 
-                        parser.supported_events().len());
+                    info!(
+                        "Loaded event parser configuration with {} parsers",
+                        parser.supported_events().len()
+                    );
+                    Some(parser)
+                }
+                Err(e) => {
+                    warn!("Failed to load event parser configuration from directory: {}", e);
+                    None
+                }
+            }
+        } else if parser_file.exists() {
+            match GenericEventParser::from_file(parser_file) {
+                Ok(parser) => {
+                    info!(
+                        "Loaded event parser configuration with {} parsers",
+                        parser.supported_events().len()
+                    );
                     Some(parser)
                 }
                 Err(e) => {
@@ -61,7 +79,7 @@ impl Server {
                 }
             }
         } else {
-            info!("No event parser configuration found at config/event_parsers.yaml");
+            info!("No event parser configuration found under config/event_parsers/");
             None
         };
         

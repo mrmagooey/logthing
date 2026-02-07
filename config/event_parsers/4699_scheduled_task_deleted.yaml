@@ -1,0 +1,21 @@
+event_id: 4699
+name: "Scheduled Task Deleted"
+description: "A scheduled task was deleted"
+fields:
+  - name: "TaskName"
+    source: EventData
+    xpath: "Data[@Name='TaskName']"
+    required: true
+    type: string
+  - name: "Author"
+    source: EventData
+    xpath: "Data[@Name='Author']"
+    required: false
+    type: string
+  - name: "Reason"
+    source: EventData
+    xpath: "Data[@Name='Reason']"
+    required: false
+    type: string
+output_format: |
+  Scheduled task {TaskName} deleted ({Reason})

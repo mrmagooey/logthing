@@ -1,0 +1,16 @@
+event_id: 4726
+name: "User Account Deleted"
+description: "A user account was deleted"
+fields:
+  - name: "TargetUserName"
+    source: EventData
+    xpath: "Data[@Name='TargetUserName']"
+    required: true
+    type: string
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+output_format: |
+  {SubjectUserName} deleted {TargetUserName}

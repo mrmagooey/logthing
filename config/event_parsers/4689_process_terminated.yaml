@@ -1,0 +1,21 @@
+event_id: 4689
+name: "Process Terminated"
+description: "A process has exited"
+fields:
+  - name: "ProcessName"
+    source: EventData
+    xpath: "Data[@Name='ProcessName']"
+    required: true
+    type: string
+  - name: "ProcessId"
+    source: EventData
+    xpath: "Data[@Name='ProcessId']"
+    required: true
+    type: integer
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: false
+    type: string
+output_format: |
+  {ProcessName} (PID {ProcessId}) terminated

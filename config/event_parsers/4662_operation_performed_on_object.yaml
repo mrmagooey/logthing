@@ -1,0 +1,21 @@
+event_id: 4662
+name: "Operation Performed on Object"
+description: "An operation was performed on an object"
+fields:
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+  - name: "ObjectName"
+    source: EventData
+    xpath: "Data[@Name='ObjectName']"
+    required: true
+    type: string
+  - name: "OperationType"
+    source: EventData
+    xpath: "Data[@Name='OperationType']"
+    required: true
+    type: string
+output_format: |
+  {SubjectUserName} performed {OperationType} on {ObjectName}

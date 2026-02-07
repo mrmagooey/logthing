@@ -1,0 +1,26 @@
+event_id: 4688
+name: "Process Created"
+description: "A new process was created"
+fields:
+  - name: "NewProcessName"
+    source: EventData
+    xpath: "Data[@Name='NewProcessName']"
+    required: true
+    type: string
+  - name: "ParentProcessName"
+    source: EventData
+    xpath: "Data[@Name='ParentProcessName']"
+    required: true
+    type: string
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+  - name: "ProcessCommandLine"
+    source: EventData
+    xpath: "Data[@Name='ProcessCommandLine']"
+    required: false
+    type: string
+output_format: |
+  {SubjectUserName} started {NewProcessName} (parent {ParentProcessName})

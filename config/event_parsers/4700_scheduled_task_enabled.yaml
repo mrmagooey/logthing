@@ -1,0 +1,21 @@
+event_id: 4700
+name: "Scheduled Task Enabled"
+description: "A scheduled task was enabled"
+fields:
+  - name: "TaskName"
+    source: EventData
+    xpath: "Data[@Name='TaskName']"
+    required: true
+    type: string
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+  - name: "Enabled"
+    source: EventData
+    xpath: "Data[@Name='Enabled']"
+    required: true
+    type: boolean
+output_format: |
+  Task {TaskName} enabled by {SubjectUserName}

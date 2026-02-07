@@ -1,0 +1,21 @@
+event_id: 4732
+name: "Member Added to Local Group"
+description: "A member was added to a security-enabled local group"
+fields:
+  - name: "GroupName"
+    source: EventData
+    xpath: "Data[@Name='GroupName']"
+    required: true
+    type: string
+  - name: "MemberName"
+    source: EventData
+    xpath: "Data[@Name='MemberName']"
+    required: true
+    type: string
+  - name: "MemberSid"
+    source: EventData
+    xpath: "Data[@Name='MemberSid']"
+    required: false
+    type: string
+output_format: |
+  {MemberName} added to local group {GroupName}

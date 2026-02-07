@@ -1,0 +1,21 @@
+event_id: 4756
+name: "Member Added to Universal Group"
+description: "A member was added to a security-enabled universal group"
+fields:
+  - name: "GroupName"
+    source: EventData
+    xpath: "Data[@Name='GroupName']"
+    required: true
+    type: string
+  - name: "MemberName"
+    source: EventData
+    xpath: "Data[@Name='MemberName']"
+    required: true
+    type: string
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+output_format: |
+  {MemberName} added to universal group {GroupName}

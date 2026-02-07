@@ -1,0 +1,21 @@
+event_id: 4647
+name: "User Initiated Logoff"
+description: "A user initiated a logoff"
+fields:
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+  - name: "SubjectDomainName"
+    source: EventData
+    xpath: "Data[@Name='SubjectDomainName']"
+    required: true
+    type: string
+  - name: "LogonID"
+    source: EventData
+    xpath: "Data[@Name='LogonID']"
+    required: true
+    type: string
+output_format: |
+  {SubjectUserName} initiated logoff (LogonID {LogonID})

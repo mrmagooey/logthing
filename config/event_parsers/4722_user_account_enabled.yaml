@@ -1,0 +1,21 @@
+event_id: 4722
+name: "User Account Enabled"
+description: "A disabled user account was enabled"
+fields:
+  - name: "TargetUserName"
+    source: EventData
+    xpath: "Data[@Name='TargetUserName']"
+    required: true
+    type: string
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+  - name: "Status"
+    source: EventData
+    xpath: "Data[@Name='Status']"
+    required: false
+    type: string
+output_format: |
+  {SubjectUserName} enabled {TargetUserName}

@@ -1,0 +1,16 @@
+event_id: 4743
+name: "Computer Account Deleted"
+description: "A computer account was deleted"
+fields:
+  - name: "ComputerName"
+    source: EventData
+    xpath: "Data[@Name='ComputerName']"
+    required: true
+    type: string
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+output_format: |
+  Computer {ComputerName} deleted by {SubjectUserName}

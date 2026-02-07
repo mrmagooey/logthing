@@ -1,0 +1,21 @@
+event_id: 4634
+name: "Logoff"
+description: "An account was logged off"
+fields:
+  - name: "TargetUserName"
+    source: EventData
+    xpath: "Data[@Name='TargetUserName']"
+    required: true
+    type: string
+  - name: "TargetDomainName"
+    source: EventData
+    xpath: "Data[@Name='TargetDomainName']"
+    required: true
+    type: string
+  - name: "LogonID"
+    source: EventData
+    xpath: "Data[@Name='LogonID']"
+    required: true
+    type: string
+output_format: |
+  {TargetUserName} from {TargetDomainName} logged off (LogonID {LogonID})

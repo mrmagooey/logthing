@@ -1,0 +1,21 @@
+event_id: 4658
+name: "Handle Closed"
+description: "A handle to an object was closed"
+fields:
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+  - name: "HandleID"
+    source: EventData
+    xpath: "Data[@Name='HandleID']"
+    required: true
+    type: string
+  - name: "ObjectType"
+    source: EventData
+    xpath: "Data[@Name='ObjectType']"
+    required: false
+    type: string
+output_format: |
+  {SubjectUserName} closed handle {HandleID} ({ObjectType})

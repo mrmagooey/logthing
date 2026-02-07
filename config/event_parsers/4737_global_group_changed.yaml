@@ -1,0 +1,26 @@
+event_id: 4737
+name: "Global Group Changed"
+description: "Properties of a security-enabled global group were changed"
+fields:
+  - name: "GroupName"
+    source: EventData
+    xpath: "Data[@Name='GroupName']"
+    required: true
+    type: string
+  - name: "Attribute"
+    source: EventData
+    xpath: "Data[@Name='Attribute']"
+    required: true
+    type: string
+  - name: "OldValue"
+    source: EventData
+    xpath: "Data[@Name='OldValue']"
+    required: false
+    type: string
+  - name: "NewValue"
+    source: EventData
+    xpath: "Data[@Name='NewValue']"
+    required: false
+    type: string
+output_format: |
+  Global group {GroupName} attribute {Attribute} changed

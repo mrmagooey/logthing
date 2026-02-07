@@ -1,0 +1,21 @@
+event_id: 4731
+name: "Local Group Created"
+description: "A security-enabled local group was created"
+fields:
+  - name: "GroupName"
+    source: EventData
+    xpath: "Data[@Name='GroupName']"
+    required: true
+    type: string
+  - name: "GroupSid"
+    source: EventData
+    xpath: "Data[@Name='GroupSid']"
+    required: false
+    type: string
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+output_format: |
+  Local group {GroupName} created by {SubjectUserName}

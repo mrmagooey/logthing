@@ -1,0 +1,21 @@
+event_id: 4742
+name: "Computer Account Changed"
+description: "A computer account was changed"
+fields:
+  - name: "ComputerName"
+    source: EventData
+    xpath: "Data[@Name='ComputerName']"
+    required: true
+    type: string
+  - name: "Attribute"
+    source: EventData
+    xpath: "Data[@Name='Attribute']"
+    required: true
+    type: string
+  - name: "NewValue"
+    source: EventData
+    xpath: "Data[@Name='NewValue']"
+    required: false
+    type: string
+output_format: |
+  Computer {ComputerName} attribute {Attribute} changed

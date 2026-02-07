@@ -1,0 +1,21 @@
+event_id: 4720
+name: "User Account Created"
+description: "A user account was created"
+fields:
+  - name: "SamAccountName"
+    source: EventData
+    xpath: "Data[@Name='SamAccountName']"
+    required: true
+    type: string
+  - name: "DisplayName"
+    source: EventData
+    xpath: "Data[@Name='DisplayName']"
+    required: false
+    type: string
+  - name: "UserPrincipalName"
+    source: EventData
+    xpath: "Data[@Name='UserPrincipalName']"
+    required: false
+    type: string
+output_format: |
+  User {SamAccountName} created ({DisplayName})

@@ -9,8 +9,8 @@ I've implemented a generic framework for parsing specific Windows event codes wi
 
 ## Files Created/Modified
 
-### 1. Configuration File (`config/event_parsers.yaml`)
-Defines parsing rules for events 4624 and 4668:
+### 1. Configuration Directory (`config/event_parsers/`)
+Each YAML file inside this directory defines one Windows event (e.g., `4624_successful_logon.yaml`):
 - Field extraction rules with XPath-like selectors
 - Data type conversion (string, integer, boolean)
 - Enrichment lookups (e.g., LogonType integer → readable name)
@@ -49,31 +49,38 @@ Added `mod parser;` to include the new module
 ## Configuration Format
 
 ```yaml
-event_parsers:
-  4624:  # Event ID
-    name: "Successful Logon"
-    description: "An account was successfully logged on"
-    fields:
-      - name: "TargetUserName"
-        source: "EventData"
-        xpath: "Data[@Name='TargetUserName']"
-        required: true
-        type: "string"
-    enrichments:
-      - field: "LogonType"
-        lookup_table:
-          "2": "Interactive"
-          "3": "Network"
-    output_format: "User {TargetUserName} logged on via {LogonType_Name}"
+event_id: 4624
+name: "Successful Logon"
+description: "An account was successfully logged on"
+fields:
+  - name: "TargetUserName"
+    source: EventData
+    xpath: "Data[@Name='TargetUserName']"
+    required: true
+    type: string
+  - name: "LogonType"
+    source: EventData
+    xpath: "Data[@Name='LogonType']"
+    required: true
+    type: integer
+enrichments:
+  - field: "LogonType"
+    lookup_table:
+      "2": "Interactive"
+      "3": "Network"
+output_format: |
+  User {TargetUserName} logged on via {LogonType_Name}
 ```
+
+> For backward compatibility the parser still accepts a single aggregated `config/event_parsers.yaml`, but the directory layout makes it easier to version-control individual events.
 
 ## Usage Example
 
 ```rust
 use wef_server::parser::GenericEventParser;
 
-// Load configuration
-let parser = GenericEventParser::from_file("config/event_parsers.yaml")?;
+// Load configuration directory (or pass a single YAML file for legacy setups)
+let parser = GenericEventParser::from_file("config/event_parsers")?;
 
 // Check if parser exists for event
 if parser.has_parser(4624) {
@@ -107,7 +114,7 @@ if parser.has_parser(4624) {
 ## Integration with WEF Server
 
 The generic parser integrates into the server pipeline:
-1. Server loads `config/event_parsers.yaml` on startup
+1. Server loads `config/event_parsers/` (or the legacy YAML file) on startup
 2. When events are received, they're first parsed by the WEF protocol parser
 3. If a generic parser exists for the event ID, it's applied for detailed extraction
 4. Enriched event data is available for forwarding to destinations

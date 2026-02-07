@@ -1,0 +1,21 @@
+event_id: 4697
+name: "Service Installed"
+description: "A service was installed on the system"
+fields:
+  - name: "ServiceName"
+    source: EventData
+    xpath: "Data[@Name='ServiceName']"
+    required: true
+    type: string
+  - name: "ImagePath"
+    source: EventData
+    xpath: "Data[@Name='ImagePath']"
+    required: true
+    type: string
+  - name: "ServiceType"
+    source: EventData
+    xpath: "Data[@Name='ServiceType']"
+    required: false
+    type: string
+output_format: |
+  Service {ServiceName} installed ({ImagePath})

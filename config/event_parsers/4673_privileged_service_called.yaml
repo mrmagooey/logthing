@@ -1,0 +1,21 @@
+event_id: 4673
+name: "Privileged Service Called"
+description: "A privileged service was called"
+fields:
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+  - name: "ServiceName"
+    source: EventData
+    xpath: "Data[@Name='ServiceName']"
+    required: true
+    type: string
+  - name: "PrivilegeList"
+    source: EventData
+    xpath: "Data[@Name='PrivilegeList']"
+    required: false
+    type: string
+output_format: |
+  {SubjectUserName} invoked {ServiceName} ({PrivilegeList})

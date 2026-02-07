@@ -1,0 +1,21 @@
+event_id: 4770
+name: "Kerberos Service Ticket Renewed"
+description: "A Kerberos service ticket was renewed"
+fields:
+  - name: "ServiceName"
+    source: EventData
+    xpath: "Data[@Name='ServiceName']"
+    required: true
+    type: string
+  - name: "TargetUserName"
+    source: EventData
+    xpath: "Data[@Name='TargetUserName']"
+    required: true
+    type: string
+  - name: "TicketOptions"
+    source: EventData
+    xpath: "Data[@Name='TicketOptions']"
+    required: false
+    type: string
+output_format: |
+  Kerberos ticket for {TargetUserName} renewed on {ServiceName}
