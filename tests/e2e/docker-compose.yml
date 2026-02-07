@@ -1,0 +1,89 @@
+services:
+  wef-server:
+    build:
+      context: ../..
+    image: wef-server:e2e
+    environment:
+      - RUST_LOG=info
+      - WEF__TLS__ENABLED=false
+      - WEF__SYSLOG__ENABLED=true
+      - WEF__SYSLOG__UDP_PORT=5514
+      - WEF__SYSLOG__TCP_PORT=5601
+      - WEF_ADMIN_USER=e2e
+      - WEF_ADMIN_PASS=e2e
+    volumes:
+      - ./config/wef-server.toml:/etc/wef-server/config.toml:ro
+    depends_on:
+      - minio
+    networks:
+      - e2e
+
+  minio:
+    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    environment:
+      - MINIO_ROOT_USER=miniouser
+      - MINIO_ROOT_PASSWORD=miniopassword
+    command: server /data --console-address ':9001'
+    expose:
+      - "9000"
+      - "9001"
+    networks:
+      - e2e
+
+  minio-setup:
+    image: minio/mc:latest
+    environment:
+      - MINIO_ROOT_USER=miniouser
+      - MINIO_ROOT_PASSWORD=miniopassword
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "until mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; do sleep 2; done &&
+       mc mb --ignore-existing local/wef-events"
+    depends_on:
+      - minio
+    networks:
+      - e2e
+
+  wef-generator:
+    build:
+      context: .
+      dockerfile: wef-generator/Dockerfile
+    environment:
+      - WEF_ENDPOINT=http://wef-server:5985
+      - WEF_STATS_ENDPOINT=http://wef-server:5985/stats/throughput
+      - EVENTS_FIXTURE=/app/fixtures/wef/events_batch.xml
+      - EXPECTED_EVENT_IDS=4624,4668
+    networks:
+      - e2e
+
+  syslog-generator:
+    build:
+      context: .
+      dockerfile: syslog-generator/Dockerfile
+    environment:
+      - SYSLOG_HOST=wef-server
+      - SYSLOG_UDP_PORT=5514
+      - SYSLOG_TCP_PORT=5601
+      - SYSLOG_HTTP_ENDPOINT=http://wef-server:5985/syslog
+    depends_on:
+      - wef-server
+    networks:
+      - e2e
+
+  s3-verifier:
+    build:
+      context: .
+      dockerfile: s3-verifier/Dockerfile
+    environment:
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_BUCKET=wef-events
+      - AWS_ACCESS_KEY_ID=miniouser
+      - AWS_SECRET_ACCESS_KEY=miniopassword
+      - WEF_STATS_ENDPOINT=http://wef-server:5985/stats/throughput
+      - EXPECTED_EVENT_TOTAL=2
+    networks:
+      - e2e
+
+networks:
+  e2e:
+    driver: bridge
