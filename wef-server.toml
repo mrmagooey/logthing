@@ -1,0 +1,49 @@
+bind_address = "0.0.0.0:5985"
+
+[logging]
+level = "info"
+format = "pretty"
+
+[tls]
+enabled = false
+port = 5986
+
+[security]
+allowed_ips = []
+max_connections = 10000
+connection_timeout_secs = 300
+
+[forwarding]
+buffer_size = 10000
+retry_attempts = 3
+
+[[forwarding.destinations]]
+name = "example"
+url = "http://localhost:9200/events"
+protocol = "http"
+enabled = false
+
+# Parquet S3 Forwarder Example (stores events in S3-compatible storage as Parquet files)
+[[forwarding.destinations]]
+name = "parquet-s3"
+url = "s3://wef-events"
+protocol = "http"
+enabled = false
+[forwarding.destinations.headers]
+endpoint = "http://localhost:9000"  # S3-compatible endpoint (MinIO, etc.)
+region = "us-east-1"
+access-key = "minioadmin"
+secret-key = "minioadmin"
+max-size-mb = "100"          # Flush when buffer reaches 100MB
+flush-interval-secs = "900"  # Flush every 15 minutes (900 seconds)
+buffer-path = "/tmp/wef-events"  # Local temp directory for Parquet files
+
+[metrics]
+enabled = true
+port = 9090
+
+[syslog]
+enabled = true
+udp_port = 514      # Standard syslog UDP port
+tcp_port = 601      # Standard syslog TCP port (RFC 6587)
+parse_dns = true    # Enable DNS log parsing

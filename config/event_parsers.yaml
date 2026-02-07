@@ -1,0 +1,134 @@
+# Windows Event Parsing Configuration
+# This file defines how to parse specific Windows event codes
+
+event_parsers:
+  # Event ID 4624: Successful Logon
+  4624:
+    name: "Successful Logon"
+    description: "An account was successfully logged on"
+    fields:
+      - name: "TargetUserName"
+        source: "EventData"
+        xpath: "Data[@Name='TargetUserName']"
+        required: true
+        type: "string"
+      
+      - name: "TargetDomainName"
+        source: "EventData"
+        xpath: "Data[@Name='TargetDomainName']"
+        required: true
+        type: "string"
+      
+      - name: "LogonType"
+        source: "EventData"
+        xpath: "Data[@Name='LogonType']"
+        required: true
+        type: "integer"
+      
+      - name: "IpAddress"
+        source: "EventData"
+        xpath: "Data[@Name='IpAddress']"
+        required: false
+        type: "string"
+      
+      - name: "IpPort"
+        source: "EventData"
+        xpath: "Data[@Name='IpPort']"
+        required: false
+        type: "string"
+      
+      - name: "ProcessName"
+        source: "EventData"
+        xpath: "Data[@Name='ProcessName']"
+        required: false
+        type: "string"
+      
+      - name: "Status"
+        source: "EventData"
+        xpath: "Data[@Name='Status']"
+        required: false
+        type: "string"
+      
+      - name: "SubStatus"
+        source: "EventData"
+        xpath: "Data[@Name='SubStatus']"
+        required: false
+        type: "string"
+      
+      - name: "LmPackageName"
+        source: "EventData"
+        xpath: "Data[@Name='LmPackageName']"
+        required: false
+        type: "string"
+    
+    enrichments:
+      - field: "LogonType"
+        lookup_table:
+          "2": "Interactive"
+          "3": "Network"
+          "4": "Batch"
+          "5": "Service"
+          "7": "Unlock"
+          "8": "NetworkCleartext"
+          "9": "NewCredentials"
+          "10": "RemoteInteractive"
+          "11": "CachedInteractive"
+    
+    output_format: |
+      User {TargetUserName} from {TargetDomainName} logged on via {LogonType_Name} from {IpAddress}:{IpPort}
+
+  # Event ID 4668: S4U2Self
+  4668:
+    name: "S4U2Self"
+    description: "An account was logged on with S4U2Self"
+    fields:
+      - name: "TargetUserName"
+        source: "EventData"
+        xpath: "Data[@Name='TargetUserName']"
+        required: true
+        type: "string"
+      
+      - name: "TargetDomainName"
+        source: "EventData"
+        xpath: "Data[@Name='TargetDomainName']"
+        required: true
+        type: "string"
+      
+      - name: "ServiceName"
+        source: "EventData"
+        xpath: "Data[@Name='ServiceName']"
+        required: true
+        type: "string"
+      
+      - name: "ServiceSid"
+        source: "EventData"
+        xpath: "Data[@Name='ServiceSid']"
+        required: false
+        type: "string"
+      
+      - name: "TicketOptions"
+        source: "EventData"
+        xpath: "Data[@Name='TicketOptions']"
+        required: false
+        type: "string"
+      
+      - name: "Status"
+        source: "EventData"
+        xpath: "Data[@Name='Status']"
+        required: false
+        type: "string"
+      
+      - name: "LogonGuid"
+        source: "EventData"
+        xpath: "Data[@Name='LogonGuid']"
+        required: false
+        type: "string"
+      
+      - name: "TransmittedServices"
+        source: "EventData"
+        xpath: "Data[@Name='TransmittedServices']"
+        required: false
+        type: "string"
+    
+    output_format: |
+      S4U2Self: {TargetUserName}@{TargetDomainName} requested {ServiceName} with status {Status}
