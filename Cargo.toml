@@ -1,0 +1,77 @@
+[package]
+name = "wef-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# HTTP server framework
+axum = { version = "0.7", features = ["macros"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+headers = "0.4"
+tower = { version = "0.4", features = ["full"] }
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+hyper = { version = "1.0", features = ["full"] }
+
+# TLS/SSL
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2.0"
+
+# Serialization/Deserialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# XML parsing for WEF events
+quick-xml = { version = "0.31", features = ["serialize"] }
+
+# Configuration
+config = "0.14"
+serde_yaml = "0.9"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Metrics
+metrics = "0.22"
+metrics-exporter-prometheus = "0.13"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# IP/network utilities
+ipnet = "2.9"
+
+# Utilities
+uuid = { version = "1.7", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "5.5"
+
+# HTTP client for forwarding
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+
+# Parquet file handling
+parquet = { version = "53.0", features = ["async", "arrow"] }
+arrow = "53.0"
+arrow-array = "53.0"
+arrow-schema = "53.0"
+
+# S3 SDK
+aws-config = { version = "1.1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.15"
+aws-credential-types = "1.1"
+
+# Additional utilities
+tempfile = "3.9"
+bytes = "1.5"
+regex = "1.10"
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.9"
