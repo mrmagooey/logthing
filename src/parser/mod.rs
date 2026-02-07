@@ -1,7 +1,8 @@
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 /// Configuration for all event parsers
@@ -81,16 +82,18 @@ pub struct GenericEventParser {
 impl GenericEventParser {
     /// Load parser configuration from a YAML file
     pub fn from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        info!("Loading event parser configuration from {:?}", path.as_ref());
-        
-        let content = fs::read_to_string(&path)?;
-        let config: EventParserConfig = serde_yaml::from_str(&content)?;
-        
-        info!(
-            "Loaded {} event parser definitions",
-            config.parsers.len()
-        );
-        
+        let path = path.as_ref();
+        info!("Loading event parser configuration from {:?}", path);
+
+        let config = if path.is_dir() {
+            Self::load_from_directory(path)?
+        } else {
+            let content = fs::read_to_string(path)?;
+            serde_yaml::from_str(&content)?
+        };
+
+        info!("Loaded {} event parser definitions", config.parsers.len());
+
         for (event_id, parser) in &config.parsers {
             debug!(
                 "Event {}: {} ({} fields)",
@@ -99,18 +102,66 @@ impl GenericEventParser {
                 parser.fields.len()
             );
         }
-        
+
         Ok(Self { config })
     }
-    
+
+    fn load_from_directory(dir: &Path) -> anyhow::Result<EventParserConfig> {
+        let mut yaml_files: Vec<PathBuf> = fs::read_dir(dir)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| matches!(ext.to_lowercase().as_str(), "yml" | "yaml"))
+                        .unwrap_or(false)
+            })
+            .collect();
+
+        yaml_files.sort();
+
+        let mut parsers = HashMap::new();
+
+        for file_path in yaml_files {
+            let content = fs::read_to_string(&file_path)
+                .with_context(|| format!("Failed to read {:?}", file_path))?;
+            let parser_file: EventParserFile = serde_yaml::from_str(&content)
+                .with_context(|| format!("Failed to parse {:?}", file_path))?;
+
+            if parsers
+                .insert(parser_file.event_id, parser_file.definition)
+                .is_some()
+            {
+                warn!(
+                    "Duplicate parser definition detected for event {} in {:?}",
+                    parser_file.event_id, file_path
+                );
+            }
+        }
+
+        if parsers.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No parser definitions found in directory {:?}",
+                dir
+            ));
+        }
+
+        Ok(EventParserConfig { parsers })
+    }
+
     /// Parse a Windows event XML using the appropriate parser
     pub fn parse_event(&self, event_id: u32, xml: &str) -> Option<ParsedEventData> {
         let parser_def = self.config.parsers.get(&event_id)?;
-        
-        debug!("Parsing event {} using parser: {}", event_id, parser_def.name);
-        
+
+        debug!(
+            "Parsing event {} using parser: {}",
+            event_id, parser_def.name
+        );
+
         let mut fields = HashMap::new();
-        
+
         // Extract each field defined in the configuration
         for field_def in &parser_def.fields {
             match self.extract_field(xml, field_def) {
@@ -133,7 +184,7 @@ impl GenericEventParser {
                 }
             }
         }
-        
+
         // Apply enrichments
         let mut enrichments = HashMap::new();
         for enrichment in &parser_def.enrichments {
@@ -143,19 +194,20 @@ impl GenericEventParser {
                     serde_json::Value::Number(n) => n.to_string(),
                     _ => value.to_string(),
                 };
-                
+
                 if let Some(enriched) = enrichment.lookup.get(&value_str) {
                     let enriched_field_name = format!("{}_Name", enrichment.field);
                     enrichments.insert(enriched_field_name, enriched.clone());
                 }
             }
         }
-        
+
         // Format output message if template exists
-        let formatted_message = parser_def.output_format.as_ref().and_then(|template| {
-            self.format_message(template, &fields, &enrichments)
-        });
-        
+        let formatted_message = parser_def
+            .output_format
+            .as_ref()
+            .and_then(|template| self.format_message(template, &fields, &enrichments));
+
         Some(ParsedEventData {
             event_id,
             parser_name: parser_def.name.clone(),
@@ -164,7 +216,7 @@ impl GenericEventParser {
             formatted_message,
         })
     }
-    
+
     /// Extract a field from the XML using the field definition
     fn extract_field(
         &self,
@@ -177,7 +229,7 @@ impl GenericEventParser {
             FieldSource::RenderingInfo => self.extract_from_rendering_info(xml, &field_def.name),
             FieldSource::UserData => self.extract_from_user_data(xml, &field_def.xpath),
         }?;
-        
+
         // Convert to appropriate type
         let converted = match field_def.field_type {
             FieldType::String => serde_json::Value::String(value),
@@ -185,15 +237,15 @@ impl GenericEventParser {
                 .parse::<i64>()
                 .map(|n| serde_json::Value::Number(serde_json::Number::from(n)))
                 .map_err(|e| anyhow::anyhow!("Failed to parse integer: {}", e))?,
-            FieldType::Boolean => serde_json::Value::Bool(
-                value.to_lowercase() == "true" || value == "1"
-            ),
+            FieldType::Boolean => {
+                serde_json::Value::Bool(value.to_lowercase() == "true" || value == "1")
+            }
             FieldType::IpAddress | FieldType::Guid => serde_json::Value::String(value),
         };
-        
+
         Ok(converted)
     }
-    
+
     /// Extract a value from EventData section
     fn extract_from_event_data(&self, xml: &str, xpath: &str) -> anyhow::Result<String> {
         // Parse the xpath to extract attribute name
@@ -201,61 +253,61 @@ impl GenericEventParser {
         let attr_name = xpath
             .trim_start_matches("Data[@Name='")
             .trim_end_matches("']");
-        
+
         // Look for Data element with the specified Name attribute
         let search_pattern = format!(r#"Data Name="{}""#, attr_name);
-        
+
         if let Some(pos) = xml.find(&search_pattern) {
             // Find the start of this element
-            let start = xml[..pos].rfind('<').ok_or_else(|| {
-                anyhow::anyhow!("Could not find element start for {}", attr_name)
-            })?;
-            
+            let start = xml[..pos]
+                .rfind('<')
+                .ok_or_else(|| anyhow::anyhow!("Could not find element start for {}", attr_name))?;
+
             // Find the end of the start tag
-            let tag_end = xml[pos..].find('>').ok_or_else(|| {
-                anyhow::anyhow!("Could not find tag end for {}", attr_name)
-            })?;
-            
+            let tag_end = xml[pos..]
+                .find('>')
+                .ok_or_else(|| anyhow::anyhow!("Could not find tag end for {}", attr_name))?;
+
             // Check if it's a self-closing tag
             let full_tag = &xml[start..pos + tag_end + 1];
             if full_tag.ends_with("/>") {
                 return Ok(String::new());
             }
-            
+
             // Extract content between tags
             let content_start = pos + tag_end + 1;
             let end_tag = format!("</Data>");
-            
+
             if let Some(end_pos) = xml[content_start..].find(&end_tag) {
                 let value = xml[content_start..content_start + end_pos].trim();
                 return Ok(value.to_string());
             }
         }
-        
+
         Err(anyhow::anyhow!(
             "Field with attribute Name='{}' not found in EventData",
             attr_name
         ))
     }
-    
+
     /// Extract a value from System section
     fn extract_from_system(&self, xml: &str, field_name: &str) -> anyhow::Result<String> {
         let start_tag = format!("<{}>", field_name);
         let end_tag = format!("</{}>", field_name);
-        
+
         if let Some(start) = xml.find(&start_tag) {
             let content_start = start + start_tag.len();
             if let Some(end) = xml[content_start..].find(&end_tag) {
                 return Ok(xml[content_start..content_start + end].to_string());
             }
         }
-        
+
         Err(anyhow::anyhow!(
             "Field '{}' not found in System section",
             field_name
         ))
     }
-    
+
     /// Extract a value from RenderingInfo section
     fn extract_from_rendering_info(&self, xml: &str, _field_name: &str) -> anyhow::Result<String> {
         // RenderingInfo contains the message template
@@ -266,16 +318,16 @@ impl GenericEventParser {
                 return Ok(xml[content_start..content_start + end].to_string());
             }
         }
-        
+
         Err(anyhow::anyhow!("RenderingInfo Message not found"))
     }
-    
+
     /// Extract a value from UserData section
     fn extract_from_user_data(&self, xml: &str, xpath: &str) -> anyhow::Result<String> {
         // Similar to EventData extraction for UserData section
         self.extract_from_event_data(xml, xpath)
     }
-    
+
     /// Format an output message using the template
     fn format_message(
         &self,
@@ -284,7 +336,7 @@ impl GenericEventParser {
         enrichments: &HashMap<String, String>,
     ) -> Option<String> {
         let mut result = template.to_string();
-        
+
         // Replace field placeholders
         for (field_name, value) in fields {
             let placeholder = format!("{{{}}}", field_name);
@@ -296,25 +348,32 @@ impl GenericEventParser {
             };
             result = result.replace(&placeholder, &value_str);
         }
-        
+
         // Replace enrichment placeholders
         for (field_name, value) in enrichments {
             let placeholder = format!("{{{}}}", field_name);
             result = result.replace(&placeholder, value);
         }
-        
+
         Some(result.trim().to_string())
     }
-    
+
     /// Check if a parser exists for the given event ID
     pub fn has_parser(&self, event_id: u32) -> bool {
         self.config.parsers.contains_key(&event_id)
     }
-    
+
     /// Get list of supported event IDs
     pub fn supported_events(&self) -> Vec<u32> {
         self.config.parsers.keys().copied().collect()
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct EventParserFile {
+    event_id: u32,
+    #[serde(flatten)]
+    definition: EventParserDefinition,
 }
 
 #[cfg(test)]

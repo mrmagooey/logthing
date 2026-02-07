@@ -1,0 +1,43 @@
+event_id: 4624
+name: "Successful Logon"
+description: "An account was successfully logged on"
+fields:
+  - name: "TargetUserName"
+    source: EventData
+    xpath: "Data[@Name='TargetUserName']"
+    required: true
+    type: string
+  - name: "TargetDomainName"
+    source: EventData
+    xpath: "Data[@Name='TargetDomainName']"
+    required: true
+    type: string
+  - name: "LogonType"
+    source: EventData
+    xpath: "Data[@Name='LogonType']"
+    required: true
+    type: integer
+  - name: "IpAddress"
+    source: EventData
+    xpath: "Data[@Name='IpAddress']"
+    required: false
+    type: string
+  - name: "IpPort"
+    source: EventData
+    xpath: "Data[@Name='IpPort']"
+    required: false
+    type: string
+enrichments:
+  - field: "LogonType"
+    lookup_table:
+      "2": "Interactive"
+      "3": "Network"
+      "4": "Batch"
+      "5": "Service"
+      "7": "Unlock"
+      "8": "NetworkCleartext"
+      "9": "NewCredentials"
+      "10": "RemoteInteractive"
+      "11": "CachedInteractive"
+output_format: |
+  User {TargetUserName} from {TargetDomainName} logged on via {LogonType_Name} from {IpAddress}:{IpPort}

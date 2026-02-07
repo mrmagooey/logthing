@@ -1,0 +1,21 @@
+event_id: 4661
+name: "Handle Requested for Object"
+description: "A handle request was made for an object"
+fields:
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+  - name: "ObjectType"
+    source: EventData
+    xpath: "Data[@Name='ObjectType']"
+    required: true
+    type: string
+  - name: "ProcessName"
+    source: EventData
+    xpath: "Data[@Name='ProcessName']"
+    required: false
+    type: string
+output_format: |
+  {SubjectUserName} requested handle to {ObjectType} using {ProcessName}

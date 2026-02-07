@@ -1,0 +1,21 @@
+event_id: 4729
+name: "Member Removed from Global Group"
+description: "A member was removed from a security-enabled global group"
+fields:
+  - name: "GroupName"
+    source: EventData
+    xpath: "Data[@Name='GroupName']"
+    required: true
+    type: string
+  - name: "MemberName"
+    source: EventData
+    xpath: "Data[@Name='MemberName']"
+    required: true
+    type: string
+  - name: "MemberSid"
+    source: EventData
+    xpath: "Data[@Name='MemberSid']"
+    required: false
+    type: string
+output_format: |
+  {MemberName} removed from {GroupName}

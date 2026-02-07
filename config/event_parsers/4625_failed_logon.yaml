@@ -1,0 +1,36 @@
+event_id: 4625
+name: "Failed Logon"
+description: "An account failed to log on"
+fields:
+  - name: "TargetUserName"
+    source: EventData
+    xpath: "Data[@Name='TargetUserName']"
+    required: true
+    type: string
+  - name: "TargetDomainName"
+    source: EventData
+    xpath: "Data[@Name='TargetDomainName']"
+    required: true
+    type: string
+  - name: "LogonType"
+    source: EventData
+    xpath: "Data[@Name='LogonType']"
+    required: true
+    type: integer
+  - name: "Status"
+    source: EventData
+    xpath: "Data[@Name='Status']"
+    required: true
+    type: string
+  - name: "SubStatus"
+    source: EventData
+    xpath: "Data[@Name='SubStatus']"
+    required: false
+    type: string
+  - name: "IpAddress"
+    source: EventData
+    xpath: "Data[@Name='IpAddress']"
+    required: false
+    type: string
+output_format: |
+  Failed logon for {TargetUserName} ({Status}/{SubStatus}) from {IpAddress}

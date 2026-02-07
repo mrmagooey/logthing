@@ -1,0 +1,21 @@
+event_id: 4657
+name: "Registry Value Changed"
+description: "A registry value was modified"
+fields:
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+  - name: "ObjectName"
+    source: EventData
+    xpath: "Data[@Name='ObjectName']"
+    required: true
+    type: string
+  - name: "NewValue"
+    source: EventData
+    xpath: "Data[@Name='NewValue']"
+    required: true
+    type: string
+output_format: |
+  {SubjectUserName} set {ObjectName} to {NewValue}

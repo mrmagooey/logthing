@@ -1,0 +1,21 @@
+event_id: 4719
+name: "System Audit Policy Changed"
+description: "System audit policy was modified"
+fields:
+  - name: "Category"
+    source: EventData
+    xpath: "Data[@Name='Category']"
+    required: true
+    type: string
+  - name: "SubcategoryGuid"
+    source: EventData
+    xpath: "Data[@Name='SubcategoryGuid']"
+    required: true
+    type: string
+  - name: "AuditPolicyChanges"
+    source: EventData
+    xpath: "Data[@Name='AuditPolicyChanges']"
+    required: true
+    type: string
+output_format: |
+  Audit policy {Category} changed ({AuditPolicyChanges})

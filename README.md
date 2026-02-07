@@ -152,32 +152,34 @@ s3://bucket-name/
 
 ### Generic Event Parser Configuration
 
-Create `config/event_parsers.yaml` to define custom parsing for specific Windows event codes:
+Add per-event parser definitions under `config/event_parsers/`. Each file contains a single event definition so you can mix and match without touching the others. For example, `config/event_parsers/4624_successful_logon.yaml`:
 
 ```yaml
-event_parsers:
-  4624:  # Successful Logon
-    name: "Successful Logon"
-    description: "An account was successfully logged on"
-    fields:
-      - name: "TargetUserName"
-        source: "EventData"
-        xpath: "Data[@Name='TargetUserName']"
-        required: true
-        type: "string"
-      - name: "LogonType"
-        source: "EventData"
-        xpath: "Data[@Name='LogonType']"
-        required: true
-        type: "integer"
-    enrichments:
-      - field: "LogonType"
-        lookup_table:
-          "2": "Interactive"
-          "3": "Network"
-          "10": "RemoteInteractive"
-    output_format: "User {TargetUserName} logged on via {LogonType_Name}"
+event_id: 4624
+name: "Successful Logon"
+description: "An account was successfully logged on"
+fields:
+  - name: "TargetUserName"
+    source: EventData
+    xpath: "Data[@Name='TargetUserName']"
+    required: true
+    type: string
+  - name: "LogonType"
+    source: EventData
+    xpath: "Data[@Name='LogonType']"
+    required: true
+    type: integer
+enrichments:
+  - field: "LogonType"
+    lookup_table:
+      "2": "Interactive"
+      "3": "Network"
+      "10": "RemoteInteractive"
+output_format: |
+  User {TargetUserName} logged on via {LogonType_Name}
 ```
+
+> **Note:** The legacy aggregated `config/event_parsers.yaml` file format is still supported for backward compatibility, but the directory layout makes it easier to version and swap individual event definitions.
 
 The parser supports:
 - **Field Extraction**: Extract specific fields from EventData, System, RenderingInfo, or UserData sections
@@ -185,9 +187,62 @@ The parser supports:
 - **Enrichments**: Add lookup tables to enrich raw values (e.g., logon type codes to names)
 - **Message Formatting**: Generate custom output messages using field placeholders
 
-**Pre-configured Events**:
-- Event 4624: Successful Logon
-- Event 4668: S4U2Self (Service for User)
+### Event Parser Coverage
+
+The repository ships example parsers for 50 high-value Windows Security events. Each file in `config/event_parsers/` matches one of the entries below:
+
+| Event ID | Description |
+| --- | --- |
+| 4624 | Successful Logon |
+| 4625 | Failed Logon |
+| 4634 | Logoff |
+| 4647 | User Initiated Logoff |
+| 4648 | Logon Using Explicit Credentials |
+| 4649 | Replay Attack Detected |
+| 4656 | Handle Requested |
+| 4657 | Registry Value Changed |
+| 4658 | Handle Closed |
+| 4660 | Object Deleted |
+| 4661 | Handle Requested for Object |
+| 4662 | Operation Performed on Object |
+| 4663 | Attempted Object Access |
+| 4670 | Permissions on Object Changed |
+| 4672 | Admin Logon |
+| 4673 | Privileged Service Called |
+| 4674 | Privileged Service Operation |
+| 4688 | Process Created |
+| 4689 | Process Terminated |
+| 4697 | Service Installed |
+| 4698 | Scheduled Task Created |
+| 4699 | Scheduled Task Deleted |
+| 4700 | Scheduled Task Enabled |
+| 4702 | Scheduled Task Updated |
+| 4719 | System Audit Policy Changed |
+| 4720 | User Account Created |
+| 4722 | User Account Enabled |
+| 4723 | Password Change Attempt |
+| 4724 | Password Reset Attempt |
+| 4725 | User Account Disabled |
+| 4726 | User Account Deleted |
+| 4727 | Global Group Created |
+| 4728 | Member Added to Global Group |
+| 4729 | Member Removed from Global Group |
+| 4730 | Global Group Deleted |
+| 4731 | Local Group Created |
+| 4732 | Member Added to Local Group |
+| 4733 | Member Removed from Local Group |
+| 4735 | Local Group Changed |
+| 4737 | Global Group Changed |
+| 4740 | Account Locked |
+| 4741 | Computer Account Created |
+| 4742 | Computer Account Changed |
+| 4743 | Computer Account Deleted |
+| 4756 | Member Added to Universal Group |
+| 4757 | Member Removed from Universal Group |
+| 4767 | Account Unlocked |
+| 4768 | Kerberos TGT Requested |
+| 4769 | Kerberos Service Ticket Requested |
+| 4770 | Kerberos Service Ticket Renewed |
 
 ### Running
 

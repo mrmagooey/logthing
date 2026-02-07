@@ -1,0 +1,21 @@
+event_id: 4649
+name: "Replay Attack Detected"
+description: "A Kerberos replay attack was detected"
+fields:
+  - name: "TargetUserName"
+    source: EventData
+    xpath: "Data[@Name='TargetUserName']"
+    required: true
+    type: string
+  - name: "ServiceName"
+    source: EventData
+    xpath: "Data[@Name='ServiceName']"
+    required: true
+    type: string
+  - name: "TicketOptions"
+    source: EventData
+    xpath: "Data[@Name='TicketOptions']"
+    required: false
+    type: string
+output_format: |
+  Replay attack detected for {TargetUserName} via {ServiceName}

@@ -1,0 +1,21 @@
+event_id: 4698
+name: "Scheduled Task Created"
+description: "A scheduled task was created"
+fields:
+  - name: "TaskName"
+    source: EventData
+    xpath: "Data[@Name='TaskName']"
+    required: true
+    type: string
+  - name: "Author"
+    source: EventData
+    xpath: "Data[@Name='Author']"
+    required: false
+    type: string
+  - name: "Enabled"
+    source: EventData
+    xpath: "Data[@Name='Enabled']"
+    required: false
+    type: boolean
+output_format: |
+  Scheduled task {TaskName} created (enabled={Enabled})

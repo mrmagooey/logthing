@@ -1,0 +1,21 @@
+event_id: 4670
+name: "Permissions on Object Changed"
+description: "Permissions on an object were changed"
+fields:
+  - name: "ObjectName"
+    source: EventData
+    xpath: "Data[@Name='ObjectName']"
+    required: true
+    type: string
+  - name: "OldSd"
+    source: EventData
+    xpath: "Data[@Name='OldSd']"
+    required: false
+    type: string
+  - name: "NewSd"
+    source: EventData
+    xpath: "Data[@Name='NewSd']"
+    required: false
+    type: string
+output_format: |
+  Permissions on {ObjectName} updated

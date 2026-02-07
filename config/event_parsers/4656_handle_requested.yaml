@@ -1,0 +1,26 @@
+event_id: 4656
+name: "Handle Requested"
+description: "A handle to an object was requested"
+fields:
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+  - name: "ObjectName"
+    source: EventData
+    xpath: "Data[@Name='ObjectName']"
+    required: true
+    type: string
+  - name: "AccessMask"
+    source: EventData
+    xpath: "Data[@Name='AccessMask']"
+    required: true
+    type: string
+  - name: "ProcessName"
+    source: EventData
+    xpath: "Data[@Name='ProcessName']"
+    required: false
+    type: string
+output_format: |
+  {SubjectUserName} requested access {AccessMask} to {ObjectName} ({ProcessName})

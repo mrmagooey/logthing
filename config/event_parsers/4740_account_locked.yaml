@@ -1,0 +1,21 @@
+event_id: 4740
+name: "Account Locked"
+description: "A user account was locked out"
+fields:
+  - name: "TargetUserName"
+    source: EventData
+    xpath: "Data[@Name='TargetUserName']"
+    required: true
+    type: string
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: false
+    type: string
+  - name: "IpAddress"
+    source: EventData
+    xpath: "Data[@Name='IpAddress']"
+    required: false
+    type: string
+output_format: |
+  {TargetUserName} locked out (caller {IpAddress})

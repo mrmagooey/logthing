@@ -1,0 +1,16 @@
+event_id: 4730
+name: "Global Group Deleted"
+description: "A security-enabled global group was deleted"
+fields:
+  - name: "GroupName"
+    source: EventData
+    xpath: "Data[@Name='GroupName']"
+    required: true
+    type: string
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+output_format: |
+  Group {GroupName} deleted by {SubjectUserName}

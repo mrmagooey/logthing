@@ -1,0 +1,21 @@
+event_id: 4767
+name: "Account Unlocked"
+description: "A user account was unlocked"
+fields:
+  - name: "TargetUserName"
+    source: EventData
+    xpath: "Data[@Name='TargetUserName']"
+    required: true
+    type: string
+  - name: "SubjectUserName"
+    source: EventData
+    xpath: "Data[@Name='SubjectUserName']"
+    required: true
+    type: string
+  - name: "Reason"
+    source: EventData
+    xpath: "Data[@Name='Reason']"
+    required: false
+    type: string
+output_format: |
+  {SubjectUserName} unlocked {TargetUserName}

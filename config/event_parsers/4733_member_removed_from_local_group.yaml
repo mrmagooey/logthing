@@ -1,0 +1,21 @@
+event_id: 4733
+name: "Member Removed from Local Group"
+description: "A member was removed from a security-enabled local group"
+fields:
+  - name: "GroupName"
+    source: EventData
+    xpath: "Data[@Name='GroupName']"
+    required: true
+    type: string
+  - name: "MemberName"
+    source: EventData
+    xpath: "Data[@Name='MemberName']"
+    required: true
+    type: string
+  - name: "MemberSid"
+    source: EventData
+    xpath: "Data[@Name='MemberSid']"
+    required: false
+    type: string
+output_format: |
+  {MemberName} removed from local group {GroupName}

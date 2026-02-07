@@ -1,0 +1,26 @@
+event_id: 4769
+name: "Kerberos Service Ticket Requested"
+description: "A Kerberos service ticket was requested"
+fields:
+  - name: "ServiceName"
+    source: EventData
+    xpath: "Data[@Name='ServiceName']"
+    required: true
+    type: string
+  - name: "TargetUserName"
+    source: EventData
+    xpath: "Data[@Name='TargetUserName']"
+    required: true
+    type: string
+  - name: "IpAddress"
+    source: EventData
+    xpath: "Data[@Name='IpAddress']"
+    required: false
+    type: string
+  - name: "TicketOptions"
+    source: EventData
+    xpath: "Data[@Name='TicketOptions']"
+    required: false
+    type: string
+output_format: |
+  {TargetUserName} requested Kerberos ticket for {ServiceName}
