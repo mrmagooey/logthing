@@ -54,6 +54,7 @@ dashmap = "5.5"
 
 # HTTP client for forwarding
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+curl = "0.4"
 
 # Parquet file handling
 parquet = { version = "53.0", features = ["async", "arrow"] }

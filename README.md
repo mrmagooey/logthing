@@ -57,6 +57,12 @@ url = "https://elasticsearch:9200/events"
 protocol = "https"
 enabled = true
 
+  [forwarding.destinations.kerberos]
+  enabled = true
+  principal = "wef/forwarder@EXAMPLE.COM"
+  keytab = "/etc/krb5.keytab"
+  kinit_path = "/usr/bin/kinit"
+
 [[forwarding.destinations]]
 name = "syslog"
 url = "syslog://log-server:514"
@@ -67,6 +73,27 @@ enabled = true
 enabled = true
 port = 9090
 ```
+
+### Kerberos-Authenticated HTTP Forwarding
+
+For destinations protected by SPNEGO/Negotiate (e.g., IIS, Apache with mod_auth_gssapi), enable the per-destination Kerberos block. The server will run `kinit -k -t <keytab> <principal>` before forwarding (if both are supplied) and uses libcurl to perform the HTTP request via `AUTH_NEGOTIATE`.
+
+```toml
+[[forwarding.destinations]]
+name = "kerberos-http"
+url = "https://kerb.example.com/wef"
+protocol = "https"
+enabled = true
+
+  [forwarding.destinations.kerberos]
+  enabled = true
+  principal = "wef/forwarder@EXAMPLE.COM"
+  keytab = "/etc/krb5.keytab"
+  # optional: override `kinit` binary
+  kinit_path = "/usr/bin/kinit"
+```
+
+If `keytab`/`principal` are omitted, the agent uses whatever Kerberos credentials already exist in the environment. Ensure `kinit` and the relevant krb5 libraries are installed inside the container/host where WEF runs.
 
 ### Syslog Listener
 
