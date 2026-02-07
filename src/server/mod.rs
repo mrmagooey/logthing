@@ -1,25 +1,26 @@
 use crate::config::Config;
 use crate::forwarding::{Forwarder, parquet_s3::ParquetS3Forwarder};
+use crate::middleware::{IpWhitelist, ip_whitelist_middleware};
 use crate::models::WindowsEvent;
-use crate::middleware::{ip_whitelist_middleware, IpWhitelist};
 use crate::parser::GenericEventParser;
-use crate::protocol::{create_heartbeat_response, create_subscription_response, WefMessage, WefParser};
-use crate::stats::ThroughputStats;
+use crate::protocol::{
+    WefMessage, WefParser, create_heartbeat_response, create_subscription_response,
+};
+use crate::stats::{ThroughputSnapshot, ThroughputStats};
 use crate::syslog::SyslogMessage;
 use axum::{
+    Json, Router,
     body::Bytes,
     extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
     middleware,
     response::{IntoResponse, Response},
-    routing::{post, get},
-    Router,
-    Json,
+    routing::{get, post},
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
@@ -46,7 +47,7 @@ impl Server {
         let forwarder = Forwarder::new(config.forwarding.destinations.clone())
             .initialize()
             .await;
-        
+
         // Load event parser configuration if available
         let parser_dir = std::path::Path::new("config/event_parsers");
         let parser_file = std::path::Path::new("config/event_parsers.yaml");
@@ -60,7 +61,10 @@ impl Server {
                     Some(parser)
                 }
                 Err(e) => {
-                    warn!("Failed to load event parser configuration from directory: {}", e);
+                    warn!(
+                        "Failed to load event parser configuration from directory: {}",
+                        e
+                    );
                     None
                 }
             }
@@ -82,16 +86,20 @@ impl Server {
             info!("No event parser configuration found under config/event_parsers/");
             None
         };
-        
+
         // Initialize Parquet S3 forwarder if configured
-        let parquet_s3_forwarder = if let Ok(Some(s3_config)) = 
-            crate::forwarding::parquet_s3::create_parquet_s3_forwarder(&config.forwarding.destinations).await {
+        let parquet_s3_forwarder = if let Ok(Some(s3_config)) =
+            crate::forwarding::parquet_s3::create_parquet_s3_forwarder(
+                &config.forwarding.destinations,
+            )
+            .await
+        {
             info!("Initialized Parquet S3 forwarder");
             Some(tokio::sync::Mutex::new(s3_config))
         } else {
             None
         };
-        
+
         let state = Arc::new(AppState {
             config: Arc::clone(&shared_config),
             throughput,
@@ -126,41 +134,41 @@ impl Server {
                 }
             });
         }
-        
+
         Ok(Self { config, state })
     }
-    
+
     pub async fn run(self) -> anyhow::Result<()> {
         let ip_whitelist = if self.config.security.allowed_ips.is_empty() {
             IpWhitelist::empty()
         } else {
             IpWhitelist::new(self.config.security.allowed_ips.clone())?
         };
-        
+
         let app = self.create_router(ip_whitelist);
-        
+
         // Start HTTP server
         let addr = self.config.bind_address;
         info!("Starting WEF server on http://{}", addr);
-        
+
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        
+
         // Start metrics server if enabled
         if self.config.metrics.enabled {
-            let metrics_addr: SocketAddr = format!("0.0.0.0:{}", self.config.metrics.port)
-                .parse()?;
+            let metrics_addr: SocketAddr =
+                format!("0.0.0.0:{}", self.config.metrics.port).parse()?;
             tokio::spawn(start_metrics_server(metrics_addr));
         }
-        
+
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .await?;
-        
+
         Ok(())
     }
-    
+
     fn create_router(&self, ip_whitelist: IpWhitelist) -> Router {
         Router::new()
             .route("/wsman", post(handle_wef_request))
@@ -179,37 +187,36 @@ impl Server {
             .layer(axum::Extension(ip_whitelist))
             .with_state(self.state.clone())
     }
-    
+
     pub async fn run_tls(self) -> anyhow::Result<()> {
         if !self.config.tls.enabled {
             return self.run().await;
         }
-        
+
         let ip_whitelist = if self.config.security.allowed_ips.is_empty() {
             IpWhitelist::empty()
         } else {
             IpWhitelist::new(self.config.security.allowed_ips.clone())?
         };
-        
+
         let app = self.create_router(ip_whitelist);
-        
+
         // Load TLS configuration
         let tls_config = self.load_tls_config()?;
         let acceptor = TlsAcceptor::from(Arc::new(tls_config));
-        
-        let tls_addr: SocketAddr = format!("0.0.0.0:{}", self.config.tls.port)
-            .parse()?;
-        
+
+        let tls_addr: SocketAddr = format!("0.0.0.0:{}", self.config.tls.port).parse()?;
+
         info!("Starting WEF server with TLS on https://{}", tls_addr);
-        
+
         let listener = tokio::net::TcpListener::bind(&tls_addr).await?;
-        
+
         // Accept TLS connections
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             let acceptor = acceptor.clone();
             let app = app.clone();
-            
+
             tokio::spawn(async move {
                 match acceptor.accept(stream).await {
                     Ok(_tls_stream) => {
@@ -226,12 +233,12 @@ impl Server {
             });
         }
     }
-    
+
     fn load_tls_config(&self) -> anyhow::Result<rustls::ServerConfig> {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
         use std::fs::File;
         use std::io::BufReader;
-        
+
         let cert_file = self
             .config
             .tls
@@ -244,26 +251,26 @@ impl Server {
             .key_file
             .as_ref()
             .expect("TLS enabled but no key_file specified");
-        
+
         // Load certificate chain
         let cert_file = File::open(cert_file)?;
         let mut cert_reader = BufReader::new(cert_file);
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-            .collect::<Result<Vec<_>, _>>()?;
-        
+        let certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+
         // Load private key
         let key_file = File::open(key_file)?;
         let mut key_reader = BufReader::new(key_file);
         let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)?
             .expect("No private key found in key file");
-        
+
         let mut config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)?;
-        
+
         // Configure ALPN for HTTP/1.1
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        
+
         Ok(config)
     }
 }
@@ -280,11 +287,14 @@ async fn handle_wef_request(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(|| addr.ip().to_string());
-    
+
     match state.parser.parse_message(&body_str, source_host) {
         Ok(WefMessage::Subscription(sub)) => {
-            info!("New subscription from {}: {}", sub.source_host, sub.subscription_id);
-            
+            info!(
+                "New subscription from {}: {}",
+                sub.source_host, sub.subscription_id
+            );
+
             let response = create_subscription_response(&sub.subscription_id);
             Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -295,15 +305,18 @@ async fn handle_wef_request(
         Ok(WefMessage::Events(events)) => {
             info!("Received {} events from {}", events.len(), addr);
             process_events(&state, events).await;
-            
+
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .body(axum::body::Body::from("Events received"))
                 .unwrap())
         }
         Ok(WefMessage::Heartbeat(hb)) => {
-            debug!("Heartbeat from {} for subscription {}", hb.source_host, hb.subscription_id);
-            
+            debug!(
+                "Heartbeat from {} for subscription {}",
+                hb.source_host, hb.subscription_id
+            );
+
             let response = create_heartbeat_response();
             Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -312,7 +325,11 @@ async fn handle_wef_request(
                 .unwrap())
         }
         Ok(WefMessage::Unknown(content)) => {
-            warn!("Unknown message type from {}: {}", addr, &content[..100.min(content.len())]);
+            warn!(
+                "Unknown message type from {}: {}",
+                addr,
+                &content[..100.min(content.len())]
+            );
             Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(axum::body::Body::from("Unknown message type"))
@@ -331,16 +348,16 @@ async fn handle_subscription(
     body: Bytes,
 ) -> Result<Response, StatusCode> {
     info!("Subscription request from {}", addr);
-    
+
     let _body_str = String::from_utf8_lossy(&body);
     let subscription_id = format!("sub_{}", uuid::Uuid::new_v4());
-    
+
     let response = create_subscription_response(&subscription_id);
-Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/soap+xml")
-                .body(axum::body::Body::from(response))
-                .unwrap())
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/soap+xml")
+        .body(axum::body::Body::from(response))
+        .unwrap())
 }
 
 async fn handle_events(
@@ -349,14 +366,17 @@ async fn handle_events(
     body: Bytes,
 ) -> Result<Response, StatusCode> {
     info!("Events from {}", addr);
-    
+
     let body_str = String::from_utf8_lossy(&body);
     let source_host = addr.ip().to_string();
-    
+
     match state.parser.parse_message(&body_str, source_host) {
         Ok(WefMessage::Events(events)) => {
             process_events(&state, events).await;
-            Ok(Response::builder().status(StatusCode::OK).body(axum::body::Body::from("OK")).unwrap())
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(axum::body::Body::from("OK"))
+                .unwrap())
         }
         _ => Err(StatusCode::BAD_REQUEST),
     }
@@ -366,7 +386,9 @@ async fn process_events(state: &Arc<AppState>, events: Vec<WindowsEvent>) {
     for event in events {
         if let Some(ref event_parser) = state.event_parser {
             if let Some(ref parsed) = event.parsed {
-                if let Some(generic_parsed) = event_parser.parse_event(parsed.event_id, &event.raw_xml) {
+                if let Some(generic_parsed) =
+                    event_parser.parse_event(parsed.event_id, &event.raw_xml)
+                {
                     info!(
                         "Event {} parsed with generic parser '{}': {}",
                         parsed.event_id,
@@ -405,9 +427,181 @@ fn describe_event_type(event: &WindowsEvent) -> String {
 
 async fn handle_throughput_stats(
     State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+) -> Json<Vec<ThroughputSnapshot>> {
     let snapshot = state.throughput.snapshot().await;
     Json(snapshot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{EventLevel, ParsedEvent};
+    use axum::body::Bytes;
+    use axum::http::HeaderMap;
+    use serde_json::Value;
+
+    fn sample_parsed_event() -> ParsedEvent {
+        ParsedEvent {
+            provider: "Security".into(),
+            event_id: 4624,
+            level: EventLevel::Information,
+            task: 0,
+            opcode: 0,
+            keywords: 0,
+            time_created: chrono::Utc::now(),
+            event_record_id: 1,
+            process_id: None,
+            thread_id: None,
+            channel: "Security".into(),
+            computer: "HOST".into(),
+            security_user_id: None,
+            message: None,
+            data: None,
+        }
+    }
+
+    async fn build_state_with_config(config: Config) -> Arc<AppState> {
+        let forwarder = Forwarder::new(config.forwarding.destinations.clone())
+            .initialize()
+            .await;
+        Arc::new(AppState {
+            config: Arc::new(RwLock::new(config)),
+            throughput: Arc::new(ThroughputStats::new()),
+            forwarder,
+            parser: WefParser::new(),
+            event_parser: None,
+            parquet_s3_forwarder: None,
+        })
+    }
+
+    async fn default_state() -> Arc<AppState> {
+        build_state_with_config(Config::default()).await
+    }
+
+    #[test]
+    fn describe_event_type_uses_provider() {
+        let event =
+            WindowsEvent::new("test".into(), "<Event/>".into()).with_parsed(sample_parsed_event());
+        assert_eq!(describe_event_type(&event), "Security:4624");
+
+        let bare = WindowsEvent::new("test".into(), "<Event/>".into());
+        assert_eq!(describe_event_type(&bare), "unknown");
+    }
+
+    #[tokio::test]
+    async fn process_events_updates_throughput_stats() {
+        let state = default_state().await;
+
+        let event =
+            WindowsEvent::new("host".into(), "<Event/>".into()).with_parsed(sample_parsed_event());
+
+        process_events(&state, vec![event]).await;
+
+        let summary = state.throughput.snapshot().await;
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].total_events, 1);
+        assert_eq!(summary[0].event_type, "Security:4624");
+    }
+
+    #[tokio::test]
+    async fn throughput_endpoint_returns_snapshot() {
+        let state = default_state().await;
+        state.throughput.record_event("Security:4624".into()).await;
+        let Json(body): Json<Vec<ThroughputSnapshot>> = handle_throughput_stats(State(state)).await;
+        assert_eq!(body.len(), 1);
+        assert_eq!(body[0].event_type, "Security:4624");
+    }
+
+    #[tokio::test]
+    async fn syslog_info_reflects_configured_ports() {
+        let mut config = Config::default();
+        config.syslog.udp_port = 5514;
+        config.syslog.tcp_port = 5601;
+        let state = build_state_with_config(config).await;
+        let Json(value) = handle_syslog_udp_info(State(state)).await;
+        assert_eq!(value["udp_port"], Value::from(5514));
+        assert_eq!(value["tcp_port"], Value::from(5601));
+    }
+
+    #[tokio::test]
+    async fn syslog_examples_returns_samples() {
+        let Json(value) = handle_syslog_examples().await;
+        assert!(value["bind_named"].as_array().unwrap().len() > 0);
+        assert!(value["powerdns"].as_array().unwrap().len() > 0);
+    }
+
+    #[tokio::test]
+    async fn handle_events_accepts_valid_payload() {
+        let state = default_state().await;
+        let body = Bytes::from(
+            r#"
+        <Envelope>
+          <Body>
+            <Events>
+              <Event>
+                <System>
+                  <Provider>Security</Provider>
+                  <EventID>4624</EventID>
+                  <Level>4</Level>
+                  <TimeCreated>2024-01-01T00:00:00Z</TimeCreated>
+                  <Computer>host</Computer>
+                </System>
+                <EventData>
+                  <Data Name="TargetUserName">alice</Data>
+                </EventData>
+              </Event>
+            </Events>
+          </Body>
+        </Envelope>
+        "#,
+        );
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let response = handle_events(State(state), ConnectInfo(addr), body)
+            .await
+            .expect("events accepted");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn handle_wef_request_handles_subscription() {
+        let state = default_state().await;
+        let body = Bytes::from(
+            r#"
+        <Envelope>
+          <Body>
+            <Subscribe>
+              <SubscriptionId>TestSub</SubscriptionId>
+              <Query>*</Query>
+            </Subscribe>
+          </Body>
+        </Envelope>
+        "#,
+        );
+        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
+        let headers = HeaderMap::new();
+
+        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
+            .await
+            .expect("subscription handled");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn handle_syslog_http_parses_message() {
+        let addr: SocketAddr = "192.0.2.10:5514".parse().unwrap();
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: client 192.168.1.100#12345: query: example.com IN A + (93.184.216.34)";
+
+        let ok_response = handle_syslog_http(ConnectInfo(addr), Bytes::from(msg))
+            .await
+            .into_response();
+        assert_eq!(ok_response.status(), StatusCode::OK);
+
+        let bad_response = handle_syslog_http(ConnectInfo(addr), Bytes::from("not syslog"))
+            .await
+            .into_response();
+        assert_eq!(bad_response.status(), StatusCode::BAD_REQUEST);
+    }
 }
 
 async fn health_check() -> &'static str {
@@ -416,23 +610,24 @@ async fn health_check() -> &'static str {
 
 async fn start_metrics_server(addr: SocketAddr) {
     use metrics_exporter_prometheus::PrometheusBuilder;
-    
-    let recorder = PrometheusBuilder::new()
-        .build_recorder();
-    
+
+    let recorder = PrometheusBuilder::new().build_recorder();
+
     let handle = recorder.handle();
-    
-    metrics::set_global_recorder(recorder)
-        .expect("Failed to install Prometheus recorder");
-    
-    let app = Router::new().route("/metrics", axum::routing::get(move || {
-        let handle = handle.clone();
-        async move { handle.render() }
-    }));
-    
+
+    metrics::set_global_recorder(recorder).expect("Failed to install Prometheus recorder");
+
+    let app = Router::new().route(
+        "/metrics",
+        axum::routing::get(move || {
+            let handle = handle.clone();
+            async move { handle.render() }
+        }),
+    );
+
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     info!("Metrics server started on http://{}", addr);
-    
+
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -442,7 +637,7 @@ async fn handle_syslog_http(
     body: Bytes,
 ) -> impl IntoResponse {
     let msg = String::from_utf8_lossy(&body);
-    
+
     match SyslogMessage::parse(&msg) {
         Some(syslog) => {
             info!(
@@ -453,18 +648,15 @@ async fn handle_syslog_http(
                 syslog.app_name.as_deref().unwrap_or("unknown"),
                 syslog.message
             );
-            
+
             // Try to parse as DNS log
             if let Some(dns) = crate::syslog::dns::DnsLogEntry::from_syslog(&syslog) {
                 info!(
                     "DNS Query from {}: {} ({}) -> {:?}",
-                    dns.client_ip,
-                    dns.query_name,
-                    dns.query_type,
-                    dns.response_ips
+                    dns.client_ip, dns.query_name, dns.query_type, dns.response_ips
                 );
             }
-            
+
             (StatusCode::OK, "Syslog message received")
         }
         None => {
@@ -475,9 +667,7 @@ async fn handle_syslog_http(
 }
 
 /// Get syslog UDP listener info
-async fn handle_syslog_udp_info(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn handle_syslog_udp_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let cfg = state.config.read().await;
     let udp_port = cfg.syslog.udp_port;
     let tcp_port = cfg.syslog.tcp_port;
@@ -490,9 +680,9 @@ async fn handle_syslog_udp_info(
 }
 
 /// Get example DNS syslog records
-async fn handle_syslog_examples() -> impl IntoResponse {
+async fn handle_syslog_examples() -> Json<serde_json::Value> {
     use crate::syslog::listener::examples;
-    
+
     Json(serde_json::json!({
         "bind_named": examples::BIND_DNS_QUERIES,
         "unbound": examples::UNBOUND_DNS_QUERIES,

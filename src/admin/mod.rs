@@ -1,18 +1,19 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
+    Json, Router,
     extract::State,
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::get,
-    Json, Router,
 };
 use axum_extra::extract::TypedHeader;
-use headers::{authorization::Basic, Authorization};
+use headers::{Authorization, authorization::Basic};
+use std::path::Path;
 use tokio::{fs, net::TcpListener, sync::RwLock};
 use tracing::{error, info, warn};
 
-use crate::config::{Config, ADMIN_OVERRIDE_FILE};
+use crate::config::{ADMIN_OVERRIDE_FILE, Config};
 
 #[derive(Clone)]
 struct AdminState {
@@ -96,8 +97,21 @@ async fn update_config(
 }
 
 async fn persist_config(config: &Config) -> anyhow::Result<()> {
+    if let Ok(path) = std::env::var("WEF_ADMIN_OVERRIDE_FILE") {
+        write_config_to_path(config, Path::new(&path)).await
+    } else {
+        write_config_to_path(config, Path::new(ADMIN_OVERRIDE_FILE)).await
+    }
+}
+
+async fn write_config_to_path(config: &Config, path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).await.ok();
+        }
+    }
     let contents = toml::to_string_pretty(config)?;
-    fs::write(ADMIN_OVERRIDE_FILE, contents).await?;
+    fs::write(path, contents).await?;
     Ok(())
 }
 
@@ -109,9 +123,7 @@ async fn ensure_authorized(
         return Err(unauthorized());
     };
     let creds = auth.0;
-    if creds.username() == state.username.as_str()
-        && creds.password() == state.password.as_str()
-    {
+    if creds.username() == state.username.as_str() && creds.password() == state.password.as_str() {
         Ok(())
     } else {
         Err(unauthorized())
@@ -121,7 +133,10 @@ async fn ensure_authorized(
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Basic realm=\"WEF Admin\", charset=\"UTF-8\"")],
+        [(
+            header::WWW_AUTHENTICATE,
+            "Basic realm=\"WEF Admin\", charset=\"UTF-8\"",
+        )],
         "Unauthorized",
     )
         .into_response()
@@ -509,3 +524,79 @@ const ADMIN_PAGE: &str = r#"<!DOCTYPE html>
     </script>
 </body>
 </html>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn test_state() -> AdminState {
+        AdminState {
+            config: Arc::new(RwLock::new(Config::default())),
+            username: Arc::new("user".into()),
+            password: Arc::new("pass".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_authorized_checks_credentials() {
+        let state = test_state();
+        let good = Some(TypedHeader(Authorization::basic("user", "pass")));
+        let bad = Some(TypedHeader(Authorization::basic("user", "nope")));
+
+        assert!(ensure_authorized(&state, good).await.is_ok());
+        assert!(ensure_authorized(&state, bad).await.is_err());
+        assert!(ensure_authorized(&state, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn write_config_outputs_toml() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("override.toml");
+        let cfg = Config::default();
+
+        write_config_to_path(&cfg, &path)
+            .await
+            .expect("write succeeds");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("bind_address"));
+    }
+
+    #[tokio::test]
+    async fn get_config_requires_auth() {
+        let state = test_state();
+        let auth = Some(TypedHeader(Authorization::basic("user", "pass")));
+        let Json(cfg) = get_config(State(state.clone()), auth)
+            .await
+            .expect("authorized");
+        assert_eq!(cfg.bind_address, Config::default().bind_address);
+
+        let unauthorized = get_config(State(state), None).await;
+        assert!(unauthorized.is_err());
+    }
+
+    #[tokio::test]
+    async fn update_config_persists_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("override.toml");
+        unsafe {
+            std::env::set_var("WEF_ADMIN_OVERRIDE_FILE", &path);
+        }
+
+        let state = test_state();
+        let mut updated = Config::default();
+        updated.bind_address = "127.0.0.1:7777".parse().unwrap();
+        let auth = Some(TypedHeader(Authorization::basic("user", "pass")));
+
+        let Json(saved) = update_config(State(state), auth, Json(updated.clone()))
+            .await
+            .expect("updated");
+        assert_eq!(saved.bind_address, updated.bind_address);
+        let file = std::fs::read_to_string(&path).unwrap();
+        assert!(file.contains("127.0.0.1:7777"));
+
+        unsafe {
+            std::env::remove_var("WEF_ADMIN_OVERRIDE_FILE");
+        }
+    }
+}

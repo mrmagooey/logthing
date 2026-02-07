@@ -109,3 +109,27 @@ fn current_minute() -> i64 {
     let now: DateTime<Utc> = Utc::now();
     now.timestamp() / 60
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn records_counts_per_event_type() {
+        let stats = ThroughputStats::new();
+
+        stats.record_event("type-a".into()).await;
+        stats.record_event("type-b".into()).await;
+        stats.record_event("type-a".into()).await;
+
+        let snapshot = stats.snapshot().await;
+        let mut map = std::collections::HashMap::new();
+        for row in snapshot {
+            map.insert(row.event_type.clone(), row);
+        }
+
+        assert_eq!(map.get("type-a").unwrap().total_events, 2);
+        assert_eq!(map.get("type-b").unwrap().total_events, 1);
+        assert!(map.get("type-a").unwrap().average_per_second_last_minute > 0.0);
+    }
+}
