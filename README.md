@@ -95,6 +95,32 @@ enabled = true
 
 If `keytab`/`principal` are omitted, the agent uses whatever Kerberos credentials already exist in the environment. Ensure `kinit` and the relevant krb5 libraries are installed inside the container/host where WEF runs.
 
+#### Active Directory Setup (Kerberos)
+
+1. **Create a service account** that will own the HTTP SPN used by your downstream collector (IIS/Apache/etc.). In AD Users & Computers: `wef-forwarder` in `CONTOSO.COM`.
+2. **Register the SPN** so AD knows which account can decrypt the ticket:
+   ```powershell
+   setspn -S HTTP/forwarder.contoso.com CONTOSO\wef-forwarder
+   ```
+3. **Generate a keytab** on a domain controller (requires Domain Admin):
+   ```powershell
+   ktpass /princ HTTP/forwarder.contoso.com@CONTOSO.COM ^
+          /mapuser CONTOSO\wef-forwarder ^
+          /pass * ^
+          /ptype KRB5_NT_PRINCIPAL ^
+          /crypto AES256-SHA1 ^
+          /out C:\temp\wef-forwarder.keytab
+   ```
+   Transfer the resulting keytab to the Linux host/container that runs WEF and store it securely (e.g., `/etc/krb5.keytab` with `chmod 600`).
+4. **Configure Kerberos on the WEF host** (`/etc/krb5.conf`) with your AD realm and KDC addresses.
+5. **Verify tickets manually** before enabling forwarding:
+   ```bash
+   kinit -k -t /etc/krb5.keytab wef-forwarder@CONTOSO.COM
+   curl --negotiate -u : https://forwarder.contoso.com/wef -d '{}'
+   ```
+6. **Update `wef-server.toml`** with the `kerberos` block shown above, pointing to the same principal/keytab. If WEF runs in Docker, mount the keytab into the container and ensure `kinit` is available (e.g., install `krb5-user`).
+7. **Restart WEF**; it will run `kinit` automatically (when principal+keytab are provided) before forwarding each batch and will authenticate to the downstream collector using SPNEGO/Negotiate.
+
 ### Syslog Listener
 
 Receive and parse syslog messages via UDP (port 514) and TCP (port 601):
