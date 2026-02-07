@@ -1,8 +1,8 @@
 use crate::models::{EventLevel, Heartbeat, ParsedEvent, SubscriptionRequest, WindowsEvent};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use quick_xml::events::Event as XmlEvent;
 use quick_xml::Reader;
+use quick_xml::events::Event as XmlEvent;
 use tracing::{debug, error};
 
 #[derive(Debug)]
@@ -249,4 +249,98 @@ pub fn create_heartbeat_response() -> String {
         </s:Body>
     </s:Envelope>"#
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_subscription_request() {
+        let parser = WefParser::new();
+        let xml = r#"
+        <Envelope>
+          <Body>
+            <Subscribe>
+              <SubscriptionId>TestSubscription</SubscriptionId>
+              <Query>*</Query>
+            </Subscribe>
+          </Body>
+        </Envelope>
+        "#;
+
+        match parser
+            .parse_message(xml, "source-host".into())
+            .expect("parse succeeds")
+        {
+            WefMessage::Subscription(sub) => {
+                assert_eq!(sub.subscription_id, "TestSubscription");
+                assert_eq!(sub.source_host, "source-host");
+                assert_eq!(sub.query, "*");
+            }
+            other => panic!("unexpected message: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_event_batch() {
+        let parser = WefParser::new();
+        let xml = r#"
+        <Envelope>
+          <Body>
+            <Events>
+              <Event>
+                <System>
+                  <Provider>Security</Provider>
+                  <EventID>4624</EventID>
+                  <Level>4</Level>
+                  <TimeCreated>2024-01-01T00:00:00Z</TimeCreated>
+                  <Computer>host</Computer>
+                </System>
+                <EventData>
+                  <Data Name="TargetUserName">alice</Data>
+                </EventData>
+              </Event>
+            </Events>
+          </Body>
+        </Envelope>
+        "#;
+
+        match parser
+            .parse_message(xml, "collector".into())
+            .expect("parse succeeds")
+        {
+            WefMessage::Events(events) => {
+                assert_eq!(events.len(), 1);
+                let event = &events[0];
+                assert_eq!(event.source_host, "collector");
+                let parsed = event.parsed.as_ref().expect("parsed event");
+                assert_eq!(parsed.event_id, 4624);
+                assert_eq!(parsed.computer, "host");
+                assert_eq!(parsed.provider, "Security");
+            }
+            other => panic!("expected events but got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_heartbeat() {
+        let parser = WefParser::new();
+        let xml = r#"
+        <Heartbeat>
+          <SubscriptionId>hb-123</SubscriptionId>
+        </Heartbeat>
+        "#;
+
+        match parser
+            .parse_message(xml, "hb-source".into())
+            .expect("parse succeeds")
+        {
+            WefMessage::Heartbeat(hb) => {
+                assert_eq!(hb.subscription_id, "hb-123");
+                assert_eq!(hb.source_host, "hb-source");
+            }
+            other => panic!("expected heartbeat but got {:?}", other),
+        }
+    }
 }

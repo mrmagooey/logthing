@@ -55,7 +55,7 @@ impl Severity {
             _ => None,
         }
     }
-    
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Severity::Emergency => "EMERGENCY",
@@ -129,7 +129,7 @@ impl Facility {
             _ => None,
         }
     }
-    
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Facility::Kernel => "kernel",
@@ -167,56 +167,55 @@ impl SyslogMessage {
         if let Some(msg) = Self::parse_rfc5424(input) {
             return Some(msg);
         }
-        
+
         // Fall back to RFC 3164
         Self::parse_rfc3164(input)
     }
-    
+
     /// Parse RFC 5424 formatted syslog message
     fn parse_rfc5424(input: &str) -> Option<Self> {
         // RFC 5424 format: <priority>version timestamp hostname app-name procid msgid [structured-data] msg
         // Example: <34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ID47 [example@32473 iut="3"] 'su root' failed
-        
-        let re = Regex::new(
-            r"^<(\d{1,3})>(\d)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*(.*?)$"
-        ).ok()?;
-        
+
+        let re = Regex::new(r"^<(\d{1,3})>(\d)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*(.*?)$")
+            .ok()?;
+
         let caps = re.captures(input)?;
-        
+
         let priority: u8 = caps.get(1)?.as_str().parse().ok()?;
         let severity = priority & 0x07;
         let facility = (priority >> 3) & 0x1f;
-        
+
         let timestamp_str = caps.get(3)?.as_str();
         let timestamp = DateTime::parse_from_rfc3339(timestamp_str)
             .map(|dt| dt.with_timezone(&Utc))
             .ok();
-        
+
         let hostname = caps.get(4).and_then(|m| {
             let s = m.as_str();
             if s == "-" { None } else { Some(s.to_string()) }
         });
-        
+
         let app_name = caps.get(5).and_then(|m| {
             let s = m.as_str();
             if s == "-" { None } else { Some(s.to_string()) }
         });
-        
+
         let proc_id = caps.get(6).and_then(|m| {
             let s = m.as_str();
             if s == "-" { None } else { Some(s.to_string()) }
         });
-        
+
         let msg_id = caps.get(7).and_then(|m| {
             let s = m.as_str();
             if s == "-" { None } else { Some(s.to_string()) }
         });
-        
+
         let rest = caps.get(8)?.as_str();
-        
+
         // Parse structured data and message
         let (structured_data, message) = Self::parse_structured_data(rest);
-        
+
         Some(SyslogMessage {
             priority,
             severity,
@@ -231,32 +230,32 @@ impl SyslogMessage {
             protocol: SyslogProtocol::Rfc5424,
         })
     }
-    
+
     /// Parse RFC 3164 (BSD syslog) formatted message
     fn parse_rfc3164(input: &str) -> Option<Self> {
         // RFC 3164 format: <priority>timestamp hostname tag[pid]: message
         // Example: <34>Oct 11 22:14:15 mymachine su: 'su root' failed
-        
-        let re = Regex::new(
-            r"^<(\d{1,3})>([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+(.*?)$"
-        ).ok()?;
-        
+
+        let re =
+            Regex::new(r"^<(\d{1,3})>([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+(.*?)$")
+                .ok()?;
+
         let caps = re.captures(input)?;
-        
+
         let priority: u8 = caps.get(1)?.as_str().parse().ok()?;
         let severity = priority & 0x07;
         let facility = (priority >> 3) & 0x1f;
-        
+
         let timestamp_str = caps.get(2)?.as_str();
         let timestamp = Self::parse_rfc3164_timestamp(timestamp_str);
-        
+
         let hostname = Some(caps.get(3)?.as_str().to_string());
-        
+
         let rest = caps.get(4)?.as_str();
-        
+
         // Parse tag and message
         let (app_name, proc_id, message) = Self::parse_rfc3164_tag(rest);
-        
+
         Some(SyslogMessage {
             priority,
             severity,
@@ -271,19 +270,19 @@ impl SyslogMessage {
             protocol: SyslogProtocol::Rfc3164,
         })
     }
-    
+
     /// Parse RFC 3164 timestamp (assumes current year)
     fn parse_rfc3164_timestamp(ts_str: &str) -> Option<DateTime<Utc>> {
         // RFC 3164 uses: "Oct 11 22:14:15" format (no year)
         let re = Regex::new(r"^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})$").ok()?;
         let caps = re.captures(ts_str)?;
-        
+
         let month_str = caps.get(1)?.as_str();
         let day: u32 = caps.get(2)?.as_str().parse().ok()?;
         let hour: u32 = caps.get(3)?.as_str().parse().ok()?;
         let minute: u32 = caps.get(4)?.as_str().parse().ok()?;
         let second: u32 = caps.get(5)?.as_str().parse().ok()?;
-        
+
         let month = match month_str.to_lowercase().as_str() {
             "jan" => 1,
             "feb" => 2,
@@ -299,20 +298,20 @@ impl SyslogMessage {
             "dec" => 12,
             _ => return None,
         };
-        
+
         // Assume current year
         let year = Utc::now().year();
         let naive_date = NaiveDate::from_ymd_opt(year, month, day)?;
         let naive_datetime = naive_date.and_hms_opt(hour, minute, second)?;
-        
+
         Some(DateTime::from_naive_utc_and_offset(naive_datetime, Utc))
     }
-    
+
     /// Parse RFC 3164 tag and extract app_name, proc_id, and message
     fn parse_rfc3164_tag(rest: &str) -> (Option<String>, Option<String>, String) {
         // Tag format: "tag[pid]: " or "tag: "
         let re = Regex::new(r"^([^:\[]+)(?:\[(\d+)\])?:\s*(.*)$").unwrap();
-        
+
         if let Some(caps) = re.captures(rest) {
             let app_name = Some(caps.get(1).unwrap().as_str().to_string());
             let proc_id = caps.get(2).map(|m| m.as_str().to_string());
@@ -322,28 +321,30 @@ impl SyslogMessage {
             (None, None, rest.to_string())
         }
     }
-    
+
     /// Parse structured data from RFC 5424
-    fn parse_structured_data(rest: &str) -> (Option<HashMap<String, HashMap<String, String>>>, String) {
+    fn parse_structured_data(
+        rest: &str,
+    ) -> (Option<HashMap<String, HashMap<String, String>>>, String) {
         let mut structured_data = HashMap::new();
         let mut remaining = rest;
-        
+
         // Check if it starts with structured data
         if rest.starts_with('[') {
             // Extract SD elements
             let sd_re = Regex::new(r"\[([^\]]+)\]").unwrap();
             let mut last_end = 0;
-            
+
             for cap in sd_re.captures_iter(rest) {
                 let sd_element = cap.get(1).unwrap().as_str();
                 let sd_id: String;
                 let mut params = HashMap::new();
-                
+
                 // Parse SD-ID and parameters
                 let parts: Vec<&str> = sd_element.split_whitespace().collect();
                 if !parts.is_empty() {
                     sd_id = parts[0].to_string();
-                    
+
                     // Parse param="value" pairs
                     let param_re = Regex::new(r#"(\S+)="([^"]*)""#).unwrap();
                     for param_cap in param_re.captures_iter(sd_element) {
@@ -351,46 +352,46 @@ impl SyslogMessage {
                         let value = param_cap.get(2).unwrap().as_str().to_string();
                         params.insert(key, value);
                     }
-                    
+
                     structured_data.insert(sd_id, params);
                     last_end = cap.get(0).unwrap().end();
                 }
             }
-            
+
             remaining = rest[last_end..].trim_start();
         }
-        
+
         let message = if remaining.starts_with("\u{feff}") {
             // Strip BOM if present
             remaining[3..].to_string()
         } else {
             remaining.to_string()
         };
-        
+
         if structured_data.is_empty() {
             (None, message)
         } else {
             (Some(structured_data), message)
         }
     }
-    
+
     /// Get severity as enum
     pub fn severity(&self) -> Option<Severity> {
         Severity::from_u8(self.severity)
     }
-    
+
     /// Get facility as enum
     pub fn facility(&self) -> Option<Facility> {
         Facility::from_u8(self.facility)
     }
-    
+
     /// Get severity as string
     pub fn severity_str(&self) -> String {
         self.severity()
             .map(|s| s.as_str().to_string())
             .unwrap_or_else(|| format!("UNKNOWN({})", self.severity))
     }
-    
+
     /// Get facility as string
     pub fn facility_str(&self) -> String {
         self.facility()
@@ -405,7 +406,7 @@ pub mod listener;
 /// Parse DNS syslog records
 pub mod dns {
     use super::*;
-    
+
     /// DNS query log entry
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct DnsLogEntry {
@@ -417,7 +418,7 @@ pub mod dns {
         pub response_ips: Vec<String>,
         pub duration_ms: Option<f64>,
     }
-    
+
     /// Parse common DNS syslog formats
     impl DnsLogEntry {
         /// Parse BIND/named DNS query log format
@@ -426,9 +427,9 @@ pub mod dns {
             let re = Regex::new(
                 r"client\s+(\d+\.\d+\.\d+\.\d+)#\d+:\s+query:\s+(\S+)\s+(\S+)\s+(\S+)\s+.*\((\d+\.\d+\.\d+\.\d+)\)"
             ).ok()?;
-            
+
             let caps = re.captures(message)?;
-            
+
             Some(DnsLogEntry {
                 timestamp: Utc::now(),
                 client_ip: caps.get(1)?.as_str().to_string(),
@@ -439,16 +440,14 @@ pub mod dns {
                 duration_ms: None,
             })
         }
-        
+
         /// Parse Unbound DNS log format
         /// Example: info: 192.168.1.100 example.com. A IN
         pub fn from_unbound_format(message: &str) -> Option<Self> {
-            let re = Regex::new(
-                r"info:\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)\s+(\S+)\s+(\S+)"
-            ).ok()?;
-            
+            let re = Regex::new(r"info:\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)\s+(\S+)\s+(\S+)").ok()?;
+
             let caps = re.captures(message)?;
-            
+
             Some(DnsLogEntry {
                 timestamp: Utc::now(),
                 client_ip: caps.get(1)?.as_str().to_string(),
@@ -459,16 +458,15 @@ pub mod dns {
                 duration_ms: None,
             })
         }
-        
+
         /// Parse PowerDNS log format
         /// Example: Remote 192.168.1.100 wants 'example.com|A', do = 0, bufsize = 512
         pub fn from_powerdns_format(message: &str) -> Option<Self> {
-            let re = Regex::new(
-                r"Remote\s+(\d+\.\d+\.\d+\.\d+)\s+wants\s+'([^|]+)\|([^']+)'"
-            ).ok()?;
-            
+            let re =
+                Regex::new(r"Remote\s+(\d+\.\d+\.\d+\.\d+)\s+wants\s+'([^|]+)\|([^']+)'").ok()?;
+
             let caps = re.captures(message)?;
-            
+
             Some(DnsLogEntry {
                 timestamp: Utc::now(),
                 client_ip: caps.get(1)?.as_str().to_string(),
@@ -479,26 +477,26 @@ pub mod dns {
                 duration_ms: None,
             })
         }
-        
+
         /// Parse from syslog message (auto-detect format)
         pub fn from_syslog(syslog: &SyslogMessage) -> Option<Self> {
             let msg = &syslog.message;
-            
+
             // Try BIND format first
             if let Some(entry) = Self::from_bind_format(msg) {
                 return Some(entry);
             }
-            
+
             // Try Unbound format
             if let Some(entry) = Self::from_unbound_format(msg) {
                 return Some(entry);
             }
-            
+
             // Try PowerDNS format
             if let Some(entry) = Self::from_powerdns_format(msg) {
                 return Some(entry);
             }
-            
+
             None
         }
     }
@@ -507,12 +505,12 @@ pub mod dns {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_parse_rfc3164() {
         let msg = "<34>Oct 11 22:14:15 mymachine su: 'su root' failed for lonvick on /dev/pts/8";
         let parsed = SyslogMessage::parse(msg).unwrap();
-        
+
         assert_eq!(parsed.priority, 34);
         assert_eq!(parsed.severity, 2); // Critical
         assert_eq!(parsed.facility, 4); // Security
@@ -521,12 +519,12 @@ mod tests {
         assert!(parsed.message.contains("'su root' failed"));
         assert!(matches!(parsed.protocol, SyslogProtocol::Rfc3164));
     }
-    
+
     #[test]
     fn test_parse_rfc5424() {
         let msg = "<34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ID47 - 'su root' failed for lonvick";
         let parsed = SyslogMessage::parse(msg).unwrap();
-        
+
         assert_eq!(parsed.priority, 34);
         assert_eq!(parsed.severity, 2);
         assert_eq!(parsed.facility, 4);
@@ -535,12 +533,12 @@ mod tests {
         assert!(parsed.message.contains("'su root' failed"));
         assert!(matches!(parsed.protocol, SyslogProtocol::Rfc5424));
     }
-    
+
     #[test]
     fn test_parse_rfc5424_with_structured_data() {
         let msg = r#"<165>1 2003-08-24T05:14:15.000003-07:00 192.0.2.1 myproc 8710 - [example@32473 iut="3" eventSource="Application" eventID="1011"] An application event log entry"#;
         let parsed = SyslogMessage::parse(msg).unwrap();
-        
+
         assert_eq!(parsed.priority, 165);
         assert!(parsed.structured_data.is_some());
         let sd = parsed.structured_data.unwrap();
@@ -549,45 +547,45 @@ mod tests {
         assert_eq!(params.get("iut"), Some(&"3".to_string()));
         assert_eq!(params.get("eventID"), Some(&"1011".to_string()));
     }
-    
+
     #[test]
     fn test_dns_bind_format() {
         let msg = "client 192.168.1.100#12345: query: example.com IN A + (192.168.1.1)";
         let entry = dns::DnsLogEntry::from_bind_format(msg).unwrap();
-        
+
         assert_eq!(entry.client_ip, "192.168.1.100");
         assert_eq!(entry.query_name, "example.com");
         assert_eq!(entry.query_type, "A");
         assert_eq!(entry.response_ips, vec!["192.168.1.1"]);
     }
-    
+
     #[test]
     fn test_dns_unbound_format() {
         let msg = "info: 192.168.1.100 example.com. A IN";
         let entry = dns::DnsLogEntry::from_unbound_format(msg).unwrap();
-        
+
         assert_eq!(entry.client_ip, "192.168.1.100");
         assert_eq!(entry.query_name, "example.com");
         assert_eq!(entry.query_type, "A");
     }
-    
+
     #[test]
     fn test_dns_powerdns_format() {
         let msg = "Remote 192.168.1.100 wants 'example.com|A', do = 0, bufsize = 512";
         let entry = dns::DnsLogEntry::from_powerdns_format(msg).unwrap();
-        
+
         assert_eq!(entry.client_ip, "192.168.1.100");
         assert_eq!(entry.query_name, "example.com");
         assert_eq!(entry.query_type, "A");
     }
-    
+
     #[test]
     fn test_full_dns_syslog() {
         // Example: BIND DNS query logged via syslog
         let syslog_msg = "<134>Jan 15 10:30:45 dns-server named[1234]: client 192.168.1.100#12345: query: example.com IN A + (93.184.216.34)";
         let syslog = SyslogMessage::parse(syslog_msg).unwrap();
         let dns = dns::DnsLogEntry::from_syslog(&syslog).unwrap();
-        
+
         assert_eq!(dns.client_ip, "192.168.1.100");
         assert_eq!(dns.query_name, "example.com");
         assert_eq!(dns.query_type, "A");
