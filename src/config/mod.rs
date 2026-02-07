@@ -78,6 +78,18 @@ pub struct DestinationConfig {
     pub enabled: bool,
     #[serde(default)]
     pub headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub kerberos: Option<KerberosConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct KerberosConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub principal: Option<String>,
+    pub keytab: Option<PathBuf>,
+    #[serde(default)]
+    pub kinit_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
@@ -292,5 +304,32 @@ impl Config {
 
         let config = builder.build()?;
         Ok(config.try_deserialize()?)
+    }
+}
+
+impl KerberosConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_values_match_expectations() {
+        let cfg = Config::default();
+        assert_eq!(cfg.bind_address, "0.0.0.0:5985".parse().unwrap());
+        assert!(cfg.tls.enabled);
+        assert_eq!(cfg.metrics.port, 9090);
+        assert!(cfg.syslog.enabled);
+    }
+
+    #[test]
+    fn load_reads_configuration_file() {
+        let cfg = Config::load().expect("config loads");
+        assert!(!cfg.tls.enabled, "wef-server.toml disables TLS");
+        assert!(cfg.forwarding.destinations.len() >= 1);
     }
 }
