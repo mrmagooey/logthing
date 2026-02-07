@@ -135,6 +135,17 @@ This script builds the helper images, launches `tests/e2e/docker-compose.yml`, r
 - **Compression**: ZSTD compression for efficient storage
 - **Timestamped Files**: Each file named with timestamp for uniqueness
 
+## Test Coverage
+
+Generate coverage reports with [cargo-tarpaulin](https://github.com/xd009642/tarpaulin):
+
+```bash
+cargo install cargo-tarpaulin        # one-time tool install
+scripts/run_coverage.sh              # runs tests with instrumentation
+```
+
+The helper script writes HTML and XML reports to `target/coverage/`, so you can open `target/coverage/tarpaulin-report.html` locally or feed the LCOV/XML data into CI.
+
 **S3 Path Structure**:
 ```
 s3://bucket-name/
