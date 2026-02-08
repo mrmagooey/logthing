@@ -1,0 +1,53 @@
+# Kerberos-Enabled WEF Server for E2E Testing
+FROM rust:1.93-slim-bookworm AS builder
+
+WORKDIR /app
+
+# Install build dependencies including Kerberos libraries and clang (required for bindgen)
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    libkrb5-dev \
+    libclang-dev \
+    clang \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Cargo files first for better caching
+COPY Cargo.toml Cargo.lock ./
+
+# Copy source code
+COPY src ./src
+
+# Build release binary with Kerberos feature
+RUN cargo build --release --features kerberos-auth
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+WORKDIR /app
+
+# Install runtime dependencies including Kerberos libraries
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libkrb5-3 \
+    krb5-user \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy binary from builder
+COPY --from=builder /app/target/release/wef-server /usr/local/bin/wef-server
+
+# Copy default config
+COPY wef-server.toml /etc/wef-server/config.toml
+
+# Create directory for certificates and keytabs
+RUN mkdir -p /etc/wef-server/certs /etc/wef-server/keytabs
+
+# Expose ports
+EXPOSE 5985 5986 9090
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:5985/health || exit 1
+
+# Run server
+CMD ["wef-server"]
