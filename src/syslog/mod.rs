@@ -161,7 +161,28 @@ impl Facility {
 }
 
 impl SyslogMessage {
-    /// Parse a syslog message (auto-detects RFC 3164 or RFC 5424)
+    /// Parse a syslog message (auto-detects RFC 3164 or RFC 5424).
+    ///
+    /// Attempts to parse as RFC 5424 first, then falls back to RFC 3164 (BSD syslog).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use wef_server::syslog::SyslogMessage;
+    ///
+    /// // Parse RFC 3164 format (BSD syslog)
+    /// let rfc3164 = "<134>Jan 15 10:30:45 myhost myapp[1234]: Test message";
+    /// if let Some(msg) = SyslogMessage::parse(rfc3164) {
+    ///     println!("Host: {:?}, Message: {}", msg.hostname, msg.message);
+    ///     println!("Severity: {}, Facility: {}", msg.severity, msg.facility);
+    /// }
+    ///
+    /// // Parse RFC 5424 format (modern syslog)
+    /// let rfc5424 = "<134>1 2024-01-15T10:30:45.000Z myhost myapp 1234 - - Test message";
+    /// if let Some(msg) = SyslogMessage::parse(rfc5424) {
+    ///     println!("Protocol: {:?}", msg.protocol);
+    /// }
+    /// ```
     pub fn parse(input: &str) -> Option<Self> {
         // Try RFC 5424 first (starts with version number after priority)
         if let Some(msg) = Self::parse_rfc5424(input) {

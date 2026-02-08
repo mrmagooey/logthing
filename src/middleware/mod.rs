@@ -13,6 +13,27 @@ pub struct IpWhitelist {
 }
 
 impl IpWhitelist {
+    /// Create a new IP whitelist from a list of IP addresses or CIDR ranges.
+    ///
+    /// Supports both single IP addresses (e.g., "192.168.1.1") and CIDR notation
+    /// (e.g., "10.0.0.0/24").
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use wef_server::middleware::IpWhitelist;
+    ///
+    /// // Whitelist with CIDR range and single IP
+    /// let allowed = vec![
+    ///     "10.0.0.0/24".to_string(),
+    ///     "192.168.1.100".to_string(),
+    /// ];
+    /// let whitelist = IpWhitelist::new(allowed).unwrap();
+    ///
+    /// // Test if an address is allowed
+    /// let addr: std::net::SocketAddr = "10.0.0.50:8080".parse().unwrap();
+    /// assert!(whitelist.is_allowed(&addr));
+    /// ```
     pub fn new(allowed_ips: Vec<String>) -> anyhow::Result<Self> {
         let mut networks = Vec::new();
 
@@ -36,12 +57,31 @@ impl IpWhitelist {
         })
     }
 
+    /// Create an empty whitelist that allows all connections.
     pub fn empty() -> Self {
         Self {
             allowed_networks: Vec::new(),
         }
     }
 
+    /// Check if the given socket address is allowed.
+    ///
+    /// Returns true if the address is in the whitelist, or if the whitelist is empty.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use wef_server::middleware::IpWhitelist;
+    /// use std::net::SocketAddr;
+    ///
+    /// let whitelist = IpWhitelist::new(vec!["127.0.0.1".to_string()]).unwrap();
+    ///
+    /// let allowed_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    /// let blocked_addr: SocketAddr = "192.168.1.1:8080".parse().unwrap();
+    ///
+    /// assert!(whitelist.is_allowed(&allowed_addr));
+    /// assert!(!whitelist.is_allowed(&blocked_addr));
+    /// ```
     pub fn is_allowed(&self, addr: &SocketAddr) -> bool {
         // If no whitelist configured, allow all
         if self.allowed_networks.is_empty() {

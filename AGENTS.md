@@ -7,47 +7,131 @@ This document explains how automated or semi-automated agents should interact wi
 - Agents assist with routine engineering tasks: running builds/tests, executing the Dockerized end-to-end suite, generating coverage reports, and updating documentation/configuration.
 - Anything involving production secrets, credentials, billing, or infrastructure changes **must** be escalated to a human maintainer.
 
-## 2. Available Agent Tasks
+## 2. Build, Test & Lint Commands
 
-| Agent Role | Responsibilities | Key Commands |
-| --- | --- | --- |
-| Build/Test Agent | Run `cargo test`, lint, or targeted component checks. | `cargo test`, `cargo check`, custom commands as needed. |
-| Coverage Agent | Produce Rust code coverage reports. | `scripts/run_coverage.sh` (uses `cargo tarpaulin`). |
-| E2E Agent | Execute the full Docker-based integration suite (WEF generator, syslog generator, S3 verifier). | `tests/e2e/run.sh` (requires Docker + Compose). |
-| Docs Agent | Update Markdown/docs when workflows change; ensure README/AGENTS reflect new procedures. | Edit relevant `.md` files. |
+| Task | Command |
+|------|---------|
+| Build release | `cargo build --release` |
+| Build debug | `cargo build` |
+| Run all tests | `cargo test` |
+| Run single test | `cargo test <test_name>` |
+| Run module tests | `cargo test <module_name>::` |
+| Check only | `cargo check` |
+| Format code | `cargo fmt` |
+| Lint check | `cargo clippy -- -D warnings` |
+| Coverage report | `scripts/run_coverage.sh` |
+| E2E tests | `tests/e2e/run.sh` (requires Docker) |
 
-## 3. Workflow & Invocation
+**Example - run a specific test:**
+```bash
+cargo test test_event_4624_logon
+cargo test parser::tests::test_event_4624_logon
+```
 
-1. **Preparation**
-   - Ensure dependencies are installed (Rust toolchain, cargo-tarpaulin, Docker/Compose if running e2e tests).
-   - Confirm no local uncommitted changes conflict with the intended work.
-2. **Execution**
-   - Use the provided scripts/commands rather than reimplementing functionality.
-   - Capture relevant output (summaries) for PR or issue comments.
-3. **Post-Run Actions**
-   - Review generated artifacts (e.g., coverage HTML under `target/coverage/`, e2e logs) for failures.
-   - Document any deviations or manual steps needed.
+**Example - run tests for a module:**
+```bash
+cargo test parser::
+cargo test models::
+```
 
-## 4. Git & Commit Requirements
+## 3. Code Style Guidelines
 
-- **Mandatory Rule:** After each discrete change is made, the agent must stage the affected files and create a git commit with an appropriate, descriptive message. Do not batch unrelated modifications into a single commit.
-- Use conventional-style messages when possible (e.g., `feat: …`, `fix: …`, `docs: …`, `test: …`).
-- Never amend or force-push without explicit human approval.
-- Keep the working tree clean before starting a new task.
+### General
+- **Edition**: Rust 2024
+- **Line length**: 100 characters max
+- **Indent**: 4 spaces (no tabs)
+- **Trailing whitespace**: Remove
+- **Final newline**: Required
+
+### Imports Ordering
+```rust
+// 1. Standard library
+use std::collections::HashMap;
+use std::path::Path;
+
+// 2. External crates (alphabetical)
+use anyhow::Context;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
+
+// 3. Internal modules
+use crate::config::Config;
+use crate::models::WindowsEvent;
+```
+
+### Naming Conventions
+- **Structs/Enums**: PascalCase (e.g., `WindowsEvent`, `EventLevel`)
+- **Functions/methods**: snake_case (e.g., `parse_event`, `extract_field`)
+- **Constants**: SCREAMING_SNAKE_CASE (e.g., `ADMIN_OVERRIDE_FILE`)
+- **Variables**: snake_case (e.g., `event_id`, `source_host`)
+- **Type parameters**: PascalCase, single letter preferred (e.g., `T`, `P`)
+- **Acronyms**: Treat as words (e.g., `TlsConfig`, not `TLSConfig`)
+
+### Error Handling
+- Use `anyhow::Result<T>` for functions that can fail
+- Use `thiserror` for custom error types
+- Propagate errors with `?` operator
+- Add context with `.with_context(|| "message")`
+- Log errors at appropriate level before returning
+
+### Types & Documentation
+- Prefer explicit types for public APIs
+- Use `Option<T>` for optional fields
+- Document all public items with `///`
+- Include examples in doc comments when helpful
+- Use `#[derive(Debug)]` for all structs/enums
+
+### Async & Concurrency
+- Use `tokio` runtime
+- Prefer `tokio::spawn` for concurrent tasks
+- Use channels for communication between tasks
+- Prefer `Arc<RwLock<T>>` for shared mutable state
+
+### Testing
+- Tests live in `#[cfg(test)]` module at end of file
+- Use `tempfile` crate for temp files in tests
+- Name tests descriptively: `test_<what>_<condition>`
+- Use `assert_eq!`, `assert!`, `assert_matches!` appropriately
+
+## 4. Git Workflow
+
+- After each discrete change, stage files and commit
+- Do not batch unrelated modifications
+- Use conventional commit style: `feat:`, `fix:`, `docs:`, `test:`, `refactor:`
+- Never amend or force-push without explicit approval
+- Keep working tree clean before new tasks
 
 ## 5. Safety & Guardrails
 
-- Do not introduce or expose secrets. Configuration files with credentials should reference environment variables or example placeholders.
-- The Docker-based e2e suite (`tests/e2e/run.sh`) requires a local Docker daemon; skip running it if the host cannot provide `/var/run/docker.sock` and report the limitation.
-- When editing files, prefer ASCII unless the file already uses UTF-8 symbols and there is a clear reason to add more.
+- Do not introduce or expose secrets in code
+- Use environment variables for configuration
+- Prefer ASCII unless UTF-8 is required
+- The E2E suite requires Docker; skip if unavailable
 
-## 6. Extending Agent Capabilities
+## 6. Project Structure
 
-- Add new helper scripts under `scripts/` or `tests/` with clear usage comments.
-- Update this `AGENTS.md` plus README sections so humans know how to invoke the new functionality.
-- Provide at least one example command or workflow for every new automated capability.
+```
+src/
+  admin/        # Admin API and hot-reload
+  config/       # Configuration loading
+  forwarding/   # Event forwarding to destinations
+  middleware/   # HTTP middleware
+  models/       # Data structures
+  parser/       # Event parsing logic
+  protocol/     # WEF protocol handlers
+  server/       # HTTP server implementation
+  stats/        # Metrics and statistics
+  syslog/       # Syslog listener
+```
 
-## 7. Support & Contacts
+## 7. Extending Capabilities
 
-- Maintainers: tag the repository owners in issues labeled `automation` for help.
-- For CI/CD-related agent failures, attach the relevant command output and log excerpts to the issue or PR discussion.
+- Add helper scripts under `scripts/` with usage comments
+- Update AGENTS.md and README when adding features
+- Provide example commands for new capabilities
+
+## 8. Support & Contacts
+
+- Tag repository owners in issues labeled `automation` for help
+- Attach relevant output/logs to CI/CD failure discussions

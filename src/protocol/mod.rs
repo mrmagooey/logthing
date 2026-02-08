@@ -16,10 +16,38 @@ pub enum WefMessage {
 pub struct WefParser;
 
 impl WefParser {
+    /// Create a new WEF protocol parser.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use wef_server::protocol::WefParser;
+    ///
+    /// let parser = WefParser::new();
+    /// ```
     pub fn new() -> Self {
         Self
     }
 
+    /// Parse a WEF protocol message.
+    ///
+    /// Automatically detects message type (Subscription, Events, or Heartbeat)
+    /// and parses accordingly.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use wef_server::protocol::WefParser;
+    ///
+    /// let parser = WefParser::new();
+    ///
+    /// // Parse a subscription request
+    /// let subscription_xml = r#"<Subscribe><SubscriptionId>test-sub</SubscriptionId></Subscribe>"#;
+    /// match parser.parse_message(subscription_xml, "workstation01".to_string()) {
+    ///     Ok(msg) => println!("Parsed message: {:?}", msg),
+    ///     Err(e) => eprintln!("Parse error: {}", e),
+    /// }
+    /// ```
     pub fn parse_message(&self, body: &str, source_host: String) -> Result<WefMessage> {
         debug!("Parsing WEF message from {}", source_host);
 

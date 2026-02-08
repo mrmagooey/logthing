@@ -12,10 +12,27 @@ pub struct ThroughputStats {
 }
 
 impl ThroughputStats {
+    /// Create a new throughput statistics tracker.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Record an event occurrence for tracking throughput statistics.
+    ///
+    /// Events are aggregated by type and tracked in 1-minute buckets.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use wef_server::stats::ThroughputStats;
+    ///
+    /// let stats = ThroughputStats::new();
+    ///
+    /// // Record some events
+    /// stats.record_event("Microsoft-Windows-Security-Auditing:4624".to_string()).await;
+    /// stats.record_event("Microsoft-Windows-Security-Auditing:4624".to_string()).await;
+    /// stats.record_event("Microsoft-Windows-Security-Auditing:4625".to_string()).await;
+    /// ```
     pub async fn record_event(&self, event_type: String) {
         let minute = current_minute();
         let mut guard = self.inner.write().await;
@@ -23,6 +40,29 @@ impl ThroughputStats {
         stats.record(minute);
     }
 
+    /// Get a snapshot of current throughput statistics.
+    ///
+    /// Returns per-event-type statistics including total events, events in the
+    /// last minute, and events in the last 5 minutes.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use wef_server::stats::ThroughputStats;
+    ///
+    /// let stats = ThroughputStats::new();
+    ///
+    /// // Record events and get snapshot
+    /// stats.record_event("Microsoft-Windows-Security-Auditing:4624".to_string()).await;
+    ///
+    /// let snapshot = stats.snapshot().await;
+    /// for row in snapshot {
+    ///     println!(
+    ///         "{}: {} total, {} last minute",
+    ///         row.event_type, row.total_events, row.last_minute
+    ///     );
+    /// }
+    /// ```
     pub async fn snapshot(&self) -> Vec<ThroughputSnapshot> {
         let guard = self.inner.read().await;
         let minute = current_minute();

@@ -80,7 +80,24 @@ pub struct GenericEventParser {
 }
 
 impl GenericEventParser {
-    /// Load parser configuration from a YAML file
+    /// Load parser configuration from a YAML file or directory.
+    ///
+    /// If the path is a directory, loads all `.yml` and `.yaml` files from it.
+    /// If the path is a file, loads that single YAML file.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use wef_server::parser::GenericEventParser;
+    ///
+    /// // Load from a directory containing parser YAML files
+    /// let parser = GenericEventParser::from_file("config/event_parsers")?;
+    ///
+    /// // Check if a parser exists for event ID 4624
+    /// let has_parser = parser.has_parser(4624);
+    /// println!("Has parser for 4624: {}", has_parser);
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
     pub fn from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let path = path.as_ref();
         info!("Loading event parser configuration from {:?}", path);
@@ -151,7 +168,35 @@ impl GenericEventParser {
         Ok(EventParserConfig { parsers })
     }
 
-    /// Parse a Windows event XML using the appropriate parser
+    /// Parse a Windows event XML using the appropriate parser.
+    ///
+    /// Extracts fields based on the parser configuration, applies enrichments,
+    /// and formats the output message.
+    ///
+    /// Returns `None` if no parser is defined for the event ID or if required fields are missing.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use wef_server::parser::GenericEventParser;
+    ///
+    /// let parser = GenericEventParser::from_file("config/event_parsers").unwrap();
+    ///
+    /// let xml = r#"<Event>
+    ///   <System>
+    ///     <EventID>4624</EventID>
+    ///   </System>
+    ///   <EventData>
+    ///     <Data Name="TargetUserName">admin</Data>
+    ///     <Data Name="LogonType">3</Data>
+    ///   </EventData>
+    /// </Event>"#;
+    ///
+    /// if let Some(parsed) = parser.parse_event(4624, xml) {
+    ///     println!("Parsed {} fields", parsed.fields.len());
+    ///     println!("Message: {:?}", parsed.formatted_message);
+    /// }
+    /// ```
     pub fn parse_event(&self, event_id: u32, xml: &str) -> Option<ParsedEventData> {
         let parser_def = self.config.parsers.get(&event_id)?;
 
