@@ -1,0 +1,327 @@
+---
+# Ansible Playbook: Configure WEF Server for Real AD Testing
+# This playbook sets up the WEF server application on a Debian host
+# for integration testing with real Active Directory and Windows clients
+#
+# Usage:
+#   ansible-playbook -i inventory.yml configure-wef-server.yml
+#
+# Prerequisites:
+#   - Debian 12 host with Docker and Rust installed (via Ludus roles)
+#   - Network connectivity to AD domain (10.10.10.0/24)
+#   - Kerberos keytab from Domain Admin
+
+- name: Configure WEF Server for Real AD Testing
+  hosts: wef-srv-01
+  become: yes
+  vars:
+    wef_server_version: "0.1.0"
+    wef_install_dir: "/opt/wef-server"
+    wef_config_dir: "/etc/wef-server"
+    wef_data_dir: "/var/lib/wef-server"
+    wef_log_dir: "/var/log/wef-server"
+    wef_user: "wef-server"
+    wef_group: "wef-server"
+    
+    # Network configuration
+    wef_bind_address: "0.0.0.0:5985"
+    wef_domain: "wef.lab"
+    wef_hostname: "wef-srv-01"
+    wef_fqdn: "wef-srv-01.wef.lab"
+    
+    # Kerberos configuration
+    wef_kerberos_enabled: true
+    wef_kerberos_realm: "WEF.LAB"
+    wef_kerberos_spn: "HTTP/wef-srv-01.wef.lab@WEF.LAB"
+    wef_keytab_path: "/etc/wef-server/keytabs/wef.keytab"
+    
+    # S3/MinIO configuration
+    s3_endpoint: "http://minio-srv.wef.lab:9000"
+    s3_bucket: "wef-events"
+    s3_access_key: "minioadmin"
+    s3_secret_key: "minioadmin"
+    
+    # Security
+    allowed_networks:
+      - "10.10.10.0/24"
+      - "127.0.0.1/32"
+
+  tasks:
+    # ============================================
+    # 1. SYSTEM PREPARATION
+    # ============================================
+    
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      tags: ["packages"]
+
+    - name: Install required system packages
+      apt:
+        name:
+          - build-essential
+          - pkg-config
+          - libssl-dev
+          - krb5-user
+          - libkrb5-dev
+          - libgssapi-krb5-2
+          - curl
+          - jq
+          - python3
+          - python3-pip
+          - python3-venv
+          - ufw
+          - logrotate
+          - systemd-timesyncd
+        state: present
+      tags: ["packages"]
+
+    - name: Install Python packages for testing
+      pip:
+        name:
+          - requests
+          - pyarrow
+          - pandas
+          - prometheus-client
+        state: present
+      tags: ["packages"]
+
+    # ============================================
+    # 2. USER AND DIRECTORY SETUP
+    # ============================================
+
+    - name: Create WEF server group
+      group:
+        name: "{{ wef_group }}"
+        system: yes
+      tags: ["user"]
+
+    - name: Create WEF server user
+      user:
+        name: "{{ wef_user }}"
+        group: "{{ wef_group }}"
+        home: "{{ wef_data_dir }}"
+        shell: /bin/false
+        system: yes
+        create_home: no
+      tags: ["user"]
+
+    - name: Create WEF server directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ wef_user }}"
+        group: "{{ wef_group }}"
+        mode: '0750'
+      loop:
+        - "{{ wef_install_dir }}"
+        - "{{ wef_config_dir }}"
+        - "{{ wef_data_dir }}"
+        - "{{ wef_log_dir }}"
+        - "{{ wef_config_dir }}/keytabs"
+        - "{{ wef_data_dir }}/events"
+        - "{{ wef_data_dir }}/buffer"
+      tags: ["directories"]
+
+    # ============================================
+    # 3. KERBEROS CONFIGURATION
+    # ============================================
+
+    - name: Deploy krb5.conf
+      template:
+        src: krb5.conf.j2
+        dest: /etc/krb5.conf
+        owner: root
+        group: root
+        mode: '0644'
+      tags: ["kerberos"]
+
+    - name: Check if keytab exists
+      stat:
+        path: "{{ wef_keytab_path }}"
+      register: keytab_file
+      tags: ["kerberos"]
+
+    - name: Warning if keytab not present
+      debug:
+        msg: |
+          WARNING: Kerberos keytab not found at {{ wef_keytab_path }}
+          
+          To generate the keytab on the Domain Controller (DC01), run:
+          
+          1. Create service account:
+             New-ADUser -Name "wef-service" `
+                        -UserPrincipalName "wef-service@wef.lab" `
+                        -AccountPassword (ConvertTo-SecureString "P@ssw0rd123!" -AsPlainText -Force) `
+                        -Enabled $true
+          
+          2. Register SPN:
+             setspn -S HTTP/wef-srv-01.wef.lab WEF\wef-service
+          
+          3. Generate keytab:
+             ktpass /princ HTTP/wef-srv-01.wef.lab@WEF.LAB `
+                    /mapuser WEF\wef-service `
+                    /pass P@ssw0rd123! `
+                    /ptype KRB5_NT_PRINCIPAL `
+                    /crypto AES256-SHA1 `
+                    /out C:\temp\wef.keytab
+          
+          4. Copy keytab to WEF server:
+             scp C:\temp\wef.keytab root@wef-srv-01.wef.lab:{{ wef_keytab_path }}
+             chmod 600 {{ wef_keytab_path }}
+             chown {{ wef_user }}:{{ wef_group }} {{ wef_keytab_path }}
+      when: not keytab_file.stat.exists
+      tags: ["kerberos"]
+
+    - name: Set keytab permissions
+      file:
+        path: "{{ wef_keytab_path }}"
+        owner: "{{ wef_user }}"
+        group: "{{ wef_group }}"
+        mode: '0600'
+      when: keytab_file.stat.exists
+      tags: ["kerberos"]
+
+    # ============================================
+    # 4. BUILD AND INSTALL WEF SERVER
+    # ============================================
+
+    - name: Clone WEF server repository
+      git:
+        repo: "https://github.com/your-org/wef-server.git"
+        dest: "{{ wef_install_dir }}/source"
+        version: main
+      tags: ["build"]
+
+    - name: Build WEF server binary
+      command: cargo build --release --features kerberos-auth
+      args:
+        chdir: "{{ wef_install_dir }}/source"
+      environment:
+        CARGO_HOME: "{{ wef_data_dir }}/.cargo"
+        RUSTUP_HOME: "{{ wef_data_dir }}/.rustup"
+      become_user: "{{ wef_user }}"
+      tags: ["build"]
+
+    - name: Copy WEF server binary
+      copy:
+        src: "{{ wef_install_dir }}/source/target/release/wef-server"
+        dest: "{{ wef_install_dir }}/wef-server"
+        owner: "{{ wef_user }}"
+        group: "{{ wef_group }}"
+        mode: '0755'
+        remote_src: yes
+      tags: ["build"]
+
+    # ============================================
+    # 5. CONFIGURATION FILES
+    # ============================================
+
+    - name: Deploy WEF server configuration
+      template:
+        src: wef-server.toml.j2
+        dest: "{{ wef_config_dir }}/wef-server.toml"
+        owner: "{{ wef_user }}"
+        group: "{{ wef_group }}"
+        mode: '0640'
+      tags: ["config"]
+
+    - name: Deploy event parser configurations
+      copy:
+        src: "{{ wef_install_dir }}/source/config/event_parsers/"
+        dest: "{{ wef_config_dir }}/event_parsers/"
+        owner: "{{ wef_user }}"
+        group: "{{ wef_group }}"
+        mode: '0640'
+        remote_src: yes
+      tags: ["config"]
+
+    - name: Deploy logrotate configuration
+      template:
+        src: logrotate-wef-server.j2
+        dest: /etc/logrotate.d/wef-server
+        owner: root
+        group: root
+        mode: '0644'
+      tags: ["config"]
+
+    # ============================================
+    # 6. SYSTEMD SERVICE
+    # ============================================
+
+    - name: Deploy systemd service
+      template:
+        src: wef-server.service.j2
+        dest: /etc/systemd/system/wef-server.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify: reload systemd
+      tags: ["service"]
+
+    - name: Enable and start WEF server
+      systemd:
+        name: wef-server
+        enabled: yes
+        state: started
+      tags: ["service"]
+
+    # ============================================
+    # 7. FIREWALL CONFIGURATION
+    # ============================================
+
+    - name: Configure UFW firewall
+      ufw:
+        rule: allow
+        port: "{{ item.port }}"
+        proto: "{{ item.proto }}"
+        comment: "{{ item.comment }}"
+      loop:
+        - { port: 22, proto: tcp, comment: "SSH" }
+        - { port: 5985, proto: tcp, comment: "WEF HTTP" }
+        - { port: 5986, proto: tcp, comment: "WEF HTTPS" }
+        - { port: 9090, proto: tcp, comment: "Prometheus Metrics" }
+        - { port: 514, proto: tcp, comment: "Syslog TCP" }
+        - { port: 601, proto: tcp, comment: "Syslog TCP RFC 6587" }
+        - { port: 514, proto: udp, comment: "Syslog UDP" }
+      tags: ["firewall"]
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+        default_policy: deny
+      tags: ["firewall"]
+
+    # ============================================
+    # 8. TESTING TOOLS
+    # ============================================
+
+    - name: Deploy test scripts
+      copy:
+        src: "{{ item }}"
+        dest: "/opt/wef-tests/"
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - scripts/test_phase1_connectivity.py
+        - scripts/test_phase2_events.py
+        - scripts/test_phase3_performance.py
+        - scripts/validate_metrics.py
+        - scripts/generate_load.py
+      tags: ["testing"]
+
+    - name: Create test results directory
+      file:
+        path: /var/log/wef-tests
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      tags: ["testing"]
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: yes
