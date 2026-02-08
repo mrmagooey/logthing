@@ -1,0 +1,349 @@
+---
+# Ansible Playbook: Configure Windows Clients for WEF Testing
+# This playbook configures Windows workstations and servers to forward
+# events to the WEF server for real AD integration testing
+#
+# Usage:
+#   ansible-playbook -i inventory.yml configure-wef-client.yml
+#
+# Prerequisites:
+#   - Windows hosts must be joined to the wef.lab domain
+#   - WinRM must be enabled on Windows hosts
+#   - Network connectivity to WEF server (wef-srv-01.wef.lab)
+
+- name: Configure Windows Clients for WEF Testing
+  hosts: windows_clients
+  gather_facts: yes
+  vars:
+    wef_server_fqdn: "wef-srv-01.wef.lab"
+    wef_server_ip: "10.10.10.20"
+    wef_http_port: 5985
+    wef_https_port: 5986
+    
+    # Subscription configuration
+    subscription_name: "SecurityEvents"
+    subscription_id: "SecurityEvents-RealAD-Test"
+    
+    # Event query configuration
+    event_ids:
+      - 4624  # Successful Logon
+      - 4625  # Failed Logon
+      - 4634  # Logoff
+      - 4647  # User Initiated Logoff
+      - 4648  # Logon Using Explicit Credentials
+      - 4663  # Attempted Object Access
+      - 4672  # Admin Logon
+      - 4688  # Process Created
+      - 4697  # Service Installed
+      - 4720  # User Account Created
+      - 4728  # Member Added to Global Group
+      - 4732  # Member Added to Local Group
+      - 4768  # Kerberos TGT Requested
+      - 4769  # Kerberos Service Ticket Requested
+    
+    # Transport settings
+    transport_name: "HTTP"  # Options: HTTP, HTTPS
+    content_format: "Events"  # Options: Events, RenderedText
+    batch_max_items: 10
+    batch_max_latency_ms: 30000
+    heartbeat_interval_ms: 900000
+    
+    # Local configuration path
+    wef_config_dir: "C:\\WEF"
+
+  tasks:
+    # ============================================
+    # 1. WINRM CONFIGURATION
+    # ============================================
+    
+    - name: Ensure WinRM is configured
+      win_shell: |
+        if (-not (Test-WSMan -ErrorAction SilentlyContinue)) {
+            Enable-PSRemoting -Force -SkipNetworkProfileCheck
+            winrm quickconfig -q
+        }
+      tags: ["winrm"]
+
+    - name: Configure WinRM Client - Trusted Hosts
+      win_shell: |
+        $currentTrusted = (Get-Item WSMan:\localhost\Client\TrustedHosts).Value
+        $newHosts = @("{{ wef_server_fqdn }}", "{{ wef_server_ip }}")
+        foreach ($host in $newHosts) {
+            if ($currentTrusted -notlike "*$host*") {
+                if ($currentTrusted -eq "") {
+                    Set-Item WSMan:\localhost\Client\TrustedHosts -Value $host -Force
+                } else {
+                    Set-Item WSMan:\localhost\Client\TrustedHosts -Value "$currentTrusted,$host" -Force
+                }
+            }
+        }
+      tags: ["winrm"]
+
+    - name: Allow unencrypted traffic (for HTTP testing)
+      win_shell: |
+        Set-Item WSMan:\localhost\Client\AllowUnencrypted -Value $true -Force
+      when: transport_name == "HTTP"
+      tags: ["winrm"]
+
+    # ============================================
+    # 2. WINDOWS EVENT COLLECTOR SERVICE
+    # ============================================
+
+    - name: Ensure Windows Event Collector service is running
+      win_service:
+        name: Wecsvc
+        state: started
+        start_mode: auto
+      tags: ["service"]
+
+    - name: Configure Windows Event Collector to auto-start
+      win_shell: |
+        sc config Wecsvc start= auto
+      tags: ["service"]
+
+    # ============================================
+    # 3. DIRECTORY SETUP
+    # ============================================
+
+    - name: Create WEF configuration directory
+      win_file:
+        path: "{{ wef_config_dir }}"
+        state: directory
+      tags: ["config"]
+
+    - name: Create test scripts directory
+      win_file:
+        path: "{{ wef_config_dir }}\\scripts"
+        state: directory
+      tags: ["config"]
+
+    # ============================================
+    # 4. SUBSCRIPTION CONFIGURATION
+    # ============================================
+
+    - name: Generate event ID query string
+      set_fact:
+        event_id_query: "{{ event_ids | map('regex_replace', '^(.*)$', 'System[(EventID=\\1)]') | list | join(' or ') }}"
+      tags: ["subscription"]
+
+    - name: Deploy subscription XML configuration
+      win_template:
+        src: subscription.xml.j2
+        dest: "{{ wef_config_dir }}\\{{ subscription_id }}.xml"
+      tags: ["subscription"]
+
+    - name: Check if subscription exists
+      win_shell: |
+        wecutil gs {{ subscription_id }} 2>&1
+      register: subscription_exists
+      ignore_errors: yes
+      tags: ["subscription"]
+
+    - name: Delete existing subscription (if reconfiguring)
+      win_shell: |
+        wecutil ds {{ subscription_id }}
+      when: 
+        - subscription_exists.rc == 0
+        - force_reconfigure | default(false) | bool
+      ignore_errors: yes
+      tags: ["subscription"]
+
+    - name: Create WEF subscription
+      win_shell: |
+        wecutil cs "{{ wef_config_dir }}\\{{ subscription_id }}.xml"
+        wecutil ss {{ subscription_id }} /e:true
+      when: subscription_exists.rc != 0 or (force_reconfigure | default(false) | bool)
+      tags: ["subscription"]
+
+    - name: Verify subscription is active
+      win_shell: |
+        wecutil gs {{ subscription_id }}
+      register: subscription_status
+      tags: ["subscription"]
+
+    - name: Display subscription status
+      debug:
+        var: subscription_status.stdout
+      tags: ["subscription"]
+
+    # ============================================
+    # 5. TEST EVENT GENERATION SCRIPTS
+    # ============================================
+
+    - name: Deploy test event generation script
+      win_copy:
+        content: |
+          # Test Event Generation Script for WEF Testing
+          # Run this script to generate various Windows events for testing
+          
+          param(
+              [int]$EventCount = 10,
+              [string[]]$EventTypes = @("Logon", "Process", "User")
+          )
+          
+          Write-Host "Generating $EventCount test events..."
+          
+          for ($i = 1; $i -le $EventCount; $i++) {
+              $eventType = $EventTypes[$i % $EventTypes.Count]
+              
+              switch ($eventType) {
+                  "Logon" {
+                      # Generate logon event (requires audit policy)
+                      Write-Host "Event $i`: Simulating logon activity"
+                      # This will be captured by the system if auditing is enabled
+                  }
+                  "Process" {
+                      # Start a process to generate event 4688
+                      Write-Host "Event $i`: Starting notepad process"
+                      Start-Process notepad -WindowStyle Hidden
+                      Start-Sleep -Milliseconds 100
+                      Get-Process notepad | Stop-Process -Force
+                  }
+                  "User" {
+                      # Write to application log
+                      Write-Host "Event $i`: Writing to Application log"
+                      Write-EventLog -LogName Application -Source "WEF Test" -EventId 1000 -EntryType Information -Message "WEF test event $i"
+                  }
+              }
+              
+              Start-Sleep -Milliseconds 100
+          }
+          
+          Write-Host "Test event generation complete."
+        dest: "{{ wef_config_dir }}\\scripts\\Generate-TestEvents.ps1"
+      tags: ["testing"]
+
+    - name: Deploy load test script
+      win_copy:
+        content: |
+          # Load Test Script for WEF Server
+          # Generates high volume of events for performance testing
+          
+          param(
+              [int]$DurationMinutes = 5,
+              [int]$EventsPerMinute = 100
+          )
+          
+          Write-Host "Starting load test: $EventsPerMinute events/minute for $DurationMinutes minutes"
+          
+          $startTime = Get-Date
+          $endTime = $startTime.AddMinutes($DurationMinutes)
+          $totalEvents = 0
+          $intervalSeconds = 60 / $EventsPerMinute
+          
+          while ((Get-Date) -lt $endTime) {
+              # Generate a batch of events
+              $batchSize = [math]::Min(10, $EventsPerMinute)
+              for ($i = 0; $i -lt $batchSize; $i++) {
+                  Write-EventLog -LogName Application -Source "WEF Load Test" -EventId 2000 -EntryType Information -Message "Load test event $totalEvents"
+                  $totalEvents++
+              }
+              
+              Write-Host "$(Get-Date -Format 'HH:mm:ss')`: Generated $totalEvents events so far..."
+              Start-Sleep -Seconds 1
+          }
+          
+          Write-Host "Load test complete. Total events generated: $totalEvents"
+        dest: "{{ wef_config_dir }}\\scripts\\Start-LoadTest.ps1"
+      tags: ["testing"]
+
+    - name: Deploy validation script
+      win_copy:
+        content: |
+          # WEF Client Validation Script
+          # Verifies WEF configuration and connectivity
+          
+          Write-Host "=== WEF Client Validation ==="
+          Write-Host ""
+          
+          # Check Windows Event Collector service
+          $svc = Get-Service Wecsvc
+          Write-Host "Windows Event Collector Service: $($svc.Status)"
+          
+          # Check WinRM configuration
+          $winrmConfig = winrm get winrm/config/client
+          Write-Host "WinRM Client Configuration:"
+          Write-Host $winrmConfig
+          
+          # Check subscription status
+          Write-Host "`nSubscription Status:"
+          wecutil gs SecurityEvents-RealAD-Test
+          
+          # Test connectivity to WEF server
+          Write-Host "`nTesting connectivity to {{ wef_server_fqdn }}..."
+          $connection = Test-NetConnection -ComputerName {{ wef_server_fqdn }} -Port {{ wef_http_port }}
+          Write-Host "Connection test: $($connection.TcpTestSucceeded)"
+          
+          # Check local event logs for forwarded events
+          Write-Host "`nForwarded Events log entries (last 10):"
+          Get-WinEvent -LogName ForwardedEvents -MaxEvents 10 -ErrorAction SilentlyContinue | 
+              Select-Object TimeCreated, Id, LevelDisplayName, Message | 
+              Format-Table -AutoSize
+          
+          Write-Host "`n=== Validation Complete ==="
+        dest: "{{ wef_config_dir }}\\scripts\\Test-WEFClient.ps1"
+      tags: ["testing"]
+
+    # ============================================
+    # 6. SECURITY AUDIT POLICY CONFIGURATION
+    # ============================================
+
+    - name: Configure audit policies for event generation
+      win_shell: |
+        # Enable audit policies that generate events we want to capture
+        auditpol /set /subcategory:"Logon" /success:enable /failure:enable
+        auditpol /set /subcategory:"Account Logon" /success:enable /failure:enable
+        auditpol /set /subcategory:"Object Access" /success:enable /failure:enable
+        auditpol /set /subcategory:"Process Creation" /success:enable
+        auditpol /set /subcategory:"Process Termination" /success:enable
+        auditpol /set /subcategory:"Security Group Management" /success:enable /failure:enable
+        auditpol /set /subcategory:"User Account Management" /success:enable /failure:enable
+      tags: ["audit"]
+
+    - name: Verify audit policies
+      win_shell: |
+        auditpol /get /category:*
+      register: audit_policy
+      tags: ["audit"]
+
+    - name: Display audit policy configuration
+      debug:
+        var: audit_policy.stdout_lines
+      tags: ["audit"]
+
+    # ============================================
+    # 7. INITIAL TEST
+    # ============================================
+
+    - name: Run initial connectivity test
+      win_shell: |
+        & "{{ wef_config_dir }}\\scripts\\Test-WEFClient.ps1"
+      register: initial_test
+      ignore_errors: yes
+      tags: ["test"]
+
+    - name: Display initial test results
+      debug:
+        var: initial_test.stdout
+      tags: ["test"]
+
+    # ============================================
+    # 8. CREATE EVENT SOURCE FOR TESTING
+    # ============================================
+
+    - name: Create WEF Test event source
+      win_shell: |
+        if (-not [System.Diagnostics.EventLog]::SourceExists("WEF Test")) {
+            New-EventLog -LogName Application -Source "WEF Test"
+        }
+        if (-not [System.Diagnostics.EventLog]::SourceExists("WEF Load Test")) {
+            New-EventLog -LogName Application -Source "WEF Load Test"
+        }
+      tags: ["setup"]
+
+  handlers:
+    - name: Restart Windows Event Collector
+      win_service:
+        name: Wecsvc
+        state: restarted
+      listen: "restart wecsvc"

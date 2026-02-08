@@ -1,0 +1,34 @@
+[Unit]
+Description=WEF Server - Windows Event Forwarding Collector
+Documentation=https://github.com/your-org/wef-server
+After=network.target
+
+[Service]
+Type=simple
+User={{ wef_user }}
+Group={{ wef_group }}
+WorkingDirectory={{ wef_config_dir }}
+
+# Kerberos keytab environment
+Environment="KRB5_KTNAME={{ wef_keytab_path }}"
+Environment="KRB5_CONFIG=/etc/krb5.conf"
+Environment="RUST_LOG={{ wef_log_level | default('info') }}"
+
+# Run the WEF server
+ExecStart={{ wef_install_dir }}/wef-server
+
+# Restart on failure
+Restart=always
+RestartSec=5
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=4096
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wef-server
+
+[Install]
+WantedBy=multi-user.target

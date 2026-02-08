@@ -1,0 +1,108 @@
+# Ludus Range Configuration for WEF Server Real AD Testing
+# This configuration deploys a complete Active Directory environment
+# for testing Windows Event Forwarding with real Windows hosts
+#
+# Usage:
+#   1. Install Ludus on a Debian 12 host with virtualization support
+#   2. Copy this file to ~/ludus-range-config.yml
+#   3. Run: ludus range deploy -f ~/ludus-range-config.yml
+#   4. Wait for deployment: ludus range wait
+#
+# Requirements:
+#   - Host: 8+ CPU cores, 32GB+ RAM, 200GB+ SSD
+#   - Network: 2+ NICs for VLAN isolation
+#   - Virtualization: VT-x/AMD-V enabled
+
+ludus:
+  network:
+    name: "wef-testing"
+    cidr: "10.10.10.0/24"
+    vlan_id: 10
+    description: "Isolated network for WEF server testing"
+  
+  dns:
+    domain: "wef.lab"
+    forwarders:
+      - "8.8.8.8"
+      - "8.8.4.4"
+    description: "Internal DNS for AD domain"
+  
+  vms:
+    # Domain Controller - Core AD infrastructure
+    - hostname: dc01
+      template: win2022-server-x64
+      ip: 10.10.10.10
+      role: dc
+      domain: wef.lab
+      description: "Primary Domain Controller and DNS"
+      ansible:
+        - playbook: ansible/configure-dc.yml
+      
+    # WEF Server - The application under test
+    - hostname: wef-srv-01
+      template: debian-12-server-x64
+      ip: 10.10.10.20
+      description: "WEF Server - Application under test"
+      roles:
+        - role: ludus.install_docker
+        - role: ludus.install_rust
+      ansible:
+        - playbook: ansible/configure-wef-server.yml
+      resources:
+        cpu: 4
+        memory: 8192
+      
+    # MinIO S3 Storage - Event storage backend
+    - hostname: minio-srv
+      template: debian-12-server-x64
+      ip: 10.10.10.30
+      description: "S3-compatible storage for Parquet files"
+      roles:
+        - role: ludus.install_minio
+      ansible:
+        - playbook: ansible/configure-minio.yml
+      
+    # Windows 11 Workstation - Event source
+    - hostname: ws01
+      template: win11-22h2-x64
+      ip: 10.10.10.100
+      domain_join: wef.lab
+      description: "Windows 11 workstation - WEF client"
+      ansible:
+        - playbook: ansible/configure-wef-client.yml
+      
+    # Windows 11 Workstation - Event source
+    - hostname: ws02
+      template: win11-22h2-x64
+      ip: 10.10.10.101
+      domain_join: wef.lab
+      description: "Windows 11 workstation - WEF client"
+      ansible:
+        - playbook: ansible/configure-wef-client.yml
+      
+    # Windows 10 Workstation - Event source
+    - hostname: ws03
+      template: win10-22h2-x64
+      ip: 10.10.10.102
+      domain_join: wef.lab
+      description: "Windows 10 workstation - WEF client"
+      ansible:
+        - playbook: ansible/configure-wef-client.yml
+      
+    # Windows Server 2022 - Event source
+    - hostname: srv01
+      template: win2022-server-x64
+      ip: 10.10.10.103
+      domain_join: wef.lab
+      description: "Windows Server - WEF client"
+      ansible:
+        - playbook: ansible/configure-wef-client.yml
+
+# Optional: Additional test scenarios
+# Uncomment to add more hosts for scale testing
+#    - hostname: ws04
+#      template: win11-22h2-x64
+#      ip: 10.10.10.104
+#      domain_join: wef.lab
+#      ansible:
+#        - playbook: ansible/configure-wef-client.yml
