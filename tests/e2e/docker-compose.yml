@@ -18,6 +18,24 @@ services:
     networks:
       - e2e
 
+  wef-server-kerberos:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.kerberos
+    image: wef-server:e2e-kerberos
+    environment:
+      - RUST_LOG=info
+      - WEF__TLS__ENABLED=false
+      - WEF__SYSLOG__ENABLED=true
+      - WEF__SYSLOG__UDP_PORT=5514
+      - WEF__SYSLOG__TCP_PORT=5601
+    volumes:
+      - ./config/wef-server-kerberos.toml:/etc/wef-server/config.toml:ro
+    depends_on:
+      - minio
+    networks:
+      - e2e
+
   minio:
     image: minio/minio:RELEASE.2024-01-16T16-07-38Z
     environment:
@@ -83,6 +101,70 @@ services:
       - AWS_SECRET_ACCESS_KEY=miniopassword
       - WEF_STATS_ENDPOINT=http://wef-server:5985/stats/throughput
       - EXPECTED_EVENT_TOTAL=50
+    networks:
+      - e2e
+
+  kerberos-test:
+    build:
+      context: .
+      dockerfile: kerberos-test/Dockerfile
+    environment:
+      - WEF_ENDPOINT=http://wef-server-kerberos:5985
+      - WEF_TIMEOUT_SECS=60
+    depends_on:
+      - wef-server-kerberos
+    networks:
+      - e2e
+
+  parsing-validator:
+    build:
+      context: .
+      dockerfile: parsing-validator/Dockerfile
+    environment:
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_BUCKET=wef-events
+      - AWS_ACCESS_KEY_ID=miniouser
+      - AWS_SECRET_ACCESS_KEY=miniopassword
+      - WEF_STATS_ENDPOINT=http://wef-server:5985/stats/throughput
+      - PARSER_DIR=/app/parsers
+      - E2E_TIMEOUT_SECS=120
+    volumes:
+      - ../../config/event_parsers:/app/parsers:ro
+    networks:
+      - e2e
+
+  wef-server-tls:
+    build:
+      context: ../..
+    image: wef-server:e2e
+    environment:
+      - RUST_LOG=info
+      - WEF__TLS__ENABLED=true
+      - WEF__TLS__PORT=5986
+      - WEF__SYSLOG__ENABLED=true
+      - WEF__SYSLOG__UDP_PORT=5514
+      - WEF__SYSLOG__TCP_PORT=5601
+      - WEF_ADMIN_USER=e2e
+      - WEF_ADMIN_PASS=e2e
+    volumes:
+      - ./config/wef-server-tls.toml:/etc/wef-server/config.toml:ro
+      - ./certs/server.crt:/etc/wef-server/certs/server.crt:ro
+      - ./certs/server.key:/etc/wef-server/certs/server.key:ro
+    depends_on:
+      - minio
+    networks:
+      - e2e
+
+  tls-test:
+    build:
+      context: .
+      dockerfile: tls-test/Dockerfile
+    environment:
+      - HTTP_ENDPOINT=http://wef-server-tls:5985
+      - HTTPS_ENDPOINT=https://wef-server-tls:5986
+      - TLS_TEST_TIMEOUT=60
+    depends_on:
+      - wef-server-tls
     networks:
       - e2e
 
