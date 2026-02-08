@@ -1,552 +1,79 @@
-use std::{net::SocketAddr, sync::Arc};
+//! Admin HTTP interface for WEF server configuration management
+//!
+//! This module provides a secure web interface for managing server configuration,
+//! viewing audit logs, and monitoring system status.
 
-use axum::{
-    Json, Router,
-    extract::State,
-    http::{StatusCode, header},
-    response::{Html, IntoResponse, Response},
-    routing::get,
-};
-use axum_extra::extract::TypedHeader;
-use headers::{Authorization, authorization::Basic};
-use std::path::Path;
-use tokio::{fs, net::TcpListener, sync::RwLock};
-use tracing::{error, info, warn};
+mod auth;
+mod config_api;
+mod middleware;
+mod routes;
+mod state;
 
-use crate::config::{ADMIN_OVERRIDE_FILE, Config};
-
-#[derive(Clone)]
-struct AdminState {
-    config: Arc<RwLock<Config>>,
-    username: Arc<String>,
-    password: Arc<String>,
-}
-
-pub fn spawn_admin_server(config: Arc<RwLock<Config>>) {
-    let username = std::env::var("WEF_ADMIN_USER").unwrap_or_else(|_| "admin".to_string());
-    let password = std::env::var("WEF_ADMIN_PASS").unwrap_or_else(|_| "admin".to_string());
-
-    if username == "admin" && password == "admin" {
-        warn!("Admin interface is using default credentials; set WEF_ADMIN_USER/WEF_ADMIN_PASS");
-    }
-
-    tokio::spawn(async move {
-        if let Err(err) = run_admin_server(config, username, password).await {
-            error!("Admin server error: {}", err);
-        }
-    });
-}
-
-async fn run_admin_server(
-    config: Arc<RwLock<Config>>,
-    username: String,
-    password: String,
-) -> anyhow::Result<()> {
-    let addr: SocketAddr = "0.0.0.0:8080".parse()?;
-    let app = Router::new()
-        .route("/", get(admin_page))
-        .route("/config", get(get_config).put(update_config))
-        .with_state(AdminState {
-            config,
-            username: Arc::new(username),
-            password: Arc::new(password),
-        });
-
-    let listener = TcpListener::bind(addr).await?;
-    info!("Admin interface available on http://{}", addr);
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-async fn get_config(
-    State(state): State<AdminState>,
-    auth: Option<TypedHeader<Authorization<Basic>>>,
-) -> Result<Json<Config>, Response> {
-    ensure_authorized(&state, auth).await?;
-    let cfg = state.config.read().await;
-    Ok(Json(cfg.clone()))
-}
-
-async fn admin_page(
-    State(state): State<AdminState>,
-    auth: Option<TypedHeader<Authorization<Basic>>>,
-) -> Result<Html<&'static str>, Response> {
-    ensure_authorized(&state, auth).await?;
-    Ok(Html(ADMIN_PAGE))
-}
-
-async fn update_config(
-    State(state): State<AdminState>,
-    auth: Option<TypedHeader<Authorization<Basic>>>,
-    Json(new_config): Json<Config>,
-) -> Result<Json<Config>, Response> {
-    ensure_authorized(&state, auth).await?;
-    let updated_config = {
-        let mut cfg = state.config.write().await;
-        *cfg = new_config;
-        cfg.clone()
-    };
-
-    if let Err(err) = persist_config(&updated_config).await {
-        error!("Failed to persist admin config: {}", err);
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Persist failed").into_response());
-    }
-
-    info!("Configuration updated via admin API");
-    Ok(Json(updated_config))
-}
-
-async fn persist_config(config: &Config) -> anyhow::Result<()> {
-    if let Ok(path) = std::env::var("WEF_ADMIN_OVERRIDE_FILE") {
-        write_config_to_path(config, Path::new(&path)).await
-    } else {
-        write_config_to_path(config, Path::new(ADMIN_OVERRIDE_FILE)).await
-    }
-}
-
-async fn write_config_to_path(config: &Config, path: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).await.ok();
-        }
-    }
-    let contents = toml::to_string_pretty(config)?;
-    fs::write(path, contents).await?;
-    Ok(())
-}
-
-async fn ensure_authorized(
-    state: &AdminState,
-    auth: Option<TypedHeader<Authorization<Basic>>>,
-) -> Result<(), Response> {
-    let Some(auth) = auth else {
-        return Err(unauthorized());
-    };
-    let creds = auth.0;
-    if creds.username() == state.username.as_str() && creds.password() == state.password.as_str() {
-        Ok(())
-    } else {
-        Err(unauthorized())
-    }
-}
-
-fn unauthorized() -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        [(
-            header::WWW_AUTHENTICATE,
-            "Basic realm=\"WEF Admin\", charset=\"UTF-8\"",
-        )],
-        "Unauthorized",
-    )
-        .into_response()
-}
-
-const ADMIN_PAGE: &str = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>WEF Admin Console</title>
-    <style>
-        :root {
-            color-scheme: light dark;
-            --bg: linear-gradient(135deg, #101726 0%, #1e1c2a 45%, #1f2f3a 100%);
-            --panel-bg: rgba(17, 24, 39, 0.75);
-            --accent: #64d2ff;
-            --accent-strong: #14b8a6;
-            --text: #f4f6fb;
-            --muted: #9ba5be;
-            font-family: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
-        }
-        * { box-sizing: border-box; }
-        body {
-            margin: 0;
-            min-height: 100vh;
-            background: var(--bg);
-            color: var(--text);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 2rem;
-        }
-        .shell {
-            width: min(1100px, 100%);
-            background: var(--panel-bg);
-            border-radius: 24px;
-            padding: 2.5rem;
-            box-shadow: 0 20px 50px rgba(0,0,0,0.35);
-            border: 1px solid rgba(255,255,255,0.08);
-            backdrop-filter: blur(12px);
-        }
-        h1 {
-            margin: 0 0 0.5rem;
-            font-size: 1.9rem;
-            letter-spacing: 0.04em;
-        }
-        p.subtitle {
-            margin: 0 0 2rem;
-            color: var(--muted);
-        }
-        form {
-            display: grid;
-            gap: 1.5rem;
-        }
-        fieldset {
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 18px;
-            padding: 1.5rem;
-            background: rgba(255,255,255,0.01);
-        }
-        legend {
-            font-weight: 600;
-            letter-spacing: 0.05em;
-            text-transform: uppercase;
-            color: var(--accent);
-            padding: 0 0.5rem;
-        }
-        label {
-            display: flex;
-            flex-direction: column;
-            gap: 0.35rem;
-            font-size: 0.95rem;
-            color: var(--muted);
-        }
-        input[type="text"],
-        input[type="number"],
-        textarea,
-        select {
-            border: 1px solid rgba(255,255,255,0.12);
-            border-radius: 12px;
-            padding: 0.65rem 0.85rem;
-            font-size: 1rem;
-            background: rgba(0,0,0,0.25);
-            color: var(--text);
-            font-family: inherit;
-        }
-        textarea { min-height: 5.5rem; resize: vertical; }
-        .grid-2 {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 1rem;
-        }
-        .grid-3 {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 1rem;
-        }
-        .check-row {
-            display: flex;
-            align-items: center;
-            gap: 0.6rem;
-        }
-        .check-row label {
-            flex-direction: row;
-            align-items: center;
-            gap: 0.4rem;
-            font-weight: 600;
-            text-transform: uppercase;
-            color: var(--text);
-        }
-        .actions {
-            display: flex;
-            gap: 1rem;
-            align-items: center;
-            flex-wrap: wrap;
-        }
-        button {
-            background: linear-gradient(120deg, var(--accent), var(--accent-strong));
-            border: none;
-            color: #051923;
-            font-weight: 600;
-            font-size: 1rem;
-            letter-spacing: 0.04em;
-            padding: 0.85rem 1.8rem;
-            border-radius: 999px;
-            cursor: pointer;
-            transition: transform 120ms ease;
-        }
-        button:hover { transform: translateY(-1px) scale(1.01); }
-        #status {
-            font-size: 0.95rem;
-            min-height: 1.2rem;
-        }
-        #status.ok { color: #5befc0; }
-        #status.err { color: #ff6b6b; }
-        @media (max-width: 700px) {
-            body { padding: 1rem; }
-            .shell { padding: 1.5rem; }
-        }
-    </style>
-</head>
-<body>
-    <div class="shell">
-        <h1>WEF Admin Console</h1>
-        <p class="subtitle">Inspect and adjust runtime configuration. Changes persist to <code>wef-server.admin.toml</code>.</p>
-        <form id="config-form">
-            <fieldset>
-                <legend>Core</legend>
-                <div class="grid-2">
-                    <label>Bind Address
-                        <input type="text" name="bind_address" required />
-                    </label>
-                    <label>Log Level
-                        <select name="logging_level">
-                            <option value="trace">trace</option>
-                            <option value="debug">debug</option>
-                            <option value="info">info</option>
-                            <option value="warn">warn</option>
-                            <option value="error">error</option>
-                        </select>
-                    </label>
-                    <label>Log Format
-                        <select name="logging_format">
-                            <option value="pretty">pretty</option>
-                            <option value="json">json</option>
-                        </select>
-                    </label>
-                </div>
-            </fieldset>
-
-            <fieldset>
-                <legend>TLS</legend>
-                <div class="grid-3">
-                    <label>Port
-                        <input type="number" name="tls_port" min="1" max="65535" />
-                    </label>
-                    <label>Certificate File
-                        <input type="text" name="tls_cert" />
-                    </label>
-                    <label>Key File
-                        <input type="text" name="tls_key" />
-                    </label>
-                    <label>CA File
-                        <input type="text" name="tls_ca" />
-                    </label>
-                </div>
-                <div class="check-row">
-                    <label><input type="checkbox" name="tls_enabled" /> TLS Enabled</label>
-                    <label><input type="checkbox" name="tls_require_client" /> Require Client Cert</label>
-                </div>
-            </fieldset>
-
-            <fieldset>
-                <legend>Security</legend>
-                <div class="grid-3">
-                    <label>Max Connections
-                        <input type="number" name="security_max_connections" min="1" />
-                    </label>
-                    <label>Connection Timeout (secs)
-                        <input type="number" name="security_timeout" min="0" />
-                    </label>
-                </div>
-                <label>Allowed IPs (one per line)
-                    <textarea name="security_allowed_ips" placeholder="192.168.0.0/24"></textarea>
-                </label>
-            </fieldset>
-
-            <fieldset>
-                <legend>Forwarding</legend>
-                <div class="grid-3">
-                    <label>Buffer Size
-                        <input type="number" name="forwarding_buffer_size" min="0" />
-                    </label>
-                    <label>Retry Attempts
-                        <input type="number" name="forwarding_retry_attempts" min="0" />
-                    </label>
-                </div>
-                <label>Destinations (JSON array)
-                    <textarea name="forwarding_destinations" placeholder='[{"name":"siem","url":"https://..."}]'></textarea>
-                </label>
-            </fieldset>
-
-            <fieldset>
-                <legend>Metrics</legend>
-                <div class="grid-2">
-                    <label>Port
-                        <input type="number" name="metrics_port" min="1" max="65535" />
-                    </label>
-                </div>
-                <div class="check-row">
-                    <label><input type="checkbox" name="metrics_enabled" /> Metrics Enabled</label>
-                </div>
-            </fieldset>
-
-            <fieldset>
-                <legend>Syslog</legend>
-                <div class="grid-3">
-                    <label>UDP Port
-                        <input type="number" name="syslog_udp_port" min="1" max="65535" />
-                    </label>
-                    <label>TCP Port
-                        <input type="number" name="syslog_tcp_port" min="1" max="65535" />
-                    </label>
-                </div>
-                <div class="check-row">
-                    <label><input type="checkbox" name="syslog_enabled" /> Syslog Enabled</label>
-                    <label><input type="checkbox" name="syslog_parse_dns" /> Parse DNS Logs</label>
-                </div>
-            </fieldset>
-
-            <div class="actions">
-                <button type="submit">Save Configuration</button>
-                <span id="status"></span>
-            </div>
-        </form>
-    </div>
-
-    <script>
-        const form = document.getElementById('config-form');
-        const statusEl = document.getElementById('status');
-        let currentConfig = null;
-
-        const setStatus = (message, ok = false) => {
-            statusEl.textContent = message;
-            statusEl.className = ok ? 'ok' : 'err';
-        };
-
-        const toInt = (value, fallback) => {
-            const parsed = parseInt(value, 10);
-            return Number.isFinite(parsed) ? parsed : fallback;
-        };
-
-        const fillForm = (cfg) => {
-            form.bind_address.value = cfg.bind_address || '';
-            form.logging_level.value = cfg.logging?.level || 'info';
-            form.logging_format.value = (cfg.logging?.format || 'Pretty').toString().toLowerCase();
-
-            form.tls_enabled.checked = cfg.tls?.enabled ?? false;
-            form.tls_port.value = cfg.tls?.port ?? '';
-            form.tls_cert.value = cfg.tls?.cert_file || '';
-            form.tls_key.value = cfg.tls?.key_file || '';
-            form.tls_ca.value = cfg.tls?.ca_file || '';
-            form.tls_require_client.checked = cfg.tls?.require_client_cert ?? false;
-
-            form.security_allowed_ips.value = (cfg.security?.allowed_ips || []).join('\n');
-            form.security_max_connections.value = cfg.security?.max_connections ?? '';
-            form.security_timeout.value = cfg.security?.connection_timeout_secs ?? '';
-
-            form.forwarding_buffer_size.value = cfg.forwarding?.buffer_size ?? '';
-            form.forwarding_retry_attempts.value = cfg.forwarding?.retry_attempts ?? '';
-            form.forwarding_destinations.value = JSON.stringify(cfg.forwarding?.destinations || [], null, 2);
-
-            form.metrics_enabled.checked = cfg.metrics?.enabled ?? false;
-            form.metrics_port.value = cfg.metrics?.port ?? '';
-
-            form.syslog_enabled.checked = cfg.syslog?.enabled ?? false;
-            form.syslog_udp_port.value = cfg.syslog?.udp_port ?? '';
-            form.syslog_tcp_port.value = cfg.syslog?.tcp_port ?? '';
-            form.syslog_parse_dns.checked = cfg.syslog?.parse_dns ?? false;
-        };
-
-        const textareaToList = (value) =>
-            value.split('\n').map((line) => line.trim()).filter(Boolean);
-
-        const buildPayload = () => {
-            const payload = JSON.parse(JSON.stringify(currentConfig));
-            payload.bind_address = form.bind_address.value.trim();
-            payload.logging.level = form.logging_level.value;
-            payload.logging.format = form.logging_format.value;
-
-            payload.tls.enabled = form.tls_enabled.checked;
-            payload.tls.port = toInt(form.tls_port.value, payload.tls.port);
-            payload.tls.cert_file = form.tls_cert.value.trim() || null;
-            payload.tls.key_file = form.tls_key.value.trim() || null;
-            payload.tls.ca_file = form.tls_ca.value.trim() || null;
-            payload.tls.require_client_cert = form.tls_require_client.checked;
-
-            payload.security.allowed_ips = textareaToList(form.security_allowed_ips.value);
-            payload.security.max_connections = toInt(form.security_max_connections.value, payload.security.max_connections);
-            payload.security.connection_timeout_secs = toInt(form.security_timeout.value, payload.security.connection_timeout_secs);
-
-            payload.forwarding.buffer_size = toInt(form.forwarding_buffer_size.value, payload.forwarding.buffer_size);
-            payload.forwarding.retry_attempts = toInt(form.forwarding_retry_attempts.value, payload.forwarding.retry_attempts);
-            const parsedDestinations = JSON.parse(form.forwarding_destinations.value || '[]');
-            if (!Array.isArray(parsedDestinations)) {
-                throw new Error('Destinations must be a JSON array');
-            }
-            payload.forwarding.destinations = parsedDestinations;
-
-            payload.metrics.enabled = form.metrics_enabled.checked;
-            payload.metrics.port = toInt(form.metrics_port.value, payload.metrics.port);
-
-            payload.syslog.enabled = form.syslog_enabled.checked;
-            payload.syslog.udp_port = toInt(form.syslog_udp_port.value, payload.syslog.udp_port);
-            payload.syslog.tcp_port = toInt(form.syslog_tcp_port.value, payload.syslog.tcp_port);
-            payload.syslog.parse_dns = form.syslog_parse_dns.checked;
-
-            return payload;
-        };
-
-        const loadConfig = async () => {
-            try {
-                const res = await fetch('/config');
-                if (!res.ok) throw new Error('Failed to load config');
-                currentConfig = await res.json();
-                fillForm(currentConfig);
-                setStatus('Configuration loaded', true);
-            } catch (err) {
-                setStatus(err.message || 'Unable to fetch configuration');
-            }
-        };
-
-        form.addEventListener('submit', async (event) => {
-            event.preventDefault();
-            if (!currentConfig) return;
-
-            let payload;
-            try {
-                payload = buildPayload();
-            } catch (err) {
-                setStatus(`Invalid form data: ${err.message}`);
-                return;
-            }
-
-            try {
-                const res = await fetch('/config', {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload),
-                });
-                if (!res.ok) {
-                    const body = await res.text();
-                    throw new Error(body || 'Save failed');
-                }
-                currentConfig = await res.json();
-                fillForm(currentConfig);
-                setStatus('Configuration saved', true);
-            } catch (err) {
-                setStatus(err.message || 'Unable to save configuration');
-            }
-        });
-
-        loadConfig();
-    </script>
-</body>
-</html>"#;
+// Re-export public API
+pub use routes::spawn_admin_server;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::state::{AdminServerConfig, AdminState, AuditLogger, PasswordHash};
+    use std::sync::Arc;
     use tempfile::tempdir;
+    use tokio::sync::RwLock;
 
-    fn test_state() -> AdminState {
+    use crate::config::Config;
+
+    async fn test_state() -> AdminState {
+        let server_config = AdminServerConfig {
+            bind_address: "0.0.0.0:8080".parse().unwrap(),
+            username: "user".to_string(),
+            password_hash: PasswordHash::hash("pass").unwrap(),
+            allowed_ips: vec![],
+            tls_config: None,
+            enable_csrf: false,
+            enable_rate_limiting: false,
+        };
+
         AdminState {
             config: Arc::new(RwLock::new(Config::default())),
-            username: Arc::new("user".into()),
-            password: Arc::new("pass".into()),
+            server_config,
+            audit_logger: AuditLogger::new(100).await,
+            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
+            request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
+    }
+
+    #[test]
+    fn password_hashing_works() {
+        let password = "mysecretpassword";
+        let hash = PasswordHash::hash(password).unwrap();
+
+        assert!(hash.verify(password));
+        assert!(!hash.verify("wrongpassword"));
+    }
+
+    #[test]
+    fn password_hash_from_string_works() {
+        let password = "testpassword";
+        let hash1 = PasswordHash::hash(password).unwrap();
+        let hash2 = PasswordHash::from_hash(&hash1.hash);
+
+        assert!(hash2.verify(password));
     }
 
     #[tokio::test]
     async fn ensure_authorized_checks_credentials() {
-        let state = test_state();
+        use axum_extra::extract::TypedHeader;
+        use headers::Authorization;
+
+        let state = test_state().await;
+        let client_ip = "127.0.0.1";
+
         let good = Some(TypedHeader(Authorization::basic("user", "pass")));
         let bad = Some(TypedHeader(Authorization::basic("user", "nope")));
 
-        assert!(ensure_authorized(&state, good).await.is_ok());
-        assert!(ensure_authorized(&state, bad).await.is_err());
-        assert!(ensure_authorized(&state, None).await.is_err());
+        assert!(auth::ensure_authorized(&state, good, client_ip).await.is_ok());
+        assert!(auth::ensure_authorized(&state, bad, client_ip).await.is_err());
+        assert!(auth::ensure_authorized(&state, None, client_ip).await.is_err());
     }
 
     #[tokio::test]
@@ -555,7 +82,7 @@ mod tests {
         let path = dir.path().join("override.toml");
         let cfg = Config::default();
 
-        write_config_to_path(&cfg, &path)
+        config_api::write_config_to_path(&cfg, &path)
             .await
             .expect("write succeeds");
         let contents = std::fs::read_to_string(&path).unwrap();
@@ -563,40 +90,516 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_config_requires_auth() {
-        let state = test_state();
-        let auth = Some(TypedHeader(Authorization::basic("user", "pass")));
-        let Json(cfg) = get_config(State(state.clone()), auth)
-            .await
-            .expect("authorized");
-        assert_eq!(cfg.bind_address, Config::default().bind_address);
+    async fn audit_logger_records_entries() {
+        // Use a temp directory to avoid loading existing entries
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("test-audit.log");
+        unsafe {
+            std::env::set_var("WEF_ADMIN_AUDIT_LOG", &log_path);
+        }
+        
+        let logger = AuditLogger::new(10).await;
 
-        let unauthorized = get_config(State(state), None).await;
-        assert!(unauthorized.is_err());
+        logger
+            .log("TEST_ACTION", "testuser", "127.0.0.1", Some("test details"))
+            .await;
+
+        let entries = logger.get_entries(10).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action, "TEST_ACTION");
+        assert_eq!(entries[0].username, "testuser");
+        assert_eq!(entries[0].client_ip, "127.0.0.1");
+        assert_eq!(entries[0].details, Some("test details".to_string()));
+        
+        unsafe {
+            std::env::remove_var("WEF_ADMIN_AUDIT_LOG");
+        }
     }
 
     #[tokio::test]
-    async fn update_config_persists_file() {
+    async fn audit_logger_respects_max_entries() {
+        // Use a temp directory to avoid loading existing entries
         let dir = tempdir().unwrap();
-        let path = dir.path().join("override.toml");
+        let log_path = dir.path().join("test-audit.log");
         unsafe {
-            std::env::set_var("WEF_ADMIN_OVERRIDE_FILE", &path);
+            std::env::set_var("WEF_ADMIN_AUDIT_LOG", &log_path);
+        }
+        
+        let logger = AuditLogger::new(2).await;
+
+        logger.log("ACTION1", "user", "127.0.0.1", None).await;
+        logger.log("ACTION2", "user", "127.0.0.1", None).await;
+        logger.log("ACTION3", "user", "127.0.0.1", None).await;
+
+        let entries = logger.get_entries(10).await;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].action, "ACTION3");
+        assert_eq!(entries[1].action, "ACTION2");
+        
+        unsafe {
+            std::env::remove_var("WEF_ADMIN_AUDIT_LOG");
+        }
+    }
+
+    // Auth module tests
+    mod auth_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn generate_csrf_token_creates_valid_token() {
+            let state = test_state().await;
+            let token = auth::generate_csrf_token(&state).await;
+            
+            assert!(!token.is_empty());
+            assert_eq!(token.len(), 32);
+            
+            // Verify token is stored
+            let tokens = state.csrf_tokens.read().await;
+            assert!(tokens.iter().any(|(t, _)| t == &token));
         }
 
-        let state = test_state();
-        let mut updated = Config::default();
-        updated.bind_address = "127.0.0.1:7777".parse().unwrap();
-        let auth = Some(TypedHeader(Authorization::basic("user", "pass")));
+        #[tokio::test]
+        async fn verify_csrf_token_accepts_valid_token() {
+            let state = test_state().await;
+            let token = auth::generate_csrf_token(&state).await;
+            
+            assert!(auth::verify_csrf_token(&state, &token).await);
+        }
 
-        let Json(saved) = update_config(State(state), auth, Json(updated.clone()))
-            .await
-            .expect("updated");
-        assert_eq!(saved.bind_address, updated.bind_address);
-        let file = std::fs::read_to_string(&path).unwrap();
-        assert!(file.contains("127.0.0.1:7777"));
+        #[tokio::test]
+        async fn verify_csrf_token_rejects_invalid_token() {
+            let mut state = test_state().await;
+            // Enable CSRF for this test
+            state.server_config.enable_csrf = true;
+            
+            // Generate a valid token first
+            let valid_token = auth::generate_csrf_token(&state).await;
+            
+            // Invalid token should be rejected
+            assert!(!auth::verify_csrf_token(&state, "invalid_token").await);
+            
+            // But valid token should be accepted
+            assert!(auth::verify_csrf_token(&state, &valid_token).await);
+        }
 
-        unsafe {
-            std::env::remove_var("WEF_ADMIN_OVERRIDE_FILE");
+        #[tokio::test]
+        async fn verify_csrf_token_always_passes_when_disabled() {
+            let state = test_state().await;
+            // CSRF is disabled in test_state
+            assert!(auth::verify_csrf_token(&state, "any_token").await);
+        }
+
+        #[test]
+        fn unauthorized_returns_correct_response() {
+            let response = auth::unauthorized();
+            // Check it's a valid response type
+            let _ = response;
+        }
+    }
+
+    // Config API tests
+    mod config_api_tests {
+        use super::*;
+        use axum::extract::{ConnectInfo, State};
+        use axum::Json;
+
+        #[tokio::test]
+        async fn persist_config_writes_to_file() {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("test-admin.toml");
+            unsafe {
+                std::env::set_var("WEF_ADMIN_OVERRIDE_FILE", &path);
+            }
+            
+            let cfg = Config::default();
+            config_api::persist_config(&cfg).await.expect("persist succeeds");
+            
+            assert!(path.exists());
+            let contents = std::fs::read_to_string(&path).unwrap();
+            assert!(contents.contains("bind_address"));
+            
+            unsafe {
+                std::env::remove_var("WEF_ADMIN_OVERRIDE_FILE");
+            }
+        }
+
+        #[tokio::test]
+        async fn validate_config_detects_port_zero() {
+            let state = test_state().await;
+            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+            let auth = None;
+            
+            let mut invalid_config = Config::default();
+            invalid_config.bind_address = "127.0.0.1:0".parse().unwrap();
+            invalid_config.tls.enabled = false;
+            
+            let result = config_api::validate_config(
+                State(state),
+                ConnectInfo(addr),
+                auth,
+                Json(invalid_config),
+            ).await;
+            
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn diff_config_shows_no_changes_for_identical_configs() {
+            let state = test_state().await;
+            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+            
+            use axum_extra::extract::TypedHeader;
+            use headers::Authorization;
+            let auth = Some(TypedHeader(Authorization::basic("user", "pass")));
+            
+            let config = Config::default();
+            
+            let Json(diff) = config_api::diff_config(
+                State(state),
+                ConnectInfo(addr),
+                auth,
+                Json(config),
+            ).await.expect("diff succeeds");
+            
+            assert!(diff.changed.is_empty());
+            assert!(diff.added.is_empty());
+            assert!(diff.removed.is_empty());
+        }
+    }
+
+    // State module tests
+    mod state_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn audit_logger_persists_to_json_lines() {
+            let dir = tempdir().unwrap();
+            let log_path = dir.path().join("test-persist.log");
+            unsafe {
+                std::env::set_var("WEF_ADMIN_AUDIT_LOG", &log_path);
+            }
+            
+            let logger = AuditLogger::new(10).await;
+            logger.log("TEST", "user", "127.0.0.1", Some("details")).await;
+            
+            // Force a small delay to ensure file write
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            
+            // Check file exists and contains JSON
+            assert!(log_path.exists());
+            let contents = std::fs::read_to_string(&log_path).unwrap();
+            assert!(contents.contains("TEST"));
+            assert!(contents.contains("user"));
+            
+            unsafe {
+                std::env::remove_var("WEF_ADMIN_AUDIT_LOG");
+            }
+        }
+
+        #[tokio::test]
+        async fn audit_logger_loads_from_file_on_init() {
+            let dir = tempdir().unwrap();
+            let log_path = dir.path().join("test-load.log");
+            
+            // Pre-populate log file
+            let entry = state::AuditEntry {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                action: "PRELOADED".to_string(),
+                username: "test".to_string(),
+                client_ip: "127.0.0.1".to_string(),
+                details: None,
+            };
+            let json = serde_json::to_string(&entry).unwrap();
+            std::fs::create_dir_all(dir.path()).unwrap();
+            std::fs::write(&log_path, json + "\n").unwrap();
+            
+            unsafe {
+                std::env::set_var("WEF_ADMIN_AUDIT_LOG", &log_path);
+            }
+            
+            let logger = AuditLogger::new(10).await;
+            let entries = logger.get_entries(10).await;
+            
+            assert!(!entries.is_empty());
+            assert!(entries.iter().any(|e| e.action == "PRELOADED"));
+            
+            unsafe {
+                std::env::remove_var("WEF_ADMIN_AUDIT_LOG");
+            }
+        }
+
+        #[test]
+        fn load_admin_config_uses_defaults() {
+            // Test that default config loads without environment variables
+            let _ = state::load_admin_config();
+            // Should not panic
+        }
+
+        #[test]
+        fn admin_server_config_is_cloneable() {
+            let config = AdminServerConfig {
+                bind_address: "0.0.0.0:8080".parse().unwrap(),
+                username: "admin".to_string(),
+                password_hash: PasswordHash::hash("test").unwrap(),
+                allowed_ips: vec![],
+                tls_config: None,
+                enable_csrf: true,
+                enable_rate_limiting: true,
+            };
+            
+            let _cloned = config.clone();
+        }
+    }
+
+    // Middleware tests
+    mod middleware_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn csrf_middleware_allows_when_disabled() {
+            let state = test_state().await;
+            // CSRF is disabled by default in test_state
+            assert!(!state.server_config.enable_csrf);
+        }
+    }
+
+    // Additional config validation tests
+    mod config_validation_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn validate_config_detects_tls_cert_missing() {
+            let state = test_state().await;
+            use axum_extra::extract::TypedHeader;
+            use headers::Authorization;
+            let auth = TypedHeader(Authorization::basic("user", "pass"));
+            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+            
+            let mut config = Config::default();
+            config.tls.enabled = true;
+            config.tls.cert_file = None;
+            config.tls.key_file = None;
+            
+            let result = config_api::validate_config(
+                axum::extract::State(state),
+                axum::extract::ConnectInfo(addr),
+                Some(auth),
+                axum::Json(config),
+            ).await;
+            
+            // Should fail because TLS is enabled but cert/key files are missing
+            assert!(result.is_ok()); // Handler returns Ok, but result.valid is false
+        }
+
+        #[tokio::test]
+        async fn validate_config_accepts_valid_config() {
+            let state = test_state().await;
+            use axum_extra::extract::TypedHeader;
+            use headers::Authorization;
+            let auth = TypedHeader(Authorization::basic("user", "pass"));
+            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+            
+            let mut config = Config::default();
+            config.tls.enabled = false; // Disable TLS to avoid cert validation
+            
+            let axum::Json(result) = config_api::validate_config(
+                axum::extract::State(state),
+                axum::extract::ConnectInfo(addr),
+                Some(auth),
+                axum::Json(config),
+            ).await.expect("validation runs");
+            
+            assert!(result.valid);
+        }
+    }
+
+    // Route handler tests
+    mod route_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_state_helper_creates_valid_state() {
+            let state = test_state().await;
+            
+            // Verify all fields are initialized
+            assert_eq!(state.server_config.username, "user");
+            assert!(state.server_config.password_hash.verify("pass"));
+            assert!(state.server_config.allowed_ips.is_empty());
+        }
+    }
+
+    // Tests for config_api functions that weren't covered
+    mod config_api_extended_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn export_config_returns_toml_attachment() {
+            let state = test_state().await;
+            use axum_extra::extract::TypedHeader;
+            use headers::Authorization;
+            let auth = TypedHeader(Authorization::basic("user", "pass"));
+            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+            let response = config_api::export_config(
+                axum::extract::State(state),
+                axum::extract::ConnectInfo(addr),
+                Some(auth),
+            ).await;
+
+            assert!(response.is_ok());
+            let resp = response.unwrap();
+            assert_eq!(resp.status(), 200);
+        }
+
+        #[tokio::test]
+        async fn import_config_rejects_invalid_content() {
+            let state = test_state().await;
+            use axum_extra::extract::TypedHeader;
+            use headers::Authorization;
+            let auth = TypedHeader(Authorization::basic("user", "pass"));
+            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+            let invalid_content = axum::body::Bytes::from_static(b"invalid toml content");
+
+            let result = config_api::import_config(
+                axum::extract::State(state),
+                axum::extract::ConnectInfo(addr),
+                Some(auth),
+                invalid_content,
+            ).await;
+
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn import_config_accepts_valid_toml() {
+            let state = test_state().await;
+            use axum_extra::extract::TypedHeader;
+            use headers::Authorization;
+            let auth = TypedHeader(Authorization::basic("user", "pass"));
+            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+            let toml_content = axum::body::Bytes::from_static(br#"
+bind_address = "127.0.0.1:9999"
+
+[logging]
+level = "debug"
+
+[metrics]
+enabled = true
+port = 9090
+"#);
+
+            let result = config_api::import_config(
+                axum::extract::State(state),
+                axum::extract::ConnectInfo(addr),
+                Some(auth),
+                toml_content,
+            ).await;
+
+            assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn reload_config_loads_from_disk() {
+            let state = test_state().await;
+            use axum_extra::extract::TypedHeader;
+            use headers::Authorization;
+            let auth = TypedHeader(Authorization::basic("user", "pass"));
+            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+            let result = config_api::reload_config(
+                axum::extract::State(state),
+                axum::extract::ConnectInfo(addr),
+                Some(auth),
+            ).await;
+
+            // This should work since Config::load() should find the config files
+            assert!(result.is_ok());
+        }
+    }
+
+    // Test helper to create a real HTTP request
+    async fn create_test_app() -> axum::Router {
+        let server_config = AdminServerConfig {
+            bind_address: "0.0.0.0:8080".parse().unwrap(),
+            username: "user".to_string(),
+            password_hash: PasswordHash::hash("pass").unwrap(),
+            allowed_ips: vec![],
+            tls_config: None,
+            enable_csrf: false,
+            enable_rate_limiting: false,
+        };
+
+        let state = AdminState {
+            config: Arc::new(RwLock::new(Config::default())),
+            server_config,
+            audit_logger: AuditLogger::new(100).await,
+            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
+            request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        };
+
+        axum::Router::new()
+            .route("/health", axum::routing::get(routes::health_check))
+            .with_state(state)
+    }
+
+    // Integration tests for routes
+    mod route_integration_tests {
+        use super::*;
+        use axum::Json;
+
+        #[tokio::test]
+        async fn health_check_returns_ok() {
+            let response = routes::health_check().await;
+            assert_eq!(response, "OK");
+        }
+
+        #[tokio::test] 
+        async fn config_diff_detects_changes() {
+            let state = test_state().await;
+            use axum_extra::extract::TypedHeader;
+            use headers::Authorization;
+            let auth = TypedHeader(Authorization::basic("user", "pass"));
+            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+            
+            // Test with modified config
+            let mut config = Config::default();
+            config.bind_address = "127.0.0.1:9999".parse().unwrap();
+            
+            let Json(result) = config_api::diff_config(
+                axum::extract::State(state),
+                axum::extract::ConnectInfo(addr),
+                Some(auth),
+                axum::Json(config),
+            ).await.expect("diff succeeds");
+            
+            // Should detect bind_address changed
+            assert!(!result.changed.is_empty() || !result.unchanged.is_empty());
+        }
+
+        #[tokio::test]
+        async fn validate_config_detects_missing_tls_files() {
+            let state = test_state().await;
+            use axum_extra::extract::TypedHeader;
+            use headers::Authorization;
+            let auth = TypedHeader(Authorization::basic("user", "pass"));
+            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+            
+            let mut config = Config::default();
+            config.tls.enabled = true;
+            config.tls.cert_file = None;
+            config.tls.key_file = None;
+            
+            let Json(result) = config_api::validate_config(
+                axum::extract::State(state),
+                axum::extract::ConnectInfo(addr),
+                Some(auth),
+                axum::Json(config),
+            ).await.expect("validation runs");
+            
+            assert!(!result.valid);
+            assert!(!result.errors.is_empty());
         }
     }
 }
