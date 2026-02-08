@@ -286,6 +286,25 @@ fn default_syslog_parse_dns() -> bool {
 }
 
 impl Config {
+    /// Load configuration from files and environment variables.
+    ///
+    /// Configuration is loaded from the following sources (in order of precedence):
+    /// 1. Default values
+    /// 2. `wef-server.toml` file (optional)
+    /// 3. Admin override file (`wef-server.admin.toml`, optional)
+    /// 4. `/etc/wef-server/config.toml` (optional)
+    /// 5. Environment variables with `WEF__` prefix
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use wef_server::config::Config;
+    ///
+    /// // Load configuration from default locations
+    /// let config = Config::load()?;
+    /// println!("Server will bind to: {}", config.bind_address);
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
     pub fn load() -> anyhow::Result<Self> {
         let mut builder = config::Config::builder();
 
@@ -322,8 +341,28 @@ mod tests {
 
     #[test]
     fn load_reads_configuration_file() {
-        let cfg = Config::load().expect("config loads");
-        assert!(!cfg.tls.enabled, "wef-server.toml disables TLS");
-        assert!(cfg.forwarding.destinations.len() >= 1);
+        // Temporarily rename admin override file if it exists to test base config loading
+        let admin_override = Path::new(ADMIN_OVERRIDE_FILE);
+        let admin_override_backup = Path::new("wef-server.admin.toml.bak");
+        let had_override = admin_override.exists();
+
+        if had_override {
+            std::fs::rename(admin_override, admin_override_backup).expect("rename override file");
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let cfg = Config::load().expect("config loads");
+            assert!(!cfg.tls.enabled, "wef-server.toml disables TLS");
+            assert!(cfg.forwarding.destinations.len() >= 1);
+        });
+
+        // Restore admin override file
+        if had_override {
+            std::fs::rename(admin_override_backup, admin_override).expect("restore override file");
+        }
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 }

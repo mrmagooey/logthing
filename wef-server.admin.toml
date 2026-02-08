@@ -1,0 +1,33 @@
+bind_address = "127.0.0.1:9999"
+
+[tls]
+enabled = true
+port = 5986
+require_client_cert = false
+
+[security]
+allowed_ips = []
+max_connections = 10000
+connection_timeout_secs = 300
+
+[security.kerberos]
+enabled = false
+
+[forwarding]
+destinations = []
+buffer_size = 10000
+retry_attempts = 3
+
+[logging]
+level = "debug"
+format = "pretty"
+
+[metrics]
+enabled = true
+port = 9090
+
+[syslog]
+enabled = true
+udp_port = 514
+tcp_port = 601
+parse_dns = true
