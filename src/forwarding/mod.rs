@@ -18,6 +18,26 @@ struct Destination {
 }
 
 impl Forwarder {
+    /// Create a new event forwarder with the given destination configurations.
+    ///
+    /// The forwarder must be initialized with `initialize()` before use.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use wef_server::forwarding::Forwarder;
+    /// use wef_server::config::DestinationConfig;
+    ///
+    /// let destinations = vec![DestinationConfig {
+    ///     name: "http-destination".to_string(),
+    ///     url: "http://example.com/events".to_string(),
+    ///     protocol: wef_server::config::ForwardProtocol::Http,
+    ///     enabled: true,
+    ///     headers: std::collections::HashMap::new(),
+    /// }];
+    ///
+    /// let forwarder = Forwarder::new(destinations);
+    /// ```
     pub fn new(_destinations: Vec<DestinationConfig>) -> Self {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -30,6 +50,29 @@ impl Forwarder {
         }
     }
 
+    /// Initialize the forwarder and start forwarding tasks.
+    ///
+    /// This spawns async tasks for each enabled destination to handle event forwarding.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use wef_server::forwarding::Forwarder;
+    /// use wef_server::config::DestinationConfig;
+    ///
+    /// async fn setup_forwarder() {
+    ///     let destinations = vec![DestinationConfig {
+    ///         name: "http-destination".to_string(),
+    ///         url: "http://example.com/events".to_string(),
+    ///         protocol: wef_server::config::ForwardProtocol::Http,
+    ///         enabled: true,
+    ///         headers: std::collections::HashMap::new(),
+    ///     }];
+    ///
+    ///     let forwarder = Forwarder::new(destinations).initialize().await;
+    ///     // forwarder.forward(event).await;
+    /// }
+    /// ```
     pub async fn initialize(mut self) -> Self {
         let mut new_destinations = Vec::new();
 
@@ -71,6 +114,25 @@ impl Forwarder {
         self
     }
 
+    /// Forward an event to all configured destinations.
+    ///
+    /// The event is queued for each destination and sent asynchronously.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use wef_server::forwarding::Forwarder;
+    /// use wef_server::models::WindowsEvent;
+    ///
+    /// async fn forward_event(forwarder: &Forwarder) {
+    ///     let event = WindowsEvent::new(
+    ///         "workstation01".to_string(),
+    ///         "<Event><System><EventID>4624</EventID></System></Event>".to_string()
+    ///     );
+    ///
+    ///     forwarder.forward(event).await;
+    /// }
+    /// ```
     pub async fn forward(&self, event: WindowsEvent) {
         for dest in &self.destinations {
             if let Err(e) = dest.sender.send(event.clone()).await {

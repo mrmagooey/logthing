@@ -48,6 +48,21 @@ impl Default for EventLevel {
 }
 
 impl WindowsEvent {
+    /// Create a new Windows event with the given source host and raw XML.
+    ///
+    /// The event is assigned a unique UUID and the current timestamp.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use wef_server::models::WindowsEvent;
+    ///
+    /// let xml = r#"<Event><System><EventID>4624</EventID></System></Event>"#;
+    /// let event = WindowsEvent::new("workstation01".to_string(), xml.to_string());
+    ///
+    /// assert_eq!(event.source_host, "workstation01");
+    /// assert!(event.parsed.is_none());
+    /// ```
     pub fn new(source_host: String, raw_xml: String) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -59,6 +74,36 @@ impl WindowsEvent {
         }
     }
 
+    /// Add parsed event data using the builder pattern.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use wef_server::models::{WindowsEvent, ParsedEvent, EventLevel};
+    ///
+    /// let xml = r#"<Event><System><EventID>4624</EventID></System></Event>"#;
+    /// let event = WindowsEvent::new("workstation01".to_string(), xml.to_string())
+    ///     .with_parsed(ParsedEvent {
+    ///         provider: "Microsoft-Windows-Security-Auditing".to_string(),
+    ///         event_id: 4624,
+    ///         level: EventLevel::Information,
+    ///         task: 12544,
+    ///         opcode: 0,
+    ///         keywords: 0,
+    ///         time_created: chrono::Utc::now(),
+    ///         event_record_id: 1,
+    ///         process_id: None,
+    ///         thread_id: None,
+    ///         channel: "Security".to_string(),
+    ///         computer: "WORKSTATION01".to_string(),
+    ///         security_user_id: None,
+    ///         message: Some("User logged on".to_string()),
+    ///         data: None,
+    ///     });
+    ///
+    /// assert!(event.parsed.is_some());
+    /// assert_eq!(event.parsed.unwrap().event_id, 4624);
+    /// ```
     pub fn with_parsed(mut self, parsed: ParsedEvent) -> Self {
         self.parsed = Some(parsed);
         self
