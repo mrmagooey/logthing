@@ -24,6 +24,7 @@ hyper = { version = "1.0", features = ["full"] }
 rustls = "0.23"
 tokio-rustls = "0.26"
 rustls-pemfile = "2.0"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 
 # Serialization/Deserialization
 serde = { version = "1.0", features = ["derive"] }
@@ -76,6 +77,11 @@ tempfile = "3.9"
 bytes = "1.5"
 regex = "1.10"
 async-trait = "0.1"
+hex = "0.4.3"
+
+# Security
+argon2 = { version = "0.5", features = ["std", "password-hash", "rand"] }
+rand = "0.9.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
