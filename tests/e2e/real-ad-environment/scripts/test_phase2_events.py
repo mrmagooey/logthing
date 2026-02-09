@@ -20,6 +20,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -66,26 +67,29 @@ results = {
     "tests": [],
     "passed": 0,
     "failed": 0,
-    "errors": []
+    "errors": [],
 }
 
 
 class TestResult:
     """Represents a single test result"""
-    def __init__(self, name: str, status: str, message: str = "", details: Optional[Dict] = None):
+
+    def __init__(
+        self, name: str, status: str, message: str = "", details: Optional[Dict] = None
+    ):
         self.name = name
         self.status = status
         self.message = message
         self.details = details or {}
         self.timestamp = datetime.now().isoformat()
-    
+
     def to_dict(self) -> Dict:
         return {
             "name": self.name,
             "status": self.status,
             "message": self.message,
             "details": self.details,
-            "timestamp": self.timestamp
+            "timestamp": self.timestamp,
         }
 
 
@@ -113,20 +117,22 @@ def parse_metric(metrics: str, metric_name: str) -> Optional[int]:
 def test_event_reception(wef_server: str) -> TestResult:
     """Test that events are being received from Windows clients"""
     test_name = "Event Reception"
-    
+
     try:
         # Get initial metrics
         initial_metrics = get_metrics(wef_server)
-        initial_received = parse_metric(initial_metrics, "wef_events_received_total") or 0
-        
+        initial_received = (
+            parse_metric(initial_metrics, "wef_events_received_total") or 0
+        )
+
         # Wait for events to arrive (give some time for batching)
         print(f"  Waiting for events to arrive (current: {initial_received})...")
         time.sleep(10)
-        
+
         # Get updated metrics
         final_metrics = get_metrics(wef_server)
         final_received = parse_metric(final_metrics, "wef_events_received_total") or 0
-        
+
         if final_received > initial_received:
             return TestResult(
                 test_name,
@@ -135,15 +141,15 @@ def test_event_reception(wef_server: str) -> TestResult:
                 {
                     "initial_count": initial_received,
                     "final_count": final_received,
-                    "new_events": final_received - initial_received
-                }
+                    "new_events": final_received - initial_received,
+                },
             )
         else:
             return TestResult(
                 test_name,
                 "FAILED",
                 f"No new events received (total: {final_received})",
-                {"total_events": final_received}
+                {"total_events": final_received},
             )
     except Exception as e:
         return TestResult(test_name, "FAILED", f"Error: {e}")
@@ -152,12 +158,12 @@ def test_event_reception(wef_server: str) -> TestResult:
 def test_event_forwarding(wef_server: str) -> TestResult:
     """Test that events are being forwarded to destinations"""
     test_name = "Event Forwarding"
-    
+
     try:
         metrics = get_metrics(wef_server)
         forwarded = parse_metric(metrics, "wef_events_forwarded_total") or 0
         received = parse_metric(metrics, "wef_events_received_total") or 0
-        
+
         if forwarded > 0 and received > 0:
             forward_rate = (forwarded / received) * 100
             return TestResult(
@@ -167,22 +173,22 @@ def test_event_forwarding(wef_server: str) -> TestResult:
                 {
                     "received": received,
                     "forwarded": forwarded,
-                    "forward_rate": forward_rate
-                }
+                    "forward_rate": forward_rate,
+                },
             )
         elif received > 0 and forwarded == 0:
             return TestResult(
                 test_name,
                 "FAILED",
                 f"Events received but not forwarded ({received} received, {forwarded} forwarded)",
-                {"received": received, "forwarded": forwarded}
+                {"received": received, "forwarded": forwarded},
             )
         else:
             return TestResult(
                 test_name,
                 "FAILED",
                 "No events received or forwarded",
-                {"received": received, "forwarded": forwarded}
+                {"received": received, "forwarded": forwarded},
             )
     except Exception as e:
         return TestResult(test_name, "FAILED", f"Error: {e}")
@@ -191,13 +197,13 @@ def test_event_forwarding(wef_server: str) -> TestResult:
 def test_event_type_coverage(wef_server: str) -> TestResult:
     """Test that different event types are being received"""
     test_name = "Event Type Coverage"
-    
+
     try:
         # This test would ideally check S3 for different event type directories
         # For now, we'll check if events are being received at all
         metrics = get_metrics(wef_server)
         received = parse_metric(metrics, "wef_events_received_total") or 0
-        
+
         if received >= len(EXPECTED_EVENT_TYPES):
             return TestResult(
                 test_name,
@@ -206,15 +212,15 @@ def test_event_type_coverage(wef_server: str) -> TestResult:
                 {
                     "total_events": received,
                     "expected_types": len(EXPECTED_EVENT_TYPES),
-                    "event_types": list(EXPECTED_EVENT_TYPES.keys())
-                }
+                    "event_types": list(EXPECTED_EVENT_TYPES.keys()),
+                },
             )
         else:
             return TestResult(
                 test_name,
                 "FAILED",
                 f"Insufficient event volume ({received} events, need at least {len(EXPECTED_EVENT_TYPES)})",
-                {"total_events": received, "expected_types": len(EXPECTED_EVENT_TYPES)}
+                {"total_events": received, "expected_types": len(EXPECTED_EVENT_TYPES)},
             )
     except Exception as e:
         return TestResult(test_name, "FAILED", f"Error: {e}")
@@ -223,29 +229,28 @@ def test_event_type_coverage(wef_server: str) -> TestResult:
 def test_s3_storage(args) -> TestResult:
     """Test that events are being stored in S3/MinIO"""
     test_name = "S3 Storage"
-    
+
     try:
         # Use mc (MinIO client) or AWS CLI to check S3 bucket
         # First, let's try to list objects
         result = subprocess.run(
-            [
-                "mc", "ls", 
-                f"--json",
-                f"minio/{DEFAULT_S3_BUCKET}/"
-            ],
+            ["mc", "ls", f"--json", f"minio/{DEFAULT_S3_BUCKET}/"],
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
         )
-        
+
         if result.returncode != 0:
             # Try with AWS CLI as fallback
             result = subprocess.run(
                 [
-                    "aws", "s3", "ls",
+                    "aws",
+                    "s3",
+                    "ls",
                     f"s3://{DEFAULT_S3_BUCKET}/",
-                    "--endpoint-url", args.s3_endpoint,
-                    "--recursive"
+                    "--endpoint-url",
+                    args.s3_endpoint,
+                    "--recursive",
                 ],
                 capture_output=True,
                 text=True,
@@ -253,37 +258,35 @@ def test_s3_storage(args) -> TestResult:
                 env={
                     **subprocess.os.environ,
                     "AWS_ACCESS_KEY_ID": DEFAULT_S3_ACCESS_KEY,
-                    "AWS_SECRET_ACCESS_KEY": DEFAULT_S3_SECRET_KEY
-                }
+                    "AWS_SECRET_ACCESS_KEY": DEFAULT_S3_SECRET_KEY,
+                },
             )
-        
+
         if result.returncode == 0 and result.stdout.strip():
             lines = result.stdout.strip().split("\n")
             return TestResult(
                 test_name,
                 "PASSED",
                 f"S3 bucket contains {len(lines)} object(s)",
-                {"object_count": len(lines)}
+                {"object_count": len(lines)},
             )
         elif result.returncode == 0:
             return TestResult(
                 test_name,
                 "FAILED",
                 "S3 bucket exists but is empty",
-                {"s3_output": result.stdout}
+                {"s3_output": result.stdout},
             )
         else:
             return TestResult(
                 test_name,
                 "FAILED",
                 f"Failed to access S3 bucket: {result.stderr}",
-                {"error": result.stderr}
+                {"error": result.stderr},
             )
     except FileNotFoundError:
         return TestResult(
-            test_name,
-            "SKIPPED",
-            "MinIO client (mc) or AWS CLI not available"
+            test_name, "SKIPPED", "MinIO client (mc) or AWS CLI not available"
         )
     except subprocess.TimeoutExpired:
         return TestResult(test_name, "FAILED", "S3 access timeout")
@@ -294,53 +297,46 @@ def test_s3_storage(args) -> TestResult:
 def test_parquet_format(args) -> TestResult:
     """Test that events are stored in valid Parquet format"""
     test_name = "Parquet Format"
-    
+
     # Try to import pyarrow - optional dependency
     try:
         import pyarrow.parquet as pq
     except ImportError:
         return TestResult(
-            test_name,
-            "SKIPPED",
-            "pyarrow not installed, cannot verify Parquet format"
+            test_name, "SKIPPED", "pyarrow not installed, cannot verify Parquet format"
         )
-    
+
     try:
-        
         # First, find a Parquet file in S3
         result = subprocess.run(
             ["mc", "find", f"minio/{DEFAULT_S3_BUCKET}/", "--name", "*.parquet"],
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
         )
-        
+
         if result.returncode != 0 or not result.stdout.strip():
             return TestResult(
-                test_name,
-                "FAILED",
-                "No Parquet files found in S3 bucket"
+                test_name, "FAILED", "No Parquet files found in S3 bucket"
             )
-        
+
         # Download the first Parquet file
         parquet_file = result.stdout.strip().split("\n")[0]
-        local_path = "/tmp/test_sample.parquet"
-        
+        local_path = os.path.join(tempfile.gettempdir(), "test_sample.parquet")
+
         subprocess.run(
-            ["mc", "cp", parquet_file, local_path],
-            capture_output=True,
-            timeout=30
+            ["mc", "cp", parquet_file, local_path], capture_output=True, timeout=30
         )
-        
+
         # Try to read the Parquet file
         table = pq.read_table(local_path)
         schema = table.schema
         row_count = len(table)
-        
+
         # Check for expected columns
         expected_columns = ["event_id", "timestamp", "computer", "event_data"]
         found_columns = [field.name for field in schema]
-        
+
         return TestResult(
             test_name,
             "PASSED",
@@ -349,15 +345,13 @@ def test_parquet_format(args) -> TestResult:
                 "row_count": row_count,
                 "column_count": len(found_columns),
                 "columns": found_columns,
-                "expected_columns": expected_columns
-            }
+                "expected_columns": expected_columns,
+            },
         )
-        
+
     except ImportError:
         return TestResult(
-            test_name,
-            "SKIPPED",
-            "pyarrow not installed, cannot verify Parquet format"
+            test_name, "SKIPPED", "pyarrow not installed, cannot verify Parquet format"
         )
     except Exception as e:
         return TestResult(test_name, "FAILED", f"Error: {e}")
@@ -366,34 +360,33 @@ def test_parquet_format(args) -> TestResult:
 def test_parser_accuracy(args) -> TestResult:
     """Test that event parsers are correctly extracting fields"""
     test_name = "Parser Accuracy"
-    
+
     try:
         # Check if parsers are configured
         import os
+
         parser_dir = "/etc/wef-server/event_parsers"
-        
+
         if not os.path.exists(parser_dir):
             return TestResult(
-                test_name,
-                "SKIPPED",
-                f"Parser directory not found: {parser_dir}"
+                test_name, "SKIPPED", f"Parser directory not found: {parser_dir}"
             )
-        
-        parser_files = [f for f in os.listdir(parser_dir) if f.endswith('.yaml')]
-        
+
+        parser_files = [f for f in os.listdir(parser_dir) if f.endswith(".yaml")]
+
         if len(parser_files) >= 10:  # We expect at least 10 parsers
             return TestResult(
                 test_name,
                 "PASSED",
                 f"Found {len(parser_files)} event parser configuration files",
-                {"parser_count": len(parser_files), "parsers": parser_files[:10]}
+                {"parser_count": len(parser_files), "parsers": parser_files[:10]},
             )
         else:
             return TestResult(
                 test_name,
                 "FAILED",
                 f"Insufficient parser configurations ({len(parser_files)} found, expected >= 10)",
-                {"parser_count": len(parser_files)}
+                {"parser_count": len(parser_files)},
             )
     except Exception as e:
         return TestResult(test_name, "FAILED", f"Error: {e}")
@@ -402,30 +395,30 @@ def test_parser_accuracy(args) -> TestResult:
 def test_syslog_integration(wef_server: str) -> TestResult:
     """Test that syslog messages are being received and parsed"""
     test_name = "Syslog Integration"
-    
+
     try:
         # Send a test syslog message
         import socket
-        
+
         # UDP syslog test
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         test_message = f"<134>{datetime.now().strftime('%b %d %H:%M:%S')} test-host wef-test: Test syslog message from Phase 2 testing"
         sock.sendto(test_message.encode(), (wef_server, 514))
         sock.close()
-        
+
         # Wait for processing
         time.sleep(2)
-        
+
         # Check metrics for syslog events
         metrics = get_metrics(wef_server)
         # Note: We may not have a specific syslog metric, so we'll check general event reception
         received = parse_metric(metrics, "wef_events_received_total") or 0
-        
+
         return TestResult(
             test_name,
             "PASSED",
             "Syslog test message sent successfully",
-            {"test_message": test_message, "total_events": received}
+            {"test_message": test_message, "total_events": received},
         )
     except Exception as e:
         return TestResult(test_name, "FAILED", f"Error: {e}")
@@ -437,12 +430,12 @@ def run_tests(args) -> Tuple[int, int, int]:
     print("PHASE 2: Event Types & Parsing Validation")
     print("=" * 60)
     print()
-    
+
     wef_server = args.wef_server
     passed = 0
     failed = 0
     skipped = 0
-    
+
     tests = [
         ("Event Reception", lambda: test_event_reception(wef_server)),
         ("Event Forwarding", lambda: test_event_forwarding(wef_server)),
@@ -452,12 +445,12 @@ def run_tests(args) -> Tuple[int, int, int]:
         ("Parser Accuracy", lambda: test_parser_accuracy(args)),
         ("Syslog Integration", lambda: test_syslog_integration(wef_server)),
     ]
-    
+
     for test_name, test_func in tests:
         print(f"Testing {test_name}...")
         result = test_func()
         results["tests"].append(result.to_dict())
-        
+
         if result.status == "PASSED":
             passed += 1
             print(f"  ✓ {test_name}: {result.message}")
@@ -468,17 +461,17 @@ def run_tests(args) -> Tuple[int, int, int]:
             failed += 1
             print(f"  ✗ {test_name}: {result.message}")
         print()
-    
+
     # Save results
     results["passed"] = passed
     results["failed"] = failed
     results["skipped"] = skipped
-    
+
     if args.output:
         with open(args.output, "w") as f:
             json.dump(results, f, indent=2)
         print(f"Results saved to: {args.output}")
-    
+
     return passed, failed, skipped
 
 
@@ -489,23 +482,23 @@ def main():
     parser.add_argument(
         "--wef-server",
         default=DEFAULT_WEF_SERVER,
-        help=f"WEF server hostname or IP (default: {DEFAULT_WEF_SERVER})"
+        help=f"WEF server hostname or IP (default: {DEFAULT_WEF_SERVER})",
     )
     parser.add_argument(
         "--s3-endpoint",
         default=DEFAULT_S3_ENDPOINT,
-        help=f"S3/MinIO endpoint URL (default: {DEFAULT_S3_ENDPOINT})"
+        help=f"S3/MinIO endpoint URL (default: {DEFAULT_S3_ENDPOINT})",
     )
     parser.add_argument(
         "--output",
         default="/var/log/wef-tests/phase2-results.json",
-        help="Output file for test results"
+        help="Output file for test results",
     )
-    
+
     args = parser.parse_args()
-    
+
     passed, failed, skipped = run_tests(args)
-    
+
     print("=" * 60)
     print("TEST SUMMARY")
     print("=" * 60)
@@ -513,7 +506,7 @@ def main():
     print(f"Failed:  {failed}")
     print(f"Skipped: {skipped}")
     print("=" * 60)
-    
+
     if failed > 0:
         print(f"\nPhase 2 tests completed with {failed} failure(s)")
         sys.exit(1)

@@ -732,8 +732,9 @@ port = 9090
             config.tls.enabled = true;
             config.tls.require_client_cert = true;
             config.tls.ca_file = None;
-            config.tls.cert_file = Some("/tmp/cert.pem".into());
-            config.tls.key_file = Some("/tmp/key.pem".into());
+            let temp_dir = std::env::temp_dir();
+            config.tls.cert_file = Some(temp_dir.join("cert.pem"));
+            config.tls.key_file = Some(temp_dir.join("key.pem"));
             
             let Json(result) = config_api::validate_config(
                 axum::extract::State(state),
