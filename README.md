@@ -46,10 +46,13 @@ enabled = true
 port = 5986
 cert_file = "/path/to/cert.pem"
 key_file = "/path/to/key.pem"
+ca_file = "/path/to/ca.pem"           # Optional: for client certificate verification
+require_client_cert = false           # Set to true to enforce mTLS
 
 [security]
 allowed_ips = ["192.168.1.0/24", "10.0.0.0/8"]
 max_connections = 10000
+connection_timeout_secs = 300
 
 [[forwarding.destinations]]
 name = "elasticsearch"
@@ -66,7 +69,24 @@ enabled = true
 [metrics]
 enabled = true
 port = 9090
+
+[syslog]
+enabled = true
+udp_port = 514
+tcp_port = 601
+parse_dns = true
 ```
+
+### Configuration Sources
+
+Configuration is loaded from multiple sources (in order of precedence):
+1. Default values
+2. `wef-server.toml` file (optional)
+3. **Admin override file** (`wef-server.admin.toml`, optional) - takes precedence over main config
+4. `/etc/wef-server/config.toml` (optional)
+5. Environment variables with `WEF__` prefix (double underscore for nesting)
+
+The admin override file is useful for runtime configuration changes without modifying the main config file.
 
 ### Kerberos Client Authentication
 
@@ -147,48 +167,23 @@ Store Windows events in S3-compatible storage (AWS S3, MinIO, etc.) as compresse
 [[forwarding.destinations]]
 name = "parquet-s3"
 url = "s3://wef-events"
-protocol = "http"
+protocol = "http"                       # Note: Use "http" protocol for S3 destinations
 enabled = true
 [forwarding.destinations.headers]
-endpoint = "http://localhost:9000"      # S3 endpoint
+endpoint = "http://localhost:9000"      # S3 endpoint (MinIO, AWS S3, etc.)
 region = "us-east-1"                    # AWS region
 access-key = "minioadmin"               # Access key
 secret-key = "minioadmin"               # Secret key
 max-size-mb = "100"                     # Flush at 100MB
 flush-interval-secs = "900"             # Flush every 15 minutes
-buffer-path = "/tmp/wef-events"         # Local temp directory
+buffer-path = "/tmp/wef-events"         # Local temp directory for buffering
 ```
 
 **Features**:
 - **Event Type Partitioning**: Each Windows Event ID gets its own Parquet file
 - **Time-Based Partitioning**: Files organized by `event_type/year/month/day/`
 - **Batching**: Flushes when reaching 100MB or 15 minutes (configurable)
-
-## End-to-End Test Harness
-
-Spin up a self-contained validation stack (WEF server, generators, MinIO) to exercise the full data path.
-
-Requirements: Docker with Compose v2.
-
-```bash
-# from repo root
-bash tests/e2e/run.sh
-```
-
-This script builds the helper images, launches `tests/e2e/docker-compose.yml`, replays Windows event fixtures, emits syslog traffic, verifies throughput counters, and confirms Parquet files arrive in the MinIO bucket. Containers shut down automatically once the generators and verifier exit.
 - **Compression**: ZSTD compression for efficient storage
-- **Timestamped Files**: Each file named with timestamp for uniqueness
-
-## Test Coverage
-
-Generate coverage reports with [cargo-tarpaulin](https://github.com/xd009642/tarpaulin):
-
-```bash
-cargo install cargo-tarpaulin        # one-time tool install
-scripts/run_coverage.sh              # runs tests with instrumentation
-```
-
-The helper script writes HTML and XML reports to `target/coverage/`, so you can open `target/coverage/tarpaulin-report.html` locally or feed the LCOV/XML data into CI.
 
 **S3 Path Structure**:
 ```
@@ -204,6 +199,60 @@ s3://bucket-name/
         day=15/
           events_4668_20240115_104512.parquet
 ```
+
+## End-to-End Test Harness
+
+Spin up a self-contained validation stack (WEF server, generators, MinIO) to exercise the full data path.
+
+Requirements: Docker with Compose v2.
+
+```bash
+# from repo root
+bash tests/e2e/simulation-environment/run.sh
+```
+
+This script builds the helper images, launches `tests/e2e/docker-compose.yml`, replays Windows event fixtures, emits syslog traffic, verifies throughput counters, and confirms Parquet files arrive in the MinIO bucket. Containers shut down automatically once the generators and verifier exit.
+
+### Performance Testing
+
+The E2E suite includes comprehensive performance tests:
+
+**Test Coverage:**
+- **Baseline Performance**: Maximum throughput measurement (~48k events/second)
+- **Target Rate Tests**: Sustained load at 100k, 200k, and 500k RPS targets
+- **10k Sustained Test**: 60-second test validating both ingestion and S3 parquet file generation (100MB file limit)
+
+```bash
+# Run specific performance test
+cd tests/e2e/simulation-environment
+docker compose up -d wef-server-10k-sustained
+docker compose run --rm performance-test-10k-sustained
+
+# View performance test documentation
+cat tests/e2e/simulation-environment/performance-test/README.md
+```
+
+**Example Performance Test Output:**
+```
+Performance Test Results
+========================
+Total time: 60.07 seconds
+Events sent: 570,000
+Overall ingestion rate: 9489.41 events/second
+S3 files: 12 parquet files (20.93 MB total)
+Status: ✓ PASSED
+```
+
+## Test Coverage
+
+Generate coverage reports with [cargo-tarpaulin](https://github.com/xd009642/tarpaulin):
+
+```bash
+cargo install cargo-tarpaulin        # one-time tool install
+scripts/run_coverage.sh              # runs tests with instrumentation
+```
+
+The helper script writes HTML and XML reports to `target/coverage/`, so you can open `target/coverage/tarpaulin-report.html` locally or feed the LCOV/XML data into CI.
 
 ### Generic Event Parser Configuration
 
@@ -305,8 +354,11 @@ The repository ships example parsers for 50 high-value Windows Security events. 
 # Run with config file
 ./wef-server
 
-# Or with environment variables
-WEF_BIND_ADDRESS=0.0.0.0:5985 WEF_TLS_ENABLED=true ./wef-server
+# Or with environment variables (note the double underscore)
+WEF__BIND_ADDRESS=0.0.0.0:5985 WEF__TLS__ENABLED=true ./wef-server
+
+# For nested configuration values
+WEF__SECURITY__MAX_CONNECTIONS=5000 WEF__METRICS__PORT=8080 ./wef-server
 ```
 
 ## Windows Client Configuration
