@@ -12,6 +12,7 @@ Validates that:
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -113,9 +114,7 @@ def wait_for_parquet_files() -> List[str]:
             resp = client.list_objects_v2(Bucket=BUCKET)
             contents = resp.get("Contents", [])
             parquet_files = [
-                obj["Key"]
-                for obj in contents
-                if obj["Key"].endswith(".parquet")
+                obj["Key"] for obj in contents if obj["Key"].endswith(".parquet")
             ]
 
             if parquet_files:
@@ -132,7 +131,8 @@ def wait_for_parquet_files() -> List[str]:
 def download_and_read_parquet(key: str) -> Tuple[Optional[pq.ParquetFile], str]:
     """Download and read a Parquet file from S3."""
     client = get_s3_client()
-    local_path = f"/tmp/{key.replace('/', '_')}"
+    temp_dir = tempfile.gettempdir()
+    local_path = os.path.join(temp_dir, key.replace("/", "_"))
 
     try:
         client.download_file(BUCKET, key, local_path)

@@ -435,7 +435,8 @@ mod tests {
         headers.insert("secret-key".into(), "SECRET".into());
         headers.insert("max-size-mb".into(), "1".into());
         headers.insert("flush-interval-secs".into(), "60".into());
-        headers.insert("buffer-path".into(), "/tmp/test-buf".into());
+        let temp_path = std::env::temp_dir().join("test-buf");
+        headers.insert("buffer-path".into(), temp_path.to_string_lossy().to_string());
 
         DestinationConfig {
             name: "parquet".into(),
@@ -474,7 +475,8 @@ mod tests {
         assert_eq!(cfg.endpoint, "http://minio:9000");
         assert_eq!(cfg.max_file_size_mb, 1);
         assert_eq!(cfg.flush_interval_secs, 60);
-        assert_eq!(cfg.local_buffer_path, PathBuf::from("/tmp/test-buf"));
+        let expected_path = std::env::temp_dir().join("test-buf");
+        assert_eq!(cfg.local_buffer_path, expected_path);
     }
 
     #[test]
