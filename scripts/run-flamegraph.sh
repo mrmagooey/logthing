@@ -1,7 +1,8 @@
 #!/bin/bash
 # Run cargo flamegraph for profiling
 
-cd /home/peter/projects/logthing
+# Change to repo root (parent of scripts directory)
+cd "$(dirname "$0")/.."
 
 # Kill any existing server
 pkill -f wef-server || true
@@ -24,4 +25,4 @@ echo "Waiting for flamegraph to complete..."
 wait $SERVER_PID 2>/dev/null || true
 
 echo ""
-echo "Flamegraph saved to: /home/peter/projects/logthing/flamegraph.svg"
+echo "Flamegraph saved to: flamegraph.svg"
