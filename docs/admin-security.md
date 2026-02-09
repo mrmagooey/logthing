@@ -1,6 +1,6 @@
 # Admin Interface Security Hardening
 
-This document describes the security hardening improvements implemented in the WEF admin interface.
+This document describes the security hardening improvements implemented in the Logthing admin interface.
 
 ## Security Features
 

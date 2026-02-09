@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-pub const ADMIN_OVERRIDE_FILE: &str = "wef-server.admin.toml";
+pub const ADMIN_OVERRIDE_FILE: &str = "logthing.admin.toml";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -290,9 +290,9 @@ impl Config {
     ///
     /// Configuration is loaded from the following sources (in order of precedence):
     /// 1. Default values
-    /// 2. `wef-server.toml` file (optional)
-    /// 3. Admin override file (`wef-server.admin.toml`, optional)
-    /// 4. `/etc/wef-server/config.toml` (optional)
+    /// 2. `logthing.toml` file (optional)
+    /// 3. Admin override file (`logthing.admin.toml`, optional)
+    /// 4. `/etc/logthing/config.toml` (optional)
     /// 5. Environment variables with `WEF__` prefix
     ///
     /// # Examples
@@ -312,11 +312,11 @@ impl Config {
         builder = builder.set_default("bind_address", "0.0.0.0:5985")?;
 
         // Try to load from file
-        builder = builder.add_source(config::File::with_name("wef-server").required(false));
+        builder = builder.add_source(config::File::with_name("logthing").required(false));
         builder =
             builder.add_source(config::File::from(Path::new(ADMIN_OVERRIDE_FILE)).required(false));
         builder =
-            builder.add_source(config::File::with_name("/etc/wef-server/config").required(false));
+            builder.add_source(config::File::with_name("/etc/logthing/config").required(false));
 
         // Add environment variables with prefix WEF_
         builder = builder.add_source(config::Environment::with_prefix("WEF").separator("__"));
@@ -343,7 +343,7 @@ mod tests {
     fn load_reads_configuration_file() {
         // Temporarily rename admin override file if it exists to test base config loading
         let admin_override = Path::new(ADMIN_OVERRIDE_FILE);
-        let admin_override_backup = Path::new("wef-server.admin.toml.bak");
+        let admin_override_backup = Path::new("logthing.admin.toml.bak");
         let had_override = admin_override.exists();
 
         if had_override {
@@ -352,7 +352,7 @@ mod tests {
 
         let result = std::panic::catch_unwind(|| {
             let cfg = Config::load().expect("config loads");
-            assert!(!cfg.tls.enabled, "wef-server.toml disables TLS");
+            assert!(!cfg.tls.enabled, "logthing.toml disables TLS");
             assert!(cfg.forwarding.destinations.len() >= 1);
         });
 

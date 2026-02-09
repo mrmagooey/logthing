@@ -17,7 +17,7 @@ from pathlib import Path
 import requests
 
 # Configuration
-WEF_ENDPOINT = os.environ.get("WEF_ENDPOINT", "http://wef-server:5985")
+WEF_ENDPOINT = os.environ.get("WEF_ENDPOINT", "http://logthing:5985")
 STATS_ENDPOINT = os.environ.get(
     "WEF_STATS_ENDPOINT", f"{WEF_ENDPOINT}/stats/throughput"
 )

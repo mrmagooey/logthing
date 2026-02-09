@@ -4,10 +4,10 @@ import time
 
 import requests
 
-SYSLOG_HOST = os.environ.get("SYSLOG_HOST", "wef-server")
+SYSLOG_HOST = os.environ.get("SYSLOG_HOST", "logthing")
 UDP_PORT = int(os.environ.get("SYSLOG_UDP_PORT", "5514"))
 TCP_PORT = int(os.environ.get("SYSLOG_TCP_PORT", "5601"))
-HTTP_ENDPOINT = os.environ.get("SYSLOG_HTTP_ENDPOINT", "http://wef-server:5985/syslog")
+HTTP_ENDPOINT = os.environ.get("SYSLOG_HTTP_ENDPOINT", "http://logthing:5985/syslog")
 TIMEOUT = int(os.environ.get("SYSLOG_WAIT_SECS", "60"))
 
 MESSAGE = "<134>Jan 15 10:30:45 dns-server named[1234]: client 192.168.1.100#12345: query: example.com IN A + (93.184.216.34)"

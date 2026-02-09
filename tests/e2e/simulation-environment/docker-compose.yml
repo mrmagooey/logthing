@@ -1,8 +1,8 @@
 services:
-  wef-server:
+  logthing:
     build:
       context: ../../..
-    image: wef-server:e2e
+    image: logthing:e2e
     environment:
       - RUST_LOG=info
       - WEF__TLS__ENABLED=false
@@ -12,17 +12,17 @@ services:
       - WEF_ADMIN_USER=e2e
       - WEF_ADMIN_PASS=e2e
     volumes:
-      - ./config/wef-server.toml:/etc/wef-server/config.toml:ro
+      - ./config/logthing.toml:/etc/logthing/config.toml:ro
     depends_on:
       - minio
     networks:
       - e2e
 
-  wef-server-kerberos:
+  logthing-kerberos:
     build:
       context: ../../..
       dockerfile: tests/e2e/simulation-environment/Dockerfile.kerberos
-    image: wef-server:e2e-kerberos
+    image: logthing:e2e-kerberos
     environment:
       - RUST_LOG=info
       - WEF__TLS__ENABLED=false
@@ -30,7 +30,7 @@ services:
       - WEF__SYSLOG__UDP_PORT=5514
       - WEF__SYSLOG__TCP_PORT=5601
     volumes:
-      - ./config/wef-server-kerberos.toml:/etc/wef-server/config.toml:ro
+      - ./config/logthing-kerberos.toml:/etc/logthing/config.toml:ro
     depends_on:
       - minio
     networks:
@@ -67,8 +67,8 @@ services:
       context: .
       dockerfile: wef-generator/Dockerfile
     environment:
-      - WEF_ENDPOINT=http://wef-server:5985
-      - WEF_STATS_ENDPOINT=http://wef-server:5985/stats/throughput
+      - WEF_ENDPOINT=http://logthing:5985
+      - WEF_STATS_ENDPOINT=http://logthing:5985/stats/throughput
       - PARSER_DIR=/app/parsers
       - EXPECTED_EVENT_IDS=4624,4625,4634,4647,4648,4649,4656,4657,4658,4660,4661,4662,4663,4670,4672,4673,4674,4688,4689,4697,4698,4699,4700,4702,4719,4720,4722,4723,4724,4725,4726,4727,4728,4729,4730,4731,4732,4733,4735,4737,4740,4741,4742,4743,4756,4757,4767,4768,4769,4770
     volumes:
@@ -81,12 +81,12 @@ services:
       context: .
       dockerfile: syslog-generator/Dockerfile
     environment:
-      - SYSLOG_HOST=wef-server
+      - SYSLOG_HOST=logthing
       - SYSLOG_UDP_PORT=5514
       - SYSLOG_TCP_PORT=5601
-      - SYSLOG_HTTP_ENDPOINT=http://wef-server:5985/syslog
+      - SYSLOG_HTTP_ENDPOINT=http://logthing:5985/syslog
     depends_on:
-      - wef-server
+      - logthing
     networks:
       - e2e
 
@@ -99,7 +99,7 @@ services:
       - MINIO_BUCKET=wef-events
       - AWS_ACCESS_KEY_ID=miniouser
       - AWS_SECRET_ACCESS_KEY=miniopassword
-      - WEF_STATS_ENDPOINT=http://wef-server:5985/stats/throughput
+      - WEF_STATS_ENDPOINT=http://logthing:5985/stats/throughput
       - EXPECTED_EVENT_TOTAL=50
     networks:
       - e2e
@@ -109,10 +109,10 @@ services:
       context: .
       dockerfile: kerberos-test/Dockerfile
     environment:
-      - WEF_ENDPOINT=http://wef-server-kerberos:5985
+      - WEF_ENDPOINT=http://logthing-kerberos:5985
       - WEF_TIMEOUT_SECS=60
     depends_on:
-      - wef-server-kerberos
+      - logthing-kerberos
     networks:
       - e2e
 
@@ -125,7 +125,7 @@ services:
       - MINIO_BUCKET=wef-events
       - AWS_ACCESS_KEY_ID=miniouser
       - AWS_SECRET_ACCESS_KEY=miniopassword
-      - WEF_STATS_ENDPOINT=http://wef-server:5985/stats/throughput
+      - WEF_STATS_ENDPOINT=http://logthing:5985/stats/throughput
       - PARSER_DIR=/app/parsers
       - E2E_TIMEOUT_SECS=120
     volumes:
@@ -133,10 +133,10 @@ services:
     networks:
       - e2e
 
-  wef-server-tls:
+  logthing-tls:
     build:
       context: ../../..
-    image: wef-server:e2e
+    image: logthing:e2e
     environment:
       - RUST_LOG=info
       - WEF__TLS__ENABLED=true
@@ -147,9 +147,9 @@ services:
       - WEF_ADMIN_USER=e2e
       - WEF_ADMIN_PASS=e2e
     volumes:
-      - ./config/wef-server-tls.toml:/etc/wef-server/config.toml:ro
-      - ./certs/server.crt:/etc/wef-server/certs/server.crt:ro
-      - ./certs/server.key:/etc/wef-server/certs/server.key:ro
+      - ./config/logthing-tls.toml:/etc/logthing/config.toml:ro
+      - ./certs/server.crt:/etc/logthing/certs/server.crt:ro
+      - ./certs/server.key:/etc/logthing/certs/server.key:ro
     depends_on:
       - minio
     networks:
@@ -160,11 +160,11 @@ services:
       context: .
       dockerfile: tls-test/Dockerfile
     environment:
-      - HTTP_ENDPOINT=http://wef-server-tls:5985
-      - HTTPS_ENDPOINT=https://wef-server-tls:5986
+      - HTTP_ENDPOINT=http://logthing-tls:5985
+      - HTTPS_ENDPOINT=https://logthing-tls:5986
       - TLS_TEST_TIMEOUT=60
     depends_on:
-      - wef-server-tls
+      - logthing-tls
     networks:
       - e2e
 
@@ -173,14 +173,14 @@ services:
       context: .
       dockerfile: performance-test/Dockerfile
     environment:
-      - WEF_ENDPOINT=http://wef-server:5985
-      - WEF_STATS_ENDPOINT=http://wef-server:5985/stats/throughput
+      - WEF_ENDPOINT=http://logthing:5985
+      - WEF_STATS_ENDPOINT=http://logthing:5985/stats/throughput
       - PERF_TEST_TOTAL_EVENTS=50000
       - PERF_TEST_BATCH_SIZE=1000
       - PERF_TEST_TIMEOUT_SECS=300
       - PERF_TEST_TARGET_EPS=0
     depends_on:
-      - wef-server
+      - logthing
     networks:
       - e2e
 
@@ -189,14 +189,14 @@ services:
       context: .
       dockerfile: performance-test/Dockerfile
     environment:
-      - WEF_ENDPOINT=http://wef-server:5985
-      - WEF_STATS_ENDPOINT=http://wef-server:5985/stats/throughput
+      - WEF_ENDPOINT=http://logthing:5985
+      - WEF_STATS_ENDPOINT=http://logthing:5985/stats/throughput
       - PERF_TEST_TOTAL_EVENTS=1000000
       - PERF_TEST_BATCH_SIZE=1000
       - PERF_TEST_TIMEOUT_SECS=300
       - PERF_TEST_TARGET_EPS=100000
     depends_on:
-      - wef-server
+      - logthing
     networks:
       - e2e
 
@@ -205,14 +205,14 @@ services:
       context: .
       dockerfile: performance-test/Dockerfile
     environment:
-      - WEF_ENDPOINT=http://wef-server:5985
-      - WEF_STATS_ENDPOINT=http://wef-server:5985/stats/throughput
+      - WEF_ENDPOINT=http://logthing:5985
+      - WEF_STATS_ENDPOINT=http://logthing:5985/stats/throughput
       - PERF_TEST_TOTAL_EVENTS=2000000
       - PERF_TEST_BATCH_SIZE=1000
       - PERF_TEST_TIMEOUT_SECS=300
       - PERF_TEST_TARGET_EPS=200000
     depends_on:
-      - wef-server
+      - logthing
     networks:
       - e2e
 
@@ -221,21 +221,21 @@ services:
       context: .
       dockerfile: performance-test/Dockerfile
     environment:
-      - WEF_ENDPOINT=http://wef-server:5985
-      - WEF_STATS_ENDPOINT=http://wef-server:5985/stats/throughput
+      - WEF_ENDPOINT=http://logthing:5985
+      - WEF_STATS_ENDPOINT=http://logthing:5985/stats/throughput
       - PERF_TEST_TOTAL_EVENTS=5000000
       - PERF_TEST_BATCH_SIZE=1000
       - PERF_TEST_TIMEOUT_SECS=600
       - PERF_TEST_TARGET_EPS=500000
     depends_on:
-      - wef-server
+      - logthing
     networks:
       - e2e
 
-  wef-server-10k-sustained:
+  logthing-10k-sustained:
     build:
       context: ../../..
-    image: wef-server:e2e
+    image: logthing:e2e
     environment:
       - RUST_LOG=info
       - WEF__TLS__ENABLED=false
@@ -245,7 +245,7 @@ services:
       - WEF_ADMIN_USER=e2e
       - WEF_ADMIN_PASS=e2e
     volumes:
-      - ./config/wef-server-10k-sustained.toml:/etc/wef-server/config.toml:ro
+      - ./config/logthing-10k-sustained.toml:/etc/logthing/config.toml:ro
     depends_on:
       - minio
     networks:
@@ -256,8 +256,8 @@ services:
       context: .
       dockerfile: performance-test/Dockerfile
     environment:
-      - WEF_ENDPOINT=http://wef-server-10k-sustained:5985
-      - WEF_STATS_ENDPOINT=http://wef-server-10k-sustained:5985/stats/throughput
+      - WEF_ENDPOINT=http://logthing-10k-sustained:5985
+      - WEF_STATS_ENDPOINT=http://logthing-10k-sustained:5985/stats/throughput
       - PERF_TEST_DURATION_SECS=60
       - PERF_TEST_BATCH_SIZE=1000
       - PERF_TEST_TARGET_EPS=10000
@@ -268,7 +268,7 @@ services:
       - AWS_ACCESS_KEY_ID=miniouser
       - AWS_SECRET_ACCESS_KEY=miniopassword
     depends_on:
-      - wef-server-10k-sustained
+      - logthing-10k-sustained
     networks:
       - e2e
 
@@ -277,8 +277,8 @@ services:
       context: .
       dockerfile: performance-test/Dockerfile
     environment:
-      - WEF_ENDPOINT=http://wef-server-10k-sustained:5985
-      - WEF_STATS_ENDPOINT=http://wef-server-10k-sustained:5985/stats/throughput
+      - WEF_ENDPOINT=http://logthing-10k-sustained:5985
+      - WEF_STATS_ENDPOINT=http://logthing-10k-sustained:5985/stats/throughput
       - PERF_TEST_DURATION_SECS=60
       - PERF_TEST_BATCH_SIZE=1000
       - PERF_TEST_TARGET_EPS=0
@@ -289,7 +289,7 @@ services:
       - AWS_ACCESS_KEY_ID=miniouser
       - AWS_SECRET_ACCESS_KEY=miniopassword
     depends_on:
-      - wef-server-10k-sustained
+      - logthing-10k-sustained
     networks:
       - e2e
 

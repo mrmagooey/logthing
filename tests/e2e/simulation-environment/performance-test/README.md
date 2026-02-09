@@ -1,10 +1,10 @@
 # Performance Test Suite
 
-End-to-end performance testing suite for the WEF server, validating ingestion throughput, sustained load handling, and S3 parquet file generation.
+End-to-end performance testing suite for Logthing, validating ingestion throughput, sustained load handling, and S3 parquet file generation.
 
 ## Overview
 
-This test suite measures the WEF server's performance under various load conditions:
+This test suite measures Logthing's performance under various load conditions:
 - **Baseline Performance**: Maximum throughput without rate limiting
 - **Target Rate Tests**: Sustained load at specific rates (100k, 200k, 500k RPS)
 - **Sustained 10k RPS Test**: Long-duration test with S3 verification (60 seconds, single event type, 100MB parquet files)
@@ -65,7 +65,7 @@ S3 verification: Enabled
 
 **Architecture**:
 ```
-Performance Test Client          WEF Server                    MinIO/S3
+Performance Test Client          Logthing                      MinIO/S3
        |                              |                            |
        |---- 1000 events/batch -----> |                            |
        |   (rate limited to 10k/s)    |                            |
@@ -108,19 +108,19 @@ cd tests/e2e/simulation-environment
 
 #### Baseline Performance
 ```bash
-docker compose up -d wef-server
+docker compose up -d logthing
 docker compose run --rm performance-test
 ```
 
 #### Sustained 10k RPS Test
 ```bash
-docker compose up -d wef-server-10k-sustained
+docker compose up -d logthing-10k-sustained
 docker compose run --rm performance-test-10k-sustained
 ```
 
 #### 100k RPS Target Test
 ```bash
-docker compose up -d wef-server
+docker compose up -d logthing
 docker compose run --rm performance-test-100k
 ```
 
@@ -149,8 +149,8 @@ docker compose run --rm performance-test-10k-sustained \
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `PERF_TEST_EVENT_TYPE` | Fixed event type (empty = random) | "" |
-| `WEF_ENDPOINT` | WEF server URL | http://wef-server:5985 |
-| `WEF_STATS_ENDPOINT` | Throughput stats API | http://wef-server:5985/stats/throughput |
+| `WEF_ENDPOINT` | WEF server URL | http://logthing:5985 |
+| `WEF_STATS_ENDPOINT` | Throughput stats API | http://logthing:5985/stats/throughput |
 
 #### S3 Verification (Sustained Test Only)
 | Variable | Description | Default |
@@ -163,7 +163,7 @@ docker compose run --rm performance-test-10k-sustained \
 
 ### Server Configuration (Sustained 10k Test)
 
-The `config/wef-server-10k-sustained.toml` configures the server for the sustained test:
+The `config/logthing-10k-sustained.toml` configures the server for the sustained test:
 
 ```toml
 [forwarding]
@@ -261,7 +261,7 @@ docker compose build performance-test-10k-sustained
 
 **Solution**: Check server logs or reduce target rate:
 ```bash
-docker compose logs wef-server-10k-sustained
+docker compose logs logthing-10k-sustained
 ```
 
 ### "Batch X failed: Read timed out"
@@ -269,7 +269,7 @@ docker compose logs wef-server-10k-sustained
 **Cause**: Server is overloaded or unresponsive.
 
 **Solution**: 
-- Check server health: `curl http://wef-server:5985/health`
+- Check server health: `curl http://logthing:5985/health`
 - Review server logs for errors
 - Reduce batch size or target rate
 

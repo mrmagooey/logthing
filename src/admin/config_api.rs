@@ -224,7 +224,7 @@ pub async fn export_config(
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "application/toml"),
-            (header::CONTENT_DISPOSITION, "attachment; filename=\"wef-server-backup.toml\""),
+            (header::CONTENT_DISPOSITION, "attachment; filename=\"logthing-backup.toml\""),
         ],
         toml_content,
     )

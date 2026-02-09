@@ -77,7 +77,7 @@ output_format: |
 ## Usage Example
 
 ```rust
-use wef_server::parser::GenericEventParser;
+use logthing::parser::GenericEventParser;
 
 // Load configuration directory (or pass a single YAML file for legacy setups)
 let parser = GenericEventParser::from_file("config/event_parsers")?;
@@ -111,7 +111,7 @@ if parser.has_parser(4624) {
 ✅ Returns None when required fields are missing
 ✅ Lists all supported events correctly
 
-## Integration with WEF Server
+## Integration with Logthing
 
 The generic parser integrates into the server pipeline:
 1. Server loads `config/event_parsers/` (or the legacy YAML file) on startup

@@ -7,11 +7,19 @@ from pathlib import Path
 import requests
 import yaml
 
-WEF_ENDPOINT = os.environ.get("WEF_ENDPOINT", "http://wef-server:5985")
-STATS_ENDPOINT = os.environ.get("WEF_STATS_ENDPOINT", f"{WEF_ENDPOINT}/stats/throughput")
-EVENTS_FIXTURE = Path(os.environ.get("EVENTS_FIXTURE", "/app/fixtures/wef/events_batch.xml"))
+WEF_ENDPOINT = os.environ.get("WEF_ENDPOINT", "http://logthing:5985")
+STATS_ENDPOINT = os.environ.get(
+    "WEF_STATS_ENDPOINT", f"{WEF_ENDPOINT}/stats/throughput"
+)
+EVENTS_FIXTURE = Path(
+    os.environ.get("EVENTS_FIXTURE", "/app/fixtures/wef/events_batch.xml")
+)
 PARSER_DIR = Path(os.environ.get("PARSER_DIR", ""))
-ENV_EXPECTED_EVENT_IDS = [event.strip() for event in os.environ.get("EXPECTED_EVENT_IDS", "").split(",") if event.strip()]
+ENV_EXPECTED_EVENT_IDS = [
+    event.strip()
+    for event in os.environ.get("EXPECTED_EVENT_IDS", "").split(",")
+    if event.strip()
+]
 TIMEOUT = int(os.environ.get("WEF_TIMEOUT_SECS", "60"))
 
 
@@ -56,7 +64,11 @@ def build_from_parsers(directory: Path):
             field_values.append(
                 (
                     field.get("name", "Field"),
-                    sample_value(event_id, field.get("name", "Field"), field.get("type", "string")),
+                    sample_value(
+                        event_id,
+                        field.get("name", "Field"),
+                        field.get("type", "string"),
+                    ),
                 )
             )
         events_xml.append(build_event_xml(event_id, field_values))
@@ -150,7 +162,7 @@ def sample_value(event_id: int, field_name: str, field_type: str) -> str:
 def build_event_xml(event_id: int, data_pairs):
     timestamp = datetime.now(timezone.utc).isoformat()
     event_data = "\n".join(
-        f"        <Data Name=\"{name}\">{value}</Data>" for name, value in data_pairs
+        f'        <Data Name="{name}">{value}</Data>' for name, value in data_pairs
     )
     return f"""
     <Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\">
@@ -199,7 +211,9 @@ def wait_for_stats(expected_ids):
     if not expected_ids:
         return
     deadline = time.time() + TIMEOUT
-    expected_types = {f"Microsoft-Windows-Security-Auditing:{eid}" for eid in expected_ids}
+    expected_types = {
+        f"Microsoft-Windows-Security-Auditing:{eid}" for eid in expected_ids
+    }
     while time.time() < deadline:
         try:
             resp = requests.get(STATS_ENDPOINT, timeout=5)

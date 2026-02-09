@@ -1,11 +1,11 @@
 # TLS Test Component
 
-End-to-end test component that validates TLS/HTTPS functionality for the WEF server.
+End-to-end test component that validates TLS/HTTPS functionality for Logthing.
 
 ## Purpose
 
 Validates that:
-1. WEF server correctly serves HTTPS on port 5986 when TLS is enabled
+1. Logthing correctly serves HTTPS on port 5986 when TLS is enabled
 2. HTTP endpoint continues to work on port 5985
 3. Certificate validation works correctly
 4. All WEF endpoints are accessible over HTTPS
@@ -67,8 +67,8 @@ docker compose -f tests/e2e/docker-compose.yml run --rm tls-test
 
 ### Environment Variables
 
-- `HTTP_ENDPOINT`: HTTP endpoint URL (default: http://wef-server-tls:5985)
-- `HTTPS_ENDPOINT`: HTTPS endpoint URL (default: https://wef-server-tls:5986)
+- `HTTP_ENDPOINT`: HTTP endpoint URL (default: http://logthing-tls:5985)
+- `HTTPS_ENDPOINT`: HTTPS endpoint URL (default: https://logthing-tls:5986)
 - `TLS_TEST_TIMEOUT`: Timeout in seconds (default: 60)
 
 ### In Full E2E Suite
@@ -86,16 +86,16 @@ The TLS tests run automatically as part of `tests/e2e/run.sh`:
 
 ```
 ============================================================
-WEF Server TLS E2E Tests
+Logthing TLS E2E Tests
 ============================================================
-HTTP Endpoint: http://wef-server-tls:5985
-HTTPS Endpoint: https://wef-server-tls:5986
+HTTP Endpoint: http://logthing-tls:5985
+HTTPS Endpoint: https://logthing-tls:5986
 CA Certificate: /app/certs/ca.crt
 Timeout: 60s
 
 Waiting for server to be ready...
-  ✓ HTTP endpoint ready (http://wef-server-tls:5985)
-  ✓ HTTPS endpoint ready (https://wef-server-tls:5986)
+  ✓ HTTP endpoint ready (http://logthing-tls:5985)
+  ✓ HTTPS endpoint ready (https://logthing-tls:5986)
 
 Testing HTTP Health Endpoint...
   [✓ PASS] HTTP Health: Status 200

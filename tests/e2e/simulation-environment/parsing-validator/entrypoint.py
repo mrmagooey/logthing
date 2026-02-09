@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Parsing Validator for WEF Server E2E Tests
+Parsing Validator for Logthing E2E Tests
 
 Validates that:
 1. Parquet files have correct schema
@@ -27,7 +27,7 @@ import yaml
 MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "http://minio:9000")
 BUCKET = os.environ.get("MINIO_BUCKET", "wef-events")
 STATS_ENDPOINT = os.environ.get(
-    "WEF_STATS_ENDPOINT", "http://wef-server:5985/stats/throughput"
+    "WEF_STATS_ENDPOINT", "http://logthing:5985/stats/throughput"
 )
 PARSER_DIR = Path(os.environ.get("PARSER_DIR", "/app/parsers"))
 TIMEOUT = int(os.environ.get("E2E_TIMEOUT_SECS", "120"))
@@ -252,7 +252,7 @@ def validate_event_counts(table: pyarrow.Table) -> bool:
 def main():
     """Main entry point for parsing validator."""
     print("=" * 60)
-    print("WEF Server Parsing Validator")
+    print("Logthing Parsing Validator")
     print("=" * 60)
     print(f"MinIO Endpoint: {MINIO_ENDPOINT}")
     print(f"Bucket: {BUCKET}")
