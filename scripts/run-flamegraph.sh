@@ -5,14 +5,14 @@
 cd "$(dirname "$0")/.."
 
 # Kill any existing server
-pkill -f wef-server || true
+pkill -f logthing || true
 sleep 1
 
 echo "Running server with flamegraph profiling..."
 echo "This will take about 70 seconds..."
 
 # Run with cargo flamegraph - it will automatically profile and generate SVG
-timeout 70 cargo flamegraph --profile profiling --root -- --config tests/e2e/simulation-environment/config/wef-server-10k-sustained.toml 2>&1 | tee /tmp/flamegraph-run.log &
+timeout 70 cargo flamegraph --profile profiling --root -- --config tests/e2e/simulation-environment/config/logthing-10k-sustained.toml 2>&1 | tee /tmp/flamegraph-run.log &
 SERVER_PID=$!
 
 sleep 10

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Added comprehensive syslog parsing and listening capabilities to the WEF Server, including support for RFC 3164 (BSD syslog), RFC 5424 (modern syslog), and automatic DNS query log parsing.
+Added comprehensive syslog parsing and listening capabilities to Logthing, including support for RFC 3164 (BSD syslog), RFC 5424 (modern syslog), and automatic DNS query log parsing.
 
 ## Features Implemented
 
@@ -77,7 +77,7 @@ Added comprehensive syslog parsing and listening capabilities to the WEF Server,
 
 ### 5. Configuration
 
-**Config File** (`wef-server.toml`):
+**Config File** (`logthing.toml`):
 ```toml
 [syslog]
 enabled = true
@@ -167,7 +167,7 @@ curl http://localhost:5985/syslog/examples
    - `src/server/mod.rs` - Added syslog HTTP endpoints
    - `src/config/mod.rs` - Added SyslogConfig struct
    - `Cargo.toml` - Added regex and async-trait dependencies
-   - `wef-server.toml` - Added syslog configuration section
+   - `logthing.toml` - Added syslog configuration section
    - `README.md` - Updated documentation
 
 ## Architecture Integration

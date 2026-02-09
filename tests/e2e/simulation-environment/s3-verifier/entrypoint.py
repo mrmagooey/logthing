@@ -6,7 +6,9 @@ import requests
 
 MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "http://minio:9000")
 BUCKET = os.environ.get("MINIO_BUCKET", "wef-events")
-STATS_ENDPOINT = os.environ.get("WEF_STATS_ENDPOINT", "http://wef-server:5985/stats/throughput")
+STATS_ENDPOINT = os.environ.get(
+    "WEF_STATS_ENDPOINT", "http://logthing:5985/stats/throughput"
+)
 EXPECTED_TOTAL = int(os.environ.get("EXPECTED_EVENT_TOTAL", "2"))
 TIMEOUT = int(os.environ.get("E2E_TIMEOUT_SECS", "120"))
 

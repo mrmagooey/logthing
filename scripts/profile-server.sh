@@ -1,5 +1,5 @@
 #!/bin/bash
-# Profile the WEF server during performance test
+# Profile the Logthing server during performance test
 
 set -e
 
@@ -7,7 +7,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 echo "========================================"
-echo "Starting WEF Server with CPU Profiling"
+echo "Starting Logthing Server with CPU Profiling"
 echo "========================================"
 
 # Create profiling directory
@@ -15,7 +15,7 @@ mkdir -p profiling-results
 
 # Start server with perf recording in background
 echo "Starting server with perf record..."
-perf record -g -- ./target/profiling/wef-server &
+perf record -g -- ./target/profiling/logthing &
 SERVER_PID=$!
 
 echo "Server PID: $SERVER_PID"

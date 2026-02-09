@@ -23,7 +23,7 @@ A high-performance TCP server written in Rust for receiving Windows Event Logs f
 ```bash
 # Clone and build
 git clone <repository>
-cd wef-server
+cd logthing
 cargo build --release
 
 # Or install directly
@@ -32,7 +32,7 @@ cargo install --path .
 
 ### Configuration
 
-Create a configuration file at `wef-server.toml` or set environment variables:
+Create a configuration file at `logthing.toml` or set environment variables:
 
 ```toml
 bind_address = "0.0.0.0:5985"
@@ -81,9 +81,9 @@ parse_dns = true
 
 Configuration is loaded from multiple sources (in order of precedence):
 1. Default values
-2. `wef-server.toml` file (optional)
-3. **Admin override file** (`wef-server.admin.toml`, optional) - takes precedence over main config
-4. `/etc/wef-server/config.toml` (optional)
+2. `logthing.toml` file (optional)
+3. **Admin override file** (`logthing.admin.toml`, optional) - takes precedence over main config
+4. `/etc/logthing/config.toml` (optional)
 5. Environment variables with `WEF__` prefix (double underscore for nesting)
 
 The admin override file is useful for runtime configuration changes without modifying the main config file.
@@ -130,7 +130,7 @@ keytab = "/etc/wef/krb5.keytab"
    curl --negotiate -u : https://wef.contoso.com/wsman -d '' -k
    ```
    (The curl call should return `401` until you pass a valid SOAP payload, but it proves SPNEGO works.)
-6. **Update `wef-server.toml`** as shown above, restart the service, and ensure the keytab is mounted into any containers. Clients will now need valid Kerberos tickets to reach the API.
+6. **Update `logthing.toml`** as shown above, restart the service, and ensure the keytab is mounted into any containers. Clients will now need valid Kerberos tickets to reach the API.
 
 ### Syslog Listener
 
@@ -225,7 +225,7 @@ The E2E suite includes comprehensive performance tests:
 ```bash
 # Run specific performance test
 cd tests/e2e/simulation-environment
-docker compose up -d wef-server-10k-sustained
+docker compose up -d logthing-10k-sustained
 docker compose run --rm performance-test-10k-sustained
 
 # View performance test documentation
@@ -352,13 +352,13 @@ The repository ships example parsers for 50 high-value Windows Security events. 
 
 ```bash
 # Run with config file
-./wef-server
+./logthing
 
 # Or with environment variables (note the double underscore)
-WEF__BIND_ADDRESS=0.0.0.0:5985 WEF__TLS__ENABLED=true ./wef-server
+WEF__BIND_ADDRESS=0.0.0.0:5985 WEF__TLS__ENABLED=true ./logthing
 
 # For nested configuration values
-WEF__SECURITY__MAX_CONNECTIONS=5000 WEF__METRICS__PORT=8080 ./wef-server
+WEF__SECURITY__MAX_CONNECTIONS=5000 WEF__METRICS__PORT=8080 ./logthing
 ```
 
 ## Windows Client Configuration
@@ -418,7 +418,7 @@ Example `subscription.xml`:
 
 Set the collector server:
 ```powershell
-winrm set winrm/config/client '@{TrustedHosts="your-wef-server-ip"}'
+winrm set winrm/config/client '@{TrustedHosts="your-logthing-ip"}'
 ```
 
 ## API Endpoints

@@ -25,8 +25,8 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configuration
-HTTP_ENDPOINT = os.environ.get("HTTP_ENDPOINT", "http://wef-server-tls:5985")
-HTTPS_ENDPOINT = os.environ.get("HTTPS_ENDPOINT", "https://wef-server-tls:5986")
+HTTP_ENDPOINT = os.environ.get("HTTP_ENDPOINT", "http://logthing-tls:5985")
+HTTPS_ENDPOINT = os.environ.get("HTTPS_ENDPOINT", "https://logthing-tls:5986")
 TLS_VERIFY = os.environ.get("TLS_VERIFY", "false").lower() == "true"
 TIMEOUT = int(os.environ.get("TLS_TEST_TIMEOUT", "60"))
 CA_CERT_PATH = "/app/certs/ca.crt"
@@ -46,7 +46,9 @@ def log_result(test_name: str, passed: bool, message: str = "") -> bool:
     return passed
 
 
-def create_ssl_context(verify: bool = True, ca_file: Optional[str] = None) -> ssl.SSLContext:
+def create_ssl_context(
+    verify: bool = True, ca_file: Optional[str] = None
+) -> ssl.SSLContext:
     """Create SSL context with appropriate settings."""
     if verify and ca_file and Path(ca_file).exists():
         context = ssl.create_default_context(cafile=ca_file)
@@ -79,7 +81,9 @@ def http_request(
     try:
         if url.startswith("https://"):
             context = create_ssl_context(verify, ca_file)
-            with urllib.request.urlopen(req, context=context, timeout=timeout) as response:
+            with urllib.request.urlopen(
+                req, context=context, timeout=timeout
+            ) as response:
                 return response.status, response.read().decode("utf-8")
         else:
             with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -98,9 +102,7 @@ def wait_for_server():
     https_ready = False
 
     while time.time() < deadline and not https_ready:
-        status, _ = http_request(
-            f"{HTTPS_ENDPOINT}/health", verify=False, timeout=5
-        )
+        status, _ = http_request(f"{HTTPS_ENDPOINT}/health", verify=False, timeout=5)
         if status == 200:
             print(f"  ✓ HTTPS endpoint ready ({HTTPS_ENDPOINT})")
             https_ready = True
@@ -153,7 +155,9 @@ def test_https_with_ca_cert():
     if status == 200:
         return log_result("HTTPS with CA Cert", True, f"Status {status}")
     else:
-        return log_result("HTTPS with CA Cert", False, f"Status {status}, Body: {body[:100]}")
+        return log_result(
+            "HTTPS with CA Cert", False, f"Status {status}, Body: {body[:100]}"
+        )
 
 
 def test_https_certificate_validation():
@@ -189,9 +193,7 @@ def test_https_certificate_validation():
             return log_result(
                 "Cert Validation Rejection", True, f"Rejected with: {type(e).__name__}"
             )
-        return log_result(
-            "Cert Validation Rejection", False, f"Unexpected error: {e}"
-        )
+        return log_result("Cert Validation Rejection", False, f"Unexpected error: {e}")
 
 
 def test_https_wef_endpoint():
@@ -217,7 +219,9 @@ def test_https_wef_endpoint():
     if status in [200, 201, 202, 400]:
         return log_result("HTTPS WEF Endpoint", True, f"Status {status}")
     else:
-        return log_result("HTTPS WEF Endpoint", False, f"Status {status}, Response: {response[:100]}")
+        return log_result(
+            "HTTPS WEF Endpoint", False, f"Status {status}, Response: {response[:100]}"
+        )
 
 
 def test_https_events_endpoint():
@@ -247,7 +251,9 @@ def test_https_events_endpoint():
         return log_result("HTTPS Events Endpoint", True, f"Status {status}")
     else:
         return log_result(
-            "HTTPS Events Endpoint", False, f"Status {status}, Response: {response[:100]}"
+            "HTTPS Events Endpoint",
+            False,
+            f"Status {status}, Response: {response[:100]}",
         )
 
 
@@ -256,7 +262,7 @@ def test_https_syslog_endpoint():
     print("\nTesting Syslog HTTP Endpoint over HTTPS...")
 
     url = f"{HTTPS_ENDPOINT}/syslog"
-    body = b'<134>Jan 15 10:30:45 test-server test[1234]: Test syslog message'
+    body = b"<134>Jan 15 10:30:45 test-server test[1234]: Test syslog message"
 
     status, response = http_request(url, method="POST", data=body, verify=False)
 
@@ -264,7 +270,9 @@ def test_https_syslog_endpoint():
         return log_result("HTTPS Syslog Endpoint", True, f"Status {status}")
     else:
         return log_result(
-            "HTTPS Syslog Endpoint", False, f"Status {status}, Response: {response[:100]}"
+            "HTTPS Syslog Endpoint",
+            False,
+            f"Status {status}, Response: {response[:100]}",
         )
 
 
@@ -282,12 +290,12 @@ def test_https_throughput_stats():
             data = json.loads(body)
             event_count = sum(row.get("total_events", 0) for row in data)
             return log_result(
-                "HTTPS Throughput Stats", True, f"Status {status}, Events: {event_count}"
+                "HTTPS Throughput Stats",
+                True,
+                f"Status {status}, Events: {event_count}",
             )
         except json.JSONDecodeError:
-            return log_result(
-                "HTTPS Throughput Stats", False, "Invalid JSON response"
-            )
+            return log_result("HTTPS Throughput Stats", False, "Invalid JSON response")
     else:
         return log_result("HTTPS Throughput Stats", False, f"Status {status}")
 
@@ -317,7 +325,7 @@ def test_https_metrics_endpoint():
 def main():
     """Run all TLS tests."""
     print("=" * 60)
-    print("WEF Server TLS E2E Tests")
+    print("Logthing TLS E2E Tests")
     print("=" * 60)
     print(f"HTTP Endpoint: {HTTP_ENDPOINT}")
     print(f"HTTPS Endpoint: {HTTPS_ENDPOINT}")

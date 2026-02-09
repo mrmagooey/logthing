@@ -1,5 +1,5 @@
 #!/bin/bash
-# Script to run WEF server with profiling
+# Script to run Logthing server with profiling
 
 # Change to repo root (parent of scripts directory)
 cd "$(dirname "$0")/.."
@@ -22,5 +22,5 @@ export WEF__SYSLOG__ENABLED=false
 mkdir -p /tmp/wef-events
 
 # Run server with profiling
-echo "Starting WEF server with profiling..."
-exec ./target/profiling/wef-server
+echo "Starting Logthing server with profiling..."
+exec ./target/profiling/logthing

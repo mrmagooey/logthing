@@ -28,13 +28,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary from builder
-COPY --from=builder /app/target/release/wef-server /usr/local/bin/wef-server
+COPY --from=builder /app/target/release/logthing /usr/local/bin/logthing
 
 # Copy default config
-COPY wef-server.toml /etc/wef-server/config.toml
+COPY logthing.toml /etc/logthing/config.toml
 
 # Create directory for certificates
-RUN mkdir -p /etc/wef-server/certs
+RUN mkdir -p /etc/logthing/certs
 
 # Expose ports
 EXPOSE 5985 5986 9090
@@ -44,4 +44,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:5985/health || exit 1
 
 # Run server
-CMD ["wef-server"]
+CMD ["logthing"]

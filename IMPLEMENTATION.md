@@ -1,4 +1,4 @@
-# WEF Server - Implementation Summary
+# Logthing - Implementation Summary
 
 ## Project Overview
 
@@ -10,7 +10,7 @@ A high-performance Windows Event Forwarding (WEF) server written in Rust, capabl
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        WEF Server                           │
+│                        Logthing                           │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
 │  │ TCP Listener│  │  TLS Layer  │  │ IP Whitelist Filter │  │
 │  │  (Tokio)    │  │  (rustls)   │  │    (middleware)     │  │
@@ -160,13 +160,13 @@ metrics = "0.22"        # Metrics
 ### 1. Binary
 ```bash
 cargo build --release
-./target/release/wef-server
+./target/release/logthing
 ```
 
 ### 2. Docker
 ```bash
-docker build -t wef-server .
-docker run -p 5985:5985 -p 5986:5986 -p 9090:9090 wef-server
+docker build -t logthing .
+docker run -p 5985:5985 -p 5986:5986 -p 9090:9090 logthing
 ```
 
 ### 3. Docker Compose
@@ -189,7 +189,7 @@ wecutil cs subscription.xml
 
 ### 3. Configure Trusted Hosts
 ```powershell
-winrm set winrm/config/client '@{TrustedHosts="wef-server-ip"}'
+winrm set winrm/config/client '@{TrustedHosts="logthing-ip"}'
 ```
 
 ## Configuration Examples
@@ -212,8 +212,8 @@ bind_address = "0.0.0.0:5985"
 [tls]
 enabled = true
 port = 5986
-cert_file = "/etc/wef-server/certs/server.crt"
-key_file = "/etc/wef-server/certs/server.key"
+cert_file = "/etc/logthing/certs/server.crt"
+key_file = "/etc/logthing/certs/server.key"
 require_client_cert = true
 
 [security]
