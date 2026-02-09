@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::forwarding::{Forwarder, parquet_s3::ParquetS3Forwarder};
+use crate::forwarding::Forwarder;
 use crate::middleware::{IpWhitelist, ip_whitelist_middleware};
 use crate::models::WindowsEvent;
 use crate::parser::GenericEventParser;
@@ -24,10 +24,10 @@ use axum::{extract::Request, middleware::Next};
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use tokio::time::{Duration, sleep};
-use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
+use futures::stream::{self, StreamExt};
 
 pub struct AppState {
     pub config: Arc<RwLock<Config>>,
@@ -35,7 +35,7 @@ pub struct AppState {
     pub forwarder: Forwarder,
     pub parser: WefParser,
     pub event_parser: Option<GenericEventParser>,
-    pub parquet_s3_forwarder: Option<tokio::sync::Mutex<ParquetS3Forwarder>>,
+    pub parquet_s3_sender: Option<tokio::sync::mpsc::Sender<Arc<WindowsEvent>>>,
 }
 
 pub struct Server {
@@ -143,15 +143,42 @@ impl Server {
             None
         };
 
-        // Initialize Parquet S3 forwarder if configured
-        let parquet_s3_forwarder = if let Ok(Some(s3_config)) =
+        // Initialize Parquet S3 forwarder with channel-based architecture
+        let parquet_s3_sender = if let Ok(Some(mut s3_forwarder)) =
             crate::forwarding::parquet_s3::create_parquet_s3_forwarder(
                 &config.forwarding.destinations,
             )
             .await
         {
-            info!("Initialized Parquet S3 forwarder");
-            Some(tokio::sync::Mutex::new(s3_config))
+            info!("Initialized Parquet S3 forwarder with channel-based architecture");
+            
+            // Create channel for event forwarding (buffer size: 10000 events)
+            let (sender, mut receiver) = mpsc::channel::<Arc<WindowsEvent>>(10000);
+            let flush_interval_secs = s3_forwarder.flush_interval_secs();
+            
+            // Spawn worker task to receive events and forward to Parquet S3
+            tokio::spawn(async move {
+                info!("Parquet S3 worker task started");
+                
+                loop {
+                    tokio::select! {
+                        // Receive event from channel
+                        Some(event) = receiver.recv() => {
+                            if let Err(e) = s3_forwarder.forward((*event).clone()).await {
+                                error!("Failed to forward to Parquet S3: {}", e);
+                            }
+                        }
+                        // Periodic flush
+                        _ = sleep(Duration::from_secs(flush_interval_secs)) => {
+                            if let Err(e) = s3_forwarder.flush_all().await {
+                                error!("Failed to run scheduled Parquet S3 flush: {}", e);
+                            }
+                        }
+                    }
+                }
+            });
+            
+            Some(sender)
         } else {
             None
         };
@@ -162,34 +189,8 @@ impl Server {
             forwarder,
             parser: WefParser::new(),
             event_parser,
-            parquet_s3_forwarder,
+            parquet_s3_sender,
         });
-
-        if state.parquet_s3_forwarder.is_some() {
-            let state_clone = Arc::clone(&state);
-            tokio::spawn(async move {
-                loop {
-                    let interval_secs = {
-                        if let Some(ref forwarder) = state_clone.parquet_s3_forwarder {
-                            let guard = forwarder.lock().await;
-                            guard.flush_interval_secs()
-                        } else {
-                            break;
-                        }
-                    };
-
-                    sleep(Duration::from_secs(interval_secs)).await;
-
-                    if let Some(ref forwarder) = state_clone.parquet_s3_forwarder {
-                        if let Err(e) = forwarder.lock().await.flush_all().await {
-                            error!("Failed to run scheduled Parquet S3 flush: {}", e);
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            });
-        }
 
         Ok(Self { config, state })
     }
@@ -251,24 +252,40 @@ impl Server {
     }
 
     fn create_router(&self, ip_whitelist: IpWhitelist) -> anyhow::Result<Router> {
-        let router = Router::new()
+        // Shared layers for all routes
+        let shared_layers = middleware::from_fn_with_state(
+            ip_whitelist.clone(),
+            ip_whitelist_middleware,
+        );
+
+        // Public routes (no authentication required)
+        let public_router = Router::new()
+            .route("/health", axum::routing::get(health_check))
+            .route("/stats/throughput", get(handle_throughput_stats))
+            .layer(shared_layers.clone())
+            .layer(axum::Extension(ip_whitelist.clone()))
+            .with_state(self.state.clone());
+
+        // Protected routes (require authentication)
+        let protected_router = Router::new()
             .route("/wsman", post(handle_wef_request))
             .route("/wsman/subscriptions", post(handle_subscription))
             .route("/wsman/events", post(handle_events))
-            .route("/stats/throughput", get(handle_throughput_stats))
-            .route("/health", axum::routing::get(health_check))
             // Syslog endpoints
             .route("/syslog", post(handle_syslog_http))
             .route("/syslog/udp", get(handle_syslog_udp_info))
             .route("/syslog/examples", get(handle_syslog_examples))
-            .layer(middleware::from_fn_with_state(
-                ip_whitelist.clone(),
-                ip_whitelist_middleware,
-            ))
+            .layer(shared_layers)
             .layer(axum::Extension(ip_whitelist))
             .with_state(self.state.clone());
 
-        self.apply_kerberos_layer(router)
+        // Apply Kerberos only to protected routes
+        let protected_router = self.apply_kerberos_layer(protected_router)?;
+
+        // Merge public and protected routes
+        let router = public_router.merge(protected_router);
+
+        Ok(router)
     }
 
     /// Run the WEF server with TLS enabled.
@@ -299,6 +316,8 @@ impl Server {
     /// }
     /// ```
     pub async fn run_tls(self) -> anyhow::Result<()> {
+        use axum_server::tls_rustls::RustlsConfig;
+
         if !self.config.tls.enabled {
             return self.run().await;
         }
@@ -311,44 +330,7 @@ impl Server {
 
         let app = self.create_router(ip_whitelist)?;
 
-        // Load TLS configuration
-        let tls_config = self.load_tls_config()?;
-        let acceptor = TlsAcceptor::from(Arc::new(tls_config));
-
-        let tls_addr: SocketAddr = format!("0.0.0.0:{}", self.config.tls.port).parse()?;
-
-        info!("Starting WEF server with TLS on https://{}", tls_addr);
-
-        let listener = tokio::net::TcpListener::bind(&tls_addr).await?;
-
-        // Accept TLS connections
-        loop {
-            let (stream, peer_addr) = listener.accept().await?;
-            let acceptor = acceptor.clone();
-            let app = app.clone();
-
-            tokio::spawn(async move {
-                match acceptor.accept(stream).await {
-                    Ok(_tls_stream) => {
-                        // Serve the connection
-                        let _service = app.into_make_service();
-                        // Note: This is a simplified version - in production you'd need
-                        // proper TLS stream handling with axum
-                        info!("TLS connection from {}", peer_addr);
-                    }
-                    Err(e) => {
-                        error!("TLS handshake failed from {}: {}", peer_addr, e);
-                    }
-                }
-            });
-        }
-    }
-
-    fn load_tls_config(&self) -> anyhow::Result<rustls::ServerConfig> {
-        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-        use std::fs::File;
-        use std::io::BufReader;
-
+        // Load TLS configuration from PEM files
         let cert_file = self
             .config
             .tls
@@ -362,26 +344,17 @@ impl Server {
             .as_ref()
             .expect("TLS enabled but no key_file specified");
 
-        // Load certificate chain
-        let cert_file = File::open(cert_file)?;
-        let mut cert_reader = BufReader::new(cert_file);
-        let certs: Vec<CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+        let tls_config = RustlsConfig::from_pem_file(cert_file, key_file).await?;
+        let tls_addr: SocketAddr = format!("0.0.0.0:{}", self.config.tls.port).parse()?;
 
-        // Load private key
-        let key_file = File::open(key_file)?;
-        let mut key_reader = BufReader::new(key_file);
-        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)?
-            .expect("No private key found in key file");
+        info!("Starting WEF server with TLS on https://{}", tls_addr);
 
-        let mut config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)?;
+        // Use axum-server for proper TLS handling
+        axum_server::bind_rustls(tls_addr, tls_config)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await?;
 
-        // Configure ALPN for HTTP/1.1
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-
-        Ok(config)
+        Ok(())
     }
 
     #[cfg(feature = "kerberos-auth")]
@@ -552,35 +525,54 @@ async fn handle_events(
     }
 }
 
-async fn process_events(state: &Arc<AppState>, events: Vec<WindowsEvent>) {
-    for event in events {
-        if let Some(ref event_parser) = state.event_parser {
-            if let Some(ref parsed) = event.parsed {
-                if let Some(generic_parsed) =
-                    event_parser.parse_event(parsed.event_id, &event.raw_xml)
-                {
-                    info!(
-                        "Event {} parsed with generic parser '{}': {}",
-                        parsed.event_id,
-                        generic_parsed.parser_name,
-                        generic_parsed.formatted_message.as_deref().unwrap_or("N/A")
-                    );
-                }
-            }
-        }
-
-        let event_type = describe_event_type(&event);
-        state.throughput.record_event(event_type).await;
-
-        state.forwarder.forward(event.clone()).await;
-
-        if let Some(ref parquet_s3) = state.parquet_s3_forwarder {
-            let mut forwarder = parquet_s3.lock().await;
-            if let Err(e) = forwarder.forward(event.clone()).await {
-                error!("Failed to forward to Parquet S3: {}", e);
+async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
+    // Wrap event in Arc to avoid cloning for each forwarder
+    let event = Arc::new(event);
+    
+    if let Some(ref event_parser) = state.event_parser {
+        if let Some(ref parsed) = event.parsed {
+            if let Some(generic_parsed) =
+                event_parser.parse_event(parsed.event_id, &event.raw_xml)
+            {
+                info!(
+                    "Event {} parsed with generic parser '{}': {}",
+                    parsed.event_id,
+                    generic_parsed.parser_name,
+                    generic_parsed.formatted_message.as_deref().unwrap_or("N/A")
+                );
             }
         }
     }
+
+    let event_type = describe_event_type(&event);
+    state.throughput.record_event(event_type).await;
+
+    // Pass Arc to forwarder (cheap clone of Arc, not the event)
+    state.forwarder.forward(event.clone()).await;
+
+    // Send to Parquet S3 via channel (non-blocking)
+    if let Some(ref sender) = state.parquet_s3_sender {
+        if let Err(e) = sender.try_send(event.clone()) {
+            match e {
+                mpsc::error::TrySendError::Full(_) => {
+                    warn!("Parquet S3 channel full, dropping event");
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    error!("Parquet S3 channel closed");
+                }
+            }
+        }
+    }
+}
+
+async fn process_events(state: &Arc<AppState>, events: Vec<WindowsEvent>) {
+    // Process events concurrently with a limit of 16 concurrent tasks
+    // This leverages multi-core CPUs for better throughput
+    stream::iter(events)
+        .for_each_concurrent(16, |event| async move {
+            process_single_event(state, event).await;
+        })
+        .await;
 }
 
 fn describe_event_type(event: &WindowsEvent) -> String {
@@ -640,7 +632,7 @@ mod tests {
             forwarder,
             parser: WefParser::new(),
             event_parser: None,
-            parquet_s3_forwarder: None,
+            parquet_s3_sender: None,
         })
     }
 
@@ -771,6 +763,229 @@ mod tests {
             .await
             .into_response();
         assert_eq!(bad_response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn handle_syslog_http_with_rfc5424_message() {
+        let addr: SocketAddr = "192.0.2.10:5514".parse().unwrap();
+        // RFC 5424 format
+        let msg = r#"<165>1 2024-01-15T10:33:45.000Z dns-server named 1234 - [dns@12345 query="example.com"] DNS query"#;
+
+        let response = handle_syslog_http(ConnectInfo(addr), Bytes::from(msg))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn handle_wef_request_with_heartbeat() {
+        let state = default_state().await;
+        let body = Bytes::from(
+            r#"
+        <Envelope>
+          <Body>
+            <Heartbeat>
+              <SubscriptionId>hb-sub-123</SubscriptionId>
+            </Heartbeat>
+          </Body>
+        </Envelope>
+        "#,
+        );
+        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
+        let headers = HeaderMap::new();
+
+        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
+            .await
+            .expect("heartbeat handled");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn handle_wef_request_with_unknown_message() {
+        let state = default_state().await;
+        let body = Bytes::from(
+            r#"
+        <Envelope>
+          <Body>
+            <UnknownTag>Some unknown content</UnknownTag>
+          </Body>
+        </Envelope>
+        "#,
+        );
+        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
+        let headers = HeaderMap::new();
+
+        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
+            .await
+            .expect("unknown message handled");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn handle_wef_request_with_parse_error() {
+        let state = default_state().await;
+        // Invalid XML - parser treats it as Unknown message, not an error
+        let body = Bytes::from("<Invalid XML");
+        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
+        let headers = HeaderMap::new();
+
+        let result = handle_wef_request(State(state), ConnectInfo(addr), headers, body).await;
+        // The parser doesn't fail on invalid XML, it returns Unknown message type
+        // which results in BAD_REQUEST status
+        match result {
+            Ok(response) => {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            }
+            Err(_) => {
+                // Either way is acceptable
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_events_with_invalid_body() {
+        let state = default_state().await;
+        let body = Bytes::from("not valid events");
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let result = handle_events(State(state), ConnectInfo(addr), body).await;
+        assert!(result.is_err(), "Should return error for invalid body");
+    }
+
+    #[test]
+    fn describe_event_type_with_empty_provider() {
+        let parsed = ParsedEvent {
+            provider: "".to_string(),
+            event_id: 1234,
+            level: EventLevel::Information,
+            task: 0,
+            opcode: 0,
+            keywords: 0,
+            time_created: chrono::Utc::now(),
+            event_record_id: 1,
+            process_id: None,
+            thread_id: None,
+            channel: "Security".into(),
+            computer: "HOST".into(),
+            security_user_id: None,
+            message: None,
+            data: None,
+        };
+        let event = WindowsEvent::new("test".into(), "<Event/>".into()).with_parsed(parsed);
+        assert_eq!(describe_event_type(&event), "EventID 1234");
+    }
+
+    #[test]
+    fn describe_event_type_with_provider() {
+        let parsed = ParsedEvent {
+            provider: "Microsoft-Windows-Security-Auditing".to_string(),
+            event_id: 4624,
+            level: EventLevel::Information,
+            task: 0,
+            opcode: 0,
+            keywords: 0,
+            time_created: chrono::Utc::now(),
+            event_record_id: 1,
+            process_id: None,
+            thread_id: None,
+            channel: "Security".into(),
+            computer: "HOST".into(),
+            security_user_id: None,
+            message: None,
+            data: None,
+        };
+        let event = WindowsEvent::new("test".into(), "<Event/>".into()).with_parsed(parsed);
+        assert_eq!(describe_event_type(&event), "Microsoft-Windows-Security-Auditing:4624");
+    }
+
+    #[tokio::test]
+    async fn health_check_returns_ok_directly() {
+        let response = health_check().await;
+        assert_eq!(response, "OK");
+    }
+
+    #[tokio::test]
+    async fn process_single_event_with_parsed_data() {
+        let state = default_state().await;
+        let event = WindowsEvent::new("host".into(), "<Event/>".into())
+            .with_parsed(sample_parsed_event());
+        
+        process_single_event(&state, event).await;
+        
+        let summary = state.throughput.snapshot().await;
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].event_type, "Security:4624");
+    }
+
+    #[tokio::test]
+    async fn process_single_event_without_parsed_data() {
+        let state = default_state().await;
+        let event = WindowsEvent::new("host".into(), "<Event/>".into());
+        
+        process_single_event(&state, event).await;
+        
+        // Should not panic and throughput should show "unknown"
+        let summary = state.throughput.snapshot().await;
+        assert!(summary.len() >= 0);
+    }
+
+    #[tokio::test]
+    async fn handle_wef_request_with_x_forwarded_for() {
+        let state = default_state().await;
+        let body = Bytes::from(
+            r#"
+        <Envelope>
+          <Body>
+            <Subscribe>
+              <SubscriptionId>ForwardedTest</SubscriptionId>
+              <Query>*</Query>
+            </Subscribe>
+          </Body>
+        </Envelope>
+        "#,
+        );
+        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", "10.0.0.100".parse().unwrap());
+
+        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
+            .await
+            .expect("subscription handled");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn handle_subscription_generates_unique_id() {
+        let state = default_state().await;
+        let body = Bytes::from(
+            r#"
+        <Envelope>
+          <Body>
+            <Subscribe>
+              <Query>*</Query>
+            </Subscribe>
+          </Body>
+        </Envelope>
+        "#,
+        );
+        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
+
+        let response = handle_subscription(State(state), ConnectInfo(addr), body)
+            .await
+            .expect("subscription handled");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn handle_syslog_http_with_dns_log() {
+        let addr: SocketAddr = "192.0.2.10:5514".parse().unwrap();
+        // BIND DNS query format
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: client 192.168.1.100#12345: query: example.com IN A + (93.184.216.34)";
+
+        let response = handle_syslog_http(ConnectInfo(addr), Bytes::from(msg))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
 

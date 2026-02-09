@@ -1,14 +1,22 @@
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 const RETENTION_MINUTES: i64 = 60;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ThroughputStats {
-    inner: Arc<RwLock<HashMap<String, EventStats>>>,
+    inner: Arc<DashMap<String, EventStats>>,
+}
+
+impl Default for ThroughputStats {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(DashMap::new()),
+        }
+    }
 }
 
 impl ThroughputStats {
@@ -20,6 +28,7 @@ impl ThroughputStats {
     /// Record an event occurrence for tracking throughput statistics.
     ///
     /// Events are aggregated by type and tracked in 1-minute buckets.
+    /// Uses DashMap for lock-free concurrent access.
     ///
     /// # Examples
     ///
@@ -35,15 +44,19 @@ impl ThroughputStats {
     /// ```
     pub async fn record_event(&self, event_type: String) {
         let minute = current_minute();
-        let mut guard = self.inner.write().await;
-        let stats = guard.entry(event_type).or_insert_with(EventStats::default);
-        stats.record(minute);
+        // Use DashMap for lock-free concurrent updates
+        self.inner
+            .entry(event_type)
+            .or_default()
+            .value_mut()
+            .record(minute);
     }
 
     /// Get a snapshot of current throughput statistics.
     ///
     /// Returns per-event-type statistics including total events, events in the
     /// last minute, and events in the last 5 minutes.
+    /// Uses DashMap for lock-free concurrent reads.
     ///
     /// # Examples
     ///
@@ -64,12 +77,17 @@ impl ThroughputStats {
     /// }
     /// ```
     pub async fn snapshot(&self) -> Vec<ThroughputSnapshot> {
-        let guard = self.inner.read().await;
         let minute = current_minute();
-        let mut rows = guard
+        // Use DashMap's concurrent iterator for lock-free reads
+        let mut rows: Vec<ThroughputSnapshot> = self
+            .inner
             .iter()
-            .map(|(event_type, stats)| stats.to_snapshot(event_type.clone(), minute))
-            .collect::<Vec<_>>();
+            .map(|entry| {
+                let event_type = entry.key().clone();
+                let stats = entry.value();
+                stats.to_snapshot(event_type, minute)
+            })
+            .collect();
 
         rows.sort_by(|a, b| b.last_minute.cmp(&a.last_minute));
         rows

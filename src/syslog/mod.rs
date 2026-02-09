@@ -612,4 +612,127 @@ mod tests {
         assert_eq!(dns.query_type, "A");
         assert_eq!(dns.response_ips, vec!["93.184.216.34"]);
     }
+
+    #[test]
+    fn test_parse_invalid_syslog() {
+        let result = SyslogMessage::parse("not a valid syslog message");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_empty_message() {
+        let result = SyslogMessage::parse("");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_facility_str() {
+        let msg = "<0>Oct 11 22:14:15 mymachine test: message";
+        let parsed = SyslogMessage::parse(msg).unwrap();
+        assert_eq!(parsed.facility_str(), "kernel");
+
+        // Priority 128 = facility 16 (local0) * 8 + severity 0
+        let msg2 = "<128>Oct 11 22:14:15 mymachine test: message";
+        let parsed2 = SyslogMessage::parse(msg2).unwrap();
+        assert_eq!(parsed2.facility_str(), "local0");
+    }
+
+    #[test]
+    fn test_severity_str() {
+        let msg = "<0>Oct 11 22:14:15 mymachine test: message";
+        let parsed = SyslogMessage::parse(msg).unwrap();
+        assert_eq!(parsed.severity_str(), "EMERGENCY");
+
+        let msg2 = "<6>Oct 11 22:14:15 mymachine test: message";
+        let parsed2 = SyslogMessage::parse(msg2).unwrap();
+        assert_eq!(parsed2.severity_str(), "INFO");
+    }
+
+    #[test]
+    fn test_parse_rfc3164_variants() {
+        // With hostname and app
+        let msg = "<34>Oct 11 22:14:15 mymachine myapp: test message";
+        let parsed = SyslogMessage::parse(msg).unwrap();
+        assert_eq!(parsed.hostname, Some("mymachine".to_string()));
+        assert_eq!(parsed.app_name, Some("myapp".to_string()));
+
+        // With process ID
+        let msg2 = "<34>Oct 11 22:14:15 mymachine myapp[1234]: test message";
+        let parsed2 = SyslogMessage::parse(msg2).unwrap();
+        assert_eq!(parsed2.app_name, Some("myapp".to_string()));
+    }
+
+    #[test]
+    fn test_parse_rfc5424_variants() {
+        // With msgid and structured data
+        let msg = r#"<165>1 2003-08-24T05:14:15.000003-07:00 192.0.2.1 myproc 8710 msgid1 [example@32473 iut="3"] An application event"#;
+        let parsed = SyslogMessage::parse(msg).unwrap();
+        assert_eq!(parsed.msg_id, Some("msgid1".to_string()));
+
+        // Minimal RFC5424
+        let msg2 = "<34>1 2003-10-11T22:14:15Z host app - - - message";
+        let parsed2 = SyslogMessage::parse(msg2).unwrap();
+        assert_eq!(parsed2.hostname, Some("host".to_string()));
+    }
+
+    #[test]
+    fn test_dns_bind_format_variants() {
+        // Standard BIND format - works with the current regex
+        let msg = "client 192.168.1.100#12345: query: example.com IN A + (192.168.1.1)";
+        let entry = dns::DnsLogEntry::from_bind_format(msg).unwrap();
+        assert_eq!(entry.client_ip, "192.168.1.100");
+        assert_eq!(entry.response_ips, vec!["192.168.1.1"]);
+
+        // CNAME response with valid IP
+        let msg2 = "client 192.168.1.100#12345: query: www.example.com IN CNAME + (93.184.216.34)";
+        let entry2 = dns::DnsLogEntry::from_bind_format(msg2).unwrap();
+        assert_eq!(entry2.query_type, "CNAME");
+    }
+
+    #[test]
+    fn test_dns_non_dns_message() {
+        let syslog = SyslogMessage::parse("<34>Oct 11 22:14:15 mymachine app: regular message without DNS").unwrap();
+        let dns = dns::DnsLogEntry::from_syslog(&syslog);
+        assert!(dns.is_none());
+    }
+
+    #[test]
+    fn test_dns_bind_format_invalid() {
+        let result = dns::DnsLogEntry::from_bind_format("not a valid bind format");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_dns_unbound_format_invalid() {
+        let result = dns::DnsLogEntry::from_unbound_format("not valid");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_dns_powerdns_format_invalid() {
+        let result = dns::DnsLogEntry::from_powerdns_format("not valid");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_severity_from_u8() {
+        assert_eq!(Severity::from_u8(0), Some(Severity::Emergency));
+        assert_eq!(Severity::from_u8(3), Some(Severity::Error));
+        assert_eq!(Severity::from_u8(6), Some(Severity::Informational));
+        assert_eq!(Severity::from_u8(7), Some(Severity::Debug));
+    }
+
+    #[test]
+    fn test_facility_from_u8() {
+        assert_eq!(Facility::from_u8(0), Some(Facility::Kernel));
+        assert_eq!(Facility::from_u8(4), Some(Facility::Security));
+        assert_eq!(Facility::from_u8(16), Some(Facility::Local0));
+    }
+
+    #[test]
+    fn test_facility_debug() {
+        let f = Facility::System;
+        let debug_str = format!("{:?}", f);
+        assert_eq!(debug_str, "System");
+    }
 }
