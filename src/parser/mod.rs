@@ -1,3 +1,4 @@
+use aho_corasick::AhoCorasick;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -374,15 +375,18 @@ impl GenericEventParser {
     }
 
     /// Format an output message using the template
+    /// Uses aho-corasick for efficient multi-pattern replacement in a single pass
     fn format_message(
         &self,
         template: &str,
         fields: &HashMap<String, serde_json::Value>,
         enrichments: &HashMap<String, String>,
     ) -> Option<String> {
-        let mut result = template.to_string();
+        // Collect all placeholders and their replacements
+        let mut patterns = Vec::new();
+        let mut replacements = Vec::new();
 
-        // Replace field placeholders
+        // Collect field placeholders
         for (field_name, value) in fields {
             let placeholder = format!("{{{}}}", field_name);
             let value_str = match value {
@@ -391,14 +395,24 @@ impl GenericEventParser {
                 serde_json::Value::Bool(b) => b.to_string(),
                 _ => value.to_string(),
             };
-            result = result.replace(&placeholder, &value_str);
+            patterns.push(placeholder);
+            replacements.push(value_str);
         }
 
-        // Replace enrichment placeholders
+        // Collect enrichment placeholders
         for (field_name, value) in enrichments {
             let placeholder = format!("{{{}}}", field_name);
-            result = result.replace(&placeholder, value);
+            patterns.push(placeholder);
+            replacements.push(value.clone());
         }
+
+        // Use aho-corasick for efficient multi-pattern replacement
+        if patterns.is_empty() {
+            return Some(template.trim().to_string());
+        }
+
+        let ac = AhoCorasick::new(&patterns).ok()?;
+        let result = ac.replace_all(template, &replacements);
 
         Some(result.trim().to_string())
     }

@@ -157,10 +157,12 @@ impl BufferedEvent {
     }
 
     fn estimated_size(&self) -> usize {
-        // Rough estimation: JSON string length + metadata
-        serde_json::to_string(&self.event_data)
-            .map(|s| s.len())
-            .unwrap_or(1024)
+        // Use raw_xml length as efficient size estimation
+        // This avoids expensive JSON serialization
+        self.event_data
+            .get("raw_xml")
+            .and_then(|v| v.as_str().map(|s| s.len()))
+            .unwrap_or(512)
             + 256 // metadata overhead
     }
 }
@@ -351,15 +353,23 @@ impl ParquetS3Forwarder {
             ],
         )?;
 
-        // Write to parquet file
-        let file = File::create(&filepath)?;
-        let props = WriterProperties::builder()
-            .set_compression(parquet::basic::Compression::ZSTD(ZstdLevel::try_new(3)?))
-            .build();
+        // Clone filepath for use in spawn_blocking
+        let filepath_clone = filepath.clone();
+        let schema_clone = schema.clone();
+        
+        // Write to parquet file in a blocking task to avoid blocking async runtime
+        tokio::task::spawn_blocking(move || {
+            let file = File::create(&filepath_clone)?;
+            let props = WriterProperties::builder()
+                .set_compression(parquet::basic::Compression::ZSTD(ZstdLevel::try_new(3)?))
+                .build();
 
-        let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-        writer.write(&batch)?;
-        writer.close()?;
+            let mut writer = ArrowWriter::try_new(file, schema_clone, Some(props))?;
+            writer.write(&batch)?;
+            writer.close()?;
+            
+            Result::<(), anyhow::Error>::Ok(())
+        }).await??;
 
         debug!(
             "Written {} events to parquet file: {:?}",

@@ -14,8 +14,31 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Determine number of worker threads (default to all CPU cores)
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    
+    // Check for environment override
+    let worker_threads = std::env::var("WEF_WORKER_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(num_cpus);
+
+    info!("Starting WEF Server with {} worker threads ({} CPUs available)", 
+          worker_threads, num_cpus);
+
+    // Create multi-threaded Tokio runtime
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     // Load configuration
     let config = config::Config::load()?;
 
