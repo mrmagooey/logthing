@@ -3,7 +3,8 @@
 
 set -e
 
-cd /home/peter/projects/logthing
+# Change to repo root (parent of scripts directory)
+cd "$(dirname "$0")/.."
 
 echo "========================================"
 echo "Starting WEF Server with CPU Profiling"
@@ -28,7 +29,7 @@ echo "========================================"
 
 # Run performance test
 cd tests/e2e/simulation-environment
-docker compose run --rm performance-test-max-throughput 2>&1 | tee ../../../profiling-results/test-output.txt
+docker compose run --rm performance-test-max-throughput 2>&1 | tee ../../../../profiling-results/test-output.txt
 
 echo ""
 echo "========================================"
@@ -39,7 +40,7 @@ echo "========================================"
 kill $SERVER_PID 2>/dev/null || true
 wait $SERVER_PID 2>/dev/null || true
 
-cd /home/peter/projects/logthing
+cd "$(dirname "$0")/.."
 
 # Generate flamegraph
 echo "Generating flamegraph..."

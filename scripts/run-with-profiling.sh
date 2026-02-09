@@ -1,7 +1,8 @@
 #!/bin/bash
 # Script to run WEF server with profiling
 
-cd /home/peter/projects/logthing
+# Change to repo root (parent of scripts directory)
+cd "$(dirname "$0")/.."
 
 # Set environment variables
 export RUST_LOG=info
