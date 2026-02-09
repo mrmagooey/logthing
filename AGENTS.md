@@ -20,7 +20,7 @@ This document explains how automated or semi-automated agents should interact wi
 | Format code | `cargo fmt` |
 | Lint check | `cargo clippy -- -D warnings` |
 | Coverage report | `scripts/run_coverage.sh` |
-| E2E tests | `tests/e2e/run.sh` (requires Docker) |
+| E2E tests | `tests/e2e/simulation-environment/run.sh` (requires Docker) |
 
 **Example - run a specific test:**
 ```bash
