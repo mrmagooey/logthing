@@ -26,6 +26,9 @@ pub struct Config {
 
     #[serde(default)]
     pub syslog: SyslogConfig,
+
+    #[serde(default)]
+    pub ipfix: IpfixConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -143,6 +146,39 @@ pub struct SyslogConfig {
     pub parse_dns: bool,
 }
 
+/// Configuration for the IPFIX / NetFlow UDP listener.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IpfixConfig {
+    #[serde(default = "default_ipfix_enabled")]
+    pub enabled: bool,
+
+    #[serde(default = "default_ipfix_udp_port")]
+    pub udp_port: u16,
+
+    #[serde(default = "default_ipfix_bind_address")]
+    pub bind_address: String,
+}
+
+impl Default for IpfixConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_ipfix_enabled(),
+            udp_port: default_ipfix_udp_port(),
+            bind_address: default_ipfix_bind_address(),
+        }
+    }
+}
+
+fn default_ipfix_enabled() -> bool {
+    false
+}
+fn default_ipfix_udp_port() -> u16 {
+    4739
+}
+fn default_ipfix_bind_address() -> String {
+    "0.0.0.0".to_string()
+}
+
 impl Default for SyslogConfig {
     fn default() -> Self {
         Self {
@@ -164,6 +200,7 @@ impl Default for Config {
             logging: LoggingConfig::default(),
             metrics: MetricsConfig::default(),
             syslog: SyslogConfig::default(),
+            ipfix: IpfixConfig::default(),
         }
     }
 }
@@ -337,6 +374,14 @@ mod tests {
         assert!(cfg.tls.enabled);
         assert_eq!(cfg.metrics.port, 9090);
         assert!(cfg.syslog.enabled);
+    }
+
+    #[test]
+    fn default_ipfix_config_disabled_on_port_4739() {
+        let cfg = Config::default();
+        assert!(!cfg.ipfix.enabled, "ipfix disabled by default");
+        assert_eq!(cfg.ipfix.udp_port, 4739);
+        assert_eq!(cfg.ipfix.bind_address, "0.0.0.0");
     }
 
     #[test]
