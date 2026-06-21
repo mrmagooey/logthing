@@ -365,14 +365,10 @@ impl ParquetS3Forwarder {
             filename
         );
 
-        // Read file into memory and delegate to S3Sink
+        // Read file into memory and delegate to S3Sink.
+        // S3Sink::upload already logs the successful upload; no need to log here too.
         let body = tokio::fs::read(filepath).await?;
         self.sink.upload(&s3_key, body).await?;
-
-        info!(
-            "Uploaded parquet file to S3: s3://{}/{}",
-            self.sink.bucket, s3_key
-        );
 
         Ok(())
     }
