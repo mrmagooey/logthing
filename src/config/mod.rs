@@ -4,6 +4,19 @@ use std::path::{Path, PathBuf};
 
 pub const ADMIN_OVERRIDE_FILE: &str = "logthing.admin.toml";
 
+/// Shared S3 connection parameters embedded (via `#[serde(flatten)]`) into
+/// `SyslogS3Config` and `IpfixS3Config`. This keeps the TOML surface flat
+/// (e.g. `[syslog.s3]\nendpoint = …`) while ensuring the client-construction
+/// logic lives in one place (`S3Sink::from_connection`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct S3ConnectionConfig {
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+    pub access_key: String,
+    pub secret_key: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default = "default_bind_address")]
@@ -152,26 +165,29 @@ pub struct SyslogConfig {
 }
 
 /// Per-source S3 persistence config for the syslog listener.
+/// Absent from TOML → `None` → no S3 persistence (backward compatible).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SyslogS3Config {
-    pub endpoint: String,
-    pub bucket: String,
-    pub region: String,
-    pub access_key: String,
-    pub secret_key: String,
-    /// S3 key prefix, e.g. `"syslog/"`.
-    #[serde(default = "default_syslog_s3_key_prefix")]
-    pub key_prefix: String,
+    /// Shared S3 connection fields (endpoint, bucket, region, access_key, secret_key).
+    /// Flattened so the TOML block stays flat: `[syslog.s3]\nendpoint = …`
+    #[serde(flatten)]
+    pub connection: S3ConnectionConfig,
+    /// S3 key prefix, slash-free (default: `"syslog"`); builder inserts `/`.
+    #[serde(default = "default_syslog_s3_prefix")]
+    pub prefix: String,
     /// Flush when row count reaches this threshold (default 10 000).
     #[serde(default = "default_syslog_s3_max_rows")]
     pub max_buffer_rows: usize,
     /// Flush after this many seconds regardless of row count (default 900 = 15 min).
     #[serde(default = "default_syslog_s3_flush_interval_secs")]
     pub flush_interval_secs: u64,
+    /// Bounded channel capacity (number of messages; default 4096).
+    #[serde(default = "default_syslog_s3_channel_capacity")]
+    pub channel_capacity: usize,
 }
 
-fn default_syslog_s3_key_prefix() -> String {
-    "syslog/".to_string()
+fn default_syslog_s3_prefix() -> String {
+    "syslog".to_string()
 }
 fn default_syslog_s3_max_rows() -> usize {
     10_000
@@ -179,21 +195,8 @@ fn default_syslog_s3_max_rows() -> usize {
 fn default_syslog_s3_flush_interval_secs() -> u64 {
     900
 }
-
-impl SyslogS3Config {
-    /// Convert to `ParquetS3Config` so we can construct an `S3Sink` via Phase-2 API.
-    pub fn to_parquet_s3_config(&self) -> crate::forwarding::parquet_s3::ParquetS3Config {
-        crate::forwarding::parquet_s3::ParquetS3Config {
-            endpoint: self.endpoint.clone(),
-            bucket: self.bucket.clone(),
-            region: self.region.clone(),
-            access_key: self.access_key.clone(),
-            secret_key: self.secret_key.clone(),
-            max_file_size_mb: 0, // unused by S3Sink directly
-            flush_interval_secs: self.flush_interval_secs,
-            local_buffer_path: std::path::PathBuf::new(), // unused by S3Sink directly
-        }
-    }
+fn default_syslog_s3_channel_capacity() -> usize {
+    4_096
 }
 
 /// Configuration for the IPFIX / NetFlow UDP listener.
@@ -451,14 +454,14 @@ bucket     = "syslog-bucket"
 region     = "us-east-1"
 access_key = "KEY"
 secret_key = "SECRET"
-key_prefix = "syslog/"
+prefix = "syslog"
 max_buffer_rows = 5000
 flush_interval_secs = 300
 "#;
         let cfg: Config = toml::from_str(toml_str).expect("parse config");
         let s3 = cfg.syslog.s3.expect("s3 config present");
-        assert_eq!(s3.bucket, "syslog-bucket");
-        assert_eq!(s3.key_prefix, "syslog/");
+        assert_eq!(s3.connection.bucket, "syslog-bucket");
+        assert_eq!(s3.prefix, "syslog");
         assert_eq!(s3.max_buffer_rows, 5000);
         assert_eq!(s3.flush_interval_secs, 300);
     }
@@ -475,9 +478,49 @@ secret_key = "SECRET"
 "#;
         let cfg: Config = toml::from_str(toml_str).expect("parse");
         let s3 = cfg.syslog.s3.expect("present");
-        assert_eq!(s3.key_prefix, "syslog/");
+        assert_eq!(s3.prefix, "syslog");
         assert_eq!(s3.max_buffer_rows, 10_000);
         assert_eq!(s3.flush_interval_secs, 900);
+        assert_eq!(s3.channel_capacity, 4096);
+    }
+
+    #[test]
+    fn syslog_s3_flat_toml_deserializes_correctly() {
+        // Verify that #[serde(flatten)] keeps the TOML surface flat.
+        let toml_str = r#"
+[syslog.s3]
+endpoint   = "http://minio:9000"
+bucket     = "log-bucket"
+region     = "eu-west-1"
+access_key = "AKEY"
+secret_key = "SKEY"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        let s3 = cfg.syslog.s3.expect("present");
+        assert_eq!(s3.connection.endpoint, "http://minio:9000");
+        assert_eq!(s3.connection.bucket, "log-bucket");
+        assert_eq!(s3.connection.region, "eu-west-1");
+        assert_eq!(s3.connection.access_key, "AKEY");
+        assert_eq!(s3.connection.secret_key, "SKEY");
+    }
+
+    #[test]
+    fn ipfix_s3_flat_toml_deserializes_correctly() {
+        // Verify that #[serde(flatten)] keeps the TOML surface flat.
+        let toml_str = r#"
+[ipfix.s3]
+endpoint   = "http://minio:9001"
+bucket     = "flow-bucket"
+region     = "ap-east-1"
+access_key = "FKEY"
+secret_key = "FSKEY"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        let s3 = cfg.ipfix.s3.expect("present");
+        assert_eq!(s3.connection.endpoint, "http://minio:9001");
+        assert_eq!(s3.connection.bucket, "flow-bucket");
+        assert_eq!(s3.connection.region, "ap-east-1");
+        assert_eq!(s3.connection.access_key, "FKEY");
     }
 
     #[test]
@@ -546,7 +589,7 @@ secret_key = "secret"
         let cfg: Config = toml::from_str(toml_str).expect("parse");
         assert!(cfg.ipfix.enabled);
         let s3 = cfg.ipfix.s3.expect("s3 present");
-        assert_eq!(s3.bucket, "ipfix-flows");
+        assert_eq!(s3.connection.bucket, "ipfix-flows");
         assert_eq!(s3.prefix, "ipfix"); // default
         assert_eq!(s3.flush_interval_secs, 900); // default
     }
