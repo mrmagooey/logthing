@@ -18,6 +18,7 @@ MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "http://minio:9000")
 BUCKET = os.environ.get("MINIO_BUCKET", "ipfix-flows")
 IPFIX_PREFIX = os.environ.get("IPFIX_S3_PREFIX", "ipfix/")
 TIMEOUT = int(os.environ.get("E2E_TIMEOUT_SECS", "60"))
+EXPECTED_EVENT_TOTAL = int(os.environ.get("EXPECTED_EVENT_TOTAL", "0"))
 
 REQUIRED_COLUMNS = [
     "observation_domain_id",
@@ -85,9 +86,18 @@ def verify_parquet(key, body):
         print("ERROR: IPFIX Parquet object has 0 rows", file=sys.stderr)
         sys.exit(1)
 
+    if EXPECTED_EVENT_TOTAL > 0 and table.num_rows < EXPECTED_EVENT_TOTAL:
+        print(
+            f"ERROR: IPFIX Parquet has {table.num_rows} row(s) but expected "
+            f">= {EXPECTED_EVENT_TOTAL}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     print(
         f"OK: IPFIX Parquet verified at {key}: "
-        f"{table.num_rows} row(s), {len(actual_columns)} column(s)"
+        f"{table.num_rows} row(s) (expected >= {EXPECTED_EVENT_TOTAL}), "
+        f"{len(actual_columns)} column(s)"
     )
     print(f"    Columns: {sorted(actual_columns)}")
 
