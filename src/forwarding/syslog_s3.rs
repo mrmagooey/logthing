@@ -124,7 +124,9 @@ pub struct SyslogS3WriterConfig {
     pub max_buffer_rows: usize,
     /// Maximum wall-clock age of a non-empty buffer before flush.
     pub flush_interval: std::time::Duration,
-    /// S3 key prefix, e.g. `"syslog/"`.  A trailing slash is conventional.
+    /// S3 key prefix without a trailing slash, e.g. `"syslog"`.
+    /// The key builder inserts the `/` separator, so `"syslog"` produces
+    /// `"syslog/year=.../month=.../day=.../<uuid>.parquet"`.
     pub key_prefix: String,
 }
 
@@ -133,7 +135,7 @@ impl Default for SyslogS3WriterConfig {
         Self {
             max_buffer_rows: 10_000,
             flush_interval: std::time::Duration::from_secs(900), // 15 min
-            key_prefix: "syslog/".to_string(),
+            key_prefix: "syslog".to_string(),
         }
     }
 }
@@ -280,12 +282,12 @@ impl SyslogS3Writer {
         Ok(())
     }
 
-    /// Build the S3 object key: `{prefix}year={Y}/month={MM}/day={DD}/{uuid}.parquet`
+    /// Build the S3 object key: `{prefix}/year={Y}/month={MM}/day={DD}/{uuid}.parquet`
     fn build_key(&self) -> String {
         let now = Utc::now();
         let id = uuid::Uuid::new_v4();
         format!(
-            "{}year={}/month={:02}/day={:02}/{}.parquet",
+            "{}/year={}/month={:02}/day={:02}/{}.parquet",
             self.config.key_prefix,
             now.year(),
             now.month(),
@@ -632,7 +634,7 @@ mod tests {
         let config = SyslogS3WriterConfig {
             max_buffer_rows: 3,
             flush_interval: std::time::Duration::from_secs(3600),
-            key_prefix: "test/".to_string(),
+            key_prefix: "test".to_string(),
         };
         let mut writer = SyslogS3Writer::new(config, sink);
 
@@ -677,7 +679,7 @@ mod tests {
         let config = SyslogS3WriterConfig {
             max_buffer_rows: max_rows,
             flush_interval: std::time::Duration::from_secs(3600),
-            key_prefix: "test/".to_string(),
+            key_prefix: "test".to_string(),
         };
         let hard_cap = config.hard_cap_rows(); // 2 * 4 = 8
         let mut writer = SyslogS3Writer::new(config, sink);
@@ -748,7 +750,7 @@ mod tests {
         let config = SyslogS3WriterConfig {
             max_buffer_rows: 1, // flush on every message so the writer task stalls immediately
             flush_interval: std::time::Duration::from_secs(3600),
-            key_prefix: "test/".to_string(),
+            key_prefix: "test".to_string(),
         };
         let handler = SyslogS3Handler::start_with_capacity(config, sink, 1);
 
@@ -799,17 +801,17 @@ mod tests {
 
     // -- A3: prefix and channel_capacity coherence --
 
-    /// When `key_prefix` is set to `"syslog/"` (as main.rs constructs it from a
-    /// slash-free `prefix` config field) the generated key must start with
+    /// When `key_prefix` is set to `"syslog"` (slash-free, as main.rs now passes it),
+    /// `build_key` must insert the `/` separator so the generated key starts with
     /// `syslog/year=` with correct date partitions.
     #[test]
     fn build_key_inserts_slash_between_prefix_and_partition() {
-        // Construct a writer whose key_prefix mimics what main.rs produces:
-        // `format!("{}/", cfg.prefix)` where `prefix` defaults to `"syslog"`.
+        // Construct a writer with a slash-free key_prefix matching what main.rs now passes:
+        // `s3_cfg.prefix.clone()` where `prefix` defaults to `"syslog"`.
         let config = SyslogS3WriterConfig {
             max_buffer_rows: 1000,
             flush_interval: std::time::Duration::from_secs(900),
-            key_prefix: "syslog/".to_string(),
+            key_prefix: "syslog".to_string(),
         };
         // We need access to the private build_key; test via the writer directly.
         // Create an unreachable sink synchronously using a blocking executor.
@@ -827,16 +829,22 @@ mod tests {
         assert!(key.contains("/month="), "key must contain /month=");
         assert!(key.contains("/day="), "key must contain /day=");
         assert!(key.ends_with(".parquet"), "key must end with .parquet");
+        // Guard against double-slash: the prefix must not produce "syslog//year="
+        assert!(
+            !key.contains("//"),
+            "key must not contain double-slash; got: {key}"
+        );
     }
 
-    /// Prove that a custom slash-free prefix results in the correct key structure.
+    /// Prove that a custom slash-free prefix (e.g. `"logs"`) results in the correct key
+    /// structure `"logs/year=..."`, with exactly one slash between prefix and partition.
     #[test]
     fn build_key_respects_custom_slash_free_prefix() {
         let config = SyslogS3WriterConfig {
             max_buffer_rows: 1000,
             flush_interval: std::time::Duration::from_secs(900),
-            // Simulate main.rs: `format!("{}/", "audit")` = `"audit/"`
-            key_prefix: "audit/".to_string(),
+            // Slash-free custom prefix — main.rs now passes `s3_cfg.prefix.clone()`.
+            key_prefix: "logs".to_string(),
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -846,8 +854,12 @@ mod tests {
         let writer = SyslogS3Writer::new(config, sink);
         let key = writer.build_key();
         assert!(
-            key.starts_with("audit/year="),
-            "key must start with 'audit/year='; got: {key}"
+            key.starts_with("logs/year="),
+            "key must start with 'logs/year='; got: {key}"
+        );
+        assert!(
+            !key.contains("//"),
+            "key must not contain double-slash; got: {key}"
         );
     }
 
@@ -874,7 +886,7 @@ mod tests {
             let config = SyslogS3WriterConfig {
                 max_buffer_rows: 1, // flush on every message so writer stalls on S3
                 flush_interval: std::time::Duration::from_secs(3600),
-                key_prefix: "syslog/".to_string(),
+                key_prefix: "syslog".to_string(),
             };
             let handler = SyslogS3Handler::start_with_capacity(config, sink, 1);
             tokio::task::yield_now().await;
@@ -918,7 +930,7 @@ mod tests {
             let config = SyslogS3WriterConfig {
                 max_buffer_rows: 100_000, // prevent flush so channel never stalls
                 flush_interval: std::time::Duration::from_secs(3600),
-                key_prefix: "syslog/".to_string(),
+                key_prefix: "syslog".to_string(),
             };
             let handler = SyslogS3Handler::start_with_capacity(config, sink, 10_000);
             tokio::task::yield_now().await;
