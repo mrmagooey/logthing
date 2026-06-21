@@ -159,6 +159,34 @@ The server automatically parses DNS query logs from:
 - Unbound: `info: 192.168.1.100 example.com. A IN`
 - PowerDNS: `Remote 192.168.1.100 wants 'example.com|A', do = 0, bufsize = 512`
 
+### Syslog S3 Persistence
+
+Syslog messages can be persisted directly to S3-compatible storage as compressed Parquet files:
+
+```toml
+[syslog]
+enabled = true
+parse_dns = true   # see note below
+
+[syslog.s3]
+endpoint   = "http://localhost:9000"
+bucket     = "syslog-logs"
+region     = "us-east-1"
+access_key = "minioadmin"
+secret_key = "minioadmin"
+prefix     = "syslog"          # slash-free; builder inserts /
+max_buffer_rows = 10000        # flush when this many rows buffered (default 10 000)
+flush_interval_secs = 900      # flush every N seconds regardless of row count (default 900)
+channel_capacity = 4096        # bounded channel between listener and writer (default 4096)
+```
+
+**Note — `parse_dns` and `[syslog.s3]` are currently mutually exclusive.**
+When `[syslog.s3]` is present the S3 handler is used instead of the default syslog
+handler.  The S3 handler writes every received message to Parquet and does **not** run
+the DNS-log extraction (`parse_dns`).  If you need both S3 persistence and DNS-log
+parsing, omit `[syslog.s3]` and forward syslog messages to an external pipeline.
+Combining both in a single handler is a planned future feature.
+
 ### Parquet S3 Forwarder
 
 Store Windows events in S3-compatible storage (AWS S3, MinIO, etc.) as compressed Parquet files:

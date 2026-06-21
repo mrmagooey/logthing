@@ -70,7 +70,22 @@ impl SyslogHandler for DefaultSyslogHandler {
     }
 }
 
-/// Syslog listener that can receive messages via UDP and TCP
+/// Syslog listener that can receive messages via UDP and TCP.
+///
+/// The listener is wired to a [`SyslogHandler`] that determines what happens to
+/// each parsed message.  Two handlers are provided:
+///
+/// - [`DefaultSyslogHandler`]: logs the message and optionally runs DNS-log
+///   extraction when `parse_dns` is enabled.
+/// - `SyslogS3Handler` (in `forwarding::syslog_s3`): buffers messages and
+///   persists them to S3 as Parquet.
+///
+/// **Important:** `SyslogS3Handler` and DNS-log parsing (`parse_dns`) are
+/// currently **mutually exclusive**.  When `[syslog.s3]` is configured in
+/// `logthing.toml`, the server uses `SyslogS3Handler` and DNS-log extraction
+/// does **not** run.  If you need both persistence and DNS parsing, use the
+/// default handler and route syslog traffic to an external pipeline for S3
+/// ingestion.  Combining both is a planned future feature.
 pub struct SyslogListener {
     config: SyslogListenerConfig,
     handler: Arc<dyn SyslogHandler>,
