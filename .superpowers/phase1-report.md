@@ -2,7 +2,7 @@
 
 **Branch:** `feat/ipfix-phase1-ingestion`
 **Date:** 2026-06-21
-**Status:** DONE_WITH_CONCERNS
+**Status:** DONE (review fixes applied 2026-06-21)
 
 ---
 
@@ -21,14 +21,18 @@ rather than one-per-task:
 
 ---
 
-## Final Test Count
+## Final Test Count (after review fixes)
 
 ```
-test result: ok. 183 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.87s
+test result: ok. 186 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.32s
 ```
 
 - Baseline (before Phase 1): 155 tests
-- Phase 1 additions: 28 new tests
+- Phase 1 additions (original): 28 new tests
+- Review-fix additions: 3 new tests (I1: 2, I2: 1)
+- Total: 186 tests passing
+
+### Original Phase 1 test breakdown
   - `ipfix::tests`: 3 (FlowRecord type/serde/clone)
   - `ipfix::decoder::tests`: 22 (IE map, DecodeError, read helpers, template cache, IPFIX v10, v9, v5, dispatch)
   - `ipfix::listener::tests`: 2 (integration: UDP receive + malformed resilience)
@@ -81,6 +85,26 @@ The plan's 10 tasks map to 3 feature commits (plus 1 formatting commit) rather t
 
 ### 5. E2E tests
 Per the plan's explicit note, Phase 1 has no E2E tests: "Phase 1 does not add an E2E test because S3 persistence is out of scope and there is no persistent side-effect to assert against." This is a documented gap, not a deviation.
+
+---
+
+---
+
+## Review Fix Log (2026-06-21)
+
+| Finding | SHA | Summary |
+|---------|-----|---------|
+| scope-creep revert | 9cfa780 | Revert "chore: apply cargo fmt to pre-existing files" |
+| m6 | c934114 | `fix(ipfix): restrict cache visibility to pub(crate)` |
+| m1 | ca54a54 | `fix(ipfix): remove dead _export_time parameter from decode_ipfix` |
+| I1 | 42939be | `fix(ipfix): remove double-counted ipfix_flows_decoded from DefaultIpfixHandler` |
+| I2 | 71e18d8 | `fix(ipfix): add bounded template cache to prevent DoS via template flood` |
+| m3 | 5829eae | `fix(ipfix): eliminate TOCTOU race in listener integration tests` |
+| fmt + admin | 73d4a8f | `chore(ipfix): apply rustfmt to ipfix source files and restore admin.toml ipfix section` |
+
+### Findings NOT fixed
+
+None. All 6 review findings (I1, I2, m1, m3, m6, scope-creep revert) were addressed.
 
 ---
 
