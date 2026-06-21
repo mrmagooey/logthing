@@ -691,9 +691,7 @@ mod tests {
 
     #[test]
     fn test_dns_non_dns_message() {
-        let syslog =
-            SyslogMessage::parse("<34>Oct 11 22:14:15 mymachine app: regular message without DNS")
-                .unwrap();
+        let syslog = SyslogMessage::parse("<34>Oct 11 22:14:15 mymachine app: regular message without DNS").unwrap();
         let dns = dns::DnsLogEntry::from_syslog(&syslog);
         assert!(dns.is_none());
     }

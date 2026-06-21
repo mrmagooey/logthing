@@ -60,10 +60,7 @@ pub async fn validate_config(
             errors.push("Forwarding destination name cannot be empty".to_string());
         }
         if dest.url.is_empty() {
-            errors.push(format!(
-                "Forwarding destination '{}' URL cannot be empty",
-                dest.name
-            ));
+            errors.push(format!("Forwarding destination '{}' URL cannot be empty", dest.name));
         }
     }
 
@@ -99,12 +96,7 @@ pub async fn validate_config(
 
     state
         .audit_logger
-        .log(
-            "CONFIG_VALIDATED",
-            &username,
-            &client_ip,
-            Some(&format!("Valid: {}", result.valid)),
-        )
+        .log("CONFIG_VALIDATED", &username, &client_ip, Some(&format!("Valid: {}", result.valid)))
         .await;
 
     Ok(Json(result))
@@ -194,12 +186,7 @@ pub async fn diff_config(
 
     state
         .audit_logger
-        .log(
-            "CONFIG_DIFF",
-            &username,
-            &client_ip,
-            Some(&format!("{} changes", diff.changed.len())),
-        )
+        .log("CONFIG_DIFF", &username, &client_ip, Some(&format!("{} changes", diff.changed.len())))
         .await;
 
     Ok(Json(diff))
@@ -237,10 +224,7 @@ pub async fn export_config(
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "application/toml"),
-            (
-                header::CONTENT_DISPOSITION,
-                "attachment; filename=\"logthing-backup.toml\"",
-            ),
+            (header::CONTENT_DISPOSITION, "attachment; filename=\"logthing-backup.toml\""),
         ],
         toml_content,
     )
@@ -271,7 +255,11 @@ pub async fn import_config(
                 .into_response());
         }
     } else {
-        return Err((StatusCode::BAD_REQUEST, "Invalid UTF-8 content").into_response());
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid UTF-8 content",
+        )
+            .into_response());
     };
 
     // Validate before applying

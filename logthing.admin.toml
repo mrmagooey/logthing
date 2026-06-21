@@ -31,8 +31,3 @@ enabled = true
 udp_port = 514
 tcp_port = 601
 parse_dns = true
-
-[ipfix]
-enabled = false
-udp_port = 4739
-bind_address = "0.0.0.0"

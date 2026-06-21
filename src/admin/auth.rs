@@ -65,11 +65,7 @@ pub async fn generate_csrf_token(state: &AdminState) -> String {
         .collect();
 
     let expiry = std::time::Instant::now() + std::time::Duration::from_secs(3600);
-    state
-        .csrf_tokens
-        .write()
-        .await
-        .push((token.clone(), expiry));
+    state.csrf_tokens.write().await.push((token.clone(), expiry));
 
     token
 }

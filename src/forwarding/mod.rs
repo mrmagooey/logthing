@@ -315,11 +315,8 @@ mod tests {
             message: Some("User logged in".into()),
             data: None,
         };
-        WindowsEvent::new(
-            "192.168.1.100".into(),
-            "<Event><System><EventID>4624</EventID></System></Event>".into(),
-        )
-        .with_parsed(parsed)
+        WindowsEvent::new("192.168.1.100".into(), "<Event><System><EventID>4624</EventID></System></Event>".into())
+            .with_parsed(parsed)
     }
 
     #[test]
@@ -477,7 +474,10 @@ mod tests {
     #[tokio::test]
     async fn forward_tcp_handles_connection_failure() {
         // Test with no server listening
-        let result = Forwarder::forward_tcp(&sample_event(), "tcp://127.0.0.1:19998").await;
+        let result = Forwarder::forward_tcp(
+            &sample_event(),
+            "tcp://127.0.0.1:19998"
+        ).await;
         assert!(result.is_err(), "Should fail to connect");
     }
 
@@ -498,8 +498,10 @@ mod tests {
         // Give server time to start
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        let result =
-            Forwarder::forward_tcp(&sample_event(), &format!("tcp://{}", local_addr)).await;
+        let result = Forwarder::forward_tcp(
+            &sample_event(),
+            &format!("tcp://{}", local_addr)
+        ).await;
 
         assert!(result.is_ok(), "Should successfully forward via TCP");
         assert!(server_task.await.unwrap(), "Should receive data");
@@ -510,8 +512,10 @@ mod tests {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let local_addr = socket.local_addr().unwrap();
 
-        let result =
-            Forwarder::forward_udp(&sample_event(), &format!("udp://{}", local_addr)).await;
+        let result = Forwarder::forward_udp(
+            &sample_event(),
+            &format!("udp://{}", local_addr)
+        ).await;
 
         assert!(result.is_ok(), "Should successfully forward via UDP");
 
@@ -534,8 +538,10 @@ mod tests {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let local_addr = socket.local_addr().unwrap();
 
-        let result =
-            Forwarder::forward_syslog(&sample_event(), &format!("syslog://{}", local_addr)).await;
+        let result = Forwarder::forward_syslog(
+            &sample_event(),
+            &format!("syslog://{}", local_addr)
+        ).await;
 
         assert!(result.is_ok(), "Should successfully forward via syslog");
 
@@ -552,10 +558,7 @@ mod tests {
         let received = String::from_utf8_lossy(&buf[..len]);
         // RFC 5424 format: <priority>version timestamp hostname app-name ...
         assert!(received.starts_with('<'), "Should be RFC 5424 format");
-        assert!(
-            received.contains("192.168.1.100"),
-            "Should contain source host"
-        );
+        assert!(received.contains("192.168.1.100"), "Should contain source host");
     }
 
     #[tokio::test]
@@ -564,7 +567,10 @@ mod tests {
         let local_addr = socket.local_addr().unwrap();
 
         // Test without syslog:// prefix
-        let result = Forwarder::forward_syslog(&sample_event(), &local_addr.to_string()).await;
+        let result = Forwarder::forward_syslog(
+            &sample_event(),
+            &local_addr.to_string()
+        ).await;
 
         assert!(result.is_ok(), "Should handle URL without prefix");
     }
