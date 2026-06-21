@@ -323,8 +323,9 @@ impl SyslogS3Handler {
 
     /// Construct a handler and start the writer background task with a custom channel `capacity`.
     ///
-    /// Intended for tests that need a small channel to exercise the overflow/drop path without
-    /// relying on the production `SYSLOG_S3_CHANNEL_CAPACITY` constant.
+    /// This is the production entry point: `main.rs` calls it with the operator-configured
+    /// `channel_capacity`. Tests also use it with a small capacity to exercise the overflow/drop
+    /// path. `start` is a convenience wrapper that uses the `SYSLOG_S3_CHANNEL_CAPACITY` default.
     pub fn start_with_capacity(
         config: SyslogS3WriterConfig,
         sink: Arc<S3Sink>,
