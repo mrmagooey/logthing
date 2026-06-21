@@ -144,6 +144,56 @@ pub struct SyslogConfig {
 
     #[serde(default = "default_syslog_parse_dns")]
     pub parse_dns: bool,
+
+    /// Optional S3 persistence for syslog messages.
+    /// Absent from TOML → `None` → no S3 persistence (backward compatible).
+    #[serde(default)]
+    pub s3: Option<SyslogS3Config>,
+}
+
+/// Per-source S3 persistence config for the syslog listener.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SyslogS3Config {
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+    pub access_key: String,
+    pub secret_key: String,
+    /// S3 key prefix, e.g. `"syslog/"`.
+    #[serde(default = "default_syslog_s3_key_prefix")]
+    pub key_prefix: String,
+    /// Flush when row count reaches this threshold (default 10 000).
+    #[serde(default = "default_syslog_s3_max_rows")]
+    pub max_buffer_rows: usize,
+    /// Flush after this many seconds regardless of row count (default 900 = 15 min).
+    #[serde(default = "default_syslog_s3_flush_interval_secs")]
+    pub flush_interval_secs: u64,
+}
+
+fn default_syslog_s3_key_prefix() -> String {
+    "syslog/".to_string()
+}
+fn default_syslog_s3_max_rows() -> usize {
+    10_000
+}
+fn default_syslog_s3_flush_interval_secs() -> u64 {
+    900
+}
+
+impl SyslogS3Config {
+    /// Convert to `ParquetS3Config` so we can construct an `S3Sink` via Phase-2 API.
+    pub fn to_parquet_s3_config(&self) -> crate::forwarding::parquet_s3::ParquetS3Config {
+        crate::forwarding::parquet_s3::ParquetS3Config {
+            endpoint: self.endpoint.clone(),
+            bucket: self.bucket.clone(),
+            region: self.region.clone(),
+            access_key: self.access_key.clone(),
+            secret_key: self.secret_key.clone(),
+            max_file_size_mb: 0, // unused by S3Sink directly
+            flush_interval_secs: self.flush_interval_secs,
+            local_buffer_path: std::path::PathBuf::new(), // unused by S3Sink directly
+        }
+    }
 }
 
 /// Configuration for the IPFIX / NetFlow UDP listener.
@@ -186,6 +236,7 @@ impl Default for SyslogConfig {
             udp_port: default_syslog_udp_port(),
             tcp_port: default_syslog_tcp_port(),
             parse_dns: default_syslog_parse_dns(),
+            s3: None, // backward-compatible default
         }
     }
 }
@@ -374,6 +425,53 @@ mod tests {
         assert!(cfg.tls.enabled);
         assert_eq!(cfg.metrics.port, 9090);
         assert!(cfg.syslog.enabled);
+    }
+
+    #[test]
+    fn syslog_s3_absent_gives_none() {
+        let cfg = Config::default();
+        assert!(
+            cfg.syslog.s3.is_none(),
+            "absent [syslog.s3] must deserialize to None"
+        );
+    }
+
+    #[test]
+    fn syslog_s3_present_parses_correctly() {
+        let toml_str = r#"
+[syslog.s3]
+endpoint   = "http://minio:9000"
+bucket     = "syslog-bucket"
+region     = "us-east-1"
+access_key = "KEY"
+secret_key = "SECRET"
+key_prefix = "syslog/"
+max_buffer_rows = 5000
+flush_interval_secs = 300
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse config");
+        let s3 = cfg.syslog.s3.expect("s3 config present");
+        assert_eq!(s3.bucket, "syslog-bucket");
+        assert_eq!(s3.key_prefix, "syslog/");
+        assert_eq!(s3.max_buffer_rows, 5000);
+        assert_eq!(s3.flush_interval_secs, 300);
+    }
+
+    #[test]
+    fn syslog_s3_defaults_apply_when_sub_keys_absent() {
+        let toml_str = r#"
+[syslog.s3]
+endpoint   = "http://minio:9000"
+bucket     = "syslog-bucket"
+region     = "us-east-1"
+access_key = "KEY"
+secret_key = "SECRET"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        let s3 = cfg.syslog.s3.expect("present");
+        assert_eq!(s3.key_prefix, "syslog/");
+        assert_eq!(s3.max_buffer_rows, 10_000);
+        assert_eq!(s3.flush_interval_secs, 900);
     }
 
     #[test]

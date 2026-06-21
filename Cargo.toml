@@ -3,6 +3,9 @@ name = "logthing"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+doctest = false
+
 [features]
 default = []
 kerberos-auth = ["axum-negotiate"]
@@ -88,6 +91,7 @@ rand = "0.9.2"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.9"
+metrics-util = { version = "0.16", features = ["debugging"] }
 
 [profile.profiling]
 inherits = "release"
