@@ -56,16 +56,16 @@ impl SyslogHandler for DefaultSyslogHandler {
             message.message
         );
 
-        if self.parse_dns_logs {
-            if let Some(dns_entry) = DnsLogEntry::from_syslog(&message) {
-                info!(
-                    "DNS Query: {} asked for {} ({}) -> {:?}",
-                    dns_entry.client_ip,
-                    dns_entry.query_name,
-                    dns_entry.query_type,
-                    dns_entry.response_ips
-                );
-            }
+        if self.parse_dns_logs
+            && let Some(dns_entry) = DnsLogEntry::from_syslog(&message)
+        {
+            info!(
+                "DNS Query: {} asked for {} ({}) -> {:?}",
+                dns_entry.client_ip,
+                dns_entry.query_name,
+                dns_entry.query_type,
+                dns_entry.response_ips
+            );
         }
     }
 }

@@ -1,20 +1,16 @@
 use axum::{
-    Json,
-    Router,
+    Json, Router,
     extract::{ConnectInfo, State},
     response::{Html, IntoResponse, Response},
 };
 use axum_extra::extract::TypedHeader;
 use headers::{Authorization, authorization::Basic};
 use std::sync::Arc;
-use tokio::{
-    net::TcpListener,
-    sync::RwLock,
-};
+use tokio::{net::TcpListener, sync::RwLock};
 use tracing::{error, info};
 
 use crate::admin::auth::{ensure_authorized, generate_csrf_token};
-use crate::admin::config_api::{persist_config, PartialConfigUpdate};
+use crate::admin::config_api::{PartialConfigUpdate, persist_config};
 use crate::admin::middleware::security_middleware;
 use crate::admin::state::{AdminServerConfig, AdminState, AuditLogger, load_admin_config};
 use crate::config::Config;
@@ -41,7 +37,8 @@ async fn run_admin_server(
     server_config: AdminServerConfig,
 ) -> anyhow::Result<()> {
     let audit_logger = AuditLogger::new(1000).await;
-    let csrf_tokens: Arc<RwLock<Vec<(String, std::time::Instant)>>> = Arc::new(RwLock::new(Vec::new()));
+    let csrf_tokens: Arc<RwLock<Vec<(String, std::time::Instant)>>> =
+        Arc::new(RwLock::new(Vec::new()));
     let request_counts: Arc<RwLock<std::collections::HashMap<String, (std::time::Instant, u32)>>> =
         Arc::new(RwLock::new(std::collections::HashMap::new()));
 
@@ -55,12 +52,32 @@ async fn run_admin_server(
 
     let app = axum::Router::new()
         .route("/", axum::routing::get(admin_page))
-        .route("/config", axum::routing::get(get_config).put(update_config).patch(patch_config))
-        .route("/config/validate", axum::routing::post(crate::admin::config_api::validate_config))
-        .route("/config/diff", axum::routing::post(crate::admin::config_api::diff_config))
-        .route("/config/export", axum::routing::post(crate::admin::config_api::export_config))
-        .route("/config/import", axum::routing::post(crate::admin::config_api::import_config))
-        .route("/config/reload", axum::routing::post(crate::admin::config_api::reload_config))
+        .route(
+            "/config",
+            axum::routing::get(get_config)
+                .put(update_config)
+                .patch(patch_config),
+        )
+        .route(
+            "/config/validate",
+            axum::routing::post(crate::admin::config_api::validate_config),
+        )
+        .route(
+            "/config/diff",
+            axum::routing::post(crate::admin::config_api::diff_config),
+        )
+        .route(
+            "/config/export",
+            axum::routing::post(crate::admin::config_api::export_config),
+        )
+        .route(
+            "/config/import",
+            axum::routing::post(crate::admin::config_api::import_config),
+        )
+        .route(
+            "/config/reload",
+            axum::routing::post(crate::admin::config_api::reload_config),
+        )
         .route("/health", axum::routing::get(health_check))
         .route("/audit-log", axum::routing::get(get_audit_log))
         .layer(axum::middleware::from_fn_with_state(
@@ -83,7 +100,10 @@ async fn run_admin_server(
         );
         run_tls_server(listener, app, tls_config).await?;
     } else {
-        info!("Admin interface available on http://{} (HTTP - consider enabling TLS)", addr);
+        info!(
+            "Admin interface available on http://{} (HTTP - consider enabling TLS)",
+            addr
+        );
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -102,14 +122,12 @@ async fn run_tls_server(
 ) -> anyhow::Result<()> {
     use axum_server::tls_rustls::RustlsConfig;
 
-    let rustls_config = RustlsConfig::from_pem_file(
-        &tls_config.cert_file,
-        &tls_config.key_file,
-    ).await?;
+    let rustls_config =
+        RustlsConfig::from_pem_file(&tls_config.cert_file, &tls_config.key_file).await?;
 
     // Convert tokio TcpListener to std TcpListener for axum_server
     let std_listener = listener.into_std()?;
-    
+
     axum_server::from_tcp_rustls(std_listener, rustls_config)
         .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .await?;
@@ -197,7 +215,11 @@ async fn update_config(
             )
             .await;
 
-        return Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Persist failed").into_response());
+        return Err((
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Persist failed",
+        )
+            .into_response());
     }
 
     // Log the change
@@ -298,7 +320,7 @@ async fn get_audit_log(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::state::{AdminServerConfig, PasswordHash, AuditLogger};
+    use crate::admin::state::{AdminServerConfig, AuditLogger, PasswordHash};
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use std::net::SocketAddr;
@@ -360,16 +382,16 @@ mod tests {
             };
 
             let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | (b[2] as u32);
-            
+
             result.push(CHARSET[(n >> 18) as usize & 0x3f] as char);
             result.push(CHARSET[(n >> 12) as usize & 0x3f] as char);
-            
+
             if chunk.len() > 1 {
                 result.push(CHARSET[(n >> 6) as usize & 0x3f] as char);
             } else {
                 result.push('=');
             }
-            
+
             if chunk.len() > 2 {
                 result.push(CHARSET[n as usize & 0x3f] as char);
             } else {
@@ -497,7 +519,8 @@ mod tests {
     #[tokio::test]
     async fn get_audit_log_returns_entries_with_valid_auth() {
         let state = test_state().await;
-        let mut request = create_request_with_auth(Method::GET, "/audit-log", "admin", "admin", None);
+        let mut request =
+            create_request_with_auth(Method::GET, "/audit-log", "admin", "admin", None);
         inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
 
         let app = axum::Router::new()
@@ -513,16 +536,32 @@ mod tests {
         let state = test_state().await;
         let new_config = Config::default();
         let json_body = serde_json::to_string(&new_config).unwrap();
-        let mut request = create_request_with_auth(Method::PUT, "/config", "admin", "admin", Some(Body::from(json_body)));
+        let mut request = create_request_with_auth(
+            Method::PUT,
+            "/config",
+            "admin",
+            "admin",
+            Some(Body::from(json_body)),
+        );
         inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
-        
+
         // Add content-type header
         let request = axum::http::Request::builder()
             .method(Method::PUT)
             .uri("/config")
             .header("content-type", "application/json")
-            .header("Authorization", request.headers().get("Authorization").unwrap().to_str().unwrap())
-            .body(Body::from(serde_json::to_string(&Config::default()).unwrap()))
+            .header(
+                "Authorization",
+                request
+                    .headers()
+                    .get("Authorization")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+            )
+            .body(Body::from(
+                serde_json::to_string(&Config::default()).unwrap(),
+            ))
             .unwrap();
 
         let app = axum::Router::new()
@@ -532,7 +571,10 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         // Will fail because persist_config tries to write to disk
         // but we're testing the auth flow works
-        assert!(response.status() == StatusCode::OK || response.status() == StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            response.status() == StatusCode::OK
+                || response.status() == StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[tokio::test]
@@ -540,12 +582,15 @@ mod tests {
         let state = test_state().await;
         let partial = PartialConfigUpdate::default();
         let json_body = serde_json::to_string(&partial).unwrap();
-        
+
         let request = axum::http::Request::builder()
             .method(Method::PATCH)
             .uri("/config")
             .header("content-type", "application/json")
-            .header("Authorization", format!("Basic {}", encode_base64("admin:admin")))
+            .header(
+                "Authorization",
+                format!("Basic {}", encode_base64("admin:admin")),
+            )
             .body(Body::from(json_body))
             .unwrap();
 
@@ -555,7 +600,10 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         // Will fail because persist_config tries to write to disk
-        assert!(response.status() == StatusCode::OK || response.status() == StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            response.status() == StatusCode::OK
+                || response.status() == StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[tokio::test]
@@ -573,12 +621,15 @@ mod tests {
             syslog_tcp_port: Some(5601),
         };
         let json_body = serde_json::to_string(&partial).unwrap();
-        
+
         let request = axum::http::Request::builder()
             .method(Method::PATCH)
             .uri("/config")
             .header("content-type", "application/json")
-            .header("Authorization", format!("Basic {}", encode_base64("admin:admin")))
+            .header(
+                "Authorization",
+                format!("Basic {}", encode_base64("admin:admin")),
+            )
             .body(Body::from(json_body))
             .unwrap();
 
@@ -588,7 +639,10 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         // Will fail because persist_config tries to write to disk
-        assert!(response.status() == StatusCode::OK || response.status() == StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            response.status() == StatusCode::OK
+                || response.status() == StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[tokio::test]
@@ -638,7 +692,10 @@ mod tests {
         // Verify audit log was recorded
         let entries = state.audit_logger.get_entries(10).await;
         let has_admin_page_access = entries.iter().any(|e| e.action == "ADMIN_PAGE_ACCESS");
-        assert!(has_admin_page_access, "Should record ADMIN_PAGE_ACCESS audit log entry");
+        assert!(
+            has_admin_page_access,
+            "Should record ADMIN_PAGE_ACCESS audit log entry"
+        );
     }
 
     #[tokio::test]
@@ -663,7 +720,8 @@ mod tests {
     #[tokio::test]
     async fn get_audit_log_records_self_audit() {
         let state = test_state().await;
-        let mut request = create_request_with_auth(Method::GET, "/audit-log", "admin", "admin", None);
+        let mut request =
+            create_request_with_auth(Method::GET, "/audit-log", "admin", "admin", None);
         inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
 
         let app = axum::Router::new()
@@ -676,6 +734,9 @@ mod tests {
         // Verify audit log was recorded
         let entries = state.audit_logger.get_entries(10).await;
         let has_audit_log_read = entries.iter().any(|e| e.action == "AUDIT_LOG_READ");
-        assert!(has_audit_log_read, "Should record AUDIT_LOG_READ audit log entry");
+        assert!(
+            has_audit_log_read,
+            "Should record AUDIT_LOG_READ audit log entry"
+        );
     }
 }
