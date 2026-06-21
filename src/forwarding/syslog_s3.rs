@@ -792,6 +792,162 @@ mod tests {
         );
     }
 
+    // -- A3: prefix and channel_capacity coherence --
+
+    /// When `key_prefix` is set to `"syslog/"` (as main.rs constructs it from a
+    /// slash-free `prefix` config field) the generated key must start with
+    /// `syslog/year=` with correct date partitions.
+    #[test]
+    fn build_key_inserts_slash_between_prefix_and_partition() {
+        // Construct a writer whose key_prefix mimics what main.rs produces:
+        // `format!("{}/", cfg.prefix)` where `prefix` defaults to `"syslog"`.
+        let config = SyslogS3WriterConfig {
+            max_buffer_rows: 1000,
+            flush_interval: std::time::Duration::from_secs(900),
+            key_prefix: "syslog/".to_string(),
+        };
+        // We need access to the private build_key; test via the writer directly.
+        // Create an unreachable sink synchronously using a blocking executor.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sink = rt.block_on(async { unreachable_sink().await });
+        let writer = SyslogS3Writer::new(config, sink);
+        let key = writer.build_key();
+        assert!(
+            key.starts_with("syslog/year="),
+            "key must start with 'syslog/year='; got: {key}"
+        );
+        assert!(key.contains("/month="), "key must contain /month=");
+        assert!(key.contains("/day="), "key must contain /day=");
+        assert!(key.ends_with(".parquet"), "key must end with .parquet");
+    }
+
+    /// Prove that a custom slash-free prefix results in the correct key structure.
+    #[test]
+    fn build_key_respects_custom_slash_free_prefix() {
+        let config = SyslogS3WriterConfig {
+            max_buffer_rows: 1000,
+            flush_interval: std::time::Duration::from_secs(900),
+            // Simulate main.rs: `format!("{}/", "audit")` = `"audit/"`
+            key_prefix: "audit/".to_string(),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sink = rt.block_on(async { unreachable_sink().await });
+        let writer = SyslogS3Writer::new(config, sink);
+        let key = writer.build_key();
+        assert!(
+            key.starts_with("audit/year="),
+            "key must start with 'audit/year='; got: {key}"
+        );
+    }
+
+    /// Verify that a configured `channel_capacity` is honored: capacity=1 causes drops,
+    /// a large capacity does not (for a modest send count).
+    #[tokio::test]
+    async fn syslog_channel_capacity_parameter_is_wired() {
+        use crate::syslog::listener::SyslogHandler as SyslogHandlerTrait;
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::DebuggingRecorder;
+        use std::net::SocketAddr;
+
+        let src: SocketAddr = "127.0.0.1:5514".parse().unwrap();
+
+        // --- small capacity (1): expect drops ---
+        {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = set_default_local_recorder(&recorder);
+
+            let sink = unreachable_sink().await;
+            let config = SyslogS3WriterConfig {
+                max_buffer_rows: 1, // flush on every message so writer stalls on S3
+                flush_interval: std::time::Duration::from_secs(3600),
+                key_prefix: "syslog/".to_string(),
+            };
+            let handler = SyslogS3Handler::start_with_capacity(config, sink, 1);
+            tokio::task::yield_now().await;
+
+            for i in 0..30usize {
+                handler
+                    .handle_message(dummy_msg(&format!("msg-{i}")), src)
+                    .await;
+            }
+            tokio::task::yield_now().await;
+
+            let snapshot = snapshotter.snapshot();
+            let map = snapshot.into_hashmap();
+            let key = CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("syslog_s3_dropped"),
+            );
+            let dropped = map
+                .get(&key)
+                .map(|(_, _, v)| {
+                    if let metrics_util::debugging::DebugValue::Counter(c) = v {
+                        *c
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0);
+            assert!(
+                dropped >= 1,
+                "capacity=1 should cause drops; got syslog_s3_dropped={dropped}"
+            );
+        }
+
+        // --- large capacity (10_000): expect no drops for 30 sends ---
+        {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = set_default_local_recorder(&recorder);
+
+            let sink = unreachable_sink().await;
+            let config = SyslogS3WriterConfig {
+                max_buffer_rows: 100_000, // prevent flush so channel never stalls
+                flush_interval: std::time::Duration::from_secs(3600),
+                key_prefix: "syslog/".to_string(),
+            };
+            let handler = SyslogS3Handler::start_with_capacity(config, sink, 10_000);
+            tokio::task::yield_now().await;
+
+            for i in 0..30usize {
+                handler
+                    .handle_message(dummy_msg(&format!("msg-{i}")), src)
+                    .await;
+            }
+            tokio::task::yield_now().await;
+
+            let snapshot = snapshotter.snapshot();
+            let map = snapshot.into_hashmap();
+            let key = CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("syslog_s3_dropped"),
+            );
+            let dropped = map
+                .get(&key)
+                .map(|(_, _, v)| {
+                    if let metrics_util::debugging::DebugValue::Counter(c) = v {
+                        *c
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0);
+            assert!(
+                dropped == 0,
+                "capacity=10_000 should not cause drops for 30 sends; got syslog_s3_dropped={dropped}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn handler_routes_messages_to_writer_task() {
         use crate::syslog::listener::SyslogHandler as SyslogHandlerTrait;
