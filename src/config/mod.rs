@@ -395,7 +395,7 @@ impl Config {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::config::Config;
+    /// use logthing::config::Config;
     ///
     /// // Load configuration from default locations
     /// let config = Config::load()?;

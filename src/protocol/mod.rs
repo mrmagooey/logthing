@@ -22,7 +22,7 @@ impl WefParser {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::protocol::WefParser;
+    /// use logthing::protocol::WefParser;
     ///
     /// let parser = WefParser::new();
     /// ```
@@ -38,7 +38,7 @@ impl WefParser {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::protocol::WefParser;
+    /// use logthing::protocol::WefParser;
     ///
     /// let parser = WefParser::new();
     ///

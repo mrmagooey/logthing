@@ -171,7 +171,7 @@ impl SyslogMessage {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::syslog::SyslogMessage;
+    /// use logthing::syslog::SyslogMessage;
     ///
     /// // Parse RFC 3164 format (BSD syslog)
     /// let rfc3164 = "<134>Jan 15 10:30:45 myhost myapp[1234]: Test message";

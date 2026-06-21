@@ -89,7 +89,7 @@ impl GenericEventParser {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::parser::GenericEventParser;
+    /// use logthing::parser::GenericEventParser;
     ///
     /// // Load from a directory containing parser YAML files
     /// let parser = GenericEventParser::from_file("config/event_parsers")?;
@@ -179,7 +179,7 @@ impl GenericEventParser {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::parser::GenericEventParser;
+    /// use logthing::parser::GenericEventParser;
     ///
     /// let parser = GenericEventParser::from_file("config/event_parsers").unwrap();
     ///

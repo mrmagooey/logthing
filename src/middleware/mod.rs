@@ -21,7 +21,7 @@ impl IpWhitelist {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::middleware::IpWhitelist;
+    /// use logthing::middleware::IpWhitelist;
     ///
     /// // Whitelist with CIDR range and single IP
     /// let allowed = vec![
@@ -71,7 +71,7 @@ impl IpWhitelist {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::middleware::IpWhitelist;
+    /// use logthing::middleware::IpWhitelist;
     /// use std::net::SocketAddr;
     ///
     /// let whitelist = IpWhitelist::new(vec!["127.0.0.1".to_string()]).unwrap();
