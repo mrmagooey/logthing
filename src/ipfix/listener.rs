@@ -153,10 +153,7 @@ mod tests {
         let handler = CapturingHandler::new();
         let handler_clone = handler.clone();
 
-        let listener = IpfixListener::new(
-            IpfixListenerConfig::default(),
-            handler_clone,
-        );
+        let listener = IpfixListener::new(IpfixListenerConfig::default(), handler_clone);
 
         let listener_task = tokio::spawn(async move {
             listener.run_with_socket(listener_socket).await.ok();
