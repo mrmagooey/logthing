@@ -91,17 +91,56 @@ pub struct FieldSpecifier {
     pub enterprise_number: Option<u32>,
 }
 
+/// Maximum number of distinct template keys held in the cache.
+/// A flood of distinct (exporter IP, obs-domain-id, template-id) triples —
+/// e.g. from spoofed UDP source addresses — would otherwise grow memory
+/// without bound. New keys are rejected once this limit is reached; existing
+/// keys are always allowed to be updated (templates are periodically re-sent).
+pub const MAX_CACHED_TEMPLATES: usize = 100_000;
+
 /// Stateful IPFIX / NetFlow decoder.
 /// Owns the template cache; safe to use single-threaded from a listener task.
 pub struct IpfixDecoder {
     pub(crate) cache: HashMap<TemplateKey, Vec<FieldSpecifier>>,
+    /// Tracks whether we have already emitted the cache-capacity warning so we
+    /// don't log-spam on every subsequent insert attempt.
+    template_limit_warned: bool,
 }
 
 impl IpfixDecoder {
     pub fn new() -> Self {
         Self {
             cache: HashMap::new(),
+            template_limit_warned: false,
         }
+    }
+
+    /// Insert `fields` for `key` into the template cache, enforcing the capacity bound.
+    ///
+    /// - If `key` already exists the entry is updated unconditionally.
+    /// - If `key` is new and the cache is at `MAX_CACHED_TEMPLATES` capacity,
+    ///   the insert is refused, `ipfix_templates_dropped` is incremented, and a
+    ///   warning is logged (at most once until capacity drops below the limit).
+    pub(crate) fn try_insert_template(&mut self, key: TemplateKey, fields: Vec<FieldSpecifier>) {
+        if !self.cache.contains_key(&key) && self.cache.len() >= MAX_CACHED_TEMPLATES {
+            metrics::counter!("ipfix_templates_dropped").increment(1);
+            if !self.template_limit_warned {
+                tracing::warn!(
+                    "ipfix: template cache full ({MAX_CACHED_TEMPLATES} entries); \
+                     new template from exporter {} (domain {}, id {}) dropped. \
+                     Possible template flood — check for spoofed UDP sources.",
+                    key.0, key.1, key.2,
+                );
+                self.template_limit_warned = true;
+            }
+            return;
+        }
+        // Reset the warned flag once we're back below capacity (key already existed
+        // and was updated, so cache size did not grow).
+        if self.cache.len() < MAX_CACHED_TEMPLATES {
+            self.template_limit_warned = false;
+        }
+        self.cache.insert(key, fields);
     }
 }
 
@@ -510,7 +549,7 @@ fn parse_ipfix_template_set(
         }
 
         let key: TemplateKey = (exporter, obs_domain_id, template_id);
-        decoder.cache.insert(key, fields);
+        decoder.try_insert_template(key, fields);
         metrics::counter!("ipfix_templates_received").increment(1);
     }
     Ok(())
@@ -555,9 +594,7 @@ fn parse_ipfix_options_template_set(
             });
         }
         if template_id >= 256 {
-            decoder
-                .cache
-                .insert((exporter, obs_domain_id, template_id), fields);
+            decoder.try_insert_template((exporter, obs_domain_id, template_id), fields);
         }
     }
     Ok(())
@@ -910,9 +947,7 @@ fn parse_v9_template_flowset(
                 enterprise_number: None,
             });
         }
-        decoder
-            .cache
-            .insert((exporter, source_id, template_id), fields);
+        decoder.try_insert_template((exporter, source_id, template_id), fields);
         metrics::counter!("ipfix_templates_received").increment(1);
     }
     Ok(())
@@ -1366,6 +1401,67 @@ mod tests {
             records.len(),
             3,
             "decoder must return exactly 3 flows for a 3-record v5 packet"
+        );
+    }
+
+    // ---- I2: template cache capacity bound tests ----
+
+    #[test]
+    fn template_cache_rejects_new_key_when_full() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let mut dec = IpfixDecoder::new();
+
+        // Pre-fill the cache to MAX_CACHED_TEMPLATES by directly inserting into
+        // the underlying HashMap. Keys use (exporter_ip, obs_domain, tmpl_id)
+        // triples constructed from the loop index (spread across exporter IPs and
+        // obs-domain-ids to avoid u16 template-id overflow at 65536).
+        for i in 0u32..MAX_CACHED_TEMPLATES as u32 {
+            let a = (i >> 16) as u8;
+            let b = (i >> 8) as u8;
+            let c = i as u8;
+            let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, a, b, c));
+            let tmpl_id = ((i % 65000) + 256) as u16;
+            let obs_domain = i / 65000;
+            dec.cache.insert((exporter, obs_domain, tmpl_id), vec![]);
+        }
+        assert_eq!(dec.cache.len(), MAX_CACHED_TEMPLATES, "cache should be at capacity");
+
+        // A new key that is definitely not in the cache should be rejected.
+        let new_exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 99, 99));
+        let new_key: TemplateKey = (new_exporter, 9999, 256);
+        assert!(
+            !dec.cache.contains_key(&new_key),
+            "new_key must not already be in the cache"
+        );
+        dec.try_insert_template(new_key, vec![]);
+        assert!(
+            !dec.cache.contains_key(&new_key),
+            "new key must be refused when cache is full"
+        );
+        assert_eq!(
+            dec.cache.len(),
+            MAX_CACHED_TEMPLATES,
+            "cache size must not grow beyond the limit"
+        );
+
+        // An existing key must still be updatable (template re-send scenario).
+        // Pick the first key that was inserted.
+        let existing_exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0));
+        let existing_key: TemplateKey = (existing_exporter, 0, 256);
+        assert!(
+            dec.cache.contains_key(&existing_key),
+            "existing_key must be in the cache"
+        );
+        let updated_fields = vec![FieldSpecifier {
+            ie_id: 8,
+            length: 4,
+            enterprise_number: None,
+        }];
+        dec.try_insert_template(existing_key, updated_fields);
+        assert_eq!(
+            dec.cache.get(&existing_key).map(|v| v.len()),
+            Some(1),
+            "existing key must be updatable even when cache is full"
         );
     }
 }
