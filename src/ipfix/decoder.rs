@@ -94,7 +94,7 @@ pub struct FieldSpecifier {
 /// Stateful IPFIX / NetFlow decoder.
 /// Owns the template cache; safe to use single-threaded from a listener task.
 pub struct IpfixDecoder {
-    pub cache: HashMap<TemplateKey, Vec<FieldSpecifier>>,
+    pub(crate) cache: HashMap<TemplateKey, Vec<FieldSpecifier>>,
 }
 
 impl IpfixDecoder {
