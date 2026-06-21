@@ -207,6 +207,11 @@ pub struct IpfixConfig {
 
     #[serde(default = "default_ipfix_bind_address")]
     pub bind_address: String,
+
+    /// Optional S3 persistence for IPFIX flows.
+    /// Absent from TOML → `None` → no S3 persistence (backward compatible).
+    #[serde(default)]
+    pub s3: Option<crate::forwarding::ipfix_s3::IpfixS3Config>,
 }
 
 impl Default for IpfixConfig {
@@ -215,6 +220,7 @@ impl Default for IpfixConfig {
             enabled: default_ipfix_enabled(),
             udp_port: default_ipfix_udp_port(),
             bind_address: default_ipfix_bind_address(),
+            s3: None,
         }
     }
 }
@@ -507,5 +513,51 @@ secret_key = "SECRET"
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
+    }
+
+    #[test]
+    fn ipfix_config_defaults() {
+        let cfg = Config::default();
+        assert!(!cfg.ipfix.enabled);
+        assert_eq!(cfg.ipfix.udp_port, 4739);
+        assert_eq!(cfg.ipfix.bind_address, "0.0.0.0");
+        assert!(cfg.ipfix.s3.is_none(), "absent [ipfix.s3] must be None");
+    }
+
+    #[test]
+    fn ipfix_disabled_by_default() {
+        let cfg = Config::default();
+        assert!(!cfg.ipfix.enabled, "IPFIX must be opt-in");
+    }
+
+    #[test]
+    fn ipfix_s3_config_deserializes_from_toml() {
+        let toml_str = r#"
+[ipfix]
+enabled = true
+udp_port = 4739
+[ipfix.s3]
+endpoint = "http://minio:9000"
+bucket = "ipfix-flows"
+region = "us-east-1"
+access_key = "key"
+secret_key = "secret"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.ipfix.enabled);
+        let s3 = cfg.ipfix.s3.expect("s3 present");
+        assert_eq!(s3.bucket, "ipfix-flows");
+        assert_eq!(s3.prefix, "ipfix"); // default
+        assert_eq!(s3.flush_interval_secs, 900); // default
+    }
+
+    #[test]
+    fn ipfix_s3_absent_means_no_persistence() {
+        let toml_str = "[ipfix]\nenabled = true\n";
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(
+            cfg.ipfix.s3.is_none(),
+            "absent [ipfix.s3] must yield None for backward compat"
+        );
     }
 }
