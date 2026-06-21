@@ -334,7 +334,6 @@ pub fn decode_ipfix(
     decoder: &mut IpfixDecoder,
     buf: &[u8],
     exporter: IpAddr,
-    _export_time: DateTime<Utc>,
 ) -> Result<Vec<FlowRecord>, DecodeError> {
     // --- Message header (16 bytes) ---
     if buf.len() < 16 {
@@ -996,7 +995,7 @@ pub fn decode_datagram(
     }
     let version = read_u16_be(buf, 0)?;
     match version {
-        10 => decode_ipfix(decoder, buf, exporter, Utc::now()),
+        10 => decode_ipfix(decoder, buf, exporter),
         9 => decode_netflow_v9(decoder, buf, exporter),
         5 => decode_netflow_v5(buf, exporter),
         other => Err(DecodeError::UnknownVersion(other)),
@@ -1006,7 +1005,6 @@ pub fn decode_datagram(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     #[test]
     fn ie_info_known_ids_return_correct_type() {
@@ -1101,19 +1099,15 @@ mod tests {
 
     // ---- IPFIX v10 decode tests (Task 4) ----
 
-    use super::super::FlowRecord; // ipfix::FlowRecord
-
     #[tokio::test]
     async fn ipfix_template_then_data_decodes_src_dst() {
         use std::net::{IpAddr, Ipv4Addr};
         let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
-        let export_ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let mut dec = IpfixDecoder::new();
         let records = decode_ipfix(
             &mut dec,
             FIXTURE_IPFIX_TEMPLATE_THEN_DATA,
             exporter,
-            export_ts,
         )
         .expect("should decode");
         assert_eq!(records.len(), 1, "one data record");
@@ -1129,9 +1123,8 @@ mod tests {
     fn ipfix_truncated_returns_error_not_panic() {
         use std::net::{IpAddr, Ipv4Addr};
         let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-        let export_ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let mut dec = IpfixDecoder::new();
-        let result = decode_ipfix(&mut dec, FIXTURE_IPFIX_TRUNCATED, exporter, export_ts);
+        let result = decode_ipfix(&mut dec, FIXTURE_IPFIX_TRUNCATED, exporter);
         assert!(result.is_err(), "truncated input must error");
     }
 
@@ -1139,9 +1132,8 @@ mod tests {
     fn ipfix_unknown_ie_goes_to_extra_as_hex() {
         use std::net::{IpAddr, Ipv4Addr};
         let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
-        let export_ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let mut dec = IpfixDecoder::new();
-        let records = decode_ipfix(&mut dec, FIXTURE_IPFIX_UNKNOWN_IE, exporter, export_ts)
+        let records = decode_ipfix(&mut dec, FIXTURE_IPFIX_UNKNOWN_IE, exporter)
             .expect("should decode");
         assert_eq!(records.len(), 1);
         let r = &records[0];
@@ -1156,13 +1148,11 @@ mod tests {
     fn ipfix_missing_template_skipped_no_error() {
         use std::net::{IpAddr, Ipv4Addr};
         let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4));
-        let export_ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let mut dec = IpfixDecoder::new();
         let records = decode_ipfix(
             &mut dec,
             FIXTURE_IPFIX_MISSING_TEMPLATE,
             exporter,
-            export_ts,
         )
         .expect("missing template must not error");
         assert_eq!(
