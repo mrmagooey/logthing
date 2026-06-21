@@ -56,21 +56,36 @@ impl SyslogHandler for DefaultSyslogHandler {
             message.message
         );
 
-        if self.parse_dns_logs {
-            if let Some(dns_entry) = DnsLogEntry::from_syslog(&message) {
-                info!(
-                    "DNS Query: {} asked for {} ({}) -> {:?}",
-                    dns_entry.client_ip,
-                    dns_entry.query_name,
-                    dns_entry.query_type,
-                    dns_entry.response_ips
-                );
-            }
+        if self.parse_dns_logs
+            && let Some(dns_entry) = DnsLogEntry::from_syslog(&message)
+        {
+            info!(
+                "DNS Query: {} asked for {} ({}) -> {:?}",
+                dns_entry.client_ip,
+                dns_entry.query_name,
+                dns_entry.query_type,
+                dns_entry.response_ips
+            );
         }
     }
 }
 
-/// Syslog listener that can receive messages via UDP and TCP
+/// Syslog listener that can receive messages via UDP and TCP.
+///
+/// The listener is wired to a [`SyslogHandler`] that determines what happens to
+/// each parsed message.  Two handlers are provided:
+///
+/// - [`DefaultSyslogHandler`]: logs the message and optionally runs DNS-log
+///   extraction when `parse_dns` is enabled.
+/// - `SyslogS3Handler` (in `forwarding::syslog_s3`): buffers messages and
+///   persists them to S3 as Parquet.
+///
+/// **Important:** `SyslogS3Handler` and DNS-log parsing (`parse_dns`) are
+/// currently **mutually exclusive**.  When `[syslog.s3]` is configured in
+/// `logthing.toml`, the server uses `SyslogS3Handler` and DNS-log extraction
+/// does **not** run.  If you need both persistence and DNS parsing, use the
+/// default handler and route syslog traffic to an external pipeline for S3
+/// ingestion.  Combining both is a planned future feature.
 pub struct SyslogListener {
     config: SyslogListenerConfig,
     handler: Arc<dyn SyslogHandler>,
@@ -79,11 +94,6 @@ pub struct SyslogListener {
 impl SyslogListener {
     pub fn new(config: SyslogListenerConfig, handler: Arc<dyn SyslogHandler>) -> Self {
         Self { config, handler }
-    }
-
-    pub fn with_default_handler(config: SyslogListenerConfig) -> Self {
-        let parse_dns_logs = config.parse_dns_logs;
-        Self::new(config, Arc::new(DefaultSyslogHandler::new(parse_dns_logs)))
     }
 
     /// Start both UDP and TCP listeners
@@ -274,7 +284,8 @@ mod tests {
             ..Default::default()
         };
 
-        let listener = SyslogListener::with_default_handler(config);
+        let handler = Arc::new(DefaultSyslogHandler::new(config.parse_dns_logs));
+        let listener = SyslogListener::new(config, handler);
 
         // Start listener in background
         let listener_handle = tokio::spawn(async move {

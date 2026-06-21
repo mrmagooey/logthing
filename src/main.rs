@@ -1,16 +1,5 @@
-mod admin;
-mod config;
-mod forwarding;
-mod ipfix;
-mod middleware;
-mod models;
-mod parser;
-mod protocol;
-mod server;
-mod stats;
-mod syslog;
-
-use server::Server;
+use logthing::server::Server;
+use logthing::{admin, config, forwarding, ipfix, stats, syslog};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
@@ -73,39 +62,40 @@ async fn async_main() -> anyhow::Result<()> {
                 parse_dns_logs: config_clone.syslog.parse_dns,
             };
 
-            let handler: Arc<dyn syslog::listener::SyslogHandler> =
-                if let Some(s3_cfg) = config_clone.syslog.s3.as_ref() {
-                    let parquet_cfg = s3_cfg.to_parquet_s3_config();
-                    match forwarding::s3_sink::S3Sink::from_config(&parquet_cfg).await {
-                        Ok(sink) => {
-                            let writer_cfg = forwarding::syslog_s3::SyslogS3WriterConfig {
-                                max_buffer_rows: s3_cfg.max_buffer_rows,
-                                flush_interval: std::time::Duration::from_secs(
-                                    s3_cfg.flush_interval_secs,
-                                ),
-                                key_prefix: s3_cfg.key_prefix.clone(),
-                            };
-                            let handler = forwarding::syslog_s3::SyslogS3Handler::start(
-                                writer_cfg,
-                                Arc::new(sink),
-                            );
-                            Arc::new(handler)
-                        }
-                        Err(e) => {
-                            error!(
-                                "Failed to create S3Sink for syslog persistence, \
-                                 falling back to DefaultSyslogHandler: {e}"
-                            );
-                            Arc::new(syslog::listener::DefaultSyslogHandler::new(
-                                config_clone.syslog.parse_dns,
-                            ))
-                        }
+            let handler: Arc<dyn syslog::listener::SyslogHandler> = if let Some(s3_cfg) =
+                config_clone.syslog.s3.as_ref()
+            {
+                match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
+                    Ok(sink) => {
+                        let writer_cfg = forwarding::syslog_s3::SyslogS3WriterConfig {
+                            max_buffer_rows: s3_cfg.max_buffer_rows,
+                            flush_interval: std::time::Duration::from_secs(
+                                s3_cfg.flush_interval_secs,
+                            ),
+                            key_prefix: s3_cfg.prefix.clone(),
+                        };
+                        let handler = forwarding::syslog_s3::SyslogS3Handler::start_with_capacity(
+                            writer_cfg,
+                            Arc::new(sink),
+                            s3_cfg.channel_capacity,
+                        );
+                        Arc::new(handler)
                     }
-                } else {
-                    Arc::new(syslog::listener::DefaultSyslogHandler::new(
-                        config_clone.syslog.parse_dns,
-                    ))
-                };
+                    Err(e) => {
+                        error!(
+                            "Failed to create S3Sink for syslog persistence, \
+                                 falling back to DefaultSyslogHandler: {e}"
+                        );
+                        Arc::new(syslog::listener::DefaultSyslogHandler::new(
+                            config_clone.syslog.parse_dns,
+                        ))
+                    }
+                }
+            } else {
+                Arc::new(syslog::listener::DefaultSyslogHandler::new(
+                    config_clone.syslog.parse_dns,
+                ))
+            };
 
             let listener = syslog::listener::SyslogListener::new(syslog_config, handler);
             if let Err(e) = listener.start().await {
@@ -129,8 +119,7 @@ async fn async_main() -> anyhow::Result<()> {
 
             let handler: Arc<dyn ipfix::listener::IpfixHandler> =
                 if let Some(s3_cfg) = ipfix_config_clone.ipfix.s3.as_ref() {
-                    let parquet_cfg = s3_cfg.to_parquet_s3_config();
-                    match forwarding::s3_sink::S3Sink::from_config(&parquet_cfg).await {
+                    match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
                         Ok(sink) => {
                             let writer_cfg = forwarding::ipfix_s3::IpfixS3WriterConfig {
                                 flush_threshold_bytes: s3_cfg.flush_threshold_bytes,

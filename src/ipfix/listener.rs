@@ -59,10 +59,6 @@ impl IpfixListener {
         Self { config, handler }
     }
 
-    pub fn with_default_handler(config: IpfixListenerConfig) -> Self {
-        Self::new(config, Arc::new(DefaultIpfixHandler))
-    }
-
     /// Bind the UDP socket and run the receive loop until error.
     pub async fn start(&self) -> anyhow::Result<()> {
         let addr: SocketAddr =

@@ -1,3 +1,4 @@
+use crate::config::S3ConnectionConfig;
 use crate::forwarding::parquet_s3::ParquetS3Config;
 use anyhow::Result;
 use aws_config::meta::region::RegionProviderChain;
@@ -14,9 +15,11 @@ pub struct S3Sink {
 }
 
 impl S3Sink {
-    /// Construct an S3Sink from a ParquetS3Config.
-    /// Mirrors the client-construction logic currently in ParquetS3Forwarder::new.
-    pub async fn from_config(cfg: &ParquetS3Config) -> Result<Self> {
+    /// Construct an `S3Sink` from a shared [`S3ConnectionConfig`].
+    ///
+    /// This is the canonical client-construction path. All other constructors
+    /// delegate here so the AWS SDK wiring lives in exactly one place.
+    pub async fn from_connection(cfg: &S3ConnectionConfig) -> Result<Self> {
         let region_provider =
             RegionProviderChain::first_try(aws_sdk_s3::config::Region::new(cfg.region.clone()));
 
@@ -55,6 +58,21 @@ impl S3Sink {
             client,
             bucket: cfg.bucket.clone(),
         })
+    }
+
+    /// Construct an `S3Sink` from a [`ParquetS3Config`].
+    ///
+    /// Delegates to [`from_connection`][Self::from_connection] so the WEF/parquet
+    /// path gets identical AWS client construction behaviour.
+    pub async fn from_config(cfg: &ParquetS3Config) -> Result<Self> {
+        let conn = S3ConnectionConfig {
+            endpoint: cfg.endpoint.clone(),
+            bucket: cfg.bucket.clone(),
+            region: cfg.region.clone(),
+            access_key: cfg.access_key.clone(),
+            secret_key: cfg.secret_key.clone(),
+        };
+        Self::from_connection(&conn).await
     }
 
     /// Upload `body` bytes to `key` in the configured bucket.

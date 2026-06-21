@@ -22,12 +22,12 @@ use axum::{
 #[cfg(feature = "kerberos-auth")]
 use axum::{extract::Request, middleware::Next};
 
+use futures::stream::{self, StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
-use futures::stream::{self, StreamExt};
 
 pub struct AppState {
     pub config: Arc<RwLock<Config>>,
@@ -52,9 +52,9 @@ impl Server {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::config::Config;
-    /// use wef_server::server::Server;
-    /// use wef_server::stats::ThroughputStats;
+    /// use logthing::config::Config;
+    /// use logthing::server::Server;
+    /// use logthing::stats::ThroughputStats;
     /// use std::sync::Arc;
     /// use tokio::sync::RwLock;
     ///
@@ -151,15 +151,15 @@ impl Server {
             .await
         {
             info!("Initialized Parquet S3 forwarder with channel-based architecture");
-            
+
             // Create channel for event forwarding (buffer size: 10000 events)
             let (sender, mut receiver) = mpsc::channel::<Arc<WindowsEvent>>(10000);
             let flush_interval_secs = s3_forwarder.flush_interval_secs();
-            
+
             // Spawn worker task to receive events and forward to Parquet S3
             tokio::spawn(async move {
                 info!("Parquet S3 worker task started");
-                
+
                 loop {
                     tokio::select! {
                         // Receive event from channel
@@ -177,7 +177,7 @@ impl Server {
                     }
                 }
             });
-            
+
             Some(sender)
         } else {
             None
@@ -203,9 +203,9 @@ impl Server {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::config::Config;
-    /// use wef_server::server::Server;
-    /// use wef_server::stats::ThroughputStats;
+    /// use logthing::config::Config;
+    /// use logthing::server::Server;
+    /// use logthing::stats::ThroughputStats;
     /// use std::sync::Arc;
     /// use tokio::sync::RwLock;
     ///
@@ -253,10 +253,8 @@ impl Server {
 
     fn create_router(&self, ip_whitelist: IpWhitelist) -> anyhow::Result<Router> {
         // Shared layers for all routes
-        let shared_layers = middleware::from_fn_with_state(
-            ip_whitelist.clone(),
-            ip_whitelist_middleware,
-        );
+        let shared_layers =
+            middleware::from_fn_with_state(ip_whitelist.clone(), ip_whitelist_middleware);
 
         // Public routes (no authentication required)
         let public_router = Router::new()
@@ -296,9 +294,9 @@ impl Server {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::config::Config;
-    /// use wef_server::server::Server;
-    /// use wef_server::stats::ThroughputStats;
+    /// use logthing::config::Config;
+    /// use logthing::server::Server;
+    /// use logthing::stats::ThroughputStats;
     /// use std::sync::Arc;
     /// use tokio::sync::RwLock;
     ///
@@ -528,20 +526,16 @@ async fn handle_events(
 async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
     // Wrap event in Arc to avoid cloning for each forwarder
     let event = Arc::new(event);
-    
-    if let Some(ref event_parser) = state.event_parser {
-        if let Some(ref parsed) = event.parsed {
-            if let Some(generic_parsed) =
-                event_parser.parse_event(parsed.event_id, &event.raw_xml)
-            {
-                info!(
-                    "Event {} parsed with generic parser '{}': {}",
-                    parsed.event_id,
-                    generic_parsed.parser_name,
-                    generic_parsed.formatted_message.as_deref().unwrap_or("N/A")
-                );
-            }
-        }
+
+    if let (Some(event_parser), Some(parsed)) = (&state.event_parser, &event.parsed)
+        && let Some(generic_parsed) = event_parser.parse_event(parsed.event_id, &event.raw_xml)
+    {
+        info!(
+            "Event {} parsed with generic parser '{}': {}",
+            parsed.event_id,
+            generic_parsed.parser_name,
+            generic_parsed.formatted_message.as_deref().unwrap_or("N/A")
+        );
     }
 
     let event_type = describe_event_type(&event);
@@ -551,15 +545,15 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
     state.forwarder.forward(event.clone()).await;
 
     // Send to Parquet S3 via channel (non-blocking)
-    if let Some(ref sender) = state.parquet_s3_sender {
-        if let Err(e) = sender.try_send(event.clone()) {
-            match e {
-                mpsc::error::TrySendError::Full(_) => {
-                    warn!("Parquet S3 channel full, dropping event");
-                }
-                mpsc::error::TrySendError::Closed(_) => {
-                    error!("Parquet S3 channel closed");
-                }
+    if let Some(ref sender) = state.parquet_s3_sender
+        && let Err(e) = sender.try_send(event.clone())
+    {
+        match e {
+            mpsc::error::TrySendError::Full(_) => {
+                warn!("Parquet S3 channel full, dropping event");
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                error!("Parquet S3 channel closed");
             }
         }
     }
@@ -895,7 +889,10 @@ mod tests {
             data: None,
         };
         let event = WindowsEvent::new("test".into(), "<Event/>".into()).with_parsed(parsed);
-        assert_eq!(describe_event_type(&event), "Microsoft-Windows-Security-Auditing:4624");
+        assert_eq!(
+            describe_event_type(&event),
+            "Microsoft-Windows-Security-Auditing:4624"
+        );
     }
 
     #[tokio::test]
@@ -907,11 +904,11 @@ mod tests {
     #[tokio::test]
     async fn process_single_event_with_parsed_data() {
         let state = default_state().await;
-        let event = WindowsEvent::new("host".into(), "<Event/>".into())
-            .with_parsed(sample_parsed_event());
-        
+        let event =
+            WindowsEvent::new("host".into(), "<Event/>".into()).with_parsed(sample_parsed_event());
+
         process_single_event(&state, event).await;
-        
+
         let summary = state.throughput.snapshot().await;
         assert_eq!(summary.len(), 1);
         assert_eq!(summary[0].event_type, "Security:4624");
@@ -921,9 +918,9 @@ mod tests {
     async fn process_single_event_without_parsed_data() {
         let state = default_state().await;
         let event = WindowsEvent::new("host".into(), "<Event/>".into());
-        
+
         process_single_event(&state, event).await;
-        
+
         // Should not panic and throughput should show "unknown"
         let summary = state.throughput.snapshot().await;
         assert!(summary.len() >= 0);

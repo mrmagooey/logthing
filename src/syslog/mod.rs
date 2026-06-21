@@ -4,6 +4,9 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::LazyLock;
+
+type StructuredData = Option<HashMap<String, HashMap<String, String>>>;
 
 /// Parsed syslog message structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,7 +171,7 @@ impl SyslogMessage {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::syslog::SyslogMessage;
+    /// use logthing::syslog::SyslogMessage;
     ///
     /// // Parse RFC 3164 format (BSD syslog)
     /// let rfc3164 = "<134>Jan 15 10:30:45 myhost myapp[1234]: Test message";
@@ -344,31 +347,30 @@ impl SyslogMessage {
     }
 
     /// Parse structured data from RFC 5424
-    fn parse_structured_data(
-        rest: &str,
-    ) -> (Option<HashMap<String, HashMap<String, String>>>, String) {
+    fn parse_structured_data(rest: &str) -> (StructuredData, String) {
+        static SD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]+)\]").unwrap());
+        static PARAM_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r#"(\S+)="([^"]*)""#).unwrap());
+
         let mut structured_data = HashMap::new();
         let mut remaining = rest;
 
         // Check if it starts with structured data
         if rest.starts_with('[') {
             // Extract SD elements
-            let sd_re = Regex::new(r"\[([^\]]+)\]").unwrap();
             let mut last_end = 0;
 
-            for cap in sd_re.captures_iter(rest) {
+            for cap in SD_RE.captures_iter(rest) {
                 let sd_element = cap.get(1).unwrap().as_str();
-                let sd_id: String;
                 let mut params = HashMap::new();
 
                 // Parse SD-ID and parameters
                 let parts: Vec<&str> = sd_element.split_whitespace().collect();
                 if !parts.is_empty() {
-                    sd_id = parts[0].to_string();
+                    let sd_id = parts[0].to_string();
 
                     // Parse param="value" pairs
-                    let param_re = Regex::new(r#"(\S+)="([^"]*)""#).unwrap();
-                    for param_cap in param_re.captures_iter(sd_element) {
+                    for param_cap in PARAM_RE.captures_iter(sd_element) {
                         let key = param_cap.get(1).unwrap().as_str().to_string();
                         let value = param_cap.get(2).unwrap().as_str().to_string();
                         params.insert(key, value);
@@ -382,12 +384,11 @@ impl SyslogMessage {
             remaining = rest[last_end..].trim_start();
         }
 
-        let message = if remaining.starts_with("\u{feff}") {
-            // Strip BOM if present
-            remaining[3..].to_string()
-        } else {
-            remaining.to_string()
-        };
+        // Strip BOM if present
+        let message = remaining
+            .strip_prefix('\u{feff}')
+            .unwrap_or(remaining)
+            .to_string();
 
         if structured_data.is_empty() {
             (None, message)
@@ -691,7 +692,9 @@ mod tests {
 
     #[test]
     fn test_dns_non_dns_message() {
-        let syslog = SyslogMessage::parse("<34>Oct 11 22:14:15 mymachine app: regular message without DNS").unwrap();
+        let syslog =
+            SyslogMessage::parse("<34>Oct 11 22:14:15 mymachine app: regular message without DNS")
+                .unwrap();
         let dns = dns::DnsLogEntry::from_syslog(&syslog);
         assert!(dns.is_none());
     }
