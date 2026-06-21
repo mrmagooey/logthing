@@ -22,6 +22,20 @@ key_prefix = "syslog/"
 max_buffer_rows     = 10
 flush_interval_secs = 5
 
+[ipfix]
+enabled = true
+udp_port = 4739
+
+[ipfix.s3]
+endpoint   = "http://minio:9000"
+bucket     = "ipfix-flows"
+region     = "us-east-1"
+access_key = "miniouser"
+secret_key = "miniopassword"
+prefix     = "ipfix"
+flush_threshold_bytes = 1
+flush_interval_secs   = 5
+
 [forwarding]
 buffer_size = 10000
 retry_attempts = 3

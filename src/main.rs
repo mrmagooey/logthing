@@ -126,7 +126,40 @@ async fn async_main() -> anyhow::Result<()> {
                 udp_port: ipfix_config_clone.ipfix.udp_port,
                 bind_address: ipfix_config_clone.ipfix.bind_address.clone(),
             };
-            let listener = ipfix::listener::IpfixListener::with_default_handler(listener_config);
+
+            let handler: Arc<dyn ipfix::listener::IpfixHandler> =
+                if let Some(s3_cfg) = ipfix_config_clone.ipfix.s3.as_ref() {
+                    let parquet_cfg = s3_cfg.to_parquet_s3_config();
+                    match forwarding::s3_sink::S3Sink::from_config(&parquet_cfg).await {
+                        Ok(sink) => {
+                            let writer_cfg = forwarding::ipfix_s3::IpfixS3WriterConfig {
+                                flush_threshold_bytes: s3_cfg.flush_threshold_bytes,
+                                flush_interval: std::time::Duration::from_secs(
+                                    s3_cfg.flush_interval_secs,
+                                ),
+                                key_prefix: s3_cfg.prefix.clone(),
+                                max_buffer_rows: s3_cfg.max_buffer_rows,
+                            };
+                            let handler = forwarding::ipfix_s3::IpfixS3Handler::start_with_capacity(
+                                writer_cfg,
+                                Arc::new(sink),
+                                s3_cfg.channel_capacity,
+                            );
+                            Arc::new(handler)
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to create S3Sink for IPFIX persistence, \
+                                 falling back to DefaultIpfixHandler: {e}"
+                            );
+                            Arc::new(ipfix::listener::DefaultIpfixHandler)
+                        }
+                    }
+                } else {
+                    Arc::new(ipfix::listener::DefaultIpfixHandler)
+                };
+
+            let listener = ipfix::listener::IpfixListener::new(listener_config, handler);
             if let Err(e) = listener.start().await {
                 error!("IPFIX listener error: {}", e);
             }
