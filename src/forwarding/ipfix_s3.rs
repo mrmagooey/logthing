@@ -354,6 +354,8 @@ pub struct IpfixS3Writer {
     config: IpfixS3WriterConfig,
     sink: Arc<S3Sink>,
     buffer: VecDeque<RecordBatch>,
+    /// Estimated byte size for each buffered batch, in the same order as `buffer`.
+    buffer_bytes: VecDeque<usize>,
     buffer_row_count: usize,
     buffered_bytes: usize,
     last_flush: Instant,
@@ -367,6 +369,7 @@ impl IpfixS3Writer {
             config,
             sink,
             buffer: VecDeque::new(),
+            buffer_bytes: VecDeque::new(),
             buffer_row_count: 0,
             buffered_bytes: 0,
             last_flush: Instant::now(),
@@ -401,6 +404,7 @@ impl IpfixS3Writer {
         self.buffer_row_count += batch.num_rows();
         self.buffered_bytes += estimated;
         self.buffer.push_back(batch);
+        self.buffer_bytes.push_back(estimated);
 
         if self.buffered_bytes >= self.config.flush_threshold_bytes {
             self.flush_then_cap().await?;
@@ -431,8 +435,10 @@ impl IpfixS3Writer {
                 .buffer
                 .pop_front()
                 .expect("buffer non-empty per loop guard");
+            let oldest_bytes = self.buffer_bytes.pop_front().unwrap_or(0);
             let n = oldest.num_rows();
             self.buffer_row_count = self.buffer_row_count.saturating_sub(n);
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(oldest_bytes);
             dropped_rows += n;
         }
         if dropped_rows > 0 {
@@ -486,6 +492,7 @@ impl IpfixS3Writer {
             }
         }
         self.buffer.clear();
+        self.buffer_bytes.clear();
         self.buffer_row_count = 0;
         self.buffered_bytes = 0;
         self.last_flush = Instant::now();
@@ -498,6 +505,9 @@ impl IpfixS3Writer {
 // ---------------------------------------------------------------------------
 
 /// Channel capacity for the handler → writer channel (production default).
+/// Used by `start()` as a convenience wrapper and available for callers that
+/// want the default without hardcoding the literal.
+#[allow(dead_code)]
 pub const IPFIX_S3_CHANNEL_CAPACITY: usize = 256;
 
 /// `IpfixHandler` implementation that forwards flow batches through a bounded channel to a
@@ -508,6 +518,8 @@ pub struct IpfixS3Handler {
 
 impl IpfixS3Handler {
     /// Construct a handler and start the writer background task with the default channel capacity.
+    /// Production callers should prefer `start_with_capacity` to honour the configured value.
+    #[allow(dead_code)]
     pub fn start(config: IpfixS3WriterConfig, sink: Arc<S3Sink>) -> Self {
         Self::start_with_capacity(config, sink, IPFIX_S3_CHANNEL_CAPACITY)
     }
@@ -515,8 +527,9 @@ impl IpfixS3Handler {
     /// Construct a handler and start the writer background task with a custom channel `capacity`.
     ///
     /// Intended for tests that need a small channel to exercise the overflow/drop path without
-    /// relying on the production `IPFIX_S3_CHANNEL_CAPACITY` constant.
-    pub(crate) fn start_with_capacity(
+    /// relying on the production `IPFIX_S3_CHANNEL_CAPACITY` constant, and for production use
+    /// when the configured `channel_capacity` should override the default.
+    pub fn start_with_capacity(
         config: IpfixS3WriterConfig,
         sink: Arc<S3Sink>,
         capacity: usize,
@@ -907,6 +920,112 @@ mod tests {
             "expected ipfix_s3_dropped >= 1 after saturating the channel; got {dropped}. \
              The real IpfixS3Handler::handle_flows must increment the counter on overflow."
         );
+    }
+
+    // -- F1: channel_capacity is honored by start_with_capacity --
+
+    /// Prove that `start_with_capacity` wires the capacity parameter by showing that
+    /// a tiny capacity (1) causes drops for a burst of sends, while a large capacity
+    /// (10_000) does not for the same modest send count.
+    #[tokio::test]
+    async fn channel_capacity_parameter_is_wired() {
+        use crate::ipfix::listener::IpfixHandler;
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::DebuggingRecorder;
+        use std::net::SocketAddr;
+
+        let src: SocketAddr = "127.0.0.1:4739".parse().unwrap();
+
+        // --- small capacity (1): expect drops ---
+        {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = set_default_local_recorder(&recorder);
+
+            let sink = unreachable_sink().await;
+            let config = IpfixS3WriterConfig {
+                flush_threshold_bytes: 1, // flush on every push so background task stalls on S3
+                flush_interval: Duration::from_secs(3600),
+                key_prefix: "ipfix".to_string(),
+                max_buffer_rows: 1,
+            };
+            let handler = IpfixS3Handler::start_with_capacity(config, sink, 1);
+            tokio::task::yield_now().await;
+
+            // Send 30 batches — far more than capacity (1) + the one in-flight with S3.
+            for i in 0..30usize {
+                let record = make_flow_record(None, None, serde_json::json!({"i": i}));
+                handler.handle_flows(vec![record], src).await;
+            }
+            tokio::task::yield_now().await;
+
+            let snapshot = snapshotter.snapshot();
+            let map = snapshot.into_hashmap();
+            let key = CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("ipfix_s3_dropped"),
+            );
+            let dropped = map
+                .get(&key)
+                .map(|(_, _, v)| {
+                    if let metrics_util::debugging::DebugValue::Counter(c) = v {
+                        *c
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0);
+            assert!(
+                dropped >= 1,
+                "capacity=1 should cause drops; got ipfix_s3_dropped={dropped}"
+            );
+        }
+
+        // --- large capacity (10_000): expect no drops for a modest send count (30) ---
+        {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = set_default_local_recorder(&recorder);
+
+            let sink = unreachable_sink().await;
+            let config = IpfixS3WriterConfig {
+                flush_threshold_bytes: usize::MAX, // prevent flush so channel never stalls
+                flush_interval: Duration::from_secs(3600),
+                key_prefix: "ipfix".to_string(),
+                max_buffer_rows: 100_000,
+            };
+            let handler = IpfixS3Handler::start_with_capacity(config, sink, 10_000);
+            tokio::task::yield_now().await;
+
+            for i in 0..30usize {
+                let record = make_flow_record(None, None, serde_json::json!({"i": i}));
+                handler.handle_flows(vec![record], src).await;
+            }
+            tokio::task::yield_now().await;
+
+            let snapshot = snapshotter.snapshot();
+            let map = snapshot.into_hashmap();
+            let key = CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("ipfix_s3_dropped"),
+            );
+            let dropped = map
+                .get(&key)
+                .map(|(_, _, v)| {
+                    if let metrics_util::debugging::DebugValue::Counter(c) = v {
+                        *c
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0);
+            assert!(
+                dropped == 0,
+                "capacity=10_000 should not cause drops for 30 sends; got ipfix_s3_dropped={dropped}"
+            );
+        }
     }
 
     // -- Task 6 Integration test (gated on IPFIX_S3_INTEGRATION_TEST env var) --

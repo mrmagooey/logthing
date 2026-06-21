@@ -140,9 +140,10 @@ async fn async_main() -> anyhow::Result<()> {
                                 key_prefix: s3_cfg.prefix.clone(),
                                 max_buffer_rows: s3_cfg.max_buffer_rows,
                             };
-                            let handler = forwarding::ipfix_s3::IpfixS3Handler::start(
+                            let handler = forwarding::ipfix_s3::IpfixS3Handler::start_with_capacity(
                                 writer_cfg,
                                 Arc::new(sink),
+                                s3_cfg.channel_capacity,
                             );
                             Arc::new(handler)
                         }
