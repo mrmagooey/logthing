@@ -16,6 +16,7 @@ use chrono::{Datelike, Utc};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -150,7 +151,7 @@ impl SyslogS3WriterConfig {
 pub struct SyslogS3Writer {
     config: SyslogS3WriterConfig,
     sink: Arc<S3Sink>,
-    buffer: Vec<RecordBatch>,
+    buffer: VecDeque<RecordBatch>,
     buffer_row_count: usize,
     last_flush: Instant,
     /// Timestamp of the last drop-warning log line, used to throttle noisy output.
@@ -162,7 +163,7 @@ impl SyslogS3Writer {
         Self {
             config,
             sink,
-            buffer: Vec::new(),
+            buffer: VecDeque::new(),
             buffer_row_count: 0,
             last_flush: Instant::now(),
             last_drop_warn: None,
@@ -183,10 +184,16 @@ impl SyslogS3Writer {
     pub async fn push(&mut self, msg: &SyslogMessage) -> anyhow::Result<()> {
         let batch = syslog_message_to_batch(msg)?;
         self.buffer_row_count += batch.num_rows();
-        self.buffer.push(batch);
+        self.buffer.push_back(batch);
         if self.buffer_row_count < self.config.max_buffer_rows {
             return Ok(());
         }
+        self.flush_then_cap().await
+    }
+
+    /// Attempt a flush; if it fails and the buffer exceeds the hard cap, drop the oldest batches.
+    /// This ensures the hard cap is enforced on every trigger path (threshold and timer).
+    async fn flush_then_cap(&mut self) -> anyhow::Result<()> {
         if let Err(e) = self.flush().await {
             // Flush failed (S3 unavailable); apply the hard cap to prevent unbounded growth.
             let cap = self.config.hard_cap_rows();
@@ -205,7 +212,10 @@ impl SyslogS3Writer {
             if self.buffer.is_empty() {
                 break;
             }
-            let oldest = self.buffer.remove(0);
+            let oldest = self
+                .buffer
+                .pop_front()
+                .expect("buffer non-empty per loop guard");
             let n = oldest.num_rows();
             self.buffer_row_count = self.buffer_row_count.saturating_sub(n);
             dropped_rows += n;
@@ -229,6 +239,7 @@ impl SyslogS3Writer {
     }
 
     /// Flush if the age or row-count threshold is exceeded; no-op if the buffer is empty.
+    /// If the flush fails, the hard cap is enforced to keep memory bounded.
     pub async fn flush_if_needed(&mut self) -> anyhow::Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
@@ -236,7 +247,7 @@ impl SyslogS3Writer {
         let age_exceeded = self.last_flush.elapsed() >= self.config.flush_interval;
         let size_exceeded = self.buffer_row_count >= self.config.max_buffer_rows;
         if age_exceeded || size_exceeded {
-            self.flush().await?;
+            self.flush_then_cap().await?;
         }
         Ok(())
     }
@@ -247,7 +258,10 @@ impl SyslogS3Writer {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        let bytes = encode_batches_to_parquet(&self.buffer)?;
+        // VecDeque is not contiguous, so collect clones for the encoder.
+        // RecordBatch clones are cheap (Arc-backed column arrays).
+        let batches: Vec<RecordBatch> = self.buffer.iter().cloned().collect();
+        let bytes = encode_batches_to_parquet(&batches)?;
         let key = self.build_key();
         match self.sink.upload(&key, bytes).await {
             Ok(()) => {
