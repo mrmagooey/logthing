@@ -346,6 +346,12 @@ impl Default for IpfixS3WriterConfig {
     }
 }
 
+/// A single buffered batch: the Arrow batch paired with its estimated byte size.
+struct BufferedBatch {
+    batch: RecordBatch,
+    est_bytes: usize,
+}
+
 /// Buffers `FlowRecord` rows as Arrow `RecordBatch`es and flushes to S3 as Parquet.
 ///
 /// Memory safety: the buffer has a hard cap of `max_buffer_rows * 4`. When a flush fails and
@@ -353,9 +359,9 @@ impl Default for IpfixS3WriterConfig {
 pub struct IpfixS3Writer {
     config: IpfixS3WriterConfig,
     sink: Arc<S3Sink>,
-    buffer: VecDeque<RecordBatch>,
-    /// Estimated byte size for each buffered batch, in the same order as `buffer`.
-    buffer_bytes: VecDeque<usize>,
+    /// Single deque whose elements carry both the batch and its byte estimate.
+    /// This eliminates the former two-deque design that risked length desync.
+    buffer: VecDeque<BufferedBatch>,
     buffer_row_count: usize,
     buffered_bytes: usize,
     last_flush: Instant,
@@ -369,7 +375,6 @@ impl IpfixS3Writer {
             config,
             sink,
             buffer: VecDeque::new(),
-            buffer_bytes: VecDeque::new(),
             buffer_row_count: 0,
             buffered_bytes: 0,
             last_flush: Instant::now(),
@@ -403,8 +408,10 @@ impl IpfixS3Writer {
             .sum::<usize>();
         self.buffer_row_count += batch.num_rows();
         self.buffered_bytes += estimated;
-        self.buffer.push_back(batch);
-        self.buffer_bytes.push_back(estimated);
+        self.buffer.push_back(BufferedBatch {
+            batch,
+            est_bytes: estimated,
+        });
 
         if self.buffered_bytes >= self.config.flush_threshold_bytes {
             self.flush_then_cap().await?;
@@ -435,10 +442,9 @@ impl IpfixS3Writer {
                 .buffer
                 .pop_front()
                 .expect("buffer non-empty per loop guard");
-            let oldest_bytes = self.buffer_bytes.pop_front().unwrap_or(0);
-            let n = oldest.num_rows();
+            let n = oldest.batch.num_rows();
             self.buffer_row_count = self.buffer_row_count.saturating_sub(n);
-            self.buffered_bytes = self.buffered_bytes.saturating_sub(oldest_bytes);
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(oldest.est_bytes);
             dropped_rows += n;
         }
         if dropped_rows > 0 {
@@ -477,7 +483,7 @@ impl IpfixS3Writer {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        let batches: Vec<RecordBatch> = self.buffer.iter().cloned().collect();
+        let batches: Vec<RecordBatch> = self.buffer.iter().map(|b| b.batch.clone()).collect();
         let row_count = self.buffer_row_count;
         let bytes = encode_batches_to_parquet(&batches)?;
         let key = build_s3_key(&self.config.key_prefix, Utc::now());
@@ -492,7 +498,6 @@ impl IpfixS3Writer {
             }
         }
         self.buffer.clear();
-        self.buffer_bytes.clear();
         self.buffer_row_count = 0;
         self.buffered_bytes = 0;
         self.last_flush = Instant::now();
@@ -858,6 +863,45 @@ mod tests {
             "buffer must stay at or below hard cap ({hard_cap}), got {}",
             writer.buffered_rows()
         );
+    }
+
+    // -- A1: single-deque byte consistency --
+
+    /// Verify that after the hard cap kicks in, `buffered_bytes` equals the sum of
+    /// `est_bytes` for the remaining elements in the single buffer deque.
+    #[tokio::test]
+    async fn buffer_byte_accounting_is_consistent_after_cap() {
+        let sink = unreachable_sink().await;
+        let max_rows = 2usize;
+        let config = IpfixS3WriterConfig {
+            flush_threshold_bytes: 1, // flush immediately on every push
+            flush_interval: Duration::from_secs(3600),
+            key_prefix: "ipfix".to_string(),
+            max_buffer_rows: max_rows,
+        };
+        let hard_cap = config.hard_cap_rows();
+        let mut writer = IpfixS3Writer::new(config, sink);
+
+        // Push enough records to exceed the cap several times.
+        for _ in 0..(hard_cap * 3) {
+            let record = make_flow_record(None, None, serde_json::json!({}));
+            let _ = writer.push_batch(&[record]).await;
+        }
+
+        // After many failed flushes the cap must have been applied. Now verify
+        // that buffered_bytes == sum of each element's est_bytes in the deque.
+        let sum_from_deque: usize = writer.buffer.iter().map(|b| b.est_bytes).sum();
+        assert_eq!(
+            writer.buffered_bytes, sum_from_deque,
+            "buffered_bytes scalar must equal the sum of est_bytes in the buffer deque"
+        );
+
+        // Also verify the row count scalar is consistent.
+        let rows_from_deque: usize = writer.buffer.iter().map(|b| b.batch.num_rows()).sum();
+        assert_eq!(writer.buffer_row_count, rows_from_deque);
+
+        // And the hard cap was enforced.
+        assert!(writer.buffered_rows() <= hard_cap);
     }
 
     // -- Task 3: IpfixS3Handler overflow test (real handler, real metrics) --
