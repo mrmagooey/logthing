@@ -299,7 +299,10 @@ impl SyslogS3Writer {
 // SyslogS3Handler
 // ---------------------------------------------------------------------------
 
-/// Channel capacity for the handler → writer channel.
+/// Channel capacity for the handler → writer channel (production default).
+/// Used by `start()` as a convenience wrapper and available for callers that
+/// want the default without hardcoding the literal.
+#[allow(dead_code)]
 pub const SYSLOG_S3_CHANNEL_CAPACITY: usize = 4_096;
 
 /// `SyslogHandler` implementation that forwards messages through a bounded channel to a background
@@ -310,6 +313,8 @@ pub struct SyslogS3Handler {
 
 impl SyslogS3Handler {
     /// Construct a handler and start the writer background task with the default channel capacity.
+    /// Production callers should prefer `start_with_capacity` to honour the configured value.
+    #[allow(dead_code)]
     pub fn start(config: SyslogS3WriterConfig, sink: Arc<S3Sink>) -> Self {
         Self::start_with_capacity(config, sink, SYSLOG_S3_CHANNEL_CAPACITY)
     }
