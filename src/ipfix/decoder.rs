@@ -319,6 +319,39 @@ pub(crate) const FIXTURE_NFV5_TRUNCATED: &[u8] = &[
     0x00, 0x00, 0x00, 0x00, // 24 bytes of header but NO record bytes follow
 ];
 
+/// Two-record IPFIX v10 fixture: same template as FIXTURE_IPFIX_TEMPLATE_THEN_DATA
+/// (template id 256, ie 8 + ie 12, 4 bytes each) but with TWO data records in the data set.
+/// Layout:
+///   16 bytes: message header  (version=10, total_len=52)
+///   16 bytes: template set    (same as FIXTURE_IPFIX_TEMPLATE_THEN_DATA)
+///   20 bytes: data set header(4) + record1(8) + record2(8)
+/// Used to verify that the decoder returns exactly N flows for N records.
+#[cfg(test)]
+pub(crate) const FIXTURE_IPFIX_TWO_RECORDS: &[u8] = &[
+    // Message header (16 bytes)
+    0x00, 0x0A, // version = 10
+    0x00, 0x34, // total length = 52
+    0x67, 0x5C, 0xB0, 0x20, // export_time
+    0x00, 0x00, 0x00, 0x02, // sequence
+    0x00, 0x00, 0x00, 0x00, // observation domain id = 0
+    // Template Set (16 bytes: 4 hdr + 2 tmpl_id + 2 field_count + 2 fields×4)
+    0x00, 0x02, // set id = 2
+    0x00, 0x10, // length = 16
+    0x01, 0x00, // template id = 256
+    0x00, 0x02, // field count = 2
+    0x00, 0x08, 0x00, 0x04, // ie 8 (srcIP), len 4
+    0x00, 0x0C, 0x00, 0x04, // ie 12 (dstIP), len 4
+    // Data Set (20 bytes: 4 hdr + 8 record1 + 8 record2)
+    0x01, 0x00, // set id = 256
+    0x00, 0x14, // length = 20
+    // record 1
+    0xC0, 0xA8, 0x01, 0x01, // 192.168.1.1
+    0x0A, 0x00, 0x00, 0x01, // 10.0.0.1
+    // record 2
+    0xC0, 0xA8, 0x01, 0x02, // 192.168.1.2
+    0x0A, 0x00, 0x00, 0x02, // 10.0.0.2
+];
+
 // ---- IPFIX v10 decode -------------------------------------------------------
 
 use crate::ipfix::FlowRecord;
@@ -1283,5 +1316,56 @@ mod tests {
         let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let mut dec = IpfixDecoder::new();
         assert!(decode_datagram(&mut dec, &[], exporter).is_err());
+    }
+
+    // ---- I1: ipfix_flows_decoded counter ownership test ----
+    // The decoder (parse_ipfix_data_set / decode_netflow_v5) is the SOLE place
+    // that increments ipfix_flows_decoded. DefaultIpfixHandler must NOT also
+    // increment it. This test verifies the decoder returns the correct number of
+    // flows for a known multi-record fixture; if the handler were double-counting
+    // in tests we would notice via integration tests, but the API contract is
+    // that flows.len() == the number of records decoded (i.e. the decoder is the
+    // authority, and handle_flows just consumes the result).
+    #[test]
+    fn decoder_returns_exactly_n_flows_for_n_records() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 20));
+        let mut dec = IpfixDecoder::new();
+        // FIXTURE_IPFIX_TWO_RECORDS contains one template set (tmpl 256, 2 fields)
+        // and one data set with 2 records. Expect exactly 2 flows returned.
+        let records = decode_ipfix(&mut dec, FIXTURE_IPFIX_TWO_RECORDS, exporter)
+            .expect("two-record fixture should decode");
+        assert_eq!(
+            records.len(),
+            2,
+            "decoder must return exactly 2 flows for a 2-record data set"
+        );
+        // Verify the two records have distinct addresses
+        use std::net::Ipv4Addr as V4;
+        assert_eq!(records[0].src_addr, Some(IpAddr::V4(V4::new(192, 168, 1, 1))));
+        assert_eq!(records[1].src_addr, Some(IpAddr::V4(V4::new(192, 168, 1, 2))));
+    }
+
+    /// NetFlow v5 multi-record: 3 records in one packet → decoder returns 3 flows.
+    #[test]
+    fn netflow_v5_three_records_returns_three_flows() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 21));
+        // Build a v5 packet with count=3 by repeating the record from FIXTURE_NFV5_ONE_RECORD
+        let mut pkt = FIXTURE_NFV5_ONE_RECORD.to_vec();
+        // Update count to 3
+        pkt[2] = 0x00;
+        pkt[3] = 0x03;
+        // Append 2 more copies of the 48-byte record
+        let record = &FIXTURE_NFV5_ONE_RECORD[24..]; // slice off the 24-byte header
+        pkt.extend_from_slice(record);
+        pkt.extend_from_slice(record);
+
+        let records = decode_netflow_v5(&pkt, exporter).expect("v5 three-record decode");
+        assert_eq!(
+            records.len(),
+            3,
+            "decoder must return exactly 3 flows for a 3-record v5 packet"
+        );
     }
 }
