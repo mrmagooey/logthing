@@ -73,7 +73,41 @@ async fn async_main() -> anyhow::Result<()> {
                 parse_dns_logs: config_clone.syslog.parse_dns,
             };
 
-            let listener = syslog::listener::SyslogListener::with_default_handler(syslog_config);
+            let handler: Arc<dyn syslog::listener::SyslogHandler> =
+                if let Some(s3_cfg) = config_clone.syslog.s3.as_ref() {
+                    let parquet_cfg = s3_cfg.to_parquet_s3_config();
+                    match forwarding::s3_sink::S3Sink::from_config(&parquet_cfg).await {
+                        Ok(sink) => {
+                            let writer_cfg = forwarding::syslog_s3::SyslogS3WriterConfig {
+                                max_buffer_rows: s3_cfg.max_buffer_rows,
+                                flush_interval: std::time::Duration::from_secs(
+                                    s3_cfg.flush_interval_secs,
+                                ),
+                                key_prefix: s3_cfg.key_prefix.clone(),
+                            };
+                            let handler = forwarding::syslog_s3::SyslogS3Handler::start(
+                                writer_cfg,
+                                Arc::new(sink),
+                            );
+                            Arc::new(handler)
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to create S3Sink for syslog persistence, \
+                                 falling back to DefaultSyslogHandler: {e}"
+                            );
+                            Arc::new(syslog::listener::DefaultSyslogHandler::new(
+                                config_clone.syslog.parse_dns,
+                            ))
+                        }
+                    }
+                } else {
+                    Arc::new(syslog::listener::DefaultSyslogHandler::new(
+                        config_clone.syslog.parse_dns,
+                    ))
+                };
+
+            let listener = syslog::listener::SyslogListener::new(syslog_config, handler);
             if let Err(e) = listener.start().await {
                 error!("Syslog listener error: {}", e);
             }
