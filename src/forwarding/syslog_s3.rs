@@ -309,9 +309,21 @@ pub struct SyslogS3Handler {
 }
 
 impl SyslogS3Handler {
-    /// Construct a handler and start the writer background task.
+    /// Construct a handler and start the writer background task with the default channel capacity.
     pub fn start(config: SyslogS3WriterConfig, sink: Arc<S3Sink>) -> Self {
-        let (tx, mut rx) = mpsc::channel::<SyslogMessage>(SYSLOG_S3_CHANNEL_CAPACITY);
+        Self::start_with_capacity(config, sink, SYSLOG_S3_CHANNEL_CAPACITY)
+    }
+
+    /// Construct a handler and start the writer background task with a custom channel `capacity`.
+    ///
+    /// Intended for tests that need a small channel to exercise the overflow/drop path without
+    /// relying on the production `SYSLOG_S3_CHANNEL_CAPACITY` constant.
+    pub(crate) fn start_with_capacity(
+        config: SyslogS3WriterConfig,
+        sink: Arc<S3Sink>,
+        capacity: usize,
+    ) -> Self {
+        let (tx, mut rx) = mpsc::channel::<SyslogMessage>(capacity);
         let flush_check = std::time::Duration::from_secs(60);
         tokio::spawn(async move {
             let mut writer = SyslogS3Writer::new(config, sink);
@@ -703,63 +715,80 @@ mod tests {
 
     // -- I2: SyslogS3Handler overflow path test --
 
-    /// Verify that when the handler's bounded channel is saturated, `handle_message` increments
-    /// `syslog_s3_dropped` rather than blocking.  Exercises the production overflow path using
-    /// the same `try_send` + counter pattern as `SyslogS3Handler`.
+    /// Verify that when the real `SyslogS3Handler`'s bounded channel is saturated,
+    /// `SyslogS3Handler::handle_message` increments `syslog_s3_dropped` rather than blocking.
+    ///
+    /// Uses `start_with_capacity(…, 1)` so the channel fills immediately once the background
+    /// writer task stalls awaiting the (always-failing) S3 upload.  Sends 50 messages — far more
+    /// than capacity + in-flight — and asserts the metric counter increased.  Uses a thread-local
+    /// `DebuggingRecorder` so this test is hermetic and does not conflict with other tests that
+    /// may install a global recorder.
     #[tokio::test]
     async fn handler_overflow_increments_dropped_counter() {
         use crate::syslog::listener::SyslogHandler as SyslogHandlerTrait;
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::DebuggingRecorder;
         use std::net::SocketAddr;
-        use std::sync::Arc as StdArc;
-        use std::sync::atomic::{AtomicU64, Ordering};
 
-        // Shared counter that the handler increments on every drop, mirroring the production
-        // `syslog_s3_dropped` metric increment.
-        let dropped_count = StdArc::new(AtomicU64::new(0));
+        // Install a thread-local debugging recorder so counter reads are hermetic.
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
 
-        // A handler whose internal sender has capacity 1, so it overflows quickly.
-        // Holds a clone of the drop counter to verify the drop path executes.
-        struct SmallHandler {
-            sender: mpsc::Sender<SyslogMessage>,
-            dropped: StdArc<AtomicU64>,
-        }
-        #[async_trait::async_trait]
-        impl crate::syslog::listener::SyslogHandler for SmallHandler {
-            async fn handle_message(&self, message: SyslogMessage, _source: std::net::SocketAddr) {
-                match self.sender.try_send(message) {
-                    Ok(()) => {}
-                    Err(_) => {
-                        metrics::counter!("syslog_s3_dropped").increment(1);
-                        self.dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-
-        let (tx, rx) = mpsc::channel::<SyslogMessage>(1);
-        // Park rx in a task that never reads — simulates a permanently-stalled background writer.
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            drop(rx);
-        });
-
-        let handler = SmallHandler {
-            sender: tx,
-            dropped: dropped_count.clone(),
+        let sink = unreachable_sink().await;
+        // Channel capacity of 1: background task receives at most 1 message before it blocks
+        // waiting for the S3 upload to complete (which never succeeds on port 1).
+        let config = SyslogS3WriterConfig {
+            max_buffer_rows: 1, // flush on every message so the writer task stalls immediately
+            flush_interval: std::time::Duration::from_secs(3600),
+            key_prefix: "test/".to_string(),
         };
+        let handler = SyslogS3Handler::start_with_capacity(config, sink, 1);
+
+        // Yield briefly so the background task starts and receives (and blocks on) the first
+        // message, leaving the channel slot empty again — but stalled inside an S3 upload.
+        // Then the next send fills the slot, and all subsequent sends are dropped.
+        tokio::task::yield_now().await;
+
         let src: SocketAddr = "127.0.0.1:5514".parse().unwrap();
 
-        // Send 10 messages into a channel of capacity 1.
-        // The first message fills the slot; the next 9 must overflow.
-        for i in 0..10usize {
+        // Send 50 messages — far more than capacity (1) + in-flight (1).
+        // After the channel is full, every subsequent handle_message call must drop and increment
+        // the counter in the *caller's* task (this test), where our local recorder is active.
+        for i in 0..50usize {
             handler
                 .handle_message(dummy_msg(&format!("overflow-{i}")), src)
                 .await;
         }
 
+        // Give background task a moment to pull out the first message and stall on S3
+        // (it was already started above, but an extra yield doesn't hurt determinism).
+        tokio::task::yield_now().await;
+
+        // Snapshot and check the syslog_s3_dropped counter.
+        let snapshot = snapshotter.snapshot();
+        let map = snapshot.into_hashmap();
+        let key = CompositeKey::new(
+            MetricKind::Counter,
+            metrics::Key::from_name("syslog_s3_dropped"),
+        );
+        let dropped = map
+            .get(&key)
+            .map(|(_, _, v)| {
+                if let metrics_util::debugging::DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+
         assert!(
-            dropped_count.load(Ordering::Relaxed) >= 1,
-            "expected at least one dropped message; overflow path must increment the drop counter"
+            dropped >= 1,
+            "expected syslog_s3_dropped ≥ 1 after saturating the channel; got {dropped}. \
+             The real SyslogS3Handler::handle_message must increment the counter on overflow."
         );
     }
 
