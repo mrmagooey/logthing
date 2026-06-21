@@ -35,12 +35,11 @@ use tracing::warn;
 /// Absent from TOML → `None` → no S3 persistence (backward compatible).
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct IpfixS3Config {
-    pub endpoint: String,
-    pub bucket: String,
-    pub region: String,
-    pub access_key: String,
-    pub secret_key: String,
-    /// S3 key prefix for IPFIX objects (default: "ipfix")
+    /// Shared S3 connection fields (endpoint, bucket, region, access_key, secret_key).
+    /// Flattened so the TOML block stays flat: `[ipfix.s3]\nendpoint = …`
+    #[serde(flatten)]
+    pub connection: crate::config::S3ConnectionConfig,
+    /// S3 key prefix for IPFIX objects, slash-free (default: `"ipfix"`); builder inserts `/`.
     #[serde(default = "default_ipfix_s3_prefix")]
     pub prefix: String,
     /// Max buffer size in bytes before an eager flush (default: 100 MiB)
@@ -71,22 +70,6 @@ fn default_ipfix_channel_capacity() -> usize {
 }
 fn default_ipfix_max_buffer_rows() -> usize {
     100_000
-}
-
-impl IpfixS3Config {
-    /// Convert to `ParquetS3Config` so we can construct an `S3Sink`.
-    pub fn to_parquet_s3_config(&self) -> crate::forwarding::parquet_s3::ParquetS3Config {
-        crate::forwarding::parquet_s3::ParquetS3Config {
-            endpoint: self.endpoint.clone(),
-            bucket: self.bucket.clone(),
-            region: self.region.clone(),
-            access_key: self.access_key.clone(),
-            secret_key: self.secret_key.clone(),
-            max_file_size_mb: 0, // unused by S3Sink directly
-            flush_interval_secs: self.flush_interval_secs,
-            local_buffer_path: std::path::PathBuf::new(), // unused by S3Sink directly
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,11 +1068,13 @@ mod tests {
 
         let bucket = std::env::var("IPFIX_S3_BUCKET").unwrap_or_else(|_| "ipfix-test".to_string());
         let s3_cfg = IpfixS3Config {
-            endpoint: "http://localhost:9000".to_string(),
-            bucket: bucket.clone(),
-            region: "us-east-1".to_string(),
-            access_key: "minioadmin".to_string(),
-            secret_key: "minioadmin".to_string(),
+            connection: crate::config::S3ConnectionConfig {
+                endpoint: "http://localhost:9000".to_string(),
+                bucket: bucket.clone(),
+                region: "us-east-1".to_string(),
+                access_key: "minioadmin".to_string(),
+                secret_key: "minioadmin".to_string(),
+            },
             prefix: "ipfix".to_string(),
             flush_threshold_bytes: 1, // force immediate flush
             flush_interval_secs: 1,
@@ -1098,7 +1083,7 @@ mod tests {
         };
 
         let sink = Arc::new(
-            S3Sink::from_config(&s3_cfg.to_parquet_s3_config())
+            S3Sink::from_connection(&s3_cfg.connection)
                 .await
                 .expect("S3Sink construct"),
         );
