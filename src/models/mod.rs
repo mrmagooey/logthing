@@ -31,20 +31,15 @@ pub struct ParsedEvent {
     pub data: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "PascalCase")]
 pub enum EventLevel {
     Critical = 1,
     Error = 2,
     Warning = 3,
+    #[default]
     Information = 4,
     Verbose = 5,
-}
-
-impl Default for EventLevel {
-    fn default() -> Self {
-        EventLevel::Information
-    }
 }
 
 impl WindowsEvent {
@@ -55,7 +50,7 @@ impl WindowsEvent {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::models::WindowsEvent;
+    /// use logthing::models::WindowsEvent;
     ///
     /// let xml = r#"<Event><System><EventID>4624</EventID></System></Event>"#;
     /// let event = WindowsEvent::new("workstation01".to_string(), xml.to_string());
@@ -79,7 +74,7 @@ impl WindowsEvent {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::models::{WindowsEvent, ParsedEvent, EventLevel};
+    /// use logthing::models::{WindowsEvent, ParsedEvent, EventLevel};
     ///
     /// let xml = r#"<Event><System><EventID>4624</EventID></System></Event>"#;
     /// let event = WindowsEvent::new("workstation01".to_string(), xml.to_string())
