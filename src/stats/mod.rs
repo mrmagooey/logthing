@@ -34,14 +34,16 @@ impl ThroughputStats {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::stats::ThroughputStats;
+    /// use logthing::stats::ThroughputStats;
     ///
+    /// # async fn example() {
     /// let stats = ThroughputStats::new();
     ///
     /// // Record some events
     /// stats.record_event("Microsoft-Windows-Security-Auditing:4624".to_string()).await;
     /// stats.record_event("Microsoft-Windows-Security-Auditing:4624".to_string()).await;
     /// stats.record_event("Microsoft-Windows-Security-Auditing:4625".to_string()).await;
+    /// # }
     /// ```
     pub async fn record_event(&self, event_type: String) {
         let minute = current_minute();
@@ -62,8 +64,9 @@ impl ThroughputStats {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::stats::ThroughputStats;
+    /// use logthing::stats::ThroughputStats;
     ///
+    /// # async fn example() {
     /// let stats = ThroughputStats::new();
     ///
     /// // Record events and get snapshot
@@ -76,6 +79,7 @@ impl ThroughputStats {
     ///         row.event_type, row.total_events, row.last_minute
     ///     );
     /// }
+    /// # }
     /// ```
     pub async fn snapshot(&self) -> Vec<ThroughputSnapshot> {
         let minute = current_minute();

@@ -50,7 +50,7 @@ impl WindowsEvent {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::models::WindowsEvent;
+    /// use logthing::models::WindowsEvent;
     ///
     /// let xml = r#"<Event><System><EventID>4624</EventID></System></Event>"#;
     /// let event = WindowsEvent::new("workstation01".to_string(), xml.to_string());
@@ -74,7 +74,7 @@ impl WindowsEvent {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::models::{WindowsEvent, ParsedEvent, EventLevel};
+    /// use logthing::models::{WindowsEvent, ParsedEvent, EventLevel};
     ///
     /// let xml = r#"<Event><System><EventID>4624</EventID></System></Event>"#;
     /// let event = WindowsEvent::new("workstation01".to_string(), xml.to_string())

@@ -29,13 +29,13 @@ impl Forwarder {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::forwarding::Forwarder;
-    /// use wef_server::config::DestinationConfig;
+    /// use logthing::forwarding::Forwarder;
+    /// use logthing::config::DestinationConfig;
     ///
     /// let destinations = vec![DestinationConfig {
     ///     name: "http-destination".to_string(),
     ///     url: "http://example.com/events".to_string(),
-    ///     protocol: wef_server::config::ForwardProtocol::Http,
+    ///     protocol: logthing::config::ForwardProtocol::Http,
     ///     enabled: true,
     ///     headers: std::collections::HashMap::new(),
     /// }];
@@ -61,14 +61,14 @@ impl Forwarder {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::forwarding::Forwarder;
-    /// use wef_server::config::DestinationConfig;
+    /// use logthing::forwarding::Forwarder;
+    /// use logthing::config::DestinationConfig;
     ///
     /// async fn setup_forwarder() {
     ///     let destinations = vec![DestinationConfig {
     ///         name: "http-destination".to_string(),
     ///         url: "http://example.com/events".to_string(),
-    ///         protocol: wef_server::config::ForwardProtocol::Http,
+    ///         protocol: logthing::config::ForwardProtocol::Http,
     ///         enabled: true,
     ///         headers: std::collections::HashMap::new(),
     ///     }];
@@ -126,8 +126,8 @@ impl Forwarder {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::forwarding::Forwarder;
-    /// use wef_server::models::WindowsEvent;
+    /// use logthing::forwarding::Forwarder;
+    /// use logthing::models::WindowsEvent;
     /// use std::sync::Arc;
     ///
     /// async fn forward_event(forwarder: &Forwarder) {

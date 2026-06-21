@@ -52,9 +52,9 @@ impl Server {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::config::Config;
-    /// use wef_server::server::Server;
-    /// use wef_server::stats::ThroughputStats;
+    /// use logthing::config::Config;
+    /// use logthing::server::Server;
+    /// use logthing::stats::ThroughputStats;
     /// use std::sync::Arc;
     /// use tokio::sync::RwLock;
     ///
@@ -203,9 +203,9 @@ impl Server {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::config::Config;
-    /// use wef_server::server::Server;
-    /// use wef_server::stats::ThroughputStats;
+    /// use logthing::config::Config;
+    /// use logthing::server::Server;
+    /// use logthing::stats::ThroughputStats;
     /// use std::sync::Arc;
     /// use tokio::sync::RwLock;
     ///
@@ -294,9 +294,9 @@ impl Server {
     /// # Examples
     ///
     /// ```no_run
-    /// use wef_server::config::Config;
-    /// use wef_server::server::Server;
-    /// use wef_server::stats::ThroughputStats;
+    /// use logthing::config::Config;
+    /// use logthing::server::Server;
+    /// use logthing::stats::ThroughputStats;
     /// use std::sync::Arc;
     /// use tokio::sync::RwLock;
     ///
