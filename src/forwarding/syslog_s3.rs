@@ -325,7 +325,7 @@ impl SyslogS3Handler {
     ///
     /// Intended for tests that need a small channel to exercise the overflow/drop path without
     /// relying on the production `SYSLOG_S3_CHANNEL_CAPACITY` constant.
-    pub(crate) fn start_with_capacity(
+    pub fn start_with_capacity(
         config: SyslogS3WriterConfig,
         sink: Arc<S3Sink>,
         capacity: usize,

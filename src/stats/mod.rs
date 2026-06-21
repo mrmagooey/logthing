@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::Serialize;
+use std::cmp::Reverse;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -89,7 +90,7 @@ impl ThroughputStats {
             })
             .collect();
 
-        rows.sort_by(|a, b| b.last_minute.cmp(&a.last_minute));
+        rows.sort_by_key(|r| Reverse(r.last_minute));
         rows
     }
 }

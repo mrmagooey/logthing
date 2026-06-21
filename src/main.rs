@@ -1,16 +1,5 @@
-mod admin;
-mod config;
-mod forwarding;
-mod ipfix;
-mod middleware;
-mod models;
-mod parser;
-mod protocol;
-mod server;
-mod stats;
-mod syslog;
-
-use server::Server;
+use logthing::server::Server;
+use logthing::{admin, config, forwarding, ipfix, stats, syslog};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};

@@ -322,9 +322,9 @@ impl GenericEventParser {
 
             // Extract content between tags
             let content_start = pos + tag_end + 1;
-            let end_tag = format!("</Data>");
+            let end_tag = "</Data>";
 
-            if let Some(end_pos) = xml[content_start..].find(&end_tag) {
+            if let Some(end_pos) = xml[content_start..].find(end_tag) {
                 let value = xml[content_start..content_start + end_pos].trim();
                 return Ok(value.to_string());
             }

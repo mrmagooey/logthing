@@ -1,8 +1,8 @@
 use crate::models::{EventLevel, Heartbeat, ParsedEvent, SubscriptionRequest, WindowsEvent};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use quick_xml::events::Event as XmlEvent;
 use quick_xml::Reader;
+use quick_xml::events::Event as XmlEvent;
 use tracing::{debug, error};
 
 #[derive(Debug)]
@@ -13,6 +13,7 @@ pub enum WefMessage {
     Unknown(String),
 }
 
+#[derive(Default)]
 pub struct WefParser;
 
 impl WefParser {
@@ -143,6 +144,7 @@ impl WefParser {
                         depth -= 1;
                     }
                 }
+                #[allow(clippy::collapsible_match)]
                 Ok(XmlEvent::Empty(e)) => {
                     if in_event && e.name().as_ref() == b"Event" && depth == 0 {
                         // Self-closing Event tag
@@ -246,22 +248,18 @@ impl WefParser {
                         _ => {}
                     }
                 }
-                Ok(XmlEvent::Empty(e)) => {
-                    // Handle attributes in empty tags
-                    if e.name().as_ref() == b"TimeCreated" {
-                        for attr in e.attributes() {
-                            if let Ok(attr) = attr {
-                                if attr.key.as_ref() == b"SystemTime" {
-                                    if let Ok(val) = std::str::from_utf8(&attr.value) {
-                                        if let Ok(dt) = DateTime::parse_from_rfc3339(val) {
-                                            time_created = dt.with_timezone(&Utc);
-                                        }
-                                    }
-                                }
-                            }
+                Ok(XmlEvent::Empty(e)) if e.name().as_ref() == b"TimeCreated" => {
+                    // Handle attributes in empty TimeCreated tags
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"SystemTime"
+                            && let Ok(val) = std::str::from_utf8(&attr.value)
+                            && let Ok(dt) = DateTime::parse_from_rfc3339(val)
+                        {
+                            time_created = dt.with_timezone(&Utc);
                         }
                     }
                 }
+                Ok(XmlEvent::Empty(_)) => {}
                 Ok(XmlEvent::Eof) => break,
                 Err(_) => break,
                 _ => {}

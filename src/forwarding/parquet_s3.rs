@@ -57,7 +57,7 @@ impl ParquetS3Config {
         } else {
             format!(
                 "{}//{}",
-                parts.get(0).unwrap_or(&"http:"),
+                parts.first().unwrap_or(&"http:"),
                 parts.get(2).unwrap_or(&"localhost:9000")
             )
         };
@@ -230,10 +230,12 @@ impl ParquetS3Forwarder {
         let event_types: Vec<u32> = self.buffers.keys().copied().collect();
 
         for event_type in event_types {
-            if let Some(buffer) = self.buffers.get(&event_type) {
-                if !buffer.events.is_empty() {
-                    self.flush_event_type(event_type).await?;
-                }
+            if self
+                .buffers
+                .get(&event_type)
+                .is_some_and(|b| !b.events.is_empty())
+            {
+                self.flush_event_type(event_type).await?;
             }
         }
 
