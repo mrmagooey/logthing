@@ -83,7 +83,7 @@ async fn async_main() -> anyhow::Result<()> {
                             flush_interval: std::time::Duration::from_secs(
                                 s3_cfg.flush_interval_secs,
                             ),
-                            key_prefix: format!("{}/", s3_cfg.prefix),
+                            key_prefix: s3_cfg.prefix.clone(),
                         };
                         let handler = forwarding::syslog_s3::SyslogS3Handler::start_with_capacity(
                             writer_cfg,
