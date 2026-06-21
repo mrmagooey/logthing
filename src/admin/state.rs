@@ -1,9 +1,17 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::Instant,
+};
 
 use chrono::Utc;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncWriteExt, sync::RwLock};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::RwLock,
+};
 use tracing::info;
 
 use crate::config::Config;
@@ -205,7 +213,8 @@ impl PasswordHash {
     /// Hash a plain password using Argon2
     pub fn hash(password: &str) -> anyhow::Result<Self> {
         use argon2::{
-            Argon2, PasswordHasher,
+            Argon2,
+            PasswordHasher,
             password_hash::{SaltString, rand_core::OsRng},
         };
 

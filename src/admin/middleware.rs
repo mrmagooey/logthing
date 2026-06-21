@@ -31,8 +31,15 @@ pub async fn security_middleware(
             .any(|net| net.contains(&ip));
 
         if !allowed {
-            tracing::warn!("Admin access denied from {} - not in whitelist", client_ip);
-            return (StatusCode::FORBIDDEN, "Access denied - IP not in whitelist").into_response();
+            tracing::warn!(
+                "Admin access denied from {} - not in whitelist",
+                client_ip
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                "Access denied - IP not in whitelist",
+            )
+                .into_response();
         }
     }
 
@@ -176,13 +183,14 @@ mod tests {
             .uri("/test")
             .body(axum::body::Body::empty())
             .unwrap();
-
+        
         // Inject ConnectInfo as an extension
-        request
-            .extensions_mut()
-            .insert(axum::extract::ConnectInfo(addr));
+        request.extensions_mut().insert(axum::extract::ConnectInfo(addr));
 
-        let response: axum::http::Response<axum::body::Body> = app.oneshot(request).await.unwrap();
+        let response: axum::http::Response<axum::body::Body> = app
+            .oneshot(request)
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -198,11 +206,9 @@ mod tests {
             .uri("/test")
             .body(axum::body::Body::empty())
             .unwrap();
-
+        
         // Inject ConnectInfo as an extension
-        request
-            .extensions_mut()
-            .insert(axum::extract::ConnectInfo(addr));
+        request.extensions_mut().insert(axum::extract::ConnectInfo(addr));
 
         let app = axum::Router::new()
             .route("/test", axum::routing::get(|| async { "OK" }))
@@ -212,7 +218,10 @@ mod tests {
             ))
             .with_state(state);
 
-        let response: axum::http::Response<axum::body::Body> = app.oneshot(request).await.unwrap();
+        let response: axum::http::Response<axum::body::Body> = app
+            .oneshot(request)
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
@@ -228,10 +237,8 @@ mod tests {
             .uri("/test")
             .body(axum::body::Body::empty())
             .unwrap();
-
-        request
-            .extensions_mut()
-            .insert(axum::extract::ConnectInfo(addr));
+        
+        request.extensions_mut().insert(axum::extract::ConnectInfo(addr));
 
         let app = axum::Router::new()
             .route("/test", axum::routing::get(|| async { "OK" }))
@@ -241,7 +248,10 @@ mod tests {
             ))
             .with_state(state);
 
-        let response: axum::http::Response<axum::body::Body> = app.oneshot(request).await.unwrap();
+        let response: axum::http::Response<axum::body::Body> = app
+            .oneshot(request)
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -259,7 +269,10 @@ mod tests {
             ))
             .with_state(state);
 
-        let response: axum::http::Response<axum::body::Body> = app.oneshot(request).await.unwrap();
+        let response: axum::http::Response<axum::body::Body> = app
+            .oneshot(request)
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -277,7 +290,10 @@ mod tests {
             ))
             .with_state(state);
 
-        let response: axum::http::Response<axum::body::Body> = app.oneshot(request).await.unwrap();
+        let response: axum::http::Response<axum::body::Body> = app
+            .oneshot(request)
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -295,7 +311,10 @@ mod tests {
             ))
             .with_state(state);
 
-        let response: axum::http::Response<axum::body::Body> = app.oneshot(request).await.unwrap();
+        let response: axum::http::Response<axum::body::Body> = app
+            .oneshot(request)
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
@@ -303,8 +322,7 @@ mod tests {
     #[tokio::test]
     async fn csrf_middleware_blocks_invalid_token() {
         let state = test_state_with_config(vec![], true, false).await;
-        let request =
-            create_test_request(Method::POST, Some(vec![("X-CSRF-Token", "invalid-token")]));
+        let request = create_test_request(Method::POST, Some(vec![("X-CSRF-Token", "invalid-token")]));
 
         let app = axum::Router::new()
             .route("/test", axum::routing::post(|| async { "OK" }))
@@ -314,7 +332,10 @@ mod tests {
             ))
             .with_state(state);
 
-        let response: axum::http::Response<axum::body::Body> = app.oneshot(request).await.unwrap();
+        let response: axum::http::Response<axum::body::Body> = app
+            .oneshot(request)
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
