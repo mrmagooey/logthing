@@ -1,6 +1,7 @@
 mod admin;
 mod config;
 mod forwarding;
+mod ipfix;
 mod middleware;
 mod models;
 mod parser;
@@ -19,15 +20,17 @@ fn main() -> anyhow::Result<()> {
     let num_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    
+
     // Check for environment override
     let worker_threads = std::env::var("WEF_WORKER_THREADS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(num_cpus);
 
-    info!("Starting WEF Server with {} worker threads ({} CPUs available)", 
-          worker_threads, num_cpus);
+    info!(
+        "Starting WEF Server with {} worker threads ({} CPUs available)",
+        worker_threads, num_cpus
+    );
 
     // Create multi-threaded Tokio runtime
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -79,6 +82,22 @@ async fn async_main() -> anyhow::Result<()> {
             "Syslog listener started on UDP:{}/TCP:{}",
             config.syslog.udp_port, config.syslog.tcp_port
         );
+    }
+
+    // Start IPFIX listener if enabled
+    if config.ipfix.enabled {
+        let ipfix_config_clone = config.clone();
+        tokio::spawn(async move {
+            let listener_config = ipfix::listener::IpfixListenerConfig {
+                udp_port: ipfix_config_clone.ipfix.udp_port,
+                bind_address: ipfix_config_clone.ipfix.bind_address.clone(),
+            };
+            let listener = ipfix::listener::IpfixListener::with_default_handler(listener_config);
+            if let Err(e) = listener.start().await {
+                error!("IPFIX listener error: {}", e);
+            }
+        });
+        info!("IPFIX listener started on UDP:{}", config.ipfix.udp_port);
     }
 
     // Create and run server
