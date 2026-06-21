@@ -67,9 +67,18 @@ impl IpfixListener {
     pub async fn start(&self) -> anyhow::Result<()> {
         let addr: SocketAddr =
             format!("{}:{}", self.config.bind_address, self.config.udp_port).parse()?;
-
         let socket = UdpSocket::bind(&addr).await?;
-        info!("IPFIX UDP listener started on {}", addr);
+        self.run_with_socket(socket).await
+    }
+
+    /// Run the receive loop on an already-bound socket.
+    ///
+    /// This is the shared implementation used by both `start()` (which binds
+    /// the configured address) and tests (which bind their own socket so the
+    /// OS-assigned port is known without any TOCTOU race).
+    pub(crate) async fn run_with_socket(&self, socket: UdpSocket) -> anyhow::Result<()> {
+        let bound_addr = socket.local_addr()?;
+        info!("IPFIX UDP listener started on {}", bound_addr);
 
         let mut buf = vec![0u8; 65535];
         let mut decoder = IpfixDecoder::new();
@@ -135,26 +144,26 @@ mod tests {
 
     #[tokio::test]
     async fn listener_receives_ipfix_datagrams_and_calls_handler() {
-        // Bind on an ephemeral port (OS assigns port 0)
-        let tmp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let listener_addr = tmp_socket.local_addr().unwrap();
-        drop(tmp_socket);
+        // Bind the listener socket here so we know the exact port without any
+        // TOCTOU race (previously we'd bind, drop, then hope the listener could
+        // re-bind the same port before something else claimed it).
+        let listener_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener_socket.local_addr().unwrap();
 
         let handler = CapturingHandler::new();
         let handler_clone = handler.clone();
 
-        let real_config = IpfixListenerConfig {
-            udp_port: listener_addr.port(),
-            bind_address: "127.0.0.1".to_string(),
-        };
-        let listener = IpfixListener::new(real_config, handler_clone);
+        let listener = IpfixListener::new(
+            IpfixListenerConfig::default(),
+            handler_clone,
+        );
 
         let listener_task = tokio::spawn(async move {
-            listener.start().await.ok();
+            listener.run_with_socket(listener_socket).await.ok();
         });
 
-        // Give the listener time to bind
-        sleep(Duration::from_millis(50)).await;
+        // Give the listener time to enter recv_from
+        sleep(Duration::from_millis(20)).await;
 
         // Send the IPFIX template + data fixture
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -186,22 +195,18 @@ mod tests {
 
     #[tokio::test]
     async fn listener_ignores_malformed_datagrams_and_continues() {
-        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let listener_addr = tmp.local_addr().unwrap();
-        drop(tmp);
+        // Bind the listener socket here to eliminate the TOCTOU race.
+        let listener_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener_socket.local_addr().unwrap();
 
         let handler = CapturingHandler::new();
         let handler_clone = handler.clone();
-        let config = IpfixListenerConfig {
-            udp_port: listener_addr.port(),
-            bind_address: "127.0.0.1".to_string(),
-        };
-        let listener = IpfixListener::new(config, handler_clone);
+        let listener = IpfixListener::new(IpfixListenerConfig::default(), handler_clone);
 
         let task = tokio::spawn(async move {
-            listener.start().await.ok();
+            listener.run_with_socket(listener_socket).await.ok();
         });
-        sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(20)).await;
 
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
