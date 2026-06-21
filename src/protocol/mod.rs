@@ -1,8 +1,8 @@
 use crate::models::{EventLevel, Heartbeat, ParsedEvent, SubscriptionRequest, WindowsEvent};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use quick_xml::events::Event as XmlEvent;
 use quick_xml::Reader;
+use quick_xml::events::Event as XmlEvent;
 use tracing::{debug, error};
 
 #[derive(Debug)]

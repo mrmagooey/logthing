@@ -356,7 +356,7 @@ impl ParquetS3Forwarder {
         // Clone filepath for use in spawn_blocking
         let filepath_clone = filepath.clone();
         let schema_clone = schema.clone();
-        
+
         // Write to parquet file in a blocking task to avoid blocking async runtime
         tokio::task::spawn_blocking(move || {
             let file = File::create(&filepath_clone)?;
@@ -367,9 +367,10 @@ impl ParquetS3Forwarder {
             let mut writer = ArrowWriter::try_new(file, schema_clone, Some(props))?;
             writer.write(&batch)?;
             writer.close()?;
-            
+
             Result::<(), anyhow::Error>::Ok(())
-        }).await??;
+        })
+        .await??;
 
         debug!(
             "Written {} events to parquet file: {:?}",
@@ -436,7 +437,10 @@ mod tests {
         headers.insert("max-size-mb".into(), "1".into());
         headers.insert("flush-interval-secs".into(), "60".into());
         let temp_path = std::env::temp_dir().join("test-buf");
-        headers.insert("buffer-path".into(), temp_path.to_string_lossy().to_string());
+        headers.insert(
+            "buffer-path".into(),
+            temp_path.to_string_lossy().to_string(),
+        );
 
         DestinationConfig {
             name: "parquet".into(),
