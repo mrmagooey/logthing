@@ -12,6 +12,16 @@ udp_port = 5514
 tcp_port = 5601
 parse_dns = true
 
+[syslog.s3]
+endpoint   = "http://minio:9000"
+bucket     = "wef-events"
+region     = "us-east-1"
+access_key = "miniouser"
+secret_key = "miniopassword"
+key_prefix = "syslog/"
+max_buffer_rows     = 10
+flush_interval_secs = 5
+
 [forwarding]
 buffer_size = 10000
 retry_attempts = 3

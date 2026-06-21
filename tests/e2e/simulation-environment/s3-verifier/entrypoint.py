@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 
 import boto3
@@ -53,9 +54,53 @@ def wait_for_object():
     raise SystemExit("No S3 objects created in time")
 
 
+def wait_for_syslog_parquet():
+    """Poll for a Parquet object under the syslog/ prefix and validate its schema."""
+    session = boto3.session.Session()
+    client = session.client(
+        "s3",
+        endpoint_url=MINIO_ENDPOINT,
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+    )
+
+    syslog_prefix = "syslog/"
+    deadline = time.time() + 30  # 30-second poll window
+    syslog_found = False
+    resp = None
+    while time.time() < deadline:
+        resp = client.list_objects_v2(Bucket=BUCKET, Prefix=syslog_prefix)
+        if resp.get("Contents"):
+            syslog_found = True
+            break
+        time.sleep(2)
+
+    if not syslog_found:
+        print(
+            f"ERROR: No Parquet object found under {syslog_prefix} in {BUCKET}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Verify the first object is readable Parquet with 11 columns
+    key = resp["Contents"][0]["Key"]
+    obj = client.get_object(Bucket=BUCKET, Key=key)
+    import io
+
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(io.BytesIO(obj["Body"].read()))
+    assert table.num_columns == 11, f"Expected 11 columns, got {table.num_columns}"
+    assert table.num_rows > 0, "Expected at least one row in syslog Parquet"
+    print(
+        f"OK: syslog Parquet verified: {table.num_rows} row(s) under {syslog_prefix}"
+    )
+
+
 def main():
     wait_for_stats()
     wait_for_object()
+    wait_for_syslog_parquet()
     print("S3 verifier succeeded")
 
 
