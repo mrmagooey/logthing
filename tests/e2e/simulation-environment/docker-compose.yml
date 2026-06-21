@@ -56,7 +56,8 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command: >
       "until mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; do sleep 2; done &&
-       mc mb --ignore-existing local/wef-events"
+       mc mb --ignore-existing local/wef-events &&
+       mc mb --ignore-existing local/ipfix-flows"
     depends_on:
       - minio
     networks:
@@ -290,6 +291,36 @@ services:
       - AWS_SECRET_ACCESS_KEY=miniopassword
     depends_on:
       - logthing-10k-sustained
+    networks:
+      - e2e
+
+  ipfix-generator:
+    build:
+      context: .
+      dockerfile: ipfix-generator/Dockerfile
+    environment:
+      - IPFIX_HOST=logthing
+      - IPFIX_PORT=4739
+    depends_on:
+      - logthing
+    networks:
+      - e2e
+
+  ipfix-s3-verifier:
+    build:
+      context: .
+      dockerfile: ipfix-s3-verifier/Dockerfile
+    environment:
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_BUCKET=ipfix-flows
+      - AWS_ACCESS_KEY_ID=miniouser
+      - AWS_SECRET_ACCESS_KEY=miniopassword
+      - IPFIX_S3_PREFIX=ipfix/
+      - EXPECTED_EVENT_TOTAL=5
+      - E2E_TIMEOUT_SECS=60
+    depends_on:
+      - ipfix-generator
+      - logthing
     networks:
       - e2e
 
