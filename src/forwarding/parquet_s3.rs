@@ -4,11 +4,6 @@ use anyhow::Result;
 use arrow::array::{ArrayRef, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use aws_config::meta::region::RegionProviderChain;
-use aws_credential_types::{Credentials, provider::SharedCredentialsProvider};
-use aws_sdk_s3::Client as S3Client;
-use aws_sdk_s3::config::Builder as S3ConfigBuilder;
-use aws_sdk_s3::primitives::ByteStream;
 use chrono::{Datelike, Utc};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -170,55 +165,26 @@ impl BufferedEvent {
 /// Parquet S3 Forwarder
 pub struct ParquetS3Forwarder {
     config: ParquetS3Config,
-    s3_client: S3Client,
+    sink: crate::forwarding::s3_sink::S3Sink,
     buffers: HashMap<u32, EventTypeBuffer>,
 }
 
 impl ParquetS3Forwarder {
     pub async fn new(config: ParquetS3Config) -> Result<Self> {
-        // Create S3 client
-        let region_provider =
-            RegionProviderChain::first_try(aws_sdk_s3::config::Region::new(config.region.clone()));
-
-        let credentials_provider = if !config.access_key.is_empty() && !config.secret_key.is_empty()
-        {
-            Some(SharedCredentialsProvider::new(Credentials::new(
-                config.access_key.clone(),
-                config.secret_key.clone(),
-                None,
-                None,
-                "config",
-            )))
-        } else {
-            None
-        };
-
-        let sdk_config = aws_config::from_env()
-            .region(region_provider)
-            .endpoint_url(&config.endpoint)
-            .load()
-            .await;
-
-        let mut s3_conf_builder = S3ConfigBuilder::from(&sdk_config);
-        if let Some(provider) = credentials_provider {
-            s3_conf_builder = s3_conf_builder.credentials_provider(provider);
-        }
-
-        let s3_config = s3_conf_builder.force_path_style(true).build();
-
-        let s3_client = S3Client::from_conf(s3_config);
+        let sink = crate::forwarding::s3_sink::S3Sink::from_config(&config).await?;
 
         // Ensure buffer directory exists
         tokio::fs::create_dir_all(&config.local_buffer_path).await?;
 
         info!(
-            "ParquetS3Forwarder initialized: bucket={}, endpoint={}, flush_interval={}s, max_size={}MB",
+            "ParquetS3Forwarder initialized: bucket={}, endpoint={}, \
+             flush_interval={}s, max_size={}MB",
             config.bucket, config.endpoint, config.flush_interval_secs, config.max_file_size_mb
         );
 
         Ok(Self {
             config,
-            s3_client,
+            sink,
             buffers: HashMap::new(),
         })
     }
@@ -356,7 +322,7 @@ impl ParquetS3Forwarder {
         // Clone filepath for use in spawn_blocking
         let filepath_clone = filepath.clone();
         let schema_clone = schema.clone();
-        
+
         // Write to parquet file in a blocking task to avoid blocking async runtime
         tokio::task::spawn_blocking(move || {
             let file = File::create(&filepath_clone)?;
@@ -367,9 +333,10 @@ impl ParquetS3Forwarder {
             let mut writer = ArrowWriter::try_new(file, schema_clone, Some(props))?;
             writer.write(&batch)?;
             writer.close()?;
-            
+
             Result::<(), anyhow::Error>::Ok(())
-        }).await??;
+        })
+        .await??;
 
         debug!(
             "Written {} events to parquet file: {:?}",
@@ -387,7 +354,7 @@ impl ParquetS3Forwarder {
             .and_then(|n| n.to_str())
             .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
 
-        // Generate S3 key with date partitioning
+        // Generate S3 key with date partitioning (unchanged from before)
         let now = Utc::now();
         let s3_key = format!(
             "event_type={}/year={}/month={:02}/day={:02}/{}",
@@ -398,22 +365,13 @@ impl ParquetS3Forwarder {
             filename
         );
 
-        // Read file
-        let body = ByteStream::from_path(filepath).await?;
-
-        // Upload to S3
-        self.s3_client
-            .put_object()
-            .bucket(&self.config.bucket)
-            .key(&s3_key)
-            .body(body)
-            .content_type("application/octet-stream")
-            .send()
-            .await?;
+        // Read file into memory and delegate to S3Sink
+        let body = tokio::fs::read(filepath).await?;
+        self.sink.upload(&s3_key, body).await?;
 
         info!(
             "Uploaded parquet file to S3: s3://{}/{}",
-            self.config.bucket, s3_key
+            self.sink.bucket, s3_key
         );
 
         Ok(())
@@ -436,7 +394,10 @@ mod tests {
         headers.insert("max-size-mb".into(), "1".into());
         headers.insert("flush-interval-secs".into(), "60".into());
         let temp_path = std::env::temp_dir().join("test-buf");
-        headers.insert("buffer-path".into(), temp_path.to_string_lossy().to_string());
+        headers.insert(
+            "buffer-path".into(),
+            temp_path.to_string_lossy().to_string(),
+        );
 
         DestinationConfig {
             name: "parquet".into(),
