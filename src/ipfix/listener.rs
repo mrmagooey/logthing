@@ -35,13 +35,16 @@ pub struct DefaultIpfixHandler;
 #[async_trait::async_trait]
 impl IpfixHandler for DefaultIpfixHandler {
     async fn handle_flows(&self, flows: Vec<FlowRecord>, source: SocketAddr) {
+        // NOTE: ipfix_flows_decoded is already incremented per record inside the
+        // decoder (parse_ipfix_data_set / decode_netflow_v5). Do NOT increment it
+        // here — the handler sees flows AFTER decoding, so adding it here would
+        // double-count every flow.
         info!(
             "[{}] received {} flow(s) (versions: {:?})",
             source,
             flows.len(),
             flows.iter().map(|r| r.protocol_version).collect::<Vec<_>>(),
         );
-        metrics::counter!("ipfix_flows_decoded").increment(flows.len() as u64);
     }
 }
 
