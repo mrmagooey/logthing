@@ -81,11 +81,6 @@ impl SyslogListener {
         Self { config, handler }
     }
 
-    pub fn with_default_handler(config: SyslogListenerConfig) -> Self {
-        let parse_dns_logs = config.parse_dns_logs;
-        Self::new(config, Arc::new(DefaultSyslogHandler::new(parse_dns_logs)))
-    }
-
     /// Start both UDP and TCP listeners
     pub async fn start(&self) -> anyhow::Result<()> {
         let udp_listener = self.start_udp_listener();
@@ -274,7 +269,8 @@ mod tests {
             ..Default::default()
         };
 
-        let listener = SyslogListener::with_default_handler(config);
+        let handler = Arc::new(DefaultSyslogHandler::new(config.parse_dns_logs));
+        let listener = SyslogListener::new(config, handler);
 
         // Start listener in background
         let listener_handle = tokio::spawn(async move {
