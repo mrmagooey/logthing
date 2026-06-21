@@ -321,6 +321,7 @@ services:
     depends_on:
       - ipfix-generator
       - logthing
+      - minio-setup
     networks:
       - e2e
 
