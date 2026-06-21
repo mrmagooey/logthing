@@ -129,7 +129,9 @@ impl IpfixDecoder {
                     "ipfix: template cache full ({MAX_CACHED_TEMPLATES} entries); \
                      new template from exporter {} (domain {}, id {}) dropped. \
                      Possible template flood — check for spoofed UDP sources.",
-                    key.0, key.1, key.2,
+                    key.0,
+                    key.1,
+                    key.2,
                 );
                 self.template_limit_warned = true;
             }
@@ -1172,12 +1174,8 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr};
         let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
         let mut dec = IpfixDecoder::new();
-        let records = decode_ipfix(
-            &mut dec,
-            FIXTURE_IPFIX_TEMPLATE_THEN_DATA,
-            exporter,
-        )
-        .expect("should decode");
+        let records = decode_ipfix(&mut dec, FIXTURE_IPFIX_TEMPLATE_THEN_DATA, exporter)
+            .expect("should decode");
         assert_eq!(records.len(), 1, "one data record");
         let r = &records[0];
         assert_eq!(r.src_addr, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
@@ -1201,8 +1199,8 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr};
         let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
         let mut dec = IpfixDecoder::new();
-        let records = decode_ipfix(&mut dec, FIXTURE_IPFIX_UNKNOWN_IE, exporter)
-            .expect("should decode");
+        let records =
+            decode_ipfix(&mut dec, FIXTURE_IPFIX_UNKNOWN_IE, exporter).expect("should decode");
         assert_eq!(records.len(), 1);
         let r = &records[0];
         assert_eq!(
@@ -1217,12 +1215,8 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr};
         let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4));
         let mut dec = IpfixDecoder::new();
-        let records = decode_ipfix(
-            &mut dec,
-            FIXTURE_IPFIX_MISSING_TEMPLATE,
-            exporter,
-        )
-        .expect("missing template must not error");
+        let records = decode_ipfix(&mut dec, FIXTURE_IPFIX_MISSING_TEMPLATE, exporter)
+            .expect("missing template must not error");
         assert_eq!(
             records.len(),
             0,
@@ -1377,8 +1371,14 @@ mod tests {
         );
         // Verify the two records have distinct addresses
         use std::net::Ipv4Addr as V4;
-        assert_eq!(records[0].src_addr, Some(IpAddr::V4(V4::new(192, 168, 1, 1))));
-        assert_eq!(records[1].src_addr, Some(IpAddr::V4(V4::new(192, 168, 1, 2))));
+        assert_eq!(
+            records[0].src_addr,
+            Some(IpAddr::V4(V4::new(192, 168, 1, 1)))
+        );
+        assert_eq!(
+            records[1].src_addr,
+            Some(IpAddr::V4(V4::new(192, 168, 1, 2)))
+        );
     }
 
     /// NetFlow v5 multi-record: 3 records in one packet → decoder returns 3 flows.
@@ -1424,7 +1424,11 @@ mod tests {
             let obs_domain = i / 65000;
             dec.cache.insert((exporter, obs_domain, tmpl_id), vec![]);
         }
-        assert_eq!(dec.cache.len(), MAX_CACHED_TEMPLATES, "cache should be at capacity");
+        assert_eq!(
+            dec.cache.len(),
+            MAX_CACHED_TEMPLATES,
+            "cache should be at capacity"
+        );
 
         // A new key that is definitely not in the cache should be rejected.
         let new_exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 99, 99));
