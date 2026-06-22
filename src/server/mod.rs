@@ -442,15 +442,14 @@ async fn kerberos_auth_middleware(request: Request, _next: Next) -> Response {
 async fn handle_wef_request(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
     let body_str = String::from_utf8_lossy(&body);
-    let source_host = headers
-        .get("X-Forwarded-For")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| addr.ip().to_string());
+    // Use the real peer IP for source attribution.
+    // X-Forwarded-For is client-spoofable and must not be trusted
+    // for security-relevant identity; only the TCP peer address is authoritative.
+    let source_host = addr.ip().to_string();
 
     match state.parser.parse_message(&body_str, source_host) {
         Ok(WefMessage::Subscription(sub)) => {
@@ -949,6 +948,12 @@ mod tests {
         assert!(summary.len() >= 0);
     }
 
+    /// XFF header is present but ignored; peer IP is used for source attribution.
+    ///
+    /// After M-9: the `X-Forwarded-For` header is silently ignored so that a
+    /// spoofed header cannot influence the source identity recorded for the
+    /// event.  The request should still succeed (200 OK); only the attribution
+    /// logic changed.
     #[tokio::test]
     async fn handle_wef_request_with_x_forwarded_for() {
         let state = default_state().await;
@@ -968,6 +973,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("X-Forwarded-For", "10.0.0.100".parse().unwrap());
 
+        // XFF is ignored; source attribution uses the peer IP (127.0.0.1).
         let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
             .await
             .expect("subscription handled");
