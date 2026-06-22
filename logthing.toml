@@ -47,3 +47,37 @@ enabled = true
 udp_port = 514      # Standard syslog UDP port
 tcp_port = 601      # Standard syslog TCP port (RFC 6587)
 parse_dns = true    # Enable DNS log parsing
+
+# Optional: persist syslog messages to S3 as Parquet files.
+# Remove or comment out this block to disable syslog S3 persistence.
+# [syslog.s3]
+# endpoint             = "http://localhost:9000"   # S3-compatible endpoint
+# bucket               = "syslog-logs"
+# region               = "us-east-1"
+# access_key           = "minioadmin"
+# secret_key           = "minioadmin"
+# prefix               = "syslog"                 # default: "syslog"
+# max_buffer_rows      = 10000                    # flush after this many rows (default 10 000)
+# flush_interval_secs  = 900                      # flush after N seconds (default 900)
+# channel_capacity     = 4096                     # channel depth between listener and writer (default 4096)
+
+# IPFIX / NetFlow flow ingestion listener.
+# Disabled by default — set enabled = true to activate.
+[ipfix]
+enabled      = false
+udp_port     = 4739        # IANA-standard IPFIX port
+bind_address = "0.0.0.0"
+
+# Optional: persist IPFIX/NetFlow flows to S3 as Parquet files.
+# Remove or comment out this block to disable IPFIX S3 persistence.
+# [ipfix.s3]
+# endpoint              = "http://localhost:9000"  # S3-compatible endpoint
+# bucket                = "ipfix-flows"
+# region                = "us-east-1"
+# access_key            = "minioadmin"
+# secret_key            = "minioadmin"
+# prefix                = "ipfix"                 # default: "ipfix"
+# flush_threshold_bytes = 104857600               # flush at 100 MiB (default)
+# flush_interval_secs   = 900                     # flush after N seconds (default 900)
+# channel_capacity      = 256                     # channel depth (default 256)
+# max_buffer_rows       = 100000                  # hard-cap before oldest rows dropped (default 100 000)
