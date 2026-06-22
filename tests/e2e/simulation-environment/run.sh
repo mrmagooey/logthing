@@ -29,6 +29,14 @@ docker compose -f "$COMPOSE_FILE" run --rm s3-verifier
 
 echo ""
 echo "========================================"
+echo "Running Zeek NDJSON E2E Tests"
+echo "========================================"
+docker compose -f "$COMPOSE_FILE" run --rm zeek-generator
+docker compose -f "$COMPOSE_FILE" run --rm zeek-s3-verifier
+echo "Zeek E2E Tests Completed Successfully"
+
+echo ""
+echo "========================================"
 echo "Running Parsing Validator"
 echo "========================================"
 docker compose -f "$COMPOSE_FILE" run --rm parsing-validator
