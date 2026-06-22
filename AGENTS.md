@@ -116,6 +116,7 @@ src/
   admin/        # Admin API and hot-reload
   config/       # Configuration loading
   forwarding/   # Event forwarding to destinations
+  ipfix/        # IPFIX / NetFlow flow ingestion
   middleware/   # HTTP middleware
   models/       # Data structures
   parser/       # Event parsing logic
@@ -124,6 +125,8 @@ src/
   stats/        # Metrics and statistics
   syslog/       # Syslog listener
 ```
+
+Note: `src/lib.rs` is the crate's module root (the crate is both a library and a binary); `src/main.rs` is the binary entry point only.
 
 ## 7. Extending Capabilities
 
