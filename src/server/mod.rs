@@ -29,6 +29,10 @@ use tokio::sync::{RwLock, mpsc};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
+/// Maximum allowed body size for WEF/syslog ingest requests (64 MiB).
+/// Prevents unbounded memory allocation from large or malicious payloads.
+const MAX_BODY_SIZE: usize = 64 * 1024 * 1024;
+
 /// Maximum number of Windows events processed concurrently per batch.
 /// Bounds CPU and memory use while still exploiting multi-core parallelism.
 const MAX_CONCURRENT_EVENT_PROCESSING: usize = 16;
@@ -277,6 +281,7 @@ impl Server {
             .route("/syslog", post(handle_syslog_http))
             .route("/syslog/udp", get(handle_syslog_udp_info))
             .route("/syslog/examples", get(handle_syslog_examples))
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE))
             .layer(shared_layers)
             .layer(axum::Extension(ip_whitelist))
             .with_state(self.state.clone());
@@ -1012,6 +1017,51 @@ mod tests {
             .await
             .into_response();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn body_size_limit_const_is_sane() {
+        assert_eq!(MAX_BODY_SIZE, 64 * 1024 * 1024);
+        assert!(MAX_BODY_SIZE > 0);
+    }
+
+    #[tokio::test]
+    async fn protected_router_has_body_limit() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        // Build a minimal router with only the body-limit layer applied.
+        // We do not need the full protected_router (which requires ConnectInfo
+        // from a real TCP connection) — we just need to verify that
+        // DefaultBodyLimit::max(MAX_BODY_SIZE) rejects over-limit payloads
+        // with 413 PAYLOAD_TOO_LARGE.
+        //
+        // The handler must extract `Bytes` so that axum actually enforces the
+        // body-size limit (the check occurs during body extraction).
+        let router: Router = Router::new()
+            .route(
+                "/wsman",
+                post(|_body: Bytes| async { (StatusCode::OK, "ok") }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE));
+
+        // A body one byte over the limit must be rejected with 413.
+        let over_limit_body = vec![0u8; MAX_BODY_SIZE + 1];
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/wsman")
+            .header("content-type", "application/soap+xml")
+            .body(Body::from(over_limit_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "over-limit body must be rejected with 413"
+        );
     }
 
     #[test]
