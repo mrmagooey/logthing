@@ -523,7 +523,7 @@ impl IpfixS3Handler {
         capacity: usize,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Vec<FlowRecord>>(capacity);
-        let flush_check = Duration::from_secs(60);
+        let flush_check = crate::forwarding::s3_sink::flush_check_interval(config.flush_interval);
         tokio::spawn(async move {
             let mut writer = IpfixS3Writer::new(config, sink);
             let mut interval = tokio::time::interval(flush_check);
