@@ -314,7 +314,10 @@ impl ZeekS3Writer {
         let batches: Vec<RecordBatch> = stream.buffer.iter().map(|b| b.batch.clone()).collect();
         let row_count = stream.buffer_row_count;
         let schema = stream.schema.clone();
-        let bytes = encode_batches(&batches, schema)?;
+        // Move the CPU-bound Parquet encode off the async runtime thread.
+        let bytes = tokio::task::spawn_blocking(move || encode_batches(&batches, schema))
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
         let key = build_zeek_s3_key(&self.config.key_prefix, log_path, Utc::now());
 
         match self.sink.upload(&key, bytes).await {
