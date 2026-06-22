@@ -107,7 +107,7 @@ impl WefParser {
         let mut buf = Vec::new();
         let mut event_start_pos: Option<usize> = None;
         let mut in_event = false;
-        let mut depth = 0;
+        let mut depth: u32 = 0;
 
         loop {
             let pos = reader.buffer_position();
@@ -145,7 +145,7 @@ impl WefParser {
                         }
                         depth = 0;
                     } else if in_event {
-                        depth -= 1;
+                        depth = depth.saturating_sub(1);
                     }
                 }
                 #[allow(clippy::collapsible_match)]
@@ -931,6 +931,29 @@ mod tests {
             Ok(_) => {}
             Err(_) => {}
         }
+    }
+
+    #[test]
+    fn parse_events_mismatched_depth_does_not_panic() {
+        let parser = WefParser::new();
+        // Craft XML where closing tags exceed opening tags inside an Event
+        // (mismatched nesting). Must not panic in debug mode.
+        let xml = r#"
+        <Envelope>
+          <Body>
+            <Events>
+              <Event>
+                <System>
+                  <EventID>42</EventID>
+                </System>
+                </ExtraClose>
+              </Event>
+            </Events>
+          </Body>
+        </Envelope>
+        "#;
+        // Any result is acceptable — just must not panic
+        let _ = parser.parse_message(xml, "host".into());
     }
 
     #[test]
