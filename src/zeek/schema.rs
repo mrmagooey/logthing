@@ -1429,8 +1429,8 @@ mod tests {
     #[test]
     fn conn_parquet_round_trip() {
         use bytes::Bytes;
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         use parquet::arrow::ArrowWriter;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         use parquet::basic::{Compression, ZstdLevel};
         use parquet::file::properties::WriterProperties;
 
@@ -1512,8 +1512,8 @@ mod tests {
     #[test]
     fn envelope_parquet_round_trip() {
         use bytes::Bytes;
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         use parquet::arrow::ArrowWriter;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
         let json = serde_json::json!({
             "_path": "weird",
