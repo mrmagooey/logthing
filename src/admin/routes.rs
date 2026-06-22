@@ -10,7 +10,9 @@ use tokio::{net::TcpListener, sync::RwLock};
 use tracing::{error, info};
 
 use crate::admin::auth::{ensure_authorized, generate_csrf_token};
-use crate::admin::config_api::{PartialConfigUpdate, persist_config, redacted_config};
+use crate::admin::config_api::{
+    PartialConfigUpdate, persist_config, redacted_config, validate_config_invariants,
+};
 use crate::admin::middleware::security_middleware;
 use crate::admin::state::{AdminServerConfig, AdminState, AuditLogger, load_admin_config};
 use crate::config::Config;
@@ -194,17 +196,23 @@ async fn update_config(
     let client_ip = addr.ip().to_string();
     let username = ensure_authorized(&state, auth, &client_ip).await?;
 
-    // Update configuration
-    let updated_config = {
-        let mut cfg = state.config.write().await;
-        *cfg = new_config;
-        cfg.clone()
-    };
+    // H-7: validate before touching shared state.
+    if let Err(msg) = validate_config_invariants(&new_config) {
+        state
+            .audit_logger
+            .log(
+                "CONFIG_UPDATE_REJECTED",
+                &username,
+                &client_ip,
+                Some(&format!("Validation error: {msg}")),
+            )
+            .await;
+        return Err((axum::http::StatusCode::BAD_REQUEST, msg).into_response());
+    }
 
-    // Persist configuration
-    if let Err(err) = persist_config(&updated_config).await {
+    // H-7: persist first, then swap (atomic: on-disk and in-memory stay consistent).
+    if let Err(err) = persist_config(&new_config).await {
         error!("Failed to persist admin config: {}", err);
-
         state
             .audit_logger
             .log(
@@ -214,13 +222,19 @@ async fn update_config(
                 Some(&format!("Persistence error: {}", err)),
             )
             .await;
-
         return Err((
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "Persist failed",
         )
             .into_response());
     }
+
+    // Persist succeeded — now update in-memory state.
+    let updated_config = {
+        let mut cfg = state.config.write().await;
+        *cfg = new_config;
+        cfg.clone()
+    };
 
     // Log the change
     state
@@ -230,7 +244,7 @@ async fn update_config(
 
     info!("Configuration updated via admin API by {}", username);
 
-    Ok(Json(updated_config))
+    Ok(Json(redacted_config(&updated_config)))
 }
 
 /// Patch configuration endpoint (partial updates)

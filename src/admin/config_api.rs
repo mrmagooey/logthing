@@ -50,6 +50,39 @@ pub fn redacted_config(cfg: &Config) -> Config {
     out
 }
 
+/// Structural validation of a candidate `Config` that must hold before the
+/// config is accepted by any write path (update / import / reload).
+///
+/// Returns `Ok(())` if the config is acceptable, or `Err(message)` describing
+/// the first/all invariant violations found.
+///
+/// Invariants checked:
+/// - `bind_address.port() != 0` — port 0 is a hard error (unknown OS port).
+/// - If `tls.enabled`, both `cert_file` and `key_file` must be present —
+///   without them `run_tls()` would `.expect()` and panic at startup.
+pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+
+    if cfg.bind_address.port() == 0 {
+        errors.push("bind_address port cannot be 0".to_string());
+    }
+
+    if cfg.tls.enabled {
+        if cfg.tls.cert_file.is_none() {
+            errors.push("tls.enabled is true but tls.cert_file is not set".to_string());
+        }
+        if cfg.tls.key_file.is_none() {
+            errors.push("tls.enabled is true but tls.key_file is not set".to_string());
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 /// Validation result for configuration
 #[derive(Serialize)]
 pub struct ValidationResult {
@@ -312,29 +345,14 @@ pub async fn import_config(
         return Err((StatusCode::BAD_REQUEST, "Invalid UTF-8 content").into_response());
     };
 
-    // Validate before applying
-    let mut errors = Vec::new();
-    if imported_config.bind_address.port() == 0 {
-        errors.push("Bind address port cannot be 0".to_string());
+    // H-7: validate before touching shared state.
+    if let Err(msg) = validate_config_invariants(&imported_config) {
+        return Err((StatusCode::BAD_REQUEST, format!("Validation failed: {msg}")).into_response());
     }
 
-    if !errors.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("Validation failed: {}", errors.join(", ")),
-        )
-            .into_response());
-    }
-
-    // Apply the imported config
-    let updated_config = {
-        let mut cfg = state.config.write().await;
-        *cfg = imported_config;
-        cfg.clone()
-    };
-
-    // Persist to file
-    if let Err(err) = persist_config(&updated_config).await {
+    // H-7: persist first; only swap in-memory state on success so on-disk and
+    // running configs never diverge.
+    if let Err(err) = persist_config(&imported_config).await {
         tracing::error!("Failed to persist imported config: {}", err);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -343,6 +361,13 @@ pub async fn import_config(
             .into_response());
     }
 
+    // Persist succeeded — now update in-memory state.
+    let updated_config = {
+        let mut cfg = state.config.write().await;
+        *cfg = imported_config;
+        cfg.clone()
+    };
+
     state
         .audit_logger
         .log("CONFIG_IMPORTED", &username, &client_ip, None)
@@ -350,7 +375,7 @@ pub async fn import_config(
 
     tracing::info!("Configuration imported by {} from {}", username, client_ip);
 
-    Ok(Json(updated_config))
+    Ok(Json(redacted_config(&updated_config)))
 }
 
 /// Reload configuration endpoint (re-read from disk)
@@ -375,7 +400,17 @@ pub async fn reload_config(
         }
     };
 
-    // Apply the reloaded config
+    // H-7: validate the on-disk config before replacing the running one.
+    if let Err(msg) = validate_config_invariants(&reloaded_config) {
+        tracing::error!("Reloaded config failed validation: {}", msg);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Reloaded configuration is invalid: {msg}"),
+        )
+            .into_response());
+    }
+
+    // Validation passed — swap in-memory state.
     let updated_config = {
         let mut cfg = state.config.write().await;
         *cfg = reloaded_config;
@@ -389,7 +424,7 @@ pub async fn reload_config(
 
     tracing::info!("Configuration reloaded by {} from {}", username, client_ip);
 
-    Ok(Json(updated_config))
+    Ok(Json(redacted_config(&updated_config)))
 }
 
 /// Partial config update request
@@ -521,5 +556,115 @@ mod tests {
             "secret_key must not appear in TOML export: {toml_str}"
         );
         assert!(toml_str.contains(REDACTED));
+    }
+
+    // H-7: validate_config_invariants rejects port 0.
+    #[test]
+    fn validate_config_invariants_rejects_port_zero() {
+        let mut cfg = Config::default();
+        cfg.bind_address = "127.0.0.1:0".parse().unwrap();
+        cfg.tls.enabled = false;
+        assert!(
+            validate_config_invariants(&cfg).is_err(),
+            "port 0 must be rejected"
+        );
+        let msg = validate_config_invariants(&cfg).unwrap_err();
+        assert!(msg.contains("port cannot be 0"), "error: {msg}");
+    }
+
+    // H-7: validate_config_invariants rejects TLS enabled without cert/key.
+    #[test]
+    fn validate_config_invariants_rejects_tls_without_cert() {
+        let mut cfg = Config::default();
+        cfg.tls.enabled = true;
+        cfg.tls.cert_file = None;
+        cfg.tls.key_file = None;
+        let result = validate_config_invariants(&cfg);
+        assert!(result.is_err(), "TLS without cert/key must be rejected");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("cert_file") || msg.contains("key_file"),
+            "error: {msg}"
+        );
+    }
+
+    // H-7: validate_config_invariants accepts a valid config.
+    #[test]
+    fn validate_config_invariants_accepts_valid_config() {
+        let mut cfg = Config::default();
+        cfg.tls.enabled = false; // TLS off → no cert required
+        assert!(
+            validate_config_invariants(&cfg).is_ok(),
+            "valid config must be accepted"
+        );
+    }
+
+    // H-7: validate_config_invariants accepts TLS enabled with cert+key present.
+    #[test]
+    fn validate_config_invariants_accepts_tls_with_cert_and_key() {
+        let mut cfg = Config::default();
+        cfg.tls.enabled = true;
+        cfg.tls.cert_file = Some(std::path::PathBuf::from("/etc/certs/server.crt"));
+        cfg.tls.key_file = Some(std::path::PathBuf::from("/etc/certs/server.key"));
+        assert!(
+            validate_config_invariants(&cfg).is_ok(),
+            "TLS with cert+key must be accepted"
+        );
+    }
+
+    // H-7: import_config rejects a config with port 0 (running config unchanged).
+    #[tokio::test]
+    async fn import_config_rejects_port_zero_and_leaves_running_config_unchanged() {
+        let state = make_state_with_s3_secrets().await;
+
+        use axum_extra::extract::TypedHeader;
+        use headers::Authorization;
+        let auth = TypedHeader(Authorization::basic("admin", "admin"));
+        let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        let invalid_toml = br#"bind_address = "127.0.0.1:0""#;
+
+        let result = import_config(
+            axum::extract::State(state.clone()),
+            axum::extract::ConnectInfo(addr),
+            Some(auth),
+            axum::body::Bytes::from_static(invalid_toml),
+        )
+        .await;
+
+        // Must be rejected.
+        assert!(result.is_err(), "port-0 config must be rejected");
+
+        // Running config must be unchanged.
+        let running_port = state.config.read().await.bind_address.port();
+        assert_ne!(running_port, 0, "running config must not have been swapped");
+    }
+
+    // H-7: import_config rejects TLS-without-cert config.
+    #[tokio::test]
+    async fn import_config_rejects_tls_without_cert() {
+        let state = make_state_with_s3_secrets().await;
+
+        use axum_extra::extract::TypedHeader;
+        use headers::Authorization;
+        let auth = TypedHeader(Authorization::basic("admin", "admin"));
+        let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        let invalid_toml = br#"
+bind_address = "0.0.0.0:5985"
+[tls]
+enabled = true
+"#;
+
+        let result = import_config(
+            axum::extract::State(state),
+            axum::extract::ConnectInfo(addr),
+            Some(auth),
+            axum::body::Bytes::from_static(invalid_toml),
+        )
+        .await;
+
+        // Must be rejected.
+        assert!(result.is_err(), "TLS-without-cert config must be rejected");
     }
 }
