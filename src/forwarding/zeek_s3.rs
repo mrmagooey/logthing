@@ -125,6 +125,31 @@ impl StreamBuffer {
 // S3 key builder
 // ---------------------------------------------------------------------------
 
+/// Sanitise an attacker-supplied `_path` value so it is safe to embed in an S3 key.
+/// - Lowercases the input
+/// - Keeps `[a-z0-9_]`, replaces anything else with `_`
+/// - Truncates to 64 chars
+/// - Empty result → `"unknown"`
+pub(crate) fn sanitize_log_path(raw: &str) -> String {
+    let s: String = raw
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    if s.is_empty() {
+        "unknown".to_string()
+    } else {
+        s
+    }
+}
+
 pub(crate) fn build_zeek_s3_key(
     prefix: &str,
     log_path: &str,
@@ -199,13 +224,15 @@ impl ZeekS3Writer {
 
     /// Push one ZeekRecord: map to RecordBatch, append to per-stream buffer, flush if needed.
     pub async fn push_record(&mut self, record: &ZeekRecord) -> anyhow::Result<()> {
+        let raw_path = sanitize_log_path(&record.log_path);
+
         // Determine the effective log_path (may be capped to "unknown")
-        let log_path = if self.streams.contains_key(&record.log_path) {
+        let log_path = if self.streams.contains_key(&raw_path) {
             // Existing stream — always allow
-            record.log_path.clone()
+            raw_path.clone()
         } else if self.streams.len() < self.streams_cap {
             // New stream — still under cap
-            record.log_path.clone()
+            raw_path.clone()
         } else {
             // Cap exceeded — overflow to "unknown" envelope stream
             self.zeek_streams_capped += 1;
@@ -633,6 +660,26 @@ mod tests {
             writer.zeek_streams_capped > 0,
             "zeek_streams_capped must be > 0 when cap exceeded"
         );
+    }
+
+    // -- log_path sanitizer --
+
+    #[test]
+    fn log_path_sanitizer_handles_traversal() {
+        // "../weird path" → ".."→"__", "/"→"_", "weird"→"weird", " "→"_", "path"→"path"
+        assert_eq!(sanitize_log_path("../weird path"), "___weird_path");
+        assert_eq!(sanitize_log_path("conn"), "conn");
+        // "../foo" → ".."→"__", "/"→"_", "foo"→"foo"
+        assert_eq!(sanitize_log_path("../foo"), "___foo");
+        // No dots or slashes in output
+        let out = sanitize_log_path("../../etc/passwd");
+        assert!(!out.contains('/'), "sanitized path must not contain /");
+        assert!(!out.contains('.'), "sanitized path must not contain .");
+        // Empty input → "unknown"
+        assert_eq!(sanitize_log_path(""), "unknown");
+        // Cap at 64
+        let long_input = "a".repeat(100);
+        assert_eq!(sanitize_log_path(&long_input).len(), 64);
     }
 
     // -- Integration test (gated on env var) --
