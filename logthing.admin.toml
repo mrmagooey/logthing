@@ -36,3 +36,8 @@ parse_dns = true
 enabled = false
 udp_port = 4739
 bind_address = "0.0.0.0"
+
+[zeek]
+enabled = false
+tcp_port = 47760
+bind_address = "0.0.0.0"
