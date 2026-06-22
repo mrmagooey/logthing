@@ -263,7 +263,10 @@ impl SyslogS3Writer {
         // VecDeque is not contiguous, so collect clones for the encoder.
         // RecordBatch clones are cheap (Arc-backed column arrays).
         let batches: Vec<RecordBatch> = self.buffer.iter().cloned().collect();
-        let bytes = encode_batches_to_parquet(&batches)?;
+        // Move the CPU-bound Parquet encode off the async runtime thread.
+        let bytes = tokio::task::spawn_blocking(move || encode_batches_to_parquet(&batches))
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
         let key = self.build_key();
         match self.sink.upload(&key, bytes).await {
             Ok(()) => {
