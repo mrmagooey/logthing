@@ -362,18 +362,31 @@ pub struct ZeekS3Handler {
 }
 
 impl ZeekS3Handler {
-    pub fn start(config: ZeekS3WriterConfig, sink: Arc<S3Sink>) -> Self {
+    /// Construct a handler with the default channel capacity.
+    ///
+    /// Returns `(handler, writer_task_handle)`. The caller should retain the `JoinHandle` and
+    /// await it (with a timeout) during graceful shutdown, after all `Arc<ZeekS3Handler>`
+    /// references have been dropped so the channel closes and the final flush fires.
+    pub fn start(
+        config: ZeekS3WriterConfig,
+        sink: Arc<S3Sink>,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         Self::start_with_capacity(config, sink, ZEEK_S3_CHANNEL_CAPACITY)
     }
 
+    /// Construct a handler with a custom channel `capacity`.
+    ///
+    /// Returns `(handler, writer_task_handle)`. The caller should hold the `JoinHandle` and await
+    /// it (with a timeout) during shutdown, after dropping all `Arc<dyn ZeekHandler>` references
+    /// so that the channel closes and the writer flushes its buffer.
     pub fn start_with_capacity(
         config: ZeekS3WriterConfig,
         sink: Arc<S3Sink>,
         capacity: usize,
-    ) -> Self {
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let (tx, mut rx) = mpsc::channel::<ZeekRecord>(capacity);
         let flush_check = flush_check_interval(config.flush_interval);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut writer = ZeekS3Writer::new(config, sink);
             let mut interval = tokio::time::interval(flush_check);
             loop {
@@ -401,7 +414,7 @@ impl ZeekS3Handler {
                 }
             }
         });
-        Self { sender: tx }
+        (Self { sender: tx }, handle)
     }
 }
 
@@ -592,7 +605,7 @@ mod tests {
             key_prefix: "zeek".to_string(),
             max_buffer_rows: 1,
         };
-        let handler = ZeekS3Handler::start_with_capacity(config, sink, 1);
+        let (handler, _writer_handle) = ZeekS3Handler::start_with_capacity(config, sink, 1);
         tokio::task::yield_now().await;
 
         let src: SocketAddr = "127.0.0.1:47760".parse().unwrap();
@@ -712,7 +725,7 @@ mod tests {
             key_prefix: "zeek".to_string(),
             max_buffer_rows: 100_000,
         };
-        let handler = ZeekS3Handler::start(config, sink);
+        let (handler, _writer_handle) = ZeekS3Handler::start(config, sink);
         let src: std::net::SocketAddr = "127.0.0.1:47760".parse().unwrap();
 
         for i in 0..5usize {

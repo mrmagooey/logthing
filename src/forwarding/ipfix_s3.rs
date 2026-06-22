@@ -506,25 +506,31 @@ pub struct IpfixS3Handler {
 
 impl IpfixS3Handler {
     /// Construct a handler and start the writer background task with the default channel capacity.
-    /// Production callers should prefer `start_with_capacity` to honour the configured value.
+    ///
+    /// Returns `(handler, writer_task_handle)`. The caller should retain the `JoinHandle` and
+    /// await it (with a timeout) during graceful shutdown, after all `Arc<IpfixS3Handler>`
+    /// references have been dropped so the channel closes and the final flush fires.
     #[allow(dead_code)]
-    pub fn start(config: IpfixS3WriterConfig, sink: Arc<S3Sink>) -> Self {
+    pub fn start(
+        config: IpfixS3WriterConfig,
+        sink: Arc<S3Sink>,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         Self::start_with_capacity(config, sink, IPFIX_S3_CHANNEL_CAPACITY)
     }
 
     /// Construct a handler and start the writer background task with a custom channel `capacity`.
     ///
-    /// Intended for tests that need a small channel to exercise the overflow/drop path without
-    /// relying on the production `IPFIX_S3_CHANNEL_CAPACITY` constant, and for production use
-    /// when the configured `channel_capacity` should override the default.
+    /// Returns `(handler, writer_task_handle)`. The caller should hold the `JoinHandle` and await
+    /// it (with a timeout) during shutdown, after dropping all `Arc<dyn IpfixHandler>` references
+    /// so that the channel closes and the writer flushes its buffer.
     pub fn start_with_capacity(
         config: IpfixS3WriterConfig,
         sink: Arc<S3Sink>,
         capacity: usize,
-    ) -> Self {
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let (tx, mut rx) = mpsc::channel::<Vec<FlowRecord>>(capacity);
         let flush_check = crate::forwarding::s3_sink::flush_check_interval(config.flush_interval);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut writer = IpfixS3Writer::new(config, sink);
             let mut interval = tokio::time::interval(flush_check);
             loop {
@@ -553,7 +559,7 @@ impl IpfixS3Handler {
                 }
             }
         });
-        Self { sender: tx }
+        (Self { sender: tx }, handle)
     }
 }
 
@@ -910,7 +916,7 @@ mod tests {
             key_prefix: "ipfix".to_string(),
             max_buffer_rows: 1,
         };
-        let handler = IpfixS3Handler::start_with_capacity(config, sink, 1);
+        let (handler, _writer_handle) = IpfixS3Handler::start_with_capacity(config, sink, 1);
 
         // Yield so the background task starts and blocks inside the S3 upload.
         tokio::task::yield_now().await;
@@ -978,7 +984,7 @@ mod tests {
                 key_prefix: "ipfix".to_string(),
                 max_buffer_rows: 1,
             };
-            let handler = IpfixS3Handler::start_with_capacity(config, sink, 1);
+            let (handler, _writer_handle) = IpfixS3Handler::start_with_capacity(config, sink, 1);
             tokio::task::yield_now().await;
 
             // Send 30 batches — far more than capacity (1) + the one in-flight with S3.
@@ -1023,7 +1029,8 @@ mod tests {
                 key_prefix: "ipfix".to_string(),
                 max_buffer_rows: 100_000,
             };
-            let handler = IpfixS3Handler::start_with_capacity(config, sink, 10_000);
+            let (handler, _writer_handle) =
+                IpfixS3Handler::start_with_capacity(config, sink, 10_000);
             tokio::task::yield_now().await;
 
             for i in 0..30usize {
@@ -1093,7 +1100,7 @@ mod tests {
             key_prefix: s3_cfg.prefix.clone(),
             max_buffer_rows: s3_cfg.max_buffer_rows,
         };
-        let handler = IpfixS3Handler::start(writer_config, sink);
+        let (handler, _writer_handle) = IpfixS3Handler::start(writer_config, sink);
         let src: std::net::SocketAddr = "127.0.0.1:4739".parse().unwrap();
 
         let flows: Vec<FlowRecord> = (0..10)
