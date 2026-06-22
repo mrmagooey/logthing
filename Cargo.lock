@@ -2416,7 +2416,7 @@ dependencies = [
  "serde_yml",
  "subtle",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-test",

@@ -48,7 +48,7 @@ metrics = "0.22"
 metrics-exporter-prometheus = "0.13"
 
 # Error handling
-thiserror = "1.0"
+thiserror = "2.0"
 anyhow = "1.0"
 
 # IP/network utilities
