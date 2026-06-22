@@ -232,11 +232,36 @@ impl WefParser {
                     }
                 }
                 Ok(XmlEvent::Text(e)) => {
-                    let text = e.unescape().unwrap_or_default();
+                    let text = match e.unescape() {
+                        Ok(t) => t,
+                        Err(err) => {
+                            debug!(
+                                "Failed to unescape XML text in tag <{}>: {}",
+                                current_tag, err
+                            );
+                            std::borrow::Cow::Borrowed("")
+                        }
+                    };
                     match current_tag.as_str() {
                         "Provider" => provider = text.to_string(),
-                        "EventID" => event_id = text.parse().unwrap_or(0),
-                        "Level" => level = text.parse().unwrap_or(0),
+                        "EventID" => {
+                            event_id = text.parse().unwrap_or_else(|_| {
+                                debug!(
+                                    "Failed to parse EventID {:?} as u32, defaulting to 0",
+                                    text.as_ref()
+                                );
+                                0
+                            });
+                        }
+                        "Level" => {
+                            level = text.parse().unwrap_or_else(|_| {
+                                debug!(
+                                    "Failed to parse Level {:?} as u8, defaulting to 0",
+                                    text.as_ref()
+                                );
+                                0
+                            });
+                        }
                         "TimeCreated" => {
                             if let Ok(dt) = DateTime::parse_from_rfc3339(&text) {
                                 time_created = dt.with_timezone(&Utc);
