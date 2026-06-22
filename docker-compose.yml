@@ -10,6 +10,7 @@ services:
       - "514:514/udp"     # Syslog (UDP)
       - "601:601/tcp"     # Syslog (TCP)
       - "4739:4739/udp"   # IPFIX
+      - "47760:47760/tcp" # Zeek NDJSON
     volumes:
       - ./logthing.toml:/etc/logthing/config.toml:ro
       # Uncomment to mount TLS certificates:

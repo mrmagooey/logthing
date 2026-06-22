@@ -7,6 +7,7 @@ A high-performance TCP server written in Rust for receiving Windows Event Logs f
 - **WEF Protocol Support**: Implements Windows Event Forwarding (WS-Management/WinRM) protocol
 - **Syslog Support**: UDP/TCP syslog listener with RFC 3164 and RFC 5424 parsing
 - **IPFIX / NetFlow Support**: UDP flow ingestion supporting IPFIX v10, NetFlow v9, and NetFlow v5; S3 Parquet persistence
+- **Zeek NDJSON Support**: TCP NDJSON listener for Zeek network security monitor logs; per-stream typed Parquet schemas with S3 persistence
 - **DNS Log Parsing**: Automatic parsing of BIND, Unbound, and PowerDNS query logs
 - **Generic Event Parser**: YAML-configurable parsing for specific Windows event codes
 - **Parquet S3 Storage**: Aggregate events into Parquet files and store in S3-compatible storage
@@ -210,6 +211,42 @@ the DNS-log extraction (`parse_dns`).  If you need both S3 persistence and DNS-l
 parsing, omit `[syslog.s3]` and forward syslog messages to an external pipeline.
 Combining both in a single handler is a planned future feature.
 
+### Zeek Ingestion
+
+Receive Zeek (network security monitor) logs forwarded as newline-delimited JSON (NDJSON) over TCP (port 47760 by default):
+
+```toml
+[zeek]
+enabled      = true
+tcp_port     = 47760     # default Zeek NDJSON listener port
+bind_address = "0.0.0.0"
+```
+
+**Stream identification**:
+Each incoming JSON record is identified by its `_path` field (e.g. `"conn"`, `"dns"`). If `_path` is absent or is not a string, the record is assigned the stream name `"unknown"` and the `zeek_missing_path` counter is incremented.
+
+**Typed schemas — 6 curated streams**:
+
+| Stream | Arrow columns (promoted) | `_extra` |
+|--------|--------------------------|----------|
+| `conn` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `proto`, `service`, `duration`, `orig_bytes`, `resp_bytes`, `conn_state`, `history`, `orig_pkts`, `resp_pkts` | yes |
+| `dns` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `proto`, `trans_id`, `query`, `qtype_name`, `qclass_name`, `rcode_name`, `answers` | yes |
+| `http` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `method`, `host`, `uri`, `status_code`, `user_agent`, `request_body_len`, `response_body_len` | yes |
+| `ssl` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `version`, `cipher`, `curve`, `server_name`, `validation_status` | yes |
+| `files` | `ts`, `fuid`, `tx_hosts`, `rx_hosts`, `source`, `mime_type`, `filename`, `total_bytes` | yes |
+| `notice` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `note`, `msg`, `sub`, `actions` | yes |
+
+Note: Zeek JSON uses dot-notation for connection-id fields (`id.orig_h`, etc.); the Arrow column names use underscores (`id_orig_h`). All typed schemas include a non-null `_extra` JSON column that captures every field not listed above, as well as any field whose runtime type does not match the expected Arrow type (best-effort, type-mismatch-safe mapping).
+
+**Envelope fallback**:
+Records with a `_path` value that does not match one of the six curated stream names (including `"unknown"`) are routed to a generic envelope schema with columns: `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `log_path`, `ingest_time`, `payload`. The full JSON object is stored verbatim in `payload`.
+
+**Robustness**:
+- Lines longer than 16 MiB are rejected and the connection is closed; the `zeek_oversized_lines` counter is incremented.
+- Non-UTF-8 and invalid JSON lines are skipped (per-line, not per-connection); `zeek_parse_errors` is incremented.
+- The per-process stream map is bounded at 256 distinct `_path` values (`MAX_ZEEK_STREAMS`). Records whose sanitised path would create a 257th stream are routed to the `"unknown"` envelope stream and counted by `zeek_streams_capped`.
+- `_path` values are sanitised before use in S3 keys (lowercased, `[a-z0-9_]` only, truncated to 64 characters; empty result → `"unknown"`).
+
 ### IPFIX S3 Persistence
 
 Flow records can be persisted directly to S3-compatible storage as compressed Parquet files:
@@ -259,6 +296,46 @@ The `[ipfix.s3]` block is optional; when absent, flows are handled by the defaul
 Objects are stored at `ipfix/year=YYYY/month=MM/day=DD/<uuid>.parquet`, distinct from syslog's `syslog/` prefix. Files are ZSTD-compressed.
 
 **Memory safety**: when S3 is unavailable and the buffer exceeds `max_buffer_rows * 4` rows, the oldest batches are dropped and the `ipfix_s3_buffer_dropped` counter is incremented.
+
+### Zeek S3 Persistence
+
+Zeek log records can be persisted to S3-compatible storage as per-stream ZSTD-compressed Parquet files:
+
+```toml
+[zeek]
+enabled = true
+
+[zeek.s3]
+endpoint              = "http://localhost:9000"
+bucket                = "zeek-logs"
+region                = "us-east-1"
+access_key            = "minioadmin"
+secret_key            = "minioadmin"
+prefix                = "zeek"           # slash-free; builder inserts /  (default: "zeek")
+flush_threshold_bytes = 104857600        # flush when buffer reaches 100 MiB (default)
+flush_interval_secs   = 900             # flush every N seconds regardless of size (default 900)
+channel_capacity      = 256             # bounded channel between listener and writer (default 256)
+max_buffer_rows       = 100000          # hard-cap rows before oldest are dropped (default 100 000)
+```
+
+The `[zeek.s3]` block is optional; when absent, records are handled by the default handler (logged only) and no S3 writes occur.
+
+**S3 key layout** — one prefix level per stream:
+
+```
+{prefix}/<log_path>/year=YYYY/month=MM/day=DD/<uuid>.parquet
+```
+
+Examples:
+```
+zeek/conn/year=2024/month=03/day=15/f3a9….parquet
+zeek/dns/year=2024/month=03/day=15/8b2c….parquet
+zeek/unknown/year=2024/month=03/day=15/1e7f….parquet
+```
+
+Each stream produces a separate Parquet file series using its own typed schema (or the envelope schema for unrecognised stream names).
+
+**Memory safety**: when S3 is unavailable and a stream's buffer exceeds `max_buffer_rows * 4` rows, the oldest batches are dropped and the `zeek_s3_buffer_dropped` counter is incremented.
 
 ### Parquet S3 Forwarder
 
