@@ -37,7 +37,7 @@ quick-xml = { version = "0.31", features = ["serialize"] }
 
 # Configuration
 config = "0.14"
-serde_yaml = "0.9"
+serde_yml = "0.0.12"
 
 # Logging and tracing
 tracing = "0.1"
