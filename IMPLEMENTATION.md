@@ -134,7 +134,16 @@ Async UDP listener and stateful decoder for network flow telemetry:
 - **`ipfix/decoder.rs`**: `IpfixDecoder` with stateful template cache keyed on `(exporter IP, observation domain ID, template ID)`. `decode_datagram()` dispatches on the version field (5/9/10), decodes curated IANA IEs into named `FlowRecord` fields, and hex-encodes unknown/enterprise IEs into the `extra` JSON column.
 - **`ipfix/listener.rs`**: `IpfixListener` binds a UDP socket (default port 4739) and calls `decode_datagram()` per packet. Decoded flow batches are passed to an `IpfixHandler` implementation; decode errors are counted and the loop continues without crashing.
 
-### 8. S3 Persistence (`src/forwarding/s3_sink.rs`, `syslog_s3.rs`, `ipfix_s3.rs`)
+### 8. Zeek NDJSON Ingestion (`src/zeek/`)
+
+TCP listener and per-stream schema registry for Zeek network security monitor logs:
+
+- **`zeek/mod.rs`**: `ZeekRecord` — the decoded record type; carries `log_path` (from `_path`), the full `fields` JSON value, and `received_at` wall-clock time.
+- **`zeek/listener.rs`**: `ZeekListener` binds a TCP socket (default port 47760) and processes each connection as a BufReader NDJSON stream. Lines are bounded at `ZEEK_MAX_LINE_BYTES` (16 MiB); over-length lines close the connection. Decoded records are dispatched to a `ZeekHandler` implementation.
+- **`zeek/schema.rs`**: Static schema registry for six curated typed streams (`conn`, `dns`, `http`, `ssl`, `files`, `notice`), each with promoted typed Arrow columns plus a non-null `_extra` JSON column for unrecognised or type-mismatched fields. Unknown stream names fall back to a generic envelope schema (`ts`, `uid`, connection-id fields, `log_path`, `ingest_time`, `payload`). `MAX_ZEEK_STREAMS = 256` limits the number of concurrent stream buffers.
+- **`forwarding/zeek_s3.rs`**: `ZeekS3Writer` + `ZeekS3Handler` — per-stream `VecDeque<RecordBatch>` buffers flushed to S3 as ZSTD-compressed Parquet. S3 key pattern: `{prefix}/{log_path}/year={Y}/month={MM}/day={DD}/{uuid}.parquet`. Handler forwards records over a bounded `mpsc` channel; overflow increments `zeek_s3_dropped`. Stream map bounded at `MAX_ZEEK_STREAMS`; overflow paths routed to `"unknown"` and counted by `zeek_streams_capped`. `_path` values sanitised before use as key segments (lowercase, `[a-z0-9_]`, max 64 chars).
+
+### 9. S3 Persistence (`src/forwarding/s3_sink.rs`, `syslog_s3.rs`, `ipfix_s3.rs`, `zeek_s3.rs`)
 
 Generalized Arrow/Parquet S3 persistence shared between the syslog and IPFIX subsystems:
 
@@ -142,7 +151,7 @@ Generalized Arrow/Parquet S3 persistence shared between the syslog and IPFIX sub
 - **`syslog_s3.rs`**: `SyslogS3Writer` + `SyslogS3Handler` — syslog messages buffered as `RecordBatch`es and flushed to S3 as ZSTD-compressed Parquet. Handler implements `SyslogHandler` and forwards messages through a bounded channel.
 - **`ipfix_s3.rs`**: `IpfixS3Writer` + `IpfixS3Handler` — flow records buffered with a fixed 18-column Arrow schema and flushed to S3 as ZSTD-compressed Parquet. Handler implements `IpfixHandler` and forwards batches through a bounded channel. Both writers enforce a memory hard-cap: when S3 is unavailable and the buffer exceeds `max_buffer_rows * 4`, the oldest batches are dropped.
 
-Both S3 handlers are optional: absent `[syslog.s3]` or `[ipfix.s3]` sections fall back to the respective default handlers with no persistence.
+All three S3 handlers are optional: absent `[syslog.s3]`, `[ipfix.s3]`, or `[zeek.s3]` sections fall back to the respective default handlers with no persistence.
 
 ### 9. Monitoring & Observability
 - **Structured Logging**: tracing crate with JSON/pretty formats
