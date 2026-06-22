@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+    time::Instant,
+};
 
 use chrono::Utc;
 use ipnet::IpNet;
@@ -262,13 +267,41 @@ pub struct RateLimitError {
     pub retry_after: u64,
 }
 
+/// Returns whether the admin server is safe to start given its resolved bind address and
+/// credentials. This is a pure function with no side-effects so it can be tested independently
+/// of environment variables.
+///
+/// Rules:
+/// - Loopback bind (127.0.0.0/8 or ::1) with any credentials → allowed.
+/// - Non-loopback bind with non-default credentials → allowed.
+/// - Non-loopback bind with default credentials (`admin`/`admin`) → refused.
+pub fn admin_start_allowed(bind: SocketAddr, user: &str, pass: &str) -> Result<(), String> {
+    let is_loopback = match bind.ip() {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => ip.is_loopback(),
+    };
+
+    if !is_loopback && user == "admin" && pass == "admin" {
+        return Err(format!(
+            "Admin server refused to start: bind address {} is non-loopback but default \
+             credentials (admin/admin) are in use. Set WEF_ADMIN_USER and WEF_ADMIN_PASS \
+             to non-default values, or bind to a loopback address (127.0.0.1) instead. \
+             The data-plane server continues running.",
+            bind
+        ));
+    }
+
+    Ok(())
+}
+
 /// Load admin server configuration from environment variables
 pub fn load_admin_config() -> anyhow::Result<AdminServerConfig> {
-    // Admin bind address (default: 0.0.0.0:8080)
+    // Admin bind address (default: 127.0.0.1:8080 — loopback only; operators opt into
+    // a public bind via WEF_ADMIN_BIND).
     let bind_address = std::env::var("WEF_ADMIN_BIND")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| "0.0.0.0:8080".parse().unwrap());
+        .unwrap_or_else(|| "127.0.0.1:8080".parse().unwrap());
 
     // Admin credentials
     let username = std::env::var("WEF_ADMIN_USER").unwrap_or_else(|_| "admin".to_string());
@@ -278,6 +311,12 @@ pub fn load_admin_config() -> anyhow::Result<AdminServerConfig> {
     } else {
         // Hash the plain password (for backward compatibility)
         let password = std::env::var("WEF_ADMIN_PASS").unwrap_or_else(|_| "admin".to_string());
+
+        // Enforce secure-by-default: refuse to bind a non-loopback address with default creds.
+        admin_start_allowed(bind_address, &username, &password).map_err(|msg| {
+            tracing::error!("{}", msg);
+            anyhow::anyhow!("{}", msg)
+        })?;
 
         if username == "admin" && password == "admin" {
             tracing::warn!(
