@@ -536,6 +536,7 @@ mod tests {
     /// SYSLOG_MAX_LINE_BYTES + 1 bytes with no `\n`. The `take` adapter limits the read to
     /// that size and detects the overrun immediately — no timing ambiguity.
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
     async fn oversized_line_closes_connection_and_increments_metric() {
         use metrics::set_default_local_recorder;
         use metrics_util::CompositeKey;
@@ -662,6 +663,7 @@ mod tests {
     /// Sending an unparseable syslog line via TCP increments `syslog_parse_errors`
     /// and does NOT dispatch a message to the handler.
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
     async fn parse_error_increments_metric_and_no_dispatch() {
         use metrics::set_default_local_recorder;
         use metrics_util::CompositeKey;

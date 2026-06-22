@@ -717,14 +717,8 @@ mod tests {
     /// large-payload workload with a stalled background writer.
     #[test]
     fn channel_capacity_is_within_operational_bounds() {
-        assert!(
-            SYSLOG_S3_CHANNEL_CAPACITY >= 256,
-            "channel too small: {SYSLOG_S3_CHANNEL_CAPACITY}"
-        );
-        assert!(
-            SYSLOG_S3_CHANNEL_CAPACITY <= 65_536,
-            "channel too large: {SYSLOG_S3_CHANNEL_CAPACITY}"
-        );
+        const { assert!(SYSLOG_S3_CHANNEL_CAPACITY >= 256, "channel too small") }
+        const { assert!(SYSLOG_S3_CHANNEL_CAPACITY <= 65_536, "channel too large") }
     }
 
     // -- I2: SyslogS3Handler overflow path test --
@@ -738,6 +732,7 @@ mod tests {
     /// `DebuggingRecorder` so this test is hermetic and does not conflict with other tests that
     /// may install a global recorder.
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
     async fn handler_overflow_increments_dropped_counter() {
         use crate::syslog::listener::SyslogHandler as SyslogHandlerTrait;
         use metrics::set_default_local_recorder;
@@ -873,6 +868,7 @@ mod tests {
     /// Verify that a configured `channel_capacity` is honored: capacity=1 causes drops,
     /// a large capacity does not (for a modest send count).
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
     async fn syslog_channel_capacity_parameter_is_wired() {
         use crate::syslog::listener::SyslogHandler as SyslogHandlerTrait;
         use metrics::set_default_local_recorder;

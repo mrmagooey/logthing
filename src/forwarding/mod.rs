@@ -266,7 +266,6 @@ impl Forwarder {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,7 +336,7 @@ mod tests {
         assert!(!forwarder.destinations.is_empty() || forwarder.destinations.is_empty());
     }
 
-#[test]
+    #[test]
     fn calculates_priority_for_warning() {
         let warning = Some(parsed_event(EventLevel::Warning));
         let error = Some(parsed_event(EventLevel::Error));

@@ -158,7 +158,7 @@ mod tests {
     async fn security_middleware_allows_request_with_empty_whitelist() {
         let state = test_state_with_config(vec![], false, false).await;
         let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let request = create_test_request(Method::GET, None)
+        let _request = create_test_request(Method::GET, None)
             .map(|b| b)
             .map(|_| axum::body::Body::empty());
 

@@ -157,5 +157,5 @@ async fn syslog_message_appears_as_parquet_in_s3() {
 // Verify the constant is usable in tests
 #[test]
 fn syslog_s3_channel_capacity_is_reasonable() {
-    assert!(SYSLOG_S3_CHANNEL_CAPACITY >= 1024);
+    const { assert!(SYSLOG_S3_CHANNEL_CAPACITY >= 1024) }
 }

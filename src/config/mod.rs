@@ -688,7 +688,7 @@ secret_key = "SECRET"
         let result = std::panic::catch_unwind(|| {
             let cfg = Config::load().expect("config loads");
             assert!(!cfg.tls.enabled, "logthing.toml disables TLS");
-            assert!(cfg.forwarding.destinations.len() >= 1);
+            assert!(!cfg.forwarding.destinations.is_empty());
         });
 
         // Restore admin override file
