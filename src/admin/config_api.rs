@@ -318,6 +318,11 @@ pub async fn export_config(
         .into_response())
 }
 
+/// Maximum allowed body size for config import (1 MiB).
+/// A real config file is a few kilobytes at most; this cap prevents
+/// trivial memory exhaustion via oversized payloads (M-12).
+const IMPORT_MAX_BODY_BYTES: usize = 1024 * 1024;
+
 /// Import configuration endpoint
 pub async fn import_config(
     State(state): State<AdminState>,
@@ -327,6 +332,19 @@ pub async fn import_config(
 ) -> Result<Json<Config>, Response> {
     let client_ip = addr.ip().to_string();
     let username = ensure_authorized(&state, auth, &client_ip).await?;
+
+    // M-12: reject oversized bodies before any parsing.
+    if body.len() > IMPORT_MAX_BODY_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Request body too large: {} bytes (max {} bytes)",
+                body.len(),
+                IMPORT_MAX_BODY_BYTES
+            ),
+        )
+            .into_response());
+    }
 
     // Try to parse as TOML first, then JSON
     let imported_config: Config = if let Ok(content_str) = std::str::from_utf8(&body) {
@@ -666,5 +684,78 @@ enabled = true
 
         // Must be rejected.
         assert!(result.is_err(), "TLS-without-cert config must be rejected");
+    }
+
+    // M-12: import_config must reject bodies larger than IMPORT_MAX_BODY_BYTES.
+    #[tokio::test]
+    async fn import_config_rejects_oversized_body() {
+        let state = make_state_with_s3_secrets().await;
+
+        use axum_extra::extract::TypedHeader;
+        use headers::Authorization;
+        let auth = TypedHeader(Authorization::basic("admin", "admin"));
+        let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        // Create a body that is 1 byte over the limit.
+        let oversized_body = axum::body::Bytes::from(vec![b'x'; IMPORT_MAX_BODY_BYTES + 1]);
+
+        let result = import_config(
+            axum::extract::State(state),
+            axum::extract::ConnectInfo(addr),
+            Some(auth),
+            oversized_body,
+        )
+        .await;
+
+        // Must be rejected as too large.
+        assert!(result.is_err(), "oversized body must be rejected");
+        let response = result.unwrap_err();
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "expected 413 Payload Too Large"
+        );
+    }
+
+    // M-12: import_config accepts a body exactly at the limit.
+    #[tokio::test]
+    async fn import_config_accepts_body_at_limit() {
+        let state = make_state_with_s3_secrets().await;
+
+        use axum_extra::extract::TypedHeader;
+        use headers::Authorization;
+        let auth = TypedHeader(Authorization::basic("admin", "admin"));
+        let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        // A valid TOML padded with TOML comments to be just at the limit.
+        let mut toml_content =
+            String::from("bind_address = \"0.0.0.0:5985\"\n[tls]\nenabled = false\n");
+        // Pad with TOML comments so we approach the limit.
+        let comment_line = "# padding\n";
+        while toml_content.len() + comment_line.len() <= IMPORT_MAX_BODY_BYTES {
+            toml_content.push_str(comment_line);
+        }
+        // Trim to exactly the limit if we went over.
+        toml_content.truncate(IMPORT_MAX_BODY_BYTES);
+
+        // At-limit body may or may not parse as valid TOML after truncation,
+        // but it must NOT be rejected with 413 Payload Too Large.
+        let body = axum::body::Bytes::from(toml_content.into_bytes());
+        let result = import_config(
+            axum::extract::State(state),
+            axum::extract::ConnectInfo(addr),
+            Some(auth),
+            body,
+        )
+        .await;
+
+        // The only forbidden status is 413; any other outcome is acceptable.
+        if let Err(ref resp) = result {
+            assert_ne!(
+                resp.status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body at exactly the limit must not be rejected as too large"
+            );
+        }
     }
 }
