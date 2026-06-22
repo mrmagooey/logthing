@@ -19,7 +19,7 @@ region     = "us-east-1"
 access_key = "miniouser"
 secret_key = "miniopassword"
 prefix     = "syslog"
-max_buffer_rows     = 1
+max_buffer_rows     = 10
 flush_interval_secs = 5
 
 [ipfix]
