@@ -601,6 +601,7 @@ async fn handle_throughput_stats(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::models::{EventLevel, ParsedEvent};
@@ -694,8 +695,8 @@ mod tests {
     #[tokio::test]
     async fn syslog_examples_returns_samples() {
         let Json(value) = handle_syslog_examples().await;
-        assert!(value["bind_named"].as_array().unwrap().len() > 0);
-        assert!(value["powerdns"].as_array().unwrap().len() > 0);
+        assert!(!value["bind_named"].as_array().unwrap().is_empty());
+        assert!(!value["powerdns"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -933,9 +934,8 @@ mod tests {
 
         process_single_event(&state, event).await;
 
-        // Should not panic and throughput should show "unknown"
-        let summary = state.throughput.snapshot().await;
-        assert!(summary.len() >= 0);
+        // Should not panic; throughput entry is recorded as "unknown".
+        let _summary = state.throughput.snapshot().await;
     }
 
     /// XFF header is present but ignored; peer IP is used for source attribution.
@@ -1030,6 +1030,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn body_size_limit_const_is_sane() {
         assert_eq!(MAX_BODY_SIZE, 64 * 1024 * 1024);
         assert!(MAX_BODY_SIZE > 0);
@@ -1075,6 +1076,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn concurrent_processing_limit_is_reasonable() {
         assert!(
             MAX_CONCURRENT_EVENT_PROCESSING > 0 && MAX_CONCURRENT_EVENT_PROCESSING <= 256,
@@ -1146,7 +1148,10 @@ mod tests {
 
         // The event should have been recorded in throughput stats.
         let snapshot = state.throughput.snapshot().await;
-        assert!(!snapshot.is_empty(), "throughput snapshot must be non-empty after event");
+        assert!(
+            !snapshot.is_empty(),
+            "throughput snapshot must be non-empty after event"
+        );
     }
 
     /// A syslog HTTP POST with a body that exactly meets the body-size limit is
