@@ -29,6 +29,10 @@ use tokio::sync::{RwLock, mpsc};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
+/// Maximum number of Windows events processed concurrently per batch.
+/// Bounds CPU and memory use while still exploiting multi-core parallelism.
+const MAX_CONCURRENT_EVENT_PROCESSING: usize = 16;
+
 pub struct AppState {
     pub config: Arc<RwLock<Config>>,
     pub throughput: Arc<ThroughputStats>,
@@ -582,7 +586,7 @@ async fn process_events(state: &Arc<AppState>, events: Vec<WindowsEvent>) {
     // Process events concurrently with a limit of 16 concurrent tasks
     // This leverages multi-core CPUs for better throughput
     stream::iter(events)
-        .for_each_concurrent(16, |event| async move {
+        .for_each_concurrent(MAX_CONCURRENT_EVENT_PROCESSING, |event| async move {
             process_single_event(state, event).await;
         })
         .await;
@@ -1002,6 +1006,14 @@ mod tests {
             .await
             .into_response();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn concurrent_processing_limit_is_reasonable() {
+        assert!(
+            MAX_CONCURRENT_EVENT_PROCESSING > 0 && MAX_CONCURRENT_EVENT_PROCESSING <= 256,
+            "MAX_CONCURRENT_EVENT_PROCESSING must be in the range 1..=256"
+        );
     }
 
     /// CR-1 regression: kerberos_auth_middleware must fail CLOSED.
