@@ -5,7 +5,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
+
+/// Maximum number of concurrent TCP connections accepted by the syslog listener.
+/// Prevents resource exhaustion from connection floods.
+pub const MAX_SYSLOG_TCP_CONNECTIONS: usize = 1024;
 
 /// Maximum accepted line length in bytes for TCP syslog connections.
 ///
@@ -108,7 +113,7 @@ impl SyslogListener {
         Self { config, handler }
     }
 
-    /// Start both UDP and TCP listeners
+    /// Start both UDP and TCP listeners (no shutdown signal — runs until externally aborted).
     pub async fn start(&self) -> anyhow::Result<()> {
         let udp_listener = self.start_udp_listener();
         let tcp_listener = self.start_tcp_listener();
@@ -122,6 +127,98 @@ impl SyslogListener {
             result = tcp_listener => {
                 if let Err(e) = result {
                     error!("TCP listener error: {}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Start both UDP and TCP listeners with graceful shutdown support.
+    ///
+    /// The listener exits cleanly when `shutdown_rx` receives `true` (or is closed).
+    /// Used from `main.rs`; tests continue to use `start()` or `run_with_listener()`.
+    pub async fn start_with_shutdown(
+        &self,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        let semaphore = Arc::new(Semaphore::new(MAX_SYSLOG_TCP_CONNECTIONS));
+
+        let udp_addr: SocketAddr =
+            format!("{}:{}", self.config.bind_address, self.config.udp_port).parse()?;
+        let tcp_addr: SocketAddr =
+            format!("{}:{}", self.config.bind_address, self.config.tcp_port).parse()?;
+
+        let udp_socket = UdpSocket::bind(&udp_addr).await?;
+        info!("Syslog UDP listener started on {}", udp_addr);
+        let tcp_listener = TcpListener::bind(&tcp_addr).await?;
+        info!("Syslog TCP listener started on {}", tcp_addr);
+
+        let mut buf = vec![0u8; 65535];
+        let handler_udp = self.handler.clone();
+        let handler_tcp = self.handler.clone();
+
+        loop {
+            tokio::select! {
+                // UDP receive arm
+                result = udp_socket.recv_from(&mut buf) => {
+                    match result {
+                        Ok((len, src)) => {
+                            let msg = String::from_utf8_lossy(&buf[..len]);
+                            debug!("Received UDP syslog message from {}: {} bytes", src, len);
+                            metrics::counter!("syslog_messages_received").increment(1);
+                            if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
+                                handler_udp.handle_message(syslog_msg, src).await;
+                            } else {
+                                metrics::counter!("syslog_parse_errors").increment(1);
+                                warn!(
+                                    "Failed to parse syslog message from {}: {}",
+                                    src,
+                                    &msg[..100.min(msg.len())]
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!("UDP receive error: {}", e);
+                        }
+                    }
+                }
+                // TCP accept arm
+                result = tcp_listener.accept() => {
+                    match result {
+                        Ok((stream, src)) => {
+                            // Acquire semaphore permit before spawning — bounds concurrent connections
+                            match semaphore.clone().try_acquire_owned() {
+                                Ok(permit) => {
+                                    let handler = handler_tcp.clone();
+                                    tokio::spawn(async move {
+                                        let _permit = permit; // held for connection lifetime
+                                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler).await {
+                                            error!("TCP connection error from {}: {}", src, e);
+                                        }
+                                    });
+                                }
+                                Err(_) => {
+                                    // Semaphore exhausted — too many connections; drop this one
+                                    metrics::counter!("syslog_tcp_connections_rejected").increment(1);
+                                    warn!(
+                                        "Syslog: TCP connection limit ({}) reached; rejecting {}",
+                                        MAX_SYSLOG_TCP_CONNECTIONS, src
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("TCP accept error: {}", e);
+                        }
+                    }
+                }
+                // Shutdown arm
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("Syslog listener: shutdown signal received");
+                        break;
+                    }
                 }
             }
         }
@@ -182,15 +279,31 @@ impl SyslogListener {
         let bound = listener.local_addr()?;
         info!("Syslog TCP listener started on {}", bound);
 
+        let semaphore = Arc::new(Semaphore::new(MAX_SYSLOG_TCP_CONNECTIONS));
+
         loop {
             match listener.accept().await {
                 Ok((stream, src)) => {
-                    let handler = self.handler.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler).await {
-                            error!("TCP connection error from {}: {}", src, e);
+                    match semaphore.clone().try_acquire_owned() {
+                        Ok(permit) => {
+                            let handler = self.handler.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit; // held for connection lifetime
+                                if let Err(e) =
+                                    Self::handle_tcp_connection(stream, src, handler).await
+                                {
+                                    error!("TCP connection error from {}: {}", src, e);
+                                }
+                            });
                         }
-                    });
+                        Err(_) => {
+                            metrics::counter!("syslog_tcp_connections_rejected").increment(1);
+                            warn!(
+                                "Syslog: TCP connection limit ({}) reached; rejecting {}",
+                                MAX_SYSLOG_TCP_CONNECTIONS, src
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     error!("TCP accept error: {}", e);
