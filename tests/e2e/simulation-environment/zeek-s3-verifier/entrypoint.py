@@ -52,48 +52,60 @@ def make_client():
     )
 
 
-def wait_for_prefix(client, prefix, timeout):
+def scan_prefix(client, prefix):
+    """List every object under `prefix`, read each Parquet object, and return
+    (total_rows, union_of_columns, object_count). Records flush one-per-object
+    when flush_threshold_bytes=1, so rows must be summed ACROSS objects."""
+    resp = client.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
+    contents = resp.get("Contents", [])
+    total_rows = 0
+    columns = set()
+    for item in contents:
+        body = client.get_object(Bucket=BUCKET, Key=item["Key"])["Body"].read()
+        if not body:
+            continue
+        table = pq.read_table(io.BytesIO(body))
+        total_rows += table.num_rows
+        columns |= set(table.schema.names)
+    return total_rows, columns, len(contents)
+
+
+def verify_stream(client, prefix, spec, timeout):
+    """Poll until the aggregate row count under `prefix` reaches the minimum,
+    then validate the schema columns. Sums rows across all objects."""
     deadline = time.time() + timeout
+    total_rows, columns, n = 0, set(), 0
     while time.time() < deadline:
-        resp = client.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
-        contents = resp.get("Contents", [])
-        if contents:
-            key = contents[0]["Key"]
-            obj = client.get_object(Bucket=BUCKET, Key=key)
-            body = obj["Body"].read()
-            if len(body) > 0:
-                print(f"Found Parquet object at {key} ({len(body)} bytes)")
-                return key, body
+        total_rows, columns, n = scan_prefix(client, prefix)
+        if total_rows >= spec["min_rows"]:
+            break
         time.sleep(3)
-    raise SystemExit(
-        f"No Parquet object found under '{prefix}' in bucket '{BUCKET}' within {timeout}s"
-    )
 
-
-def verify_stream(prefix, body, spec):
-    table = pq.read_table(io.BytesIO(body))
-    actual_columns = set(table.schema.names)
-    missing = [c for c in spec["required_columns"] if c not in actual_columns]
+    missing = [c for c in spec["required_columns"] if c not in columns]
     if missing:
-        print(f"ERROR [{prefix}]: missing columns: {missing}", file=sys.stderr)
-        sys.exit(1)
-    if table.num_rows < spec["min_rows"]:
         print(
-            f"ERROR [{prefix}]: expected >= {spec['min_rows']} rows, got {table.num_rows}",
+            f"ERROR [{prefix}]: missing columns: {missing} "
+            f"(saw {sorted(columns)} across {n} object(s))",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if total_rows < spec["min_rows"]:
+        print(
+            f"ERROR [{prefix}]: expected >= {spec['min_rows']} rows, "
+            f"got {total_rows} across {n} object(s) within {timeout}s",
             file=sys.stderr,
         )
         sys.exit(1)
     print(
-        f"OK [{prefix}]: {table.num_rows} row(s), "
-        f"{len(actual_columns)} column(s): {sorted(actual_columns)}"
+        f"OK [{prefix}]: {total_rows} row(s) across {n} object(s), "
+        f"{len(columns)} column(s): {sorted(columns)}"
     )
 
 
 def main():
     client = make_client()
     for prefix, spec in EXPECTED_STREAMS.items():
-        key, body = wait_for_prefix(client, prefix, TIMEOUT)
-        verify_stream(prefix, body, spec)
+        verify_stream(client, prefix, spec, TIMEOUT)
     print("Zeek S3 verifier succeeded")
     sys.stdout.flush()
     sys.stderr.flush()
