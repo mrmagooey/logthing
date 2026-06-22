@@ -561,6 +561,7 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
     {
         match e {
             mpsc::error::TrySendError::Full(_) => {
+                metrics::counter!("wef_events_dropped").increment(1);
                 warn!("Parquet S3 channel full, dropping event");
             }
             mpsc::error::TrySendError::Closed(_) => {

@@ -145,9 +145,11 @@ impl SyslogListener {
                     let msg = String::from_utf8_lossy(&buf[..len]);
                     debug!("Received UDP syslog message from {}: {} bytes", src, len);
 
+                    metrics::counter!("syslog_messages_received").increment(1);
                     if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
                         self.handler.handle_message(syslog_msg, src).await;
                     } else {
+                        metrics::counter!("syslog_parse_errors").increment(1);
                         warn!(
                             "Failed to parse syslog message from {}: {}",
                             src,
@@ -253,9 +255,11 @@ impl SyslogListener {
                 src,
                 line.len()
             );
+            metrics::counter!("syslog_messages_received").increment(1);
             if let Some(syslog_msg) = SyslogMessage::parse(&line) {
                 handler.handle_message(syslog_msg, src).await;
             } else {
+                metrics::counter!("syslog_parse_errors").increment(1);
                 warn!(
                     "Failed to parse TCP syslog message from {}: {}",
                     src,
@@ -539,6 +543,73 @@ mod tests {
             messages.len(),
             1,
             "second connection should produce 1 message"
+        );
+    }
+
+    /// Sending an unparseable syslog line via TCP increments `syslog_parse_errors`
+    /// and does NOT dispatch a message to the handler.
+    #[tokio::test]
+    async fn parse_error_increments_metric_and_no_dispatch() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+
+        let handler = CapturingHandler::new();
+        let handler_clone = handler.clone();
+        let listener = SyslogListener::new(SyslogListenerConfig::default(), handler_clone);
+
+        let task = tokio::spawn(async move {
+            listener.run_with_listener(tcp_listener).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        // Send a line that is not a valid syslog message.
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"this is not a syslog message at all\n")
+            .await
+            .unwrap();
+        drop(stream);
+
+        sleep(Duration::from_millis(150)).await;
+        task.abort();
+
+        // No message should have been dispatched.
+        let messages = handler.take_messages();
+        assert!(
+            messages.is_empty(),
+            "unparseable input must not produce a message; got {}",
+            messages.len()
+        );
+
+        // syslog_parse_errors counter should be incremented exactly once.
+        let snapshot = snapshotter.snapshot();
+        let map = snapshot.into_hashmap();
+        let key = CompositeKey::new(
+            MetricKind::Counter,
+            metrics::Key::from_name("syslog_parse_errors"),
+        );
+        let count = map
+            .get(&key)
+            .map(|(_, _, v)| {
+                if let metrics_util::debugging::DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            count, 1,
+            "syslog_parse_errors counter must be 1; got {count}"
         );
     }
 }
