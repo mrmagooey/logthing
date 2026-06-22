@@ -2,9 +2,11 @@
 """
 Zeek S3 verifier for E2E testing.
 
-Polls MinIO for Parquet objects under zeek/conn/, zeek/dns/, and zeek/unknown/
-(the "weird" stream routes to unknown/ because "weird" is not a curated path),
-downloads them, and validates schema + row count.
+Polls MinIO for Parquet objects under zeek/conn/, zeek/dns/, and zeek/weird/.
+Unmodelled Zeek streams keep their own path (e.g. zeek/weird/); only records
+with a missing _path field (or a log_path that is empty after sanitisation)
+route to zeek/unknown/.
+Downloads each object and validates schema and row count.
 """
 
 import io
