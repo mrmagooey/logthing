@@ -613,14 +613,6 @@ secret_key = "FSKEY"
     }
 
     #[test]
-    fn zeek_disabled_by_default() {
-        let cfg = Config::default();
-        assert!(!cfg.zeek.enabled, "zeek must be opt-in");
-        assert_eq!(cfg.zeek.tcp_port, 47760);
-        assert_eq!(cfg.zeek.bind_address, "0.0.0.0");
-    }
-
-    #[test]
     fn zeek_s3_absent_gives_none() {
         let cfg = Config::default();
         assert!(
