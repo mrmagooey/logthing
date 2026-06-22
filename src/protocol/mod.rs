@@ -2,6 +2,7 @@ use crate::models::{EventLevel, Heartbeat, ParsedEvent, SubscriptionRequest, Win
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use quick_xml::Reader;
+use quick_xml::escape::escape as xml_escape;
 use quick_xml::events::Event as XmlEvent;
 use tracing::{debug, error};
 
@@ -332,6 +333,7 @@ impl WefParser {
 }
 
 pub fn create_subscription_response(subscription_id: &str) -> String {
+    let escaped_id = xml_escape(subscription_id);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
         <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
@@ -342,7 +344,7 @@ pub fn create_subscription_response(subscription_id: &str) -> String {
                 <SubscribeResponse xmlns="http://schemas.microsoft.com/wbem/wsman/1/windows/EventLog"/>
             </s:Body>
         </s:Envelope>"#,
-        subscription_id
+        escaped_id
     )
 }
 
@@ -748,6 +750,21 @@ mod tests {
         assert!(response.contains(sub_id));
         assert!(response.contains("SubscribeResponse"));
         assert!(response.contains("wsman"));
+    }
+
+    #[test]
+    fn create_subscription_response_escapes_xml_injection() {
+        // A subscription_id containing XML-special chars must not produce raw injection
+        let malicious_id = r#"]]><evil>&amp;"injected"</evil><![CDATA["#;
+        let response = create_subscription_response(malicious_id);
+        // Raw injection chars must not appear verbatim
+        assert!(!response.contains("<evil>"), "raw < must be escaped");
+        assert!(!response.contains("</evil>"), "raw </ must be escaped");
+        // Escaped forms should appear
+        assert!(response.contains("&lt;"), "< should be &lt;");
+        assert!(response.contains("&amp;"), "& should be &amp;");
+        // Existing test: response must still be structurally valid (contains SubscribeResponse)
+        assert!(response.contains("SubscribeResponse"));
     }
 
     #[test]
