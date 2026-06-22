@@ -107,6 +107,13 @@ def main():
     key, body = wait_for_ipfix_parquet(client)
     verify_parquet(key, body)
     print("IPFIX S3 verifier succeeded")
+    # pyarrow's Arrow C++ runtime can abort during interpreter shutdown
+    # ("terminate called without an active exception"), yielding a spurious
+    # non-zero exit *after* a successful verification. Exit cleanly here so the
+    # container's exit code reflects the verification result, not teardown noise.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
