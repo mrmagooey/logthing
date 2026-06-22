@@ -186,6 +186,9 @@ impl BufferedEvent {
     fn from_windows_event(event: &WindowsEvent) -> Option<Self> {
         let event_id = event.parsed.as_ref()?.event_id;
 
+        // Serialization failure is handled explicitly: if to_string returns Err,
+        // ok()? propagates None and the event is silently skipped rather than
+        // stored as an empty or invalid string.
         Some(Self {
             event_id,
             timestamp: event.received_at,
