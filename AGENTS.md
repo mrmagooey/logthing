@@ -124,6 +124,7 @@ src/
   server/       # HTTP server implementation
   stats/        # Metrics and statistics
   syslog/       # Syslog listener
+  zeek/         # Zeek NDJSON ingestion
 ```
 
 Note: `src/lib.rs` is the crate's module root (the crate is both a library and a binary); `src/main.rs` is the binary entry point only.
