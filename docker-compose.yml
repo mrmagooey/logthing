@@ -1,22 +1,23 @@
 version: '3.8'
 
 services:
-  wef-server:
+  logthing:
     build: .
     ports:
-      - "5985:5985"     # HTTP WEF endpoint
-      - "5986:5986"     # HTTPS WEF endpoint
-      - "9090:9090"     # Prometheus metrics
+      - "5985:5985"       # HTTP WEF endpoint
+      - "5986:5986"       # HTTPS WEF endpoint
+      - "9090:9090"       # Prometheus metrics
+      - "514:514/udp"     # Syslog (UDP)
+      - "601:601/tcp"     # Syslog (TCP)
+      - "4739:4739/udp"   # IPFIX
     volumes:
-      - ./certs:/etc/wef-server/certs:ro
-      - ./wef-server.toml:/etc/wef-server/config.toml:ro
+      - ./logthing.toml:/etc/logthing/config.toml:ro
+      # Uncomment to mount TLS certificates:
+      # - ./certs:/etc/logthing/certs:ro
     environment:
       - RUST_LOG=info
-      - WEF_BIND_ADDRESS=0.0.0.0:5985
-      - WEF_TLS_ENABLED=true
-      - WEF_TLS_PORT=5986
     networks:
-      - wef-network
+      - logthing-network
     restart: unless-stopped
 
   # Example: Elasticsearch for log storage
@@ -28,7 +29,7 @@ services:
     ports:
       - "9200:9200"
     networks:
-      - wef-network
+      - logthing-network
 
   # Example: Grafana for visualization
   grafana:
@@ -38,10 +39,10 @@ services:
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
     networks:
-      - wef-network
+      - logthing-network
     depends_on:
-      - wef-server
+      - logthing
 
 networks:
-  wef-network:
+  logthing-network:
     driver: bridge

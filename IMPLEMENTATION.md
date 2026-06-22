@@ -126,7 +126,25 @@ Multi-protocol output support:
 - Circuit breaker pattern
 - Configurable buffer sizes
 
-### 7. Monitoring & Observability
+### 7. IPFIX / NetFlow Ingestion (`src/ipfix/`)
+
+Async UDP listener and stateful decoder for network flow telemetry:
+
+- **`ipfix/mod.rs`**: `FlowRecord` — the normalized flow record type, covering IPFIX v10, NetFlow v9, and NetFlow v5.
+- **`ipfix/decoder.rs`**: `IpfixDecoder` with stateful template cache keyed on `(exporter IP, observation domain ID, template ID)`. `decode_datagram()` dispatches on the version field (5/9/10), decodes curated IANA IEs into named `FlowRecord` fields, and hex-encodes unknown/enterprise IEs into the `extra` JSON column.
+- **`ipfix/listener.rs`**: `IpfixListener` binds a UDP socket (default port 4739) and calls `decode_datagram()` per packet. Decoded flow batches are passed to an `IpfixHandler` implementation; decode errors are counted and the loop continues without crashing.
+
+### 8. S3 Persistence (`src/forwarding/s3_sink.rs`, `syslog_s3.rs`, `ipfix_s3.rs`)
+
+Generalized Arrow/Parquet S3 persistence shared between the syslog and IPFIX subsystems:
+
+- **`s3_sink.rs`**: `S3Sink` — the single S3 client wrapper used by both writers. Handles authentication and `PutObject` uploads.
+- **`syslog_s3.rs`**: `SyslogS3Writer` + `SyslogS3Handler` — syslog messages buffered as `RecordBatch`es and flushed to S3 as ZSTD-compressed Parquet. Handler implements `SyslogHandler` and forwards messages through a bounded channel.
+- **`ipfix_s3.rs`**: `IpfixS3Writer` + `IpfixS3Handler` — flow records buffered with a fixed 18-column Arrow schema and flushed to S3 as ZSTD-compressed Parquet. Handler implements `IpfixHandler` and forwards batches through a bounded channel. Both writers enforce a memory hard-cap: when S3 is unavailable and the buffer exceeds `max_buffer_rows * 4`, the oldest batches are dropped.
+
+Both S3 handlers are optional: absent `[syslog.s3]` or `[ipfix.s3]` sections fall back to the respective default handlers with no persistence.
+
+### 9. Monitoring & Observability
 - **Structured Logging**: tracing crate with JSON/pretty formats
 - **Metrics**:
   - Connection counts
