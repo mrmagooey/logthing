@@ -10,6 +10,7 @@ pub mod ipfix_s3;
 pub mod parquet_s3;
 pub mod s3_sink;
 pub mod syslog_s3;
+pub mod zeek_s3;
 
 pub struct Forwarder {
     destinations: Vec<Destination>,

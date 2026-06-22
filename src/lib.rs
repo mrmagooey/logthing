@@ -12,3 +12,4 @@ pub mod protocol;
 pub mod server;
 pub mod stats;
 pub mod syslog;
+pub mod zeek;
