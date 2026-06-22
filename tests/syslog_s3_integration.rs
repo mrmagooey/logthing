@@ -54,7 +54,9 @@ async fn syslog_message_appears_as_parquet_in_s3() {
         key_prefix: "syslog-test/".to_string(),
     };
 
-    let handler = SyslogS3Handler::start(writer_cfg, sink.clone());
+    // `start` now returns (handler, writer_join_handle) for graceful-shutdown support;
+    // the test only needs the handler and lets the writer task run in the background.
+    let (handler, _writer_task) = SyslogS3Handler::start(writer_cfg, sink.clone());
 
     let msg = SyslogMessage {
         priority: 134,
