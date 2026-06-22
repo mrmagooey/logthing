@@ -317,15 +317,18 @@ impl ParquetS3Forwarder {
         let parquet_path = self.write_parquet_file(event_type, &events).await?;
 
         // Upload to S3
-        self.upload_to_s3(&parquet_path, event_type).await?;
+        let upload_result = self.upload_to_s3(&parquet_path, event_type).await;
 
-        // Clean up local file
+        // Always remove local temp file, even on upload failure
         if let Err(e) = tokio::fs::remove_file(&parquet_path).await {
             warn!(
                 "Failed to remove local parquet file {:?}: {}",
                 parquet_path, e
             );
         }
+
+        // Now propagate the upload error (if any)
+        upload_result?;
 
         info!(
             "Successfully flushed {} events of type {} to S3",
