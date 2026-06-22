@@ -1,5 +1,5 @@
 use logthing::server::Server;
-use logthing::{admin, config, forwarding, ipfix, stats, syslog};
+use logthing::{admin, config, forwarding, ipfix, stats, syslog, zeek};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
@@ -154,6 +154,26 @@ async fn async_main() -> anyhow::Result<()> {
             }
         });
         info!("IPFIX listener started on UDP:{}", config.ipfix.udp_port);
+    }
+
+    // Start Zeek listener if enabled
+    if config.zeek.enabled {
+        let zeek_config_clone = config.clone();
+        tokio::spawn(async move {
+            let listener_config = zeek::listener::ZeekListenerConfig {
+                tcp_port: zeek_config_clone.zeek.tcp_port,
+                bind_address: zeek_config_clone.zeek.bind_address.clone(),
+            };
+            // Phase 2 will select ZeekS3Handler when [zeek.s3] is present.
+            // For now, always use DefaultZeekHandler.
+            let handler: Arc<dyn zeek::listener::ZeekHandler> =
+                Arc::new(zeek::listener::DefaultZeekHandler);
+            let listener = zeek::listener::ZeekListener::new(listener_config, handler);
+            if let Err(e) = listener.start().await {
+                error!("Zeek listener error: {}", e);
+            }
+        });
+        info!("Zeek listener started on TCP:{}", config.zeek.tcp_port);
     }
 
     // Create and run server
