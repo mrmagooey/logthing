@@ -1,4 +1,4 @@
-use crate::config::{DestinationConfig, ForwardProtocol};
+use crate::config::{DestinationConfig, ForwardProtocol, S3ConnectionConfig};
 use crate::models::WindowsEvent;
 use anyhow::Result;
 use arrow::array::{ArrayRef, StringArray, UInt32Array};
@@ -14,29 +14,29 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-/// Configuration for Parquet S3 forwarder
+/// Configuration for Parquet S3 forwarder.
+///
+/// The five S3 connection fields (endpoint, bucket, region, access_key, secret_key) are
+/// shared with the other writers via `S3ConnectionConfig`, which carries its own masking
+/// `Debug` implementation so secrets never appear in logs or panic messages.
 #[derive(Clone)]
 pub struct ParquetS3Config {
-    pub endpoint: String,
-    pub bucket: String,
-    pub region: String,
-    pub access_key: String,
-    pub secret_key: String,
+    /// Shared S3 connection fields. Debug output for these is handled by
+    /// `S3ConnectionConfig`'s masking `Debug` impl.
+    pub connection: S3ConnectionConfig,
     pub max_file_size_mb: u64,
     pub flush_interval_secs: u64,
     pub local_buffer_path: PathBuf,
 }
 
-/// Manual Debug impl that masks S3 secret fields so they never leak into logs
-/// or panic messages.
+/// Manual Debug impl for `ParquetS3Config`.
+///
+/// Secrets are masked by delegating to `S3ConnectionConfig`'s own masking `Debug` impl,
+/// so they never appear in logs or panic messages.
 impl std::fmt::Debug for ParquetS3Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ParquetS3Config")
-            .field("endpoint", &self.endpoint)
-            .field("bucket", &self.bucket)
-            .field("region", &self.region)
-            .field("access_key", &"<redacted>")
-            .field("secret_key", &"<redacted>")
+            .field("connection", &self.connection) // S3ConnectionConfig masks secrets
             .field("max_file_size_mb", &self.max_file_size_mb)
             .field("flush_interval_secs", &self.flush_interval_secs)
             .field("local_buffer_path", &self.local_buffer_path)
@@ -47,11 +47,13 @@ impl std::fmt::Debug for ParquetS3Config {
 impl Default for ParquetS3Config {
     fn default() -> Self {
         Self {
-            endpoint: "http://localhost:9000".to_string(),
-            bucket: "wef-events".to_string(),
-            region: "us-east-1".to_string(),
-            access_key: "minioadmin".to_string(),
-            secret_key: "minioadmin".to_string(),
+            connection: S3ConnectionConfig {
+                endpoint: "http://localhost:9000".to_string(),
+                bucket: "wef-events".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "minioadmin".to_string(),
+                secret_key: "minioadmin".to_string(),
+            },
             max_file_size_mb: 100,
             flush_interval_secs: 900, // 15 minutes
             local_buffer_path: std::env::temp_dir().join("logthing-wef-events"),
@@ -81,15 +83,17 @@ impl ParquetS3Config {
         };
 
         Ok(Self {
-            endpoint,
-            bucket,
-            region: dest
-                .headers
-                .get("region")
-                .cloned()
-                .unwrap_or_else(|| "us-east-1".to_string()),
-            access_key: dest.headers.get("access-key").cloned().unwrap_or_default(),
-            secret_key: dest.headers.get("secret-key").cloned().unwrap_or_default(),
+            connection: S3ConnectionConfig {
+                endpoint,
+                bucket,
+                region: dest
+                    .headers
+                    .get("region")
+                    .cloned()
+                    .unwrap_or_else(|| "us-east-1".to_string()),
+                access_key: dest.headers.get("access-key").cloned().unwrap_or_default(),
+                secret_key: dest.headers.get("secret-key").cloned().unwrap_or_default(),
+            },
             max_file_size_mb: dest
                 .headers
                 .get("max-size-mb")
@@ -218,7 +222,10 @@ impl ParquetS3Forwarder {
         info!(
             "ParquetS3Forwarder initialized: bucket={}, endpoint={}, \
              flush_interval={}s, max_size={}MB",
-            config.bucket, config.endpoint, config.flush_interval_secs, config.max_file_size_mb
+            config.connection.bucket,
+            config.connection.endpoint,
+            config.flush_interval_secs,
+            config.max_file_size_mb
         );
 
         Ok(Self {
@@ -500,12 +507,46 @@ mod tests {
     fn config_parses_destination_headers() {
         let dest = sample_destination();
         let cfg = ParquetS3Config::from_destination(&dest).expect("config");
-        assert_eq!(cfg.bucket, "audit-bucket");
-        assert_eq!(cfg.endpoint, "http://minio:9000");
+        assert_eq!(cfg.connection.bucket, "audit-bucket");
+        assert_eq!(cfg.connection.endpoint, "http://minio:9000");
         assert_eq!(cfg.max_file_size_mb, 1);
         assert_eq!(cfg.flush_interval_secs, 60);
         let expected_path = std::env::temp_dir().join("test-buf");
         assert_eq!(cfg.local_buffer_path, expected_path);
+    }
+
+    // H-5 regression: Debug output of ParquetS3Config must never expose S3 credentials.
+    // Secrets are masked by delegating to S3ConnectionConfig's own masking Debug impl.
+    #[test]
+    fn parquet_s3_config_debug_masks_secrets() {
+        use crate::config::S3ConnectionConfig;
+        let cfg = ParquetS3Config {
+            connection: S3ConnectionConfig {
+                endpoint: "http://minio:9000".to_string(),
+                bucket: "my-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "SUPERSECRETKEY".to_string(),
+                secret_key: "TOPSECRETPASSWORD".to_string(),
+            },
+            max_file_size_mb: 100,
+            flush_interval_secs: 900,
+            local_buffer_path: std::path::PathBuf::from("/tmp/test"),
+        };
+        let debug_str = format!("{cfg:?}");
+        assert!(
+            !debug_str.contains("SUPERSECRETKEY"),
+            "access_key must not appear in Debug output: {debug_str}"
+        );
+        assert!(
+            !debug_str.contains("TOPSECRETPASSWORD"),
+            "secret_key must not appear in Debug output: {debug_str}"
+        );
+        // Non-secret fields must still be visible.
+        assert!(debug_str.contains("my-bucket"), "bucket must be visible");
+        assert!(
+            debug_str.contains("<redacted>"),
+            "redacted marker must appear"
+        );
     }
 
     #[test]
