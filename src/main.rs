@@ -1,8 +1,9 @@
 use logthing::server::Server;
 use logthing::{admin, config, forwarding, ipfix, stats, syslog, zeek};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 fn main() -> anyhow::Result<()> {
     // Determine number of worker threads (default to all CPU cores)
@@ -51,34 +52,37 @@ async fn async_main() -> anyhow::Result<()> {
     admin::spawn_admin_server(shared_config.clone());
     let throughput = Arc::new(stats::ThroughputStats::new());
 
-    // Start syslog listener if enabled
-    let config_clone = config.clone();
-    if config.syslog.enabled {
-        tokio::spawn(async move {
-            let syslog_config = syslog::listener::SyslogListenerConfig {
-                udp_port: config_clone.syslog.udp_port,
-                tcp_port: config_clone.syslog.tcp_port,
-                bind_address: "0.0.0.0".to_string(),
-                parse_dns_logs: config_clone.syslog.parse_dns,
-            };
+    // Shutdown watch channel — send `true` to trigger graceful shutdown.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-            let handler: Arc<dyn syslog::listener::SyslogHandler> = if let Some(s3_cfg) =
-                config_clone.syslog.s3.as_ref()
-            {
+    // Collect writer JoinHandles (one per enabled S3 handler) and listener JoinHandles.
+    let mut writer_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // -----------------------------------------------------------------------
+    // Start syslog listener if enabled
+    // -----------------------------------------------------------------------
+    if config.syslog.enabled {
+        let config_clone = config.clone();
+        let syslog_shutdown_rx = shutdown_rx.clone();
+
+        // Build the handler BEFORE spawning so we can extract the writer JoinHandle.
+        let syslog_handler: Arc<dyn syslog::listener::SyslogHandler> =
+            if let Some(s3_cfg) = config_clone.syslog.s3.as_ref() {
                 match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
                     Ok(sink) => {
                         let writer_cfg = forwarding::syslog_s3::SyslogS3WriterConfig {
                             max_buffer_rows: s3_cfg.max_buffer_rows,
-                            flush_interval: std::time::Duration::from_secs(
-                                s3_cfg.flush_interval_secs,
-                            ),
+                            flush_interval: Duration::from_secs(s3_cfg.flush_interval_secs),
                             key_prefix: s3_cfg.prefix.clone(),
                         };
-                        let handler = forwarding::syslog_s3::SyslogS3Handler::start_with_capacity(
-                            writer_cfg,
-                            Arc::new(sink),
-                            s3_cfg.channel_capacity,
-                        );
+                        let (handler, writer_handle) =
+                            forwarding::syslog_s3::SyslogS3Handler::start_with_capacity(
+                                writer_cfg,
+                                Arc::new(sink),
+                                s3_cfg.channel_capacity,
+                            );
+                        writer_handles.push(writer_handle);
                         Arc::new(handler)
                     }
                     Err(e) => {
@@ -97,125 +101,141 @@ async fn async_main() -> anyhow::Result<()> {
                 ))
             };
 
-            let listener = syslog::listener::SyslogListener::new(syslog_config, handler);
-            if let Err(e) = listener.start().await {
+        let syslog_config = syslog::listener::SyslogListenerConfig {
+            udp_port: config_clone.syslog.udp_port,
+            tcp_port: config_clone.syslog.tcp_port,
+            bind_address: "0.0.0.0".to_string(),
+            parse_dns_logs: config_clone.syslog.parse_dns,
+        };
+        let handle = tokio::spawn(async move {
+            let listener = syslog::listener::SyslogListener::new(syslog_config, syslog_handler);
+            if let Err(e) = listener.start_with_shutdown(syslog_shutdown_rx).await {
                 error!("Syslog listener error: {}", e);
             }
         });
-        info!(
-            "Syslog listener started on UDP:{}/TCP:{}",
-            config.syslog.udp_port, config.syslog.tcp_port
-        );
+        listener_handles.push(handle);
     }
 
+    // -----------------------------------------------------------------------
     // Start IPFIX listener if enabled
+    // -----------------------------------------------------------------------
     if config.ipfix.enabled {
         let ipfix_config_clone = config.clone();
-        tokio::spawn(async move {
-            let listener_config = ipfix::listener::IpfixListenerConfig {
-                udp_port: ipfix_config_clone.ipfix.udp_port,
-                bind_address: ipfix_config_clone.ipfix.bind_address.clone(),
-            };
+        let ipfix_shutdown_rx = shutdown_rx.clone();
 
-            let handler: Arc<dyn ipfix::listener::IpfixHandler> =
-                if let Some(s3_cfg) = ipfix_config_clone.ipfix.s3.as_ref() {
-                    match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
-                        Ok(sink) => {
-                            let writer_cfg = forwarding::ipfix_s3::IpfixS3WriterConfig {
-                                flush_threshold_bytes: s3_cfg.flush_threshold_bytes,
-                                flush_interval: std::time::Duration::from_secs(
-                                    s3_cfg.flush_interval_secs,
-                                ),
-                                key_prefix: s3_cfg.prefix.clone(),
-                                max_buffer_rows: s3_cfg.max_buffer_rows,
-                            };
-                            let handler = forwarding::ipfix_s3::IpfixS3Handler::start_with_capacity(
+        let ipfix_handler: Arc<dyn ipfix::listener::IpfixHandler> =
+            if let Some(s3_cfg) = ipfix_config_clone.ipfix.s3.as_ref() {
+                match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
+                    Ok(sink) => {
+                        let writer_cfg = forwarding::ipfix_s3::IpfixS3WriterConfig {
+                            flush_threshold_bytes: s3_cfg.flush_threshold_bytes,
+                            flush_interval: Duration::from_secs(s3_cfg.flush_interval_secs),
+                            key_prefix: s3_cfg.prefix.clone(),
+                            max_buffer_rows: s3_cfg.max_buffer_rows,
+                        };
+                        let (handler, writer_handle) =
+                            forwarding::ipfix_s3::IpfixS3Handler::start_with_capacity(
                                 writer_cfg,
                                 Arc::new(sink),
                                 s3_cfg.channel_capacity,
                             );
-                            Arc::new(handler)
-                        }
-                        Err(e) => {
-                            error!(
-                                "Failed to create S3Sink for IPFIX persistence, \
-                                 falling back to DefaultIpfixHandler: {e}"
-                            );
-                            Arc::new(ipfix::listener::DefaultIpfixHandler)
-                        }
+                        writer_handles.push(writer_handle);
+                        Arc::new(handler)
                     }
-                } else {
-                    Arc::new(ipfix::listener::DefaultIpfixHandler)
-                };
+                    Err(e) => {
+                        error!(
+                            "Failed to create S3Sink for IPFIX persistence, \
+                                 falling back to DefaultIpfixHandler: {e}"
+                        );
+                        Arc::new(ipfix::listener::DefaultIpfixHandler)
+                    }
+                }
+            } else {
+                Arc::new(ipfix::listener::DefaultIpfixHandler)
+            };
 
-            let listener = ipfix::listener::IpfixListener::new(listener_config, handler);
-            if let Err(e) = listener.start().await {
+        let listener_config = ipfix::listener::IpfixListenerConfig {
+            udp_port: ipfix_config_clone.ipfix.udp_port,
+            bind_address: ipfix_config_clone.ipfix.bind_address.clone(),
+        };
+        let handle = tokio::spawn(async move {
+            let listener = ipfix::listener::IpfixListener::new(listener_config, ipfix_handler);
+            if let Err(e) = listener.start_with_shutdown(ipfix_shutdown_rx).await {
                 error!("IPFIX listener error: {}", e);
             }
         });
-        info!("IPFIX listener started on UDP:{}", config.ipfix.udp_port);
+        listener_handles.push(handle);
     }
 
+    // -----------------------------------------------------------------------
     // Start Zeek listener if enabled
+    // -----------------------------------------------------------------------
     if config.zeek.enabled {
         let zeek_config_clone = config.clone();
-        tokio::spawn(async move {
-            let listener_config = zeek::listener::ZeekListenerConfig {
-                tcp_port: zeek_config_clone.zeek.tcp_port,
-                bind_address: zeek_config_clone.zeek.bind_address.clone(),
-            };
+        let zeek_shutdown_rx = shutdown_rx.clone();
 
-            let handler: Arc<dyn zeek::listener::ZeekHandler> =
-                if let Some(s3_cfg) = zeek_config_clone.zeek.s3.as_ref() {
-                    match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
-                        Ok(sink) => {
-                            let writer_cfg = forwarding::zeek_s3::ZeekS3WriterConfig {
-                                flush_threshold_bytes: s3_cfg.flush_threshold_bytes,
-                                flush_interval: std::time::Duration::from_secs(
-                                    s3_cfg.flush_interval_secs,
-                                ),
-                                key_prefix: s3_cfg.prefix.clone(),
-                                max_buffer_rows: s3_cfg.max_buffer_rows,
-                            };
-                            let handler = forwarding::zeek_s3::ZeekS3Handler::start_with_capacity(
+        let zeek_handler: Arc<dyn zeek::listener::ZeekHandler> =
+            if let Some(s3_cfg) = zeek_config_clone.zeek.s3.as_ref() {
+                match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
+                    Ok(sink) => {
+                        let writer_cfg = forwarding::zeek_s3::ZeekS3WriterConfig {
+                            flush_threshold_bytes: s3_cfg.flush_threshold_bytes,
+                            flush_interval: Duration::from_secs(s3_cfg.flush_interval_secs),
+                            key_prefix: s3_cfg.prefix.clone(),
+                            max_buffer_rows: s3_cfg.max_buffer_rows,
+                        };
+                        let (handler, writer_handle) =
+                            forwarding::zeek_s3::ZeekS3Handler::start_with_capacity(
                                 writer_cfg,
                                 Arc::new(sink),
                                 s3_cfg.channel_capacity,
                             );
-                            Arc::new(handler)
-                        }
-                        Err(e) => {
-                            error!(
-                                "Failed to create S3Sink for Zeek persistence, \
-                                 falling back to DefaultZeekHandler: {e}"
-                            );
-                            Arc::new(zeek::listener::DefaultZeekHandler)
-                        }
+                        writer_handles.push(writer_handle);
+                        Arc::new(handler)
                     }
-                } else {
-                    Arc::new(zeek::listener::DefaultZeekHandler)
-                };
+                    Err(e) => {
+                        error!(
+                            "Failed to create S3Sink for Zeek persistence, \
+                                 falling back to DefaultZeekHandler: {e}"
+                        );
+                        Arc::new(zeek::listener::DefaultZeekHandler)
+                    }
+                }
+            } else {
+                Arc::new(zeek::listener::DefaultZeekHandler)
+            };
 
-            let listener = zeek::listener::ZeekListener::new(listener_config, handler);
-            if let Err(e) = listener.start().await {
+        let listener_config = zeek::listener::ZeekListenerConfig {
+            tcp_port: zeek_config_clone.zeek.tcp_port,
+            bind_address: zeek_config_clone.zeek.bind_address.clone(),
+        };
+        let handle = tokio::spawn(async move {
+            let listener = zeek::listener::ZeekListener::new(listener_config, zeek_handler);
+            if let Err(e) = listener.start_with_shutdown(zeek_shutdown_rx).await {
                 error!("Zeek listener error: {}", e);
             }
         });
-        info!("Zeek listener started on TCP:{}", config.zeek.tcp_port);
+        listener_handles.push(handle);
     }
 
-    // Create and run server
+    // -----------------------------------------------------------------------
+    // Create axum server
+    // -----------------------------------------------------------------------
     let server = Server::new(config, shared_config, throughput).await?;
 
-    // Handle shutdown signals
-    let shutdown = tokio::spawn(async move {
+    // -----------------------------------------------------------------------
+    // Shutdown signal task
+    // -----------------------------------------------------------------------
+    let shutdown_signal = async {
         tokio::signal::ctrl_c()
             .await
             .expect("Failed to install Ctrl+C handler");
         info!("Shutdown signal received");
-    });
+    };
 
-    // Run server
+    // -----------------------------------------------------------------------
+    // Run server until shutdown
+    // -----------------------------------------------------------------------
     tokio::select! {
         result = server.run_tls() => {
             if let Err(e) = result {
@@ -223,10 +243,79 @@ async fn async_main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
-        _ = shutdown => {
+        _ = shutdown_signal => {
             info!("Shutting down gracefully");
+        }
+        // H-3: Supervise listener tasks — log if any exits unexpectedly
+        result = async {
+            // Wait for the first listener handle to complete (unexpectedly)
+            let mut futs = futures::stream::FuturesUnordered::new();
+            for h in &mut listener_handles {
+                futs.push(h);
+            }
+            use futures::StreamExt;
+            futs.next().await
+        } => {
+            match result {
+                Some(Ok(())) => {
+                    warn!("A listener task exited unexpectedly (returned Ok); check logs");
+                }
+                Some(Err(e)) => {
+                    error!("A listener task panicked or was cancelled: {e}");
+                }
+                None => {}
+            }
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Graceful shutdown sequence
+    // -----------------------------------------------------------------------
+
+    // 1. Signal all listeners to stop accepting.
+    if let Err(e) = shutdown_tx.send(true) {
+        warn!("Failed to send shutdown signal: {e}");
+    }
+
+    // 2. Wait briefly for listeners to exit (they hold the last Arc<dyn Handler> clones).
+    //    After listeners exit (or are aborted), the Arc refcount drops to zero,
+    //    the Sender inside each S3 handler is dropped, the channel closes,
+    //    and the writer task flushes then exits.
+    for handle in listener_handles {
+        match tokio::time::timeout(Duration::from_secs(2), handle).await {
+            Ok(_) => {}
+            Err(_) => {
+                // Listener didn't exit cleanly within 2s — abort it.
+                // (The handle was consumed; we already moved it in.)
+            }
+        }
+    }
+
+    // 3. The handler Arcs created in this function were moved into the listener tasks.
+    //    With the listener tasks finished (or aborted), the Arc refcounts hit zero,
+    //    the Senders drop, and the writer channels close.
+    //    Now await all writer tasks with a 10s combined timeout.
+    info!("Waiting for S3 writer tasks to flush (up to 10s)...");
+    let flush_deadline = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(flush_deadline);
+
+    for handle in writer_handles {
+        tokio::select! {
+            result = handle => {
+                match result {
+                    Ok(()) => {}
+                    Err(e) => {
+                        warn!("S3 writer task error during shutdown: {e}");
+                    }
+                }
+            }
+            _ = &mut flush_deadline => {
+                warn!("S3 writer flush timed out after 10s; some data may not have been written");
+                break;
+            }
+        }
+    }
+
+    info!("Shutdown complete");
     Ok(())
 }
