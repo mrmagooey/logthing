@@ -4,7 +4,7 @@ use crate::zeek::ZeekRecord;
 use chrono::Utc;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
@@ -100,69 +100,83 @@ impl ZeekListener {
         }
     }
 
-    /// Handle one TCP connection: BufReader + read_line loop, one NDJSON record per line.
+    /// Handle one TCP connection: BufReader + bounded read_until loop, one NDJSON record per line.
     async fn handle_tcp_connection(
         stream: TcpStream,
         src: SocketAddr,
         handler: Arc<dyn ZeekHandler>,
     ) -> anyhow::Result<()> {
         let mut reader = BufReader::new(stream);
-        let mut line = String::new();
+        let mut buf: Vec<u8> = Vec::new();
 
         loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => {
-                    debug!("Zeek TCP connection from {} closed", src);
-                    break;
-                }
-                Ok(_) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    // Oversized-line guard.
-                    if trimmed.len() > ZEEK_MAX_LINE_BYTES {
-                        metrics::counter!("zeek_oversized_lines").increment(1);
-                        warn!(
-                            "Zeek: oversized line ({} bytes) from {} — skipping",
-                            trimmed.len(),
-                            src
-                        );
-                        continue;
-                    }
-                    // Parse JSON.
-                    match serde_json::from_str::<serde_json::Value>(trimmed) {
-                        Err(e) => {
-                            metrics::counter!("zeek_parse_errors").increment(1);
-                            warn!(
-                                "Zeek: JSON parse error from {}: {} — line: {}",
-                                src,
-                                e,
-                                &trimmed[..trimmed.len().min(120)],
-                            );
-                        }
-                        Ok(value) => {
-                            // Extract _path.
-                            let log_path = match value.get("_path").and_then(|v| v.as_str()) {
-                                Some(p) => p.to_string(),
-                                None => {
-                                    metrics::counter!("zeek_missing_path").increment(1);
-                                    "unknown".to_string()
-                                }
-                            };
-                            let record = ZeekRecord {
-                                log_path,
-                                fields: value,
-                                received_at: Utc::now(),
-                            };
-                            handler.handle_record(record, src).await;
-                        }
-                    }
-                }
+            buf.clear();
+            let mut limited = (&mut reader).take((ZEEK_MAX_LINE_BYTES as u64) + 1);
+            let n = match limited.read_until(b'\n', &mut buf).await {
+                Ok(n) => n,
                 Err(e) => {
                     error!("Zeek TCP read error from {}: {}", src, e);
                     break;
+                }
+            };
+            if n == 0 {
+                debug!("Zeek TCP connection from {} closed", src);
+                break;
+            }
+            // If we read ZEEK_MAX_LINE_BYTES+1 bytes and the last byte is NOT a newline,
+            // the line exceeded the cap — close the connection (resyncing is itself unbounded).
+            if buf.len() > ZEEK_MAX_LINE_BYTES && buf.last() != Some(&b'\n') {
+                metrics::counter!("zeek_oversized_lines").increment(1);
+                warn!(
+                    "Zeek: line from {} exceeded {} bytes; closing connection",
+                    src, ZEEK_MAX_LINE_BYTES
+                );
+                break;
+            }
+            // Trim trailing \r\n / \n.
+            if buf.last() == Some(&b'\n') {
+                buf.pop();
+            }
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            if buf.is_empty() {
+                continue;
+            }
+            let line = match std::str::from_utf8(&buf) {
+                Ok(s) => s,
+                Err(_) => {
+                    metrics::counter!("zeek_parse_errors").increment(1);
+                    warn!("Zeek: non-UTF-8 line from {}; skipping", src);
+                    continue;
+                }
+            };
+            // Parse JSON.
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Err(e) => {
+                    metrics::counter!("zeek_parse_errors").increment(1);
+                    warn!(
+                        "Zeek: JSON parse error from {}: {} — line: {}",
+                        src,
+                        e,
+                        &line[..line.len().min(120)],
+                    );
+                }
+                Ok(value) => {
+                    // Extract _path.
+                    let log_path = match value.get("_path").and_then(|v| v.as_str()) {
+                        Some(p) => p.to_string(),
+                        None => {
+                            metrics::counter!("zeek_missing_path").increment(1);
+                            "unknown".to_string()
+                        }
+                    };
+                    let record = ZeekRecord {
+                        log_path,
+                        fields: value,
+                        received_at: Utc::now(),
+                    };
+                    handler.handle_record(record, src).await;
                 }
             }
         }
@@ -175,6 +189,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::time::Duration;
+    use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     use tokio::time::sleep;
 
@@ -382,5 +397,141 @@ mod tests {
         assert!(paths.contains("conn"));
         assert!(paths.contains("http"));
         assert!(paths.contains("files"));
+    }
+
+    /// Integration test: a line exceeding ZEEK_MAX_LINE_BYTES (with no newline) closes the
+    /// connection and does NOT dispatch a record.
+    ///
+    /// To keep the test fast and deterministic without sending 16 MiB of data, we use
+    /// `handle_tcp_connection` directly with an in-process TCP pair and send
+    /// ZEEK_MAX_LINE_BYTES + 1 bytes of junk with no newline. The handler must close the
+    /// connection (and not dispatch a record) well within the test timeout.
+    ///
+    /// Metrics: we install a thread-local DebuggingRecorder so we can assert that
+    /// `zeek_oversized_lines` is incremented exactly once.
+    #[tokio::test]
+    async fn oversized_line_closes_connection_and_increments_metric() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::DebuggingRecorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use tokio::time::timeout;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+
+        let handler = CapturingHandler::new();
+        let handler_clone = handler.clone();
+        let listener = ZeekListener::new(ZeekListenerConfig::default(), handler_clone);
+
+        let task = tokio::spawn(async move {
+            listener.run_with_listener(tcp_listener).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        // Send ZEEK_MAX_LINE_BYTES + 1 bytes of 'x' with NO newline — this exceeds the cap.
+        let oversized = vec![b'x'; ZEEK_MAX_LINE_BYTES + 1];
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Write the oversized blob.  The server will read up to ZEEK_MAX_LINE_BYTES+1 bytes
+        // via `take`, detect overrun, and close its side.  We don't wait for the write to
+        // complete — the server closing its half is what we observe.
+        let _ = stream.write_all(&oversized).await;
+
+        // The server should close the connection promptly.  Wait up to 2 s.
+        let result = timeout(Duration::from_secs(2), async {
+            let mut sink = Vec::new();
+            stream.read_to_end(&mut sink).await
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "server did not close oversized connection within 2 s"
+        );
+
+        // No record should have been dispatched.
+        sleep(Duration::from_millis(50)).await;
+        task.abort();
+
+        let records = handler.take_records();
+        assert!(
+            records.is_empty(),
+            "oversized input must not produce a record; got {}",
+            records.len()
+        );
+
+        // Assert the metric counter was incremented.
+        let snapshot = snapshotter.snapshot();
+        let map = snapshot.into_hashmap();
+        let key = CompositeKey::new(
+            MetricKind::Counter,
+            metrics::Key::from_name("zeek_oversized_lines"),
+        );
+        let count = map
+            .get(&key)
+            .map(|(_, _, v)| {
+                if let metrics_util::debugging::DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            count, 1,
+            "zeek_oversized_lines counter must be 1; got {count}"
+        );
+    }
+
+    /// After an oversized-line disconnection, a new connection still works correctly.
+    #[tokio::test]
+    async fn valid_connection_after_oversized_still_works() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+
+        let handler = CapturingHandler::new();
+        let handler_clone = handler.clone();
+        let listener = ZeekListener::new(ZeekListenerConfig::default(), handler_clone);
+
+        let task = tokio::spawn(async move {
+            listener.run_with_listener(tcp_listener).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        // First connection: oversized.
+        {
+            let oversized = vec![b'x'; ZEEK_MAX_LINE_BYTES + 1];
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let _ = stream.write_all(&oversized).await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut sink = Vec::new();
+                stream.read_to_end(&mut sink).await
+            })
+            .await;
+        }
+
+        // Second connection: valid record.
+        {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"{\"_path\":\"conn\",\"uid\":\"OK\"}\n")
+                .await
+                .unwrap();
+            drop(stream);
+        }
+
+        sleep(Duration::from_millis(150)).await;
+        task.abort();
+
+        let records = handler.take_records();
+        assert_eq!(
+            records.len(),
+            1,
+            "second connection should produce 1 record"
+        );
+        assert_eq!(records[0].log_path, "conn");
     }
 }
