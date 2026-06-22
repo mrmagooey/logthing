@@ -620,18 +620,15 @@ mod tests {
     // -- Helper: build an S3Sink that always fails (unreachable port 1) --
 
     async fn unreachable_sink() -> Arc<S3Sink> {
-        use crate::forwarding::parquet_s3::ParquetS3Config;
-        let cfg = ParquetS3Config {
+        use crate::config::S3ConnectionConfig;
+        let conn = S3ConnectionConfig {
             endpoint: "http://127.0.0.1:1".to_string(), // port 1 is always refused
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
             access_key: "AKIATEST".to_string(),
             secret_key: "SECRETTEST".to_string(),
-            max_file_size_mb: 10,
-            flush_interval_secs: 60,
-            local_buffer_path: std::env::temp_dir().join("syslog-s3-test"),
         };
-        Arc::new(S3Sink::from_config(&cfg).await.expect("constructs"))
+        Arc::new(S3Sink::from_connection(&conn).await.expect("constructs"))
     }
 
     // -- I1: SyslogS3Writer lifecycle unit test --
