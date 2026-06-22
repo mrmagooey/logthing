@@ -18,8 +18,8 @@ bucket     = "wef-events"
 region     = "us-east-1"
 access_key = "miniouser"
 secret_key = "miniopassword"
-key_prefix = "syslog/"
-max_buffer_rows     = 10
+prefix     = "syslog"
+max_buffer_rows     = 1
 flush_interval_secs = 5
 
 [ipfix]
