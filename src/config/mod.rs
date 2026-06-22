@@ -42,6 +42,9 @@ pub struct Config {
 
     #[serde(default)]
     pub ipfix: IpfixConfig,
+
+    #[serde(default)]
+    pub zeek: ZeekConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -238,6 +241,83 @@ fn default_ipfix_bind_address() -> String {
     "0.0.0.0".to_string()
 }
 
+/// Configuration for the Zeek NDJSON TCP listener.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ZeekConfig {
+    #[serde(default = "default_zeek_enabled")]
+    pub enabled: bool,
+
+    #[serde(default = "default_zeek_tcp_port")]
+    pub tcp_port: u16,
+
+    #[serde(default = "default_zeek_bind_address")]
+    pub bind_address: String,
+
+    /// Optional S3 persistence. Absent from TOML → `None` → no persistence.
+    #[serde(default)]
+    pub s3: Option<ZeekS3Config>,
+}
+
+impl Default for ZeekConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_zeek_enabled(),
+            tcp_port: default_zeek_tcp_port(),
+            bind_address: default_zeek_bind_address(),
+            s3: None,
+        }
+    }
+}
+
+fn default_zeek_enabled() -> bool {
+    false
+}
+fn default_zeek_tcp_port() -> u16 {
+    47760
+}
+fn default_zeek_bind_address() -> String {
+    "0.0.0.0".to_string()
+}
+
+/// Per-source S3 persistence config for the Zeek listener.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ZeekS3Config {
+    /// Shared S3 connection fields. Flattened so TOML stays flat: `[zeek.s3]\nendpoint = …`
+    #[serde(flatten)]
+    pub connection: S3ConnectionConfig,
+    /// S3 key prefix, slash-free (default: `"zeek"`).
+    #[serde(default = "default_zeek_s3_prefix")]
+    pub prefix: String,
+    /// Flush when estimated buffer bytes exceeds this (default: 100 MiB).
+    #[serde(default = "default_zeek_flush_bytes")]
+    pub flush_threshold_bytes: usize,
+    /// Flush after this many seconds regardless of buffer size (default: 900).
+    #[serde(default = "default_zeek_flush_secs")]
+    pub flush_interval_secs: u64,
+    /// Bounded channel capacity (default: 256).
+    #[serde(default = "default_zeek_channel_capacity")]
+    pub channel_capacity: usize,
+    /// Maximum buffered rows before hard cap kicks in (default: 100_000).
+    #[serde(default = "default_zeek_max_buffer_rows")]
+    pub max_buffer_rows: usize,
+}
+
+fn default_zeek_s3_prefix() -> String {
+    "zeek".to_string()
+}
+fn default_zeek_flush_bytes() -> usize {
+    100 * 1024 * 1024
+}
+fn default_zeek_flush_secs() -> u64 {
+    900
+}
+fn default_zeek_channel_capacity() -> usize {
+    256
+}
+fn default_zeek_max_buffer_rows() -> usize {
+    100_000
+}
+
 impl Default for SyslogConfig {
     fn default() -> Self {
         Self {
@@ -261,6 +341,7 @@ impl Default for Config {
             metrics: MetricsConfig::default(),
             syslog: SyslogConfig::default(),
             ipfix: IpfixConfig::default(),
+            zeek: ZeekConfig::default(),
         }
     }
 }
@@ -529,6 +610,54 @@ secret_key = "FSKEY"
         assert!(!cfg.ipfix.enabled, "ipfix disabled by default");
         assert_eq!(cfg.ipfix.udp_port, 4739);
         assert_eq!(cfg.ipfix.bind_address, "0.0.0.0");
+    }
+
+    #[test]
+    fn zeek_s3_absent_gives_none() {
+        let cfg = Config::default();
+        assert!(
+            cfg.zeek.s3.is_none(),
+            "absent [zeek.s3] must deserialize to None"
+        );
+    }
+
+    #[test]
+    fn zeek_s3_flat_toml_deserializes_correctly() {
+        let toml_str = r#"
+[zeek]
+enabled = true
+tcp_port = 47760
+[zeek.s3]
+endpoint   = "http://minio:9000"
+bucket     = "zeek-logs"
+region     = "us-east-1"
+access_key = "KEY"
+secret_key = "SECRET"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse config");
+        assert!(cfg.zeek.enabled);
+        let s3 = cfg.zeek.s3.expect("s3 present");
+        assert_eq!(s3.connection.bucket, "zeek-logs");
+        assert_eq!(s3.prefix, "zeek");
+        assert_eq!(s3.flush_threshold_bytes, 100 * 1024 * 1024);
+        assert_eq!(s3.flush_interval_secs, 900);
+        assert_eq!(s3.channel_capacity, 256);
+        assert_eq!(s3.max_buffer_rows, 100_000);
+    }
+
+    #[test]
+    fn zeek_s3_absent_section_means_no_persistence() {
+        let toml_str = "[zeek]\nenabled = true\n";
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.zeek.s3.is_none(), "absent [zeek.s3] must yield None");
+    }
+
+    #[test]
+    fn default_zeek_config_disabled_on_port_47760() {
+        let cfg = Config::default();
+        assert!(!cfg.zeek.enabled, "zeek disabled by default");
+        assert_eq!(cfg.zeek.tcp_port, 47760);
+        assert_eq!(cfg.zeek.bind_address, "0.0.0.0");
     }
 
     #[test]
