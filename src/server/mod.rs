@@ -323,8 +323,6 @@ impl Server {
     /// }
     /// ```
     pub async fn run_tls(self) -> anyhow::Result<()> {
-        use axum_server::tls_rustls::RustlsConfig;
-
         if !self.config.tls.enabled {
             return self.run().await;
         }
@@ -337,21 +335,7 @@ impl Server {
 
         let app = self.create_router(ip_whitelist)?;
 
-        // Load TLS configuration from PEM files
-        let cert_file = self
-            .config
-            .tls
-            .cert_file
-            .as_ref()
-            .expect("TLS enabled but no cert_file specified");
-        let key_file = self
-            .config
-            .tls
-            .key_file
-            .as_ref()
-            .expect("TLS enabled but no key_file specified");
-
-        let tls_config = RustlsConfig::from_pem_file(cert_file, key_file).await?;
+        let tls_config = build_tls_config(&self.config.tls)?;
         let tls_addr: SocketAddr = format!("0.0.0.0:{}", self.config.tls.port).parse()?;
 
         info!("Starting WEF server with TLS on https://{}", tls_addr);
@@ -1019,6 +1003,31 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// H-4: `build_tls_config` must fail with a clear error when
+    /// `require_client_cert` is `true` but no `ca_file` is supplied.
+    #[test]
+    fn require_client_cert_without_ca_file_returns_error() {
+        use crate::config::TlsConfig;
+        use std::path::PathBuf;
+
+        let tls = TlsConfig {
+            enabled: true,
+            port: 5986,
+            cert_file: Some(PathBuf::from("/tmp/dummy.crt")),
+            key_file: Some(PathBuf::from("/tmp/dummy.key")),
+            ca_file: None,
+            require_client_cert: true,
+        };
+
+        let result = build_tls_config(&tls);
+        assert!(result.is_err(), "expected Err when ca_file is absent");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("ca_file"),
+            "error message must mention ca_file, got: {err_msg}"
+        );
+    }
+
     #[test]
     fn body_size_limit_const_is_sane() {
         assert_eq!(MAX_BODY_SIZE, 64 * 1024 * 1024);
@@ -1141,6 +1150,92 @@ mod tests {
             response.headers().contains_key("www-authenticate"),
             "401 response must include WWW-Authenticate header"
         );
+    }
+}
+
+/// Build a `RustlsConfig` from the TLS section of the server config.
+///
+/// When `tls.require_client_cert` is `true` the function fails with an error
+/// if `ca_file` is absent, then constructs a `rustls::ServerConfig` with a
+/// `WebPkiClientVerifier` that mandates a valid client certificate signed by
+/// the given CA.  When `require_client_cert` is `false` the simpler
+/// `RustlsConfig::from_pem_file` path is used (server-only TLS).
+fn build_tls_config(
+    tls: &crate::config::TlsConfig,
+) -> anyhow::Result<axum_server::tls_rustls::RustlsConfig> {
+    use axum_server::tls_rustls::RustlsConfig;
+    use rustls::RootCertStore;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::server::WebPkiClientVerifier;
+
+    let cert_file = tls
+        .cert_file
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("TLS enabled but no cert_file specified"))?;
+    let key_file = tls
+        .key_file
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("TLS enabled but no key_file specified"))?;
+
+    if tls.require_client_cert {
+        let ca_file = tls.ca_file.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("require_client_cert is true but no ca_file specified")
+        })?;
+
+        // Load CA certificate(s) into a root store.
+        let ca_f = std::fs::File::open(ca_file)?;
+        let mut ca_reader = std::io::BufReader::new(ca_f);
+        let ca_certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
+
+        let mut root_store = RootCertStore::empty();
+        for cert in ca_certs {
+            root_store.add(cert)?;
+        }
+
+        // Build a client verifier that requires a cert signed by the CA.
+        let verifier = WebPkiClientVerifier::builder(Arc::new(root_store)).build()?;
+
+        // Load server cert chain.
+        let cert_f = std::fs::File::open(cert_file)?;
+        let mut cert_reader = std::io::BufReader::new(cert_f);
+        let certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+
+        // Load server private key.
+        let key_f = std::fs::File::open(key_file)?;
+        let mut key_reader = std::io::BufReader::new(key_f);
+        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)?
+            .ok_or_else(|| anyhow::anyhow!("no private key found in key_file"))?;
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)?;
+
+        info!(
+            "mTLS enabled: client certificates required (CA from {:?})",
+            ca_file
+        );
+        Ok(RustlsConfig::from_config(Arc::new(server_config)))
+    } else {
+        // Server-only TLS — load synchronously via from_pem_file equivalent.
+        // RustlsConfig::from_pem_file is async; build the config inline instead
+        // so this function can remain synchronous and easily testable.
+        let cert_f = std::fs::File::open(cert_file)?;
+        let mut cert_reader = std::io::BufReader::new(cert_f);
+        let certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+
+        let key_f = std::fs::File::open(key_file)?;
+        let mut key_reader = std::io::BufReader::new(key_f);
+        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)?
+            .ok_or_else(|| anyhow::anyhow!("no private key found in key_file"))?;
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)?;
+
+        Ok(RustlsConfig::from_config(Arc::new(server_config)))
     }
 }
 
