@@ -10,7 +10,7 @@ use tokio::{net::TcpListener, sync::RwLock};
 use tracing::{error, info};
 
 use crate::admin::auth::{ensure_authorized, generate_csrf_token};
-use crate::admin::config_api::{PartialConfigUpdate, persist_config};
+use crate::admin::config_api::{PartialConfigUpdate, persist_config, redacted_config};
 use crate::admin::middleware::security_middleware;
 use crate::admin::state::{AdminServerConfig, AdminState, AuditLogger, load_admin_config};
 use crate::config::Config;
@@ -156,7 +156,7 @@ async fn get_config(
         .log("CONFIG_READ", &username, &client_ip, None)
         .await;
 
-    Ok(Json(cfg.clone()))
+    Ok(Json(redacted_config(&cfg)))
 }
 
 /// Admin page endpoint

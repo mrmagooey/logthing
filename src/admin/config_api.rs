@@ -13,7 +13,42 @@ use tokio::fs;
 
 use crate::admin::auth::ensure_authorized;
 use crate::admin::state::AdminState;
-use crate::config::{ADMIN_OVERRIDE_FILE, Config};
+use crate::config::{ADMIN_OVERRIDE_FILE, Config, S3ConnectionConfig};
+
+const REDACTED: &str = "***REDACTED***";
+
+/// Return a copy of an `S3ConnectionConfig` with credentials replaced by a
+/// placeholder so they can never appear in API responses.
+fn redact_s3_connection(conn: &S3ConnectionConfig) -> S3ConnectionConfig {
+    S3ConnectionConfig {
+        endpoint: conn.endpoint.clone(),
+        bucket: conn.bucket.clone(),
+        region: conn.region.clone(),
+        access_key: REDACTED.to_string(),
+        secret_key: REDACTED.to_string(),
+    }
+}
+
+/// Produce a sanitised copy of `cfg` where every `access_key` / `secret_key`
+/// field is replaced with `***REDACTED***`.
+///
+/// NOTE: export → import round-trips will lose the real credentials — that is
+/// intentional.  A security-export must never contain live secrets.
+pub fn redacted_config(cfg: &Config) -> Config {
+    let mut out = cfg.clone();
+
+    if let Some(ref mut s3) = out.syslog.s3 {
+        s3.connection = redact_s3_connection(&s3.connection);
+    }
+    if let Some(ref mut s3) = out.ipfix.s3 {
+        s3.connection = redact_s3_connection(&s3.connection);
+    }
+    if let Some(ref mut s3) = out.zeek.s3 {
+        s3.connection = redact_s3_connection(&s3.connection);
+    }
+
+    out
+}
 
 /// Validation result for configuration
 #[derive(Serialize)]
@@ -214,9 +249,12 @@ pub async fn export_config(
     let client_ip = addr.ip().to_string();
     let username = ensure_authorized(&state, auth, &client_ip).await?;
 
-    let cfg = state.config.read().await.clone();
+    let cfg = redacted_config(&*state.config.read().await);
 
-    // Export as TOML (primary format)
+    // Export as TOML (primary format).
+    // NOTE: Credentials are redacted in the export; an import of this file will
+    // require re-entering secrets.  This is intentional — a security export
+    // must never contain live credentials.
     let toml_content = match toml::to_string_pretty(&cfg) {
         Ok(content) => content,
         Err(e) => {
@@ -387,4 +425,101 @@ pub async fn write_config_to_path(config: &Config, path: &std::path::Path) -> an
     let contents = toml::to_string_pretty(config)?;
     fs::write(path, contents).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admin::state::{AdminServerConfig, AdminState, AuditLogger, PasswordHash};
+    use crate::config::{S3ConnectionConfig, SyslogS3Config};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    async fn make_state_with_s3_secrets() -> AdminState {
+        let server_config = AdminServerConfig {
+            bind_address: "0.0.0.0:8080".parse().unwrap(),
+            username: "admin".to_string(),
+            password_hash: PasswordHash::hash("admin").unwrap(),
+            allowed_ips: vec![],
+            tls_config: None,
+            enable_csrf: false,
+            enable_rate_limiting: false,
+        };
+
+        let mut cfg = Config::default();
+        cfg.syslog.s3 = Some(SyslogS3Config {
+            connection: S3ConnectionConfig {
+                endpoint: "http://minio:9000".to_string(),
+                bucket: "logs".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "REAL_ACCESS_KEY".to_string(),
+                secret_key: "REAL_SECRET_KEY".to_string(),
+            },
+            prefix: "syslog".to_string(),
+            max_buffer_rows: 10_000,
+            flush_interval_secs: 900,
+            channel_capacity: 4_096,
+        });
+
+        AdminState {
+            config: Arc::new(RwLock::new(cfg)),
+            server_config,
+            audit_logger: AuditLogger::new(100).await,
+            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
+            request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+
+    // H-6: redacted_config must replace credentials with placeholder.
+    #[tokio::test]
+    async fn redacted_config_masks_syslog_s3_secrets() {
+        let state = make_state_with_s3_secrets().await;
+        let cfg = state.config.read().await.clone();
+        let out = redacted_config(&cfg);
+
+        let s3 = out.syslog.s3.expect("s3 present");
+        assert_eq!(s3.connection.access_key, REDACTED);
+        assert_eq!(s3.connection.secret_key, REDACTED);
+        // Non-secret fields are preserved.
+        assert_eq!(s3.connection.bucket, "logs");
+        assert_eq!(s3.connection.endpoint, "http://minio:9000");
+    }
+
+    // H-6: the JSON serialised by get_config / export_config must not contain real secrets.
+    #[tokio::test]
+    async fn redacted_config_json_contains_no_real_secrets() {
+        let state = make_state_with_s3_secrets().await;
+        let cfg = state.config.read().await.clone();
+        let out = redacted_config(&cfg);
+
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(
+            !json.contains("REAL_ACCESS_KEY"),
+            "access_key must not appear in JSON: {json}"
+        );
+        assert!(
+            !json.contains("REAL_SECRET_KEY"),
+            "secret_key must not appear in JSON: {json}"
+        );
+        assert!(json.contains(REDACTED));
+    }
+
+    // H-6: export serialises to TOML and must not contain real secrets.
+    #[tokio::test]
+    async fn redacted_config_toml_contains_no_real_secrets() {
+        let state = make_state_with_s3_secrets().await;
+        let cfg = state.config.read().await.clone();
+        let out = redacted_config(&cfg);
+
+        let toml_str = toml::to_string_pretty(&out).unwrap();
+        assert!(
+            !toml_str.contains("REAL_ACCESS_KEY"),
+            "access_key must not appear in TOML export: {toml_str}"
+        );
+        assert!(
+            !toml_str.contains("REAL_SECRET_KEY"),
+            "secret_key must not appear in TOML export: {toml_str}"
+        );
+        assert!(toml_str.contains(REDACTED));
+    }
 }
