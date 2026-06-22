@@ -5,6 +5,7 @@ use arrow::array::{ArrayRef, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use chrono::{Datelike, Utc};
+use metrics::counter;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use std::collections::HashMap;
@@ -12,7 +13,6 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
-use metrics::counter;
 
 /// Configuration for Parquet S3 forwarder
 #[derive(Clone)]
@@ -101,15 +101,12 @@ impl ParquetS3Config {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(900),
             local_buffer_path: PathBuf::from(
-                dest.headers
-                    .get("buffer-path")
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        std::env::temp_dir()
-                            .join("logthing-wef-events")
-                            .to_string_lossy()
-                            .into_owned()
-                    }),
+                dest.headers.get("buffer-path").cloned().unwrap_or_else(|| {
+                    std::env::temp_dir()
+                        .join("logthing-wef-events")
+                        .to_string_lossy()
+                        .into_owned()
+                }),
             ),
         })
     }
@@ -280,12 +277,11 @@ impl ParquetS3Forwarder {
                 .buffers
                 .get(&event_type)
                 .is_some_and(|b| !b.events.is_empty())
+                && let Err(e) = self.flush_event_type(event_type).await
             {
-                if let Err(e) = self.flush_event_type(event_type).await {
-                    warn!("flush_all: error flushing event type {}: {}", event_type, e);
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
+                warn!("flush_all: error flushing event type {}: {}", event_type, e);
+                if first_err.is_none() {
+                    first_err = Some(e);
                 }
             }
         }
