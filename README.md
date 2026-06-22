@@ -412,7 +412,7 @@ Requirements: Docker with Compose v2.
 bash tests/e2e/simulation-environment/run.sh
 ```
 
-This script builds the helper images, launches `tests/e2e/docker-compose.yml`, replays Windows event fixtures, emits syslog traffic, verifies throughput counters, and confirms Parquet files arrive in the MinIO bucket. Containers shut down automatically once the generators and verifier exit.
+This script builds the helper images, launches `tests/e2e/docker-compose.yml`, replays Windows event fixtures, emits syslog traffic, sends IPFIX flows, emits Zeek NDJSON logs, verifies throughput counters, and confirms Parquet files arrive in the MinIO bucket for each protocol. Containers shut down automatically once the generators and verifiers exit.
 
 ### Performance Testing
 
