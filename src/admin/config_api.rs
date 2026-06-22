@@ -461,9 +461,24 @@ pub struct PartialConfigUpdate {
 
 /// Persist configuration to file
 pub async fn persist_config(config: &Config) -> anyhow::Result<()> {
-    let path = std::env::var("WEF_ADMIN_OVERRIDE_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(ADMIN_OVERRIDE_FILE));
+    // SECURITY (M-11): WEF_ADMIN_OVERRIDE_FILE is an operator-controlled env var
+    // that determines the write path for the persisted config.  An attacker who
+    // can set this env var already has the ability to run arbitrary code in the
+    // process environment, so the privilege escalation risk is low.  We emit a
+    // tracing::warn the first time a non-default path is used so that the
+    // operator is aware it has been overridden (visible in structured logs).
+    let path = match std::env::var("WEF_ADMIN_OVERRIDE_FILE") {
+        Ok(v) => {
+            let p = PathBuf::from(&v);
+            tracing::warn!(
+                path = %v,
+                "WEF_ADMIN_OVERRIDE_FILE is set; config will be written to a \
+                 non-default path — verify this is intentional"
+            );
+            p
+        }
+        Err(_) => PathBuf::from(ADMIN_OVERRIDE_FILE),
+    };
 
     write_config_to_path(config, &path).await
 }
