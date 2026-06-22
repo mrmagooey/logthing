@@ -268,18 +268,33 @@ fn map_conn(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     }
 
     let uid = json_str(value, "uid");
+    if value.get("uid").is_some() && uid.is_none() {
+        mismatches.push("uid");
+    }
     let id_orig_h = json_str(value, "id.orig_h");
+    if value.get("id.orig_h").is_some() && id_orig_h.is_none() {
+        mismatches.push("id.orig_h");
+    }
     let id_orig_p = json_u16(value, "id.orig_p");
     if value.get("id.orig_p").is_some() && id_orig_p.is_none() {
         mismatches.push("id.orig_p");
     }
     let id_resp_h = json_str(value, "id.resp_h");
+    if value.get("id.resp_h").is_some() && id_resp_h.is_none() {
+        mismatches.push("id.resp_h");
+    }
     let id_resp_p = json_u16(value, "id.resp_p");
     if value.get("id.resp_p").is_some() && id_resp_p.is_none() {
         mismatches.push("id.resp_p");
     }
     let proto = json_str(value, "proto");
+    if value.get("proto").is_some() && proto.is_none() {
+        mismatches.push("proto");
+    }
     let service = json_str(value, "service");
+    if value.get("service").is_some() && service.is_none() {
+        mismatches.push("service");
+    }
     let duration = json_f64(value, "duration");
     if value.get("duration").is_some() && duration.is_none() {
         mismatches.push("duration");
@@ -293,7 +308,13 @@ fn map_conn(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
         mismatches.push("resp_bytes");
     }
     let conn_state = json_str(value, "conn_state");
+    if value.get("conn_state").is_some() && conn_state.is_none() {
+        mismatches.push("conn_state");
+    }
     let history = json_str(value, "history");
+    if value.get("history").is_some() && history.is_none() {
+        mismatches.push("history");
+    }
     let orig_pkts = json_u64(value, "orig_pkts");
     if value.get("orig_pkts").is_some() && orig_pkts.is_none() {
         mismatches.push("orig_pkts");
@@ -384,25 +405,49 @@ fn map_dns(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
         mismatches.push("ts");
     }
     let uid = json_str(value, "uid");
+    if value.get("uid").is_some() && uid.is_none() {
+        mismatches.push("uid");
+    }
     let id_orig_h = json_str(value, "id.orig_h");
+    if value.get("id.orig_h").is_some() && id_orig_h.is_none() {
+        mismatches.push("id.orig_h");
+    }
     let id_orig_p = json_u16(value, "id.orig_p");
     if value.get("id.orig_p").is_some() && id_orig_p.is_none() {
         mismatches.push("id.orig_p");
     }
     let id_resp_h = json_str(value, "id.resp_h");
+    if value.get("id.resp_h").is_some() && id_resp_h.is_none() {
+        mismatches.push("id.resp_h");
+    }
     let id_resp_p = json_u16(value, "id.resp_p");
     if value.get("id.resp_p").is_some() && id_resp_p.is_none() {
         mismatches.push("id.resp_p");
     }
     let proto = json_str(value, "proto");
+    if value.get("proto").is_some() && proto.is_none() {
+        mismatches.push("proto");
+    }
     let trans_id = json_u32(value, "trans_id");
     if value.get("trans_id").is_some() && trans_id.is_none() {
         mismatches.push("trans_id");
     }
     let query = json_str(value, "query");
+    if value.get("query").is_some() && query.is_none() {
+        mismatches.push("query");
+    }
     let qtype_name = json_str(value, "qtype_name");
+    if value.get("qtype_name").is_some() && qtype_name.is_none() {
+        mismatches.push("qtype_name");
+    }
     let qclass_name = json_str(value, "qclass_name");
+    if value.get("qclass_name").is_some() && qclass_name.is_none() {
+        mismatches.push("qclass_name");
+    }
     let rcode_name = json_str(value, "rcode_name");
+    if value.get("rcode_name").is_some() && rcode_name.is_none() {
+        mismatches.push("rcode_name");
+    }
     let answers = json_array_str(value, "answers");
     if value.get("answers").is_some() && answers.is_none() {
         mismatches.push("answers");
@@ -483,24 +528,45 @@ fn map_http(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
         mismatches.push("ts");
     }
     let uid = json_str(value, "uid");
+    if value.get("uid").is_some() && uid.is_none() {
+        mismatches.push("uid");
+    }
     let id_orig_h = json_str(value, "id.orig_h");
+    if value.get("id.orig_h").is_some() && id_orig_h.is_none() {
+        mismatches.push("id.orig_h");
+    }
     let id_orig_p = json_u16(value, "id.orig_p");
     if value.get("id.orig_p").is_some() && id_orig_p.is_none() {
         mismatches.push("id.orig_p");
     }
     let id_resp_h = json_str(value, "id.resp_h");
+    if value.get("id.resp_h").is_some() && id_resp_h.is_none() {
+        mismatches.push("id.resp_h");
+    }
     let id_resp_p = json_u16(value, "id.resp_p");
     if value.get("id.resp_p").is_some() && id_resp_p.is_none() {
         mismatches.push("id.resp_p");
     }
     let method = json_str(value, "method");
+    if value.get("method").is_some() && method.is_none() {
+        mismatches.push("method");
+    }
     let host = json_str(value, "host");
+    if value.get("host").is_some() && host.is_none() {
+        mismatches.push("host");
+    }
     let uri = json_str(value, "uri");
+    if value.get("uri").is_some() && uri.is_none() {
+        mismatches.push("uri");
+    }
     let status_code = json_u16(value, "status_code");
     if value.get("status_code").is_some() && status_code.is_none() {
         mismatches.push("status_code");
     }
     let user_agent = json_str(value, "user_agent");
+    if value.get("user_agent").is_some() && user_agent.is_none() {
+        mismatches.push("user_agent");
+    }
     let request_body_len = json_u64(value, "request_body_len");
     if value.get("request_body_len").is_some() && request_body_len.is_none() {
         mismatches.push("request_body_len");
@@ -583,21 +649,45 @@ fn map_ssl(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
         mismatches.push("ts");
     }
     let uid = json_str(value, "uid");
+    if value.get("uid").is_some() && uid.is_none() {
+        mismatches.push("uid");
+    }
     let id_orig_h = json_str(value, "id.orig_h");
+    if value.get("id.orig_h").is_some() && id_orig_h.is_none() {
+        mismatches.push("id.orig_h");
+    }
     let id_orig_p = json_u16(value, "id.orig_p");
     if value.get("id.orig_p").is_some() && id_orig_p.is_none() {
         mismatches.push("id.orig_p");
     }
     let id_resp_h = json_str(value, "id.resp_h");
+    if value.get("id.resp_h").is_some() && id_resp_h.is_none() {
+        mismatches.push("id.resp_h");
+    }
     let id_resp_p = json_u16(value, "id.resp_p");
     if value.get("id.resp_p").is_some() && id_resp_p.is_none() {
         mismatches.push("id.resp_p");
     }
     let version = json_str(value, "version");
+    if value.get("version").is_some() && version.is_none() {
+        mismatches.push("version");
+    }
     let cipher = json_str(value, "cipher");
+    if value.get("cipher").is_some() && cipher.is_none() {
+        mismatches.push("cipher");
+    }
     let curve = json_str(value, "curve");
+    if value.get("curve").is_some() && curve.is_none() {
+        mismatches.push("curve");
+    }
     let server_name = json_str(value, "server_name");
+    if value.get("server_name").is_some() && server_name.is_none() {
+        mismatches.push("server_name");
+    }
     let validation_status = json_str(value, "validation_status");
+    if value.get("validation_status").is_some() && validation_status.is_none() {
+        mismatches.push("validation_status");
+    }
 
     let extra = build_extra(value, promoted, &mismatches);
 
@@ -663,6 +753,9 @@ fn map_files(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
         mismatches.push("ts");
     }
     let fuid = json_str(value, "fuid");
+    if value.get("fuid").is_some() && fuid.is_none() {
+        mismatches.push("fuid");
+    }
     let tx_hosts = json_array_str(value, "tx_hosts");
     if value.get("tx_hosts").is_some() && tx_hosts.is_none() {
         mismatches.push("tx_hosts");
@@ -672,8 +765,17 @@ fn map_files(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
         mismatches.push("rx_hosts");
     }
     let source = json_str(value, "source");
+    if value.get("source").is_some() && source.is_none() {
+        mismatches.push("source");
+    }
     let mime_type = json_str(value, "mime_type");
+    if value.get("mime_type").is_some() && mime_type.is_none() {
+        mismatches.push("mime_type");
+    }
     let filename = json_str(value, "filename");
+    if value.get("filename").is_some() && filename.is_none() {
+        mismatches.push("filename");
+    }
     let total_bytes = json_u64(value, "total_bytes");
     if value.get("total_bytes").is_some() && total_bytes.is_none() {
         mismatches.push("total_bytes");
@@ -736,19 +838,37 @@ fn map_notice(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
         mismatches.push("ts");
     }
     let uid = json_str(value, "uid");
+    if value.get("uid").is_some() && uid.is_none() {
+        mismatches.push("uid");
+    }
     let id_orig_h = json_str(value, "id.orig_h");
+    if value.get("id.orig_h").is_some() && id_orig_h.is_none() {
+        mismatches.push("id.orig_h");
+    }
     let id_orig_p = json_u16(value, "id.orig_p");
     if value.get("id.orig_p").is_some() && id_orig_p.is_none() {
         mismatches.push("id.orig_p");
     }
     let id_resp_h = json_str(value, "id.resp_h");
+    if value.get("id.resp_h").is_some() && id_resp_h.is_none() {
+        mismatches.push("id.resp_h");
+    }
     let id_resp_p = json_u16(value, "id.resp_p");
     if value.get("id.resp_p").is_some() && id_resp_p.is_none() {
         mismatches.push("id.resp_p");
     }
     let note = json_str(value, "note");
+    if value.get("note").is_some() && note.is_none() {
+        mismatches.push("note");
+    }
     let msg = json_str(value, "msg");
+    if value.get("msg").is_some() && msg.is_none() {
+        mismatches.push("msg");
+    }
     let sub = json_str(value, "sub");
+    if value.get("sub").is_some() && sub.is_none() {
+        mismatches.push("sub");
+    }
     let actions = json_array_str(value, "actions");
     if value.get("actions").is_some() && actions.is_none() {
         mismatches.push("actions");
@@ -1309,8 +1429,8 @@ mod tests {
     #[test]
     fn conn_parquet_round_trip() {
         use bytes::Bytes;
-        use parquet::arrow::ArrowWriter;
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::arrow::ArrowWriter;
         use parquet::basic::{Compression, ZstdLevel};
         use parquet::file::properties::WriterProperties;
 
@@ -1356,10 +1476,44 @@ mod tests {
     }
 
     #[test]
+    fn conn_mapper_string_type_mismatch_goes_to_extra() {
+        // uid is a number instead of string — typed column null, value in _extra
+        let json = serde_json::json!({
+            "_path": "conn",
+            "ts": 1700000000.0,
+            "uid": 42,  // number, not string
+            "orig_bytes": 512
+        });
+        let batch = map_conn(&json).unwrap();
+        let uid_col = batch
+            .column_by_name("uid")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(
+            uid_col.is_null(0),
+            "type-mismatched uid must be null in typed column"
+        );
+        let extra = batch
+            .column_by_name("_extra")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let extra_val: serde_json::Value = serde_json::from_str(extra.value(0)).unwrap();
+        assert!(
+            extra_val.get("uid").is_some(),
+            "type-mismatched uid must appear in _extra"
+        );
+        assert_eq!(extra_val["uid"], 42, "uid value preserved in _extra");
+    }
+
+    #[test]
     fn envelope_parquet_round_trip() {
         use bytes::Bytes;
-        use parquet::arrow::ArrowWriter;
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::arrow::ArrowWriter;
 
         let json = serde_json::json!({
             "_path": "weird",
