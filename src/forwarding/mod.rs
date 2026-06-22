@@ -266,14 +266,6 @@ impl Forwarder {
     }
 }
 
-impl Clone for Forwarder {
-    fn clone(&self) -> Self {
-        Self {
-            destinations: Vec::new(), // Can't clone senders
-            client: self.client.clone(),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -345,15 +337,7 @@ mod tests {
         assert!(!forwarder.destinations.is_empty() || forwarder.destinations.is_empty());
     }
 
-    #[test]
-    fn forwarder_clone_creates_valid_clone() {
-        let destinations = vec![];
-        let forwarder = Forwarder::new(destinations);
-        let cloned = forwarder.clone();
-        assert!(cloned.destinations.is_empty());
-    }
-
-    #[test]
+#[test]
     fn calculates_priority_for_warning() {
         let warning = Some(parsed_event(EventLevel::Warning));
         let error = Some(parsed_event(EventLevel::Error));
