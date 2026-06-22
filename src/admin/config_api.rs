@@ -499,7 +499,7 @@ pub async fn write_config_to_path(config: &Config, path: &std::path::Path) -> an
 mod tests {
     use super::*;
     use crate::admin::state::{AdminServerConfig, AdminState, AuditLogger, PasswordHash};
-    use crate::config::{S3ConnectionConfig, SyslogS3Config};
+    use crate::config::{S3ConnectionConfig, SyslogS3Config, TlsConfig};
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -594,9 +594,14 @@ mod tests {
     // H-7: validate_config_invariants rejects port 0.
     #[test]
     fn validate_config_invariants_rejects_port_zero() {
-        let mut cfg = Config::default();
-        cfg.bind_address = "127.0.0.1:0".parse().unwrap();
-        cfg.tls.enabled = false;
+        let cfg = Config {
+            bind_address: "127.0.0.1:0".parse().unwrap(),
+            tls: TlsConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         assert!(
             validate_config_invariants(&cfg).is_err(),
             "port 0 must be rejected"

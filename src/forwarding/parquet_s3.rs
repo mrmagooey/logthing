@@ -431,6 +431,22 @@ impl ParquetS3Forwarder {
     }
 }
 
+use parquet::basic::ZstdLevel;
+
+/// Create a ParquetS3 forwarder from configuration
+pub async fn create_parquet_s3_forwarder(
+    destinations: &[DestinationConfig],
+) -> Result<Option<ParquetS3Forwarder>> {
+    for dest in destinations {
+        if dest.protocol == ForwardProtocol::Http && dest.url.starts_with("s3://") {
+            let config = ParquetS3Config::from_destination(dest)?;
+            return Ok(Some(ParquetS3Forwarder::new(config).await?));
+        }
+    }
+
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,7 +532,7 @@ mod tests {
         });
 
         assert!(!buffer.should_flush(10_000, 300));
-        buffer.last_flush = buffer.last_flush - chrono::Duration::seconds(400);
+        buffer.last_flush -= chrono::Duration::seconds(400);
         assert!(buffer.should_flush(10_000, 300));
 
         let drained = buffer.take_events();
@@ -586,20 +602,4 @@ mod tests {
         assert_eq!(buffer1.events.len(), 0);
         assert_eq!(buffer2.events.len(), 0);
     }
-}
-
-use parquet::basic::ZstdLevel;
-
-/// Create a ParquetS3 forwarder from configuration
-pub async fn create_parquet_s3_forwarder(
-    destinations: &[DestinationConfig],
-) -> Result<Option<ParquetS3Forwarder>> {
-    for dest in destinations {
-        if dest.protocol == ForwardProtocol::Http && dest.url.starts_with("s3://") {
-            let config = ParquetS3Config::from_destination(dest)?;
-            return Ok(Some(ParquetS3Forwarder::new(config).await?));
-        }
-    }
-
-    Ok(None)
 }

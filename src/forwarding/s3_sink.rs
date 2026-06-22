@@ -106,7 +106,6 @@ pub(crate) fn flush_check_interval(flush_interval: std::time::Duration) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn flush_check_interval_respects_configured_interval() {
@@ -149,7 +148,7 @@ mod tests {
             secret_key: "SECRETTEST".to_string(),
             max_file_size_mb: 10,
             flush_interval_secs: 60,
-            local_buffer_path: PathBuf::from(std::env::temp_dir().join("s3sink-test")),
+            local_buffer_path: std::env::temp_dir().join("s3sink-test"),
         }
     }
 

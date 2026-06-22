@@ -489,6 +489,7 @@ mod tests {
     /// Metrics: we install a thread-local DebuggingRecorder so we can assert that
     /// `zeek_oversized_lines` is incremented exactly once.
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
     async fn oversized_line_closes_connection_and_increments_metric() {
         use metrics::set_default_local_recorder;
         use metrics_util::CompositeKey;

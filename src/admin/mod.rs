@@ -20,7 +20,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::RwLock;
 
-    use crate::config::Config;
+    use crate::config::{Config, TlsConfig};
 
     async fn test_state() -> AdminState {
         let server_config = AdminServerConfig {
@@ -243,9 +243,14 @@ mod tests {
             let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
             let auth = None;
 
-            let mut invalid_config = Config::default();
-            invalid_config.bind_address = "127.0.0.1:0".parse().unwrap();
-            invalid_config.tls.enabled = false;
+            let invalid_config = Config {
+                bind_address: "127.0.0.1:0".parse().unwrap(),
+                tls: TlsConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
 
             let result = config_api::validate_config(
                 State(state),
@@ -619,6 +624,7 @@ port = 9090
     }
 
     // Test helper to create a real HTTP request
+    #[allow(dead_code)] // helper retained for future route tests
     async fn create_test_app() -> axum::Router {
         let server_config = AdminServerConfig {
             bind_address: "0.0.0.0:8080".parse().unwrap(),
@@ -663,8 +669,10 @@ port = 9090
             let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
             // Test with modified config
-            let mut config = Config::default();
-            config.bind_address = "127.0.0.1:9999".parse().unwrap();
+            let config = Config {
+                bind_address: "127.0.0.1:9999".parse().unwrap(),
+                ..Default::default()
+            };
 
             let Json(result) = config_api::diff_config(
                 axum::extract::State(state),
@@ -846,8 +854,10 @@ port = 9090
             let auth = TypedHeader(Authorization::basic("user", "pass"));
             let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
-            let mut config = Config::default();
-            config.bind_address = state.server_config.bind_address;
+            let config = Config {
+                bind_address: state.server_config.bind_address,
+                ..Default::default()
+            };
 
             let Json(result) = config_api::validate_config(
                 axum::extract::State(state),
@@ -913,9 +923,9 @@ port = 9090
                 std::env::set_var("WEF_ADMIN_OVERRIDE_FILE", &path);
             }
 
-            let state = test_state().await;
-            let auth = TypedHeader(Authorization::basic("user", "pass"));
-            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+            let _state = test_state().await;
+            let _auth = TypedHeader(Authorization::basic("user", "pass"));
+            let _addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
             let new_config = Config::default();
 
@@ -925,9 +935,8 @@ port = 9090
             let result = config_api::persist_config(&new_config).await;
 
             // May fail due to file permissions, but shouldn't panic
-            match result {
-                Ok(_) => assert!(path.exists() || !path.exists()),
-                Err(_) => {}
+            if result.is_ok() {
+                assert!(path.exists() || !path.exists())
             }
 
             unsafe {

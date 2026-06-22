@@ -896,6 +896,7 @@ mod tests {
     // -- Task 3: IpfixS3Handler overflow test (real handler, real metrics) --
 
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
     async fn handler_overflow_increments_dropped_counter() {
         use crate::ipfix::listener::IpfixHandler;
         use metrics::set_default_local_recorder;
@@ -961,6 +962,7 @@ mod tests {
     /// a tiny capacity (1) causes drops for a burst of sends, while a large capacity
     /// (10_000) does not for the same modest send count.
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
     async fn channel_capacity_parameter_is_wired() {
         use crate::ipfix::listener::IpfixHandler;
         use metrics::set_default_local_recorder;

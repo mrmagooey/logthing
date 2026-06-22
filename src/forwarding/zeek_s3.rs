@@ -586,6 +586,7 @@ mod tests {
     // -- Handler overflow drops and counts --
 
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
     async fn handler_overflow_increments_dropped_counter() {
         use crate::zeek::listener::ZeekHandler;
         use metrics::set_default_local_recorder;
