@@ -14,6 +14,7 @@ pub struct ZeekRecord {
 }
 
 pub mod listener;
+pub mod schema;
 
 #[cfg(test)]
 mod tests {
