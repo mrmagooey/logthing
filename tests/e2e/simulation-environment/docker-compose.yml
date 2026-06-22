@@ -57,7 +57,8 @@ services:
     command: >
       "until mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; do sleep 2; done &&
        mc mb --ignore-existing local/wef-events &&
-       mc mb --ignore-existing local/ipfix-flows"
+       mc mb --ignore-existing local/ipfix-flows &&
+       mc mb --ignore-existing local/zeek-logs"
     depends_on:
       - minio
     networks:
@@ -320,6 +321,37 @@ services:
       - E2E_TIMEOUT_SECS=60
     depends_on:
       - ipfix-generator
+      - logthing
+      - minio-setup
+    networks:
+      - e2e
+
+  zeek-generator:
+    build:
+      context: .
+      dockerfile: zeek-generator/Dockerfile
+    environment:
+      - ZEEK_HOST=logthing
+      - ZEEK_PORT=47760
+      - CONNECT_TIMEOUT_SECS=30
+    depends_on:
+      - logthing
+    networks:
+      - e2e
+
+  zeek-s3-verifier:
+    build:
+      context: .
+      dockerfile: zeek-s3-verifier/Dockerfile
+    environment:
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_BUCKET=zeek-logs
+      - AWS_ACCESS_KEY_ID=miniouser
+      - AWS_SECRET_ACCESS_KEY=miniopassword
+      - ZEEK_S3_PREFIX=zeek/
+      - E2E_TIMEOUT_SECS=60
+    depends_on:
+      - zeek-generator
       - logthing
       - minio-setup
     networks:
