@@ -368,10 +368,16 @@ impl Server {
         })?;
 
         info!("Applying Kerberos authentication layer for SPN: {}", spn);
+        error!(
+            "SECURITY: Kerberos token validation is NOT implemented. \
+             The kerberos_auth_middleware will REJECT ALL requests (fail-closed) \
+             until real GSSAPI/SPNEGO validation is added. \
+             Do NOT use this in production without a complete implementation."
+        );
 
         // Use route-layer approach with custom middleware
-        // The kerberos_auth_middleware checks for Authorization header and
-        // uses axum_negotiate's Upn extractor for authentication
+        // The kerberos_auth_middleware fails closed: it rejects all requests
+        // because token validation is not implemented.
         Ok(router.layer(middleware::from_fn(kerberos_auth_middleware)))
     }
 
@@ -388,22 +394,25 @@ impl Server {
 
 /// Kerberos authentication middleware
 ///
-/// This middleware checks for the Authorization header with a Negotiate token.
-/// In a real deployment with proper Kerberos infrastructure, this would validate
-/// the token. For E2E testing, we check for the header presence and return 401
-/// if authentication is required but not provided.
+/// FAIL-CLOSED: GSSAPI/SPNEGO token validation is not implemented.
+/// This middleware rejects ALL requests rather than passing unvalidated tokens
+/// through. Any request without a `Negotiate` header gets a 401 challenge.
+/// Any request WITH a `Negotiate` token gets a 501 Not Implemented response,
+/// because we cannot validate the token and must not treat it as authenticated.
+///
+/// To make this functional, replace the 501 path with real GSSAPI validation.
 #[cfg(feature = "kerberos-auth")]
-async fn kerberos_auth_middleware(request: Request, next: Next) -> Response {
-    // Check if Authorization header is present
-    let has_auth = request
+async fn kerberos_auth_middleware(request: Request, _next: Next) -> Response {
+    // Check if Authorization header is present with a Negotiate token.
+    let has_negotiate = request
         .headers()
         .get("authorization")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.starts_with("Negotiate "))
         .unwrap_or(false);
 
-    if !has_auth {
-        // Return 401 Unauthorized with WWW-Authenticate header
+    if !has_negotiate {
+        // No token supplied — return 401 with WWW-Authenticate challenge.
         return Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header("WWW-Authenticate", "Negotiate")
@@ -411,9 +420,19 @@ async fn kerberos_auth_middleware(request: Request, next: Next) -> Response {
             .unwrap();
     }
 
-    // In a full implementation, we would validate the Negotiate token here
-    // using the Upn extractor. For now, we pass through if the header is present.
-    next.run(request).await
+    // A Negotiate token was supplied but we cannot validate it: fail closed.
+    // Passing an unvalidated token through would be a complete auth bypass.
+    error!(
+        "Kerberos authentication is enabled but token validation is not implemented; \
+         refusing request (fail-closed)"
+    );
+    Response::builder()
+        .status(StatusCode::NOT_IMPLEMENTED)
+        .body(axum::body::Body::from(
+            "Kerberos authentication is enabled but token validation is not implemented; \
+             refusing all requests",
+        ))
+        .unwrap()
 }
 
 async fn handle_wef_request(
@@ -983,6 +1002,77 @@ mod tests {
             .await
             .into_response();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// CR-1 regression: kerberos_auth_middleware must fail CLOSED.
+    ///
+    /// A request bearing a syntactically valid `Authorization: Negotiate <token>`
+    /// header must NOT be passed through as authenticated. Because token validation
+    /// is not implemented the middleware must return a non-2xx error status (501)
+    /// rather than calling next and returning 200.
+    #[cfg(feature = "kerberos-auth")]
+    #[tokio::test]
+    async fn kerberos_middleware_rejects_negotiate_token_fail_closed() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt; // for `oneshot`
+
+        // Build a minimal router with the kerberos middleware applied.
+        // The inner handler always returns 200 so any 200 response means
+        // the middleware passed the request through (a bypass).
+        let app = Router::new()
+            .route("/", axum::routing::get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn(kerberos_auth_middleware));
+
+        // Fire a request with a Negotiate token (base64 "foo" = Zm9v).
+        let request = HttpRequest::builder()
+            .uri("/")
+            .header("Authorization", "Negotiate Zm9v")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        // Must NOT be 200 — the token was never validated.
+        assert_ne!(
+            response.status(),
+            StatusCode::OK,
+            "kerberos middleware must not pass unvalidated Negotiate tokens through"
+        );
+        // Must be 501 Not Implemented (fail-closed denial).
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "kerberos middleware must return 501 when token validation is unimplemented"
+        );
+    }
+
+    /// CR-1 regression: kerberos_auth_middleware returns 401 challenge when no
+    /// Authorization header is present (unchanged behaviour, included for completeness).
+    #[cfg(feature = "kerberos-auth")]
+    #[tokio::test]
+    async fn kerberos_middleware_challenges_unauthenticated_requests() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/", axum::routing::get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn(kerberos_auth_middleware));
+
+        let request = HttpRequest::builder().uri("/").body(Body::empty()).unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "kerberos middleware must challenge requests without an Authorization header"
+        );
+        assert!(
+            response.headers().contains_key("www-authenticate"),
+            "401 response must include WWW-Authenticate header"
+        );
     }
 }
 
