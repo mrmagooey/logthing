@@ -107,7 +107,7 @@ impl GenericEventParser {
             Self::load_from_directory(path)?
         } else {
             let content = fs::read_to_string(path)?;
-            serde_yaml::from_str(&content)?
+            serde_yml::from_str(&content)?
         };
 
         info!("Loaded {} event parser definitions", config.parsers.len());
@@ -145,7 +145,7 @@ impl GenericEventParser {
         for file_path in yaml_files {
             let content = fs::read_to_string(&file_path)
                 .with_context(|| format!("Failed to read {:?}", file_path))?;
-            let parser_file: EventParserFile = serde_yaml::from_str(&content)
+            let parser_file: EventParserFile = serde_yml::from_str(&content)
                 .with_context(|| format!("Failed to parse {:?}", file_path))?;
 
             if parsers
