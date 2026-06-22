@@ -22,6 +22,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::warn;
 
+/// Maximum number of distinct Zeek stream buffers. New paths beyond this cap
+/// are routed to the "unknown" overflow stream instead of creating a new buffer.
+pub const MAX_ZEEK_STREAMS: usize = 256;
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -167,6 +171,8 @@ pub struct ZeekS3Writer {
     config: ZeekS3WriterConfig,
     sink: Arc<S3Sink>,
     streams: HashMap<String, StreamBuffer>,
+    streams_cap: usize,
+    pub zeek_streams_capped: u64,
 }
 
 impl ZeekS3Writer {
@@ -175,25 +181,49 @@ impl ZeekS3Writer {
             config,
             sink,
             streams: HashMap::new(),
+            streams_cap: MAX_ZEEK_STREAMS,
+            zeek_streams_capped: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_cap(config: ZeekS3WriterConfig, sink: Arc<S3Sink>, cap: usize) -> Self {
+        Self {
+            config,
+            sink,
+            streams: HashMap::new(),
+            streams_cap: cap,
+            zeek_streams_capped: 0,
         }
     }
 
     /// Push one ZeekRecord: map to RecordBatch, append to per-stream buffer, flush if needed.
     pub async fn push_record(&mut self, record: &ZeekRecord) -> anyhow::Result<()> {
-        let entry = get_schema_entry(&record.log_path);
+        // Determine the effective log_path (may be capped to "unknown")
+        let log_path = if self.streams.contains_key(&record.log_path) {
+            // Existing stream — always allow
+            record.log_path.clone()
+        } else if self.streams.len() < self.streams_cap {
+            // New stream — still under cap
+            record.log_path.clone()
+        } else {
+            // Cap exceeded — overflow to "unknown" envelope stream
+            self.zeek_streams_capped += 1;
+            metrics::counter!("zeek_streams_capped").increment(1);
+            "unknown".to_string()
+        };
+
+        // Get the schema entry appropriate for the effective path
+        let entry = get_schema_entry(&log_path);
         let batch = match (entry.mapper)(&record.fields) {
             Ok(b) => b,
             Err(e) => {
-                warn!(
-                    "ZeekS3Writer: row mapper error for '{}': {e}",
-                    record.log_path
-                );
+                warn!("ZeekS3Writer: row mapper error for '{}': {e}", log_path);
                 return Ok(()); // Never drop the connection; just skip this record
             }
         };
 
         let est_bytes = record.fields.to_string().len() + 128;
-        let log_path = record.log_path.clone();
         let stream = self
             .streams
             .entry(log_path.clone())
@@ -284,6 +314,11 @@ impl ZeekS3Writer {
             .get(log_path)
             .map(|s| s.buffer_row_count)
             .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn streams_len(&self) -> usize {
+        self.streams.len()
     }
 }
 
@@ -557,6 +592,47 @@ mod tests {
             })
             .unwrap_or(0);
         assert!(dropped >= 1, "expected zeek_s3_dropped >= 1; got {dropped}");
+    }
+
+    // -- Streams map is bounded --
+
+    #[tokio::test]
+    async fn writer_streams_map_is_bounded() {
+        let sink = unreachable_sink().await;
+        let config = ZeekS3WriterConfig {
+            flush_threshold_bytes: usize::MAX,
+            flush_interval: Duration::from_secs(3600),
+            key_prefix: "zeek".to_string(),
+            max_buffer_rows: 100_000,
+        };
+        let cap = 3usize;
+        let mut writer = ZeekS3Writer::new_with_cap(config, sink, cap);
+
+        // Push records with cap+5 distinct log_paths
+        for i in 0..(cap + 5) {
+            let rec = ZeekRecord {
+                log_path: format!("stream_{i}"),
+                fields: serde_json::json!({
+                    "_path": format!("stream_{i}"),
+                    "ts": 1700000000.0,
+                    "uid": format!("C{i}"),
+                }),
+                received_at: Utc::now(),
+            };
+            writer.push_record(&rec).await.ok();
+        }
+
+        // Map size must be <= cap + 1 (the +1 is the "unknown" overflow stream)
+        assert!(
+            writer.streams_len() <= cap + 1,
+            "streams map must be bounded; got {} streams (cap={cap})",
+            writer.streams_len()
+        );
+        // Overflow counter must have been incremented
+        assert!(
+            writer.zeek_streams_capped > 0,
+            "zeek_streams_capped must be > 0 when cap exceeded"
+        );
     }
 
     // -- Integration test (gated on env var) --
