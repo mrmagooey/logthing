@@ -53,7 +53,7 @@ impl Default for ParquetS3Config {
             secret_key: "minioadmin".to_string(),
             max_file_size_mb: 100,
             flush_interval_secs: 900, // 15 minutes
-            local_buffer_path: PathBuf::from("/tmp/wef-events"),
+            local_buffer_path: std::env::temp_dir().join("logthing-wef-events"),
         }
     }
 }
@@ -103,7 +103,12 @@ impl ParquetS3Config {
                 dest.headers
                     .get("buffer-path")
                     .cloned()
-                    .unwrap_or_else(|| "/tmp/wef-events".to_string()),
+                    .unwrap_or_else(|| {
+                        std::env::temp_dir()
+                            .join("logthing-wef-events")
+                            .to_string_lossy()
+                            .into_owned()
+                    }),
             ),
         })
     }
