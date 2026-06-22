@@ -265,21 +265,37 @@ impl ParquetS3Forwarder {
         Ok(())
     }
 
-    /// Flush all buffers (called periodically)
+    /// Flush all buffers — called periodically and on graceful shutdown.
+    ///
+    /// Iterates ALL event types even when individual flushes fail, so one
+    /// failing event type does not prevent others from being flushed.
     pub async fn flush_all(&mut self) -> Result<()> {
         let event_types: Vec<u32> = self.buffers.keys().copied().collect();
-
+        let mut first_err: Option<anyhow::Error> = None;
         for event_type in event_types {
             if self
                 .buffers
                 .get(&event_type)
                 .is_some_and(|b| !b.events.is_empty())
             {
-                self.flush_event_type(event_type).await?;
+                if let Err(e) = self.flush_event_type(event_type).await {
+                    warn!("flush_all: error flushing event type {}: {}", event_type, e);
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
             }
         }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 
-        Ok(())
+    /// Graceful-shutdown flush: flush all buffered events before the forwarder is dropped.
+    /// Callers (e.g. a Tokio channel `None` arm) should call this before dropping.
+    pub async fn shutdown_flush(&mut self) -> Result<()> {
+        self.flush_all().await
     }
 
     /// Flush a specific event type buffer to S3
