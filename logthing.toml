@@ -61,6 +61,27 @@ parse_dns = true    # Enable DNS log parsing
 # flush_interval_secs  = 900                      # flush after N seconds (default 900)
 # channel_capacity     = 4096                     # channel depth between listener and writer (default 4096)
 
+# Zeek NDJSON TCP listener.
+# Disabled by default — set enabled = true to activate.
+[zeek]
+enabled      = false
+tcp_port     = 47760       # default Zeek NDJSON listener port
+bind_address = "0.0.0.0"
+
+# Optional: persist Zeek logs to S3 as per-stream Parquet files.
+# Remove or comment out this block to disable Zeek S3 persistence.
+# [zeek.s3]
+# endpoint              = "http://localhost:9000"  # S3-compatible endpoint
+# bucket                = "zeek-logs"
+# region                = "us-east-1"
+# access_key            = "minioadmin"
+# secret_key            = "minioadmin"
+# prefix                = "zeek"                  # default: "zeek"
+# flush_threshold_bytes = 104857600               # flush at 100 MiB (default)
+# flush_interval_secs   = 900                     # flush after N seconds (default 900)
+# channel_capacity      = 256                     # channel depth (default 256)
+# max_buffer_rows       = 100000                  # hard-cap before oldest rows dropped (default 100 000)
+
 # IPFIX / NetFlow flow ingestion listener.
 # Disabled by default — set enabled = true to activate.
 [ipfix]
