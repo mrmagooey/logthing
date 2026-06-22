@@ -96,10 +96,49 @@ impl S3Sink {
     }
 }
 
+/// The cadence at which a writer's background task checks whether a time-based
+/// flush is due. Honors the configured flush interval, but never ticks more
+/// often than once per second (avoids a busy loop for very small intervals).
+pub(crate) fn flush_check_interval(flush_interval: std::time::Duration) -> std::time::Duration {
+    flush_interval.max(std::time::Duration::from_secs(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn flush_check_interval_respects_configured_interval() {
+        assert_eq!(
+            flush_check_interval(std::time::Duration::from_secs(5)),
+            std::time::Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn flush_check_interval_respects_large_interval() {
+        assert_eq!(
+            flush_check_interval(std::time::Duration::from_secs(900)),
+            std::time::Duration::from_secs(900)
+        );
+    }
+
+    #[test]
+    fn flush_check_interval_clamps_sub_second_interval_up_to_one_second() {
+        assert_eq!(
+            flush_check_interval(std::time::Duration::from_millis(500)),
+            std::time::Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn flush_check_interval_clamps_zero_up_to_one_second() {
+        assert_eq!(
+            flush_check_interval(std::time::Duration::from_secs(0)),
+            std::time::Duration::from_secs(1)
+        );
+    }
 
     fn test_config() -> ParquetS3Config {
         ParquetS3Config {

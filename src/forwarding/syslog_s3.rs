@@ -332,7 +332,7 @@ impl SyslogS3Handler {
         capacity: usize,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<SyslogMessage>(capacity);
-        let flush_check = std::time::Duration::from_secs(60);
+        let flush_check = crate::forwarding::s3_sink::flush_check_interval(config.flush_interval);
         tokio::spawn(async move {
             let mut writer = SyslogS3Writer::new(config, sink);
             let mut interval = tokio::time::interval(flush_check);
