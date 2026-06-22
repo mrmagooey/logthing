@@ -306,13 +306,17 @@ s3://bucket-name/
 The container image is published to GitHub Container Registry on every `v*` tag push:
 
 ```bash
-docker pull ghcr.io/mrmagooey/logthing:0.2.0
+docker pull ghcr.io/mrmagooey/logthing:0.2.0   # pin to an exact release
+docker pull ghcr.io/mrmagooey/logthing:latest  # most recent non-prerelease release
 ```
 
 **Tags** (produced by the release workflow for tag `v0.2.0`):
 - `:0.2.0` — exact version
 - `:0.2` — minor series
 - `:0` — major series
+- `:latest` — the most recent non-prerelease release. `docker/metadata-action`'s
+  default `flavor.latest=auto` adds this automatically for any non-prerelease
+  semver tag (a pre-release such as `v0.3.0-rc1` would *not* move `:latest`).
 
 **Platforms**: linux/amd64, linux/arm64 (multi-arch manifest).
 
