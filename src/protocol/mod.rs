@@ -54,7 +54,10 @@ impl WefParser {
 
         // Fast single-pass detection using first meaningful element
         // Check first 2000 chars for type detection (avoids scanning entire large bodies)
-        let check_len = body.len().min(2000);
+        let mut check_len = body.len().min(2000);
+        while check_len > 0 && !body.is_char_boundary(check_len) {
+            check_len -= 1;
+        }
         let check_body = &body[..check_len];
 
         if check_body.contains("Subscribe") && check_body.contains("SubscriptionId") {
@@ -886,6 +889,21 @@ mod tests {
             Ok(_) => {}
             Err(_) => {}
         }
+    }
+
+    #[test]
+    fn parse_message_multibyte_char_at_boundary_does_not_panic() {
+        let parser = WefParser::new();
+        // Build a body where a 4-byte emoji straddles byte 2000.
+        // Each '😀' is 4 bytes (U+1F600). Fill 1999 ASCII bytes then append emojis.
+        let prefix = "a".repeat(1999); // bytes 0..1999
+        let suffix = "😀".repeat(10); // 4 bytes each; first one spans bytes 1999..2003
+        let body = format!("{}{}", prefix, suffix);
+        assert_eq!(body.as_bytes()[1999], 0xF0); // confirms emoji straddles byte 2000
+
+        // Must not panic — any result is fine
+        let result = parser.parse_message(&body, "host".into());
+        assert!(result.is_ok() || result.is_err()); // just must not panic
     }
 
     #[test]
