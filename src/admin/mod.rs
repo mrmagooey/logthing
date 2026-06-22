@@ -284,6 +284,69 @@ mod tests {
     mod state_tests {
         use super::*;
 
+        // ── admin_start_allowed unit tests ────────────────────────────────────────
+
+        #[test]
+        fn admin_allowed_loopback_default_creds() {
+            // Loopback bind + default credentials → permitted (local dev workflow).
+            let bind: std::net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
+            assert!(
+                state::admin_start_allowed(bind, "admin", "admin").is_ok(),
+                "loopback + default creds must be allowed"
+            );
+        }
+
+        #[test]
+        fn admin_refused_non_loopback_default_creds() {
+            // Non-loopback bind + default credentials → must be refused.
+            let bind: std::net::SocketAddr = "0.0.0.0:8080".parse().unwrap();
+            let result = state::admin_start_allowed(bind, "admin", "admin");
+            assert!(
+                result.is_err(),
+                "non-loopback + default creds must be refused"
+            );
+            let msg = result.unwrap_err();
+            assert!(
+                msg.contains("non-loopback") || msg.contains("refused"),
+                "error message should describe the refusal: {msg}"
+            );
+        }
+
+        #[test]
+        fn admin_allowed_non_loopback_custom_creds() {
+            // Non-loopback bind + explicit non-default credentials → permitted.
+            let bind: std::net::SocketAddr = "0.0.0.0:8080".parse().unwrap();
+            assert!(
+                state::admin_start_allowed(bind, "ops-user", "s3cr3tP@ss").is_ok(),
+                "non-loopback + custom creds must be allowed"
+            );
+        }
+
+        #[test]
+        fn admin_allowed_ipv6_loopback_default_creds() {
+            // IPv6 loopback (::1) + default credentials → also permitted.
+            let bind: std::net::SocketAddr = "[::1]:8080".parse().unwrap();
+            assert!(
+                state::admin_start_allowed(bind, "admin", "admin").is_ok(),
+                "IPv6 loopback + default creds must be allowed"
+            );
+        }
+
+        #[test]
+        fn admin_refused_only_when_both_username_and_password_are_default() {
+            // Non-loopback bind where only the username is changed → allowed (password differs).
+            let bind: std::net::SocketAddr = "10.0.0.1:8080".parse().unwrap();
+            assert!(
+                state::admin_start_allowed(bind, "admin", "changed-pass").is_ok(),
+                "non-loopback + custom password must be allowed even if username is 'admin'"
+            );
+            // Non-loopback bind where only the password is changed → allowed.
+            assert!(
+                state::admin_start_allowed(bind, "changed-user", "admin").is_ok(),
+                "non-loopback + custom username must be allowed even if password is 'admin'"
+            );
+        }
+
         #[tokio::test]
         async fn audit_logger_persists_to_json_lines() {
             let dir = tempdir().unwrap();
