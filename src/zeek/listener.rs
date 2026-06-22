@@ -412,9 +412,9 @@ mod tests {
     #[tokio::test]
     async fn oversized_line_closes_connection_and_increments_metric() {
         use metrics::set_default_local_recorder;
-        use metrics_util::debugging::DebuggingRecorder;
         use metrics_util::CompositeKey;
         use metrics_util::MetricKind;
+        use metrics_util::debugging::DebuggingRecorder;
         use tokio::time::timeout;
 
         let recorder = DebuggingRecorder::new();
