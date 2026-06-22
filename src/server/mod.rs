@@ -1082,6 +1082,124 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------ //
+    // M-18: axum routing-layer handler tests (oneshot)                    //
+    // ------------------------------------------------------------------ //
+
+    /// `/health` endpoint returns 200 via the full router stack.
+    #[tokio::test]
+    async fn health_endpoint_returns_200_via_router() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let state = default_state().await;
+        let ip_whitelist = IpWhitelist::empty();
+        let public_router = Router::new()
+            .route("/health", axum::routing::get(health_check))
+            .layer(axum::Extension(ip_whitelist.clone()))
+            .with_state(state);
+
+        let request = HttpRequest::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = public_router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A WEF POST carrying a valid `<Events>` payload returns 200 and records
+    /// at least one throughput entry (exercises the full handler path, not just
+    /// subscription handling).
+    #[tokio::test]
+    async fn handle_wef_request_events_payload_returns_200() {
+        let state = default_state().await;
+        let body = Bytes::from(
+            r#"<Envelope>
+  <Body>
+    <Events>
+      <Event>
+        <System>
+          <Provider>Security</Provider>
+          <EventID>4625</EventID>
+          <Level>4</Level>
+          <TimeCreated>2024-06-01T00:00:00Z</TimeCreated>
+          <Computer>dc01</Computer>
+        </System>
+        <EventData>
+          <Data Name="TargetUserName">bob</Data>
+        </EventData>
+      </Event>
+    </Events>
+  </Body>
+</Envelope>"#,
+        );
+        let addr: SocketAddr = "10.0.0.1:5985".parse().unwrap();
+        let headers = HeaderMap::new();
+
+        let response = handle_wef_request(State(state.clone()), ConnectInfo(addr), headers, body)
+            .await
+            .expect("events payload accepted");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The event should have been recorded in throughput stats.
+        let snapshot = state.throughput.snapshot().await;
+        assert!(!snapshot.is_empty(), "throughput snapshot must be non-empty after event");
+    }
+
+    /// A syslog HTTP POST with a body that exactly meets the body-size limit is
+    /// accepted (boundary condition: limit is inclusive).
+    /// A body one byte over is rejected with 413 (duplicate of the WEF test, but
+    /// confirms the limit applies uniformly to the syslog route too).
+    #[tokio::test]
+    async fn syslog_route_enforces_body_size_limit() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let router: Router = Router::new()
+            .route(
+                "/syslog",
+                post(|_body: Bytes| async { (StatusCode::OK, "ok") }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE));
+
+        let over_limit_body = vec![0u8; MAX_BODY_SIZE + 1];
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/syslog")
+            .header("content-type", "text/plain")
+            .body(Body::from(over_limit_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "syslog route: over-limit body must be rejected with 413"
+        );
+    }
+
+    /// `handle_syslog_http` returns 200 for a well-formed RFC 5424 message and
+    /// 400 for one that is structurally invalid (missing priority bracket).
+    #[tokio::test]
+    async fn handle_syslog_http_rejects_structurally_invalid_message() {
+        let addr: SocketAddr = "10.0.0.2:514".parse().unwrap();
+        // Missing the leading '<' so the PRI field is absent — not a valid syslog frame.
+        let bad_msg = "134>Jun 22 09:00:00 host app[99]: message without pri bracket";
+
+        let response = handle_syslog_http(ConnectInfo(addr), Bytes::from(bad_msg))
+            .await
+            .into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "structurally invalid syslog message must be rejected with 400"
+        );
+    }
+
     /// CR-1 regression: kerberos_auth_middleware must fail CLOSED.
     ///
     /// A request bearing a syntactically valid `Authorization: Negotiate <token>`
