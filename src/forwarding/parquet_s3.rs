@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// Configuration for Parquet S3 forwarder
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ParquetS3Config {
     pub endpoint: String,
     pub bucket: String,
@@ -24,6 +24,23 @@ pub struct ParquetS3Config {
     pub max_file_size_mb: u64,
     pub flush_interval_secs: u64,
     pub local_buffer_path: PathBuf,
+}
+
+/// Manual Debug impl that masks S3 secret fields so they never leak into logs
+/// or panic messages.
+impl std::fmt::Debug for ParquetS3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParquetS3Config")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("access_key", &"<redacted>")
+            .field("secret_key", &"<redacted>")
+            .field("max_file_size_mb", &self.max_file_size_mb)
+            .field("flush_interval_secs", &self.flush_interval_secs)
+            .field("local_buffer_path", &self.local_buffer_path)
+            .finish()
+    }
 }
 
 impl Default for ParquetS3Config {
