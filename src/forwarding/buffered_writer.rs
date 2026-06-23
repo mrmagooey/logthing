@@ -410,6 +410,8 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
 
 pub struct ParquetWriterHandle<S: ParquetSink> {
     tx: tokio::sync::mpsc::Sender<S::Record>,
+    /// Source label captured at `start()` time; used for the drop metric.
+    source: &'static str,
 }
 
 impl<S: ParquetSink> ParquetWriterHandle<S> {
@@ -423,6 +425,8 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
         policy: FlushPolicy,
     ) -> (Self, tokio::task::JoinHandle<()>) {
         let capacity = config.channel_capacity.max(1);
+        // Capture the source label before `sink` is moved into the task.
+        let source = sink.source();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<S::Record>(capacity);
         let flush_check = crate::forwarding::s3_sink::flush_check_interval(policy.interval);
         let handle = tokio::spawn(async move {
@@ -454,17 +458,25 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                 }
             }
         });
-        (Self { tx }, handle)
+        (Self { tx, source }, handle)
     }
 
     /// Try to send a record without blocking.
-    /// Returns `TrySendError` on overflow/closed.
-    /// Callers should increment `parquet_s3_dropped{source}` on overflow and log a warning.
+    ///
+    /// On channel overflow or closed, increments `parquet_s3_dropped{source=<source>}` and
+    /// returns the `TrySendError` to the caller so they can apply any additional handling.
+    #[must_use = "callers should log or handle the TrySendError to avoid silent record loss"]
     pub fn try_send(
         &self,
         record: S::Record,
     ) -> Result<(), tokio::sync::mpsc::error::TrySendError<S::Record>> {
-        self.tx.try_send(record)
+        match self.tx.try_send(record) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                metrics::counter!("parquet_s3_dropped", "source" => self.source).increment(1);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -734,34 +746,76 @@ max_partitions = 128
             .expect("task did not panic");
     }
 
+    /// I3: channel-overflow metric is now incremented by the PRODUCTION `try_send` path,
+    /// not by the test itself.  We use a `DebuggingRecorder` and assert the counter was
+    /// bumped by the production code — without any manual `metrics::counter!` call in
+    /// the test body.
+    ///
+    /// Strategy: create a handle with channel capacity = 1 and send many records back-to-back
+    /// without yielding.  The channel holds at most one record; subsequent `try_send` calls
+    /// fire while the first record is still queued, returning `Err(Full)` and causing the
+    /// production code to increment the counter.
     #[tokio::test]
-    async fn handle_channel_overflow_increments_metric() {
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never used for hashing
+    async fn handle_channel_overflow_increments_metric_via_production_code() {
         use metrics::set_default_local_recorder;
-        use metrics_util::debugging::DebuggingRecorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
         let _guard = set_default_local_recorder(&recorder);
 
         let s3 = unreachable_s3().await;
-        let (mut cfg, _) = test_config(1);
-        // Override: flush immediately so background task stalls on S3
+        let (mut cfg, _) = test_config(10_000);
+        // Channel of capacity 1: the first try_send fills it; subsequent ones overflow.
+        cfg.channel_capacity = 1;
         let policy = FlushPolicy {
-            max_rows: 1,
-            max_bytes: 1,
+            max_rows: 10_000,
+            max_bytes: usize::MAX,
             interval: std::time::Duration::from_secs(3600),
         };
-        cfg.channel_capacity = 1;
         let (handle, _jh) = ParquetWriterHandle::start(MockSink, s3, cfg, policy);
-        tokio::task::yield_now().await;
 
-        let mut dropped = 0u64;
+        // Fill the channel then overflow it — without yielding so the background task
+        // cannot drain the channel between sends.  Production try_send increments the metric.
+        let mut overflow_count = 0usize;
         for i in 0..50usize {
             if handle.try_send(format!("r{i}")).is_err() {
-                dropped += 1;
-                metrics::counter!("parquet_s3_dropped", "source" => "test").increment(1);
+                overflow_count += 1;
             }
         }
-        assert!(dropped > 0, "expected channel-overflow drops");
+        assert!(
+            overflow_count > 0,
+            "expected at least one channel-overflow drop"
+        );
+
+        // Verify the production code emitted parquet_s3_dropped.
+        // The metric is labeled ("source" => "test"), so we must include labels in the lookup.
+        let snapshot = snapshotter.snapshot();
+        let map = snapshot.into_hashmap();
+        let labeled_key = CompositeKey::new(
+            MetricKind::Counter,
+            metrics::Key::from_parts(
+                "parquet_s3_dropped",
+                vec![metrics::Label::new("source", "test")],
+            ),
+        );
+        let dropped = map
+            .get(&labeled_key)
+            .map(|(_, _, v)| {
+                if let DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        assert!(
+            dropped >= 1,
+            "parquet_s3_dropped{{source=\"test\"}} should have been incremented by production try_send, got {dropped}"
+        );
     }
 
     #[tokio::test]
