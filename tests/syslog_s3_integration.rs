@@ -4,6 +4,7 @@
 //! Set MINIO_ENDPOINT, MINIO_BUCKET, MINIO_ACCESS_KEY, MINIO_SECRET_KEY env vars.
 //! If MINIO_ENDPOINT is absent, the test is skipped.
 
+use logthing::config::S3ConnectionConfig;
 use logthing::forwarding::parquet_s3::ParquetS3Config;
 use logthing::forwarding::s3_sink::S3Sink;
 use logthing::forwarding::syslog_s3::{
@@ -20,11 +21,15 @@ fn skip_if_no_minio() -> Option<String> {
 
 fn minio_config(endpoint: &str) -> ParquetS3Config {
     ParquetS3Config {
-        endpoint: endpoint.to_string(),
-        bucket: std::env::var("MINIO_BUCKET").unwrap_or_else(|_| "syslog-test".to_string()),
-        region: "us-east-1".to_string(),
-        access_key: std::env::var("MINIO_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".to_string()),
-        secret_key: std::env::var("MINIO_SECRET_KEY").unwrap_or_else(|_| "minioadmin".to_string()),
+        connection: S3ConnectionConfig {
+            endpoint: endpoint.to_string(),
+            bucket: std::env::var("MINIO_BUCKET").unwrap_or_else(|_| "syslog-test".to_string()),
+            region: "us-east-1".to_string(),
+            access_key: std::env::var("MINIO_ACCESS_KEY")
+                .unwrap_or_else(|_| "minioadmin".to_string()),
+            secret_key: std::env::var("MINIO_SECRET_KEY")
+                .unwrap_or_else(|_| "minioadmin".to_string()),
+        },
         max_file_size_mb: 0,
         flush_interval_secs: 900,
         local_buffer_path: std::path::PathBuf::new(),
@@ -54,7 +59,9 @@ async fn syslog_message_appears_as_parquet_in_s3() {
         key_prefix: "syslog-test/".to_string(),
     };
 
-    let handler = SyslogS3Handler::start(writer_cfg, sink.clone());
+    // `start` now returns (handler, writer_join_handle) for graceful-shutdown support;
+    // the test only needs the handler and lets the writer task run in the background.
+    let (handler, _writer_task) = SyslogS3Handler::start(writer_cfg, sink.clone());
 
     let msg = SyslogMessage {
         priority: 134,
@@ -80,15 +87,15 @@ async fn syslog_message_appears_as_parquet_in_s3() {
     use aws_sdk_s3::Client as S3Client;
     let region = aws_sdk_s3::config::Region::new("us-east-1");
     let credentials = aws_credential_types::Credentials::new(
-        cfg.access_key.clone(),
-        cfg.secret_key.clone(),
+        cfg.connection.access_key.clone(),
+        cfg.connection.secret_key.clone(),
         None,
         None,
         "test",
     );
     let sdk_cfg = aws_config::from_env()
         .region(region)
-        .endpoint_url(&cfg.endpoint)
+        .endpoint_url(&cfg.connection.endpoint)
         .credentials_provider(credentials)
         .load()
         .await;
@@ -100,7 +107,7 @@ async fn syslog_message_appears_as_parquet_in_s3() {
 
     let list = s3
         .list_objects_v2()
-        .bucket(&cfg.bucket)
+        .bucket(&cfg.connection.bucket)
         .prefix("syslog-test/")
         .send()
         .await
@@ -116,7 +123,7 @@ async fn syslog_message_appears_as_parquet_in_s3() {
     let key = objects[0].key().expect("key");
     let get_resp = s3
         .get_object()
-        .bucket(&cfg.bucket)
+        .bucket(&cfg.connection.bucket)
         .key(key)
         .send()
         .await
@@ -155,5 +162,5 @@ async fn syslog_message_appears_as_parquet_in_s3() {
 // Verify the constant is usable in tests
 #[test]
 fn syslog_s3_channel_capacity_is_reasonable() {
-    assert!(SYSLOG_S3_CHANNEL_CAPACITY >= 1024);
+    const { assert!(SYSLOG_S3_CHANNEL_CAPACITY >= 1024) }
 }

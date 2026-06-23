@@ -59,12 +59,68 @@ impl IpfixListener {
         Self { config, handler }
     }
 
-    /// Bind the UDP socket and run the receive loop until error.
+    /// Bind the UDP socket and run the receive loop until error (no shutdown signal).
     pub async fn start(&self) -> anyhow::Result<()> {
         let addr: SocketAddr =
             format!("{}:{}", self.config.bind_address, self.config.udp_port).parse()?;
         let socket = UdpSocket::bind(&addr).await?;
         self.run_with_socket(socket).await
+    }
+
+    /// Bind the UDP socket and run the receive loop with graceful shutdown support.
+    ///
+    /// The listener exits cleanly when `shutdown_rx` receives `true` (or is closed).
+    /// Used from `main.rs`; tests continue to use `start()` or `run_with_socket()`.
+    pub async fn start_with_shutdown(
+        &self,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        let addr: SocketAddr =
+            format!("{}:{}", self.config.bind_address, self.config.udp_port).parse()?;
+        let socket = UdpSocket::bind(&addr).await?;
+        let bound_addr = socket.local_addr()?;
+        info!("IPFIX UDP listener started on {}", bound_addr);
+
+        let mut buf = vec![0u8; 65535];
+        let mut decoder = IpfixDecoder::new();
+
+        loop {
+            tokio::select! {
+                result = socket.recv_from(&mut buf) => {
+                    match result {
+                        Ok((len, src)) => {
+                            debug!("IPFIX datagram from {}: {} bytes", src, len);
+                            match decode_datagram(&mut decoder, &buf[..len], src.ip()) {
+                                Ok(flows) if flows.is_empty() => {
+                                    debug!(
+                                        "IPFIX datagram from {} produced no flows (template-only or empty)",
+                                        src
+                                    );
+                                }
+                                Ok(flows) => {
+                                    self.handler.handle_flows(flows, src).await;
+                                }
+                                Err(e) => {
+                                    metrics::counter!("ipfix_decode_errors").increment(1);
+                                    warn!("IPFIX decode error from {}: {}", src, e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("IPFIX UDP receive error: {}", e);
+                        }
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("IPFIX listener: shutdown signal received");
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Run the receive loop on an already-bound socket.
