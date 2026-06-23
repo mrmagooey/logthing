@@ -244,7 +244,7 @@ Records with a `_path` value that does not match one of the six curated stream n
 **Robustness**:
 - Lines longer than 16 MiB are rejected and the connection is closed; the `zeek_oversized_lines` counter is incremented.
 - Non-UTF-8 and invalid JSON lines are skipped (per-line, not per-connection); `zeek_parse_errors` is incremented.
-- The per-process stream map is bounded at 256 distinct `_path` values (`MAX_ZEEK_STREAMS`). Records whose sanitised path would create a 257th stream are routed to the `"unknown"` envelope stream and counted by `zeek_streams_capped`.
+- The per-process stream map is bounded at 256 distinct `_path` values (`MAX_ZEEK_STREAMS`). Records whose sanitised path would create a 257th stream are routed to the `"unknown"` envelope stream and counted by `parquet_s3_partitions_capped{source="zeek"}`.
 - `_path` values are sanitised before use in S3 keys (lowercased, `[a-z0-9_]` only, truncated to 64 characters; empty result → `"unknown"`).
 
 ### IPFIX S3 Persistence
@@ -295,7 +295,7 @@ The `[ipfix.s3]` block is optional; when absent, flows are handled by the defaul
 
 Objects are stored at `ipfix/year=YYYY/month=MM/day=DD/<uuid>.parquet`, distinct from syslog's `syslog/` prefix. Files are ZSTD-compressed.
 
-**Memory safety**: when S3 is unavailable and the buffer exceeds `max_buffer_rows * 4` rows, the oldest batches are dropped and the `ipfix_s3_buffer_dropped` counter is incremented.
+**Memory safety**: when S3 is unavailable and the buffer exceeds `max_buffer_rows * 4` rows, the oldest batches are dropped and the `parquet_s3_buffer_dropped{source="ipfix"}` counter is incremented.
 
 ### Zeek S3 Persistence
 
@@ -335,33 +335,33 @@ zeek/unknown/year=2024/month=03/day=15/1e7f….parquet
 
 Each stream produces a separate Parquet file series using its own typed schema (or the envelope schema for unrecognised stream names).
 
-**Memory safety**: when S3 is unavailable and a stream's buffer exceeds `max_buffer_rows * 4` rows, the oldest batches are dropped and the `zeek_s3_buffer_dropped` counter is incremented.
+**Memory safety**: when S3 is unavailable and a stream's buffer exceeds `max_buffer_rows * 4` rows, the oldest batches are dropped and the `parquet_s3_buffer_dropped{source="zeek"}` counter is incremented.
 
-### Parquet S3 Forwarder
+### WEF (Windows Event) S3 Persistence
 
-Store Windows events in S3-compatible storage (AWS S3, MinIO, etc.) as compressed Parquet files:
+Store Windows events in S3-compatible storage (AWS S3, MinIO, etc.) as ZSTD-compressed Parquet files:
 
 ```toml
-[[forwarding.destinations]]
-name = "parquet-s3"
-url = "s3://wef-events"
-protocol = "http"                       # Note: Use "http" protocol for S3 destinations
-enabled = true
-[forwarding.destinations.headers]
-endpoint = "http://localhost:9000"      # S3 endpoint (MinIO, AWS S3, etc.)
-region = "us-east-1"                    # AWS region
-access-key = "minioadmin"               # Access key
-secret-key = "minioadmin"               # Secret key
-max-size-mb = "100"                     # Flush at 100MB
-flush-interval-secs = "900"             # Flush every 15 minutes
-buffer-path = "/tmp/wef-events"         # Local temp directory for buffering
+[wef.s3]
+endpoint              = "http://localhost:9000"   # S3-compatible endpoint
+bucket                = "wef-events"
+region                = "us-east-1"
+access_key            = "minioadmin"
+secret_key            = "minioadmin"
+# prefix defaults to "" (empty) — preserves event_type=.../year=... layout at root
+flush_threshold_bytes = 104857600        # flush when buffer reaches 100 MiB (default)
+flush_interval_secs   = 900             # flush every N seconds regardless of size (default 900)
+channel_capacity      = 10000           # bounded channel depth (default 10 000)
+max_buffer_rows       = 100000          # hard-cap rows before oldest are dropped (default 100 000)
 ```
 
+The `[wef.s3]` block is optional; when absent, WEF events are not persisted to S3.
+
 **Features**:
-- **Event Type Partitioning**: Each Windows Event ID gets its own Parquet file
+- **Event Type Partitioning**: Each Windows Event ID gets its own Parquet file series
 - **Time-Based Partitioning**: Files organized by `event_type/year/month/day/`
-- **Batching**: Flushes when reaching 100MB or 15 minutes (configurable)
 - **Compression**: ZSTD compression for efficient storage
+- **Backpressure**: Bounded channel; drops are counted by `parquet_s3_dropped{source="wef"}`
 
 **S3 Path Structure**:
 ```
@@ -370,12 +370,12 @@ s3://bucket-name/
     year=2024/
       month=01/
         day=15/
-          events_4624_20240115_103045.parquet
+          <uuid>.parquet
   event_type=4668/
     year=2024/
       month=01/
         day=15/
-          events_4668_20240115_104512.parquet
+          <uuid>.parquet
 ```
 
 ## Container Image / Releases
