@@ -298,15 +298,38 @@ pub fn admin_start_allowed(bind: SocketAddr, user: &str, pass: &str) -> Result<(
 pub fn load_admin_config() -> anyhow::Result<AdminServerConfig> {
     // Admin bind address (default: 127.0.0.1:8080 — loopback only; operators opt into
     // a public bind via WEF_ADMIN_BIND).
+    // R-5: warn when WEF_ADMIN_BIND is set but fails to parse, so a typo'd public
+    // bind address isn't silently swallowed and the operator doesn't think the
+    // admin interface is publicly reachable when it is actually loopback-only.
     let bind_address = std::env::var("WEF_ADMIN_BIND")
         .ok()
-        .and_then(|s| s.parse().ok())
+        .map(|s| {
+            s.parse().unwrap_or_else(|_| {
+                tracing::warn!(
+                    "WEF_ADMIN_BIND value {:?} failed to parse as a socket address; \
+                     falling back to 127.0.0.1:8080 (loopback only). \
+                     Fix the value to bind the admin interface as intended.",
+                    s
+                );
+                "127.0.0.1:8080".parse().unwrap()
+            })
+        })
         .unwrap_or_else(|| "127.0.0.1:8080".parse().unwrap());
 
     // Admin credentials
     let username = std::env::var("WEF_ADMIN_USER").unwrap_or_else(|_| "admin".to_string());
     let password_hash = if let Ok(hashed) = std::env::var("WEF_ADMIN_PASS_HASH") {
-        // Use pre-hashed password
+        // Use pre-hashed password.
+        // R-3: call admin_start_allowed on the hash path too.  For the hash path the
+        // credentials are explicitly non-default (WEF_ADMIN_PASS_HASH is set), so
+        // this will always pass — but the call is required for consistency and to
+        // ensure future changes to admin_start_allowed apply uniformly.
+        // We don't have the plaintext password, so pass the hash string as the
+        // "pass" argument; the guard only triggers on exact "admin"/"admin" values.
+        admin_start_allowed(bind_address, &username, &hashed).map_err(|msg| {
+            tracing::error!("{}", msg);
+            anyhow::anyhow!("{}", msg)
+        })?;
         PasswordHash::from_hash(&hashed)
     } else {
         // Hash the plain password (for backward compatibility)

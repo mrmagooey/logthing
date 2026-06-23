@@ -324,11 +324,20 @@ impl ZeekS3Writer {
             Ok(()) => {
                 metrics::counter!("zeek_s3_records_written").increment(row_count as u64);
                 metrics::counter!("zeek_s3_uploads").increment(1);
-                let stream = self.streams.get_mut(log_path).unwrap();
-                stream.buffer.clear();
-                stream.buffer_row_count = 0;
-                stream.buffered_bytes = 0;
-                stream.last_flush = Instant::now();
+                // R-4: use if-let instead of unwrap so a concurrent modification or
+                // future refactor cannot panic the flush path.
+                if let Some(stream) = self.streams.get_mut(log_path) {
+                    stream.buffer.clear();
+                    stream.buffer_row_count = 0;
+                    stream.buffered_bytes = 0;
+                    stream.last_flush = Instant::now();
+                } else {
+                    warn!(
+                        "zeek_s3: stream for {:?} disappeared after upload; \
+                         skipping buffer reset",
+                        log_path
+                    );
+                }
                 Ok(())
             }
             Err(e) => {
