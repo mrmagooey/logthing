@@ -1,4 +1,5 @@
 use logthing::server::Server;
+use logthing::shutdown::await_handles_with_deadline;
 use logthing::{admin, config, forwarding, ipfix, stats, syslog, zeek};
 use std::sync::Arc;
 use std::time::Duration;
@@ -282,50 +283,26 @@ async fn async_main() -> anyhow::Result<()> {
     // 3. The handler Arcs created in this function were moved into the listener tasks.
     //    With the listener tasks finished (or aborted), the Arc refcounts hit zero,
     //    the Senders drop, and the writer channels close.
-    //    Now await all writer tasks with a 10s combined timeout.
+    //    Now await all writer tasks (plus the optional WEF worker) with a shared
+    //    10s combined timeout via `await_handles_with_deadline`.
     info!("Waiting for S3 writer tasks to flush (up to 10s)...");
-    let flush_deadline = tokio::time::sleep(Duration::from_secs(10));
-    tokio::pin!(flush_deadline);
 
-    for handle in writer_handles {
-        tokio::select! {
-            result = handle => {
-                match result {
-                    Ok(()) => {}
-                    Err(e) => {
-                        warn!("S3 writer task error during shutdown: {e}");
-                    }
-                }
-            }
-            _ = &mut flush_deadline => {
-                warn!("S3 writer flush timed out after 10s; some data may not have been written");
-                break;
-            }
-        }
-    }
-
-    // 4. Gap-b: Await the WEF→S3 Parquet worker handle (within the same 10s
-    //    deadline, which is shared via the pinned flush_deadline above).
+    // 4. Gap-b: Bundle the WEF→S3 Parquet worker handle (if present) into the
+    //    same flush batch so the entire set shares a single 10s deadline.
     //    The worker exits when the axum server drops AppState (closing the channel)
     //    and its None arm calls shutdown_flush.
+    let mut all_writer_handles = writer_handles;
     if let Some(wef_handle) = wef_worker_handle {
-        tokio::select! {
-            result = wef_handle => {
-                match result {
-                    Ok(()) => {
-                        info!("Parquet S3 WEF worker flushed and exited cleanly");
-                    }
-                    Err(e) => {
-                        warn!("Parquet S3 WEF worker error during shutdown: {e}");
-                    }
-                }
-            }
-            _ = &mut flush_deadline => {
-                warn!(
-                    "Parquet S3 WEF worker flush timed out; some WEF data may not have been written"
-                );
-            }
-        }
+        all_writer_handles.push(wef_handle);
+    }
+
+    let total = all_writer_handles.len();
+    let completed = await_handles_with_deadline(all_writer_handles, Duration::from_secs(10)).await;
+    if completed < total {
+        warn!(
+            "S3 writer flush timed out after 10s; {}/{} tasks finished — some data may not have been written",
+            completed, total,
+        );
     }
 
     info!("Shutdown complete");
