@@ -242,6 +242,46 @@ mod tests {
         );
     }
 
+    /// Firing the shutdown signal makes `start_with_shutdown` return cleanly
+    /// within a short timeout (the shutdown arm of the select! is exercised).
+    #[tokio::test]
+    async fn start_with_shutdown_exits_on_signal() {
+        use tokio::sync::watch;
+        use tokio::time::timeout;
+
+        // Bind briefly to obtain an ephemeral port, then drop so the listener
+        // can re-bind the same address.
+        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = tmp.local_addr().unwrap().port();
+        drop(tmp);
+
+        let config = IpfixListenerConfig {
+            udp_port,
+            bind_address: "127.0.0.1".to_string(),
+        };
+        let handler: Arc<dyn IpfixHandler> = Arc::new(DefaultIpfixHandler);
+        let listener = IpfixListener::new(config, handler);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let task = tokio::spawn(async move {
+            listener.start_with_shutdown(shutdown_rx).await.ok();
+        });
+
+        // Give the listener time to bind and enter the select! loop.
+        sleep(Duration::from_millis(50)).await;
+
+        // Send the shutdown signal.
+        shutdown_tx.send(true).unwrap();
+
+        // The task must complete within 2 s.
+        let result = timeout(Duration::from_secs(2), task).await;
+        assert!(
+            result.is_ok(),
+            "start_with_shutdown did not return after shutdown signal within 2 s"
+        );
+    }
+
     #[tokio::test]
     async fn listener_ignores_malformed_datagrams_and_continues() {
         // Bind the listener socket here to eliminate the TOCTOU race.
