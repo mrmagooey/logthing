@@ -10,6 +10,7 @@ pub mod models;
 pub mod parser;
 pub mod protocol;
 pub mod server;
+pub mod shutdown;
 pub mod stats;
 pub mod syslog;
 pub mod zeek;
