@@ -34,21 +34,16 @@ keytab = "{{ wef_keytab_path }}"
 buffer_size = 1000
 retry_attempts = 3
 
-# Forward to S3/MinIO
-[[forwarding.destinations]]
-name = "parquet-s3"
-url = "s3://{{ s3_bucket }}"
-protocol = "http"
-enabled = true
-
-[forwarding.destinations.headers]
-endpoint = "{{ s3_endpoint }}"
-region = "us-east-1"
-access-key = "{{ s3_access_key }}"
-secret-key = "{{ s3_secret_key }}"
-max-size-mb = "100"
-flush-interval-secs = "300"
-buffer-path = "{{ wef_data_dir }}/buffer"
+# Forward WEF events to S3
+[wef.s3]
+endpoint   = "{{ s3_endpoint }}"
+bucket     = "{{ s3_bucket }}"
+region     = "us-east-1"
+access_key = "{{ s3_access_key }}"
+secret_key = "{{ s3_secret_key }}"
+# prefix defaults to "" (empty) — preserves event_type=.../year=... layout at root
+flush_threshold_bytes = 104857600
+flush_interval_secs   = 300
 
 # Event parser configuration
 [parser]

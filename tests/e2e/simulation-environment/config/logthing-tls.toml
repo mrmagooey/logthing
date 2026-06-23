@@ -24,17 +24,12 @@ parse_dns = true
 buffer_size = 10
 retry_attempts = 1
 
-[[forwarding.destinations]]
-name = "parquet"
-url = "s3://wef-events/archive"
-protocol = "http"
-enabled = true
-
-[forwarding.destinations.headers]
-endpoint = "http://minio:9000"
-region = "us-east-1"
-"access-key" = "miniouser"
-"secret-key" = "miniopassword"
-"max-size-mb" = "1"
-"flush-interval-secs" = "5"
-"buffer-path" = "/tmp/wef-events"
+[wef.s3]
+endpoint   = "http://minio:9000"
+bucket     = "wef-events"
+region     = "us-east-1"
+access_key = "miniouser"
+secret_key = "miniopassword"
+# prefix defaults to "" (empty) — preserves event_type=.../year=... layout at root
+flush_threshold_bytes = 1
+flush_interval_secs   = 5
