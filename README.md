@@ -331,9 +331,15 @@ Examples:
 zeek/conn/year=2024/month=03/day=15/f3a9….parquet
 zeek/dns/year=2024/month=03/day=15/8b2c….parquet
 zeek/unknown/year=2024/month=03/day=15/1e7f….parquet
+zeek/_overflow/year=2024/month=03/day=15/9a1b….parquet
 ```
 
 Each stream produces a separate Parquet file series using its own typed schema (or the envelope schema for unrecognised stream names).
+
+**Stream routing rules**:
+- A record whose JSON `_path` field is absent or non-string is assigned `log_path = "unknown"` by the listener; after `sanitize_log_path` it lands at `zeek/unknown/`.
+- A record whose sanitised `_path` produces an empty string (e.g. a path composed entirely of non-alphanumeric, non-underscore characters) also maps to `zeek/unknown/` via `sanitize_log_path`'s empty-result fallback.
+- A record with a valid `_path` that would create a new partition beyond the `max_partitions` cap (default 256) is routed to `zeek/_overflow/` by the generic partition-cap machinery.
 
 **Memory safety**: when S3 is unavailable and a stream's buffer exceeds `max_buffer_rows * 4` rows, the oldest batches are dropped and the `parquet_s3_buffer_dropped{source="zeek"}` counter is incremented.
 
