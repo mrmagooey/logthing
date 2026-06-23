@@ -4,9 +4,9 @@
 //! Set MINIO_ENDPOINT, MINIO_BUCKET, MINIO_ACCESS_KEY, MINIO_SECRET_KEY env vars.
 //! If MINIO_ENDPOINT is absent, the test is skipped.
 
-use logthing::config::S3ConnectionConfig;
+use logthing::config::{S3ConnectionConfig, SyslogS3Config};
 use logthing::forwarding::s3_sink::S3Sink;
-use logthing::forwarding::syslog_s3::{SyslogS3Config, SyslogS3Handler, syslog_start};
+use logthing::forwarding::syslog_s3::{SyslogS3Handler, syslog_start};
 use logthing::syslog::listener::SyslogHandler as SyslogHandlerTrait;
 use logthing::syslog::{SyslogMessage, SyslogProtocol};
 use std::net::SocketAddr;

@@ -181,7 +181,7 @@ pub struct SyslogConfig {
     /// Optional S3 persistence for syslog messages.
     /// Absent from TOML → `None` → no S3 persistence (backward compatible).
     #[serde(default)]
-    pub s3: Option<crate::forwarding::syslog_s3::SyslogS3Config>,
+    pub s3: Option<SyslogS3Config>,
 }
 
 /// Configuration for the IPFIX / NetFlow UDP listener.
@@ -199,7 +199,7 @@ pub struct IpfixConfig {
     /// Optional S3 persistence for IPFIX flows.
     /// Absent from TOML → `None` → no S3 persistence (backward compatible).
     #[serde(default)]
-    pub s3: Option<crate::forwarding::ipfix_s3::IpfixS3Config>,
+    pub s3: Option<IpfixS3Config>,
 }
 
 impl Default for IpfixConfig {
@@ -343,6 +343,82 @@ pub struct WefConfig {
     /// Optional S3 persistence. Absent from TOML → `None` → no S3 persistence.
     #[serde(default)]
     pub s3: Option<WefS3Config>,
+}
+
+/// Per-source S3 persistence config for the syslog listener.
+/// Absent from TOML → `None` → no S3 persistence (backward compatible).
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct SyslogS3Config {
+    /// Shared S3 connection fields (endpoint, bucket, region, access_key, secret_key).
+    /// Flattened so the TOML block stays flat: `[syslog.s3]\nendpoint = …`
+    #[serde(flatten)]
+    pub connection: S3ConnectionConfig,
+    /// S3 key prefix for syslog objects, slash-free (default: `"syslog"`); builder inserts `/`.
+    #[serde(default = "default_syslog_s3_prefix")]
+    pub prefix: String,
+    /// Flush when row count reaches this threshold (default 10 000).
+    #[serde(default = "default_syslog_s3_max_rows")]
+    pub max_buffer_rows: usize,
+    /// Flush after this many seconds regardless of row count (default 900 = 15 min).
+    #[serde(default = "default_syslog_s3_flush_interval_secs")]
+    pub flush_interval_secs: u64,
+    /// Bounded channel capacity (number of messages; default 4096).
+    #[serde(default = "default_syslog_s3_channel_capacity")]
+    pub channel_capacity: usize,
+}
+
+fn default_syslog_s3_prefix() -> String {
+    "syslog".to_string()
+}
+fn default_syslog_s3_max_rows() -> usize {
+    10_000
+}
+fn default_syslog_s3_flush_interval_secs() -> u64 {
+    900
+}
+fn default_syslog_s3_channel_capacity() -> usize {
+    4_096
+}
+
+/// Per-source S3 persistence config for the IPFIX listener.
+/// Absent from TOML → `None` → no S3 persistence (backward compatible).
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct IpfixS3Config {
+    /// Shared S3 connection fields (endpoint, bucket, region, access_key, secret_key).
+    /// Flattened so the TOML block stays flat: `[ipfix.s3]\nendpoint = …`
+    #[serde(flatten)]
+    pub connection: S3ConnectionConfig,
+    /// S3 key prefix for IPFIX objects, slash-free (default: `"ipfix"`); builder inserts `/`.
+    #[serde(default = "default_ipfix_s3_prefix")]
+    pub prefix: String,
+    /// Max buffer size in bytes before an eager flush (default: 100 MiB)
+    #[serde(default = "default_ipfix_flush_bytes")]
+    pub flush_threshold_bytes: usize,
+    /// Max age of buffered records in seconds before a time-triggered flush (default: 900)
+    #[serde(default = "default_ipfix_flush_secs")]
+    pub flush_interval_secs: u64,
+    /// Bounded channel capacity (number of batches; default: 256)
+    #[serde(default = "default_ipfix_channel_capacity")]
+    pub channel_capacity: usize,
+    /// Maximum number of buffered rows before hard cap kicks in (default: 100 000)
+    #[serde(default = "default_ipfix_max_buffer_rows")]
+    pub max_buffer_rows: usize,
+}
+
+fn default_ipfix_s3_prefix() -> String {
+    "ipfix".to_string()
+}
+fn default_ipfix_flush_bytes() -> usize {
+    100 * 1024 * 1024 // 100 MiB
+}
+fn default_ipfix_flush_secs() -> u64 {
+    900
+}
+fn default_ipfix_channel_capacity() -> usize {
+    256
+}
+fn default_ipfix_max_buffer_rows() -> usize {
+    100_000
 }
 
 impl Default for SyslogConfig {

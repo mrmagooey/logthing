@@ -7,51 +7,13 @@
 //! - `SyslogS3Handler` — type alias for `ParquetWriterHandle<SyslogSink>`
 //! - `syslog_start()` — convenience constructor wiring `SyslogS3Config` → `ParquetWriterHandle`
 
+use crate::config::SyslogS3Config;
 use crate::forwarding::buffered_writer::ParquetSink;
 use crate::syslog::SyslogMessage;
 use arrow::array::{ArrayRef, StringArray, UInt8Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use std::sync::{Arc, LazyLock};
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-
-/// Per-source S3 persistence config for the syslog listener.
-/// Absent from TOML → `None` → no S3 persistence (backward compatible).
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct SyslogS3Config {
-    /// Shared S3 connection fields (endpoint, bucket, region, access_key, secret_key).
-    /// Flattened so the TOML block stays flat: `[syslog.s3]\nendpoint = …`
-    #[serde(flatten)]
-    pub connection: crate::config::S3ConnectionConfig,
-    /// S3 key prefix for syslog objects, slash-free (default: `"syslog"`); builder inserts `/`.
-    #[serde(default = "default_syslog_s3_prefix")]
-    pub prefix: String,
-    /// Flush when row count reaches this threshold (default 10 000).
-    #[serde(default = "default_syslog_s3_max_rows")]
-    pub max_buffer_rows: usize,
-    /// Flush after this many seconds regardless of row count (default 900 = 15 min).
-    #[serde(default = "default_syslog_s3_flush_interval_secs")]
-    pub flush_interval_secs: u64,
-    /// Bounded channel capacity (number of messages; default 4096).
-    #[serde(default = "default_syslog_s3_channel_capacity")]
-    pub channel_capacity: usize,
-}
-
-fn default_syslog_s3_prefix() -> String {
-    "syslog".to_string()
-}
-fn default_syslog_s3_max_rows() -> usize {
-    10_000
-}
-fn default_syslog_s3_flush_interval_secs() -> u64 {
-    900
-}
-fn default_syslog_s3_channel_capacity() -> usize {
-    4_096
-}
 
 // ---------------------------------------------------------------------------
 // Schema
