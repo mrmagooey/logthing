@@ -468,7 +468,10 @@ impl IpfixS3Writer {
         }
         let batches: Vec<RecordBatch> = self.buffer.iter().map(|b| b.batch.clone()).collect();
         let row_count = self.buffer_row_count;
-        let bytes = encode_batches_to_parquet(&batches)?;
+        // Move the CPU-bound Parquet encode off the async runtime thread.
+        let bytes = tokio::task::spawn_blocking(move || encode_batches_to_parquet(&batches))
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
         let key = build_s3_key(&self.config.key_prefix, Utc::now());
         match self.sink.upload(&key, bytes).await {
             Ok(()) => {
@@ -506,25 +509,31 @@ pub struct IpfixS3Handler {
 
 impl IpfixS3Handler {
     /// Construct a handler and start the writer background task with the default channel capacity.
-    /// Production callers should prefer `start_with_capacity` to honour the configured value.
+    ///
+    /// Returns `(handler, writer_task_handle)`. The caller should retain the `JoinHandle` and
+    /// await it (with a timeout) during graceful shutdown, after all `Arc<IpfixS3Handler>`
+    /// references have been dropped so the channel closes and the final flush fires.
     #[allow(dead_code)]
-    pub fn start(config: IpfixS3WriterConfig, sink: Arc<S3Sink>) -> Self {
+    pub fn start(
+        config: IpfixS3WriterConfig,
+        sink: Arc<S3Sink>,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         Self::start_with_capacity(config, sink, IPFIX_S3_CHANNEL_CAPACITY)
     }
 
     /// Construct a handler and start the writer background task with a custom channel `capacity`.
     ///
-    /// Intended for tests that need a small channel to exercise the overflow/drop path without
-    /// relying on the production `IPFIX_S3_CHANNEL_CAPACITY` constant, and for production use
-    /// when the configured `channel_capacity` should override the default.
+    /// Returns `(handler, writer_task_handle)`. The caller should hold the `JoinHandle` and await
+    /// it (with a timeout) during shutdown, after dropping all `Arc<dyn IpfixHandler>` references
+    /// so that the channel closes and the writer flushes its buffer.
     pub fn start_with_capacity(
         config: IpfixS3WriterConfig,
         sink: Arc<S3Sink>,
         capacity: usize,
-    ) -> Self {
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let (tx, mut rx) = mpsc::channel::<Vec<FlowRecord>>(capacity);
         let flush_check = crate::forwarding::s3_sink::flush_check_interval(config.flush_interval);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut writer = IpfixS3Writer::new(config, sink);
             let mut interval = tokio::time::interval(flush_check);
             loop {
@@ -553,7 +562,7 @@ impl IpfixS3Handler {
                 }
             }
         });
-        Self { sender: tx }
+        (Self { sender: tx }, handle)
     }
 }
 
@@ -616,18 +625,15 @@ mod tests {
     }
 
     async fn unreachable_sink() -> Arc<S3Sink> {
-        use crate::forwarding::parquet_s3::ParquetS3Config;
-        let cfg = ParquetS3Config {
+        use crate::config::S3ConnectionConfig;
+        let conn = S3ConnectionConfig {
             endpoint: "http://127.0.0.1:1".to_string(), // port 1 is always refused
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
             access_key: "AKIATEST".to_string(),
             secret_key: "SECRETTEST".to_string(),
-            max_file_size_mb: 10,
-            flush_interval_secs: 60,
-            local_buffer_path: std::env::temp_dir().join("ipfix-s3-test"),
         };
-        Arc::new(S3Sink::from_config(&cfg).await.expect("constructs"))
+        Arc::new(S3Sink::from_connection(&conn).await.expect("constructs"))
     }
 
     // -- Task 1: schema shape --
@@ -890,6 +896,7 @@ mod tests {
     // -- Task 3: IpfixS3Handler overflow test (real handler, real metrics) --
 
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
     async fn handler_overflow_increments_dropped_counter() {
         use crate::ipfix::listener::IpfixHandler;
         use metrics::set_default_local_recorder;
@@ -910,7 +917,7 @@ mod tests {
             key_prefix: "ipfix".to_string(),
             max_buffer_rows: 1,
         };
-        let handler = IpfixS3Handler::start_with_capacity(config, sink, 1);
+        let (handler, _writer_handle) = IpfixS3Handler::start_with_capacity(config, sink, 1);
 
         // Yield so the background task starts and blocks inside the S3 upload.
         tokio::task::yield_now().await;
@@ -955,6 +962,7 @@ mod tests {
     /// a tiny capacity (1) causes drops for a burst of sends, while a large capacity
     /// (10_000) does not for the same modest send count.
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
     async fn channel_capacity_parameter_is_wired() {
         use crate::ipfix::listener::IpfixHandler;
         use metrics::set_default_local_recorder;
@@ -978,7 +986,7 @@ mod tests {
                 key_prefix: "ipfix".to_string(),
                 max_buffer_rows: 1,
             };
-            let handler = IpfixS3Handler::start_with_capacity(config, sink, 1);
+            let (handler, _writer_handle) = IpfixS3Handler::start_with_capacity(config, sink, 1);
             tokio::task::yield_now().await;
 
             // Send 30 batches — far more than capacity (1) + the one in-flight with S3.
@@ -1023,7 +1031,8 @@ mod tests {
                 key_prefix: "ipfix".to_string(),
                 max_buffer_rows: 100_000,
             };
-            let handler = IpfixS3Handler::start_with_capacity(config, sink, 10_000);
+            let (handler, _writer_handle) =
+                IpfixS3Handler::start_with_capacity(config, sink, 10_000);
             tokio::task::yield_now().await;
 
             for i in 0..30usize {
@@ -1093,7 +1102,7 @@ mod tests {
             key_prefix: s3_cfg.prefix.clone(),
             max_buffer_rows: s3_cfg.max_buffer_rows,
         };
-        let handler = IpfixS3Handler::start(writer_config, sink);
+        let (handler, _writer_handle) = IpfixS3Handler::start(writer_config, sink);
         let src: std::net::SocketAddr = "127.0.0.1:4739".parse().unwrap();
 
         let flows: Vec<FlowRecord> = (0..10)

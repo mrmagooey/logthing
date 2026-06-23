@@ -8,6 +8,43 @@ use std::sync::LazyLock;
 
 type StructuredData = Option<HashMap<String, HashMap<String, String>>>;
 
+// --- Module-level static regexes (compiled once per process) ---
+
+/// RFC 5424 header: <priority>version timestamp hostname app-name procid msgid [sd] msg
+static RFC5424_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^<(\d{1,3})>(\d)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*(.*?)$").unwrap()
+});
+
+/// RFC 3164 header: <priority>timestamp hostname rest
+static RFC3164_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^<(\d{1,3})>([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+(.*?)$").unwrap()
+});
+
+/// RFC 3164 timestamp: "Mon DD HH:MM:SS"
+static RFC3164_TS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})$").unwrap());
+
+/// RFC 3164 tag + pid: "tag[pid]: message" or "tag: message"
+static RFC3164_TAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([^:\[]+)(?:\[(\d+)\])?:\s*(.*)$").unwrap());
+
+/// DNS BIND format
+static DNS_BIND_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"client\s+(\d+\.\d+\.\d+\.\d+)#\d+:\s+query:\s+(\S+)\s+(\S+)\s+(\S+)\s+.*\((\d+\.\d+\.\d+\.\d+)\)",
+    )
+    .unwrap()
+});
+
+/// DNS Unbound format
+static DNS_UNBOUND_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"info:\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)\s+(\S+)\s+(\S+)").unwrap());
+
+/// DNS PowerDNS format
+static DNS_POWERDNS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"Remote\s+(\d+\.\d+\.\d+\.\d+)\s+wants\s+'([^|]+)\|([^']+)'").unwrap()
+});
+
 /// Parsed syslog message structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyslogMessage {
@@ -201,10 +238,7 @@ impl SyslogMessage {
         // RFC 5424 format: <priority>version timestamp hostname app-name procid msgid [structured-data] msg
         // Example: <34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ID47 [example@32473 iut="3"] 'su root' failed
 
-        let re = Regex::new(r"^<(\d{1,3})>(\d)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*(.*?)$")
-            .ok()?;
-
-        let caps = re.captures(input)?;
+        let caps = RFC5424_RE.captures(input)?;
 
         let priority: u8 = caps.get(1)?.as_str().parse().ok()?;
         let severity = priority & 0x07;
@@ -260,11 +294,7 @@ impl SyslogMessage {
         // RFC 3164 format: <priority>timestamp hostname tag[pid]: message
         // Example: <34>Oct 11 22:14:15 mymachine su: 'su root' failed
 
-        let re =
-            Regex::new(r"^<(\d{1,3})>([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+(.*?)$")
-                .ok()?;
-
-        let caps = re.captures(input)?;
+        let caps = RFC3164_RE.captures(input)?;
 
         let priority: u8 = caps.get(1)?.as_str().parse().ok()?;
         let severity = priority & 0x07;
@@ -298,8 +328,7 @@ impl SyslogMessage {
     /// Parse RFC 3164 timestamp (assumes current year)
     fn parse_rfc3164_timestamp(ts_str: &str) -> Option<DateTime<Utc>> {
         // RFC 3164 uses: "Oct 11 22:14:15" format (no year)
-        let re = Regex::new(r"^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})$").ok()?;
-        let caps = re.captures(ts_str)?;
+        let caps = RFC3164_TS_RE.captures(ts_str)?;
 
         let month_str = caps.get(1)?.as_str();
         let day: u32 = caps.get(2)?.as_str().parse().ok()?;
@@ -334,9 +363,7 @@ impl SyslogMessage {
     /// Parse RFC 3164 tag and extract app_name, proc_id, and message
     fn parse_rfc3164_tag(rest: &str) -> (Option<String>, Option<String>, String) {
         // Tag format: "tag[pid]: " or "tag: "
-        let re = Regex::new(r"^([^:\[]+)(?:\[(\d+)\])?:\s*(.*)$").unwrap();
-
-        if let Some(caps) = re.captures(rest) {
+        if let Some(caps) = RFC3164_TAG_RE.captures(rest) {
             let app_name = Some(caps.get(1).unwrap().as_str().to_string());
             let proc_id = caps.get(2).map(|m| m.as_str().to_string());
             let message = caps.get(3).unwrap().as_str().to_string();
@@ -446,11 +473,7 @@ pub mod dns {
         /// Parse BIND/named DNS query log format
         /// Example: client 192.168.1.100#12345: query: example.com IN A + (192.168.1.1)
         pub fn from_bind_format(message: &str) -> Option<Self> {
-            let re = Regex::new(
-                r"client\s+(\d+\.\d+\.\d+\.\d+)#\d+:\s+query:\s+(\S+)\s+(\S+)\s+(\S+)\s+.*\((\d+\.\d+\.\d+\.\d+)\)"
-            ).ok()?;
-
-            let caps = re.captures(message)?;
+            let caps = super::DNS_BIND_RE.captures(message)?;
 
             Some(DnsLogEntry {
                 timestamp: Utc::now(),
@@ -466,9 +489,7 @@ pub mod dns {
         /// Parse Unbound DNS log format
         /// Example: info: 192.168.1.100 example.com. A IN
         pub fn from_unbound_format(message: &str) -> Option<Self> {
-            let re = Regex::new(r"info:\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)\s+(\S+)\s+(\S+)").ok()?;
-
-            let caps = re.captures(message)?;
+            let caps = super::DNS_UNBOUND_RE.captures(message)?;
 
             Some(DnsLogEntry {
                 timestamp: Utc::now(),
@@ -484,10 +505,7 @@ pub mod dns {
         /// Parse PowerDNS log format
         /// Example: Remote 192.168.1.100 wants 'example.com|A', do = 0, bufsize = 512
         pub fn from_powerdns_format(message: &str) -> Option<Self> {
-            let re =
-                Regex::new(r"Remote\s+(\d+\.\d+\.\d+\.\d+)\s+wants\s+'([^|]+)\|([^']+)'").ok()?;
-
-            let caps = re.captures(message)?;
+            let caps = super::DNS_POWERDNS_RE.captures(message)?;
 
             Some(DnsLogEntry {
                 timestamp: Utc::now(),

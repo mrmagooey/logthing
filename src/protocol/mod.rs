@@ -2,6 +2,7 @@ use crate::models::{EventLevel, Heartbeat, ParsedEvent, SubscriptionRequest, Win
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use quick_xml::Reader;
+use quick_xml::escape::escape as xml_escape;
 use quick_xml::events::Event as XmlEvent;
 use tracing::{debug, error};
 
@@ -54,7 +55,10 @@ impl WefParser {
 
         // Fast single-pass detection using first meaningful element
         // Check first 2000 chars for type detection (avoids scanning entire large bodies)
-        let check_len = body.len().min(2000);
+        let mut check_len = body.len().min(2000);
+        while check_len > 0 && !body.is_char_boundary(check_len) {
+            check_len -= 1;
+        }
         let check_body = &body[..check_len];
 
         if check_body.contains("Subscribe") && check_body.contains("SubscriptionId") {
@@ -103,7 +107,7 @@ impl WefParser {
         let mut buf = Vec::new();
         let mut event_start_pos: Option<usize> = None;
         let mut in_event = false;
-        let mut depth = 0;
+        let mut depth: u32 = 0;
 
         loop {
             let pos = reader.buffer_position();
@@ -141,7 +145,7 @@ impl WefParser {
                         }
                         depth = 0;
                     } else if in_event {
-                        depth -= 1;
+                        depth = depth.saturating_sub(1);
                     }
                 }
                 #[allow(clippy::collapsible_match)]
@@ -228,11 +232,36 @@ impl WefParser {
                     }
                 }
                 Ok(XmlEvent::Text(e)) => {
-                    let text = e.unescape().unwrap_or_default();
+                    let text = match e.unescape() {
+                        Ok(t) => t,
+                        Err(err) => {
+                            debug!(
+                                "Failed to unescape XML text in tag <{}>: {}",
+                                current_tag, err
+                            );
+                            std::borrow::Cow::Borrowed("")
+                        }
+                    };
                     match current_tag.as_str() {
                         "Provider" => provider = text.to_string(),
-                        "EventID" => event_id = text.parse().unwrap_or(0),
-                        "Level" => level = text.parse().unwrap_or(0),
+                        "EventID" => {
+                            event_id = text.parse().unwrap_or_else(|_| {
+                                debug!(
+                                    "Failed to parse EventID {:?} as u32, defaulting to 0",
+                                    text.as_ref()
+                                );
+                                0
+                            });
+                        }
+                        "Level" => {
+                            level = text.parse().unwrap_or_else(|_| {
+                                debug!(
+                                    "Failed to parse Level {:?} as u8, defaulting to 0",
+                                    text.as_ref()
+                                );
+                                0
+                            });
+                        }
                         "TimeCreated" => {
                             if let Ok(dt) = DateTime::parse_from_rfc3339(&text) {
                                 time_created = dt.with_timezone(&Utc);
@@ -329,6 +358,7 @@ impl WefParser {
 }
 
 pub fn create_subscription_response(subscription_id: &str) -> String {
+    let escaped_id = xml_escape(subscription_id);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
         <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
@@ -339,7 +369,7 @@ pub fn create_subscription_response(subscription_id: &str) -> String {
                 <SubscribeResponse xmlns="http://schemas.microsoft.com/wbem/wsman/1/windows/EventLog"/>
             </s:Body>
         </s:Envelope>"#,
-        subscription_id
+        escaped_id
     )
 }
 
@@ -748,6 +778,21 @@ mod tests {
     }
 
     #[test]
+    fn create_subscription_response_escapes_xml_injection() {
+        // A subscription_id containing XML-special chars must not produce raw injection
+        let malicious_id = r#"]]><evil>&amp;"injected"</evil><![CDATA["#;
+        let response = create_subscription_response(malicious_id);
+        // Raw injection chars must not appear verbatim
+        assert!(!response.contains("<evil>"), "raw < must be escaped");
+        assert!(!response.contains("</evil>"), "raw </ must be escaped");
+        // Escaped forms should appear
+        assert!(response.contains("&lt;"), "< should be &lt;");
+        assert!(response.contains("&amp;"), "& should be &amp;");
+        // Existing test: response must still be structurally valid (contains SubscribeResponse)
+        assert!(response.contains("SubscribeResponse"));
+    }
+
+    #[test]
     fn create_heartbeat_response_is_valid_xml() {
         let response = create_heartbeat_response();
         assert!(response.contains("HeartbeatResponse"));
@@ -886,6 +931,44 @@ mod tests {
             Ok(_) => {}
             Err(_) => {}
         }
+    }
+
+    #[test]
+    fn parse_events_mismatched_depth_does_not_panic() {
+        let parser = WefParser::new();
+        // Craft XML where closing tags exceed opening tags inside an Event
+        // (mismatched nesting). Must not panic in debug mode.
+        let xml = r#"
+        <Envelope>
+          <Body>
+            <Events>
+              <Event>
+                <System>
+                  <EventID>42</EventID>
+                </System>
+                </ExtraClose>
+              </Event>
+            </Events>
+          </Body>
+        </Envelope>
+        "#;
+        // Any result is acceptable — just must not panic
+        let _ = parser.parse_message(xml, "host".into());
+    }
+
+    #[test]
+    fn parse_message_multibyte_char_at_boundary_does_not_panic() {
+        let parser = WefParser::new();
+        // Build a body where a 4-byte emoji straddles byte 2000.
+        // Each '😀' is 4 bytes (U+1F600). Fill 1999 ASCII bytes then append emojis.
+        let prefix = "a".repeat(1999); // bytes 0..1999
+        let suffix = "😀".repeat(10); // 4 bytes each; first one spans bytes 1999..2003
+        let body = format!("{}{}", prefix, suffix);
+        assert_eq!(body.as_bytes()[1999], 0xF0); // confirms emoji straddles byte 2000
+
+        // Must not panic — any result is fine
+        let result = parser.parse_message(&body, "host".into());
+        assert!(result.is_ok() || result.is_err()); // just must not panic
     }
 
     #[test]

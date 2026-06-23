@@ -314,18 +314,30 @@ impl ZeekS3Writer {
         let batches: Vec<RecordBatch> = stream.buffer.iter().map(|b| b.batch.clone()).collect();
         let row_count = stream.buffer_row_count;
         let schema = stream.schema.clone();
-        let bytes = encode_batches(&batches, schema)?;
+        // Move the CPU-bound Parquet encode off the async runtime thread.
+        let bytes = tokio::task::spawn_blocking(move || encode_batches(&batches, schema))
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
         let key = build_zeek_s3_key(&self.config.key_prefix, log_path, Utc::now());
 
         match self.sink.upload(&key, bytes).await {
             Ok(()) => {
                 metrics::counter!("zeek_s3_records_written").increment(row_count as u64);
                 metrics::counter!("zeek_s3_uploads").increment(1);
-                let stream = self.streams.get_mut(log_path).unwrap();
-                stream.buffer.clear();
-                stream.buffer_row_count = 0;
-                stream.buffered_bytes = 0;
-                stream.last_flush = Instant::now();
+                // R-4: use if-let instead of unwrap so a concurrent modification or
+                // future refactor cannot panic the flush path.
+                if let Some(stream) = self.streams.get_mut(log_path) {
+                    stream.buffer.clear();
+                    stream.buffer_row_count = 0;
+                    stream.buffered_bytes = 0;
+                    stream.last_flush = Instant::now();
+                } else {
+                    warn!(
+                        "zeek_s3: stream for {:?} disappeared after upload; \
+                         skipping buffer reset",
+                        log_path
+                    );
+                }
                 Ok(())
             }
             Err(e) => {
@@ -362,18 +374,31 @@ pub struct ZeekS3Handler {
 }
 
 impl ZeekS3Handler {
-    pub fn start(config: ZeekS3WriterConfig, sink: Arc<S3Sink>) -> Self {
+    /// Construct a handler with the default channel capacity.
+    ///
+    /// Returns `(handler, writer_task_handle)`. The caller should retain the `JoinHandle` and
+    /// await it (with a timeout) during graceful shutdown, after all `Arc<ZeekS3Handler>`
+    /// references have been dropped so the channel closes and the final flush fires.
+    pub fn start(
+        config: ZeekS3WriterConfig,
+        sink: Arc<S3Sink>,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         Self::start_with_capacity(config, sink, ZEEK_S3_CHANNEL_CAPACITY)
     }
 
+    /// Construct a handler with a custom channel `capacity`.
+    ///
+    /// Returns `(handler, writer_task_handle)`. The caller should hold the `JoinHandle` and await
+    /// it (with a timeout) during shutdown, after dropping all `Arc<dyn ZeekHandler>` references
+    /// so that the channel closes and the writer flushes its buffer.
     pub fn start_with_capacity(
         config: ZeekS3WriterConfig,
         sink: Arc<S3Sink>,
         capacity: usize,
-    ) -> Self {
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let (tx, mut rx) = mpsc::channel::<ZeekRecord>(capacity);
         let flush_check = flush_check_interval(config.flush_interval);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut writer = ZeekS3Writer::new(config, sink);
             let mut interval = tokio::time::interval(flush_check);
             loop {
@@ -401,7 +426,7 @@ impl ZeekS3Handler {
                 }
             }
         });
-        Self { sender: tx }
+        (Self { sender: tx }, handle)
     }
 }
 
@@ -573,6 +598,7 @@ mod tests {
     // -- Handler overflow drops and counts --
 
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
     async fn handler_overflow_increments_dropped_counter() {
         use crate::zeek::listener::ZeekHandler;
         use metrics::set_default_local_recorder;
@@ -592,7 +618,7 @@ mod tests {
             key_prefix: "zeek".to_string(),
             max_buffer_rows: 1,
         };
-        let handler = ZeekS3Handler::start_with_capacity(config, sink, 1);
+        let (handler, _writer_handle) = ZeekS3Handler::start_with_capacity(config, sink, 1);
         tokio::task::yield_now().await;
 
         let src: SocketAddr = "127.0.0.1:47760".parse().unwrap();
@@ -712,7 +738,7 @@ mod tests {
             key_prefix: "zeek".to_string(),
             max_buffer_rows: 100_000,
         };
-        let handler = ZeekS3Handler::start(config, sink);
+        let (handler, _writer_handle) = ZeekS3Handler::start(config, sink);
         let src: std::net::SocketAddr = "127.0.0.1:47760".parse().unwrap();
 
         for i in 0..5usize {

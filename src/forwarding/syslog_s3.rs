@@ -263,7 +263,10 @@ impl SyslogS3Writer {
         // VecDeque is not contiguous, so collect clones for the encoder.
         // RecordBatch clones are cheap (Arc-backed column arrays).
         let batches: Vec<RecordBatch> = self.buffer.iter().cloned().collect();
-        let bytes = encode_batches_to_parquet(&batches)?;
+        // Move the CPU-bound Parquet encode off the async runtime thread.
+        let bytes = tokio::task::spawn_blocking(move || encode_batches_to_parquet(&batches))
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
         let key = self.build_key();
         match self.sink.upload(&key, bytes).await {
             Ok(()) => {
@@ -315,25 +318,31 @@ pub struct SyslogS3Handler {
 
 impl SyslogS3Handler {
     /// Construct a handler and start the writer background task with the default channel capacity.
-    /// Production callers should prefer `start_with_capacity` to honour the configured value.
+    ///
+    /// Returns `(handler, writer_task_handle)`. The caller should retain the `JoinHandle` and
+    /// await it (with a timeout) during graceful shutdown, after all `Arc<SyslogS3Handler>`
+    /// references have been dropped so the channel closes and the final flush fires.
     #[allow(dead_code)]
-    pub fn start(config: SyslogS3WriterConfig, sink: Arc<S3Sink>) -> Self {
+    pub fn start(
+        config: SyslogS3WriterConfig,
+        sink: Arc<S3Sink>,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         Self::start_with_capacity(config, sink, SYSLOG_S3_CHANNEL_CAPACITY)
     }
 
     /// Construct a handler and start the writer background task with a custom channel `capacity`.
     ///
-    /// This is the production entry point: `main.rs` calls it with the operator-configured
-    /// `channel_capacity`. Tests also use it with a small capacity to exercise the overflow/drop
-    /// path. `start` is a convenience wrapper that uses the `SYSLOG_S3_CHANNEL_CAPACITY` default.
+    /// Returns `(handler, writer_task_handle)`. The caller should hold the `JoinHandle` and await
+    /// it (with a timeout) during shutdown, after dropping all `Arc<dyn SyslogHandler>` references
+    /// so that the channel closes and the writer flushes its buffer.
     pub fn start_with_capacity(
         config: SyslogS3WriterConfig,
         sink: Arc<S3Sink>,
         capacity: usize,
-    ) -> Self {
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let (tx, mut rx) = mpsc::channel::<SyslogMessage>(capacity);
         let flush_check = crate::forwarding::s3_sink::flush_check_interval(config.flush_interval);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut writer = SyslogS3Writer::new(config, sink);
             let mut interval = tokio::time::interval(flush_check);
             loop {
@@ -362,7 +371,7 @@ impl SyslogS3Handler {
                 }
             }
         });
-        Self { sender: tx }
+        (Self { sender: tx }, handle)
     }
 }
 
@@ -611,18 +620,15 @@ mod tests {
     // -- Helper: build an S3Sink that always fails (unreachable port 1) --
 
     async fn unreachable_sink() -> Arc<S3Sink> {
-        use crate::forwarding::parquet_s3::ParquetS3Config;
-        let cfg = ParquetS3Config {
+        use crate::config::S3ConnectionConfig;
+        let conn = S3ConnectionConfig {
             endpoint: "http://127.0.0.1:1".to_string(), // port 1 is always refused
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
             access_key: "AKIATEST".to_string(),
             secret_key: "SECRETTEST".to_string(),
-            max_file_size_mb: 10,
-            flush_interval_secs: 60,
-            local_buffer_path: std::env::temp_dir().join("syslog-s3-test"),
         };
-        Arc::new(S3Sink::from_config(&cfg).await.expect("constructs"))
+        Arc::new(S3Sink::from_connection(&conn).await.expect("constructs"))
     }
 
     // -- I1: SyslogS3Writer lifecycle unit test --
@@ -711,14 +717,8 @@ mod tests {
     /// large-payload workload with a stalled background writer.
     #[test]
     fn channel_capacity_is_within_operational_bounds() {
-        assert!(
-            SYSLOG_S3_CHANNEL_CAPACITY >= 256,
-            "channel too small: {SYSLOG_S3_CHANNEL_CAPACITY}"
-        );
-        assert!(
-            SYSLOG_S3_CHANNEL_CAPACITY <= 65_536,
-            "channel too large: {SYSLOG_S3_CHANNEL_CAPACITY}"
-        );
+        const { assert!(SYSLOG_S3_CHANNEL_CAPACITY >= 256, "channel too small") }
+        const { assert!(SYSLOG_S3_CHANNEL_CAPACITY <= 65_536, "channel too large") }
     }
 
     // -- I2: SyslogS3Handler overflow path test --
@@ -732,6 +732,7 @@ mod tests {
     /// `DebuggingRecorder` so this test is hermetic and does not conflict with other tests that
     /// may install a global recorder.
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
     async fn handler_overflow_increments_dropped_counter() {
         use crate::syslog::listener::SyslogHandler as SyslogHandlerTrait;
         use metrics::set_default_local_recorder;
@@ -753,7 +754,7 @@ mod tests {
             flush_interval: std::time::Duration::from_secs(3600),
             key_prefix: "test".to_string(),
         };
-        let handler = SyslogS3Handler::start_with_capacity(config, sink, 1);
+        let (handler, _writer_handle) = SyslogS3Handler::start_with_capacity(config, sink, 1);
 
         // Yield briefly so the background task starts and receives (and blocks on) the first
         // message, leaving the channel slot empty again — but stalled inside an S3 upload.
@@ -867,6 +868,7 @@ mod tests {
     /// Verify that a configured `channel_capacity` is honored: capacity=1 causes drops,
     /// a large capacity does not (for a modest send count).
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
     async fn syslog_channel_capacity_parameter_is_wired() {
         use crate::syslog::listener::SyslogHandler as SyslogHandlerTrait;
         use metrics::set_default_local_recorder;
@@ -889,7 +891,7 @@ mod tests {
                 flush_interval: std::time::Duration::from_secs(3600),
                 key_prefix: "syslog".to_string(),
             };
-            let handler = SyslogS3Handler::start_with_capacity(config, sink, 1);
+            let (handler, _writer_handle) = SyslogS3Handler::start_with_capacity(config, sink, 1);
             tokio::task::yield_now().await;
 
             for i in 0..30usize {
@@ -933,7 +935,8 @@ mod tests {
                 flush_interval: std::time::Duration::from_secs(3600),
                 key_prefix: "syslog".to_string(),
             };
-            let handler = SyslogS3Handler::start_with_capacity(config, sink, 10_000);
+            let (handler, _writer_handle) =
+                SyslogS3Handler::start_with_capacity(config, sink, 10_000);
             tokio::task::yield_now().await;
 
             for i in 0..30usize {

@@ -8,13 +8,27 @@ pub const ADMIN_OVERRIDE_FILE: &str = "logthing.admin.toml";
 /// `SyslogS3Config` and `IpfixS3Config`. This keeps the TOML surface flat
 /// (e.g. `[syslog.s3]\nendpoint = …`) while ensuring the client-construction
 /// logic lives in one place (`S3Sink::from_connection`).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct S3ConnectionConfig {
     pub endpoint: String,
     pub bucket: String,
     pub region: String,
     pub access_key: String,
     pub secret_key: String,
+}
+
+/// Manual Debug impl for S3ConnectionConfig that masks secret fields so they
+/// never appear in logs, panic messages, or anyhow error chains.
+impl std::fmt::Debug for S3ConnectionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3ConnectionConfig")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("access_key", &"<redacted>")
+            .field("secret_key", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -674,7 +688,7 @@ secret_key = "SECRET"
         let result = std::panic::catch_unwind(|| {
             let cfg = Config::load().expect("config loads");
             assert!(!cfg.tls.enabled, "logthing.toml disables TLS");
-            assert!(cfg.forwarding.destinations.len() >= 1);
+            assert!(!cfg.forwarding.destinations.is_empty());
         });
 
         // Restore admin override file
@@ -731,5 +745,31 @@ secret_key = "secret"
             cfg.ipfix.s3.is_none(),
             "absent [ipfix.s3] must yield None for backward compat"
         );
+    }
+
+    // H-5: Debug output must never expose S3 credentials.
+    #[test]
+    fn s3_connection_config_debug_masks_secrets() {
+        let cfg = S3ConnectionConfig {
+            endpoint: "http://minio:9000".to_string(),
+            bucket: "my-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key: "SUPERSECRETKEY".to_string(),
+            secret_key: "TOPSECRETPASSWORD".to_string(),
+        };
+        let debug_str = format!("{:?}", cfg);
+        assert!(
+            !debug_str.contains("SUPERSECRETKEY"),
+            "access_key must not appear in Debug output: {debug_str}"
+        );
+        assert!(
+            !debug_str.contains("TOPSECRETPASSWORD"),
+            "secret_key must not appear in Debug output: {debug_str}"
+        );
+        // Non-secret fields must still be visible.
+        assert!(debug_str.contains("http://minio:9000"));
+        assert!(debug_str.contains("my-bucket"));
+        assert!(debug_str.contains("us-east-1"));
+        assert!(debug_str.contains("<redacted>"));
     }
 }

@@ -6,7 +6,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
+
+/// Maximum number of concurrent TCP connections accepted by the Zeek listener.
+/// Prevents resource exhaustion from connection floods.
+pub const MAX_ZEEK_TCP_CONNECTIONS: usize = 1024;
 
 /// Maximum accepted line length in bytes. Lines exceeding this are skipped
 /// and counted via `zeek_oversized_lines`.
@@ -70,7 +75,7 @@ impl ZeekListener {
         Self { config, handler }
     }
 
-    /// Bind the TCP listener and run the accept loop.
+    /// Bind the TCP listener and run the accept loop (no shutdown signal — runs until aborted).
     pub async fn start(&self) -> anyhow::Result<()> {
         let addr: SocketAddr =
             format!("{}:{}", self.config.bind_address, self.config.tcp_port).parse()?;
@@ -78,20 +83,94 @@ impl ZeekListener {
         self.run_with_listener(listener).await
     }
 
+    /// Bind the TCP listener and run the accept loop with graceful shutdown support.
+    ///
+    /// The listener exits cleanly when `shutdown_rx` receives `true` (or is closed).
+    /// Used from `main.rs`; tests continue to use `start()` or `run_with_listener()`.
+    pub async fn start_with_shutdown(
+        &self,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        let addr: SocketAddr =
+            format!("{}:{}", self.config.bind_address, self.config.tcp_port).parse()?;
+        let listener = TcpListener::bind(&addr).await?;
+        let bound = listener.local_addr()?;
+        info!("Zeek TCP listener started on {}", bound);
+
+        let semaphore = Arc::new(Semaphore::new(MAX_ZEEK_TCP_CONNECTIONS));
+
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, src)) => {
+                            match semaphore.clone().try_acquire_owned() {
+                                Ok(permit) => {
+                                    let handler = self.handler.clone();
+                                    tokio::spawn(async move {
+                                        let _permit = permit; // held for connection lifetime
+                                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler).await {
+                                            error!("Zeek TCP connection error from {}: {}", src, e);
+                                        }
+                                    });
+                                }
+                                Err(_) => {
+                                    metrics::counter!("zeek_tcp_connections_rejected").increment(1);
+                                    warn!(
+                                        "Zeek: TCP connection limit ({}) reached; rejecting {}",
+                                        MAX_ZEEK_TCP_CONNECTIONS, src
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Zeek TCP accept error: {}", e);
+                        }
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("Zeek listener: shutdown signal received");
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Run the accept loop on an already-bound listener.
     /// Extracted for testability — tests bind their own listener to get a known port.
     pub(crate) async fn run_with_listener(&self, listener: TcpListener) -> anyhow::Result<()> {
         let bound = listener.local_addr()?;
         info!("Zeek TCP listener started on {}", bound);
+
+        let semaphore = Arc::new(Semaphore::new(MAX_ZEEK_TCP_CONNECTIONS));
+
         loop {
             match listener.accept().await {
                 Ok((stream, src)) => {
-                    let handler = self.handler.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler).await {
-                            error!("Zeek TCP connection error from {}: {}", src, e);
+                    match semaphore.clone().try_acquire_owned() {
+                        Ok(permit) => {
+                            let handler = self.handler.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit; // held for connection lifetime
+                                if let Err(e) =
+                                    Self::handle_tcp_connection(stream, src, handler).await
+                                {
+                                    error!("Zeek TCP connection error from {}: {}", src, e);
+                                }
+                            });
                         }
-                    });
+                        Err(_) => {
+                            metrics::counter!("zeek_tcp_connections_rejected").increment(1);
+                            warn!(
+                                "Zeek: TCP connection limit ({}) reached; rejecting {}",
+                                MAX_ZEEK_TCP_CONNECTIONS, src
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     error!("Zeek TCP accept error: {}", e);
@@ -410,6 +489,7 @@ mod tests {
     /// Metrics: we install a thread-local DebuggingRecorder so we can assert that
     /// `zeek_oversized_lines` is incremented exactly once.
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
     async fn oversized_line_closes_connection_and_increments_metric() {
         use metrics::set_default_local_recorder;
         use metrics_util::CompositeKey;

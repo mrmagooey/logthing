@@ -11,12 +11,56 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Install stable Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
     - name: Build
       run: cargo build --verbose
+
     - name: Run tests
       run: cargo test --verbose
+
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+    - name: Clippy (default features)
+      run: cargo clippy --all-targets -- -D warnings
+
+    - name: Security audit
+      # Non-fatal: advisory DB entries can fire on transitive deps we don't
+      # control.  We log the result so it's visible in CI without blocking
+      # merges.  Tighten to `cargo audit` (no `|| true`) once the advisory
+      # backlog is clear.
+      run: |
+        cargo install cargo-audit --quiet
+        cargo audit || true
+
+  build-kerberos:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install stable Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+
+    - name: Install Kerberos development libraries
+      run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
+
+    - name: Build (kerberos-auth feature)
+      run: cargo build --features kerberos-auth --verbose
+
+    - name: Run tests (kerberos-auth feature)
+      run: cargo test --features kerberos-auth --verbose
+
+    - name: Clippy (kerberos-auth feature)
+      run: cargo clippy --features kerberos-auth -- -D warnings

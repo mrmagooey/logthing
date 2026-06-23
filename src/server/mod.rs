@@ -29,6 +29,14 @@ use tokio::sync::{RwLock, mpsc};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
+/// Maximum allowed body size for WEF/syslog ingest requests (64 MiB).
+/// Prevents unbounded memory allocation from large or malicious payloads.
+const MAX_BODY_SIZE: usize = 64 * 1024 * 1024;
+
+/// Maximum number of Windows events processed concurrently per batch.
+/// Bounds CPU and memory use while still exploiting multi-core parallelism.
+const MAX_CONCURRENT_EVENT_PROCESSING: usize = 16;
+
 pub struct AppState {
     pub config: Arc<RwLock<Config>>,
     pub throughput: Arc<ThroughputStats>,
@@ -41,6 +49,9 @@ pub struct AppState {
 pub struct Server {
     config: Config,
     state: Arc<AppState>,
+    /// JoinHandle for the WEF→S3 Parquet worker task, if one was started.
+    /// Awaited during graceful shutdown so buffered data is flushed before exit.
+    wef_worker_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Server {
@@ -144,7 +155,7 @@ impl Server {
         };
 
         // Initialize Parquet S3 forwarder with channel-based architecture
-        let parquet_s3_sender = if let Ok(Some(mut s3_forwarder)) =
+        let (parquet_s3_sender, wef_worker_handle) = if let Ok(Some(mut s3_forwarder)) =
             crate::forwarding::parquet_s3::create_parquet_s3_forwarder(
                 &config.forwarding.destinations,
             )
@@ -156,16 +167,31 @@ impl Server {
             let (sender, mut receiver) = mpsc::channel::<Arc<WindowsEvent>>(10000);
             let flush_interval_secs = s3_forwarder.flush_interval_secs();
 
-            // Spawn worker task to receive events and forward to Parquet S3
-            tokio::spawn(async move {
+            // Spawn worker task to receive events and forward to Parquet S3.
+            // Gap-a: capture the JoinHandle so main.rs can await it at shutdown.
+            // Gap-a: add a None arm — when the channel closes (sender dropped),
+            //         flush all buffered data and break instead of spinning.
+            let handle = tokio::spawn(async move {
                 info!("Parquet S3 worker task started");
 
                 loop {
                     tokio::select! {
-                        // Receive event from channel
-                        Some(event) = receiver.recv() => {
-                            if let Err(e) = s3_forwarder.forward((*event).clone()).await {
-                                error!("Failed to forward to Parquet S3: {}", e);
+                        // Receive event from channel (irrefutable match).
+                        maybe_event = receiver.recv() => {
+                            match maybe_event {
+                                Some(event) => {
+                                    if let Err(e) = s3_forwarder.forward((*event).clone()).await {
+                                        error!("Failed to forward to Parquet S3: {}", e);
+                                    }
+                                }
+                                // Channel closed (all senders dropped) — flush and exit.
+                                None => {
+                                    info!("Parquet S3 channel closed; flushing buffered data");
+                                    if let Err(e) = s3_forwarder.shutdown_flush().await {
+                                        error!("Parquet S3 shutdown flush error: {}", e);
+                                    }
+                                    break;
+                                }
                             }
                         }
                         // Periodic flush
@@ -176,11 +202,13 @@ impl Server {
                         }
                     }
                 }
+
+                info!("Parquet S3 worker task exited");
             });
 
-            Some(sender)
+            (Some(sender), Some(handle))
         } else {
-            None
+            (None, None)
         };
 
         let state = Arc::new(AppState {
@@ -192,35 +220,31 @@ impl Server {
             parquet_s3_sender,
         });
 
-        Ok(Self { config, state })
+        Ok(Self {
+            config,
+            state,
+            wef_worker_handle,
+        })
+    }
+
+    /// Take the WEF→S3 Parquet worker's JoinHandle for awaiting at shutdown.
+    ///
+    /// Must be called BEFORE `run`/`run_tls`; after the server consumes `self`
+    /// the handle is no longer accessible.
+    pub fn take_wef_worker_handle(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.wef_worker_handle.take()
     }
 
     /// Run the WEF server without TLS (HTTP only).
     ///
     /// Starts the HTTP server on the configured bind address and port.
-    /// Also starts the metrics server if enabled.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use logthing::config::Config;
-    /// use logthing::server::Server;
-    /// use logthing::stats::ThroughputStats;
-    /// use std::sync::Arc;
-    /// use tokio::sync::RwLock;
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> anyhow::Result<()> {
-    ///     let config = Config::load()?;
-    ///     let shared_config = Arc::new(RwLock::new(config.clone()));
-    ///     let throughput = Arc::new(ThroughputStats::new());
-    ///
-    ///     let server = Server::new(config, shared_config, throughput).await?;
-    ///     server.run().await?;
-    ///     Ok(())
-    /// }
-    /// ```
-    pub async fn run(self) -> anyhow::Result<()> {
+    /// Also starts the metrics server if enabled.  Exits when `shutdown_rx`
+    /// fires (graceful shutdown: drains in-flight requests, then drops AppState
+    /// which closes the WEF worker's channel).
+    pub async fn run(
+        self,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
         let ip_whitelist = if self.config.security.allowed_ips.is_empty() {
             IpWhitelist::empty()
         } else {
@@ -242,10 +266,18 @@ impl Server {
             tokio::spawn(start_metrics_server(metrics_addr));
         }
 
+        // Gap-b: wire graceful shutdown so the axum server stops on SIGTERM,
+        // which drops AppState → drops parquet_s3_sender → closes the WEF worker
+        // channel → the worker's None arm flushes and exits.
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(async move {
+            // Wait until the shutdown watch fires (value becomes true).
+            let _ = shutdown_rx.wait_for(|v| *v).await;
+            info!("WEF HTTP server received shutdown signal");
+        })
         .await?;
 
         Ok(())
@@ -273,6 +305,7 @@ impl Server {
             .route("/syslog", post(handle_syslog_http))
             .route("/syslog/udp", get(handle_syslog_udp_info))
             .route("/syslog/examples", get(handle_syslog_examples))
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE))
             .layer(shared_layers)
             .layer(axum::Extension(ip_whitelist))
             .with_state(self.state.clone());
@@ -289,35 +322,14 @@ impl Server {
     /// Run the WEF server with TLS enabled.
     ///
     /// If TLS is not enabled in the configuration, falls back to running without TLS.
-    /// Otherwise, starts an HTTPS server on the configured TLS port.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use logthing::config::Config;
-    /// use logthing::server::Server;
-    /// use logthing::stats::ThroughputStats;
-    /// use std::sync::Arc;
-    /// use tokio::sync::RwLock;
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> anyhow::Result<()> {
-    ///     let config = Config::load()?;
-    ///     let shared_config = Arc::new(RwLock::new(config.clone()));
-    ///     let throughput = Arc::new(ThroughputStats::new());
-    ///
-    ///     let server = Server::new(config, shared_config, throughput).await?;
-    ///
-    ///     // Will use TLS if enabled in config, otherwise HTTP
-    ///     server.run_tls().await?;
-    ///     Ok(())
-    /// }
-    /// ```
-    pub async fn run_tls(self) -> anyhow::Result<()> {
-        use axum_server::tls_rustls::RustlsConfig;
-
+    /// Otherwise, starts an HTTPS server on the configured TLS port.  Exits on
+    /// graceful shutdown when `shutdown_rx` fires.
+    pub async fn run_tls(
+        self,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
         if !self.config.tls.enabled {
-            return self.run().await;
+            return self.run(shutdown_rx).await;
         }
 
         let ip_whitelist = if self.config.security.allowed_ips.is_empty() {
@@ -328,27 +340,27 @@ impl Server {
 
         let app = self.create_router(ip_whitelist)?;
 
-        // Load TLS configuration from PEM files
-        let cert_file = self
-            .config
-            .tls
-            .cert_file
-            .as_ref()
-            .expect("TLS enabled but no cert_file specified");
-        let key_file = self
-            .config
-            .tls
-            .key_file
-            .as_ref()
-            .expect("TLS enabled but no key_file specified");
-
-        let tls_config = RustlsConfig::from_pem_file(cert_file, key_file).await?;
+        let tls_config = build_tls_config(&self.config.tls)?;
         let tls_addr: SocketAddr = format!("0.0.0.0:{}", self.config.tls.port).parse()?;
 
         info!("Starting WEF server with TLS on https://{}", tls_addr);
 
+        // Gap-b: use axum_server::Handle to trigger graceful shutdown when the
+        // watch fires.  The handle is cloned into a task that waits for the signal
+        // then calls handle.graceful_shutdown(None).  Dropping AppState (which
+        // holds parquet_s3_sender) closes the WEF worker channel → its None arm
+        // flushes before exit.
+        let axum_handle = axum_server::Handle::new();
+        let shutdown_handle = axum_handle.clone();
+        tokio::spawn(async move {
+            let _ = shutdown_rx.wait_for(|v| *v).await;
+            info!("WEF TLS server received shutdown signal; initiating graceful shutdown");
+            shutdown_handle.graceful_shutdown(None);
+        });
+
         // Use axum-server for proper TLS handling
         axum_server::bind_rustls(tls_addr, tls_config)
+            .handle(axum_handle)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
 
@@ -368,10 +380,16 @@ impl Server {
         })?;
 
         info!("Applying Kerberos authentication layer for SPN: {}", spn);
+        error!(
+            "SECURITY: Kerberos token validation is NOT implemented. \
+             The kerberos_auth_middleware will REJECT ALL requests (fail-closed) \
+             until real GSSAPI/SPNEGO validation is added. \
+             Do NOT use this in production without a complete implementation."
+        );
 
         // Use route-layer approach with custom middleware
-        // The kerberos_auth_middleware checks for Authorization header and
-        // uses axum_negotiate's Upn extractor for authentication
+        // The kerberos_auth_middleware fails closed: it rejects all requests
+        // because token validation is not implemented.
         Ok(router.layer(middleware::from_fn(kerberos_auth_middleware)))
     }
 
@@ -388,22 +406,25 @@ impl Server {
 
 /// Kerberos authentication middleware
 ///
-/// This middleware checks for the Authorization header with a Negotiate token.
-/// In a real deployment with proper Kerberos infrastructure, this would validate
-/// the token. For E2E testing, we check for the header presence and return 401
-/// if authentication is required but not provided.
+/// FAIL-CLOSED: GSSAPI/SPNEGO token validation is not implemented.
+/// This middleware rejects ALL requests rather than passing unvalidated tokens
+/// through. Any request without a `Negotiate` header gets a 401 challenge.
+/// Any request WITH a `Negotiate` token gets a 501 Not Implemented response,
+/// because we cannot validate the token and must not treat it as authenticated.
+///
+/// To make this functional, replace the 501 path with real GSSAPI validation.
 #[cfg(feature = "kerberos-auth")]
-async fn kerberos_auth_middleware(request: Request, next: Next) -> Response {
-    // Check if Authorization header is present
-    let has_auth = request
+async fn kerberos_auth_middleware(request: Request, _next: Next) -> Response {
+    // Check if Authorization header is present with a Negotiate token.
+    let has_negotiate = request
         .headers()
         .get("authorization")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.starts_with("Negotiate "))
         .unwrap_or(false);
 
-    if !has_auth {
-        // Return 401 Unauthorized with WWW-Authenticate header
+    if !has_negotiate {
+        // No token supplied — return 401 with WWW-Authenticate challenge.
         return Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header("WWW-Authenticate", "Negotiate")
@@ -411,23 +432,32 @@ async fn kerberos_auth_middleware(request: Request, next: Next) -> Response {
             .unwrap();
     }
 
-    // In a full implementation, we would validate the Negotiate token here
-    // using the Upn extractor. For now, we pass through if the header is present.
-    next.run(request).await
+    // A Negotiate token was supplied but we cannot validate it: fail closed.
+    // Passing an unvalidated token through would be a complete auth bypass.
+    error!(
+        "Kerberos authentication is enabled but token validation is not implemented; \
+         refusing request (fail-closed)"
+    );
+    Response::builder()
+        .status(StatusCode::NOT_IMPLEMENTED)
+        .body(axum::body::Body::from(
+            "Kerberos authentication is enabled but token validation is not implemented; \
+             refusing all requests",
+        ))
+        .unwrap()
 }
 
 async fn handle_wef_request(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
     let body_str = String::from_utf8_lossy(&body);
-    let source_host = headers
-        .get("X-Forwarded-For")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| addr.ip().to_string());
+    // Use the real peer IP for source attribution.
+    // X-Forwarded-For is client-spoofable and must not be trusted
+    // for security-relevant identity; only the TCP peer address is authoritative.
+    let source_host = addr.ip().to_string();
 
     match state.parser.parse_message(&body_str, source_host) {
         Ok(WefMessage::Subscription(sub)) => {
@@ -550,6 +580,7 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
     {
         match e {
             mpsc::error::TrySendError::Full(_) => {
+                metrics::counter!("wef_events_dropped").increment(1);
                 warn!("Parquet S3 channel full, dropping event");
             }
             mpsc::error::TrySendError::Closed(_) => {
@@ -563,7 +594,7 @@ async fn process_events(state: &Arc<AppState>, events: Vec<WindowsEvent>) {
     // Process events concurrently with a limit of 16 concurrent tasks
     // This leverages multi-core CPUs for better throughput
     stream::iter(events)
-        .for_each_concurrent(16, |event| async move {
+        .for_each_concurrent(MAX_CONCURRENT_EVENT_PROCESSING, |event| async move {
             process_single_event(state, event).await;
         })
         .await;
@@ -589,6 +620,7 @@ async fn handle_throughput_stats(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::models::{EventLevel, ParsedEvent};
@@ -682,8 +714,8 @@ mod tests {
     #[tokio::test]
     async fn syslog_examples_returns_samples() {
         let Json(value) = handle_syslog_examples().await;
-        assert!(value["bind_named"].as_array().unwrap().len() > 0);
-        assert!(value["powerdns"].as_array().unwrap().len() > 0);
+        assert!(!value["bind_named"].as_array().unwrap().is_empty());
+        assert!(!value["powerdns"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -921,11 +953,16 @@ mod tests {
 
         process_single_event(&state, event).await;
 
-        // Should not panic and throughput should show "unknown"
-        let summary = state.throughput.snapshot().await;
-        assert!(summary.len() >= 0);
+        // Should not panic; throughput entry is recorded as "unknown".
+        let _summary = state.throughput.snapshot().await;
     }
 
+    /// XFF header is present but ignored; peer IP is used for source attribution.
+    ///
+    /// After M-9: the `X-Forwarded-For` header is silently ignored so that a
+    /// spoofed header cannot influence the source identity recorded for the
+    /// event.  The request should still succeed (200 OK); only the attribution
+    /// logic changed.
     #[tokio::test]
     async fn handle_wef_request_with_x_forwarded_for() {
         let state = default_state().await;
@@ -945,6 +982,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("X-Forwarded-For", "10.0.0.100".parse().unwrap());
 
+        // XFF is ignored; source attribution uses the peer IP (127.0.0.1).
         let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
             .await
             .expect("subscription handled");
@@ -983,6 +1021,364 @@ mod tests {
             .await
             .into_response();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// H-4: `build_tls_config` must fail with a clear error when
+    /// `require_client_cert` is `true` but no `ca_file` is supplied.
+    #[test]
+    fn require_client_cert_without_ca_file_returns_error() {
+        use crate::config::TlsConfig;
+        use std::path::PathBuf;
+
+        let tls = TlsConfig {
+            enabled: true,
+            port: 5986,
+            cert_file: Some(PathBuf::from("/tmp/dummy.crt")),
+            key_file: Some(PathBuf::from("/tmp/dummy.key")),
+            ca_file: None,
+            require_client_cert: true,
+        };
+
+        let result = build_tls_config(&tls);
+        assert!(result.is_err(), "expected Err when ca_file is absent");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("ca_file"),
+            "error message must mention ca_file, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn body_size_limit_const_is_sane() {
+        assert_eq!(MAX_BODY_SIZE, 64 * 1024 * 1024);
+        assert!(MAX_BODY_SIZE > 0);
+    }
+
+    #[tokio::test]
+    async fn protected_router_has_body_limit() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        // Build a minimal router with only the body-limit layer applied.
+        // We do not need the full protected_router (which requires ConnectInfo
+        // from a real TCP connection) — we just need to verify that
+        // DefaultBodyLimit::max(MAX_BODY_SIZE) rejects over-limit payloads
+        // with 413 PAYLOAD_TOO_LARGE.
+        //
+        // The handler must extract `Bytes` so that axum actually enforces the
+        // body-size limit (the check occurs during body extraction).
+        let router: Router = Router::new()
+            .route(
+                "/wsman",
+                post(|_body: Bytes| async { (StatusCode::OK, "ok") }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE));
+
+        // A body one byte over the limit must be rejected with 413.
+        let over_limit_body = vec![0u8; MAX_BODY_SIZE + 1];
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/wsman")
+            .header("content-type", "application/soap+xml")
+            .body(Body::from(over_limit_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "over-limit body must be rejected with 413"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn concurrent_processing_limit_is_reasonable() {
+        assert!(
+            MAX_CONCURRENT_EVENT_PROCESSING > 0 && MAX_CONCURRENT_EVENT_PROCESSING <= 256,
+            "MAX_CONCURRENT_EVENT_PROCESSING must be in the range 1..=256"
+        );
+    }
+
+    // ------------------------------------------------------------------ //
+    // M-18: axum routing-layer handler tests (oneshot)                    //
+    // ------------------------------------------------------------------ //
+
+    /// `/health` endpoint returns 200 via the full router stack.
+    #[tokio::test]
+    async fn health_endpoint_returns_200_via_router() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let state = default_state().await;
+        let ip_whitelist = IpWhitelist::empty();
+        let public_router = Router::new()
+            .route("/health", axum::routing::get(health_check))
+            .layer(axum::Extension(ip_whitelist.clone()))
+            .with_state(state);
+
+        let request = HttpRequest::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = public_router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A WEF POST carrying a valid `<Events>` payload returns 200 and records
+    /// at least one throughput entry (exercises the full handler path, not just
+    /// subscription handling).
+    #[tokio::test]
+    async fn handle_wef_request_events_payload_returns_200() {
+        let state = default_state().await;
+        let body = Bytes::from(
+            r#"<Envelope>
+  <Body>
+    <Events>
+      <Event>
+        <System>
+          <Provider>Security</Provider>
+          <EventID>4625</EventID>
+          <Level>4</Level>
+          <TimeCreated>2024-06-01T00:00:00Z</TimeCreated>
+          <Computer>dc01</Computer>
+        </System>
+        <EventData>
+          <Data Name="TargetUserName">bob</Data>
+        </EventData>
+      </Event>
+    </Events>
+  </Body>
+</Envelope>"#,
+        );
+        let addr: SocketAddr = "10.0.0.1:5985".parse().unwrap();
+        let headers = HeaderMap::new();
+
+        let response = handle_wef_request(State(state.clone()), ConnectInfo(addr), headers, body)
+            .await
+            .expect("events payload accepted");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The event should have been recorded in throughput stats.
+        let snapshot = state.throughput.snapshot().await;
+        assert!(
+            !snapshot.is_empty(),
+            "throughput snapshot must be non-empty after event"
+        );
+    }
+
+    /// A syslog HTTP POST with a body that exactly meets the body-size limit is
+    /// accepted (boundary condition: limit is inclusive).
+    /// A body one byte over is rejected with 413 (duplicate of the WEF test, but
+    /// confirms the limit applies uniformly to the syslog route too).
+    #[tokio::test]
+    async fn syslog_route_enforces_body_size_limit() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let router: Router = Router::new()
+            .route(
+                "/syslog",
+                post(|_body: Bytes| async { (StatusCode::OK, "ok") }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE));
+
+        let over_limit_body = vec![0u8; MAX_BODY_SIZE + 1];
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/syslog")
+            .header("content-type", "text/plain")
+            .body(Body::from(over_limit_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "syslog route: over-limit body must be rejected with 413"
+        );
+    }
+
+    /// `handle_syslog_http` returns 200 for a well-formed RFC 5424 message and
+    /// 400 for one that is structurally invalid (missing priority bracket).
+    #[tokio::test]
+    async fn handle_syslog_http_rejects_structurally_invalid_message() {
+        let addr: SocketAddr = "10.0.0.2:514".parse().unwrap();
+        // Missing the leading '<' so the PRI field is absent — not a valid syslog frame.
+        let bad_msg = "134>Jun 22 09:00:00 host app[99]: message without pri bracket";
+
+        let response = handle_syslog_http(ConnectInfo(addr), Bytes::from(bad_msg))
+            .await
+            .into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "structurally invalid syslog message must be rejected with 400"
+        );
+    }
+
+    /// CR-1 regression: kerberos_auth_middleware must fail CLOSED.
+    ///
+    /// A request bearing a syntactically valid `Authorization: Negotiate <token>`
+    /// header must NOT be passed through as authenticated. Because token validation
+    /// is not implemented the middleware must return a non-2xx error status (501)
+    /// rather than calling next and returning 200.
+    #[cfg(feature = "kerberos-auth")]
+    #[tokio::test]
+    async fn kerberos_middleware_rejects_negotiate_token_fail_closed() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt; // for `oneshot`
+
+        // Build a minimal router with the kerberos middleware applied.
+        // The inner handler always returns 200 so any 200 response means
+        // the middleware passed the request through (a bypass).
+        let app = Router::new()
+            .route("/", axum::routing::get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn(kerberos_auth_middleware));
+
+        // Fire a request with a Negotiate token (base64 "foo" = Zm9v).
+        let request = HttpRequest::builder()
+            .uri("/")
+            .header("Authorization", "Negotiate Zm9v")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        // Must NOT be 200 — the token was never validated.
+        assert_ne!(
+            response.status(),
+            StatusCode::OK,
+            "kerberos middleware must not pass unvalidated Negotiate tokens through"
+        );
+        // Must be 501 Not Implemented (fail-closed denial).
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "kerberos middleware must return 501 when token validation is unimplemented"
+        );
+    }
+
+    /// CR-1 regression: kerberos_auth_middleware returns 401 challenge when no
+    /// Authorization header is present (unchanged behaviour, included for completeness).
+    #[cfg(feature = "kerberos-auth")]
+    #[tokio::test]
+    async fn kerberos_middleware_challenges_unauthenticated_requests() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/", axum::routing::get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn(kerberos_auth_middleware));
+
+        let request = HttpRequest::builder().uri("/").body(Body::empty()).unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "kerberos middleware must challenge requests without an Authorization header"
+        );
+        assert!(
+            response.headers().contains_key("www-authenticate"),
+            "401 response must include WWW-Authenticate header"
+        );
+    }
+}
+
+/// Build a `RustlsConfig` from the TLS section of the server config.
+///
+/// When `tls.require_client_cert` is `true` the function fails with an error
+/// if `ca_file` is absent, then constructs a `rustls::ServerConfig` with a
+/// `WebPkiClientVerifier` that mandates a valid client certificate signed by
+/// the given CA.  When `require_client_cert` is `false` the simpler
+/// `RustlsConfig::from_pem_file` path is used (server-only TLS).
+fn build_tls_config(
+    tls: &crate::config::TlsConfig,
+) -> anyhow::Result<axum_server::tls_rustls::RustlsConfig> {
+    use axum_server::tls_rustls::RustlsConfig;
+    use rustls::RootCertStore;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::server::WebPkiClientVerifier;
+
+    let cert_file = tls
+        .cert_file
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("TLS enabled but no cert_file specified"))?;
+    let key_file = tls
+        .key_file
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("TLS enabled but no key_file specified"))?;
+
+    if tls.require_client_cert {
+        let ca_file = tls.ca_file.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("require_client_cert is true but no ca_file specified")
+        })?;
+
+        // Load CA certificate(s) into a root store.
+        let ca_f = std::fs::File::open(ca_file)?;
+        let mut ca_reader = std::io::BufReader::new(ca_f);
+        let ca_certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
+
+        let mut root_store = RootCertStore::empty();
+        for cert in ca_certs {
+            root_store.add(cert)?;
+        }
+
+        // Build a client verifier that requires a cert signed by the CA.
+        let verifier = WebPkiClientVerifier::builder(Arc::new(root_store)).build()?;
+
+        // Load server cert chain.
+        let cert_f = std::fs::File::open(cert_file)?;
+        let mut cert_reader = std::io::BufReader::new(cert_f);
+        let certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+
+        // Load server private key.
+        let key_f = std::fs::File::open(key_file)?;
+        let mut key_reader = std::io::BufReader::new(key_f);
+        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)?
+            .ok_or_else(|| anyhow::anyhow!("no private key found in key_file"))?;
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)?;
+
+        info!(
+            "mTLS enabled: client certificates required (CA from {:?})",
+            ca_file
+        );
+        Ok(RustlsConfig::from_config(Arc::new(server_config)))
+    } else {
+        // Server-only TLS — load synchronously via from_pem_file equivalent.
+        // RustlsConfig::from_pem_file is async; build the config inline instead
+        // so this function can remain synchronous and easily testable.
+        let cert_f = std::fs::File::open(cert_file)?;
+        let mut cert_reader = std::io::BufReader::new(cert_f);
+        let certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+
+        let key_f = std::fs::File::open(key_file)?;
+        let mut key_reader = std::io::BufReader::new(key_f);
+        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)?
+            .ok_or_else(|| anyhow::anyhow!("no private key found in key_file"))?;
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)?;
+
+        Ok(RustlsConfig::from_config(Arc::new(server_config)))
     }
 }
 

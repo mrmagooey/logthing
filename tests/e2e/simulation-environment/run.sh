@@ -29,6 +29,14 @@ docker compose -f "$COMPOSE_FILE" run --rm s3-verifier
 
 echo ""
 echo "========================================"
+echo "Running IPFIX E2E Tests"
+echo "========================================"
+docker compose -f "$COMPOSE_FILE" run --rm ipfix-generator
+docker compose -f "$COMPOSE_FILE" run --rm ipfix-s3-verifier
+echo "IPFIX E2E Tests Completed Successfully"
+
+echo ""
+echo "========================================"
 echo "Running Zeek NDJSON E2E Tests"
 echo "========================================"
 docker compose -f "$COMPOSE_FILE" run --rm zeek-generator

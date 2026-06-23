@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+    time::Instant,
+};
 
 use chrono::Utc;
 use ipnet::IpNet;
@@ -262,22 +267,79 @@ pub struct RateLimitError {
     pub retry_after: u64,
 }
 
+/// Returns whether the admin server is safe to start given its resolved bind address and
+/// credentials. This is a pure function with no side-effects so it can be tested independently
+/// of environment variables.
+///
+/// Rules:
+/// - Loopback bind (127.0.0.0/8 or ::1) with any credentials → allowed.
+/// - Non-loopback bind with non-default credentials → allowed.
+/// - Non-loopback bind with default credentials (`admin`/`admin`) → refused.
+pub fn admin_start_allowed(bind: SocketAddr, user: &str, pass: &str) -> Result<(), String> {
+    let is_loopback = match bind.ip() {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => ip.is_loopback(),
+    };
+
+    if !is_loopback && user == "admin" && pass == "admin" {
+        return Err(format!(
+            "Admin server refused to start: bind address {} is non-loopback but default \
+             credentials (admin/admin) are in use. Set WEF_ADMIN_USER and WEF_ADMIN_PASS \
+             to non-default values, or bind to a loopback address (127.0.0.1) instead. \
+             The data-plane server continues running.",
+            bind
+        ));
+    }
+
+    Ok(())
+}
+
 /// Load admin server configuration from environment variables
 pub fn load_admin_config() -> anyhow::Result<AdminServerConfig> {
-    // Admin bind address (default: 0.0.0.0:8080)
+    // Admin bind address (default: 127.0.0.1:8080 — loopback only; operators opt into
+    // a public bind via WEF_ADMIN_BIND).
+    // R-5: warn when WEF_ADMIN_BIND is set but fails to parse, so a typo'd public
+    // bind address isn't silently swallowed and the operator doesn't think the
+    // admin interface is publicly reachable when it is actually loopback-only.
     let bind_address = std::env::var("WEF_ADMIN_BIND")
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| "0.0.0.0:8080".parse().unwrap());
+        .map(|s| {
+            s.parse().unwrap_or_else(|_| {
+                tracing::warn!(
+                    "WEF_ADMIN_BIND value {:?} failed to parse as a socket address; \
+                     falling back to 127.0.0.1:8080 (loopback only). \
+                     Fix the value to bind the admin interface as intended.",
+                    s
+                );
+                "127.0.0.1:8080".parse().unwrap()
+            })
+        })
+        .unwrap_or_else(|| "127.0.0.1:8080".parse().unwrap());
 
     // Admin credentials
     let username = std::env::var("WEF_ADMIN_USER").unwrap_or_else(|_| "admin".to_string());
     let password_hash = if let Ok(hashed) = std::env::var("WEF_ADMIN_PASS_HASH") {
-        // Use pre-hashed password
+        // Use pre-hashed password.
+        // R-3: call admin_start_allowed on the hash path too.  For the hash path the
+        // credentials are explicitly non-default (WEF_ADMIN_PASS_HASH is set), so
+        // this will always pass — but the call is required for consistency and to
+        // ensure future changes to admin_start_allowed apply uniformly.
+        // We don't have the plaintext password, so pass the hash string as the
+        // "pass" argument; the guard only triggers on exact "admin"/"admin" values.
+        admin_start_allowed(bind_address, &username, &hashed).map_err(|msg| {
+            tracing::error!("{}", msg);
+            anyhow::anyhow!("{}", msg)
+        })?;
         PasswordHash::from_hash(&hashed)
     } else {
         // Hash the plain password (for backward compatibility)
         let password = std::env::var("WEF_ADMIN_PASS").unwrap_or_else(|_| "admin".to_string());
+
+        // Enforce secure-by-default: refuse to bind a non-loopback address with default creds.
+        admin_start_allowed(bind_address, &username, &password).map_err(|msg| {
+            tracing::error!("{}", msg);
+            anyhow::anyhow!("{}", msg)
+        })?;
 
         if username == "admin" && password == "admin" {
             tracing::warn!(

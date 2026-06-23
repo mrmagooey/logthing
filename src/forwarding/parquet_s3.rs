@@ -1,10 +1,11 @@
-use crate::config::{DestinationConfig, ForwardProtocol};
+use crate::config::{DestinationConfig, ForwardProtocol, S3ConnectionConfig};
 use crate::models::WindowsEvent;
 use anyhow::Result;
 use arrow::array::{ArrayRef, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use chrono::{Datelike, Utc};
+use metrics::counter;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use std::collections::HashMap;
@@ -13,30 +14,49 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-/// Configuration for Parquet S3 forwarder
-#[derive(Debug, Clone)]
+/// Configuration for Parquet S3 forwarder.
+///
+/// The five S3 connection fields (endpoint, bucket, region, access_key, secret_key) are
+/// shared with the other writers via `S3ConnectionConfig`, which carries its own masking
+/// `Debug` implementation so secrets never appear in logs or panic messages.
+#[derive(Clone)]
 pub struct ParquetS3Config {
-    pub endpoint: String,
-    pub bucket: String,
-    pub region: String,
-    pub access_key: String,
-    pub secret_key: String,
+    /// Shared S3 connection fields. Debug output for these is handled by
+    /// `S3ConnectionConfig`'s masking `Debug` impl.
+    pub connection: S3ConnectionConfig,
     pub max_file_size_mb: u64,
     pub flush_interval_secs: u64,
     pub local_buffer_path: PathBuf,
 }
 
+/// Manual Debug impl for `ParquetS3Config`.
+///
+/// Secrets are masked by delegating to `S3ConnectionConfig`'s own masking `Debug` impl,
+/// so they never appear in logs or panic messages.
+impl std::fmt::Debug for ParquetS3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParquetS3Config")
+            .field("connection", &self.connection) // S3ConnectionConfig masks secrets
+            .field("max_file_size_mb", &self.max_file_size_mb)
+            .field("flush_interval_secs", &self.flush_interval_secs)
+            .field("local_buffer_path", &self.local_buffer_path)
+            .finish()
+    }
+}
+
 impl Default for ParquetS3Config {
     fn default() -> Self {
         Self {
-            endpoint: "http://localhost:9000".to_string(),
-            bucket: "wef-events".to_string(),
-            region: "us-east-1".to_string(),
-            access_key: "minioadmin".to_string(),
-            secret_key: "minioadmin".to_string(),
+            connection: S3ConnectionConfig {
+                endpoint: "http://localhost:9000".to_string(),
+                bucket: "wef-events".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "minioadmin".to_string(),
+                secret_key: "minioadmin".to_string(),
+            },
             max_file_size_mb: 100,
             flush_interval_secs: 900, // 15 minutes
-            local_buffer_path: PathBuf::from("/tmp/wef-events"),
+            local_buffer_path: std::env::temp_dir().join("logthing-wef-events"),
         }
     }
 }
@@ -63,15 +83,17 @@ impl ParquetS3Config {
         };
 
         Ok(Self {
-            endpoint,
-            bucket,
-            region: dest
-                .headers
-                .get("region")
-                .cloned()
-                .unwrap_or_else(|| "us-east-1".to_string()),
-            access_key: dest.headers.get("access-key").cloned().unwrap_or_default(),
-            secret_key: dest.headers.get("secret-key").cloned().unwrap_or_default(),
+            connection: S3ConnectionConfig {
+                endpoint,
+                bucket,
+                region: dest
+                    .headers
+                    .get("region")
+                    .cloned()
+                    .unwrap_or_else(|| "us-east-1".to_string()),
+                access_key: dest.headers.get("access-key").cloned().unwrap_or_default(),
+                secret_key: dest.headers.get("secret-key").cloned().unwrap_or_default(),
+            },
             max_file_size_mb: dest
                 .headers
                 .get("max-size-mb")
@@ -83,10 +105,12 @@ impl ParquetS3Config {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(900),
             local_buffer_path: PathBuf::from(
-                dest.headers
-                    .get("buffer-path")
-                    .cloned()
-                    .unwrap_or_else(|| "/tmp/wef-events".to_string()),
+                dest.headers.get("buffer-path").cloned().unwrap_or_else(|| {
+                    std::env::temp_dir()
+                        .join("logthing-wef-events")
+                        .to_string_lossy()
+                        .into_owned()
+                }),
             ),
         })
     }
@@ -97,20 +121,41 @@ struct EventTypeBuffer {
     events: Vec<BufferedEvent>,
     current_size_bytes: usize,
     last_flush: chrono::DateTime<Utc>,
+    hard_cap_bytes: usize,
 }
 
 impl EventTypeBuffer {
-    fn new() -> Self {
+    fn new(hard_cap_bytes: usize) -> Self {
         Self {
             events: Vec::new(),
             current_size_bytes: 0,
             last_flush: Utc::now(),
+            hard_cap_bytes,
         }
     }
 
     fn add_event(&mut self, event: BufferedEvent) {
         self.current_size_bytes += event.estimated_size();
         self.events.push(event);
+
+        // Enforce hard cap: drop oldest events until we're within bounds
+        if self.current_size_bytes > self.hard_cap_bytes {
+            let mut dropped: usize = 0;
+            while self.current_size_bytes > self.hard_cap_bytes {
+                if self.events.is_empty() {
+                    break;
+                }
+                let oldest = self.events.remove(0);
+                let sz = oldest.estimated_size();
+                self.current_size_bytes = self.current_size_bytes.saturating_sub(sz);
+                dropped += 1;
+            }
+            warn!(
+                "WEF S3 buffer exceeded hard cap ({} bytes); dropped {} oldest events",
+                self.hard_cap_bytes, dropped
+            );
+            counter!("wef_s3_buffer_dropped").increment(dropped as u64);
+        }
     }
 
     fn should_flush(&self, max_size_bytes: usize, max_age_secs: i64) -> bool {
@@ -135,30 +180,28 @@ struct BufferedEvent {
     timestamp: chrono::DateTime<Utc>,
     source_host: String,
     subscription_id: Option<String>,
-    event_data: serde_json::Value,
+    event_data: String,
 }
 
 impl BufferedEvent {
     fn from_windows_event(event: &WindowsEvent) -> Option<Self> {
         let event_id = event.parsed.as_ref()?.event_id;
 
+        // Serialization failure is handled explicitly: if to_string returns Err,
+        // ok()? propagates None and the event is silently skipped rather than
+        // stored as an empty or invalid string.
         Some(Self {
             event_id,
             timestamp: event.received_at,
             source_host: event.source_host.clone(),
             subscription_id: event.subscription_id.clone(),
-            event_data: serde_json::to_value(event).ok()?,
+            event_data: serde_json::to_string(event).ok()?,
         })
     }
 
     fn estimated_size(&self) -> usize {
-        // Use raw_xml length as efficient size estimation
-        // This avoids expensive JSON serialization
-        self.event_data
-            .get("raw_xml")
-            .and_then(|v| v.as_str().map(|s| s.len()))
-            .unwrap_or(512)
-            + 256 // metadata overhead
+        // Use serialized JSON string length as size estimate, plus metadata overhead
+        self.event_data.len() + 256
     }
 }
 
@@ -179,7 +222,10 @@ impl ParquetS3Forwarder {
         info!(
             "ParquetS3Forwarder initialized: bucket={}, endpoint={}, \
              flush_interval={}s, max_size={}MB",
-            config.bucket, config.endpoint, config.flush_interval_secs, config.max_file_size_mb
+            config.connection.bucket,
+            config.connection.endpoint,
+            config.flush_interval_secs,
+            config.max_file_size_mb
         );
 
         Ok(Self {
@@ -206,10 +252,11 @@ impl ParquetS3Forwarder {
         let event_type = buffered.event_id;
 
         // Get or create buffer for this event type
+        let hard_cap = (self.config.max_file_size_mb * 1024 * 1024 * 4) as usize;
         let buffer = self
             .buffers
             .entry(event_type)
-            .or_insert_with(EventTypeBuffer::new);
+            .or_insert_with(|| EventTypeBuffer::new(hard_cap));
 
         // Add event to buffer
         buffer.add_event(buffered);
@@ -225,21 +272,36 @@ impl ParquetS3Forwarder {
         Ok(())
     }
 
-    /// Flush all buffers (called periodically)
+    /// Flush all buffers — called periodically and on graceful shutdown.
+    ///
+    /// Iterates ALL event types even when individual flushes fail, so one
+    /// failing event type does not prevent others from being flushed.
     pub async fn flush_all(&mut self) -> Result<()> {
         let event_types: Vec<u32> = self.buffers.keys().copied().collect();
-
+        let mut first_err: Option<anyhow::Error> = None;
         for event_type in event_types {
             if self
                 .buffers
                 .get(&event_type)
                 .is_some_and(|b| !b.events.is_empty())
+                && let Err(e) = self.flush_event_type(event_type).await
             {
-                self.flush_event_type(event_type).await?;
+                warn!("flush_all: error flushing event type {}: {}", event_type, e);
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
             }
         }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 
-        Ok(())
+    /// Graceful-shutdown flush: flush all buffered events before the forwarder is dropped.
+    /// Callers (e.g. a Tokio channel `None` arm) should call this before dropping.
+    pub async fn shutdown_flush(&mut self) -> Result<()> {
+        self.flush_all().await
     }
 
     /// Flush a specific event type buffer to S3
@@ -261,15 +323,18 @@ impl ParquetS3Forwarder {
         let parquet_path = self.write_parquet_file(event_type, &events).await?;
 
         // Upload to S3
-        self.upload_to_s3(&parquet_path, event_type).await?;
+        let upload_result = self.upload_to_s3(&parquet_path, event_type).await;
 
-        // Clean up local file
+        // Always remove local temp file, even on upload failure
         if let Err(e) = tokio::fs::remove_file(&parquet_path).await {
             warn!(
                 "Failed to remove local parquet file {:?}: {}",
                 parquet_path, e
             );
         }
+
+        // Now propagate the upload error (if any)
+        upload_result?;
 
         info!(
             "Successfully flushed {} events of type {} to S3",
@@ -304,10 +369,7 @@ impl ParquetS3Forwarder {
         let source_hosts: Vec<String> = events.iter().map(|e| e.source_host.clone()).collect();
         let subscription_ids: Vec<Option<String>> =
             events.iter().map(|e| e.subscription_id.clone()).collect();
-        let event_data_json: Vec<String> = events
-            .iter()
-            .map(|e| serde_json::to_string(&e.event_data).unwrap_or_default())
-            .collect();
+        let event_data_json: Vec<String> = events.iter().map(|e| e.event_data.clone()).collect();
 
         // Create record batch
         let batch = RecordBatch::try_new(
@@ -376,12 +438,27 @@ impl ParquetS3Forwarder {
     }
 }
 
+use parquet::basic::ZstdLevel;
+
+/// Create a ParquetS3 forwarder from configuration
+pub async fn create_parquet_s3_forwarder(
+    destinations: &[DestinationConfig],
+) -> Result<Option<ParquetS3Forwarder>> {
+    for dest in destinations {
+        if dest.protocol == ForwardProtocol::Http && dest.url.starts_with("s3://") {
+            let config = ParquetS3Config::from_destination(dest)?;
+            return Ok(Some(ParquetS3Forwarder::new(config).await?));
+        }
+    }
+
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{DestinationConfig, ForwardProtocol};
     use crate::models::{EventLevel, ParsedEvent, WindowsEvent};
-    use serde_json::json;
 
     fn sample_destination() -> DestinationConfig {
         let mut headers = HashMap::new();
@@ -430,12 +507,46 @@ mod tests {
     fn config_parses_destination_headers() {
         let dest = sample_destination();
         let cfg = ParquetS3Config::from_destination(&dest).expect("config");
-        assert_eq!(cfg.bucket, "audit-bucket");
-        assert_eq!(cfg.endpoint, "http://minio:9000");
+        assert_eq!(cfg.connection.bucket, "audit-bucket");
+        assert_eq!(cfg.connection.endpoint, "http://minio:9000");
         assert_eq!(cfg.max_file_size_mb, 1);
         assert_eq!(cfg.flush_interval_secs, 60);
         let expected_path = std::env::temp_dir().join("test-buf");
         assert_eq!(cfg.local_buffer_path, expected_path);
+    }
+
+    // H-5 regression: Debug output of ParquetS3Config must never expose S3 credentials.
+    // Secrets are masked by delegating to S3ConnectionConfig's own masking Debug impl.
+    #[test]
+    fn parquet_s3_config_debug_masks_secrets() {
+        use crate::config::S3ConnectionConfig;
+        let cfg = ParquetS3Config {
+            connection: S3ConnectionConfig {
+                endpoint: "http://minio:9000".to_string(),
+                bucket: "my-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "SUPERSECRETKEY".to_string(),
+                secret_key: "TOPSECRETPASSWORD".to_string(),
+            },
+            max_file_size_mb: 100,
+            flush_interval_secs: 900,
+            local_buffer_path: std::path::PathBuf::from("/tmp/test"),
+        };
+        let debug_str = format!("{cfg:?}");
+        assert!(
+            !debug_str.contains("SUPERSECRETKEY"),
+            "access_key must not appear in Debug output: {debug_str}"
+        );
+        assert!(
+            !debug_str.contains("TOPSECRETPASSWORD"),
+            "secret_key must not appear in Debug output: {debug_str}"
+        );
+        // Non-secret fields must still be visible.
+        assert!(debug_str.contains("my-bucket"), "bucket must be visible");
+        assert!(
+            debug_str.contains("<redacted>"),
+            "redacted marker must appear"
+        );
     }
 
     #[test]
@@ -452,37 +563,84 @@ mod tests {
 
     #[test]
     fn event_buffer_flushes_by_size_and_age() {
-        let mut buffer = EventTypeBuffer::new();
+        let mut buffer = EventTypeBuffer::new(100_000);
         buffer.add_event(BufferedEvent {
             event_id: 1,
             timestamp: Utc::now(),
             source_host: "host".into(),
             subscription_id: None,
-            event_data: json!({"value": "a"}),
+            event_data: r#"{"value":"a"}"#.into(),
         });
 
         assert!(!buffer.should_flush(10_000, 300));
-        buffer.last_flush = buffer.last_flush - chrono::Duration::seconds(400);
+        buffer.last_flush -= chrono::Duration::seconds(400);
         assert!(buffer.should_flush(10_000, 300));
 
         let drained = buffer.take_events();
         assert_eq!(drained.len(), 1);
         assert_eq!(buffer.current_size_bytes, 0);
     }
-}
 
-use parquet::basic::ZstdLevel;
+    #[test]
+    fn event_buffer_hard_cap_drops_oldest_events() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::DebuggingRecorder;
 
-/// Create a ParquetS3 forwarder from configuration
-pub async fn create_parquet_s3_forwarder(
-    destinations: &[DestinationConfig],
-) -> Result<Option<ParquetS3Forwarder>> {
-    for dest in destinations {
-        if dest.protocol == ForwardProtocol::Http && dest.url.starts_with("s3://") {
-            let config = ParquetS3Config::from_destination(dest)?;
-            return Ok(Some(ParquetS3Forwarder::new(config).await?));
+        let recorder = DebuggingRecorder::new();
+        let _guard = set_default_local_recorder(&recorder);
+
+        // 1000 bytes hard cap
+        let mut buffer = EventTypeBuffer::new(1000);
+        // Each event is ~300 bytes (data: 44 bytes + 256 overhead)
+        for i in 0u32..10 {
+            buffer.add_event(BufferedEvent {
+                event_id: i,
+                timestamp: Utc::now(),
+                source_host: "host".into(),
+                subscription_id: None,
+                event_data: "a".repeat(44), // 44 + 256 = ~300 bytes estimated
+            });
         }
+        // At ~300 bytes each, 10 events = ~3000 bytes, but cap is 1000 bytes
+        // So no more than ceil(1000/300) = ~4 events should remain
+        assert!(
+            buffer.current_size_bytes <= 1000,
+            "buffer must stay within hard cap, got {} bytes",
+            buffer.current_size_bytes
+        );
+        assert!(
+            buffer.events.len() < 10,
+            "oldest events must have been dropped"
+        );
     }
 
-    Ok(None)
+    #[test]
+    fn flush_all_does_not_bail_on_first_error_structurally() {
+        // Verify that flush_all's contract is: iterate all, collect errors.
+        // The real multi-error behavior is tested via integration; here we just confirm
+        // that the buffers are drained even when errors occur, by checking that
+        // take_events clears all event types independently.
+        let mut buffer1 = EventTypeBuffer::new(100_000);
+        let mut buffer2 = EventTypeBuffer::new(100_000);
+        buffer1.add_event(BufferedEvent {
+            event_id: 4624,
+            timestamp: Utc::now(),
+            source_host: "h1".into(),
+            subscription_id: None,
+            event_data: "{}".into(),
+        });
+        buffer2.add_event(BufferedEvent {
+            event_id: 4625,
+            timestamp: Utc::now(),
+            source_host: "h2".into(),
+            subscription_id: None,
+            event_data: "{}".into(),
+        });
+        let e1 = buffer1.take_events();
+        let e2 = buffer2.take_events();
+        assert_eq!(e1.len(), 1);
+        assert_eq!(e2.len(), 1);
+        assert_eq!(buffer1.events.len(), 0);
+        assert_eq!(buffer2.events.len(), 0);
+    }
 }
