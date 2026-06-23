@@ -1,4 +1,4 @@
-bind_address = "0.0.0.0:5985"
+bind_address = "127.0.0.1:9999"
 
 [tls]
 enabled = false
@@ -19,7 +19,7 @@ buffer_size = 10000
 retry_attempts = 3
 
 [logging]
-level = "info"
+level = "debug"
 format = "pretty"
 
 [metrics]
@@ -41,3 +41,5 @@ bind_address = "0.0.0.0"
 enabled = false
 tcp_port = 47760
 bind_address = "0.0.0.0"
+
+[wef]

@@ -1,128 +1,29 @@
 //! Zeek → S3 Parquet persistence.
 //!
-//! `ZeekS3Writer` maintains a per-`log_path` buffer of Arrow RecordBatches,
-//! each keyed by the stream's schema (typed or envelope fallback from the registry).
-//! It mirrors the hardened `IpfixS3Writer` pattern:
-//! - `VecDeque<BufferedBatch>` per stream with `flush_then_cap` / `drop_oldest_to_cap`.
-//! - S3 key pattern: `{prefix}/{log_path}/year={Y}/month={MM}/day={DD}/{uuid}.parquet`.
-//! - Bounded `mpsc` channel in `ZeekS3Handler`; overflow drops + `zeek_s3_dropped`.
+//! Provides:
+//! - `sanitize_log_path()` — safe path segment for S3 keys
+//! - `ZeekSink` — `ParquetSink` adapter for the generic writer (multi-partition)
+//! - `ZeekS3Handler` — type alias for `ParquetWriterHandle<ZeekSink>`
+//! - `zeek_start()` — convenience constructor wiring `ZeekS3Config` → `ParquetWriterHandle`
+//!
+//! The generic `PartitionedParquetWriter` handles all buffering, flush, cap, encode, and
+//! upload machinery.  `ZeekSink` is the thin adapter that provides:
+//! - `partition()` → `sanitize_log_path(record.log_path)` (per-stream buffer key)
+//! - `schema(partition)` → typed registry schema or envelope fallback
+//! - `to_record_batch()` → registry row mapper for the record's actual log_path
+//!
+//! S3 key layout:  `zeek/<sanitized_log_path>/year={Y}/month={MM}/day={DD}/{uuid}.parquet`
+//! Partition cap:  `max_partitions` (replaces `MAX_ZEEK_STREAMS`); excess → `"_overflow"` buffer.
+//! Metrics:        `parquet_s3_*{source="zeek"}` (generic labels).
 
-use crate::forwarding::s3_sink::{S3Sink, flush_check_interval};
+use crate::config::ZeekS3Config;
+use crate::forwarding::buffered_writer::ParquetSink;
 use crate::zeek::ZeekRecord;
-use crate::zeek::schema::get_schema_entry;
-use arrow::datatypes::Schema;
-use arrow::record_batch::RecordBatch;
-use chrono::{Datelike, Utc};
-use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::WriterProperties;
-use std::collections::{HashMap, VecDeque};
+use crate::zeek::schema::{envelope_schema, get_schema_entry};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
-use tracing::warn;
-
-/// Maximum number of distinct Zeek stream buffers. New paths beyond this cap
-/// are routed to the "unknown" overflow stream instead of creating a new buffer.
-pub const MAX_ZEEK_STREAMS: usize = 256;
 
 // ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-
-/// Writer configuration (derived from `ZeekS3Config`).
-pub struct ZeekS3WriterConfig {
-    pub flush_threshold_bytes: usize,
-    pub flush_interval: Duration,
-    pub key_prefix: String,
-    pub max_buffer_rows: usize,
-}
-
-impl ZeekS3WriterConfig {
-    pub fn hard_cap_rows(&self) -> usize {
-        self.max_buffer_rows.saturating_mul(4)
-    }
-}
-
-impl Default for ZeekS3WriterConfig {
-    fn default() -> Self {
-        Self {
-            flush_threshold_bytes: 100 * 1024 * 1024,
-            flush_interval: Duration::from_secs(900),
-            key_prefix: "zeek".to_string(),
-            max_buffer_rows: 100_000,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Per-stream buffer
-// ---------------------------------------------------------------------------
-
-struct BufferedBatch {
-    batch: RecordBatch,
-    est_bytes: usize,
-}
-
-struct StreamBuffer {
-    schema: Arc<Schema>,
-    buffer: VecDeque<BufferedBatch>,
-    buffer_row_count: usize,
-    buffered_bytes: usize,
-    last_flush: Instant,
-    last_drop_warn: Option<Instant>,
-}
-
-impl StreamBuffer {
-    fn new(schema: Arc<Schema>) -> Self {
-        Self {
-            schema,
-            buffer: VecDeque::new(),
-            buffer_row_count: 0,
-            buffered_bytes: 0,
-            last_flush: Instant::now(),
-            last_drop_warn: None,
-        }
-    }
-
-    fn push(&mut self, batch: RecordBatch, est_bytes: usize) {
-        self.buffer_row_count += batch.num_rows();
-        self.buffered_bytes += est_bytes;
-        self.buffer.push_back(BufferedBatch { batch, est_bytes });
-    }
-
-    fn drop_oldest_to_cap(&mut self, cap: usize) {
-        let mut dropped_rows: usize = 0;
-        while self.buffer_row_count > cap {
-            if self.buffer.is_empty() {
-                break;
-            }
-            let oldest = self.buffer.pop_front().expect("non-empty");
-            let n = oldest.batch.num_rows();
-            self.buffer_row_count = self.buffer_row_count.saturating_sub(n);
-            self.buffered_bytes = self.buffered_bytes.saturating_sub(oldest.est_bytes);
-            dropped_rows += n;
-        }
-        if dropped_rows > 0 {
-            metrics::counter!("zeek_s3_buffer_dropped").increment(dropped_rows as u64);
-            let should_warn = self
-                .last_drop_warn
-                .map(|t| t.elapsed().as_secs() >= 30)
-                .unwrap_or(true);
-            if should_warn {
-                warn!(
-                    dropped_rows,
-                    buffer_row_count = self.buffer_row_count,
-                    "ZeekS3Writer: S3 upload failing — dropped oldest rows to stay within hard cap"
-                );
-                self.last_drop_warn = Some(Instant::now());
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// S3 key builder
+// sanitize_log_path — public helper reused by tests + generic partition()
 // ---------------------------------------------------------------------------
 
 /// Sanitise an attacker-supplied `_path` value so it is safe to embed in an S3 key.
@@ -150,297 +51,149 @@ pub(crate) fn sanitize_log_path(raw: &str) -> String {
     }
 }
 
-pub(crate) fn build_zeek_s3_key(
-    prefix: &str,
-    log_path: &str,
-    now: chrono::DateTime<Utc>,
-) -> String {
-    let id = uuid::Uuid::new_v4();
-    format!(
-        "{}/{}/year={}/month={:02}/day={:02}/{}.parquet",
-        prefix,
-        log_path,
-        now.year(),
-        now.month(),
-        now.day(),
-        id,
-    )
-}
-
 // ---------------------------------------------------------------------------
-// Parquet encoding (accepts any schema)
+// ZeekSink — ParquetSink adapter
 // ---------------------------------------------------------------------------
 
-fn encode_batches(batches: &[RecordBatch], schema: Arc<Schema>) -> anyhow::Result<Vec<u8>> {
-    if batches.is_empty() {
-        return Ok(Vec::new());
+/// `ParquetSink` adapter for Zeek NDJSON records.
+///
+/// This is the multi-partition case: each distinct `log_path` (after sanitization)
+/// gets its own buffer keyed by the sanitized path.  Excess partitions overflow to
+/// the `"_overflow"` buffer (generic machinery; configured via `max_partitions`).
+pub struct ZeekSink;
+
+impl ParquetSink for ZeekSink {
+    type Record = ZeekRecord;
+
+    fn source(&self) -> &'static str {
+        "zeek"
     }
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
-        .build();
-    let mut buf = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))?;
-    for batch in batches {
-        writer.write(batch)?;
+
+    /// Partition segment = `sanitize_log_path(record.log_path)`.
+    /// This is used as both the buffer-map key and the S3 path component,
+    /// producing keys of the form `zeek/<log_path>/year=…/…parquet`.
+    fn partition(&self, record: &ZeekRecord) -> Option<String> {
+        Some(sanitize_log_path(&record.log_path))
     }
-    writer.close()?;
-    Ok(buf)
-}
 
-// ---------------------------------------------------------------------------
-// ZeekS3Writer
-// ---------------------------------------------------------------------------
-
-/// Buffers `ZeekRecord`s per stream as Arrow RecordBatches and flushes to S3.
-pub struct ZeekS3Writer {
-    config: ZeekS3WriterConfig,
-    sink: Arc<S3Sink>,
-    streams: HashMap<String, StreamBuffer>,
-    streams_cap: usize,
-    pub zeek_streams_capped: u64,
-}
-
-impl ZeekS3Writer {
-    pub fn new(config: ZeekS3WriterConfig, sink: Arc<S3Sink>) -> Self {
-        Self {
-            config,
-            sink,
-            streams: HashMap::new(),
-            streams_cap: MAX_ZEEK_STREAMS,
-            zeek_streams_capped: 0,
+    /// Schema for `partition`:
+    /// - For a typed log path (`conn`, `dns`, `http`, `ssl`, `files`, `notice`):
+    ///   returns the typed schema from the registry.
+    /// - For `None`, `"_overflow"`, or any unknown path: returns the envelope fallback schema.
+    ///
+    /// `partition` is the **sanitized** path segment (the buffer-map key), not the raw log_path.
+    fn schema(&self, partition: Option<&str>) -> Arc<arrow_schema::Schema> {
+        match partition {
+            // No partition (should not happen for ZeekSink, but be safe).
+            None => envelope_schema(),
+            // Overflow bucket — always use the envelope fallback.
+            Some("_overflow") => envelope_schema(),
+            // Known or unknown named partition: look up the registry.
+            // get_schema_entry falls back to envelope_schema for unknown paths.
+            Some(seg) => get_schema_entry(seg).schema.clone(),
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_with_cap(config: ZeekS3WriterConfig, sink: Arc<S3Sink>, cap: usize) -> Self {
-        Self {
-            config,
-            sink,
-            streams: HashMap::new(),
-            streams_cap: cap,
-            zeek_streams_capped: 0,
-        }
-    }
+    /// Convert one `ZeekRecord` to a single-row `RecordBatch`.
+    ///
+    /// Uses `get_schema_entry(&record.log_path)` to select the row mapper for the
+    /// **actual** (unsanitized) log path, applying the typed or envelope mapper.
+    /// Type mismatches go to `_extra` (typed schemas) or `payload` (envelope); never panics.
+    fn to_record_batch(
+        &self,
+        record: &ZeekRecord,
+        schema: &Arc<arrow_schema::Schema>,
+    ) -> anyhow::Result<arrow_array::RecordBatch> {
+        // Use the actual (unsanitized) log_path to select the mapper so that the
+        // registry look-up matches the same path that produced the schema in schema().
+        // For the _overflow partition the schema is envelope; get_schema_entry for an
+        // unknown path also returns an envelope mapper — so the types are always consistent.
+        let entry = get_schema_entry(&record.log_path);
 
-    /// Push one ZeekRecord: map to RecordBatch, append to per-stream buffer, flush if needed.
-    pub async fn push_record(&mut self, record: &ZeekRecord) -> anyhow::Result<()> {
-        let raw_path = sanitize_log_path(&record.log_path);
-
-        // Determine the effective log_path (may be capped to "unknown")
-        let log_path = if self.streams.contains_key(&raw_path) {
-            // Existing stream — always allow
-            raw_path.clone()
-        } else if self.streams.len() < self.streams_cap {
-            // New stream — still under cap
-            raw_path.clone()
+        // Sanity check: if the entry schema matches the partition schema we were given,
+        // use the entry's mapper directly; otherwise fall back to re-running with the
+        // schema we actually hold (avoids RecordBatch schema mismatch panics).
+        if entry.schema == *schema {
+            (entry.mapper)(&record.fields).map_err(|e| {
+                anyhow::anyhow!("ZeekSink mapper error for '{}': {e}", record.log_path)
+            })
         } else {
-            // Cap exceeded — overflow to "unknown" envelope stream
-            self.zeek_streams_capped += 1;
-            metrics::counter!("zeek_streams_capped").increment(1);
-            "unknown".to_string()
-        };
-
-        // Get the schema entry appropriate for the effective path
-        let entry = get_schema_entry(&log_path);
-        let batch = match (entry.mapper)(&record.fields) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("ZeekS3Writer: row mapper error for '{}': {e}", log_path);
-                return Ok(()); // Never drop the connection; just skip this record
-            }
-        };
-
-        let est_bytes = record.fields.to_string().len() + 128;
-        let stream = self
-            .streams
-            .entry(log_path.clone())
-            .or_insert_with(|| StreamBuffer::new(entry.schema.clone()));
-
-        stream.push(batch, est_bytes);
-
-        if stream.buffered_bytes >= self.config.flush_threshold_bytes {
-            let cap = self.config.hard_cap_rows();
-            if let Err(e) = self.flush_stream(&log_path).await {
-                if let Some(s) = self
-                    .streams
-                    .get_mut(&log_path)
-                    .filter(|s| s.buffer_row_count > cap)
-                {
-                    s.drop_oldest_to_cap(cap);
-                }
-                return Err(e);
-            }
+            // The partition was overflowed to "_overflow" (or the sanitized path doesn't match
+            // the raw path).  Use the envelope mapper for the schema we were given.
+            let overflow_entry = get_schema_entry("_overflow_nonexistent_");
+            // get_schema_entry for unknown path always returns envelope — use that mapper.
+            (overflow_entry.mapper)(&record.fields).map_err(|e| {
+                anyhow::anyhow!(
+                    "ZeekSink overflow mapper error for '{}': {e}",
+                    record.log_path
+                )
+            })
         }
-        Ok(())
-    }
-
-    /// Flush all streams whose age or byte threshold is exceeded.
-    pub async fn flush_all_if_needed(&mut self) -> anyhow::Result<()> {
-        let keys: Vec<String> = self.streams.keys().cloned().collect();
-        for key in keys {
-            let should_flush = {
-                let s = &self.streams[&key];
-                !s.buffer.is_empty()
-                    && (s.last_flush.elapsed() >= self.config.flush_interval
-                        || s.buffered_bytes >= self.config.flush_threshold_bytes)
-            };
-            if should_flush {
-                let flush_result = self.flush_stream(&key).await;
-                if let Err(e) = flush_result {
-                    warn!("ZeekS3Writer: flush_all_if_needed error for '{key}': {e}");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Unconditionally flush all streams.
-    pub async fn flush_all(&mut self) -> anyhow::Result<()> {
-        let keys: Vec<String> = self.streams.keys().cloned().collect();
-        for key in keys {
-            if let Err(e) = self.flush_stream(&key).await {
-                warn!("ZeekS3Writer: flush_all error for '{key}': {e}");
-            }
-        }
-        Ok(())
-    }
-
-    async fn flush_stream(&mut self, log_path: &str) -> anyhow::Result<()> {
-        let stream = match self.streams.get_mut(log_path) {
-            Some(s) if !s.buffer.is_empty() => s,
-            _ => return Ok(()),
-        };
-
-        let batches: Vec<RecordBatch> = stream.buffer.iter().map(|b| b.batch.clone()).collect();
-        let row_count = stream.buffer_row_count;
-        let schema = stream.schema.clone();
-        // Move the CPU-bound Parquet encode off the async runtime thread.
-        let bytes = tokio::task::spawn_blocking(move || encode_batches(&batches, schema))
-            .await
-            .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
-        let key = build_zeek_s3_key(&self.config.key_prefix, log_path, Utc::now());
-
-        match self.sink.upload(&key, bytes).await {
-            Ok(()) => {
-                metrics::counter!("zeek_s3_records_written").increment(row_count as u64);
-                metrics::counter!("zeek_s3_uploads").increment(1);
-                // R-4: use if-let instead of unwrap so a concurrent modification or
-                // future refactor cannot panic the flush path.
-                if let Some(stream) = self.streams.get_mut(log_path) {
-                    stream.buffer.clear();
-                    stream.buffer_row_count = 0;
-                    stream.buffered_bytes = 0;
-                    stream.last_flush = Instant::now();
-                } else {
-                    warn!(
-                        "zeek_s3: stream for {:?} disappeared after upload; \
-                         skipping buffer reset",
-                        log_path
-                    );
-                }
-                Ok(())
-            }
-            Err(e) => {
-                metrics::counter!("zeek_s3_upload_errors").increment(1);
-                Err(e)
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn stream_row_count(&self, log_path: &str) -> usize {
-        self.streams
-            .get(log_path)
-            .map(|s| s.buffer_row_count)
-            .unwrap_or(0)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn streams_len(&self) -> usize {
-        self.streams.len()
     }
 }
 
 // ---------------------------------------------------------------------------
-// ZeekS3Handler — channel + background writer
+// ZeekS3Handler — type alias + ZeekHandler impl
 // ---------------------------------------------------------------------------
 
-pub const ZEEK_S3_CHANNEL_CAPACITY: usize = 256;
-
-/// `ZeekHandler` implementation that forwards records via a bounded channel to a
-/// background `ZeekS3Writer` task.
-pub struct ZeekS3Handler {
-    sender: mpsc::Sender<ZeekRecord>,
-}
-
-impl ZeekS3Handler {
-    /// Construct a handler with the default channel capacity.
-    ///
-    /// Returns `(handler, writer_task_handle)`. The caller should retain the `JoinHandle` and
-    /// await it (with a timeout) during graceful shutdown, after all `Arc<ZeekS3Handler>`
-    /// references have been dropped so the channel closes and the final flush fires.
-    pub fn start(
-        config: ZeekS3WriterConfig,
-        sink: Arc<S3Sink>,
-    ) -> (Self, tokio::task::JoinHandle<()>) {
-        Self::start_with_capacity(config, sink, ZEEK_S3_CHANNEL_CAPACITY)
-    }
-
-    /// Construct a handler with a custom channel `capacity`.
-    ///
-    /// Returns `(handler, writer_task_handle)`. The caller should hold the `JoinHandle` and await
-    /// it (with a timeout) during shutdown, after dropping all `Arc<dyn ZeekHandler>` references
-    /// so that the channel closes and the writer flushes its buffer.
-    pub fn start_with_capacity(
-        config: ZeekS3WriterConfig,
-        sink: Arc<S3Sink>,
-        capacity: usize,
-    ) -> (Self, tokio::task::JoinHandle<()>) {
-        let (tx, mut rx) = mpsc::channel::<ZeekRecord>(capacity);
-        let flush_check = flush_check_interval(config.flush_interval);
-        let handle = tokio::spawn(async move {
-            let mut writer = ZeekS3Writer::new(config, sink);
-            let mut interval = tokio::time::interval(flush_check);
-            loop {
-                tokio::select! {
-                    msg = rx.recv() => {
-                        match msg {
-                            Some(record) => {
-                                if let Err(e) = writer.push_record(&record).await {
-                                    warn!("ZeekS3Writer::push_record error: {e}");
-                                }
-                            }
-                            None => {
-                                if let Err(e) = writer.flush_all().await {
-                                    warn!("ZeekS3Writer::flush_all on shutdown: {e}");
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    _ = interval.tick() => {
-                        if let Err(e) = writer.flush_all_if_needed().await {
-                            warn!("ZeekS3Writer::flush_all_if_needed error: {e}");
-                        }
-                    }
-                }
-            }
-        });
-        (Self { sender: tx }, handle)
-    }
-}
+/// `ZeekS3Handler` is a thin alias for the generic `ParquetWriterHandle<ZeekSink>`.
+pub type ZeekS3Handler = crate::forwarding::buffered_writer::ParquetWriterHandle<ZeekSink>;
 
 #[async_trait::async_trait]
-impl crate::zeek::listener::ZeekHandler for ZeekS3Handler {
+impl crate::zeek::listener::ZeekHandler
+    for crate::forwarding::buffered_writer::ParquetWriterHandle<ZeekSink>
+{
     async fn handle_record(&self, record: ZeekRecord, source: std::net::SocketAddr) {
-        match self.sender.try_send(record) {
+        match self.try_send(record) {
             Ok(()) => {}
             Err(_dropped) => {
-                metrics::counter!("zeek_s3_dropped").increment(1);
-                warn!("Zeek S3 channel full; dropped 1 record from {}", source);
+                // parquet_s3_dropped{source="zeek"} is already incremented by try_send.
+                tracing::warn!("Zeek S3 channel full; dropped 1 record from {}", source);
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// zeek_start — convenience constructor
+// ---------------------------------------------------------------------------
+
+/// Construct a `ZeekS3Handler` (i.e. `ParquetWriterHandle<ZeekSink>`) from a
+/// `ZeekS3Config` and a pre-built `S3Sink`.
+///
+/// `max_partitions` is set to 256 (the old `MAX_ZEEK_STREAMS` value) unless the
+/// config provides a higher or lower value (the config struct does not expose this
+/// field, so we hard-code the default here — matching the old behavior).
+///
+/// Returns `(handler, writer_task_handle)`. The caller should retain the `JoinHandle`
+/// and await it during graceful shutdown, after all `Arc<dyn ZeekHandler>` references
+/// have been dropped so the channel closes and the final flush fires.
+pub fn zeek_start(
+    cfg: &ZeekS3Config,
+    s3: std::sync::Arc<crate::forwarding::s3_sink::S3Sink>,
+) -> (ZeekS3Handler, tokio::task::JoinHandle<()>) {
+    use crate::forwarding::buffered_writer::{
+        BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
+    };
+
+    /// Replaces the old `MAX_ZEEK_STREAMS` constant.
+    const DEFAULT_MAX_ZEEK_PARTITIONS: usize = 256;
+
+    let bwc = BufferedWriterConfig {
+        connection: cfg.connection.clone(),
+        prefix: cfg.prefix.clone(),
+        max_buffer_rows: cfg.max_buffer_rows,
+        flush_threshold_bytes: cfg.flush_threshold_bytes,
+        flush_interval_secs: cfg.flush_interval_secs,
+        channel_capacity: cfg.channel_capacity,
+        max_partitions: DEFAULT_MAX_ZEEK_PARTITIONS,
+    };
+    let policy = FlushPolicy {
+        max_rows: cfg.max_buffer_rows,
+        max_bytes: cfg.flush_threshold_bytes,
+        interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
+    };
+    ParquetWriterHandle::start(ZeekSink, s3, bwc, policy)
 }
 
 // ---------------------------------------------------------------------------
@@ -450,11 +203,20 @@ impl crate::zeek::listener::ZeekHandler for ZeekS3Handler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::S3ConnectionConfig;
+    use crate::forwarding::buffered_writer::{
+        BufferedWriterConfig, FlushPolicy, ParquetSink, PartitionedParquetWriter,
+    };
+    use crate::forwarding::s3_sink::S3Sink;
     use crate::zeek::ZeekRecord;
     use chrono::Utc;
+    use std::sync::Arc;
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
 
     async fn unreachable_sink() -> Arc<S3Sink> {
-        use crate::config::S3ConnectionConfig;
         let conn = S3ConnectionConfig {
             endpoint: "http://127.0.0.1:1".to_string(),
             bucket: "test-bucket".to_string(),
@@ -463,6 +225,34 @@ mod tests {
             secret_key: "SECRETTEST".to_string(),
         };
         Arc::new(S3Sink::from_connection(&conn).await.expect("constructs"))
+    }
+
+    fn make_zeek_cfg(
+        max_rows: usize,
+        flush_bytes: usize,
+        max_partitions: usize,
+    ) -> (BufferedWriterConfig, FlushPolicy) {
+        let bwc = BufferedWriterConfig {
+            connection: S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "AKIATEST".to_string(),
+                secret_key: "SECRETTEST".to_string(),
+            },
+            prefix: "zeek".to_string(),
+            max_buffer_rows: max_rows,
+            flush_threshold_bytes: flush_bytes,
+            flush_interval_secs: 3600,
+            channel_capacity: 256,
+            max_partitions,
+        };
+        let policy = FlushPolicy {
+            max_rows,
+            max_bytes: flush_bytes,
+            interval: std::time::Duration::from_secs(3600),
+        };
+        (bwc, policy)
     }
 
     fn make_conn_record(uid: &str) -> ZeekRecord {
@@ -506,9 +296,9 @@ mod tests {
 
     fn make_unknown_record() -> ZeekRecord {
         ZeekRecord {
-            log_path: "unknown".to_string(),
+            log_path: "weird".to_string(),
             fields: serde_json::json!({
-                "_path": "unknown",
+                "_path": "weird",
                 "ts": 1700000200.0,
                 "uid": "CUnk1",
                 "raw_data": "some weird log"
@@ -517,88 +307,261 @@ mod tests {
         }
     }
 
-    // -- S3 key structure --
+    // -----------------------------------------------------------------------
+    // sanitize_log_path tests
+    // -----------------------------------------------------------------------
 
     #[test]
-    fn zeek_s3_key_has_correct_structure() {
-        let now = chrono::DateTime::from_timestamp(1700000000, 0).unwrap();
-        let key = build_zeek_s3_key("zeek", "conn", now);
-        assert!(key.starts_with("zeek/conn/year="), "key: {key}");
-        assert!(key.contains("/month="), "key: {key}");
-        assert!(key.contains("/day="), "key: {key}");
-        assert!(key.ends_with(".parquet"), "key: {key}");
+    fn log_path_sanitizer_handles_traversal() {
+        assert_eq!(sanitize_log_path("../weird path"), "___weird_path");
+        assert_eq!(sanitize_log_path("conn"), "conn");
+        assert_eq!(sanitize_log_path("../foo"), "___foo");
+        let out = sanitize_log_path("../../etc/passwd");
+        assert!(!out.contains('/'), "sanitized path must not contain /");
+        assert!(!out.contains('.'), "sanitized path must not contain .");
+        assert_eq!(sanitize_log_path(""), "unknown");
+        let long_input = "a".repeat(100);
+        assert_eq!(sanitize_log_path(&long_input).len(), 64);
     }
 
-    // -- Writer accumulates per-stream --
+    // -----------------------------------------------------------------------
+    // ZeekSink unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn zeek_sink_source_returns_zeek() {
+        assert_eq!(ZeekSink.source(), "zeek");
+    }
+
+    #[test]
+    fn zeek_sink_partition_sanitizes_log_path() {
+        let record = make_conn_record("C1");
+        assert_eq!(ZeekSink.partition(&record), Some("conn".to_string()));
+
+        let weird = ZeekRecord {
+            log_path: "../etc/passwd".to_string(),
+            fields: serde_json::json!({}),
+            received_at: Utc::now(),
+        };
+        let part = ZeekSink.partition(&weird).unwrap();
+        assert!(!part.contains('/'));
+        assert!(!part.contains('.'));
+    }
+
+    #[test]
+    fn zeek_sink_schema_typed_for_known_paths() {
+        use crate::zeek::schema::{conn_schema, dns_schema};
+
+        // Typed paths return typed schemas.
+        assert_eq!(ZeekSink.schema(Some("conn")), conn_schema());
+        assert_eq!(ZeekSink.schema(Some("dns")), dns_schema());
+
+        // _overflow → envelope schema
+        let overflow_schema = ZeekSink.schema(Some("_overflow"));
+        assert!(
+            overflow_schema.field_with_name("payload").is_ok(),
+            "_overflow schema must be envelope (has 'payload' column)"
+        );
+
+        // None → envelope schema
+        let none_schema = ZeekSink.schema(None);
+        assert!(
+            none_schema.field_with_name("payload").is_ok(),
+            "None partition schema must be envelope"
+        );
+
+        // Unknown path → envelope schema (fallback)
+        let unknown_schema = ZeekSink.schema(Some("notaknownpath"));
+        assert!(
+            unknown_schema.field_with_name("payload").is_ok(),
+            "unknown path schema must be envelope fallback"
+        );
+    }
+
+    #[test]
+    fn zeek_sink_to_record_batch_conn() {
+        let record = make_conn_record("C1");
+        let schema = ZeekSink.schema(Some("conn"));
+        let batch = ZeekSink.to_record_batch(&record, &schema).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        // conn schema has 'uid' column
+        use arrow::array::StringArray;
+        let uid = batch
+            .column_by_name("uid")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(uid.value(0), "C1");
+    }
+
+    #[test]
+    fn zeek_sink_to_record_batch_unknown_path_uses_envelope() {
+        let record = make_unknown_record();
+        // Unknown paths get envelope schema from schema()
+        let schema = ZeekSink.schema(Some("weird"));
+        let batch = ZeekSink.to_record_batch(&record, &schema).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        // Envelope schema has 'payload' column
+        let col = batch.column_by_name("payload");
+        assert!(col.is_some(), "envelope schema must have 'payload' column");
+    }
+
+    #[test]
+    fn zeek_sink_to_record_batch_overflow_partition() {
+        // When the partition is "_overflow", we use envelope schema.
+        // The record may have any log_path — we test with a conn record.
+        let record = make_conn_record("Overflow1");
+        let schema = ZeekSink.schema(Some("_overflow"));
+        // schema is envelope; to_record_batch must succeed (not panic).
+        let result = ZeekSink.to_record_batch(&record, &schema);
+        assert!(
+            result.is_ok(),
+            "to_record_batch must succeed for _overflow partition: {:?}",
+            result.err()
+        );
+        let batch = result.unwrap();
+        assert_eq!(batch.num_rows(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // S3 key layout verification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_key_produces_zeek_log_path_layout() {
+        use crate::forwarding::buffered_writer::build_key;
+        use chrono::TimeZone;
+
+        let now = chrono::Utc.with_ymd_and_hms(2026, 3, 7, 0, 0, 0).unwrap();
+
+        // zeek/<log_path>/year=…/month=…/day=…/<uuid>.parquet
+        let key = build_key("zeek", Some("conn"), now);
+        assert!(
+            key.starts_with("zeek/conn/year=2026/month=03/day=07/"),
+            "key: {key}"
+        );
+        assert!(key.ends_with(".parquet"), "key: {key}");
+
+        let key = build_key("zeek", Some("dns"), now);
+        assert!(key.starts_with("zeek/dns/year="), "key: {key}");
+
+        let key = build_key("zeek", Some("_overflow"), now);
+        assert!(key.starts_with("zeek/_overflow/year="), "key: {key}");
+    }
+
+    // -----------------------------------------------------------------------
+    // PartitionedParquetWriter accumulation tests
+    // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn writer_accumulates_per_stream_buffers() {
+    async fn writer_accumulates_per_partition_buffers() {
         let sink = unreachable_sink().await;
-        let config = ZeekS3WriterConfig {
-            flush_threshold_bytes: usize::MAX, // never flush by size
-            flush_interval: Duration::from_secs(3600),
-            key_prefix: "zeek".to_string(),
-            max_buffer_rows: 100_000,
-        };
-        let mut writer = ZeekS3Writer::new(config, sink);
+        let (bwc, policy) = make_zeek_cfg(100_000, usize::MAX, 256);
+        let mut writer = PartitionedParquetWriter::new(ZeekSink, sink, bwc, policy);
 
-        writer.push_record(&make_conn_record("C1")).await.ok();
-        writer.push_record(&make_conn_record("C2")).await.ok();
-        writer.push_record(&make_dns_record("D1")).await.ok();
-        writer.push_record(&make_unknown_record()).await.ok();
+        writer.push(make_conn_record("C1")).await.ok();
+        writer.push(make_conn_record("C2")).await.ok();
+        writer.push(make_dns_record("D1")).await.ok();
+        writer.push(make_unknown_record()).await.ok();
 
+        // conn → "conn" partition, dns → "dns" partition, weird → "weird" partition
         assert_eq!(
-            writer.stream_row_count("conn"),
+            writer.buffers.get("conn").map(|b| b.row_count).unwrap_or(0),
             2,
             "conn buffer should have 2 rows"
         );
         assert_eq!(
-            writer.stream_row_count("dns"),
+            writer.buffers.get("dns").map(|b| b.row_count).unwrap_or(0),
             1,
             "dns buffer should have 1 row"
         );
         assert_eq!(
-            writer.stream_row_count("unknown"),
+            writer
+                .buffers
+                .get("weird")
+                .map(|b| b.row_count)
+                .unwrap_or(0),
             1,
-            "unknown buffer should have 1 row"
+            "weird buffer should have 1 row"
         );
     }
-
-    // -- Writer bounded under S3 outage --
 
     #[tokio::test]
     async fn writer_bounded_under_s3_outage() {
         let sink = unreachable_sink().await;
         let max_rows = 2usize;
-        let config = ZeekS3WriterConfig {
-            flush_threshold_bytes: 1, // force flush on every push
-            flush_interval: Duration::from_secs(3600),
-            key_prefix: "zeek".to_string(),
-            max_buffer_rows: max_rows,
-        };
-        let hard_cap = config.hard_cap_rows();
-        let mut writer = ZeekS3Writer::new(config, sink);
+        let hard_cap = max_rows.saturating_mul(4);
+        let (bwc, policy) = make_zeek_cfg(max_rows, 1, 256); // flush on every push
 
+        let mut writer = PartitionedParquetWriter::new(ZeekSink, sink, bwc, policy);
         let total = hard_cap * 3;
         let mut errors = 0usize;
         for i in 0..total {
             let rec = make_conn_record(&format!("C{i}"));
-            if writer.push_record(&rec).await.is_err() {
+            if writer.push(rec).await.is_err() {
                 errors += 1;
             }
         }
         assert!(errors > 0, "expected flush errors under S3 outage");
         assert!(
-            writer.stream_row_count("conn") <= hard_cap,
-            "conn buffer must stay at or below hard cap ({hard_cap}), got {}",
-            writer.stream_row_count("conn")
+            writer.buffers.get("conn").map(|b| b.row_count).unwrap_or(0) <= hard_cap,
+            "conn buffer must stay at or below hard cap ({hard_cap})"
         );
     }
 
-    // -- Handler overflow drops and counts --
+    // -----------------------------------------------------------------------
+    // Partition cap test — overflow to "_overflow"
+    // -----------------------------------------------------------------------
 
     #[tokio::test]
-    #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
+    async fn writer_partition_cap_overflows_to_overflow_buffer() {
+        let sink = unreachable_sink().await;
+        let cap = 3usize;
+        let (bwc, policy) = make_zeek_cfg(100_000, usize::MAX, cap);
+        let mut writer = PartitionedParquetWriter::new(ZeekSink, sink, bwc, policy);
+
+        // Push records with cap+5 distinct log_paths.
+        for i in 0..(cap + 5) {
+            let rec = ZeekRecord {
+                log_path: format!("stream_{i}"),
+                fields: serde_json::json!({
+                    "_path": format!("stream_{i}"),
+                    "ts": 1700000000.0,
+                    "uid": format!("C{i}"),
+                }),
+                received_at: Utc::now(),
+            };
+            writer.push(rec).await.ok();
+        }
+
+        // Map size must be <= cap + 1 (the +1 is the "_overflow" buffer)
+        assert!(
+            writer.buffers.len() <= cap + 1,
+            "buffers map must be bounded; got {} (cap={})",
+            writer.buffers.len(),
+            cap
+        );
+        // The "_overflow" buffer must exist.
+        assert!(
+            writer.buffers.contains_key("_overflow"),
+            "_overflow buffer must exist after cap exceeded"
+        );
+        // The "_overflow" buffer must have rows and a valid (non-empty) schema.
+        let ov = writer.buffers.get("_overflow").unwrap();
+        assert!(ov.row_count > 0, "_overflow must contain records");
+        assert!(
+            !ov.schema.fields().is_empty(),
+            "_overflow must have a valid schema"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Handler overflow drops and increments parquet_s3_dropped{source="zeek"}
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
     async fn handler_overflow_increments_dropped_counter() {
         use crate::zeek::listener::ZeekHandler;
         use metrics::set_default_local_recorder;
@@ -612,13 +575,21 @@ mod tests {
         let _guard = set_default_local_recorder(&recorder);
 
         let sink = unreachable_sink().await;
-        let config = ZeekS3WriterConfig {
+        let cfg = ZeekS3Config {
+            connection: S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "AKIATEST".to_string(),
+                secret_key: "SECRETTEST".to_string(),
+            },
+            prefix: "zeek".to_string(),
             flush_threshold_bytes: 1,
-            flush_interval: Duration::from_secs(3600),
-            key_prefix: "zeek".to_string(),
+            flush_interval_secs: 3600,
+            channel_capacity: 1,
             max_buffer_rows: 1,
         };
-        let (handler, _writer_handle) = ZeekS3Handler::start_with_capacity(config, sink, 1);
+        let (handler, _writer_handle) = zeek_start(&cfg, sink);
         tokio::task::yield_now().await;
 
         let src: SocketAddr = "127.0.0.1:47760".parse().unwrap();
@@ -632,7 +603,10 @@ mod tests {
         let map = snapshot.into_hashmap();
         let key = CompositeKey::new(
             MetricKind::Counter,
-            metrics::Key::from_name("zeek_s3_dropped"),
+            metrics::Key::from_parts(
+                "parquet_s3_dropped",
+                vec![metrics::Label::new("source", "zeek")],
+            ),
         );
         let dropped = map
             .get(&key)
@@ -644,71 +618,54 @@ mod tests {
                 }
             })
             .unwrap_or(0);
-        assert!(dropped >= 1, "expected zeek_s3_dropped >= 1; got {dropped}");
+        assert!(
+            dropped >= 1,
+            "expected parquet_s3_dropped{{source=\"zeek\"}} >= 1; got {dropped}"
+        );
     }
 
-    // -- Streams map is bounded --
+    // -----------------------------------------------------------------------
+    // zeek_start wires handler and join handle
+    // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn writer_streams_map_is_bounded() {
+    async fn zeek_start_wires_handler_and_join_handle() {
+        use crate::zeek::listener::ZeekHandler;
+        use std::net::SocketAddr;
+
         let sink = unreachable_sink().await;
-        let config = ZeekS3WriterConfig {
+        let cfg = ZeekS3Config {
+            connection: S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "AKIATEST".to_string(),
+                secret_key: "SECRETTEST".to_string(),
+            },
+            prefix: "zeek".to_string(),
             flush_threshold_bytes: usize::MAX,
-            flush_interval: Duration::from_secs(3600),
-            key_prefix: "zeek".to_string(),
+            flush_interval_secs: 3600,
+            channel_capacity: 256,
             max_buffer_rows: 100_000,
         };
-        let cap = 3usize;
-        let mut writer = ZeekS3Writer::new_with_cap(config, sink, cap);
+        let (handler, join_handle) = zeek_start(&cfg, sink);
 
-        // Push records with cap+5 distinct log_paths
-        for i in 0..(cap + 5) {
-            let rec = ZeekRecord {
-                log_path: format!("stream_{i}"),
-                fields: serde_json::json!({
-                    "_path": format!("stream_{i}"),
-                    "ts": 1700000000.0,
-                    "uid": format!("C{i}"),
-                }),
-                received_at: Utc::now(),
-            };
-            writer.push_record(&rec).await.ok();
-        }
+        let src: SocketAddr = "127.0.0.1:47760".parse().unwrap();
+        handler.handle_record(make_conn_record("C1"), src).await;
 
-        // Map size must be <= cap + 1 (the +1 is the "unknown" overflow stream)
-        assert!(
-            writer.streams_len() <= cap + 1,
-            "streams map must be bounded; got {} streams (cap={cap})",
-            writer.streams_len()
-        );
-        // Overflow counter must have been incremented
-        assert!(
-            writer.zeek_streams_capped > 0,
-            "zeek_streams_capped must be > 0 when cap exceeded"
-        );
+        // Drop the handler to close the channel and trigger shutdown flush.
+        drop(handler);
+
+        // Join the background task within 5s.
+        tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
+            .await
+            .expect("writer task must exit within 5s")
+            .expect("writer task must not panic");
     }
 
-    // -- log_path sanitizer --
-
-    #[test]
-    fn log_path_sanitizer_handles_traversal() {
-        // "../weird path" → ".."→"__", "/"→"_", "weird"→"weird", " "→"_", "path"→"path"
-        assert_eq!(sanitize_log_path("../weird path"), "___weird_path");
-        assert_eq!(sanitize_log_path("conn"), "conn");
-        // "../foo" → ".."→"__", "/"→"_", "foo"→"foo"
-        assert_eq!(sanitize_log_path("../foo"), "___foo");
-        // No dots or slashes in output
-        let out = sanitize_log_path("../../etc/passwd");
-        assert!(!out.contains('/'), "sanitized path must not contain /");
-        assert!(!out.contains('.'), "sanitized path must not contain .");
-        // Empty input → "unknown"
-        assert_eq!(sanitize_log_path(""), "unknown");
-        // Cap at 64
-        let long_input = "a".repeat(100);
-        assert_eq!(sanitize_log_path(&long_input).len(), 64);
-    }
-
-    // -- Integration test (gated on env var) --
+    // -----------------------------------------------------------------------
+    // Integration test (gated on env var)
+    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn integration_records_produce_parquet_in_s3() {
@@ -716,7 +673,6 @@ mod tests {
             eprintln!("skipping; set ZEEK_S3_INTEGRATION_TEST=1 to run against local MinIO");
             return;
         }
-        use crate::config::S3ConnectionConfig;
         use crate::zeek::listener::ZeekHandler;
 
         let bucket = std::env::var("ZEEK_S3_BUCKET").unwrap_or_else(|_| "zeek-test".to_string());
@@ -732,13 +688,15 @@ mod tests {
                 .await
                 .expect("S3Sink construct"),
         );
-        let config = ZeekS3WriterConfig {
+        let cfg = ZeekS3Config {
+            connection: conn.clone(),
+            prefix: "zeek".to_string(),
             flush_threshold_bytes: 1,
-            flush_interval: Duration::from_secs(1),
-            key_prefix: "zeek".to_string(),
+            flush_interval_secs: 1,
+            channel_capacity: 256,
             max_buffer_rows: 100_000,
         };
-        let (handler, _writer_handle) = ZeekS3Handler::start(config, sink);
+        let (handler, _writer_handle) = zeek_start(&cfg, sink);
         let src: std::net::SocketAddr = "127.0.0.1:47760".parse().unwrap();
 
         for i in 0..5usize {

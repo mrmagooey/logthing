@@ -1,487 +1,140 @@
-use crate::config::{DestinationConfig, ForwardProtocol, S3ConnectionConfig};
+//! WEF (Windows Event Forwarding) → S3 Parquet persistence.
+//!
+//! Provides:
+//! - `WefSink` — `ParquetSink` adapter for WEF events
+//! - `wef_start()` — convenience constructor wiring `WefS3Config` → `ParquetWriterHandle`
+//!
+//! S3 KEY LAYOUT: `event_type=<id>/year=Y/month=MM/day=DD/<uuid>.parquet`
+//! (empty prefix, preserving the legacy layout — behavior-preserving choice (a)).
+
+use crate::config::WefS3Config;
+use crate::forwarding::buffered_writer::ParquetSink;
 use crate::models::WindowsEvent;
-use anyhow::Result;
 use arrow::array::{ArrayRef, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use chrono::{Datelike, Utc};
-use metrics::counter;
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
-use std::collections::HashMap;
-use std::fs::File;
-use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
 
-/// Configuration for Parquet S3 forwarder.
+// ---------------------------------------------------------------------------
+// WefSink — ParquetSink adapter
+// ---------------------------------------------------------------------------
+
+/// `ParquetSink` adapter for Windows Event Forwarding records.
 ///
-/// The five S3 connection fields (endpoint, bucket, region, access_key, secret_key) are
-/// shared with the other writers via `S3ConnectionConfig`, which carries its own masking
-/// `Debug` implementation so secrets never appear in logs or panic messages.
-#[derive(Clone)]
-pub struct ParquetS3Config {
-    /// Shared S3 connection fields. Debug output for these is handled by
-    /// `S3ConnectionConfig`'s masking `Debug` impl.
-    pub connection: S3ConnectionConfig,
-    pub max_file_size_mb: u64,
-    pub flush_interval_secs: u64,
-    pub local_buffer_path: PathBuf,
-}
-
-/// Manual Debug impl for `ParquetS3Config`.
+/// - `Record` = `Arc<WindowsEvent>` (matches the channel item type).
+/// - `partition()` = `Some("event_type=<event_id>")` from the parsed EventID.
+///   If the event has no parsed data, returns `Some("event_type=0")` as a safe
+///   sentinel — but `to_record_batch` will return `Err` to skip unparsed events.
+/// - `schema()` = fixed 5-column WEF schema (unchanged from legacy writer).
+/// - `to_record_batch()` = returns `Err` for events with no parsed data (generic
+///   writer logs + skips, matching legacy "silently skipped" behavior).
 ///
-/// Secrets are masked by delegating to `S3ConnectionConfig`'s own masking `Debug` impl,
-/// so they never appear in logs or panic messages.
-impl std::fmt::Debug for ParquetS3Config {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ParquetS3Config")
-            .field("connection", &self.connection) // S3ConnectionConfig masks secrets
-            .field("max_file_size_mb", &self.max_file_size_mb)
-            .field("flush_interval_secs", &self.flush_interval_secs)
-            .field("local_buffer_path", &self.local_buffer_path)
-            .finish()
-    }
-}
+/// **S3 KEY LAYOUT (choice a — behavior-preserving):**
+/// `event_type=<id>/year=Y/month=MM/day=DD/<uuid>.parquet`
+/// Achieved by using an empty prefix (`""`), so `build_key("", Some("event_type=4624"), now)`
+/// → `event_type=4624/year=…`. No leading slash (verified in generic unit test).
+pub struct WefSink;
 
-impl Default for ParquetS3Config {
-    fn default() -> Self {
-        Self {
-            connection: S3ConnectionConfig {
-                endpoint: "http://localhost:9000".to_string(),
-                bucket: "wef-events".to_string(),
-                region: "us-east-1".to_string(),
-                access_key: "minioadmin".to_string(),
-                secret_key: "minioadmin".to_string(),
-            },
-            max_file_size_mb: 100,
-            flush_interval_secs: 900, // 15 minutes
-            local_buffer_path: std::env::temp_dir().join("logthing-wef-events"),
-        }
-    }
-}
+impl ParquetSink for WefSink {
+    type Record = Arc<WindowsEvent>;
 
-impl ParquetS3Config {
-    pub fn from_destination(dest: &DestinationConfig) -> Result<Self> {
-        let url = &dest.url;
-        // Parse S3 URL: s3://bucket/path or http://endpoint/bucket
-        let parts: Vec<&str> = url.split("/").collect();
-
-        let bucket = parts.get(2).unwrap_or(&"wef-events").to_string();
-
-        let endpoint = if url.starts_with("s3://") {
-            dest.headers
-                .get("endpoint")
-                .cloned()
-                .unwrap_or_else(|| "http://localhost:9000".to_string())
-        } else {
-            format!(
-                "{}//{}",
-                parts.first().unwrap_or(&"http:"),
-                parts.get(2).unwrap_or(&"localhost:9000")
-            )
-        };
-
-        Ok(Self {
-            connection: S3ConnectionConfig {
-                endpoint,
-                bucket,
-                region: dest
-                    .headers
-                    .get("region")
-                    .cloned()
-                    .unwrap_or_else(|| "us-east-1".to_string()),
-                access_key: dest.headers.get("access-key").cloned().unwrap_or_default(),
-                secret_key: dest.headers.get("secret-key").cloned().unwrap_or_default(),
-            },
-            max_file_size_mb: dest
-                .headers
-                .get("max-size-mb")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(100),
-            flush_interval_secs: dest
-                .headers
-                .get("flush-interval-secs")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(900),
-            local_buffer_path: PathBuf::from(
-                dest.headers.get("buffer-path").cloned().unwrap_or_else(|| {
-                    std::env::temp_dir()
-                        .join("logthing-wef-events")
-                        .to_string_lossy()
-                        .into_owned()
-                }),
-            ),
-        })
-    }
-}
-
-/// Buffer for a specific event type
-struct EventTypeBuffer {
-    events: Vec<BufferedEvent>,
-    current_size_bytes: usize,
-    last_flush: chrono::DateTime<Utc>,
-    hard_cap_bytes: usize,
-}
-
-impl EventTypeBuffer {
-    fn new(hard_cap_bytes: usize) -> Self {
-        Self {
-            events: Vec::new(),
-            current_size_bytes: 0,
-            last_flush: Utc::now(),
-            hard_cap_bytes,
-        }
+    fn source(&self) -> &'static str {
+        "wef"
     }
 
-    fn add_event(&mut self, event: BufferedEvent) {
-        self.current_size_bytes += event.estimated_size();
-        self.events.push(event);
-
-        // Enforce hard cap: drop oldest events until we're within bounds
-        if self.current_size_bytes > self.hard_cap_bytes {
-            let mut dropped: usize = 0;
-            while self.current_size_bytes > self.hard_cap_bytes {
-                if self.events.is_empty() {
-                    break;
-                }
-                let oldest = self.events.remove(0);
-                let sz = oldest.estimated_size();
-                self.current_size_bytes = self.current_size_bytes.saturating_sub(sz);
-                dropped += 1;
-            }
-            warn!(
-                "WEF S3 buffer exceeded hard cap ({} bytes); dropped {} oldest events",
-                self.hard_cap_bytes, dropped
-            );
-            counter!("wef_s3_buffer_dropped").increment(dropped as u64);
-        }
+    fn partition(&self, record: &Arc<WindowsEvent>) -> Option<String> {
+        // Use parsed EventID for partition; if none, use sentinel "event_type=0".
+        // to_record_batch will return Err for unparsed events so they are skipped.
+        let event_id = record.parsed.as_ref().map(|p| p.event_id).unwrap_or(0);
+        Some(format!("event_type={}", event_id))
     }
 
-    fn should_flush(&self, max_size_bytes: usize, max_age_secs: i64) -> bool {
-        let size_threshold = self.current_size_bytes >= max_size_bytes;
-        let age = Utc::now().signed_duration_since(self.last_flush);
-        let time_threshold = age.num_seconds() >= max_age_secs;
-
-        size_threshold || time_threshold
-    }
-
-    fn take_events(&mut self) -> Vec<BufferedEvent> {
-        self.current_size_bytes = 0;
-        self.last_flush = Utc::now();
-        std::mem::take(&mut self.events)
-    }
-}
-
-/// Buffered event data
-#[derive(Debug, Clone)]
-struct BufferedEvent {
-    event_id: u32,
-    timestamp: chrono::DateTime<Utc>,
-    source_host: String,
-    subscription_id: Option<String>,
-    event_data: String,
-}
-
-impl BufferedEvent {
-    fn from_windows_event(event: &WindowsEvent) -> Option<Self> {
-        let event_id = event.parsed.as_ref()?.event_id;
-
-        // Serialization failure is handled explicitly: if to_string returns Err,
-        // ok()? propagates None and the event is silently skipped rather than
-        // stored as an empty or invalid string.
-        Some(Self {
-            event_id,
-            timestamp: event.received_at,
-            source_host: event.source_host.clone(),
-            subscription_id: event.subscription_id.clone(),
-            event_data: serde_json::to_string(event).ok()?,
-        })
-    }
-
-    fn estimated_size(&self) -> usize {
-        // Use serialized JSON string length as size estimate, plus metadata overhead
-        self.event_data.len() + 256
-    }
-}
-
-/// Parquet S3 Forwarder
-pub struct ParquetS3Forwarder {
-    config: ParquetS3Config,
-    sink: crate::forwarding::s3_sink::S3Sink,
-    buffers: HashMap<u32, EventTypeBuffer>,
-}
-
-impl ParquetS3Forwarder {
-    pub async fn new(config: ParquetS3Config) -> Result<Self> {
-        let sink = crate::forwarding::s3_sink::S3Sink::from_config(&config).await?;
-
-        // Ensure buffer directory exists
-        tokio::fs::create_dir_all(&config.local_buffer_path).await?;
-
-        info!(
-            "ParquetS3Forwarder initialized: bucket={}, endpoint={}, \
-             flush_interval={}s, max_size={}MB",
-            config.connection.bucket,
-            config.connection.endpoint,
-            config.flush_interval_secs,
-            config.max_file_size_mb
-        );
-
-        Ok(Self {
-            config,
-            sink,
-            buffers: HashMap::new(),
-        })
-    }
-
-    pub fn flush_interval_secs(&self) -> u64 {
-        self.config.flush_interval_secs
-    }
-
-    /// Process a single event
-    pub async fn forward(&mut self, event: WindowsEvent) -> Result<()> {
-        let buffered = match BufferedEvent::from_windows_event(&event) {
-            Some(be) => be,
-            None => {
-                warn!("Could not extract event data for buffering");
-                return Ok(());
-            }
-        };
-
-        let event_type = buffered.event_id;
-
-        // Get or create buffer for this event type
-        let hard_cap = (self.config.max_file_size_mb * 1024 * 1024 * 4) as usize;
-        let buffer = self
-            .buffers
-            .entry(event_type)
-            .or_insert_with(|| EventTypeBuffer::new(hard_cap));
-
-        // Add event to buffer
-        buffer.add_event(buffered);
-
-        // Check if we should flush
-        let max_size = (self.config.max_file_size_mb * 1024 * 1024) as usize;
-        let max_age = self.config.flush_interval_secs as i64;
-
-        if buffer.should_flush(max_size, max_age) {
-            self.flush_event_type(event_type).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Flush all buffers — called periodically and on graceful shutdown.
-    ///
-    /// Iterates ALL event types even when individual flushes fail, so one
-    /// failing event type does not prevent others from being flushed.
-    pub async fn flush_all(&mut self) -> Result<()> {
-        let event_types: Vec<u32> = self.buffers.keys().copied().collect();
-        let mut first_err: Option<anyhow::Error> = None;
-        for event_type in event_types {
-            if self
-                .buffers
-                .get(&event_type)
-                .is_some_and(|b| !b.events.is_empty())
-                && let Err(e) = self.flush_event_type(event_type).await
-            {
-                warn!("flush_all: error flushing event type {}: {}", event_type, e);
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
-            }
-        }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
-
-    /// Graceful-shutdown flush: flush all buffered events before the forwarder is dropped.
-    /// Callers (e.g. a Tokio channel `None` arm) should call this before dropping.
-    pub async fn shutdown_flush(&mut self) -> Result<()> {
-        self.flush_all().await
-    }
-
-    /// Flush a specific event type buffer to S3
-    async fn flush_event_type(&mut self, event_type: u32) -> Result<()> {
-        let buffer = match self.buffers.get_mut(&event_type) {
-            Some(b) if !b.events.is_empty() => b,
-            _ => return Ok(()),
-        };
-
-        let events = buffer.take_events();
-        let event_count = events.len();
-
-        info!(
-            "Flushing {} events of type {} to Parquet/S3",
-            event_count, event_type
-        );
-
-        // Create parquet file
-        let parquet_path = self.write_parquet_file(event_type, &events).await?;
-
-        // Upload to S3
-        let upload_result = self.upload_to_s3(&parquet_path, event_type).await;
-
-        // Always remove local temp file, even on upload failure
-        if let Err(e) = tokio::fs::remove_file(&parquet_path).await {
-            warn!(
-                "Failed to remove local parquet file {:?}: {}",
-                parquet_path, e
-            );
-        }
-
-        // Now propagate the upload error (if any)
-        upload_result?;
-
-        info!(
-            "Successfully flushed {} events of type {} to S3",
-            event_count, event_type
-        );
-
-        Ok(())
-    }
-
-    /// Write events to a local parquet file
-    async fn write_parquet_file(
-        &self,
-        event_type: u32,
-        events: &[BufferedEvent],
-    ) -> Result<PathBuf> {
-        let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
-        let filename = format!("events_{}_{}.parquet", event_type, timestamp);
-        let filepath = self.config.local_buffer_path.join(&filename);
-
-        // Create schema for the events
-        let schema = Arc::new(Schema::new(vec![
+    fn schema(&self, _partition: Option<&str>) -> Arc<arrow_schema::Schema> {
+        Arc::new(Schema::new(vec![
             Field::new("event_id", DataType::UInt32, false),
             Field::new("timestamp", DataType::Utf8, false),
             Field::new("source_host", DataType::Utf8, false),
             Field::new("subscription_id", DataType::Utf8, true),
             Field::new("event_data", DataType::Utf8, false),
-        ]));
+        ]))
+    }
 
-        // Convert events to Arrow arrays
-        let event_ids: Vec<u32> = events.iter().map(|e| e.event_id).collect();
-        let timestamps: Vec<String> = events.iter().map(|e| e.timestamp.to_rfc3339()).collect();
-        let source_hosts: Vec<String> = events.iter().map(|e| e.source_host.clone()).collect();
-        let subscription_ids: Vec<Option<String>> =
-            events.iter().map(|e| e.subscription_id.clone()).collect();
-        let event_data_json: Vec<String> = events.iter().map(|e| e.event_data.clone()).collect();
+    fn to_record_batch(
+        &self,
+        record: &Arc<WindowsEvent>,
+        schema: &Arc<arrow_schema::Schema>,
+    ) -> anyhow::Result<arrow_array::RecordBatch> {
+        // Unparsed events are silently skipped (matches legacy behavior).
+        // Return Err here; the generic writer logs a warn and continues.
+        let parsed = record
+            .parsed
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("WEF event has no parsed data; skipping"))?;
 
-        // Create record batch
+        let event_data = serde_json::to_string(record.as_ref())
+            .map_err(|e| anyhow::anyhow!("WEF event JSON serialization failed: {e}"))?;
+
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(UInt32Array::from(event_ids)) as ArrayRef,
-                Arc::new(StringArray::from(timestamps)) as ArrayRef,
-                Arc::new(StringArray::from(source_hosts)) as ArrayRef,
-                Arc::new(StringArray::from(subscription_ids)) as ArrayRef,
-                Arc::new(StringArray::from(event_data_json)) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![parsed.event_id])) as ArrayRef,
+                Arc::new(StringArray::from(vec![record.received_at.to_rfc3339()])) as ArrayRef,
+                Arc::new(StringArray::from(vec![record.source_host.as_str()])) as ArrayRef,
+                Arc::new(StringArray::from(vec![record.subscription_id.as_deref()])) as ArrayRef,
+                Arc::new(StringArray::from(vec![event_data.as_str()])) as ArrayRef,
             ],
         )?;
-
-        // Clone filepath for use in spawn_blocking
-        let filepath_clone = filepath.clone();
-        let schema_clone = schema.clone();
-
-        // Write to parquet file in a blocking task to avoid blocking async runtime
-        tokio::task::spawn_blocking(move || {
-            let file = File::create(&filepath_clone)?;
-            let props = WriterProperties::builder()
-                .set_compression(parquet::basic::Compression::ZSTD(ZstdLevel::try_new(3)?))
-                .build();
-
-            let mut writer = ArrowWriter::try_new(file, schema_clone, Some(props))?;
-            writer.write(&batch)?;
-            writer.close()?;
-
-            Result::<(), anyhow::Error>::Ok(())
-        })
-        .await??;
-
-        debug!(
-            "Written {} events to parquet file: {:?}",
-            events.len(),
-            filepath
-        );
-
-        Ok(filepath)
-    }
-
-    /// Upload parquet file to S3
-    async fn upload_to_s3(&self, filepath: &PathBuf, event_type: u32) -> Result<()> {
-        let filename = filepath
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
-
-        // Generate S3 key with date partitioning (unchanged from before)
-        let now = Utc::now();
-        let s3_key = format!(
-            "event_type={}/year={}/month={:02}/day={:02}/{}",
-            event_type,
-            now.year(),
-            now.month(),
-            now.day(),
-            filename
-        );
-
-        // Read file into memory and delegate to S3Sink.
-        // S3Sink::upload already logs the successful upload; no need to log here too.
-        let body = tokio::fs::read(filepath).await?;
-        self.sink.upload(&s3_key, body).await?;
-
-        Ok(())
+        Ok(batch)
     }
 }
 
-use parquet::basic::ZstdLevel;
+// ---------------------------------------------------------------------------
+// wef_start — convenience constructor
+// ---------------------------------------------------------------------------
 
-/// Create a ParquetS3 forwarder from configuration
-pub async fn create_parquet_s3_forwarder(
-    destinations: &[DestinationConfig],
-) -> Result<Option<ParquetS3Forwarder>> {
-    for dest in destinations {
-        if dest.protocol == ForwardProtocol::Http && dest.url.starts_with("s3://") {
-            let config = ParquetS3Config::from_destination(dest)?;
-            return Ok(Some(ParquetS3Forwarder::new(config).await?));
-        }
-    }
-
-    Ok(None)
+/// Construct a `ParquetWriterHandle<WefSink>` from a `WefS3Config` and a pre-built `S3Sink`.
+///
+/// Returns `(handle, writer_task_handle)`. The caller must retain the `JoinHandle` and
+/// await it during graceful shutdown. When `AppState` drops its `ParquetWriterHandle<WefSink>`,
+/// the channel closes, the background task flushes, and the `JoinHandle` completes.
+pub fn wef_start(
+    cfg: &WefS3Config,
+    s3: Arc<crate::forwarding::s3_sink::S3Sink>,
+) -> (
+    crate::forwarding::buffered_writer::ParquetWriterHandle<WefSink>,
+    tokio::task::JoinHandle<()>,
+) {
+    use crate::forwarding::buffered_writer::{
+        BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
+    };
+    let bwc = BufferedWriterConfig {
+        connection: cfg.connection.clone(),
+        prefix: cfg.prefix.clone(), // "" for behavior-preserving empty-prefix layout
+        max_buffer_rows: cfg.max_buffer_rows,
+        flush_threshold_bytes: cfg.flush_threshold_bytes,
+        flush_interval_secs: cfg.flush_interval_secs,
+        channel_capacity: cfg.channel_capacity,
+        max_partitions: 0, // unlimited — EventIDs are bounded in practice
+    };
+    let policy = FlushPolicy {
+        max_rows: cfg.max_buffer_rows,
+        max_bytes: cfg.flush_threshold_bytes,
+        interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
+    };
+    ParquetWriterHandle::start(WefSink, s3, bwc, policy)
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DestinationConfig, ForwardProtocol};
+    use crate::config::WefS3Config;
+    use crate::forwarding::buffered_writer::ParquetSink;
     use crate::models::{EventLevel, ParsedEvent, WindowsEvent};
-
-    fn sample_destination() -> DestinationConfig {
-        let mut headers = HashMap::new();
-        headers.insert("endpoint".into(), "http://minio:9000".into());
-        headers.insert("region".into(), "us-east-1".into());
-        headers.insert("access-key".into(), "AKIA".into());
-        headers.insert("secret-key".into(), "SECRET".into());
-        headers.insert("max-size-mb".into(), "1".into());
-        headers.insert("flush-interval-secs".into(), "60".into());
-        let temp_path = std::env::temp_dir().join("test-buf");
-        headers.insert(
-            "buffer-path".into(),
-            temp_path.to_string_lossy().to_string(),
-        );
-
-        DestinationConfig {
-            name: "parquet".into(),
-            url: "s3://audit-bucket/events".into(),
-            protocol: ForwardProtocol::Http,
-            enabled: true,
-            headers,
-        }
-    }
+    use chrono::Utc;
 
     fn sample_parsed_event(event_id: u32) -> ParsedEvent {
         ParsedEvent {
@@ -503,144 +156,196 @@ mod tests {
         }
     }
 
-    #[test]
-    fn config_parses_destination_headers() {
-        let dest = sample_destination();
-        let cfg = ParquetS3Config::from_destination(&dest).expect("config");
-        assert_eq!(cfg.connection.bucket, "audit-bucket");
-        assert_eq!(cfg.connection.endpoint, "http://minio:9000");
-        assert_eq!(cfg.max_file_size_mb, 1);
-        assert_eq!(cfg.flush_interval_secs, 60);
-        let expected_path = std::env::temp_dir().join("test-buf");
-        assert_eq!(cfg.local_buffer_path, expected_path);
+    fn make_parsed_event(event_id: u32) -> Arc<WindowsEvent> {
+        Arc::new(
+            WindowsEvent::new("host".into(), "<Event/>".into())
+                .with_parsed(sample_parsed_event(event_id)),
+        )
     }
 
-    // H-5 regression: Debug output of ParquetS3Config must never expose S3 credentials.
-    // Secrets are masked by delegating to S3ConnectionConfig's own masking Debug impl.
+    fn make_unparsed_event() -> Arc<WindowsEvent> {
+        Arc::new(WindowsEvent::new("host".into(), "<Event/>".into()))
+    }
+
+    // WefSink unit tests
+
     #[test]
-    fn parquet_s3_config_debug_masks_secrets() {
+    fn wef_sink_source_returns_wef() {
+        assert_eq!(WefSink.source(), "wef");
+    }
+
+    #[test]
+    fn wef_sink_schema_has_five_columns() {
+        let schema = WefSink.schema(None);
+        assert_eq!(schema.fields().len(), 5);
+        assert!(schema.field_with_name("event_id").is_ok());
+        assert!(schema.field_with_name("timestamp").is_ok());
+        assert!(schema.field_with_name("source_host").is_ok());
+        assert!(schema.field_with_name("subscription_id").is_ok());
+        assert!(schema.field_with_name("event_data").is_ok());
+    }
+
+    #[test]
+    fn wef_sink_partition_uses_event_id() {
+        let event = make_parsed_event(4624);
+        assert_eq!(
+            WefSink.partition(&event),
+            Some("event_type=4624".to_string())
+        );
+    }
+
+    #[test]
+    fn wef_sink_partition_unparsed_uses_sentinel() {
+        let event = make_unparsed_event();
+        // Sentinel "event_type=0" — to_record_batch will Err and skip it
+        assert_eq!(WefSink.partition(&event), Some("event_type=0".to_string()));
+    }
+
+    #[test]
+    fn wef_sink_to_record_batch_parsed_event() {
+        let event = make_parsed_event(4624);
+        let schema = WefSink.schema(Some("event_type=4624"));
+        let batch = WefSink.to_record_batch(&event, &schema).expect("ok");
+        assert_eq!(batch.num_rows(), 1);
+
+        use arrow::array::{StringArray, UInt32Array};
+        let id_col = batch
+            .column_by_name("event_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(id_col.value(0), 4624);
+
+        let host_col = batch
+            .column_by_name("source_host")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(host_col.value(0), "host");
+    }
+
+    #[test]
+    fn wef_sink_to_record_batch_unparsed_returns_err() {
+        let event = make_unparsed_event();
+        let schema = WefSink.schema(None);
+        let result = WefSink.to_record_batch(&event, &schema);
+        assert!(
+            result.is_err(),
+            "unparsed event must return Err (will be skipped by generic writer)"
+        );
+    }
+
+    #[test]
+    fn wef_sink_schema_unchanged_for_any_partition() {
+        // Schema must be identical regardless of partition segment
+        let s1 = WefSink.schema(None);
+        let s2 = WefSink.schema(Some("event_type=4624"));
+        let s3 = WefSink.schema(Some("event_type=4625"));
+        assert_eq!(s1, s2);
+        assert_eq!(s2, s3);
+    }
+
+    #[test]
+    fn s3_key_layout_empty_prefix_produces_correct_path() {
+        use crate::forwarding::buffered_writer::build_key;
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 21, 0, 0, 0).unwrap();
+        let key = build_key("", Some("event_type=4624"), now);
+        assert!(
+            key.starts_with("event_type=4624/year=2026/month=06/day=21/"),
+            "WEF S3 key must match legacy layout: {key}"
+        );
+        assert!(!key.starts_with('/'), "must not start with /");
+        assert!(!key.contains("//"), "must not have double-slash");
+        assert!(key.ends_with(".parquet"));
+    }
+
+    #[tokio::test]
+    async fn wef_start_spawns_and_exits_cleanly() {
         use crate::config::S3ConnectionConfig;
-        let cfg = ParquetS3Config {
-            connection: S3ConnectionConfig {
-                endpoint: "http://minio:9000".to_string(),
-                bucket: "my-bucket".to_string(),
-                region: "us-east-1".to_string(),
-                access_key: "SUPERSECRETKEY".to_string(),
-                secret_key: "TOPSECRETPASSWORD".to_string(),
-            },
-            max_file_size_mb: 100,
-            flush_interval_secs: 900,
-            local_buffer_path: std::path::PathBuf::from("/tmp/test"),
+        use crate::forwarding::s3_sink::S3Sink;
+
+        let conn = S3ConnectionConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key: "K".to_string(),
+            secret_key: "S".to_string(),
         };
-        let debug_str = format!("{cfg:?}");
-        assert!(
-            !debug_str.contains("SUPERSECRETKEY"),
-            "access_key must not appear in Debug output: {debug_str}"
-        );
-        assert!(
-            !debug_str.contains("TOPSECRETPASSWORD"),
-            "secret_key must not appear in Debug output: {debug_str}"
-        );
-        // Non-secret fields must still be visible.
-        assert!(debug_str.contains("my-bucket"), "bucket must be visible");
-        assert!(
-            debug_str.contains("<redacted>"),
-            "redacted marker must appear"
-        );
+        let s3 = Arc::new(S3Sink::from_connection(&conn).await.expect("construct"));
+        let cfg = WefS3Config {
+            connection: conn,
+            prefix: "".to_string(),
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 256,
+            max_buffer_rows: 100_000,
+        };
+        let (handle, jh) = wef_start(&cfg, s3);
+
+        // Send a parsed event — should be accepted
+        let event = make_parsed_event(4624);
+        assert!(handle.try_send(event).is_ok());
+
+        // Drop handle → closes channel → writer flushes + exits
+        drop(handle);
+        tokio::time::timeout(std::time::Duration::from_secs(5), jh)
+            .await
+            .expect("writer must exit within 5s")
+            .expect("writer must not panic");
     }
 
-    #[test]
-    fn buffered_event_requires_parsed_data() {
-        let event = WindowsEvent::new("host".into(), "<Event/>".into());
-        assert!(BufferedEvent::from_windows_event(&event).is_none());
+    #[tokio::test]
+    async fn unparsed_events_are_skipped_not_stored() {
+        // Verify that the generic writer's to_record_batch error path is triggered
+        // for unparsed events (they are logged+skipped, not stored).
+        use crate::config::S3ConnectionConfig;
+        use crate::forwarding::buffered_writer::{
+            BufferedWriterConfig, FlushPolicy, PartitionedParquetWriter,
+        };
+        use crate::forwarding::s3_sink::S3Sink;
 
-        let parsed_event = sample_parsed_event(4624);
-        let event = WindowsEvent::new("host".into(), "<Event/>".into()).with_parsed(parsed_event);
-        let buffered = BufferedEvent::from_windows_event(&event).expect("buffered");
-        assert_eq!(buffered.event_id, 4624);
-        assert!(buffered.estimated_size() > 256);
-    }
+        let conn = S3ConnectionConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            bucket: "t".to_string(),
+            region: "us-east-1".to_string(),
+            access_key: "K".to_string(),
+            secret_key: "S".to_string(),
+        };
+        let s3 = Arc::new(S3Sink::from_connection(&conn).await.expect("construct"));
+        let cfg = BufferedWriterConfig {
+            connection: conn,
+            prefix: "".to_string(),
+            max_buffer_rows: 100_000,
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 256,
+            max_partitions: 0,
+        };
+        let policy = FlushPolicy {
+            max_rows: 100_000,
+            max_bytes: usize::MAX,
+            interval: std::time::Duration::from_secs(3600),
+        };
+        let mut writer = PartitionedParquetWriter::new(WefSink, s3, cfg, policy);
 
-    #[test]
-    fn event_buffer_flushes_by_size_and_age() {
-        let mut buffer = EventTypeBuffer::new(100_000);
-        buffer.add_event(BufferedEvent {
-            event_id: 1,
-            timestamp: Utc::now(),
-            source_host: "host".into(),
-            subscription_id: None,
-            event_data: r#"{"value":"a"}"#.into(),
-        });
-
-        assert!(!buffer.should_flush(10_000, 300));
-        buffer.last_flush -= chrono::Duration::seconds(400);
-        assert!(buffer.should_flush(10_000, 300));
-
-        let drained = buffer.take_events();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(buffer.current_size_bytes, 0);
-    }
-
-    #[test]
-    fn event_buffer_hard_cap_drops_oldest_events() {
-        use metrics::set_default_local_recorder;
-        use metrics_util::debugging::DebuggingRecorder;
-
-        let recorder = DebuggingRecorder::new();
-        let _guard = set_default_local_recorder(&recorder);
-
-        // 1000 bytes hard cap
-        let mut buffer = EventTypeBuffer::new(1000);
-        // Each event is ~300 bytes (data: 44 bytes + 256 overhead)
-        for i in 0u32..10 {
-            buffer.add_event(BufferedEvent {
-                event_id: i,
-                timestamp: Utc::now(),
-                source_host: "host".into(),
-                subscription_id: None,
-                event_data: "a".repeat(44), // 44 + 256 = ~300 bytes estimated
-            });
-        }
-        // At ~300 bytes each, 10 events = ~3000 bytes, but cap is 1000 bytes
-        // So no more than ceil(1000/300) = ~4 events should remain
+        // Push unparsed event — to_record_batch returns Err → push returns Ok (skipped)
+        let unparsed = make_unparsed_event();
+        let result = writer.push(unparsed).await;
         assert!(
-            buffer.current_size_bytes <= 1000,
-            "buffer must stay within hard cap, got {} bytes",
-            buffer.current_size_bytes
+            result.is_ok(),
+            "unparsed event must not propagate error: {result:?}"
         );
-        assert!(
-            buffer.events.len() < 10,
-            "oldest events must have been dropped"
-        );
-    }
 
-    #[test]
-    fn flush_all_does_not_bail_on_first_error_structurally() {
-        // Verify that flush_all's contract is: iterate all, collect errors.
-        // The real multi-error behavior is tested via integration; here we just confirm
-        // that the buffers are drained even when errors occur, by checking that
-        // take_events clears all event types independently.
-        let mut buffer1 = EventTypeBuffer::new(100_000);
-        let mut buffer2 = EventTypeBuffer::new(100_000);
-        buffer1.add_event(BufferedEvent {
-            event_id: 4624,
-            timestamp: Utc::now(),
-            source_host: "h1".into(),
-            subscription_id: None,
-            event_data: "{}".into(),
-        });
-        buffer2.add_event(BufferedEvent {
-            event_id: 4625,
-            timestamp: Utc::now(),
-            source_host: "h2".into(),
-            subscription_id: None,
-            event_data: "{}".into(),
-        });
-        let e1 = buffer1.take_events();
-        let e2 = buffer2.take_events();
-        assert_eq!(e1.len(), 1);
-        assert_eq!(e2.len(), 1);
-        assert_eq!(buffer1.events.len(), 0);
-        assert_eq!(buffer2.events.len(), 0);
+        // The buffer for event_type=0 should exist but be EMPTY (record skipped)
+        // Actually: the buffer might not exist at all if the skip happens before insertion.
+        // Check: row_count is 0 for any partition, or the partition doesn't exist.
+        let total_rows: usize = writer.buffers.values().map(|b| b.row_count).sum();
+        assert_eq!(
+            total_rows, 0,
+            "unparsed events must not add rows to any buffer"
+        );
     }
 }

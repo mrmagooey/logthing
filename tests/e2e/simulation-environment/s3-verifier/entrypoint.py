@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 import time
@@ -12,6 +13,8 @@ STATS_ENDPOINT = os.environ.get(
 )
 EXPECTED_TOTAL = int(os.environ.get("EXPECTED_EVENT_TOTAL", "2"))
 TIMEOUT = int(os.environ.get("E2E_TIMEOUT_SECS", "120"))
+
+WEF_COLUMNS = {"event_id", "timestamp", "source_host", "subscription_id", "event_data"}
 
 
 def wait_for_stats():
@@ -85,7 +88,6 @@ def wait_for_syslog_parquet():
     # Verify the first object is readable Parquet with 11 columns
     key = resp["Contents"][0]["Key"]
     obj = client.get_object(Bucket=BUCKET, Key=key)
-    import io
 
     import pyarrow.parquet as pq
 
@@ -97,11 +99,61 @@ def wait_for_syslog_parquet():
     )
 
 
+def wait_for_wef_parquet():
+    """Poll for a Parquet object under the event_type= prefix (WEF root layout) and
+    validate it is readable Parquet with the expected 5 WEF columns."""
+    session = boto3.session.Session()
+    client = session.client(
+        "s3",
+        endpoint_url=MINIO_ENDPOINT,
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+    )
+
+    # WEF objects are written at the bucket root with event_type=<id>/year=.../... layout
+    wef_prefix = "event_type="
+    deadline = time.time() + 30  # 30-second poll window
+    wef_found = False
+    resp = None
+    while time.time() < deadline:
+        resp = client.list_objects_v2(Bucket=BUCKET, Prefix=wef_prefix)
+        if resp.get("Contents"):
+            wef_found = True
+            break
+        time.sleep(2)
+
+    if not wef_found:
+        print(
+            f"ERROR: No Parquet object found under {wef_prefix} in {BUCKET}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Verify the first object is readable Parquet with the expected 5 WEF columns
+    key = resp["Contents"][0]["Key"]
+    obj = client.get_object(Bucket=BUCKET, Key=key)
+
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(io.BytesIO(obj["Body"].read()))
+    assert table.num_columns == 5, f"Expected 5 WEF columns, got {table.num_columns}"
+    actual_columns = set(table.schema.names)
+    missing = WEF_COLUMNS - actual_columns
+    assert not missing, f"WEF Parquet missing expected columns: {missing}"
+    assert table.num_rows > 0, "Expected at least one row in WEF Parquet"
+    print(
+        f"OK: WEF Parquet verified: {table.num_rows} row(s) under {wef_prefix} "
+        f"with columns {sorted(actual_columns)}"
+    )
+
+
 def main():
     wait_for_stats()
     wait_for_object()
+    wait_for_wef_parquet()
     wait_for_syslog_parquet()
     print("S3 verifier succeeded")
+    os._exit(0)
 
 
 if __name__ == "__main__":

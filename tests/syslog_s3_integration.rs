@@ -4,12 +4,9 @@
 //! Set MINIO_ENDPOINT, MINIO_BUCKET, MINIO_ACCESS_KEY, MINIO_SECRET_KEY env vars.
 //! If MINIO_ENDPOINT is absent, the test is skipped.
 
-use logthing::config::S3ConnectionConfig;
-use logthing::forwarding::parquet_s3::ParquetS3Config;
+use logthing::config::{S3ConnectionConfig, SyslogS3Config};
 use logthing::forwarding::s3_sink::S3Sink;
-use logthing::forwarding::syslog_s3::{
-    SYSLOG_S3_CHANNEL_CAPACITY, SyslogS3Handler, SyslogS3WriterConfig,
-};
+use logthing::forwarding::syslog_s3::{SyslogS3Handler, syslog_start};
 use logthing::syslog::listener::SyslogHandler as SyslogHandlerTrait;
 use logthing::syslog::{SyslogMessage, SyslogProtocol};
 use std::net::SocketAddr;
@@ -19,8 +16,8 @@ fn skip_if_no_minio() -> Option<String> {
     std::env::var("MINIO_ENDPOINT").ok()
 }
 
-fn minio_config(endpoint: &str) -> ParquetS3Config {
-    ParquetS3Config {
+fn minio_syslog_config(endpoint: &str) -> SyslogS3Config {
+    SyslogS3Config {
         connection: S3ConnectionConfig {
             endpoint: endpoint.to_string(),
             bucket: std::env::var("MINIO_BUCKET").unwrap_or_else(|_| "syslog-test".to_string()),
@@ -30,9 +27,10 @@ fn minio_config(endpoint: &str) -> ParquetS3Config {
             secret_key: std::env::var("MINIO_SECRET_KEY")
                 .unwrap_or_else(|_| "minioadmin".to_string()),
         },
-        max_file_size_mb: 0,
-        flush_interval_secs: 900,
-        local_buffer_path: std::path::PathBuf::new(),
+        prefix: "syslog-test".to_string(),
+        max_buffer_rows: 1, // flush immediately on first message
+        flush_interval_secs: 3600,
+        channel_capacity: 4096,
     }
 }
 
@@ -46,22 +44,16 @@ async fn syslog_message_appears_as_parquet_in_s3() {
         }
     };
 
-    let cfg = minio_config(&endpoint);
+    let cfg = minio_syslog_config(&endpoint);
     let sink = Arc::new(
-        S3Sink::from_config(&cfg)
+        S3Sink::from_connection(&cfg.connection)
             .await
-            .expect("S3Sink::from_config"),
+            .expect("S3Sink::from_connection"),
     );
 
-    let writer_cfg = SyslogS3WriterConfig {
-        max_buffer_rows: 1, // flush immediately on first message
-        flush_interval: std::time::Duration::from_secs(3600),
-        key_prefix: "syslog-test/".to_string(),
-    };
-
-    // `start` now returns (handler, writer_join_handle) for graceful-shutdown support;
+    // `syslog_start` returns (handler, writer_join_handle) for graceful-shutdown support;
     // the test only needs the handler and lets the writer task run in the background.
-    let (handler, _writer_task) = SyslogS3Handler::start(writer_cfg, sink.clone());
+    let (handler, _writer_task) = syslog_start(&cfg, sink.clone());
 
     let msg = SyslogMessage {
         priority: 134,
@@ -159,8 +151,9 @@ async fn syslog_message_appears_as_parquet_in_s3() {
     assert_eq!(hostname.value(0), "integrationhost");
 }
 
-// Verify the constant is usable in tests
+// Verify the handler type alias is usable
 #[test]
-fn syslog_s3_channel_capacity_is_reasonable() {
-    const { assert!(SYSLOG_S3_CHANNEL_CAPACITY >= 1024) }
+fn syslog_s3_handler_type_alias_is_accessible() {
+    // This test just verifies the type alias compiles — it requires no runtime.
+    let _: fn() -> Option<SyslogS3Handler> = || None;
 }
