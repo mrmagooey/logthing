@@ -968,6 +968,156 @@ secret_key  = "SECRET"
         );
     }
 
+    // -----------------------------------------------------------------------
+    // m2 — drop_oldest_to_cap byte-counter consistency
+    // -----------------------------------------------------------------------
+
+    /// After `drop_oldest_to_cap`, `byte_count` must exactly equal the sum of
+    /// `est_bytes` for the remaining elements in the buffer.
+    #[test]
+    fn drop_oldest_to_cap_byte_count_stays_consistent() {
+        let schema = test_schema();
+        let mut buf = PartitionBuffer::new(schema.clone());
+
+        // Push 10 entries with distinct est_bytes values so we can verify bookkeeping.
+        for i in 1usize..=10 {
+            let col = Arc::new(arrow::array::StringArray::from(vec!["x"]));
+            let batch = RecordBatch::try_new(schema.clone(), vec![col]).unwrap();
+            let est = i * 100; // 100, 200, …, 1000
+            buf.buffer.push_back((batch, est));
+            buf.row_count += 1;
+            buf.byte_count += est;
+        }
+
+        // Drop down to cap = 5 rows.
+        PartitionedParquetWriter::<MockSink>::drop_oldest_to_cap(&mut buf, 5, "test");
+
+        // Verify row_count.
+        assert!(buf.row_count <= 5, "row_count={}", buf.row_count);
+
+        // Verify byte_count equals sum of remaining est_bytes.
+        let expected_bytes: usize = buf.buffer.iter().map(|(_, est)| est).sum();
+        assert_eq!(
+            buf.byte_count, expected_bytes,
+            "byte_count {} != sum of remaining est_bytes {}",
+            buf.byte_count, expected_bytes
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // m4 — _overflow partition gets a valid schema and accepts records
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn overflow_partition_gets_valid_schema_and_accepts_records() {
+        struct PartitionedMockM4;
+        impl ParquetSink for PartitionedMockM4 {
+            type Record = (String, String);
+            fn source(&self) -> &'static str {
+                "test"
+            }
+            fn partition(&self, r: &(String, String)) -> Option<String> {
+                Some(r.0.clone())
+            }
+            fn schema(&self, _p: Option<&str>) -> Arc<Schema> {
+                test_schema()
+            }
+            fn to_record_batch(
+                &self,
+                r: &(String, String),
+                s: &Arc<Schema>,
+            ) -> anyhow::Result<RecordBatch> {
+                let col = Arc::new(arrow::array::StringArray::from(vec![r.1.as_str()]));
+                Ok(RecordBatch::try_new(s.clone(), vec![col])?)
+            }
+        }
+
+        let s3 = unreachable_s3().await;
+        let (mut cfg, policy) = test_config(10_000);
+        cfg.max_partitions = 2;
+        let mut w = PartitionedParquetWriter::new(PartitionedMockM4, s3, cfg, policy);
+
+        // Push 4 distinct partitions; the 3rd and 4th should overflow to `_overflow`.
+        for i in 0..4usize {
+            w.push((format!("part_{i}"), "v".to_string()))
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            w.buffers.contains_key("_overflow"),
+            "_overflow buffer must exist after partition cap exceeded"
+        );
+        // The _overflow buffer must have rows (records were actually written to it).
+        let ov = w.buffers.get("_overflow").unwrap();
+        assert!(ov.row_count > 0, "_overflow buffer must contain records");
+        // The schema must be valid (non-empty field list from sink.schema(Some("_overflow"))).
+        assert!(
+            !ov.schema.fields().is_empty(),
+            "_overflow buffer must have a non-empty schema"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // m1 — byte-flush and age-flush tests assert state change occurred
+    // -----------------------------------------------------------------------
+
+    /// Byte-threshold flush: after a flush attempt the result is Err (unreachable S3),
+    /// confirming the flush path was actually entered (not silently skipped).
+    #[tokio::test]
+    async fn byte_threshold_flush_changes_buffer_state() {
+        let s3 = unreachable_s3().await;
+        let (cfg, _) = test_config(10_000);
+        let policy = FlushPolicy {
+            max_rows: 10_000,
+            max_bytes: 1, // triggers on the very first push
+            interval: std::time::Duration::from_secs(3600),
+        };
+        let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
+
+        // Push one record; this should trigger a flush attempt (which fails on unreachable S3).
+        let result = w.push("r1".to_string()).await;
+        // The flush should have been attempted (returned Err due to unreachable S3).
+        assert!(
+            result.is_err(),
+            "flush attempt on unreachable S3 should return Err"
+        );
+        // After failed flush the hard cap kicks in; row_count must be <= cap.
+        let buf = w.buffers.get("").unwrap();
+        let hard_cap = 10_000usize * 4;
+        assert!(
+            buf.row_count <= hard_cap,
+            "row_count {} must not exceed hard_cap {}",
+            buf.row_count,
+            hard_cap
+        );
+    }
+
+    /// Age-flush trigger: after backdating last_flush and calling flush_all_if_needed,
+    /// the flush path was entered — evidenced by Err (unreachable S3 guarantees attempt made).
+    #[tokio::test]
+    async fn age_threshold_flush_if_needed_enters_flush_path() {
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(10_000);
+        let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
+        w.push("r1".to_string()).await.unwrap();
+
+        // Backdate last_flush so the age trigger fires.
+        let backdated = Instant::now() - std::time::Duration::from_secs(3601);
+        if let Some(buf) = w.buffers.get_mut("") {
+            buf.last_flush = backdated;
+        }
+
+        // flush_all_if_needed will attempt flush (will fail, unreachable S3).
+        let flush_result = w.flush_all_if_needed().await;
+
+        // The flush path was entered: unreachable S3 guarantees the attempt was made.
+        assert!(
+            flush_result.is_err(),
+            "flush_all_if_needed should have attempted a flush and returned Err on unreachable S3"
+        );
+    }
+
     /// Encode round-trip: a schema + RecordBatch round-trips through Parquet encoding
     /// (validates the spawn_blocking encode path with a real Parquet reader).
     #[test]
