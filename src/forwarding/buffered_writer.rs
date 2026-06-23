@@ -64,6 +64,25 @@ pub struct FlushPolicy {
 // BufferedWriterConfig
 // ---------------------------------------------------------------------------
 
+fn default_max_buffer_rows() -> usize {
+    100_000
+}
+
+fn default_flush_threshold_bytes() -> usize {
+    // 128 MiB — a reasonable Parquet file size before flushing.
+    128 * 1024 * 1024
+}
+
+fn default_flush_interval_secs() -> u64 {
+    // 15 minutes.
+    900
+}
+
+fn default_channel_capacity() -> usize {
+    // Large enough to absorb bursts without dropping at the channel layer.
+    8_192
+}
+
 /// Shared config for all buffered-Parquet writers. TOML backward-compatible:
 /// each source's existing TOML keys deserialize into this struct.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -73,19 +92,24 @@ pub struct BufferedWriterConfig {
     /// S3 key prefix, slash-free (e.g. `"syslog"`, `"ipfix"`, `"zeek"`, `"wef"`).
     #[serde(default)]
     pub prefix: String,
-    /// Flush when buffered row count per partition reaches this (default: source-specific).
-    #[serde(default)]
+    /// Flush when buffered row count per partition reaches this.
+    /// Absent TOML key → 100_000 rows.
+    #[serde(default = "default_max_buffer_rows")]
     pub max_buffer_rows: usize,
-    /// Flush when estimated bytes per partition reaches this (default: source-specific).
-    #[serde(default)]
+    /// Flush when estimated bytes per partition reaches this.
+    /// Absent TOML key → 128 MiB.
+    #[serde(default = "default_flush_threshold_bytes")]
     pub flush_threshold_bytes: usize,
-    /// Flush after this many seconds regardless (default: 900).
-    #[serde(default)]
+    /// Flush after this many seconds regardless.
+    /// Absent TOML key → 900 s (15 min).
+    #[serde(default = "default_flush_interval_secs")]
     pub flush_interval_secs: u64,
-    /// Bounded channel capacity (number of records; default: source-specific).
-    #[serde(default)]
+    /// Bounded channel capacity (number of records).
+    /// Absent TOML key → 8 192 records.
+    #[serde(default = "default_channel_capacity")]
     pub channel_capacity: usize,
     /// Maximum number of distinct partition buffers; overflow → fixed `"_overflow"` partition.
+    /// 0 means "unlimited" — this is intentional and safe; no hard cap on partitions.
     #[serde(default)]
     pub max_partitions: usize,
 }
@@ -246,7 +270,11 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             let source = self.sink.source();
             if let Err(e) = self.flush_partition(&effective_key).await {
                 // Flush failed — enforce hard cap.
-                if let Some(b) = self.buffers.get_mut(&effective_key) {
+                // Defense-in-depth: cap == 0 means "no hard cap"; skip drop so a zero can never
+                // drain the entire buffer on S3 failure.
+                if cap > 0
+                    && let Some(b) = self.buffers.get_mut(&effective_key)
+                {
                     Self::drop_oldest_to_cap(b, cap, source);
                 }
                 return Err(e);
@@ -699,7 +727,8 @@ max_partitions = 128
         // try_send should succeed when channel not full and writer not stalled
         assert!(handle.try_send("hello".to_string()).is_ok());
         drop(handle);
-        tokio::time::timeout(std::time::Duration::from_secs(2), jh)
+        // 5 s — generous enough that a connection-refused S3 attempt always completes.
+        tokio::time::timeout(std::time::Duration::from_secs(5), jh)
             .await
             .expect("join within timeout")
             .expect("task did not panic");
@@ -827,6 +856,62 @@ max_partitions = 128
         }
         assert_eq!(w.buffers.get("a").unwrap().row_count, 3);
         assert_eq!(w.buffers.get("b").unwrap().row_count, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // I1 extra tests — default config and cap-0 guard
+    // -----------------------------------------------------------------------
+
+    /// A `BufferedWriterConfig` deserialized from a minimal TOML (no numeric fields) must
+    /// have a non-zero `max_buffer_rows` thanks to the serde default function.
+    #[test]
+    fn config_defaults_have_nonzero_max_buffer_rows() {
+        let toml = r#"
+endpoint   = "http://minio:9000"
+bucket     = "test"
+region     = "us-east-1"
+access_key = "KEY"
+secret_key  = "SECRET"
+"#;
+        let cfg: BufferedWriterConfig = toml::from_str(toml).expect("deserialize");
+        assert!(
+            cfg.max_buffer_rows > 0,
+            "max_buffer_rows must be non-zero by default, got {}",
+            cfg.max_buffer_rows
+        );
+        assert!(
+            cfg.flush_threshold_bytes > 0,
+            "flush_threshold_bytes must be non-zero by default"
+        );
+        assert!(
+            cfg.flush_interval_secs > 0,
+            "flush_interval_secs must be non-zero by default"
+        );
+        assert!(
+            cfg.channel_capacity > 0,
+            "channel_capacity must be non-zero by default"
+        );
+    }
+
+    /// With a non-zero `max_buffer_rows`, pushing many records against an unreachable S3
+    /// keeps `row_count <= cap` (cap = max_buffer_rows * 4).
+    #[tokio::test]
+    async fn hard_cap_enforced_with_nonzero_max_buffer_rows() {
+        let s3 = unreachable_s3().await;
+        let max_rows = 10usize;
+        let (cfg, policy) = test_config(max_rows);
+        let hard_cap = max_rows.saturating_mul(4);
+        let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
+        for i in 0..(hard_cap * 5) {
+            let _ = w.push(format!("r{i}")).await;
+        }
+        let buf = w.buffers.get("").unwrap();
+        assert!(
+            buf.row_count <= hard_cap,
+            "row_count {} exceeds hard_cap {}",
+            buf.row_count,
+            hard_cap
+        );
     }
 
     /// Encode round-trip: a schema + RecordBatch round-trips through Parquet encoding
