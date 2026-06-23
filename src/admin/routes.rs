@@ -908,8 +908,7 @@ mod tests {
     /// Since persist_config writes to disk, we point WEF_CONFIG_DIR at a temp dir.
     #[tokio::test]
     async fn patch_config_success_response_redacts_secrets() {
-        use crate::config::{S3ConnectionConfig, TlsConfig};
-        use crate::forwarding::syslog_s3::SyslogS3Config;
+        use crate::config::{S3ConnectionConfig, SyslogS3Config, TlsConfig};
         #[allow(unused_imports)]
         use axum::body::to_bytes;
         use std::env;
