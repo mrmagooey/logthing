@@ -71,17 +71,8 @@ async fn async_main() -> anyhow::Result<()> {
             if let Some(s3_cfg) = config_clone.syslog.s3.as_ref() {
                 match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
                     Ok(sink) => {
-                        let writer_cfg = forwarding::syslog_s3::SyslogS3WriterConfig {
-                            max_buffer_rows: s3_cfg.max_buffer_rows,
-                            flush_interval: Duration::from_secs(s3_cfg.flush_interval_secs),
-                            key_prefix: s3_cfg.prefix.clone(),
-                        };
                         let (handler, writer_handle) =
-                            forwarding::syslog_s3::SyslogS3Handler::start_with_capacity(
-                                writer_cfg,
-                                Arc::new(sink),
-                                s3_cfg.channel_capacity,
-                            );
+                            forwarding::syslog_s3::syslog_start(s3_cfg, Arc::new(sink));
                         writer_handles.push(writer_handle);
                         Arc::new(handler)
                     }
