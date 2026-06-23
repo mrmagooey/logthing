@@ -1263,6 +1263,381 @@ mod tests {
             "401 response must include WWW-Authenticate header"
         );
     }
+
+    // ------------------------------------------------------------------ //
+    // build_tls_config error branches                                     //
+    // ------------------------------------------------------------------ //
+
+    /// `build_tls_config` must fail when `cert_file` is absent.
+    #[test]
+    fn build_tls_config_missing_cert_file_returns_error() {
+        use crate::config::TlsConfig;
+
+        let tls = TlsConfig {
+            enabled: true,
+            port: 5986,
+            cert_file: None,
+            key_file: Some(std::path::PathBuf::from("/tmp/dummy.key")),
+            ca_file: None,
+            require_client_cert: false,
+        };
+
+        let result = build_tls_config(&tls);
+        assert!(result.is_err(), "expected Err when cert_file is absent");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("cert_file"),
+            "error must mention cert_file, got: {msg}"
+        );
+    }
+
+    /// `build_tls_config` must fail when `key_file` is absent.
+    #[test]
+    fn build_tls_config_missing_key_file_returns_error() {
+        use crate::config::TlsConfig;
+
+        let tls = TlsConfig {
+            enabled: true,
+            port: 5986,
+            cert_file: Some(std::path::PathBuf::from("/tmp/dummy.crt")),
+            key_file: None,
+            ca_file: None,
+            require_client_cert: false,
+        };
+
+        let result = build_tls_config(&tls);
+        assert!(result.is_err(), "expected Err when key_file is absent");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("key_file"),
+            "error must mention key_file, got: {msg}"
+        );
+    }
+
+    /// `build_tls_config` (require_client_cert=false) must fail with an IO error
+    /// when the cert_file path does not exist on disk.
+    #[test]
+    fn build_tls_config_nonexistent_cert_path_returns_io_error() {
+        use crate::config::TlsConfig;
+
+        let tls = TlsConfig {
+            enabled: true,
+            port: 5986,
+            cert_file: Some(std::path::PathBuf::from(
+                "/nonexistent/path/that/does/not/exist.crt",
+            )),
+            key_file: Some(std::path::PathBuf::from(
+                "/nonexistent/path/that/does/not/exist.key",
+            )),
+            ca_file: None,
+            require_client_cert: false,
+        };
+
+        let result = build_tls_config(&tls);
+        assert!(
+            result.is_err(),
+            "expected Err when cert_file path does not exist"
+        );
+    }
+
+    /// `build_tls_config` with `require_client_cert=true` must fail with an IO
+    /// error when the `ca_file` path does not exist on disk (passes the
+    /// `ca_file` presence check, then fails on `File::open`).
+    #[test]
+    fn build_tls_config_mtls_nonexistent_ca_file_returns_io_error() {
+        use crate::config::TlsConfig;
+
+        let tls = TlsConfig {
+            enabled: true,
+            port: 5986,
+            cert_file: Some(std::path::PathBuf::from("/tmp/dummy.crt")),
+            key_file: Some(std::path::PathBuf::from("/tmp/dummy.key")),
+            ca_file: Some(std::path::PathBuf::from("/nonexistent/path/ca.crt")),
+            require_client_cert: true,
+        };
+
+        let result = build_tls_config(&tls);
+        assert!(
+            result.is_err(),
+            "expected Err when ca_file path does not exist"
+        );
+    }
+
+    // ------------------------------------------------------------------ //
+    // WEF handler: zero-event events payload                              //
+    // ------------------------------------------------------------------ //
+
+    /// An `<Events>` payload with no `<Event>` children must be accepted (200)
+    /// and must not crash or record any throughput entries.
+    #[tokio::test]
+    async fn handle_wef_request_empty_events_returns_200() {
+        let state = default_state().await;
+        // Body contains <Events> (triggering the events branch in the parser)
+        // but has no <Event> children — results in zero events.
+        let body = Bytes::from(
+            r#"<Envelope>
+  <Body>
+    <Events>
+    </Events>
+  </Body>
+</Envelope>"#,
+        );
+        let addr: SocketAddr = "10.0.0.5:5985".parse().unwrap();
+        let headers = HeaderMap::new();
+
+        let response = handle_wef_request(State(state.clone()), ConnectInfo(addr), headers, body)
+            .await
+            .expect("zero-event events payload should be accepted");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "zero-event events payload must return 200"
+        );
+
+        // No events were processed, so throughput must remain empty.
+        let snapshot = state.throughput.snapshot().await;
+        assert!(
+            snapshot.is_empty(),
+            "no throughput entries expected for zero-event batch"
+        );
+    }
+
+    // ------------------------------------------------------------------ //
+    // handle_events: subscription body → BAD_REQUEST                     //
+    // ------------------------------------------------------------------ //
+
+    /// `handle_events` must return BAD_REQUEST when the body is a subscription
+    /// (not an events payload), because the handler only accepts events.
+    #[tokio::test]
+    async fn handle_events_with_subscription_body_returns_bad_request() {
+        let state = default_state().await;
+        // A valid subscription body — not an events payload.
+        let body = Bytes::from(
+            r#"<Envelope>
+  <Body>
+    <Subscribe>
+      <SubscriptionId>TestSub</SubscriptionId>
+      <Query>*</Query>
+    </Subscribe>
+  </Body>
+</Envelope>"#,
+        );
+        let addr: SocketAddr = "10.0.0.6:5985".parse().unwrap();
+
+        let result = handle_events(State(state), ConnectInfo(addr), body).await;
+        assert!(
+            result.is_err(),
+            "handle_events must reject a subscription body with BAD_REQUEST"
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            StatusCode::BAD_REQUEST,
+            "status must be 400 for non-events payload"
+        );
+    }
+
+    // ------------------------------------------------------------------ //
+    // handle_events: heartbeat body → BAD_REQUEST                        //
+    // ------------------------------------------------------------------ //
+
+    /// `handle_events` must return BAD_REQUEST when the body is a heartbeat.
+    #[tokio::test]
+    async fn handle_events_with_heartbeat_body_returns_bad_request() {
+        let state = default_state().await;
+        let body = Bytes::from(
+            r#"<Envelope>
+  <Body>
+    <Heartbeat>
+      <SubscriptionId>hb-sub-1</SubscriptionId>
+    </Heartbeat>
+  </Body>
+</Envelope>"#,
+        );
+        let addr: SocketAddr = "10.0.0.7:5985".parse().unwrap();
+
+        let result = handle_events(State(state), ConnectInfo(addr), body).await;
+        assert!(
+            result.is_err(),
+            "handle_events must reject a heartbeat body"
+        );
+        assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    // ------------------------------------------------------------------ //
+    // /stats/throughput via router oneshot                                //
+    // ------------------------------------------------------------------ //
+
+    /// `/stats/throughput` returns 200 and a JSON array via the router stack.
+    #[tokio::test]
+    async fn stats_throughput_endpoint_returns_200_via_router() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let state = default_state().await;
+        // Pre-populate one entry so the response body is non-trivial to validate.
+        state
+            .throughput
+            .record_event("TestProvider:9999".into())
+            .await;
+
+        let ip_whitelist = IpWhitelist::empty();
+        let router = Router::new()
+            .route("/stats/throughput", get(handle_throughput_stats))
+            .layer(axum::Extension(ip_whitelist))
+            .with_state(state);
+
+        let request = HttpRequest::builder()
+            .method("GET")
+            .uri("/stats/throughput")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "/stats/throughput must return 200"
+        );
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("/stats/throughput must return valid JSON");
+        assert!(
+            parsed.is_array(),
+            "/stats/throughput body must be a JSON array"
+        );
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "expected one entry after recording one event");
+        assert_eq!(arr[0]["event_type"], "TestProvider:9999");
+    }
+
+    // ------------------------------------------------------------------ //
+    // handle_subscription: check XML response contains subscription id   //
+    // ------------------------------------------------------------------ //
+
+    /// `handle_subscription` must return 200 with a SOAP XML body that
+    /// contains the generated `sub_` prefixed subscription id.
+    #[tokio::test]
+    async fn handle_subscription_response_contains_sub_prefix() {
+        use axum::body::to_bytes;
+
+        let state = default_state().await;
+        let body = Bytes::from("<Envelope><Body></Body></Envelope>");
+        let addr: SocketAddr = "10.0.1.1:5985".parse().unwrap();
+
+        let response = handle_subscription(State(state), ConnectInfo(addr), body)
+            .await
+            .expect("handle_subscription must succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Check Content-Type header.
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("application/soap+xml"),
+            "Content-Type must be application/soap+xml, got: {ct}"
+        );
+
+        // Check the body contains a subscription id with the `sub_` prefix.
+        let body_bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            body_str.contains("sub_"),
+            "subscription response body must contain generated sub_ id, got: {body_str}"
+        );
+    }
+
+    // ------------------------------------------------------------------ //
+    // handle_wef_request: subscription response Content-Type             //
+    // ------------------------------------------------------------------ //
+
+    /// The subscription branch of `handle_wef_request` must set
+    /// `Content-Type: application/soap+xml`.
+    #[tokio::test]
+    async fn handle_wef_request_subscription_sets_content_type() {
+        use axum::body::to_bytes;
+
+        let state = default_state().await;
+        let body = Bytes::from(
+            r#"<Envelope>
+  <Body>
+    <Subscribe>
+      <SubscriptionId>ct-test-sub</SubscriptionId>
+      <Query>*</Query>
+    </Subscribe>
+  </Body>
+</Envelope>"#,
+        );
+        let addr: SocketAddr = "10.0.1.2:5985".parse().unwrap();
+        let headers = HeaderMap::new();
+
+        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
+            .await
+            .expect("subscription must be handled");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("application/soap+xml"),
+            "subscription response must have Content-Type application/soap+xml, got: {ct}"
+        );
+
+        // Body must include the subscription id (escaping check).
+        let body_bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            body_str.contains("ct-test-sub"),
+            "subscription body must echo the subscription id"
+        );
+    }
+
+    // ------------------------------------------------------------------ //
+    // handle_wef_request: heartbeat Content-Type                         //
+    // ------------------------------------------------------------------ //
+
+    /// The heartbeat branch of `handle_wef_request` must set
+    /// `Content-Type: application/soap+xml`.
+    #[tokio::test]
+    async fn handle_wef_request_heartbeat_sets_content_type() {
+        let state = default_state().await;
+        let body = Bytes::from(
+            r#"<Envelope>
+  <Body>
+    <Heartbeat>
+      <SubscriptionId>hb-ct-sub</SubscriptionId>
+    </Heartbeat>
+  </Body>
+</Envelope>"#,
+        );
+        let addr: SocketAddr = "10.0.1.3:5985".parse().unwrap();
+        let headers = HeaderMap::new();
+
+        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
+            .await
+            .expect("heartbeat must be handled");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("application/soap+xml"),
+            "heartbeat response must have Content-Type application/soap+xml, got: {ct}"
+        );
+    }
 }
 
 /// Build a `RustlsConfig` from the TLS section of the server config.
