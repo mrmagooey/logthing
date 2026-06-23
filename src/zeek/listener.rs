@@ -330,6 +330,48 @@ mod tests {
         assert_eq!(path, "unknown");
     }
 
+    // -- Shutdown-arm test --
+
+    /// Firing the shutdown signal makes `start_with_shutdown` return cleanly
+    /// within a short timeout (the shutdown arm of the select! is exercised).
+    #[tokio::test]
+    async fn start_with_shutdown_exits_on_signal() {
+        use tokio::sync::watch;
+        use tokio::time::timeout;
+
+        // Bind briefly to get an ephemeral port, then drop so start_with_shutdown
+        // can re-bind the same address.
+        let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tmp.local_addr().unwrap().port();
+        drop(tmp);
+
+        let config = ZeekListenerConfig {
+            tcp_port,
+            bind_address: "127.0.0.1".to_string(),
+        };
+        let handler: Arc<dyn ZeekHandler> = Arc::new(DefaultZeekHandler);
+        let listener = ZeekListener::new(config, handler);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let task = tokio::spawn(async move {
+            listener.start_with_shutdown(shutdown_rx).await.ok();
+        });
+
+        // Give the listener time to bind and enter the select! loop.
+        sleep(Duration::from_millis(50)).await;
+
+        // Send the shutdown signal.
+        shutdown_tx.send(true).unwrap();
+
+        // The task must complete within 2 s.
+        let result = timeout(Duration::from_secs(2), task).await;
+        assert!(
+            result.is_ok(),
+            "start_with_shutdown did not return after shutdown signal within 2 s"
+        );
+    }
+
     // -- Integration: TCP listener receives records --
 
     #[tokio::test]
