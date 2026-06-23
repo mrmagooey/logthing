@@ -257,50 +257,82 @@ async fn patch_config(
     let client_ip = addr.ip().to_string();
     let username = ensure_authorized(&state, auth, &client_ip).await?;
 
-    let updated_config = {
-        let mut cfg = state.config.write().await;
+    // Build candidate config by applying partial fields to a COPY (do NOT touch
+    // shared state yet — we validate first).
+    let candidate = {
+        let cfg = state.config.read().await;
+        let mut candidate = cfg.clone();
 
-        // Apply partial updates
         if let Some(bind_addr) = partial.bind_address {
-            cfg.bind_address = bind_addr;
+            candidate.bind_address = bind_addr;
         }
         if let Some(enabled) = partial.tls_enabled {
-            cfg.tls.enabled = enabled;
+            candidate.tls.enabled = enabled;
         }
         if let Some(port) = partial.tls_port {
-            cfg.tls.port = port;
+            candidate.tls.port = port;
         }
         if let Some(level) = partial.logging_level {
-            cfg.logging.level = level;
+            candidate.logging.level = level;
         }
         if let Some(enabled) = partial.metrics_enabled {
-            cfg.metrics.enabled = enabled;
+            candidate.metrics.enabled = enabled;
         }
         if let Some(port) = partial.metrics_port {
-            cfg.metrics.port = port;
+            candidate.metrics.port = port;
         }
         if let Some(enabled) = partial.syslog_enabled {
-            cfg.syslog.enabled = enabled;
+            candidate.syslog.enabled = enabled;
         }
         if let Some(port) = partial.syslog_udp_port {
-            cfg.syslog.udp_port = port;
+            candidate.syslog.udp_port = port;
         }
         if let Some(port) = partial.syslog_tcp_port {
-            cfg.syslog.tcp_port = port;
+            candidate.syslog.tcp_port = port;
         }
 
-        cfg.clone()
+        candidate
     };
 
-    // Persist configuration
-    if let Err(err) = persist_config(&updated_config).await {
+    // H-7: validate before touching shared state.
+    if let Err(msg) = validate_config_invariants(&candidate) {
+        state
+            .audit_logger
+            .log(
+                "CONFIG_PATCH_REJECTED",
+                &username,
+                &client_ip,
+                Some(&format!("Validation error: {msg}")),
+            )
+            .await;
+        return Err((axum::http::StatusCode::BAD_REQUEST, msg).into_response());
+    }
+
+    // H-7: persist first, then swap (atomic: on-disk and in-memory stay consistent).
+    if let Err(err) = persist_config(&candidate).await {
         error!("Failed to persist patched config: {}", err);
+        state
+            .audit_logger
+            .log(
+                "CONFIG_PATCH_FAILED",
+                &username,
+                &client_ip,
+                Some(&format!("Persistence error: {}", err)),
+            )
+            .await;
         return Err((
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "Persist failed",
         )
             .into_response());
     }
+
+    // Persist succeeded — now update in-memory state.
+    let updated_config = {
+        let mut cfg = state.config.write().await;
+        *cfg = candidate;
+        cfg.clone()
+    };
 
     state
         .audit_logger
@@ -309,7 +341,8 @@ async fn patch_config(
 
     info!("Configuration partially updated via PATCH by {}", username);
 
-    Ok(Json(updated_config))
+    // H-6: return redacted config — never expose plaintext S3 secrets.
+    Ok(Json(redacted_config(&updated_config)))
 }
 
 /// Get audit log endpoint
@@ -752,5 +785,213 @@ mod tests {
             has_audit_log_read,
             "Should record AUDIT_LOG_READ audit log entry"
         );
+    }
+
+    // ------------------------------------------------------------------ //
+    // R-1: patch_config security regression tests                         //
+    // ------------------------------------------------------------------ //
+
+    /// A PATCH that enables TLS without supplying cert/key files must be rejected
+    /// with HTTP 400 and leave the running config unchanged.
+    ///
+    /// Note: Config::default() already has tls.enabled=true + no cert_file, so
+    /// the candidate config (which inherits those values) always fails validation.
+    /// We explicitly disable TLS first so the initial state is valid, then attempt
+    /// to re-enable it (still no cert_file) and verify rejection.
+    #[tokio::test]
+    async fn patch_config_tls_without_cert_rejected_and_config_unchanged() {
+        use crate::config::TlsConfig;
+
+        let state = test_state().await;
+
+        // Set the shared config to a valid baseline (TLS disabled, valid bind port).
+        {
+            let mut cfg = state.config.write().await;
+            cfg.tls = TlsConfig {
+                enabled: false,
+                ..TlsConfig::default()
+            };
+        }
+
+        // Now attempt to enable TLS via PATCH — without cert/key files this should
+        // fail validate_config_invariants and be rejected with 400.
+        let partial = PartialConfigUpdate {
+            tls_enabled: Some(true),
+            ..PartialConfigUpdate::default()
+        };
+        let json_body = serde_json::to_string(&partial).unwrap();
+
+        let mut request = axum::http::Request::builder()
+            .method(Method::PATCH)
+            .uri("/config")
+            .header("content-type", "application/json")
+            .header(
+                "Authorization",
+                format!("Basic {}", encode_base64("admin:admin")),
+            )
+            .body(Body::from(json_body))
+            .unwrap();
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+        let app = axum::Router::new()
+            .route("/config", axum::routing::patch(patch_config))
+            .with_state(state.clone());
+
+        let response = app.oneshot(request).await.unwrap();
+
+        // Must be rejected — TLS enabled with no cert is invalid.
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "PATCH enabling TLS without cert files must be rejected with 400"
+        );
+
+        // Running config must remain unchanged (tls.enabled still false).
+        let cfg = state.config.read().await;
+        assert!(
+            !cfg.tls.enabled,
+            "Running config must not be mutated after a rejected PATCH"
+        );
+    }
+
+    /// A PATCH that sets bind_address port to 0 must be rejected with HTTP 400.
+    #[tokio::test]
+    async fn patch_config_bind_port_zero_rejected() {
+        use crate::config::TlsConfig;
+
+        let state = test_state().await;
+
+        // Set a valid baseline config (TLS disabled).
+        {
+            let mut cfg = state.config.write().await;
+            cfg.tls = TlsConfig {
+                enabled: false,
+                ..TlsConfig::default()
+            };
+        }
+
+        let partial = PartialConfigUpdate {
+            bind_address: Some("0.0.0.0:0".parse().unwrap()),
+            ..PartialConfigUpdate::default()
+        };
+        let json_body = serde_json::to_string(&partial).unwrap();
+
+        let mut request = axum::http::Request::builder()
+            .method(Method::PATCH)
+            .uri("/config")
+            .header("content-type", "application/json")
+            .header(
+                "Authorization",
+                format!("Basic {}", encode_base64("admin:admin")),
+            )
+            .body(Body::from(json_body))
+            .unwrap();
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+        let app = axum::Router::new()
+            .route("/config", axum::routing::patch(patch_config))
+            .with_state(state.clone());
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "PATCH with bind_address port 0 must be rejected with 400"
+        );
+    }
+
+    /// A successful PATCH response must not contain any real S3 secret values.
+    ///
+    /// We verify that the response body from a successful PATCH uses redacted_config
+    /// (i.e., the route returns `redacted_config(&updated_config)` not the raw config).
+    /// Since persist_config writes to disk, we point WEF_CONFIG_DIR at a temp dir.
+    #[tokio::test]
+    async fn patch_config_success_response_redacts_secrets() {
+        use crate::config::{S3ConnectionConfig, SyslogS3Config, TlsConfig};
+        #[allow(unused_imports)]
+        use axum::body::to_bytes;
+        use std::env;
+
+        // Point WEF_CONFIG_DIR to a temp dir so persist_config can write.
+        let tmp = std::env::temp_dir().join(format!(
+            "logthing_test_patch_redact_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        unsafe { env::set_var("WEF_CONFIG_DIR", &tmp) };
+
+        let state = test_state().await;
+
+        // Set a valid baseline config with a known S3 secret, TLS disabled.
+        let real_secret = "super-secret-key-should-not-appear";
+        {
+            let mut cfg = state.config.write().await;
+            cfg.tls = TlsConfig {
+                enabled: false,
+                ..TlsConfig::default()
+            };
+            cfg.syslog.s3 = Some(SyslogS3Config {
+                connection: S3ConnectionConfig {
+                    endpoint: "https://s3.example.com".to_string(),
+                    bucket: "test-bucket".to_string(),
+                    region: "us-east-1".to_string(),
+                    access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
+                    secret_key: real_secret.to_string(),
+                },
+                prefix: "syslog".to_string(),
+                max_buffer_rows: 1000,
+                flush_interval_secs: 60,
+                channel_capacity: 100,
+            });
+        }
+
+        // Empty PATCH — noop fields. Should hit persist then return redacted config.
+        let partial = PartialConfigUpdate::default();
+        let json_body = serde_json::to_string(&partial).unwrap();
+
+        let mut request = axum::http::Request::builder()
+            .method(Method::PATCH)
+            .uri("/config")
+            .header("content-type", "application/json")
+            .header(
+                "Authorization",
+                format!("Basic {}", encode_base64("admin:admin")),
+            )
+            .body(Body::from(json_body))
+            .unwrap();
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+        let app = axum::Router::new()
+            .route("/config", axum::routing::patch(patch_config))
+            .with_state(state);
+
+        let response = app.oneshot(request).await.unwrap();
+
+        // Must not be 400 (valid config must not be rejected).
+        assert_ne!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "An empty PATCH on a valid config must not be rejected as invalid"
+        );
+
+        if response.status() == StatusCode::OK {
+            // On success, verify the secret is not in the response body.
+            let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body_str = String::from_utf8_lossy(&body_bytes);
+            assert!(
+                !body_str.contains(real_secret),
+                "PATCH success response must not contain plaintext S3 secret; got: {body_str}"
+            );
+        }
+
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&tmp);
+        unsafe { env::remove_var("WEF_CONFIG_DIR") };
     }
 }
