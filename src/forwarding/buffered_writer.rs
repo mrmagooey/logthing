@@ -118,13 +118,13 @@ pub struct BufferedWriterConfig {
 // PartitionBuffer — internal per-partition state
 // ---------------------------------------------------------------------------
 
-struct PartitionBuffer {
-    schema: Arc<arrow_schema::Schema>,
-    buffer: VecDeque<(arrow_array::RecordBatch, usize)>, // (batch, est_bytes)
-    row_count: usize,
-    byte_count: usize,
-    last_flush: Instant,
-    last_drop_warn: Option<Instant>,
+pub(crate) struct PartitionBuffer {
+    pub(crate) schema: Arc<arrow_schema::Schema>,
+    pub(crate) buffer: VecDeque<(arrow_array::RecordBatch, usize)>, // (batch, est_bytes)
+    pub(crate) row_count: usize,
+    pub(crate) byte_count: usize,
+    pub(crate) last_flush: Instant,
+    pub(crate) last_drop_warn: Option<Instant>,
 }
 
 impl PartitionBuffer {
@@ -185,7 +185,7 @@ pub struct PartitionedParquetWriter<S: ParquetSink> {
     config: BufferedWriterConfig,
     policy: FlushPolicy,
     /// `""` key for None-partition sources; sanitized-path / `"event_type=<id>"` for multi-partition.
-    buffers: HashMap<String, PartitionBuffer>,
+    pub(crate) buffers: HashMap<String, PartitionBuffer>,
 }
 
 impl<S: ParquetSink> PartitionedParquetWriter<S> {
