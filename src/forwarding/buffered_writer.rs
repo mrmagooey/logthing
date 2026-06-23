@@ -147,6 +147,7 @@ impl PartitionBuffer {
 /// Build the S3 object key for a flush.
 /// Pattern: `{prefix}/[{partition}/]year={Y}/month={MM}/day={DD}/{uuid}.parquet`
 /// The partition segment is omitted when `partition` is `None` (syslog, ipfix).
+/// When `prefix` is empty the prefix segment is omitted entirely (no leading slash).
 pub(crate) fn build_key(
     prefix: &str,
     partition: Option<&str>,
@@ -154,24 +155,17 @@ pub(crate) fn build_key(
 ) -> String {
     use chrono::Datelike as _;
     let id = uuid::Uuid::new_v4();
-    match partition {
-        Some(seg) => format!(
-            "{}/{}/year={}/month={:02}/day={:02}/{}.parquet",
-            prefix,
-            seg,
-            now.year(),
-            now.month(),
-            now.day(),
-            id
-        ),
-        None => format!(
-            "{}/year={}/month={:02}/day={:02}/{}.parquet",
-            prefix,
-            now.year(),
-            now.month(),
-            now.day(),
-            id
-        ),
+    let date = format!(
+        "year={}/month={:02}/day={:02}",
+        now.year(),
+        now.month(),
+        now.day()
+    );
+    match (prefix.is_empty(), partition) {
+        (true, Some(seg)) => format!("{}/{}/{}.parquet", seg, date, id),
+        (true, None) => format!("{}/{}.parquet", date, id),
+        (false, Some(seg)) => format!("{}/{}/{}/{}.parquet", prefix, seg, date, id),
+        (false, None) => format!("{}/{}/{}.parquet", prefix, date, id),
     }
 }
 
@@ -570,6 +564,30 @@ max_partitions = 128
             key.starts_with("wef/event_type=4624/year=2026/"),
             "got: {key}"
         );
+    }
+
+    #[test]
+    fn build_key_empty_prefix_with_partition() {
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 21, 0, 0, 0).unwrap();
+
+        // empty prefix + partition → no leading slash, no double-slash
+        let key = build_key("", Some("event_type=4624"), now);
+        assert!(
+            key.starts_with("event_type=4624/year=2026/"),
+            "empty prefix with partition must not have leading slash: {key}"
+        );
+        assert!(!key.starts_with('/'), "must not start with /: {key}");
+        assert!(!key.contains("//"), "must not have double-slash: {key}");
+        assert!(key.ends_with(".parquet"), "must end with .parquet: {key}");
+
+        // empty prefix + no partition → no leading slash
+        let key2 = build_key("", None, now);
+        assert!(
+            key2.starts_with("year=2026/"),
+            "empty prefix without partition must start with year=: {key2}"
+        );
+        assert!(!key2.starts_with('/'), "must not start with /: {key2}");
     }
 
     // -----------------------------------------------------------------------

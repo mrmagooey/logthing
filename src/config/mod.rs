@@ -59,6 +59,9 @@ pub struct Config {
 
     #[serde(default)]
     pub zeek: ZeekConfig,
+
+    #[serde(default)]
+    pub wef: WefConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -297,6 +300,51 @@ fn default_zeek_max_buffer_rows() -> usize {
     100_000
 }
 
+/// Per-source S3 persistence config for WEF (Windows Event Forwarding).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WefS3Config {
+    /// Shared S3 connection fields.
+    #[serde(flatten)]
+    pub connection: S3ConnectionConfig,
+    /// S3 key prefix, slash-free. Default: `""` (empty) — preserves the
+    /// `event_type=<id>/year=…` root layout from the legacy writer.
+    #[serde(default)]
+    pub prefix: String,
+    /// Flush when estimated buffer bytes exceeds this (default: 100 MiB).
+    #[serde(default = "default_wef_flush_bytes")]
+    pub flush_threshold_bytes: usize,
+    /// Flush after this many seconds regardless (default: 900).
+    #[serde(default = "default_wef_flush_secs")]
+    pub flush_interval_secs: u64,
+    /// Bounded channel capacity (default: 10_000).
+    #[serde(default = "default_wef_channel_capacity")]
+    pub channel_capacity: usize,
+    /// Maximum buffered rows before hard cap (default: 100_000).
+    #[serde(default = "default_wef_max_buffer_rows")]
+    pub max_buffer_rows: usize,
+}
+
+fn default_wef_flush_bytes() -> usize {
+    100 * 1024 * 1024
+}
+fn default_wef_flush_secs() -> u64 {
+    900
+}
+fn default_wef_channel_capacity() -> usize {
+    10_000
+}
+fn default_wef_max_buffer_rows() -> usize {
+    100_000
+}
+
+/// Top-level [wef] config section (WEF ingest + optional S3 persistence).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct WefConfig {
+    /// Optional S3 persistence. Absent from TOML → `None` → no S3 persistence.
+    #[serde(default)]
+    pub s3: Option<WefS3Config>,
+}
+
 impl Default for SyslogConfig {
     fn default() -> Self {
         Self {
@@ -321,6 +369,7 @@ impl Default for Config {
             syslog: SyslogConfig::default(),
             ipfix: IpfixConfig::default(),
             zeek: ZeekConfig::default(),
+            wef: WefConfig::default(),
         }
     }
 }
@@ -637,6 +686,35 @@ secret_key = "SECRET"
         assert!(!cfg.zeek.enabled, "zeek disabled by default");
         assert_eq!(cfg.zeek.tcp_port, 47760);
         assert_eq!(cfg.zeek.bind_address, "0.0.0.0");
+    }
+
+    #[test]
+    fn wef_s3_absent_gives_none() {
+        let cfg = Config::default();
+        assert!(
+            cfg.wef.s3.is_none(),
+            "absent [wef.s3] must deserialize to None"
+        );
+    }
+
+    #[test]
+    fn wef_s3_flat_toml_deserializes_correctly() {
+        let toml_str = r#"
+[wef.s3]
+endpoint   = "http://minio:9000"
+bucket     = "wef-events"
+region     = "us-east-1"
+access_key = "KEY"
+secret_key = "SECRET"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse config");
+        let s3 = cfg.wef.s3.expect("s3 present");
+        assert_eq!(s3.connection.bucket, "wef-events");
+        assert_eq!(s3.prefix, ""); // default: empty prefix preserves old layout
+        assert_eq!(s3.flush_threshold_bytes, 100 * 1024 * 1024);
+        assert_eq!(s3.flush_interval_secs, 900);
+        assert_eq!(s3.channel_capacity, 10_000);
+        assert_eq!(s3.max_buffer_rows, 100_000);
     }
 
     #[test]
