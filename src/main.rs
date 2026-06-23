@@ -221,7 +221,11 @@ async fn async_main() -> anyhow::Result<()> {
     // -----------------------------------------------------------------------
     // Create axum server
     // -----------------------------------------------------------------------
-    let server = Server::new(config, shared_config, throughput).await?;
+    let mut server = Server::new(config, shared_config, throughput).await?;
+
+    // Gap-b: Extract the WEF→S3 Parquet worker handle BEFORE the server is
+    // consumed by run_tls, so we can await it during the shutdown sequence.
+    let wef_worker_handle = server.take_wef_worker_handle();
 
     // -----------------------------------------------------------------------
     // Shutdown signal task
@@ -237,7 +241,7 @@ async fn async_main() -> anyhow::Result<()> {
     // Run server until shutdown
     // -----------------------------------------------------------------------
     tokio::select! {
-        result = server.run_tls() => {
+        result = server.run_tls(shutdown_rx.clone()) => {
             if let Err(e) = result {
                 error!("Server error: {}", e);
                 std::process::exit(1);
@@ -272,7 +276,10 @@ async fn async_main() -> anyhow::Result<()> {
     // Graceful shutdown sequence
     // -----------------------------------------------------------------------
 
-    // 1. Signal all listeners to stop accepting.
+    // 1. Signal all listeners to stop accepting, and signal the axum server to
+    //    begin graceful shutdown (it will stop accepting new connections and
+    //    drain in-flight requests, then drop AppState which closes the WEF
+    //    worker's channel).
     if let Err(e) = shutdown_tx.send(true) {
         warn!("Failed to send shutdown signal: {e}");
     }
@@ -281,12 +288,22 @@ async fn async_main() -> anyhow::Result<()> {
     //    After listeners exit (or are aborted), the Arc refcount drops to zero,
     //    the Sender inside each S3 handler is dropped, the channel closes,
     //    and the writer task flushes then exits.
-    for handle in listener_handles {
+    //
+    //    R-2: Capture abort_handle() before awaiting so that a timed-out
+    //    listener task is truly cancelled (not just detached).
+    let mut listener_abort_handles: Vec<tokio::task::AbortHandle> = Vec::new();
+    for handle in &listener_handles {
+        listener_abort_handles.push(handle.abort_handle());
+    }
+
+    for (handle, abort_handle) in listener_handles.into_iter().zip(listener_abort_handles) {
         match tokio::time::timeout(Duration::from_secs(2), handle).await {
             Ok(_) => {}
             Err(_) => {
-                // Listener didn't exit cleanly within 2s — abort it.
-                // (The handle was consumed; we already moved it in.)
+                // Listener didn't exit cleanly within 2s — abort it so the task
+                // is truly cancelled (dropped), releasing the Arc<dyn Handler>
+                // which closes the writer's channel.
+                abort_handle.abort();
             }
         }
     }
@@ -312,6 +329,30 @@ async fn async_main() -> anyhow::Result<()> {
             _ = &mut flush_deadline => {
                 warn!("S3 writer flush timed out after 10s; some data may not have been written");
                 break;
+            }
+        }
+    }
+
+    // 4. Gap-b: Await the WEF→S3 Parquet worker handle (within the same 10s
+    //    deadline, which is shared via the pinned flush_deadline above).
+    //    The worker exits when the axum server drops AppState (closing the channel)
+    //    and its None arm calls shutdown_flush.
+    if let Some(wef_handle) = wef_worker_handle {
+        tokio::select! {
+            result = wef_handle => {
+                match result {
+                    Ok(()) => {
+                        info!("Parquet S3 WEF worker flushed and exited cleanly");
+                    }
+                    Err(e) => {
+                        warn!("Parquet S3 WEF worker error during shutdown: {e}");
+                    }
+                }
+            }
+            _ = &mut flush_deadline => {
+                warn!(
+                    "Parquet S3 WEF worker flush timed out; some WEF data may not have been written"
+                );
             }
         }
     }

@@ -49,6 +49,9 @@ pub struct AppState {
 pub struct Server {
     config: Config,
     state: Arc<AppState>,
+    /// JoinHandle for the WEF→S3 Parquet worker task, if one was started.
+    /// Awaited during graceful shutdown so buffered data is flushed before exit.
+    wef_worker_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Server {
@@ -152,7 +155,7 @@ impl Server {
         };
 
         // Initialize Parquet S3 forwarder with channel-based architecture
-        let parquet_s3_sender = if let Ok(Some(mut s3_forwarder)) =
+        let (parquet_s3_sender, wef_worker_handle) = if let Ok(Some(mut s3_forwarder)) =
             crate::forwarding::parquet_s3::create_parquet_s3_forwarder(
                 &config.forwarding.destinations,
             )
@@ -164,16 +167,31 @@ impl Server {
             let (sender, mut receiver) = mpsc::channel::<Arc<WindowsEvent>>(10000);
             let flush_interval_secs = s3_forwarder.flush_interval_secs();
 
-            // Spawn worker task to receive events and forward to Parquet S3
-            tokio::spawn(async move {
+            // Spawn worker task to receive events and forward to Parquet S3.
+            // Gap-a: capture the JoinHandle so main.rs can await it at shutdown.
+            // Gap-a: add a None arm — when the channel closes (sender dropped),
+            //         flush all buffered data and break instead of spinning.
+            let handle = tokio::spawn(async move {
                 info!("Parquet S3 worker task started");
 
                 loop {
                     tokio::select! {
-                        // Receive event from channel
-                        Some(event) = receiver.recv() => {
-                            if let Err(e) = s3_forwarder.forward((*event).clone()).await {
-                                error!("Failed to forward to Parquet S3: {}", e);
+                        // Receive event from channel (irrefutable match).
+                        maybe_event = receiver.recv() => {
+                            match maybe_event {
+                                Some(event) => {
+                                    if let Err(e) = s3_forwarder.forward((*event).clone()).await {
+                                        error!("Failed to forward to Parquet S3: {}", e);
+                                    }
+                                }
+                                // Channel closed (all senders dropped) — flush and exit.
+                                None => {
+                                    info!("Parquet S3 channel closed; flushing buffered data");
+                                    if let Err(e) = s3_forwarder.shutdown_flush().await {
+                                        error!("Parquet S3 shutdown flush error: {}", e);
+                                    }
+                                    break;
+                                }
                             }
                         }
                         // Periodic flush
@@ -184,11 +202,13 @@ impl Server {
                         }
                     }
                 }
+
+                info!("Parquet S3 worker task exited");
             });
 
-            Some(sender)
+            (Some(sender), Some(handle))
         } else {
-            None
+            (None, None)
         };
 
         let state = Arc::new(AppState {
@@ -200,35 +220,31 @@ impl Server {
             parquet_s3_sender,
         });
 
-        Ok(Self { config, state })
+        Ok(Self {
+            config,
+            state,
+            wef_worker_handle,
+        })
+    }
+
+    /// Take the WEF→S3 Parquet worker's JoinHandle for awaiting at shutdown.
+    ///
+    /// Must be called BEFORE `run`/`run_tls`; after the server consumes `self`
+    /// the handle is no longer accessible.
+    pub fn take_wef_worker_handle(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.wef_worker_handle.take()
     }
 
     /// Run the WEF server without TLS (HTTP only).
     ///
     /// Starts the HTTP server on the configured bind address and port.
-    /// Also starts the metrics server if enabled.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use logthing::config::Config;
-    /// use logthing::server::Server;
-    /// use logthing::stats::ThroughputStats;
-    /// use std::sync::Arc;
-    /// use tokio::sync::RwLock;
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> anyhow::Result<()> {
-    ///     let config = Config::load()?;
-    ///     let shared_config = Arc::new(RwLock::new(config.clone()));
-    ///     let throughput = Arc::new(ThroughputStats::new());
-    ///
-    ///     let server = Server::new(config, shared_config, throughput).await?;
-    ///     server.run().await?;
-    ///     Ok(())
-    /// }
-    /// ```
-    pub async fn run(self) -> anyhow::Result<()> {
+    /// Also starts the metrics server if enabled.  Exits when `shutdown_rx`
+    /// fires (graceful shutdown: drains in-flight requests, then drops AppState
+    /// which closes the WEF worker's channel).
+    pub async fn run(
+        self,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
         let ip_whitelist = if self.config.security.allowed_ips.is_empty() {
             IpWhitelist::empty()
         } else {
@@ -250,10 +266,18 @@ impl Server {
             tokio::spawn(start_metrics_server(metrics_addr));
         }
 
+        // Gap-b: wire graceful shutdown so the axum server stops on SIGTERM,
+        // which drops AppState → drops parquet_s3_sender → closes the WEF worker
+        // channel → the worker's None arm flushes and exits.
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(async move {
+            // Wait until the shutdown watch fires (value becomes true).
+            let _ = shutdown_rx.wait_for(|v| *v).await;
+            info!("WEF HTTP server received shutdown signal");
+        })
         .await?;
 
         Ok(())
@@ -298,33 +322,14 @@ impl Server {
     /// Run the WEF server with TLS enabled.
     ///
     /// If TLS is not enabled in the configuration, falls back to running without TLS.
-    /// Otherwise, starts an HTTPS server on the configured TLS port.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use logthing::config::Config;
-    /// use logthing::server::Server;
-    /// use logthing::stats::ThroughputStats;
-    /// use std::sync::Arc;
-    /// use tokio::sync::RwLock;
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> anyhow::Result<()> {
-    ///     let config = Config::load()?;
-    ///     let shared_config = Arc::new(RwLock::new(config.clone()));
-    ///     let throughput = Arc::new(ThroughputStats::new());
-    ///
-    ///     let server = Server::new(config, shared_config, throughput).await?;
-    ///
-    ///     // Will use TLS if enabled in config, otherwise HTTP
-    ///     server.run_tls().await?;
-    ///     Ok(())
-    /// }
-    /// ```
-    pub async fn run_tls(self) -> anyhow::Result<()> {
+    /// Otherwise, starts an HTTPS server on the configured TLS port.  Exits on
+    /// graceful shutdown when `shutdown_rx` fires.
+    pub async fn run_tls(
+        self,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
         if !self.config.tls.enabled {
-            return self.run().await;
+            return self.run(shutdown_rx).await;
         }
 
         let ip_whitelist = if self.config.security.allowed_ips.is_empty() {
@@ -340,8 +345,22 @@ impl Server {
 
         info!("Starting WEF server with TLS on https://{}", tls_addr);
 
+        // Gap-b: use axum_server::Handle to trigger graceful shutdown when the
+        // watch fires.  The handle is cloned into a task that waits for the signal
+        // then calls handle.graceful_shutdown(None).  Dropping AppState (which
+        // holds parquet_s3_sender) closes the WEF worker channel → its None arm
+        // flushes before exit.
+        let axum_handle = axum_server::Handle::new();
+        let shutdown_handle = axum_handle.clone();
+        tokio::spawn(async move {
+            let _ = shutdown_rx.wait_for(|v| *v).await;
+            info!("WEF TLS server received shutdown signal; initiating graceful shutdown");
+            shutdown_handle.graceful_shutdown(None);
+        });
+
         // Use axum-server for proper TLS handling
         axum_server::bind_rustls(tls_addr, tls_config)
+            .handle(axum_handle)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
 
