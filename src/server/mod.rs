@@ -25,8 +25,7 @@ use axum::{extract::Request, middleware::Next};
 use futures::stream::{self, StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc};
-use tokio::time::{Duration, sleep};
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 /// Maximum allowed body size for WEF/syslog ingest requests (64 MiB).
@@ -43,7 +42,11 @@ pub struct AppState {
     pub forwarder: Forwarder,
     pub parser: WefParser,
     pub event_parser: Option<GenericEventParser>,
-    pub parquet_s3_sender: Option<tokio::sync::mpsc::Sender<Arc<WindowsEvent>>>,
+    pub parquet_s3_sender: Option<
+        crate::forwarding::buffered_writer::ParquetWriterHandle<
+            crate::forwarding::parquet_s3::WefSink,
+        >,
+    >,
 }
 
 pub struct Server {
@@ -154,59 +157,26 @@ impl Server {
             None
         };
 
-        // Initialize Parquet S3 forwarder with channel-based architecture
-        let (parquet_s3_sender, wef_worker_handle) = if let Ok(Some(mut s3_forwarder)) =
-            crate::forwarding::parquet_s3::create_parquet_s3_forwarder(
-                &config.forwarding.destinations,
-            )
-            .await
+        // Initialize WEF→S3 Parquet forwarder via generic buffered writer
+        let (parquet_s3_sender, wef_worker_handle) = if let Some(wef_s3_cfg) =
+            config.wef.s3.as_ref()
         {
-            info!("Initialized Parquet S3 forwarder with channel-based architecture");
-
-            // Create channel for event forwarding (buffer size: 10000 events)
-            let (sender, mut receiver) = mpsc::channel::<Arc<WindowsEvent>>(10000);
-            let flush_interval_secs = s3_forwarder.flush_interval_secs();
-
-            // Spawn worker task to receive events and forward to Parquet S3.
-            // Gap-a: capture the JoinHandle so main.rs can await it at shutdown.
-            // Gap-a: add a None arm — when the channel closes (sender dropped),
-            //         flush all buffered data and break instead of spinning.
-            let handle = tokio::spawn(async move {
-                info!("Parquet S3 worker task started");
-
-                loop {
-                    tokio::select! {
-                        // Receive event from channel (irrefutable match).
-                        maybe_event = receiver.recv() => {
-                            match maybe_event {
-                                Some(event) => {
-                                    if let Err(e) = s3_forwarder.forward((*event).clone()).await {
-                                        error!("Failed to forward to Parquet S3: {}", e);
-                                    }
-                                }
-                                // Channel closed (all senders dropped) — flush and exit.
-                                None => {
-                                    info!("Parquet S3 channel closed; flushing buffered data");
-                                    if let Err(e) = s3_forwarder.shutdown_flush().await {
-                                        error!("Parquet S3 shutdown flush error: {}", e);
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        // Periodic flush
-                        _ = sleep(Duration::from_secs(flush_interval_secs)) => {
-                            if let Err(e) = s3_forwarder.flush_all().await {
-                                error!("Failed to run scheduled Parquet S3 flush: {}", e);
-                            }
-                        }
-                    }
+            match crate::forwarding::s3_sink::S3Sink::from_connection(&wef_s3_cfg.connection).await
+            {
+                Ok(sink) => {
+                    info!("Initialized WEF Parquet S3 forwarder (generic buffered writer)");
+                    let (handle, join_handle) =
+                        crate::forwarding::parquet_s3::wef_start(wef_s3_cfg, Arc::new(sink));
+                    (Some(handle), Some(join_handle))
                 }
-
-                info!("Parquet S3 worker task exited");
-            });
-
-            (Some(sender), Some(handle))
+                Err(e) => {
+                    error!(
+                        "Failed to create S3Sink for WEF persistence; \
+                             WEF events will not be persisted to S3: {e}"
+                    );
+                    (None, None)
+                }
+            }
         } else {
             (None, None)
         };
@@ -579,12 +549,11 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
         && let Err(e) = sender.try_send(event.clone())
     {
         match e {
-            mpsc::error::TrySendError::Full(_) => {
-                metrics::counter!("wef_events_dropped").increment(1);
-                warn!("Parquet S3 channel full, dropping event");
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                warn!("WEF Parquet S3 channel full, dropping event");
             }
-            mpsc::error::TrySendError::Closed(_) => {
-                error!("Parquet S3 channel closed");
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                error!("WEF Parquet S3 channel closed");
             }
         }
     }

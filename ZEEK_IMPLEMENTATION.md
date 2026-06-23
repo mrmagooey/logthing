@@ -178,14 +178,14 @@ The full JSON object is stored verbatim in `payload`. `log_path` holds the actua
 
 ### 5.1 ZeekS3Handler
 
-`ZeekS3Handler` implements `ZeekHandler`. It forwards each `ZeekRecord` to a background `ZeekS3Writer` task via a bounded `mpsc` channel. When the channel is full, `try_send` fails, `zeek_s3_dropped` is incremented, and the record is discarded.
+`ZeekS3Handler` implements `ZeekHandler`. It forwards each `ZeekRecord` to the generic `PartitionedParquetWriter` via a bounded `mpsc` channel. When the channel is full, `try_send` fails, `parquet_s3_dropped{source="zeek"}` is incremented, and the record is discarded.
 
 ### 5.2 ZeekS3Writer
 
 `ZeekS3Writer` maintains a `HashMap<String, StreamBuffer>` — one `VecDeque<BufferedBatch>` per sanitised `log_path`. On each `push_record`:
 
 1. `sanitize_log_path` is applied to the record's `log_path`.
-2. If the sanitised path would create a new entry beyond `MAX_ZEEK_STREAMS`, the record is routed to `"unknown"` and `zeek_streams_capped` is incremented.
+2. If the sanitised path would create a new entry beyond `MAX_ZEEK_STREAMS`, the record is routed to `"unknown"` and `parquet_s3_partitions_capped{source="zeek"}` is incremented.
 3. `get_schema_entry` selects the typed or envelope schema.
 4. The row mapper converts the JSON to a one-row `RecordBatch`.
 5. The batch is appended to the stream's buffer.
@@ -193,9 +193,9 @@ The full JSON object is stored verbatim in `payload`. `log_path` holds the actua
 
 A background interval also fires `flush_all_if_needed()` at a fraction of `flush_interval_secs` to catch age-based flushes.
 
-**Flush**: all buffered `RecordBatch`es for the stream are encoded into a single Parquet file (ZSTD level 3) and uploaded via `S3Sink`. On success `zeek_s3_records_written` and `zeek_s3_uploads` are incremented and the buffer is cleared. On error `zeek_s3_upload_errors` is incremented and the buffer is retained.
+**Flush**: all buffered `RecordBatch`es for the stream are encoded into a single Parquet file (ZSTD level 3) and uploaded via `S3Sink`. On success `parquet_s3_records_written{source="zeek"}` and `parquet_s3_uploads{source="zeek"}` are incremented and the buffer is cleared. On error `parquet_s3_upload_errors{source="zeek"}` is incremented and the buffer is retained.
 
-**Hard cap**: if a flush fails and the buffer exceeds `max_buffer_rows * 4`, the oldest batches are dropped and `zeek_s3_buffer_dropped` is incremented.
+**Hard cap**: if a flush fails and the buffer exceeds `max_buffer_rows * 4`, the oldest batches are dropped and `parquet_s3_buffer_dropped{source="zeek"}` is incremented.
 
 ### 5.3 S3 Key Format
 
@@ -268,7 +268,7 @@ max_buffer_rows       = 100000
 | Bounded line reads | `take(ZEEK_MAX_LINE_BYTES + 1)` guard; over-length closes the connection |
 | Stream map cap | `MAX_ZEEK_STREAMS = 256`; excess paths overflow to `"unknown"` |
 | Path sanitisation | lowercase, `[a-z0-9_]`, max 64 chars, empty → `"unknown"` |
-| Channel overflow | `try_send` fails fast; record dropped, `zeek_s3_dropped` incremented |
+| Channel overflow | `try_send` fails fast; record dropped, `parquet_s3_dropped{source="zeek"}` incremented |
 | S3 outage buffer | Buffered batches retained on error; hard cap at `max_buffer_rows * 4` rows |
 | Type mismatch | Mismatched field preserved in `_extra`; typed column set to `null` |
 
@@ -283,12 +283,12 @@ All counters are registered at startup and exposed via the existing Prometheus m
 | `zeek_parse_errors` | Non-UTF-8 or invalid JSON lines skipped |
 | `zeek_missing_path` | Records missing `_path` or with a non-string `_path` |
 | `zeek_oversized_lines` | Lines exceeding `ZEEK_MAX_LINE_BYTES`; triggers connection close |
-| `zeek_s3_records_written` | Rows written on a successful S3 flush |
-| `zeek_s3_uploads` | Successful S3 uploads |
-| `zeek_s3_upload_errors` | Failed S3 uploads |
-| `zeek_s3_dropped` | Records dropped due to full channel |
-| `zeek_s3_buffer_dropped` | Rows dropped by hard-cap enforcement |
-| `zeek_streams_capped` | Records rerouted to `"unknown"` because `MAX_ZEEK_STREAMS` was reached |
+| `parquet_s3_records_written{source="zeek"}` | Rows written on a successful S3 flush |
+| `parquet_s3_uploads{source="zeek"}` | Successful S3 uploads |
+| `parquet_s3_upload_errors{source="zeek"}` | Failed S3 uploads |
+| `parquet_s3_dropped{source="zeek"}` | Records dropped due to full channel |
+| `parquet_s3_buffer_dropped{source="zeek"}` | Rows dropped by hard-cap enforcement |
+| `parquet_s3_partitions_capped{source="zeek"}` | Records rerouted to `"unknown"` because `MAX_ZEEK_STREAMS` was reached |
 
 ## 9. Files
 

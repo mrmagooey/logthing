@@ -21,7 +21,7 @@ source alongside WEF, syslog, and IPFIX.
 | Curated streams | `conn`, `dns`, `http`, `ssl`, `files`, `notice`. |
 | Drift robustness | Each typed schema carries a catch-all `_extra` JSON column; best-effort typed extraction (type mismatch → `_extra`, never panics/drops). |
 | Stream identification | Each JSON record's `_path` field (Zeek/​shipper-provided); absent → `"unknown"` → fallback schema. |
-| S3 layout | Partitioned by stream: `zeek/<log_path>/year=…/month=…/day=…/<uuid>.parquet`. |
+| S3 layout | Partitioned by stream: `zeek/<log_path>/year=…/month=…/day=…/<uuid>.parquet`. Records with a missing/non-string `_path` land at `zeek/unknown/`; partition-cap overflow lands at `zeek/_overflow/`. |
 | Persistence | Per-`log_path` Parquet writers sharing the existing `S3Sink`; gated by optional `[zeek.s3]` config. |
 
 ## Non-goals
@@ -137,8 +137,13 @@ TCP NDJSON line
 - **Malformed JSON line** → `zeek_parse_errors` counter + `warn`; the connection
   continues (one bad line does not drop the stream).
 - **Oversized line** (> cap) → `zeek_oversized_lines` counter + skip.
-- **Missing/`non-string `_path`** → `zeek_missing_path` counter; routed to the
-  fallback schema under `zeek/unknown/`.
+- **Missing/non-string `_path`** → `zeek_missing_path` counter; the listener
+  assigns `log_path = "unknown"`, which after `sanitize_log_path` routes to
+  `zeek/unknown/` (envelope fallback schema).
+- **Sanitisation-to-empty `_path`** (e.g. all non-alphanumeric/underscore chars)
+  → `sanitize_log_path` returns `"unknown"` → `zeek/unknown/`.
+- **Partition-cap overflow** (more than `max_partitions` distinct sanitised paths,
+  default 256) → routed to `zeek/_overflow/` (envelope fallback schema).
 - **Type-mismatched fields** → captured in `_extra` (see mapping rules); never a
   hard error.
 - **S3 upload failure / backpressure** → bounded buffers + drop counters,
@@ -172,9 +177,12 @@ and the writer counters `zeek_s3_records_written`, `zeek_s3_uploads`,
 - **End-to-end:** a `zeek-generator` container streams sample NDJSON (`conn`,
   `dns`, and one unmodeled stream, plus a malformed line) over TCP to the
   running server with `[zeek.s3]` enabled; a verifier confirms Parquet objects
-  under `zeek/conn/`, `zeek/dns/`, and `zeek/unknown/` with the expected
-  schemas. Added to `tests/e2e/simulation-environment/` mirroring the
-  `ipfix-generator` / `ipfix-s3-verifier` services.
+  under `zeek/conn/`, `zeek/dns/`, and `zeek/unknown/` (for the unmodeled
+  stream — its sanitised `_path` is a valid non-empty string, so it lands at
+  its own `zeek/<path>/` prefix, not `zeek/_overflow/`; `_overflow` only
+  applies when the partition cap is exceeded) with the expected schemas. Added
+  to `tests/e2e/simulation-environment/` mirroring the `ipfix-generator` /
+  `ipfix-s3-verifier` services.
 
 ## Files (summary)
 

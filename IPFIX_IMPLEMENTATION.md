@@ -103,7 +103,7 @@ Two implementations ship:
 
 ### 5. S3 Persistence (`src/forwarding/ipfix_s3.rs`)
 
-`IpfixS3Handler` implements `IpfixHandler`. It forwards each batch to a background `IpfixS3Writer` task over a bounded `mpsc` channel (capacity configurable, default: 256). When the channel is full, `try_send` fails, `ipfix_s3_dropped` is incremented, and the batch is discarded.
+`IpfixS3Handler` implements `IpfixHandler`. It forwards each batch to the generic `PartitionedParquetWriter` via a bounded `mpsc` channel (capacity configurable, default: 256). When the channel is full, `try_send` fails, `parquet_s3_dropped{source="ipfix"}` is incremented, and the batch is discarded.
 
 **Buffering and flush**
 
@@ -112,7 +112,7 @@ Two implementations ship:
 - The buffer's serialized byte estimate exceeds `flush_threshold_bytes` (default: 100 MiB)
 - The age interval timer fires (`flush_interval_secs`, default: 900 seconds)
 
-A flush encodes all buffered batches into a single Parquet file (ZSTD compression level 3) and uploads it via `S3Sink`. On success, `ipfix_s3_records_written` (per row) and `ipfix_s3_uploads` (per upload) are incremented, and the buffer is cleared. On error, `ipfix_s3_upload_errors` is incremented and the buffer is retained for the next flush attempt. If the buffer exceeds the hard cap (`max_buffer_rows * 4` rows) while in a persistent error state, the oldest batches are dropped and `ipfix_s3_buffer_dropped` is incremented.
+A flush encodes all buffered batches into a single Parquet file (ZSTD compression level 3) and uploads it via `S3Sink`. On success, `parquet_s3_records_written{source="ipfix"}` (per row) and `parquet_s3_uploads{source="ipfix"}` (per upload) are incremented, and the buffer is cleared. On error, `parquet_s3_upload_errors{source="ipfix"}` is incremented and the buffer is retained for the next flush attempt. If the buffer exceeds the hard cap (`max_buffer_rows * 4` rows) while in a persistent error state, the oldest batches are dropped and `parquet_s3_buffer_dropped{source="ipfix"}` is incremented.
 
 **S3 object key format**
 
@@ -217,11 +217,11 @@ All counters are registered at startup and exposed via the existing metrics endp
 | `ipfix_templates_missing` | Data sets skipped due to missing template |
 | `ipfix_templates_dropped` | Templates rejected because cache was full |
 | `ipfix_decode_errors` | Datagrams that failed to decode |
-| `ipfix_s3_records_written` | Flow rows written on successful S3 flush |
-| `ipfix_s3_uploads` | Successful S3 uploads |
-| `ipfix_s3_upload_errors` | Failed S3 uploads |
-| `ipfix_s3_dropped` | Flow batches dropped due to full channel |
-| `ipfix_s3_buffer_dropped` | Rows dropped by hard-cap enforcement |
+| `parquet_s3_records_written{source="ipfix"}` | Flow rows written on successful S3 flush |
+| `parquet_s3_uploads{source="ipfix"}` | Successful S3 uploads |
+| `parquet_s3_upload_errors{source="ipfix"}` | Failed S3 uploads |
+| `parquet_s3_dropped{source="ipfix"}` | Flow batches dropped due to full channel |
+| `parquet_s3_buffer_dropped{source="ipfix"}` | Rows dropped by hard-cap enforcement |
 
 ## Testing
 
@@ -232,7 +232,7 @@ All counters are registered at startup and exposed via the existing metrics endp
 - Template cache: insert, lookup, update, capacity limit (`ipfix_templates_dropped`), missing-template skip
 - IE mapping: known IEs land in typed fields; unknown IEs appear in `extra`; enterprise IEs use `"ie<PEN>:<id>"` keys
 - Checked arithmetic: truncated / zero-length datagrams do not panic
-- S3 writer: flush-on-bytes, flush-on-interval, channel overflow (`ipfix_s3_dropped`), upload-error buffer retention, hard-cap eviction (`ipfix_s3_buffer_dropped`)
+- S3 writer: flush-on-bytes, flush-on-interval, channel overflow (`parquet_s3_dropped{source="ipfix"}`), upload-error buffer retention, hard-cap eviction (`parquet_s3_buffer_dropped{source="ipfix"}`)
 - Arrow schema: column order, nullability, and string encoding of IPs and timestamps
 
 ## Files
