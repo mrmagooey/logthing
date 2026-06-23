@@ -1,127 +1,19 @@
 //! WEF (Windows Event Forwarding) → S3 Parquet persistence.
 //!
 //! Provides:
-//! - `ParquetS3Config` — legacy config type (kept for backward compat with DestinationConfig)
 //! - `WefSink` — `ParquetSink` adapter for WEF events
 //! - `wef_start()` — convenience constructor wiring `WefS3Config` → `ParquetWriterHandle`
 //!
 //! S3 KEY LAYOUT: `event_type=<id>/year=Y/month=MM/day=DD/<uuid>.parquet`
 //! (empty prefix, preserving the legacy layout — behavior-preserving choice (a)).
 
-use crate::config::{DestinationConfig, S3ConnectionConfig, WefS3Config};
+use crate::config::WefS3Config;
 use crate::forwarding::buffered_writer::ParquetSink;
 use crate::models::WindowsEvent;
 use arrow::array::{ArrayRef, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
-
-// ---------------------------------------------------------------------------
-// Legacy config (kept for backward compat)
-// ---------------------------------------------------------------------------
-
-/// Configuration for Parquet S3 forwarder (legacy — kept for DestinationConfig compat).
-#[derive(Clone)]
-pub struct ParquetS3Config {
-    pub connection: S3ConnectionConfig,
-    pub max_file_size_mb: u64,
-    pub flush_interval_secs: u64,
-    pub local_buffer_path: std::path::PathBuf,
-}
-
-impl std::fmt::Debug for ParquetS3Config {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ParquetS3Config")
-            .field("connection", &self.connection)
-            .field("max_file_size_mb", &self.max_file_size_mb)
-            .field("flush_interval_secs", &self.flush_interval_secs)
-            .field("local_buffer_path", &self.local_buffer_path)
-            .finish()
-    }
-}
-
-impl Default for ParquetS3Config {
-    fn default() -> Self {
-        Self {
-            connection: S3ConnectionConfig {
-                endpoint: "http://localhost:9000".to_string(),
-                bucket: "wef-events".to_string(),
-                region: "us-east-1".to_string(),
-                access_key: "minioadmin".to_string(),
-                secret_key: "minioadmin".to_string(),
-            },
-            max_file_size_mb: 100,
-            flush_interval_secs: 900,
-            local_buffer_path: std::env::temp_dir().join("logthing-wef-events"),
-        }
-    }
-}
-
-impl ParquetS3Config {
-    pub fn from_destination(dest: &DestinationConfig) -> anyhow::Result<Self> {
-        let url = &dest.url;
-        let parts: Vec<&str> = url.split('/').collect();
-        let bucket = parts.get(2).unwrap_or(&"wef-events").to_string();
-        let endpoint = if url.starts_with("s3://") {
-            dest.headers
-                .get("endpoint")
-                .cloned()
-                .unwrap_or_else(|| "http://localhost:9000".to_string())
-        } else {
-            format!(
-                "{}//{}",
-                parts.first().unwrap_or(&"http:"),
-                parts.get(2).unwrap_or(&"localhost:9000")
-            )
-        };
-        Ok(Self {
-            connection: S3ConnectionConfig {
-                endpoint,
-                bucket,
-                region: dest
-                    .headers
-                    .get("region")
-                    .cloned()
-                    .unwrap_or_else(|| "us-east-1".to_string()),
-                access_key: dest.headers.get("access-key").cloned().unwrap_or_default(),
-                secret_key: dest.headers.get("secret-key").cloned().unwrap_or_default(),
-            },
-            max_file_size_mb: dest
-                .headers
-                .get("max-size-mb")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(100),
-            flush_interval_secs: dest
-                .headers
-                .get("flush-interval-secs")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(900),
-            local_buffer_path: std::path::PathBuf::from(
-                dest.headers.get("buffer-path").cloned().unwrap_or_else(|| {
-                    std::env::temp_dir()
-                        .join("logthing-wef-events")
-                        .to_string_lossy()
-                        .into_owned()
-                }),
-            ),
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WEF Arrow schema (fixed; matches the legacy writer exactly)
-// ---------------------------------------------------------------------------
-
-/// Return the fixed Arrow schema for WEF rows.
-pub fn wef_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("event_id", DataType::UInt32, false),
-        Field::new("timestamp", DataType::Utf8, false),
-        Field::new("source_host", DataType::Utf8, false),
-        Field::new("subscription_id", DataType::Utf8, true),
-        Field::new("event_data", DataType::Utf8, false),
-    ]))
-}
 
 // ---------------------------------------------------------------------------
 // WefSink — ParquetSink adapter
@@ -158,7 +50,13 @@ impl ParquetSink for WefSink {
     }
 
     fn schema(&self, _partition: Option<&str>) -> Arc<arrow_schema::Schema> {
-        wef_schema()
+        Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::UInt32, false),
+            Field::new("timestamp", DataType::Utf8, false),
+            Field::new("source_host", DataType::Utf8, false),
+            Field::new("subscription_id", DataType::Utf8, true),
+            Field::new("event_data", DataType::Utf8, false),
+        ]))
     }
 
     fn to_record_batch(
@@ -233,11 +131,10 @@ pub fn wef_start(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DestinationConfig, ForwardProtocol, S3ConnectionConfig, WefS3Config};
+    use crate::config::WefS3Config;
     use crate::forwarding::buffered_writer::ParquetSink;
     use crate::models::{EventLevel, ParsedEvent, WindowsEvent};
     use chrono::Utc;
-    use std::collections::HashMap;
 
     fn sample_parsed_event(event_id: u32) -> ParsedEvent {
         ParsedEvent {
@@ -268,70 +165,6 @@ mod tests {
 
     fn make_unparsed_event() -> Arc<WindowsEvent> {
         Arc::new(WindowsEvent::new("host".into(), "<Event/>".into()))
-    }
-
-    fn sample_destination() -> DestinationConfig {
-        let mut headers = HashMap::new();
-        headers.insert("endpoint".into(), "http://minio:9000".into());
-        headers.insert("region".into(), "us-east-1".into());
-        headers.insert("access-key".into(), "AKIA".into());
-        headers.insert("secret-key".into(), "SECRET".into());
-        headers.insert("max-size-mb".into(), "1".into());
-        headers.insert("flush-interval-secs".into(), "60".into());
-        let temp_path = std::env::temp_dir().join("test-buf");
-        headers.insert(
-            "buffer-path".into(),
-            temp_path.to_string_lossy().to_string(),
-        );
-        DestinationConfig {
-            name: "parquet".into(),
-            url: "s3://audit-bucket/events".into(),
-            protocol: ForwardProtocol::Http,
-            enabled: true,
-            headers,
-        }
-    }
-
-    #[test]
-    fn config_parses_destination_headers() {
-        let dest = sample_destination();
-        let cfg = ParquetS3Config::from_destination(&dest).expect("config");
-        assert_eq!(cfg.connection.bucket, "audit-bucket");
-        assert_eq!(cfg.connection.endpoint, "http://minio:9000");
-        assert_eq!(cfg.max_file_size_mb, 1);
-        assert_eq!(cfg.flush_interval_secs, 60);
-        let expected_path = std::env::temp_dir().join("test-buf");
-        assert_eq!(cfg.local_buffer_path, expected_path);
-    }
-
-    #[test]
-    fn parquet_s3_config_debug_masks_secrets() {
-        let cfg = ParquetS3Config {
-            connection: S3ConnectionConfig {
-                endpoint: "http://minio:9000".to_string(),
-                bucket: "my-bucket".to_string(),
-                region: "us-east-1".to_string(),
-                access_key: "SUPERSECRETKEY".to_string(),
-                secret_key: "TOPSECRETPASSWORD".to_string(),
-            },
-            max_file_size_mb: 100,
-            flush_interval_secs: 900,
-            local_buffer_path: std::path::PathBuf::from("/tmp/test"),
-        };
-        let debug_str = format!("{cfg:?}");
-        assert!(
-            !debug_str.contains("SUPERSECRETKEY"),
-            "access_key must not appear in Debug output: {debug_str}"
-        );
-        assert!(
-            !debug_str.contains("TOPSECRETPASSWORD"),
-            "secret_key must not appear in Debug output: {debug_str}"
-        );
-        assert!(debug_str.contains("my-bucket"), "bucket must be visible");
-        assert!(
-            debug_str.contains("<redacted>"),
-            "redacted marker must appear"
-        );
     }
 
     // WefSink unit tests

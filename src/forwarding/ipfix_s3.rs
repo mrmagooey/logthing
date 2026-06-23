@@ -8,6 +8,7 @@
 //! - `IpfixS3Handler` — type alias for `ParquetWriterHandle<IpfixSink>`
 //! - `ipfix_start()` — convenience constructor wiring `IpfixS3Config` → `ParquetWriterHandle`
 
+use crate::config::IpfixS3Config;
 use crate::forwarding::buffered_writer::ParquetSink;
 use crate::ipfix::FlowRecord;
 use arrow::array::{
@@ -15,56 +16,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use chrono::{Datelike, Utc};
-use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::WriterProperties;
 use std::sync::{Arc, LazyLock};
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-
-/// Per-source S3 persistence config for the IPFIX listener.
-/// Absent from TOML → `None` → no S3 persistence (backward compatible).
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct IpfixS3Config {
-    /// Shared S3 connection fields (endpoint, bucket, region, access_key, secret_key).
-    /// Flattened so the TOML block stays flat: `[ipfix.s3]\nendpoint = …`
-    #[serde(flatten)]
-    pub connection: crate::config::S3ConnectionConfig,
-    /// S3 key prefix for IPFIX objects, slash-free (default: `"ipfix"`); builder inserts `/`.
-    #[serde(default = "default_ipfix_s3_prefix")]
-    pub prefix: String,
-    /// Max buffer size in bytes before an eager flush (default: 100 MiB)
-    #[serde(default = "default_ipfix_flush_bytes")]
-    pub flush_threshold_bytes: usize,
-    /// Max age of buffered records in seconds before a time-triggered flush (default: 900)
-    #[serde(default = "default_ipfix_flush_secs")]
-    pub flush_interval_secs: u64,
-    /// Bounded channel capacity (number of batches; default: 256)
-    #[serde(default = "default_ipfix_channel_capacity")]
-    pub channel_capacity: usize,
-    /// Maximum number of buffered rows before hard cap kicks in (default: 100 000)
-    #[serde(default = "default_ipfix_max_buffer_rows")]
-    pub max_buffer_rows: usize,
-}
-
-fn default_ipfix_s3_prefix() -> String {
-    "ipfix".to_string()
-}
-fn default_ipfix_flush_bytes() -> usize {
-    100 * 1024 * 1024 // 100 MiB
-}
-fn default_ipfix_flush_secs() -> u64 {
-    900
-}
-fn default_ipfix_channel_capacity() -> usize {
-    256
-}
-fn default_ipfix_max_buffer_rows() -> usize {
-    100_000
-}
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -149,16 +101,6 @@ impl FlowRecordBuilders {
             extra: StringBuilder::new(),
             row_count: 0,
         }
-    }
-
-    #[allow(dead_code)] // Part of the public builder API; used in tests
-    pub fn len(&self) -> usize {
-        self.row_count
-    }
-
-    #[allow(dead_code)] // Part of the public builder API
-    pub fn is_empty(&self) -> bool {
-        self.row_count == 0
     }
 }
 
@@ -247,48 +189,6 @@ pub fn finish_batch(
         Arc::new(builders.extra.finish()) as ArrayRef,
     ];
     Ok(RecordBatch::try_new(schema, columns)?)
-}
-
-// ---------------------------------------------------------------------------
-// Pure key-building helper (extracted for testability)
-// ---------------------------------------------------------------------------
-
-/// Build the S3 object key: `{prefix}/year={Y}/month={MM}/day={DD}/{uuid}.parquet`
-#[allow(dead_code)]
-pub(crate) fn build_s3_key(prefix: &str, now: chrono::DateTime<Utc>) -> String {
-    let id = uuid::Uuid::new_v4();
-    format!(
-        "{}/year={}/month={:02}/day={:02}/{}.parquet",
-        prefix,
-        now.year(),
-        now.month(),
-        now.day(),
-        id,
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Parquet encoding
-// ---------------------------------------------------------------------------
-
-/// Encode a slice of `RecordBatch`es (sharing `flow_record_schema()`) into Parquet bytes.
-/// Returns an empty `Vec` if `batches` is empty.
-#[allow(dead_code)]
-pub(crate) fn encode_batches_to_parquet(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> {
-    if batches.is_empty() {
-        return Ok(Vec::new());
-    }
-    let schema = flow_record_schema();
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
-        .build();
-    let mut buf = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))?;
-    for batch in batches {
-        writer.write(batch)?;
-    }
-    writer.close()?;
-    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -399,7 +299,7 @@ mod tests {
     use super::*;
     use crate::forwarding::s3_sink::S3Sink;
     use crate::ipfix::FlowRecord;
-    use arrow::array::{Array as ArrowArray, StringArray, UInt64Array};
+    use arrow::array::{Array, StringArray, UInt64Array};
     use chrono::TimeZone;
     use std::net::IpAddr;
 
@@ -506,7 +406,6 @@ mod tests {
         let mut builders = FlowRecordBuilders::new();
         append_flow_record(&mut builders, &r0).unwrap();
         append_flow_record(&mut builders, &r1).unwrap();
-        assert_eq!(builders.len(), 2);
 
         let batch = finish_batch(builders, flow_record_schema()).unwrap();
         assert_eq!(batch.num_rows(), 2);
@@ -561,72 +460,6 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(extra_col.value(0)).expect("must parse as JSON");
         assert_eq!(parsed, original);
-    }
-
-    // -- Task 2: Parquet round-trip --
-
-    #[test]
-    fn encode_parquet_round_trips_expected_schema_and_values() {
-        use bytes::Bytes;
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-        let r = make_flow_record(
-            Some("172.16.0.1"),
-            Some(9999),
-            serde_json::json!({"ie1": "val"}),
-        );
-        let mut builders = FlowRecordBuilders::new();
-        append_flow_record(&mut builders, &r).unwrap();
-        let batch = finish_batch(builders, flow_record_schema()).unwrap();
-
-        let raw = encode_batches_to_parquet(&[batch]).unwrap();
-        assert!(!raw.is_empty(), "Parquet bytes must not be empty");
-
-        let buf = Bytes::from(raw);
-        let builder = ParquetRecordBatchReaderBuilder::try_new(buf).unwrap();
-        let schema = builder.schema().clone();
-        let mut reader = builder.build().unwrap();
-        let rb = reader.next().unwrap().unwrap();
-
-        assert_eq!(rb.num_rows(), 1);
-        assert_eq!(schema.fields().len(), 18);
-
-        let exporter_col = rb
-            .column_by_name("exporter")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(exporter_col.value(0), "10.0.0.1");
-
-        let octet_col = rb
-            .column_by_name("octet_delta_count")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        assert_eq!(octet_col.value(0), 9999u64);
-    }
-
-    // -- Task 2: s3_key structure --
-
-    #[test]
-    fn s3_key_has_correct_structure() {
-        let now = chrono::Utc.with_ymd_and_hms(2026, 3, 7, 0, 0, 0).unwrap();
-        let key = build_s3_key("ipfix", now);
-        assert!(
-            key.starts_with("ipfix/year="),
-            "key must start with 'ipfix/year='; got: {key}"
-        );
-        assert!(key.contains("/month="), "key must contain /month=");
-        assert!(key.contains("/day="), "key must contain /day=");
-        assert!(key.ends_with(".parquet"), "key must end with .parquet");
-        assert!(
-            key.contains("2026"),
-            "key must contain year 2026; got: {key}"
-        );
-        assert!(key.contains("03"), "key must contain month 03");
-        assert!(key.contains("07"), "key must contain day 07");
     }
 
     // -- IpfixSink unit tests (Task 2.1) --

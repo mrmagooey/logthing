@@ -1,5 +1,4 @@
 use crate::config::S3ConnectionConfig;
-use crate::forwarding::parquet_s3::ParquetS3Config;
 use anyhow::Result;
 use aws_config::meta::region::RegionProviderChain;
 use aws_credential_types::{Credentials, provider::SharedCredentialsProvider};
@@ -58,14 +57,6 @@ impl S3Sink {
             client,
             bucket: cfg.bucket.clone(),
         })
-    }
-
-    /// Construct an `S3Sink` from a [`ParquetS3Config`].
-    ///
-    /// Delegates to [`from_connection`][Self::from_connection] so the WEF/parquet
-    /// path gets identical AWS client construction behaviour.
-    pub async fn from_config(cfg: &ParquetS3Config) -> Result<Self> {
-        Self::from_connection(&cfg.connection).await
     }
 
     /// Upload `body` bytes to `key` in the configured bucket.
@@ -132,61 +123,17 @@ mod tests {
         );
     }
 
-    fn test_config() -> ParquetS3Config {
-        use crate::config::S3ConnectionConfig;
-        ParquetS3Config {
-            connection: S3ConnectionConfig {
-                endpoint: "http://localhost:9000".to_string(),
-                bucket: "test-bucket".to_string(),
-                region: "us-east-1".to_string(),
-                access_key: "AKIATEST".to_string(),
-                secret_key: "SECRETTEST".to_string(),
-            },
-            max_file_size_mb: 10,
-            flush_interval_secs: 60,
-            local_buffer_path: std::env::temp_dir().join("s3sink-test"),
-        }
-    }
-
-    #[tokio::test]
-    async fn from_config_stores_bucket() {
-        let cfg = test_config();
-        let sink = S3Sink::from_config(&cfg).await.expect("should construct");
-        assert_eq!(sink.bucket, "test-bucket");
-    }
-
-    #[tokio::test]
-    async fn from_config_empty_credentials_skips_explicit_provider() {
-        // When access_key/secret_key are empty the SDK falls back to env-chain.
-        // Construction should still succeed (no live network call happens here).
-        let mut cfg = test_config();
-        cfg.connection.access_key = String::new();
-        cfg.connection.secret_key = String::new();
-        let sink = S3Sink::from_config(&cfg)
-            .await
-            .expect("should construct with empty creds");
-        assert_eq!(sink.bucket, "test-bucket");
-    }
-
     #[tokio::test]
     async fn upload_returns_err_on_unreachable_endpoint() {
-        // Uses an endpoint that will refuse the TCP connection immediately so
-        // the test does not hang. This exercises the error-handling path of
-        // upload without a live MinIO.
         use crate::config::S3ConnectionConfig;
-        let cfg = ParquetS3Config {
-            connection: S3ConnectionConfig {
-                endpoint: "http://127.0.0.1:1".to_string(), // port 1: always refused
-                bucket: "test-bucket".to_string(),
-                region: "us-east-1".to_string(),
-                access_key: "AKIATEST".to_string(),
-                secret_key: "SECRETTEST".to_string(),
-            },
-            max_file_size_mb: 10,
-            flush_interval_secs: 60,
-            local_buffer_path: std::env::temp_dir().join("s3sink-upload-test"),
+        let conn = S3ConnectionConfig {
+            endpoint: "http://127.0.0.1:1".to_string(), // port 1: always refused
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key: "AKIATEST".to_string(),
+            secret_key: "SECRETTEST".to_string(),
         };
-        let sink = S3Sink::from_config(&cfg).await.expect("constructs");
+        let sink = S3Sink::from_connection(&conn).await.expect("constructs");
         let result = sink.upload("some/key.parquet", b"hello".to_vec()).await;
         assert!(result.is_err(), "upload to unreachable endpoint must fail");
     }
