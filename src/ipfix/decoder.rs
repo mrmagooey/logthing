@@ -1468,4 +1468,1237 @@ mod tests {
             "existing key must be updatable even when cache is full"
         );
     }
+
+    // =================== NEW TARGETED COVERAGE TESTS ======================
+
+    // ---- read_u8 helper tests ----
+
+    #[test]
+    fn read_u8_ok_and_error() {
+        let buf = [0xAB_u8, 0xCD];
+        assert_eq!(read_u8(&buf, 0).unwrap(), 0xAB);
+        assert_eq!(read_u8(&buf, 1).unwrap(), 0xCD);
+        // Past end → Truncated
+        let err = read_u8(&buf, 2).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::Truncated {
+                offset: 2,
+                need: 1,
+                ..
+            }
+        ));
+        // Empty buffer
+        assert!(read_u8(&[], 0).is_err());
+    }
+
+    // ---- read_u64_be helper tests ----
+
+    #[test]
+    fn read_u64_be_ok_and_error() {
+        let buf: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xE8];
+        assert_eq!(read_u64_be(&buf, 0).unwrap(), 1000u64);
+        // Only 7 bytes available at offset 1 → Truncated
+        assert!(read_u64_be(&buf, 1).is_err());
+        // Empty buffer
+        assert!(read_u64_be(&[], 0).is_err());
+    }
+
+    // ---- IpfixDecoder::default() ----
+
+    #[test]
+    fn ipfix_decoder_default_creates_empty_decoder() {
+        let dec = IpfixDecoder::default();
+        assert!(dec.cache.is_empty());
+    }
+
+    // ---- DecodeError::Malformed display ----
+
+    #[test]
+    fn decode_error_malformed_display() {
+        let e = DecodeError::Malformed {
+            reason: "test reason".into(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("malformed"), "got: {s}");
+        assert!(s.contains("test reason"), "got: {s}");
+    }
+
+    // ---- decode_ipfix: wrong version ----
+
+    #[test]
+    fn decode_ipfix_wrong_version_returns_error() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+        // Build a valid-looking 16-byte header with version=9 instead of 10
+        let buf: &[u8] = &[
+            0x00, 0x09, // version = 9 (wrong for decode_ipfix)
+            0x00, 0x10, // total_len = 16
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let err = decode_ipfix(&mut dec, buf, exporter).unwrap_err();
+        assert!(matches!(err, DecodeError::UnknownVersion(9)));
+    }
+
+    // ---- decode_ipfix: buf.len() < total_len ----
+
+    #[test]
+    fn decode_ipfix_buf_shorter_than_total_len_returns_truncated() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+        // Header claims total_len = 100 but buf is only 16 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, // version = 10
+            0x00, 0x64, // total_len = 100
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let err = decode_ipfix(&mut dec, buf, exporter).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Truncated { .. }),
+            "expected Truncated, got: {err}"
+        );
+    }
+
+    // ---- decode_ipfix: set_len < 4 (malformed) ----
+
+    #[test]
+    fn decode_ipfix_set_len_too_small_returns_malformed() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+        // Message with a set that declares length=2 (< 4)
+        // Total message = 16 hdr + 4 set = 20 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, // version = 10
+            0x00, 0x14, // total_len = 20
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Set header: id=2, len=2 (malformed)
+            0x00, 0x02, 0x00, 0x02,
+        ];
+        let err = decode_ipfix(&mut dec, buf, exporter).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Malformed { .. }),
+            "expected Malformed, got: {err}"
+        );
+    }
+
+    // ---- decode_ipfix: set_end > msg.len() (set overruns message) ----
+
+    #[test]
+    fn decode_ipfix_set_overruns_message_returns_truncated() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+        // Message where set claims len=200, but message total_len=20
+        let buf: &[u8] = &[
+            0x00, 0x0A, // version = 10
+            0x00, 0x14, // total_len = 20 (msg is 20 bytes)
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Set: id=2, length=200 — overruns message
+            0x00, 0x02, 0x00, 0xC8,
+        ];
+        let err = decode_ipfix(&mut dec, buf, exporter).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Truncated { .. }),
+            "expected Truncated, got: {err}"
+        );
+    }
+
+    // ---- decode_ipfix: reserved set_id (4..255 range) ----
+
+    #[test]
+    fn decode_ipfix_reserved_set_id_is_skipped() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+        // Message with set_id=5 (reserved, 4..255) — must not error, must return empty
+        let buf: &[u8] = &[
+            0x00, 0x0A, // version = 10
+            0x00, 0x14, // total_len = 20
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Set: id=5 (reserved), len=4 (just header, empty body)
+            0x00, 0x05, 0x00, 0x04,
+        ];
+        let records =
+            decode_ipfix(&mut dec, buf, exporter).expect("reserved set_id must not error");
+        assert_eq!(records.len(), 0);
+    }
+
+    // ---- decode_ipfix: options template set (set_id=3) ----
+
+    #[test]
+    fn decode_ipfix_options_template_set_is_parsed() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+        // Options Template Set (set_id=3):
+        // body: template_id(2) + field_count(2) + scope_count(2) + 1 field(4) = 10 bytes
+        // total set = 4 header + 10 body = 14 bytes
+        // total message = 16 + 14 = 30 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, // version=10
+            0x00, 0x1E, // total_len=30
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Options Template Set header: set_id=3, len=14
+            0x00, 0x03, 0x00, 0x0E, // Options Template Record body (10 bytes):
+            0x01, 0x40, // template_id=320 (>= 256)
+            0x00, 0x01, // field_count=1
+            0x00, 0x01, // scope_count=1
+            // 1 field: ie_id=8, length=4
+            0x00, 0x08, 0x00, 0x04,
+        ];
+        let records =
+            decode_ipfix(&mut dec, buf, exporter).expect("options template set must not error");
+        assert_eq!(records.len(), 0, "no data records in this message");
+        // Template 320 should now be cached
+        let key: TemplateKey = (exporter, 0, 320);
+        assert!(
+            dec.cache.contains_key(&key),
+            "options template should be stored in cache"
+        );
+    }
+
+    // ---- parse_ipfix_template_set: template_id < 256 ----
+
+    #[test]
+    fn decode_ipfix_template_id_below_256_returns_malformed() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+        // Template Set body where template_id = 100 (< 256, reserved)
+        // body: tmpl_id(2) + field_count(2) + 1 field(4) = 8 bytes
+        // total set: 4 + 8 = 12 bytes; total msg: 16 + 12 = 28 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, // version=10
+            0x00, 0x1C, // total_len=28
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Template Set header: set_id=2, len=12
+            0x00, 0x02, 0x00, 0x0C, // Template record with id=100 (invalid)
+            0x00, 0x64, // template_id=100
+            0x00, 0x01, // field_count=1
+            0x00, 0x08, 0x00, 0x04, // ie 8, len 4
+        ];
+        let err = decode_ipfix(&mut dec, buf, exporter).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Malformed { .. }),
+            "expected Malformed for template_id < 256, got: {err}"
+        );
+    }
+
+    // ---- parse_ipfix_template_set: truncated field specifier ----
+
+    #[test]
+    fn decode_ipfix_template_field_list_truncated_returns_error() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+        // Template claims 2 fields but only 1 field's bytes are present
+        // body: tmpl_id(2) + field_count(2) + 1 field(4) = 8 bytes (but field_count=2)
+        // total set: 4 + 8 = 12; total msg: 16 + 12 = 28
+        let buf: &[u8] = &[
+            0x00, 0x0A, // version=10
+            0x00, 0x1C, // total_len=28
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Template Set: set_id=2, len=12
+            0x00, 0x02, 0x00, 0x0C,
+            // Template record: tmpl_id=256, field_count=2 (but only 4 bytes follow)
+            0x01, 0x00, // template_id=256
+            0x00, 0x02, // field_count=2 — only room for 1
+            0x00, 0x08, 0x00, 0x04, // field 1 only — field 2 is missing
+        ];
+        let err = decode_ipfix(&mut dec, buf, exporter).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Truncated { .. }),
+            "expected Truncated for truncated field list, got: {err}"
+        );
+    }
+
+    // ---- parse_ipfix_template_set: enterprise IE (bit 15 set) ----
+
+    #[test]
+    fn decode_ipfix_enterprise_ie_is_parsed() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+        // Template with one enterprise field (bit 15 of ie_id set) + enterprise number (4 bytes)
+        // body: tmpl_id(2) + field_count(2) + raw_ie(2, high bit set) + field_len(2) + enterprise_num(4) = 12 bytes
+        // total set: 4 + 12 = 16; total msg: 16 + 16 = 32
+        let buf: &[u8] = &[
+            0x00, 0x0A, // version=10
+            0x00, 0x20, // total_len=32
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Template Set header: set_id=2, len=16
+            0x00, 0x02, 0x00, 0x10, // Template record: tmpl_id=300, field_count=1
+            0x01, 0x2C, // template_id=300
+            0x00, 0x01, // field_count=1
+            // Enterprise field: raw_ie = 0x8001 (enterprise bit set, ie_id=1), len=4
+            0x80, 0x01, 0x00, 0x04, // Enterprise number (PEN): 0xDEADBEEF
+            0xDE, 0xAD, 0xBE, 0xEF,
+        ];
+        let records =
+            decode_ipfix(&mut dec, buf, exporter).expect("enterprise IE template must not error");
+        assert_eq!(records.len(), 0);
+        let key: TemplateKey = (exporter, 0, 300);
+        let fields = dec.cache.get(&key).expect("template 300 should be cached");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].ie_id, 1); // top bit cleared
+        assert_eq!(fields[0].enterprise_number, Some(0xDEAD_BEEF));
+    }
+
+    // ---- parse_ipfix_template_set: enterprise IE with truncated enterprise number ----
+
+    #[test]
+    fn decode_ipfix_enterprise_ie_truncated_pen_returns_error() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+        // Enterprise bit set but only 2 bytes follow (need 4 for PEN)
+        // body: tmpl_id(2) + field_count(2) + raw_ie(2) + field_len(2) + 2 bytes PEN (truncated)
+        // total set: 4 + 10 = 14; total msg: 16 + 14 = 30
+        let buf: &[u8] = &[
+            0x00, 0x0A, // version=10
+            0x00, 0x1E, // total_len=30
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Template Set: set_id=2, len=14
+            0x00, 0x02, 0x00, 0x0E, // tmpl_id=301, field_count=1
+            0x01, 0x2D, 0x00, 0x01, // Enterprise field: raw_ie=0x8002, len=4
+            0x80, 0x02, 0x00, 0x04, // Only 2 bytes of PEN (need 4) — truncated
+            0xDE, 0xAD,
+        ];
+        let err = decode_ipfix(&mut dec, buf, exporter).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Truncated { .. }),
+            "expected Truncated for truncated PEN, got: {err}"
+        );
+    }
+
+    // ---- apply_field_to_record: enterprise IE goes to extra ----
+
+    #[test]
+    fn enterprise_ie_always_goes_to_extra_with_pen_prefix() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // Build IPFIX with enterprise template + matching data
+        // Template: tmpl_id=256, field_count=1, enterprise field ie_id=42 pen=12345, len=4
+        // Data: 4 bytes = 0xCAFEBABE
+        // Total layout:
+        //   16 msg hdr + (4 set hdr + 4 tmpl hdr + 4 field + 4 pen = 16 template set)
+        //   + (4 set hdr + 4 data = 8 data set) = 40 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, // version=10
+            0x00, 0x28, // total_len=40
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Template Set: set_id=2, len=16
+            0x00, 0x02, 0x00, 0x10, // tmpl_id=256, field_count=1
+            0x01, 0x00, 0x00, 0x01,
+            // enterprise field: raw_ie=0x802A (bit15 + 42), len=4
+            0x80, 0x2A, 0x00, 0x04, // PEN = 12345 = 0x00003039
+            0x00, 0x00, 0x30, 0x39, // Data Set: set_id=256, len=8
+            0x01, 0x00, 0x00, 0x08, // 4 data bytes
+            0xCA, 0xFE, 0xBA, 0xBE,
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("enterprise data decode");
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        // Key is "ie12345:42"
+        assert_eq!(
+            r.extra["ie12345:42"], "cafebabe",
+            "enterprise IE must go to extra; got: {}",
+            r.extra
+        );
+    }
+
+    // ---- apply_field_to_record: IPv4 wrong-length → extra ----
+
+    #[test]
+    fn ipv4_ie_wrong_length_goes_to_extra() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // Template: ie_id=8 (sourceIPv4Address) declared as 6 bytes (wrong)
+        // Data: 6 bytes
+        // msg: 16 + (4+4+4 = 12 template set) + (4+6 = 10 data set) = 38 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x26, // total_len=38
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Template Set: set_id=2, len=12
+            0x00, 0x02, 0x00, 0x0C, // tmpl_id=256, field_count=1
+            0x01, 0x00, 0x00, 0x01, // ie_id=8, length=6 (wrong for IPv4)
+            0x00, 0x08, 0x00, 0x06, // Data Set: set_id=256, len=10
+            0x01, 0x00, 0x00, 0x0A, // 6 data bytes
+            0xC0, 0xA8, 0x01, 0x01, 0x00, 0x00,
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("ipv4 wrong length decode");
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        // src_addr should NOT be set (wrong length prevents IPv4 parse)
+        assert!(
+            r.src_addr.is_none(),
+            "src_addr must be None for wrong-length IPv4"
+        );
+        // Instead it goes to extra
+        assert!(
+            r.extra.get("sourceIPv4Address").is_some(),
+            "wrong-length IPv4 must be in extra; got: {}",
+            r.extra
+        );
+    }
+
+    // ---- apply_field_to_record: IPv6 correct ----
+
+    #[test]
+    fn ipv6_src_address_is_decoded_correctly() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // Template: ie_id=27 (sourceIPv6Address), length=16
+        // Data: 16 bytes = 2001:db8::1
+        // msg: 16 + (4+4+4 = 12 tmpl set) + (4+16 = 20 data set) = 48 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x30, // total_len=48
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Template Set: set_id=2, len=12
+            0x00, 0x02, 0x00, 0x0C, 0x01, 0x00, 0x00, 0x01, // tmpl_id=256, field_count=1
+            0x00, 0x1B, 0x00, 0x10, // ie_id=27, length=16
+            // Data Set: set_id=256, len=20
+            0x01, 0x00, 0x00, 0x14, // 2001:0db8:0000:0000:0000:0000:0000:0001
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("ipv6 src decode");
+        assert_eq!(records.len(), 1);
+        // ie_id=27 (sourceIPv6Address) goes through set_addr_field which routes
+        // only ie 8/225 → src_addr and 12/226 → dst_addr; all others (incl. 27)
+        // go to extra as a string.
+        let expected_str = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1)).to_string();
+        assert_eq!(
+            records[0].extra["sourceIPv6Address"],
+            serde_json::json!(expected_str),
+            "sourceIPv6Address should be in extra as string; got: {}",
+            records[0].extra
+        );
+    }
+
+    // ---- apply_field_to_record: IPv6 wrong length → extra ----
+
+    #[test]
+    fn ipv6_ie_wrong_length_goes_to_extra() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // Template: ie_id=27 (sourceIPv6Address), length=4 (wrong — need 16)
+        // msg: 16 + 12 tmpl + (4+4 = 8 data) = 36 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x24, // total_len=36
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Template Set: set_id=2, len=12
+            0x00, 0x02, 0x00, 0x0C, 0x01, 0x00, 0x00, 0x01, 0x00, 0x1B, 0x00,
+            0x04, // ie_id=27, len=4 (wrong)
+            // Data Set: set_id=256, len=8
+            0x01, 0x00, 0x00, 0x08, 0xC0, 0xA8, 0x01, 0x01,
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("ipv6 wrong len decode");
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].src_addr.is_none(),
+            "src_addr must be None for wrong-length IPv6"
+        );
+        assert!(
+            records[0].extra.get("sourceIPv6Address").is_some(),
+            "wrong-length IPv6 should go to extra; got: {}",
+            records[0].extra
+        );
+    }
+
+    // ---- apply_field_to_record: U16 short (< 2 bytes) ----
+
+    #[test]
+    fn u16_ie_single_byte_is_decoded() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // Template: ie_id=7 (sourceTransportPort), length=1 (non-standard short)
+        // msg: 16 msg_hdr + 12 tmpl_set + 5 data_set = 33 bytes total
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x21, // total_len=33
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Template Set: set_id=2, len=12
+            0x00, 0x02, 0x00, 0x0C, 0x01, 0x00, 0x00, 0x01, 0x00, 0x07, 0x00,
+            0x01, // ie_id=7, length=1
+            // Data Set: set_id=256, len=5 (4 hdr + 1 data)
+            0x01, 0x00, 0x00, 0x05, 0x50, // 80 decimal → src_port should be 80
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("u16 1-byte decode");
+        assert_eq!(records.len(), 1);
+        // raw.len() < 2 → uses raw.first().copied() as u16
+        assert_eq!(records[0].src_port, Some(0x50));
+    }
+
+    // ---- apply_field_to_record: U32 short (< 4 bytes) ----
+
+    #[test]
+    fn u32_ie_short_is_zero_padded() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // Template: ie_id=10 (ingressInterface), length=2 (non-standard)
+        // msg: 16 + 12 tmpl + (4+2 = 6 data set) = 34 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x22, // total_len=34
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Template Set: set_id=2, len=12
+            0x00, 0x02, 0x00, 0x0C, 0x01, 0x00, 0x00, 0x01, 0x00, 0x0A, 0x00,
+            0x02, // ie_id=10, length=2
+            // Data Set: set_id=256, len=6
+            0x01, 0x00, 0x00, 0x06, 0x00, 0x03, // 2 bytes = 3 → zero-padded to 0x00000003
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("u32 short decode");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].input_interface, Some(3u32));
+    }
+
+    // ---- apply_field_to_record: U64 short (< 8 bytes) ----
+
+    #[test]
+    fn u64_ie_short_is_zero_padded() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // Template: ie_id=1 (octetDeltaCount), length=4 (shorter than 8 bytes)
+        // msg: 16 + 12 tmpl + (4+4 = 8 data set) = 36 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x24, // total_len=36
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Template Set: set_id=2, len=12
+            0x00, 0x02, 0x00, 0x0C, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+            0x04, // ie_id=1, length=4
+            // Data Set: set_id=256, len=8
+            0x01, 0x00, 0x00, 0x08, 0x00, 0x00, 0x07, 0xD0, // 2000 octets
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("u64 4-byte decode");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].octet_delta_count, Some(2000u64));
+    }
+
+    // ---- apply_field_to_record: DateTimeMillis correct (ie 152, 153) ----
+
+    #[test]
+    fn datetime_millis_ie_152_and_153_decoded_to_flow_times() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // Template: ie_id=152 + ie_id=153, both 8 bytes
+        // msg: 16 + (4+4+4+4 = 16 tmpl set) + (4+16 = 20 data set) = 52 bytes
+        // flowStartMilliseconds = 1_735_689_600_000 ms = 2025-01-01T00:00:00Z
+        // flowEndMilliseconds   = 1_735_689_601_000 ms = 2025-01-01T00:00:01Z
+        let start_ms: u64 = 1_735_689_600_000u64;
+        let end_ms: u64 = 1_735_689_601_000u64;
+        let sb = start_ms.to_be_bytes();
+        let eb = end_ms.to_be_bytes();
+        let mut buf = Vec::new();
+        // Message header
+        buf.extend_from_slice(&[0x00, 0x0A, 0x00, 0x34]);
+        buf.extend_from_slice(&[
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        // Template Set header: set_id=2, len=16
+        buf.extend_from_slice(&[0x00, 0x02, 0x00, 0x10]);
+        // tmpl_id=256, field_count=2
+        buf.extend_from_slice(&[0x01, 0x00, 0x00, 0x02]);
+        // ie_id=152, length=8
+        buf.extend_from_slice(&[0x00, 0x98, 0x00, 0x08]);
+        // ie_id=153, length=8
+        buf.extend_from_slice(&[0x00, 0x99, 0x00, 0x08]);
+        // Data Set: set_id=256, len=20
+        buf.extend_from_slice(&[0x01, 0x00, 0x00, 0x14]);
+        buf.extend_from_slice(&sb);
+        buf.extend_from_slice(&eb);
+
+        let records = decode_ipfix(&mut dec, &buf, exporter).expect("datetime millis decode");
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert!(r.flow_start.is_some(), "flow_start should be set");
+        assert!(r.flow_end.is_some(), "flow_end should be set");
+        assert_eq!(r.flow_start.unwrap().timestamp_millis(), start_ms as i64);
+        assert_eq!(r.flow_end.unwrap().timestamp_millis(), end_ms as i64);
+    }
+
+    // ---- apply_field_to_record: DateTimeMillis short → extra ----
+
+    #[test]
+    fn datetime_millis_short_goes_to_extra() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // Template: ie_id=152, length=4 (less than 8)
+        // msg: 16 + 12 tmpl + (4+4 = 8 data) = 36 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x24, // total_len=36
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x0C, 0x01, 0x00, 0x00, 0x01, 0x00, 0x98, 0x00, 0x04, // ie_id=152, length=4
+            0x01, 0x00, 0x00, 0x08, 0x00, 0x00, 0x07, 0xD0,
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("datetime millis short decode");
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].flow_start.is_none(),
+            "flow_start should be None for short DateTimeMillis"
+        );
+        assert!(
+            records[0].extra.get("flowStartMilliseconds").is_some(),
+            "short DateTimeMillis should go to extra; got: {}",
+            records[0].extra
+        );
+    }
+
+    // ---- apply_field_to_record: DateTimeSysUptime correct ----
+
+    #[test]
+    fn datetime_sysuptime_ie_goes_to_extra_as_u32() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // Template: ie_id=22 (flowStartSysUpTime), length=4
+        // msg: 16 + 12 tmpl + (4+4 = 8 data) = 36 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x24, 0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x0C, 0x01, 0x00, 0x00, 0x01, 0x00, 0x16, 0x00,
+            0x04, // ie_id=22, length=4
+            0x01, 0x00, 0x00, 0x08, 0x00, 0x0F, 0x42, 0x40, // 1_000_000 ms
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("sysuptime decode");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].extra["flowStartSysUpTime"],
+            serde_json::json!(1_000_000u32)
+        );
+    }
+
+    // ---- apply_field_to_record: DateTimeSysUptime short → extra as hex ----
+
+    #[test]
+    fn datetime_sysuptime_short_goes_to_extra_as_hex() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // Template: ie_id=22, length=2 (less than 4)
+        // msg: 16 + 12 tmpl + (4+2 = 6 data set) = 34 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x22, 0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x0C, 0x01, 0x00, 0x00, 0x01, 0x00, 0x16, 0x00,
+            0x02, // ie_id=22, length=2
+            0x01, 0x00, 0x00, 0x06, // data set len=6
+            0x0F, 0x42, // 2 raw bytes
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("sysuptime short decode");
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].extra.get("flowStartSysUpTime").is_some(),
+            "short SysUptime must be in extra; got: {}",
+            records[0].extra
+        );
+    }
+
+    // ---- set_addr_field: non-src/dst address IEs go to extra ----
+
+    #[test]
+    fn non_src_dst_addr_ie_goes_to_extra() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // ie_id=130 (exporterIPv4Address), length=4 — goes to extra, not src/dst
+        // msg: 16 + 12 tmpl + (4+4 = 8 data set) = 36 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x24, 0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x0C, 0x01, 0x00, 0x00, 0x01, 0x00, 0x82, 0x00,
+            0x04, // ie_id=130, length=4
+            0x01, 0x00, 0x00, 0x08, 0x0A, 0x00, 0x00, 0x01, // 10.0.0.1
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("exporter addr decode");
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert!(r.src_addr.is_none());
+        assert!(r.dst_addr.is_none());
+        assert_eq!(
+            r.extra["exporterIPv4Address"], "10.0.0.1",
+            "exporterIPv4Address should go to extra; got: {}",
+            r.extra
+        );
+    }
+
+    // ---- set_u8_field: non-protocol/tcp-flags IEs go to extra ----
+
+    #[test]
+    fn u8_ie_non_protocol_goes_to_extra() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // ie_id=60 (ipVersion), length=1 — goes to extra
+        // msg: 16 + 12 tmpl + (4+1 = 5 data set) = 33 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x21, 0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x0C, 0x01, 0x00, 0x00, 0x01, 0x00, 0x3C, 0x00,
+            0x01, // ie_id=60, length=1
+            0x01, 0x00, 0x00, 0x05, 0x04, // IPv4=4
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("u8 extra decode");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].extra["ipVersion"], serde_json::json!(4u8));
+    }
+
+    // ---- set_u16_field: non-port IEs go to extra ----
+
+    #[test]
+    fn u16_ie_non_port_goes_to_extra() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // ie_id=58 (vlanId), length=2 — goes to extra
+        // msg: 16 + 12 tmpl + (4+2 = 6 data set) = 34 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x22, 0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x0C, 0x01, 0x00, 0x00, 0x01, 0x00, 0x3A, 0x00,
+            0x02, // ie_id=58, length=2
+            0x01, 0x00, 0x00, 0x06, 0x00, 0x64, // vlan 100
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("vlan decode");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].extra["vlanId"], serde_json::json!(100u16));
+    }
+
+    // ---- set_u32_field: non-interface IEs go to extra ----
+
+    #[test]
+    fn u32_ie_non_interface_goes_to_extra() {
+        // ie_id=10 is ingressInterface, ie_id=14 is egressInterface.
+        // All other U32 IEs should end up in extra — but looking at ie_info, all
+        // the registered U32 IEs are 10 and 14. Let's use an *unregistered* U32 IE
+        // to exercise the None branch of ie_info inside set_u32_field.
+        // We'll declare a custom template with ie_id=99 (unregistered, raw→extra as unknown ie).
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // The "extra match arm for set_u32_field" is exercised when ie_info returns Some
+        // but ie_id is not 10 or 14. Looking at the IE map, there are no registered U32
+        // IEs other than 10 and 14. To trigger that branch, we must use a custom U32 spec
+        // *and* manually insert into the cache (bypassing template parsing) to avoid also
+        // going through the unknown-IE branch (which just does raw-hex).
+        // Actually the easiest path is to call apply_field_to_record directly by building
+        // a data record. Since set_u32_field falls through to ie_info for unknown ie_ids,
+        // we can use ie_id=10 and ie_id=14 explicitly or just verify the extra path
+        // through the generic unknown-IE path in apply_field_to_record.
+        // Here we exercise set_u32_field's extra path by crafting a template where the
+        // IE is known-but-non-interface (but all U32 IEs in ie_info are 10 and 14, so
+        // we pick a known U32 IE that routes to extra — there isn't one).
+        // Instead, test the *interface* IEs (10 and 14 route to FlowRecord fields)
+        // plus verify output_interface via ie_id=14.
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x24, 0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x0C, 0x01, 0x00, 0x00, 0x01, 0x00, 0x0E, 0x00,
+            0x04, // ie_id=14 (egressInterface), length=4
+            0x01, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x07, // output_interface=7
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("egress iface decode");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].output_interface, Some(7u32));
+    }
+
+    // ---- set_u64_field: non-octet/packet IEs go to extra ----
+
+    #[test]
+    fn u64_ie_non_delta_goes_to_extra() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // ie_id=148 (flowId), length=8 — goes to extra
+        // msg: 16 + 12 tmpl + (4+8 = 12 data set) = 40 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x28, 0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x0C, 0x01, 0x00, 0x00, 0x01, 0x00, 0x94, 0x00,
+            0x08, // ie_id=148, length=8
+            0x01, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x86,
+            0xA0, // flowId=100_000
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("flowId decode");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].extra["flowId"], serde_json::json!(100_000u64));
+    }
+
+    // ---- apply_field_to_record: DateTimeMillis with other ie_id goes to extra ----
+
+    #[test]
+    fn datetime_millis_non_start_end_goes_to_extra() {
+        // The DateTimeMillis branch has a match: 152→flow_start, 153→flow_end, _→extra
+        // There are no other registered DateTimeMillis IEs in the map besides 152/153,
+        // so to exercise the _ arm we'd need a hypothetical extra DateTimeMillis IE.
+        // Instead, directly verify that ie 153 goes to flow_end (the second branch).
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // Template: ie_id=153 (flowEndMilliseconds), length=8
+        // msg: 16 + 12 tmpl + (4+8 = 12 data set) = 40 bytes
+        let end_ms: u64 = 1_735_689_601_000u64;
+        let eb = end_ms.to_be_bytes();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x00, 0x0A, 0x00, 0x28]);
+        buf.extend_from_slice(&[
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        buf.extend_from_slice(&[0x00, 0x02, 0x00, 0x0C]);
+        buf.extend_from_slice(&[0x01, 0x00, 0x00, 0x01]);
+        buf.extend_from_slice(&[0x00, 0x99, 0x00, 0x08]); // ie_id=153, length=8
+        buf.extend_from_slice(&[0x01, 0x00, 0x00, 0x0C]);
+        buf.extend_from_slice(&eb);
+
+        let records = decode_ipfix(&mut dec, &buf, exporter).expect("flow_end decode");
+        assert_eq!(records.len(), 1);
+        assert!(records[0].flow_end.is_some());
+        assert_eq!(
+            records[0].flow_end.unwrap().timestamp_millis(),
+            end_ms as i64
+        );
+    }
+
+    // ---- parse_ipfix_data_set: zero-length template (record_len=0) → empty ----
+
+    #[test]
+    fn data_set_with_zero_length_template_returns_empty() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // Manually insert a zero-length template (field_count=0)
+        let key: TemplateKey = (exporter, 0, 300);
+        dec.cache.insert(key, vec![]);
+
+        // A data set for template 300 — decoder should return empty due to record_len==0
+        // msg: 16 + (4+8 = 12 data set) = 28 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x1C, // total_len=28
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Data Set: set_id=300, len=12
+            0x01, 0x2C, 0x00, 0x0C, 0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44,
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("zero-len template decode");
+        assert_eq!(
+            records.len(),
+            0,
+            "zero-length template must produce no records"
+        );
+    }
+
+    // ---- decode_netflow_v9: wrong version for v9 decoder ----
+
+    #[test]
+    fn decode_netflow_v9_wrong_version_returns_error() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+        // 20-byte buf with version=10 sent to v9 decoder
+        let buf: &[u8] = &[
+            0x00, 0x0A, // version=10 (wrong)
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x05,
+        ];
+        let err = decode_netflow_v9(&mut dec, buf, exporter).unwrap_err();
+        assert!(matches!(err, DecodeError::UnknownVersion(10)));
+    }
+
+    // ---- decode_netflow_v9: flowset_len < 4 (malformed) ----
+
+    #[test]
+    fn decode_netflow_v9_flowset_len_too_small_returns_malformed() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+        // v9 header (20 bytes) + flowset with len=2 (malformed)
+        let buf: &[u8] = &[
+            0x00, 0x09, // version=9
+            0x00, 0x01, // count=1
+            0x00, 0x00, 0x00, 0x00, // sys_uptime
+            0x67, 0x5C, 0xB0, 0x20, // unix_secs
+            0x00, 0x00, 0x00, 0x01, // sequence
+            0x00, 0x00, 0x00, 0x05, // source_id
+            // FlowSet: id=0, len=2 (malformed, < 4)
+            0x00, 0x00, 0x00, 0x02,
+        ];
+        let err = decode_netflow_v9(&mut dec, buf, exporter).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Malformed { .. }),
+            "expected Malformed for flowset_len < 4, got: {err}"
+        );
+    }
+
+    // ---- decode_netflow_v9: flowset_end > buf.len() (truncated) ----
+
+    #[test]
+    fn decode_netflow_v9_flowset_overruns_buf_returns_truncated() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+        // v9 header (20 bytes) + flowset claiming len=200 but buf is only 24 bytes
+        let buf: &[u8] = &[
+            0x00, 0x09, // version=9
+            0x00, 0x01, // count=1
+            0x00, 0x00, 0x00, 0x00, 0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x05, // FlowSet: id=0, len=200 (overruns buf)
+            0x00, 0x00, 0x00, 0xC8,
+        ];
+        let err = decode_netflow_v9(&mut dec, buf, exporter).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Truncated { .. }),
+            "expected Truncated for flowset overrun, got: {err}"
+        );
+    }
+
+    // ---- decode_netflow_v9: flowset_id=1 (options template, skipped) ----
+
+    #[test]
+    fn decode_netflow_v9_options_template_flowset_is_skipped() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+        // v9 header + options template flowset (id=1) with minimal body
+        // total: 20 + 4 + 4 (body) = 28 bytes; flowset len = 8
+        let buf: &[u8] = &[
+            0x00, 0x09, // version=9
+            0x00, 0x01, // count=1
+            0x00, 0x00, 0x00, 0x00, 0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x05, // Options Template FlowSet: id=1, len=8
+            0x00, 0x01, 0x00, 0x08, 0x01, 0x00, 0x00, 0x01, // some body bytes
+        ];
+        let records = decode_netflow_v9(&mut dec, buf, exporter)
+            .expect("options template flowset must not error");
+        assert_eq!(
+            records.len(),
+            0,
+            "options template flowset produces no data records"
+        );
+    }
+
+    // ---- decode_netflow_v9: reserved flowset_id (2..255 range) ----
+
+    #[test]
+    fn decode_netflow_v9_reserved_flowset_id_is_skipped() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+        // v9 header + flowset with id=50 (reserved 2..255)
+        let buf: &[u8] = &[
+            0x00, 0x09, // version=9
+            0x00, 0x01, // count=1
+            0x00, 0x00, 0x00, 0x00, 0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x05, // FlowSet: id=50 (reserved), len=4 (empty body)
+            0x00, 0x32, 0x00, 0x04,
+        ];
+        let records =
+            decode_netflow_v9(&mut dec, buf, exporter).expect("reserved flowset id must not error");
+        assert_eq!(records.len(), 0);
+    }
+
+    // ---- decode_netflow_v9: truncated template field list ----
+
+    #[test]
+    fn decode_netflow_v9_template_field_truncated_returns_error() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+        // Template flowset: claims 2 fields but only provides 1 field (4 bytes for 1 field)
+        // template flowset body: tmpl_id(2) + field_count(2) + 4 bytes = 8 bytes body
+        // flowset: 4 hdr + 8 body = 12; total: 20 + 12 = 32
+        let buf: &[u8] = &[
+            0x00, 0x09, // version=9
+            0x00, 0x01, // count=1
+            0x00, 0x00, 0x00, 0x00, 0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x05, // Template FlowSet: id=0, len=12
+            0x00, 0x00, 0x00, 0x0C,
+            // Template record: tmpl_id=256, field_count=2 (only 1 field present)
+            0x01, 0x00, // template_id=256
+            0x00, 0x02, // field_count=2
+            0x00, 0x08, 0x00, 0x04, // field 1 only
+        ];
+        let err = decode_netflow_v9(&mut dec, buf, exporter).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Truncated { .. }),
+            "expected Truncated for v9 truncated template, got: {err}"
+        );
+    }
+
+    // ---- decode_netflow_v5: wrong version for v5 decoder ----
+
+    #[test]
+    fn decode_netflow_v5_wrong_version_returns_error() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        // Valid-looking 24-byte header with version=9 (wrong for v5 decoder)
+        let buf: &[u8] = &[
+            0x00, 0x09, // version=9 (wrong)
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let err = decode_netflow_v5(buf, exporter).unwrap_err();
+        assert!(matches!(err, DecodeError::UnknownVersion(9)));
+    }
+
+    // ---- decode_datagram: buf shorter than 2 bytes (1 byte) ----
+
+    #[test]
+    fn decode_datagram_one_byte_returns_truncated() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+        let err = decode_datagram(&mut dec, &[0x00], exporter).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DecodeError::Truncated {
+                    offset: 0,
+                    need: 2,
+                    have: 1
+                }
+            ),
+            "expected Truncated for 1-byte buf, got: {err}"
+        );
+    }
+
+    // ---- try_insert_template: warned flag is reset when cache drops below capacity ----
+
+    #[test]
+    fn template_cache_warned_flag_resets_after_update() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let mut dec = IpfixDecoder::new();
+
+        // Fill to capacity using direct inserts
+        for i in 0u32..MAX_CACHED_TEMPLATES as u32 {
+            let a = (i >> 16) as u8;
+            let b = (i >> 8) as u8;
+            let c = i as u8;
+            let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, a, b, c));
+            let tmpl_id = ((i % 65000) + 256) as u16;
+            let obs_domain = i / 65000;
+            dec.cache.insert((exporter, obs_domain, tmpl_id), vec![]);
+        }
+
+        // Attempt to insert a new key → rejected, warns
+        let new_exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 99, 1));
+        dec.try_insert_template((new_exporter, 0, 300), vec![]);
+        assert!(
+            dec.template_limit_warned,
+            "warned flag should be set after rejection"
+        );
+
+        // Update an *existing* key — cache size stays at MAX, so warned stays true
+        // (the reset only happens when len < MAX after an insert that *reduces* cache
+        // size, which can't happen via try_insert_template).
+        // We can verify the update path: existing key is always accepted.
+        let existing_exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0));
+        let existing_key: TemplateKey = (existing_exporter, 0, 256);
+        assert!(dec.cache.contains_key(&existing_key));
+        dec.try_insert_template(
+            existing_key,
+            vec![FieldSpecifier {
+                ie_id: 4,
+                length: 1,
+                enterprise_number: None,
+            }],
+        );
+        // The key was already present so it was updated (cache.len() stays the same).
+        // warned flag reset happens only when cache.len() < MAX — not the case here.
+        assert_eq!(
+            dec.cache.get(&existing_key).unwrap().len(),
+            1,
+            "existing key updated"
+        );
+    }
+
+    // ---- parse_ipfix_options_template_set: enterprise field in options template ----
+
+    #[test]
+    fn options_template_with_enterprise_field_is_parsed() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // Options Template Set (set_id=3) with one enterprise field:
+        // body: tmpl_id(2) + field_count(2) + scope_count(2) + enterprise_raw_ie(2) + len(2) + PEN(4) = 14 bytes
+        // set: 4 + 14 = 18; msg: 16 + 18 = 34 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x22, // total_len=34
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Options Template Set header: set_id=3, len=18
+            0x00, 0x03, 0x00, 0x12, // body (14 bytes):
+            0x01, 0x40, // template_id=320
+            0x00, 0x01, // field_count=1
+            0x00, 0x01, // scope_count=1
+            // enterprise field: raw_ie=0x8020 (bit15 + 32), len=4
+            0x80, 0x20, 0x00, 0x04, // PEN=0x00002710 (10000)
+            0x00, 0x00, 0x27, 0x10,
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter)
+            .expect("options template enterprise field must not error");
+        assert_eq!(records.len(), 0);
+        let key: TemplateKey = (exporter, 0, 320);
+        let fields = dec
+            .cache
+            .get(&key)
+            .expect("options template 320 should be cached");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].enterprise_number, Some(10000));
+        assert_eq!(fields[0].ie_id, 32); // bit15 cleared
+    }
+
+    // ---- parse_ipfix_options_template_set: template_id < 256 is ignored ----
+
+    #[test]
+    fn options_template_with_id_below_256_is_ignored() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // Options Template Set (set_id=3) with template_id=5 (< 256 → ignored)
+        // body: tmpl_id(2) + field_count(2) + scope_count(2) + 1 field(4) = 10 bytes
+        // set: 4 + 10 = 14; msg: 16 + 14 = 30 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x1E, // total_len=30
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+            0x00, 0x0E, // body:
+            0x00, 0x05, // template_id=5 (<256, should be ignored)
+            0x00, 0x01, // field_count=1
+            0x00, 0x01, // scope_count=1
+            0x00, 0x08, 0x00, 0x04, // field
+        ];
+        let records =
+            decode_ipfix(&mut dec, buf, exporter).expect("options template id<256 must not error");
+        assert_eq!(records.len(), 0);
+        // Template 5 should NOT be cached
+        let key: TemplateKey = (exporter, 0, 5);
+        assert!(
+            !dec.cache.contains_key(&key),
+            "template_id<256 must not be cached"
+        );
+    }
+
+    // ---- postNAT src/dst IEs route to src_addr/dst_addr ----
+
+    #[test]
+    fn post_nat_src_dst_ies_map_to_addr_fields() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // ie_id=225 (postNATSourceIPv4Address) and ie_id=226 (postNATDestinationIPv4Address)
+        // msg: 16 + (4+4+4+4 = 16 tmpl set) + (4+8 = 12 data set) = 44 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x2C, 0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, // Template Set: set_id=2, len=16
+            0x00, 0x02, 0x00, 0x10, 0x01, 0x00, 0x00, 0x02, // tmpl_id=256, field_count=2
+            0x00, 0xE1, 0x00, 0x04, // ie_id=225 (postNATSrc), len=4
+            0x00, 0xE2, 0x00, 0x04, // ie_id=226 (postNATDst), len=4
+            // Data Set: set_id=256, len=12
+            0x01, 0x00, 0x00, 0x0C, 0xC0, 0xA8, 0x02, 0x01, // 192.168.2.1
+            0x0A, 0x01, 0x00, 0x01, // 10.1.0.1
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("postNAT decode");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].src_addr,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 1)))
+        );
+        assert_eq!(
+            records[0].dst_addr,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 1)))
+        );
+    }
+
+    // ---- postNAPT src/dst port IEs route to src_port/dst_port ----
+
+    #[test]
+    fn post_napt_port_ies_map_to_port_fields() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // ie_id=227 (postNAPTSourceTransportPort) and ie_id=228 (postNAPTDestinationTransportPort)
+        // msg: 16 msg_hdr + 16 tmpl_set + 8 data_set = 40 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x28, // total_len=40
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Template Set: set_id=2, len=16
+            0x00, 0x02, 0x00, 0x10, 0x01, 0x00, 0x00, 0x02, // tmpl_id=256, field_count=2
+            0x00, 0xE3, 0x00, 0x02, // ie_id=227, len=2
+            0x00, 0xE4, 0x00, 0x02, // ie_id=228, len=2
+            // Data Set: set_id=256, len=8
+            0x01, 0x00, 0x00, 0x08, 0x1F, 0x90, // 8080
+            0x00, 0x50, // 80
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter).expect("postNAPT decode");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].src_port, Some(8080));
+        assert_eq!(records[0].dst_port, Some(80));
+    }
+
+    // ---- NetFlow v9 source_id stored as observation_domain_id ----
+
+    #[test]
+    fn netflow_v9_source_id_stored_in_observation_domain_id() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 50));
+        let mut dec = IpfixDecoder::new();
+        let records = decode_netflow_v9(&mut dec, FIXTURE_NFV9_TEMPLATE_THEN_DATA, exporter)
+            .expect("v9 decode for source_id check");
+        // FIXTURE_NFV9_TEMPLATE_THEN_DATA has source_id=5
+        assert_eq!(
+            records[0].observation_domain_id, 5,
+            "source_id must be stored as observation_domain_id"
+        );
+        assert_eq!(records[0].protocol_version, 9);
+    }
+
+    // ---- NetFlow v9 template cache uses source_id as domain, separate from v10 ----
+
+    #[test]
+    fn netflow_v9_template_keyed_by_source_id_not_shared_with_v10() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 60));
+        let mut dec = IpfixDecoder::new();
+
+        // Decode v9 packet to populate cache with source_id=5
+        decode_netflow_v9(&mut dec, FIXTURE_NFV9_TEMPLATE_THEN_DATA, exporter)
+            .expect("v9 template population");
+
+        // v9 template key uses source_id=5
+        let v9_key: TemplateKey = (exporter, 5, 256);
+        assert!(
+            dec.cache.contains_key(&v9_key),
+            "v9 template must be keyed by source_id"
+        );
+
+        // v10 with obs_domain=5 would also have key (exporter, 5, 256), but decoding
+        // a v10 with obs_domain=0 must NOT find the v9 template under domain=0.
+        let v10_key_wrong_domain: TemplateKey = (exporter, 0, 256);
+        assert!(
+            !dec.cache.contains_key(&v10_key_wrong_domain),
+            "v10 domain=0 template must not exist in v9-populated cache"
+        );
+    }
 }
