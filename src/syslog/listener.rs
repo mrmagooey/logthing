@@ -660,6 +660,51 @@ mod tests {
         );
     }
 
+    /// Firing the shutdown signal makes `start_with_shutdown` return cleanly
+    /// within a short timeout (the shutdown arm of the select! is exercised).
+    #[tokio::test]
+    async fn start_with_shutdown_exits_on_signal() {
+        use tokio::sync::watch;
+        use tokio::time::timeout;
+
+        // Bind on ephemeral ports so we don't need privileged ports or fixed values.
+        let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = udp_socket.local_addr().unwrap().port();
+        drop(udp_socket); // release so start_with_shutdown can re-bind
+
+        let tcp_listener_raw = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tcp_listener_raw.local_addr().unwrap().port();
+        drop(tcp_listener_raw);
+
+        let config = SyslogListenerConfig {
+            udp_port,
+            tcp_port,
+            bind_address: "127.0.0.1".to_string(),
+            parse_dns_logs: false,
+        };
+        let handler: Arc<dyn SyslogHandler> = Arc::new(DefaultSyslogHandler::new(false));
+        let listener = SyslogListener::new(config, handler);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let task = tokio::spawn(async move {
+            listener.start_with_shutdown(shutdown_rx).await.ok();
+        });
+
+        // Give the listener time to bind and enter the select! loop.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Send the shutdown signal.
+        shutdown_tx.send(true).unwrap();
+
+        // The task must complete within 2 s.
+        let result = timeout(Duration::from_secs(2), task).await;
+        assert!(
+            result.is_ok(),
+            "start_with_shutdown did not return after shutdown signal within 2 s"
+        );
+    }
+
     /// Sending an unparseable syslog line via TCP increments `syslog_parse_errors`
     /// and does NOT dispatch a message to the handler.
     #[tokio::test]
