@@ -3,24 +3,55 @@
 //! Provides:
 //! - `syslog_schema()` — fixed Arrow schema for `SyslogMessage`
 //! - `syslog_message_to_batch()` — convert one message to a single-row RecordBatch
-//! - `encode_batches_to_parquet()` — encode a slice of RecordBatches to Parquet bytes
-//! - `SyslogS3Writer` — buffers RecordBatches and flushes to S3 on size/age thresholds
-//! - `SyslogS3Handler` — implements `SyslogHandler`, wraps a bounded channel + background writer
+//! - `SyslogSink` — `ParquetSink` adapter for the generic writer
+//! - `SyslogS3Handler` — type alias for `ParquetWriterHandle<SyslogSink>`
+//! - `syslog_start()` — convenience constructor wiring `SyslogS3Config` → `ParquetWriterHandle`
 
-use crate::forwarding::s3_sink::S3Sink;
+use crate::forwarding::buffered_writer::ParquetSink;
 use crate::syslog::SyslogMessage;
 use arrow::array::{ArrayRef, StringArray, UInt8Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use chrono::{Datelike, Utc};
-use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::WriterProperties;
-use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
-use tokio::sync::mpsc;
-use tracing::warn;
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+/// Per-source S3 persistence config for the syslog listener.
+/// Absent from TOML → `None` → no S3 persistence (backward compatible).
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct SyslogS3Config {
+    /// Shared S3 connection fields (endpoint, bucket, region, access_key, secret_key).
+    /// Flattened so the TOML block stays flat: `[syslog.s3]\nendpoint = …`
+    #[serde(flatten)]
+    pub connection: crate::config::S3ConnectionConfig,
+    /// S3 key prefix for syslog objects, slash-free (default: `"syslog"`); builder inserts `/`.
+    #[serde(default = "default_syslog_s3_prefix")]
+    pub prefix: String,
+    /// Flush when row count reaches this threshold (default 10 000).
+    #[serde(default = "default_syslog_s3_max_rows")]
+    pub max_buffer_rows: usize,
+    /// Flush after this many seconds regardless of row count (default 900 = 15 min).
+    #[serde(default = "default_syslog_s3_flush_interval_secs")]
+    pub flush_interval_secs: u64,
+    /// Bounded channel capacity (number of messages; default 4096).
+    #[serde(default = "default_syslog_s3_channel_capacity")]
+    pub channel_capacity: usize,
+}
+
+fn default_syslog_s3_prefix() -> String {
+    "syslog".to_string()
+}
+fn default_syslog_s3_max_rows() -> usize {
+    10_000
+}
+fn default_syslog_s3_flush_interval_secs() -> u64 {
+    900
+}
+fn default_syslog_s3_channel_capacity() -> usize {
+    4_096
+}
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -92,12 +123,15 @@ pub fn syslog_message_to_batch(msg: &SyslogMessage) -> anyhow::Result<RecordBatc
 }
 
 // ---------------------------------------------------------------------------
-// Parquet encoding
+// Parquet encoding (kept as private helper for tests)
 // ---------------------------------------------------------------------------
 
-/// Encode a slice of `RecordBatch`es (all sharing `syslog_schema()`) into a Parquet byte buffer.
-/// Returns an empty `Vec` if `batches` is empty.
+#[cfg(test)]
 pub(crate) fn encode_batches_to_parquet(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> {
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::{Compression, ZstdLevel};
+    use parquet::file::properties::WriterProperties;
+
     if batches.is_empty() {
         return Ok(Vec::new());
     }
@@ -115,276 +149,90 @@ pub(crate) fn encode_batches_to_parquet(batches: &[RecordBatch]) -> anyhow::Resu
 }
 
 // ---------------------------------------------------------------------------
-// SyslogS3Writer
+// SyslogSink — ParquetSink adapter
 // ---------------------------------------------------------------------------
 
-/// Writer configuration.
-pub struct SyslogS3WriterConfig {
-    /// Maximum number of buffered rows before an automatic flush is triggered.
-    pub max_buffer_rows: usize,
-    /// Maximum wall-clock age of a non-empty buffer before flush.
-    pub flush_interval: std::time::Duration,
-    /// S3 key prefix without a trailing slash, e.g. `"syslog"`.
-    /// The key builder inserts the `/` separator, so `"syslog"` produces
-    /// `"syslog/year=.../month=.../day=.../<uuid>.parquet"`.
-    pub key_prefix: String,
-}
+/// `ParquetSink` adapter for syslog messages.
+/// The `Record` type is `SyslogMessage` — one row per message.
+pub struct SyslogSink;
 
-impl Default for SyslogS3WriterConfig {
-    fn default() -> Self {
-        Self {
-            max_buffer_rows: 10_000,
-            flush_interval: std::time::Duration::from_secs(900), // 15 min
-            key_prefix: "syslog".to_string(),
-        }
-    }
-}
+impl ParquetSink for SyslogSink {
+    type Record = SyslogMessage;
 
-impl SyslogS3WriterConfig {
-    /// Hard cap on total buffered rows: 4× the flush threshold.
-    /// When the buffer exceeds this limit and a flush fails, the oldest batch(es)
-    /// are dropped to keep memory bounded.
-    pub fn hard_cap_rows(&self) -> usize {
-        self.max_buffer_rows.saturating_mul(4)
-    }
-}
-
-/// Buffers `SyslogMessage` rows as Arrow `RecordBatch`es and flushes to S3 as Parquet.
-pub struct SyslogS3Writer {
-    config: SyslogS3WriterConfig,
-    sink: Arc<S3Sink>,
-    buffer: VecDeque<RecordBatch>,
-    buffer_row_count: usize,
-    last_flush: Instant,
-    /// Timestamp of the last drop-warning log line, used to throttle noisy output.
-    last_drop_warn: Option<Instant>,
-}
-
-impl SyslogS3Writer {
-    pub fn new(config: SyslogS3WriterConfig, sink: Arc<S3Sink>) -> Self {
-        Self {
-            config,
-            sink,
-            buffer: VecDeque::new(),
-            buffer_row_count: 0,
-            last_flush: Instant::now(),
-            last_drop_warn: None,
-        }
+    fn source(&self) -> &'static str {
+        "syslog"
     }
 
-    /// Returns the number of rows currently held in the write buffer.
-    ///
-    /// Used by tests to inspect internal state without exposing the field directly.
-    #[allow(dead_code)] // used in tests via `super::*`; not called from production code yet
-    pub(crate) fn buffered_rows(&self) -> usize {
-        self.buffer_row_count
+    fn partition(&self, _: &SyslogMessage) -> Option<String> {
+        None
     }
 
-    /// Append one message to the buffer; flushes immediately if the row-count threshold is met.
-    /// If the flush fails and the buffer has grown past the hard cap, the oldest batch(es) are
-    /// dropped to keep memory bounded.  Dropped rows increment `syslog_s3_buffer_dropped`.
-    pub async fn push(&mut self, msg: &SyslogMessage) -> anyhow::Result<()> {
-        let batch = syslog_message_to_batch(msg)?;
-        self.buffer_row_count += batch.num_rows();
-        self.buffer.push_back(batch);
-        if self.buffer_row_count < self.config.max_buffer_rows {
-            return Ok(());
-        }
-        self.flush_then_cap().await
+    fn schema(&self, _: Option<&str>) -> Arc<arrow_schema::Schema> {
+        syslog_schema()
     }
 
-    /// Attempt a flush; if it fails and the buffer exceeds the hard cap, drop the oldest batches.
-    /// This ensures the hard cap is enforced on every trigger path (threshold and timer).
-    async fn flush_then_cap(&mut self) -> anyhow::Result<()> {
-        if let Err(e) = self.flush().await {
-            // Flush failed (S3 unavailable); apply the hard cap to prevent unbounded growth.
-            let cap = self.config.hard_cap_rows();
-            if self.buffer_row_count > cap {
-                self.drop_oldest_to_cap(cap);
-            }
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    /// Drop batches from the front of the buffer until `buffer_row_count <= cap`.
-    fn drop_oldest_to_cap(&mut self, cap: usize) {
-        let mut dropped_rows: usize = 0;
-        while self.buffer_row_count > cap {
-            if self.buffer.is_empty() {
-                break;
-            }
-            let oldest = self
-                .buffer
-                .pop_front()
-                .expect("buffer non-empty per loop guard");
-            let n = oldest.num_rows();
-            self.buffer_row_count = self.buffer_row_count.saturating_sub(n);
-            dropped_rows += n;
-        }
-        if dropped_rows > 0 {
-            metrics::counter!("syslog_s3_buffer_dropped").increment(dropped_rows as u64);
-            // Throttle the warning to at most once per 30 seconds.
-            let should_warn = self
-                .last_drop_warn
-                .map(|t| t.elapsed().as_secs() >= 30)
-                .unwrap_or(true);
-            if should_warn {
-                warn!(
-                    dropped_rows,
-                    buffer_row_count = self.buffer_row_count,
-                    "SyslogS3Writer: S3 upload failing — dropped oldest rows to stay within hard cap"
-                );
-                self.last_drop_warn = Some(Instant::now());
-            }
-        }
-    }
-
-    /// Flush if the age or row-count threshold is exceeded; no-op if the buffer is empty.
-    /// If the flush fails, the hard cap is enforced to keep memory bounded.
-    pub async fn flush_if_needed(&mut self) -> anyhow::Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-        let age_exceeded = self.last_flush.elapsed() >= self.config.flush_interval;
-        let size_exceeded = self.buffer_row_count >= self.config.max_buffer_rows;
-        if age_exceeded || size_exceeded {
-            self.flush_then_cap().await?;
-        }
-        Ok(())
-    }
-
-    /// Unconditionally encode all buffered rows to Parquet and upload via `self.sink`.
-    /// Clears the buffer on success.
-    pub async fn flush(&mut self) -> anyhow::Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-        // VecDeque is not contiguous, so collect clones for the encoder.
-        // RecordBatch clones are cheap (Arc-backed column arrays).
-        let batches: Vec<RecordBatch> = self.buffer.iter().cloned().collect();
-        // Move the CPU-bound Parquet encode off the async runtime thread.
-        let bytes = tokio::task::spawn_blocking(move || encode_batches_to_parquet(&batches))
-            .await
-            .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
-        let key = self.build_key();
-        match self.sink.upload(&key, bytes).await {
-            Ok(()) => {
-                metrics::counter!("syslog_s3_records_written")
-                    .increment(self.buffer_row_count as u64);
-                metrics::counter!("syslog_s3_uploads").increment(1);
-            }
-            Err(e) => {
-                metrics::counter!("syslog_s3_upload_errors").increment(1);
-                return Err(e);
-            }
-        }
-        self.buffer.clear();
-        self.buffer_row_count = 0;
-        self.last_flush = std::time::Instant::now();
-        Ok(())
-    }
-
-    /// Build the S3 object key: `{prefix}/year={Y}/month={MM}/day={DD}/{uuid}.parquet`
-    fn build_key(&self) -> String {
-        let now = Utc::now();
-        let id = uuid::Uuid::new_v4();
-        format!(
-            "{}/year={}/month={:02}/day={:02}/{}.parquet",
-            self.config.key_prefix,
-            now.year(),
-            now.month(),
-            now.day(),
-            id,
-        )
+    fn to_record_batch(
+        &self,
+        record: &SyslogMessage,
+        _schema: &Arc<arrow_schema::Schema>,
+    ) -> anyhow::Result<arrow_array::RecordBatch> {
+        syslog_message_to_batch(record)
     }
 }
 
 // ---------------------------------------------------------------------------
-// SyslogS3Handler
+// SyslogS3Handler — type alias + SyslogHandler impl
 // ---------------------------------------------------------------------------
 
-/// Channel capacity for the handler → writer channel (production default).
-/// Used by `start()` as a convenience wrapper and available for callers that
-/// want the default without hardcoding the literal.
-#[allow(dead_code)]
-pub const SYSLOG_S3_CHANNEL_CAPACITY: usize = 4_096;
-
-/// `SyslogHandler` implementation that forwards messages through a bounded channel to a background
-/// writer task.  Messages dropped on overflow increment `syslog_s3_dropped`.
-pub struct SyslogS3Handler {
-    sender: mpsc::Sender<SyslogMessage>,
-}
-
-impl SyslogS3Handler {
-    /// Construct a handler and start the writer background task with the default channel capacity.
-    ///
-    /// Returns `(handler, writer_task_handle)`. The caller should retain the `JoinHandle` and
-    /// await it (with a timeout) during graceful shutdown, after all `Arc<SyslogS3Handler>`
-    /// references have been dropped so the channel closes and the final flush fires.
-    #[allow(dead_code)]
-    pub fn start(
-        config: SyslogS3WriterConfig,
-        sink: Arc<S3Sink>,
-    ) -> (Self, tokio::task::JoinHandle<()>) {
-        Self::start_with_capacity(config, sink, SYSLOG_S3_CHANNEL_CAPACITY)
-    }
-
-    /// Construct a handler and start the writer background task with a custom channel `capacity`.
-    ///
-    /// Returns `(handler, writer_task_handle)`. The caller should hold the `JoinHandle` and await
-    /// it (with a timeout) during shutdown, after dropping all `Arc<dyn SyslogHandler>` references
-    /// so that the channel closes and the writer flushes its buffer.
-    pub fn start_with_capacity(
-        config: SyslogS3WriterConfig,
-        sink: Arc<S3Sink>,
-        capacity: usize,
-    ) -> (Self, tokio::task::JoinHandle<()>) {
-        let (tx, mut rx) = mpsc::channel::<SyslogMessage>(capacity);
-        let flush_check = crate::forwarding::s3_sink::flush_check_interval(config.flush_interval);
-        let handle = tokio::spawn(async move {
-            let mut writer = SyslogS3Writer::new(config, sink);
-            let mut interval = tokio::time::interval(flush_check);
-            loop {
-                tokio::select! {
-                    msg = rx.recv() => {
-                        match msg {
-                            Some(m) => {
-                                if let Err(e) = writer.push(&m).await {
-                                    warn!("SyslogS3Writer::push error: {e}");
-                                }
-                            }
-                            None => {
-                                // Sender dropped — flush remaining and exit.
-                                if let Err(e) = writer.flush().await {
-                                    warn!("SyslogS3Writer::flush on shutdown error: {e}");
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    _ = interval.tick() => {
-                        if let Err(e) = writer.flush_if_needed().await {
-                            warn!("SyslogS3Writer::flush_if_needed error: {e}");
-                        }
-                    }
-                }
-            }
-        });
-        (Self { sender: tx }, handle)
-    }
-}
+/// `SyslogS3Handler` is a thin alias for the generic `ParquetWriterHandle<SyslogSink>`.
+pub type SyslogS3Handler = crate::forwarding::buffered_writer::ParquetWriterHandle<SyslogSink>;
 
 #[async_trait::async_trait]
-impl crate::syslog::listener::SyslogHandler for SyslogS3Handler {
+impl crate::syslog::listener::SyslogHandler
+    for crate::forwarding::buffered_writer::ParquetWriterHandle<SyslogSink>
+{
     async fn handle_message(&self, message: SyslogMessage, _source: std::net::SocketAddr) {
-        match self.sender.try_send(message) {
+        match self.try_send(message) {
             Ok(()) => {}
-            Err(_) => {
-                metrics::counter!("syslog_s3_dropped").increment(1);
+            Err(_dropped) => {
+                tracing::warn!("Syslog S3 channel full; dropped message");
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// syslog_start — convenience constructor
+// ---------------------------------------------------------------------------
+
+/// Construct a `SyslogS3Handler` (i.e. `ParquetWriterHandle<SyslogSink>`) from a
+/// `SyslogS3Config` and a pre-built `S3Sink`.
+///
+/// Returns `(handler, writer_task_handle)`. The caller should retain the `JoinHandle`
+/// and await it during graceful shutdown, after all `Arc<dyn SyslogHandler>` references
+/// have been dropped so the channel closes and the final flush fires.
+pub fn syslog_start(
+    cfg: &SyslogS3Config,
+    s3: std::sync::Arc<crate::forwarding::s3_sink::S3Sink>,
+) -> (SyslogS3Handler, tokio::task::JoinHandle<()>) {
+    use crate::forwarding::buffered_writer::{
+        BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
+    };
+    let bwc = BufferedWriterConfig {
+        connection: cfg.connection.clone(),
+        prefix: cfg.prefix.clone(),
+        max_buffer_rows: cfg.max_buffer_rows,
+        flush_threshold_bytes: usize::MAX, // syslog uses row-count + age triggers only
+        flush_interval_secs: cfg.flush_interval_secs,
+        channel_capacity: cfg.channel_capacity,
+        max_partitions: 1,
+    };
+    let policy = FlushPolicy {
+        max_rows: cfg.max_buffer_rows,
+        max_bytes: usize::MAX,
+        interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
+    };
+    ParquetWriterHandle::start(SyslogSink, s3, bwc, policy)
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +286,24 @@ mod tests {
             structured_data: None,
             protocol: SyslogProtocol::Unknown,
         }
+    }
+
+    // -- helper: unreachable S3Sink --
+
+    async fn unreachable_sink() -> Arc<crate::forwarding::s3_sink::S3Sink> {
+        use crate::config::S3ConnectionConfig;
+        let conn = S3ConnectionConfig {
+            endpoint: "http://127.0.0.1:1".to_string(), // port 1 is always refused
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key: "AKIATEST".to_string(),
+            secret_key: "SECRETTEST".to_string(),
+        };
+        Arc::new(
+            crate::forwarding::s3_sink::S3Sink::from_connection(&conn)
+                .await
+                .expect("constructs"),
+        )
     }
 
     // -- Task 1: schema shape --
@@ -617,401 +483,74 @@ mod tests {
         assert_eq!(total_rows, 3);
     }
 
-    // -- Helper: build an S3Sink that always fails (unreachable port 1) --
+    // -- SyslogSink adapter tests --
 
-    async fn unreachable_sink() -> Arc<S3Sink> {
+    #[test]
+    fn syslog_sink_source_returns_syslog() {
+        assert_eq!(SyslogSink.source(), "syslog");
+    }
+
+    #[test]
+    fn syslog_sink_partition_returns_none() {
+        let msg = dummy_msg("test");
+        assert!(SyslogSink.partition(&msg).is_none());
+    }
+
+    #[test]
+    fn syslog_sink_to_record_batch_produces_correct_schema_and_rows() {
+        use crate::forwarding::buffered_writer::ParquetSink;
+        use arrow::array::StringArray;
+
+        let sink = SyslogSink;
+        let schema = sink.schema(None);
+        assert_eq!(schema.fields().len(), 11);
+
+        let msg = sample_rfc5424();
+        let batch = sink.to_record_batch(&msg, &schema).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        let hostname = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(hostname.value(0), "mymachine");
+    }
+
+    #[tokio::test]
+    async fn syslog_start_wires_handler_and_join_handle() {
         use crate::config::S3ConnectionConfig;
-        let conn = S3ConnectionConfig {
-            endpoint: "http://127.0.0.1:1".to_string(), // port 1 is always refused
-            bucket: "test-bucket".to_string(),
-            region: "us-east-1".to_string(),
-            access_key: "AKIATEST".to_string(),
-            secret_key: "SECRETTEST".to_string(),
-        };
-        Arc::new(S3Sink::from_connection(&conn).await.expect("constructs"))
-    }
-
-    // -- I1: SyslogS3Writer lifecycle unit test --
-
-    /// Verify that `SyslogS3Writer::push` accumulates rows below the threshold without flushing,
-    /// and that it triggers a flush (and retains data on failure) at the threshold.
-    #[tokio::test]
-    async fn writer_push_accumulates_below_threshold_and_fails_flush_at_threshold() {
-        let sink = unreachable_sink().await;
-        let config = SyslogS3WriterConfig {
-            max_buffer_rows: 3,
-            flush_interval: std::time::Duration::from_secs(3600),
-            key_prefix: "test".to_string(),
-        };
-        let mut writer = SyslogS3Writer::new(config, sink);
-
-        // Push 2 messages (below threshold of 3) — no flush should occur.
-        writer.push(&dummy_msg("one")).await.unwrap();
-        assert_eq!(
-            writer.buffered_rows(),
-            1,
-            "after first push: 1 row buffered"
-        );
-        writer.push(&dummy_msg("two")).await.unwrap();
-        assert_eq!(
-            writer.buffered_rows(),
-            2,
-            "after second push: 2 rows buffered, no flush yet"
-        );
-
-        // Third push hits the threshold — flush is attempted, fails (unreachable S3).
-        // On flush failure the buffer is retained (not cleared).
-        let result = writer.push(&dummy_msg("three")).await;
-        assert!(
-            result.is_err(),
-            "push at threshold must propagate the flush error"
-        );
-        // Buffer was NOT cleared because flush failed.
-        assert!(
-            writer.buffered_rows() >= 3,
-            "buffer must be retained when flush fails (got {})",
-            writer.buffered_rows()
-        );
-    }
-
-    // -- C1: unbounded-buffer hard-cap regression test --
-
-    /// When S3 is permanently unreachable, repeated pushes beyond the hard cap must cause the
-    /// writer to drop the oldest batch(es), keeping `buffered_rows()` at or below the cap.
-    #[tokio::test]
-    async fn writer_buffer_is_bounded_when_flush_always_fails() {
-        let sink = unreachable_sink().await;
-        // Small threshold so we flush often and the hard cap is easy to hit.
-        let max_rows = 2usize;
-        let config = SyslogS3WriterConfig {
-            max_buffer_rows: max_rows,
-            flush_interval: std::time::Duration::from_secs(3600),
-            key_prefix: "test".to_string(),
-        };
-        let hard_cap = config.hard_cap_rows(); // 2 * 4 = 8
-        let mut writer = SyslogS3Writer::new(config, sink);
-
-        // Push well beyond the hard cap — each batch that triggers a flush will fail.
-        // After enough pushes the drop logic must kick in and the buffer must stay bounded.
-        let total_pushes = hard_cap * 3; // 3× the cap
-        let mut flush_errors = 0usize;
-        for i in 0..total_pushes {
-            let result = writer.push(&dummy_msg(&format!("msg-{i}"))).await;
-            if result.is_err() {
-                flush_errors += 1;
-            }
-        }
-
-        assert!(flush_errors > 0, "expected at least some flush errors");
-        assert!(
-            writer.buffered_rows() <= hard_cap,
-            "buffer must stay at or below hard cap ({hard_cap}), got {}",
-            writer.buffered_rows()
-        );
-    }
-
-    // -- Task 3: channel semantics --
-
-    /// Verify that `SYSLOG_S3_CHANNEL_CAPACITY` is reasonable: it must be at least 256 (enough
-    /// to absorb short bursts) but not so large (≤ 65_536) that it would exhaust memory on a
-    /// large-payload workload with a stalled background writer.
-    #[test]
-    fn channel_capacity_is_within_operational_bounds() {
-        const { assert!(SYSLOG_S3_CHANNEL_CAPACITY >= 256, "channel too small") }
-        const { assert!(SYSLOG_S3_CHANNEL_CAPACITY <= 65_536, "channel too large") }
-    }
-
-    // -- I2: SyslogS3Handler overflow path test --
-
-    /// Verify that when the real `SyslogS3Handler`'s bounded channel is saturated,
-    /// `SyslogS3Handler::handle_message` increments `syslog_s3_dropped` rather than blocking.
-    ///
-    /// Uses `start_with_capacity(…, 1)` so the channel fills immediately once the background
-    /// writer task stalls awaiting the (always-failing) S3 upload.  Sends 50 messages — far more
-    /// than capacity + in-flight — and asserts the metric counter increased.  Uses a thread-local
-    /// `DebuggingRecorder` so this test is hermetic and does not conflict with other tests that
-    /// may install a global recorder.
-    #[tokio::test]
-    #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
-    async fn handler_overflow_increments_dropped_counter() {
-        use crate::syslog::listener::SyslogHandler as SyslogHandlerTrait;
-        use metrics::set_default_local_recorder;
-        use metrics_util::CompositeKey;
-        use metrics_util::MetricKind;
-        use metrics_util::debugging::DebuggingRecorder;
-        use std::net::SocketAddr;
-
-        // Install a thread-local debugging recorder so counter reads are hermetic.
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        let _guard = set_default_local_recorder(&recorder);
-
-        let sink = unreachable_sink().await;
-        // Channel capacity of 1: background task receives at most 1 message before it blocks
-        // waiting for the S3 upload to complete (which never succeeds on port 1).
-        let config = SyslogS3WriterConfig {
-            max_buffer_rows: 1, // flush on every message so the writer task stalls immediately
-            flush_interval: std::time::Duration::from_secs(3600),
-            key_prefix: "test".to_string(),
-        };
-        let (handler, _writer_handle) = SyslogS3Handler::start_with_capacity(config, sink, 1);
-
-        // Yield briefly so the background task starts and receives (and blocks on) the first
-        // message, leaving the channel slot empty again — but stalled inside an S3 upload.
-        // Then the next send fills the slot, and all subsequent sends are dropped.
-        tokio::task::yield_now().await;
-
-        let src: SocketAddr = "127.0.0.1:5514".parse().unwrap();
-
-        // Send 50 messages — far more than capacity (1) + in-flight (1).
-        // After the channel is full, every subsequent handle_message call must drop and increment
-        // the counter in the *caller's* task (this test), where our local recorder is active.
-        for i in 0..50usize {
-            handler
-                .handle_message(dummy_msg(&format!("overflow-{i}")), src)
-                .await;
-        }
-
-        // Give background task a moment to pull out the first message and stall on S3
-        // (it was already started above, but an extra yield doesn't hurt determinism).
-        tokio::task::yield_now().await;
-
-        // Snapshot and check the syslog_s3_dropped counter.
-        let snapshot = snapshotter.snapshot();
-        let map = snapshot.into_hashmap();
-        let key = CompositeKey::new(
-            MetricKind::Counter,
-            metrics::Key::from_name("syslog_s3_dropped"),
-        );
-        let dropped = map
-            .get(&key)
-            .map(|(_, _, v)| {
-                if let metrics_util::debugging::DebugValue::Counter(c) = v {
-                    *c
-                } else {
-                    0
-                }
-            })
-            .unwrap_or(0);
-
-        assert!(
-            dropped >= 1,
-            "expected syslog_s3_dropped ≥ 1 after saturating the channel; got {dropped}. \
-             The real SyslogS3Handler::handle_message must increment the counter on overflow."
-        );
-    }
-
-    // -- A3: prefix and channel_capacity coherence --
-
-    /// When `key_prefix` is set to `"syslog"` (slash-free, as main.rs now passes it),
-    /// `build_key` must insert the `/` separator so the generated key starts with
-    /// `syslog/year=` with correct date partitions.
-    #[test]
-    fn build_key_inserts_slash_between_prefix_and_partition() {
-        // Construct a writer with a slash-free key_prefix matching what main.rs now passes:
-        // `s3_cfg.prefix.clone()` where `prefix` defaults to `"syslog"`.
-        let config = SyslogS3WriterConfig {
-            max_buffer_rows: 1000,
-            flush_interval: std::time::Duration::from_secs(900),
-            key_prefix: "syslog".to_string(),
-        };
-        // We need access to the private build_key; test via the writer directly.
-        // Create an unreachable sink synchronously using a blocking executor.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let sink = rt.block_on(async { unreachable_sink().await });
-        let writer = SyslogS3Writer::new(config, sink);
-        let key = writer.build_key();
-        assert!(
-            key.starts_with("syslog/year="),
-            "key must start with 'syslog/year='; got: {key}"
-        );
-        assert!(key.contains("/month="), "key must contain /month=");
-        assert!(key.contains("/day="), "key must contain /day=");
-        assert!(key.ends_with(".parquet"), "key must end with .parquet");
-        // Guard against double-slash: the prefix must not produce "syslog//year="
-        assert!(
-            !key.contains("//"),
-            "key must not contain double-slash; got: {key}"
-        );
-    }
-
-    /// Prove that a custom slash-free prefix (e.g. `"logs"`) results in the correct key
-    /// structure `"logs/year=..."`, with exactly one slash between prefix and partition.
-    #[test]
-    fn build_key_respects_custom_slash_free_prefix() {
-        let config = SyslogS3WriterConfig {
-            max_buffer_rows: 1000,
-            flush_interval: std::time::Duration::from_secs(900),
-            // Slash-free custom prefix — main.rs now passes `s3_cfg.prefix.clone()`.
-            key_prefix: "logs".to_string(),
-        };
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let sink = rt.block_on(async { unreachable_sink().await });
-        let writer = SyslogS3Writer::new(config, sink);
-        let key = writer.build_key();
-        assert!(
-            key.starts_with("logs/year="),
-            "key must start with 'logs/year='; got: {key}"
-        );
-        assert!(
-            !key.contains("//"),
-            "key must not contain double-slash; got: {key}"
-        );
-    }
-
-    /// Verify that a configured `channel_capacity` is honored: capacity=1 causes drops,
-    /// a large capacity does not (for a modest send count).
-    #[tokio::test]
-    #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
-    async fn syslog_channel_capacity_parameter_is_wired() {
-        use crate::syslog::listener::SyslogHandler as SyslogHandlerTrait;
-        use metrics::set_default_local_recorder;
-        use metrics_util::CompositeKey;
-        use metrics_util::MetricKind;
-        use metrics_util::debugging::DebuggingRecorder;
-        use std::net::SocketAddr;
-
-        let src: SocketAddr = "127.0.0.1:5514".parse().unwrap();
-
-        // --- small capacity (1): expect drops ---
-        {
-            let recorder = DebuggingRecorder::new();
-            let snapshotter = recorder.snapshotter();
-            let _guard = set_default_local_recorder(&recorder);
-
-            let sink = unreachable_sink().await;
-            let config = SyslogS3WriterConfig {
-                max_buffer_rows: 1, // flush on every message so writer stalls on S3
-                flush_interval: std::time::Duration::from_secs(3600),
-                key_prefix: "syslog".to_string(),
-            };
-            let (handler, _writer_handle) = SyslogS3Handler::start_with_capacity(config, sink, 1);
-            tokio::task::yield_now().await;
-
-            for i in 0..30usize {
-                handler
-                    .handle_message(dummy_msg(&format!("msg-{i}")), src)
-                    .await;
-            }
-            tokio::task::yield_now().await;
-
-            let snapshot = snapshotter.snapshot();
-            let map = snapshot.into_hashmap();
-            let key = CompositeKey::new(
-                MetricKind::Counter,
-                metrics::Key::from_name("syslog_s3_dropped"),
-            );
-            let dropped = map
-                .get(&key)
-                .map(|(_, _, v)| {
-                    if let metrics_util::debugging::DebugValue::Counter(c) = v {
-                        *c
-                    } else {
-                        0
-                    }
-                })
-                .unwrap_or(0);
-            assert!(
-                dropped >= 1,
-                "capacity=1 should cause drops; got syslog_s3_dropped={dropped}"
-            );
-        }
-
-        // --- large capacity (10_000): expect no drops for 30 sends ---
-        {
-            let recorder = DebuggingRecorder::new();
-            let snapshotter = recorder.snapshotter();
-            let _guard = set_default_local_recorder(&recorder);
-
-            let sink = unreachable_sink().await;
-            let config = SyslogS3WriterConfig {
-                max_buffer_rows: 100_000, // prevent flush so channel never stalls
-                flush_interval: std::time::Duration::from_secs(3600),
-                key_prefix: "syslog".to_string(),
-            };
-            let (handler, _writer_handle) =
-                SyslogS3Handler::start_with_capacity(config, sink, 10_000);
-            tokio::task::yield_now().await;
-
-            for i in 0..30usize {
-                handler
-                    .handle_message(dummy_msg(&format!("msg-{i}")), src)
-                    .await;
-            }
-            tokio::task::yield_now().await;
-
-            let snapshot = snapshotter.snapshot();
-            let map = snapshot.into_hashmap();
-            let key = CompositeKey::new(
-                MetricKind::Counter,
-                metrics::Key::from_name("syslog_s3_dropped"),
-            );
-            let dropped = map
-                .get(&key)
-                .map(|(_, _, v)| {
-                    if let metrics_util::debugging::DebugValue::Counter(c) = v {
-                        *c
-                    } else {
-                        0
-                    }
-                })
-                .unwrap_or(0);
-            assert!(
-                dropped == 0,
-                "capacity=10_000 should not cause drops for 30 sends; got syslog_s3_dropped={dropped}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn handler_routes_messages_to_writer_task() {
         use crate::syslog::listener::SyslogHandler as SyslogHandlerTrait;
         use std::net::SocketAddr;
-        use tokio::sync::mpsc;
 
-        let (tx, mut rx) = mpsc::channel::<SyslogMessage>(SYSLOG_S3_CHANNEL_CAPACITY);
-        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let received_clone = received.clone();
-        tokio::spawn(async move {
-            while rx.recv().await.is_some() {
-                received_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-        });
+        let sink = unreachable_sink().await;
+        let cfg = SyslogS3Config {
+            connection: S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "AKIATEST".to_string(),
+                secret_key: "SECRETTEST".to_string(),
+            },
+            prefix: "syslog".to_string(),
+            max_buffer_rows: 10_000,
+            flush_interval_secs: 3600,
+            channel_capacity: 4096,
+        };
 
-        struct TestHandler(mpsc::Sender<SyslogMessage>);
-        #[async_trait::async_trait]
-        impl crate::syslog::listener::SyslogHandler for TestHandler {
-            async fn handle_message(&self, message: SyslogMessage, _src: SocketAddr) {
-                let _ = self.0.try_send(message);
-            }
-        }
+        let (handler, join_handle) = syslog_start(&cfg, sink);
 
-        let handler = TestHandler(tx);
+        // try_send one message through the handler
         let src: SocketAddr = "127.0.0.1:5514".parse().unwrap();
-        for i in 0u8..5 {
-            let msg = SyslogMessage {
-                priority: i,
-                severity: 0,
-                facility: 0,
-                timestamp: None,
-                hostname: None,
-                app_name: None,
-                proc_id: None,
-                msg_id: None,
-                message: format!("msg {i}"),
-                structured_data: None,
-                protocol: SyslogProtocol::Unknown,
-            };
-            handler.handle_message(msg, src).await;
-        }
+        handler.handle_message(dummy_msg("hello"), src).await;
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 5);
+        // Drop the handler to close the channel and trigger shutdown flush
+        drop(handler);
+
+        // Join the background task within 5s
+        tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
+            .await
+            .expect("writer task must exit within 5s")
+            .expect("writer task must not panic");
     }
 }

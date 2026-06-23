@@ -499,7 +499,8 @@ pub async fn write_config_to_path(config: &Config, path: &std::path::Path) -> an
 mod tests {
     use super::*;
     use crate::admin::state::{AdminServerConfig, AdminState, AuditLogger, PasswordHash};
-    use crate::config::{S3ConnectionConfig, SyslogS3Config, TlsConfig};
+    use crate::config::{S3ConnectionConfig, TlsConfig};
+    use crate::forwarding::syslog_s3::SyslogS3Config;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
