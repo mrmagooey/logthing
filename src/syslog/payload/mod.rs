@@ -118,15 +118,30 @@ impl StructuredSyslogRecord {
 /// 4. DNS (existing try-chain via `DnsLogEntry::from_syslog`)
 /// 5. None
 pub fn dispatch(msg: &SyslogMessage) -> SyslogPayload {
-    if let Some(r) = cef::try_parse(msg)       { return SyslogPayload::Cef(r); }
-    if let Some(r) = leef::try_parse(msg)      { return SyslogPayload::Leef(r); }
-    if let Some(r) = auditd::try_parse(msg)    { return SyslogPayload::Auditd(r); }
-    if let Some(r) = dhcp::try_parse(msg)      { return SyslogPayload::Dhcp(r); }
-    if let Some(r) = radius::try_parse(msg)    { return SyslogPayload::Radius(r); }
-    if let Some(r) = web_access::try_parse(msg){ return SyslogPayload::WebAccess(r); }
+    macro_rules! try_parser {
+        ($variant:ident, $module:ident) => {
+            if let Some(r) = $module::try_parse(msg) {
+                let payload = SyslogPayload::$variant(r);
+                if let Some(t) = payload.payload_type() {
+                    metrics::counter!("syslog_payload_parsed", "type" => t).increment(1);
+                }
+                return payload;
+            }
+        };
+    }
+
+    try_parser!(Cef,       cef);
+    try_parser!(Leef,      leef);
+    try_parser!(Auditd,    auditd);
+    try_parser!(Dhcp,      dhcp);
+    try_parser!(Radius,    radius);
+    try_parser!(WebAccess, web_access);
+
     if let Some(r) = crate::syslog::dns::DnsLogEntry::from_syslog(msg) {
+        metrics::counter!("syslog_payload_parsed", "type" => "dns").increment(1);
         return SyslogPayload::Dns(r);
     }
+
     SyslogPayload::None
 }
 
@@ -149,6 +164,72 @@ mod tests {
             structured_data: None,
             protocol: SyslogProtocol::Rfc3164,
         }
+    }
+
+    #[test]
+    fn dispatch_cef_message_returns_cef_variant() {
+        let m = bare_msg(
+            "CEF:0|Vendor|Product|1.0|100|Login|5|src=10.0.0.1 dst=10.0.0.2",
+        );
+        let p = dispatch(&m);
+        assert!(
+            matches!(p, SyslogPayload::Cef(_)),
+            "expected Cef variant, got {:?}",
+            p.payload_type()
+        );
+    }
+
+    #[test]
+    fn dispatch_leef_message_returns_leef_variant() {
+        let m = bare_msg("LEEF:1.0|V|P|1.0|E|\tkey=val");
+        assert!(matches!(dispatch(&m), SyslogPayload::Leef(_)));
+    }
+
+    #[test]
+    fn dispatch_auditd_message_returns_auditd_variant() {
+        let m = bare_msg("type=SYSCALL msg=audit(1609459200.000:1): syscall=59 success=yes");
+        assert!(matches!(dispatch(&m), SyslogPayload::Auditd(_)));
+    }
+
+    #[test]
+    fn dispatch_dhcp_message_returns_dhcp_variant() {
+        let m = bare_msg("DHCPACK on 10.0.0.5 to aa:bb:cc:dd:ee:ff (host) via eth0");
+        assert!(matches!(dispatch(&m), SyslogPayload::Dhcp(_)));
+    }
+
+    #[test]
+    fn dispatch_radius_message_returns_radius_variant() {
+        let m = bare_msg("Login OK: [alice] (from client vpn port 10)");
+        assert!(matches!(dispatch(&m), SyslogPayload::Radius(_)));
+    }
+
+    #[test]
+    fn dispatch_web_access_message_returns_web_access_variant() {
+        let m = bare_msg(
+            r#"192.168.1.1 - - [15/Jan/2024:10:00:00 +0000] "GET / HTTP/1.1" 200 1234 "-" "-""#,
+        );
+        assert!(matches!(dispatch(&m), SyslogPayload::WebAccess(_)));
+    }
+
+    #[test]
+    fn dispatch_dns_bind_returns_dns_variant() {
+        let m = bare_msg(
+            "client 192.168.1.10#12345: query: example.com IN A + (93.184.216.34)",
+        );
+        assert!(matches!(dispatch(&m), SyslogPayload::Dns(_)));
+    }
+
+    #[test]
+    fn payload_type_returns_expected_strings() {
+        assert_eq!(SyslogPayload::None.payload_type(), None);
+        // Just verify the string constants — real variants tested above.
+        assert_eq!(
+            SyslogPayload::Dhcp(crate::syslog::payload::dhcp::DhcpRecord {
+                message_type: "DHCPACK".into(),
+                ip_address: None, mac_address: None, hostname: None, interface: None,
+            }).payload_type(),
+            Some("dhcp")
+        );
     }
 
     #[test]
