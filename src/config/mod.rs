@@ -61,6 +61,9 @@ pub struct Config {
     pub zeek: ZeekConfig,
 
     #[serde(default)]
+    pub suricata: SuricataConfig,
+
+    #[serde(default)]
     pub wef: WefConfig,
 }
 
@@ -300,6 +303,61 @@ fn default_zeek_max_buffer_rows() -> usize {
     100_000
 }
 
+/// Configuration for the Suricata EVE JSON TCP listener.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SuricataConfig {
+    #[serde(default = "default_suricata_enabled")]
+    pub enabled: bool,
+
+    #[serde(default = "default_suricata_tcp_port")]
+    pub tcp_port: u16,
+
+    #[serde(default = "default_suricata_bind_address")]
+    pub bind_address: String,
+
+    /// Optional S3 persistence. Absent from TOML → `None` → no persistence.
+    #[serde(default)]
+    pub s3: Option<SuricataS3Config>,
+}
+
+impl Default for SuricataConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_suricata_enabled(),
+            tcp_port: default_suricata_tcp_port(),
+            bind_address: default_suricata_bind_address(),
+            s3: None,
+        }
+    }
+}
+
+fn default_suricata_enabled() -> bool { false }
+fn default_suricata_tcp_port() -> u16 { 47761 }
+fn default_suricata_bind_address() -> String { "0.0.0.0".to_string() }
+
+/// Per-source S3 persistence config for the Suricata listener.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SuricataS3Config {
+    #[serde(flatten)]
+    pub connection: S3ConnectionConfig,
+    #[serde(default = "default_suricata_s3_prefix")]
+    pub prefix: String,
+    #[serde(default = "default_suricata_flush_bytes")]
+    pub flush_threshold_bytes: usize,
+    #[serde(default = "default_suricata_flush_secs")]
+    pub flush_interval_secs: u64,
+    #[serde(default = "default_suricata_channel_capacity")]
+    pub channel_capacity: usize,
+    #[serde(default = "default_suricata_max_buffer_rows")]
+    pub max_buffer_rows: usize,
+}
+
+fn default_suricata_s3_prefix() -> String { "suricata".to_string() }
+fn default_suricata_flush_bytes() -> usize { 100 * 1024 * 1024 }
+fn default_suricata_flush_secs() -> u64 { 900 }
+fn default_suricata_channel_capacity() -> usize { 256 }
+fn default_suricata_max_buffer_rows() -> usize { 100_000 }
+
 /// Per-source S3 persistence config for WEF (Windows Event Forwarding).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WefS3Config {
@@ -445,6 +503,7 @@ impl Default for Config {
             syslog: SyslogConfig::default(),
             ipfix: IpfixConfig::default(),
             zeek: ZeekConfig::default(),
+            suricata: SuricataConfig::default(),
             wef: WefConfig::default(),
         }
     }
@@ -864,6 +923,57 @@ secret_key = "secret"
             cfg.ipfix.s3.is_none(),
             "absent [ipfix.s3] must yield None for backward compat"
         );
+    }
+
+    #[test]
+    fn default_suricata_config_disabled_on_port_47761() {
+        let cfg = Config::default();
+        assert!(!cfg.suricata.enabled, "suricata disabled by default");
+        assert_eq!(cfg.suricata.tcp_port, 47761);
+        assert_eq!(cfg.suricata.bind_address, "0.0.0.0");
+        assert!(cfg.suricata.s3.is_none(), "absent [suricata.s3] must be None");
+    }
+
+    #[test]
+    fn suricata_s3_flat_toml_deserializes_correctly() {
+        let toml_str = r#"
+[suricata]
+enabled = true
+tcp_port = 47761
+[suricata.s3]
+endpoint   = "http://minio:9000"
+bucket     = "suricata-logs"
+region     = "us-east-1"
+access_key = "KEY"
+secret_key = "SECRET"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse config");
+        assert!(cfg.suricata.enabled);
+        let s3 = cfg.suricata.s3.expect("s3 present");
+        assert_eq!(s3.connection.bucket, "suricata-logs");
+        assert_eq!(s3.prefix, "suricata");
+        assert_eq!(s3.flush_threshold_bytes, 100 * 1024 * 1024);
+        assert_eq!(s3.flush_interval_secs, 900);
+        assert_eq!(s3.channel_capacity, 256);
+        assert_eq!(s3.max_buffer_rows, 100_000);
+    }
+
+    #[test]
+    fn suricata_s3_absent_section_means_no_persistence() {
+        let toml_str = "[suricata]\nenabled = true\n";
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.suricata.s3.is_none(), "absent [suricata.s3] must yield None");
+    }
+
+    #[test]
+    fn suricata_config_does_not_affect_other_defaults() {
+        // Adding suricata must not change zeek, ipfix, or syslog defaults.
+        let cfg = Config::default();
+        assert!(!cfg.zeek.enabled);
+        assert!(!cfg.ipfix.enabled);
+        assert!(!cfg.suricata.enabled);
+        // syslog is enabled by default — must remain so
+        assert!(cfg.syslog.enabled);
     }
 
     // H-5: Debug output must never expose S3 credentials.
