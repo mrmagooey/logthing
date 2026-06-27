@@ -1,6 +1,6 @@
 use logthing::server::Server;
 use logthing::shutdown::await_handles_with_deadline;
-use logthing::{admin, config, forwarding, ipfix, stats, syslog, zeek};
+use logthing::{admin, config, forwarding, ipfix, stats, suricata, syslog, zeek};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -185,6 +185,48 @@ async fn async_main() -> anyhow::Result<()> {
             let listener = zeek::listener::ZeekListener::new(listener_config, zeek_handler);
             if let Err(e) = listener.start_with_shutdown(zeek_shutdown_rx).await {
                 error!("Zeek listener error: {}", e);
+            }
+        });
+        listener_handles.push(handle);
+    }
+
+    // -----------------------------------------------------------------------
+    // Start Suricata listener if enabled
+    // -----------------------------------------------------------------------
+    if config.suricata.enabled {
+        let suricata_config_clone = config.clone();
+        let suricata_shutdown_rx = shutdown_rx.clone();
+
+        let suricata_handler: Arc<dyn suricata::listener::SuricataHandler> =
+            if let Some(s3_cfg) = suricata_config_clone.suricata.s3.as_ref() {
+                match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
+                    Ok(sink) => {
+                        let (handler, writer_handle) =
+                            forwarding::suricata_s3::suricata_start(s3_cfg, Arc::new(sink));
+                        writer_handles.push(writer_handle);
+                        Arc::new(handler)
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to create S3Sink for Suricata persistence, \
+                                 falling back to DefaultSuricataHandler: {e}"
+                        );
+                        Arc::new(suricata::listener::DefaultSuricataHandler)
+                    }
+                }
+            } else {
+                Arc::new(suricata::listener::DefaultSuricataHandler)
+            };
+
+        let listener_config = suricata::listener::SuricataListenerConfig {
+            tcp_port: suricata_config_clone.suricata.tcp_port,
+            bind_address: suricata_config_clone.suricata.bind_address.clone(),
+        };
+        let handle = tokio::spawn(async move {
+            let listener =
+                suricata::listener::SuricataListener::new(listener_config, suricata_handler);
+            if let Err(e) = listener.start_with_shutdown(suricata_shutdown_rx).await {
+                error!("Suricata listener error: {}", e);
             }
         });
         listener_handles.push(handle);
