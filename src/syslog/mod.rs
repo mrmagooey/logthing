@@ -449,6 +449,8 @@ impl SyslogMessage {
     }
 }
 
+pub mod payload;
+
 /// Syslog listener module for UDP and TCP
 pub mod listener;
 
