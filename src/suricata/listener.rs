@@ -441,7 +441,95 @@ mod tests {
         assert_eq!(records[0].event_type, "unknown");
     }
 
+    /// E2E: bind on ephemeral port, send 3 Suricata EVE JSON records of mixed types
+    /// over TCP, assert handler observed all three with correct event_type.
     #[tokio::test]
+    async fn e2e_listener_receives_mixed_event_types() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+
+        let handler = CapturingHandler::new();
+        let listener = SuricataListener::new(SuricataListenerConfig::default(), handler.clone());
+        let task = tokio::spawn(async move {
+            listener.run_with_listener(tcp_listener).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        // Simulate a Suricata EVE JSON agent sending three records
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let ndjson = concat!(
+            r#"{"event_type":"alert","src_ip":"10.0.0.1","dest_ip":"8.8.8.8","alert":{"signature":"ET TEST"},"timestamp":"2024-01-15T10:30:00Z"}"#,
+            "\n",
+            r#"{"event_type":"flow","src_ip":"10.0.0.2","dest_ip":"1.1.1.1","proto":"TCP","timestamp":"2024-01-15T10:30:01Z"}"#,
+            "\n",
+            r#"{"event_type":"dns","src_ip":"10.0.0.3","dns":{"type":"query","rrname":"example.com"},"timestamp":"2024-01-15T10:30:02Z"}"#,
+            "\n",
+        );
+        stream.write_all(ndjson.as_bytes()).await.unwrap();
+        drop(stream);
+
+        sleep(Duration::from_millis(200)).await;
+        task.abort();
+
+        let records = handler.take_records();
+        assert_eq!(records.len(), 3, "expected 3 records, got {}", records.len());
+
+        let event_types: Vec<&str> = records.iter().map(|r| r.event_type.as_str()).collect();
+        assert_eq!(event_types, vec!["alert", "flow", "dns"]);
+
+        // Assert fields are preserved
+        assert_eq!(records[0].fields["src_ip"], "10.0.0.1");
+        assert_eq!(records[1].fields["proto"], "TCP");
+        assert_eq!(records[2].fields["dns"]["rrname"], "example.com");
+    }
+
+    /// E2E: records without event_type fall back to "unknown" and are still delivered.
+    #[tokio::test]
+    async fn e2e_missing_event_type_records_arrive_as_unknown() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+
+        let handler = CapturingHandler::new();
+        let listener = SuricataListener::new(SuricataListenerConfig::default(), handler.clone());
+        let task = tokio::spawn(async move {
+            listener.run_with_listener(tcp_listener).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let ndjson = concat!(
+            // Valid with event_type
+            r#"{"event_type":"stats","uptime":3600}"#,
+            "\n",
+            // Missing event_type — must arrive as "unknown"
+            r#"{"uptime":7200,"iface":"eth0"}"#,
+            "\n",
+            // Malformed JSON — must be skipped entirely
+            "GARBAGE\n",
+            // Valid with event_type — must arrive
+            r#"{"event_type":"anomaly","anomaly":{"type":"pkt"}}"#,
+            "\n",
+        );
+        stream.write_all(ndjson.as_bytes()).await.unwrap();
+        drop(stream);
+
+        sleep(Duration::from_millis(200)).await;
+        task.abort();
+
+        let records = handler.take_records();
+        assert_eq!(
+            records.len(),
+            3,
+            "expected 3 records (1 malformed skipped), got {}",
+            records.len()
+        );
+        assert_eq!(records[0].event_type, "stats");
+        assert_eq!(records[1].event_type, "unknown");
+        assert_eq!(records[2].event_type, "anomaly");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
     async fn oversized_line_closes_connection_and_increments_metric() {
         use metrics::set_default_local_recorder;
         use metrics_util::CompositeKey;
