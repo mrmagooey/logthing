@@ -13,4 +13,5 @@ pub mod server;
 pub mod shutdown;
 pub mod stats;
 pub mod syslog;
+pub mod suricata;
 pub mod zeek;
