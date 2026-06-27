@@ -86,17 +86,21 @@ pub fn try_parse(msg: &SyslogMessage) -> Option<LeefRecord> {
             let delim = decode_delimiter(seg6);
             let attrs = parse_attributes(pairs_blob, delim);
             (Some(delim), attrs)
+        } else if seg6.is_empty() {
+            // Empty delimiter field, no pairs → default tab delimiter.
+            (Some('\t'), HashMap::new())
+        } else if seg6.starts_with("0x") || seg6.starts_with("0X") {
+            // Hex delimiter spec (e.g. "0x7C") with no trailing pipe and no pairs blob.
+            // Decode the hex; attributes are empty.
+            (Some(decode_delimiter(seg6)), HashMap::new())
         } else {
-            // No seg7: seg6 = delimiter_char immediately followed by attribute pairs.
-            // The first character of seg6 IS the delimiter character; the rest are pairs.
-            if seg6.is_empty() {
-                (Some('\t'), HashMap::new())
-            } else {
-                let delim = seg6.chars().next().unwrap_or('\t');
-                let pairs_blob = &seg6[delim.len_utf8()..];
-                let attrs = parse_attributes(pairs_blob, delim);
-                (Some(delim), attrs)
-            }
+            // Literal first-char delimiter convention: the first char of seg6 IS the
+            // delimiter and the rest of seg6 is the attribute pairs blob
+            // (e.g. "\tsrc=…\tdst=…").
+            let delim = seg6.chars().next().unwrap_or('\t');
+            let pairs_blob = &seg6[delim.len_utf8()..];
+            let attrs = parse_attributes(pairs_blob, delim);
+            (Some(delim), attrs)
         }
     } else {
         // LEEF 1.0: seg6 is the entire attribute blob, tab-delimited.
@@ -173,8 +177,19 @@ mod tests {
         let rec = try_parse(&msg(LEEF_2_0_TAB)).expect("must parse");
         assert_eq!(rec.leef_version, "2.0");
         // delimiter field is "\t" → '\t'
-        assert!(matches!(rec.delimiter, None | Some('\t')));
+        assert_eq!(rec.delimiter, Some('\t'));
         assert_eq!(rec.attributes.get("src").map(|s| s.as_str()), Some("192.168.1.10"));
+    }
+
+    #[test]
+    fn parses_leef_2_0_hex_delimiter_no_pairs() {
+        // Regression: hex delimiter spec with no trailing pipe and no pairs blob.
+        // Must decode "0x7C" → '|', not naively take the first char '0'.
+        let rec = try_parse(&msg("LEEF:2.0|V|P|v|ID|0x7C")).expect("must parse");
+        assert_eq!(rec.leef_version, "2.0");
+        assert_eq!(rec.event_id, "ID");
+        assert_eq!(rec.delimiter, Some('|'));
+        assert!(rec.attributes.is_empty());
     }
 
     #[test]
