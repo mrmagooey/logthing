@@ -59,14 +59,15 @@ pub fn check_hec_token(header_value: Option<&str>, expected: &str) -> bool {
     let Some(submitted) = value.strip_prefix("Splunk ") else {
         return false;
     };
-    // Constant-time comparison: pad or truncate to avoid length-leak side-channels.
-    // ConstantTimeEq requires equal-length slices; we XOR the lengths first so
-    // mismatched lengths always return false, without branching on the length.
+    // Reject mismatched lengths up front. NOTE: this length check is an early
+    // branch, so the configured token's byte length is observable via timing —
+    // an accepted tradeoff (token length is low-sensitivity). The token VALUE is
+    // compared in constant time via `ct_eq` only on the equal-length path below.
     let a = submitted.as_bytes();
     let b = expected.as_bytes();
     if a.len() != b.len() {
-        // Different lengths: constant-time reject by comparing a against itself
-        // and returning false.  The equal-length branch runs for timing parity.
+        // The `a.ct_eq(a)` call is a best-effort timing decoy; it does not fully
+        // mask the length-branch timing difference above.
         let _ = a.ct_eq(a);
         return false;
     }
