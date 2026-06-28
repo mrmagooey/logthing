@@ -399,12 +399,10 @@ fn parse_ipv6(buf: &[u8], rec: &mut SflowRecord) -> anyhow::Result<()> {
 
 fn parse_transport(protocol: u8, buf: &[u8], rec: &mut SflowRecord) {
     match protocol {
-        6 | 17 => {
-            // TCP or UDP: src_port(2) dst_port(2) ...
-            if buf.len() >= 4 {
-                rec.src_port = Some(u16::from_be_bytes([buf[0], buf[1]]));
-                rec.dst_port = Some(u16::from_be_bytes([buf[2], buf[3]]));
-            }
+        // TCP or UDP: src_port(2) dst_port(2) ...
+        6 | 17 if buf.len() >= 4 => {
+            rec.src_port = Some(u16::from_be_bytes([buf[0], buf[1]]));
+            rec.dst_port = Some(u16::from_be_bytes([buf[2], buf[3]]));
         }
         _ => {} // ICMP etc — no port concept
     }
