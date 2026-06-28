@@ -58,6 +58,9 @@ pub struct Config {
     pub ipfix: IpfixConfig,
 
     #[serde(default)]
+    pub sflow: SflowConfig,
+
+    #[serde(default)]
     pub zeek: ZeekConfig,
 
     #[serde(default)]
@@ -489,6 +492,63 @@ fn default_ipfix_max_buffer_rows() -> usize {
     100_000
 }
 
+// ── SflowConfig ───────────────────────────────────────────────────────────
+
+/// Configuration for the sFlow v5 UDP listener.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SflowConfig {
+    #[serde(default = "default_sflow_enabled")]
+    pub enabled: bool,
+
+    #[serde(default = "default_sflow_udp_port")]
+    pub udp_port: u16,
+
+    #[serde(default = "default_sflow_bind_address")]
+    pub bind_address: String,
+
+    /// Optional S3 persistence. Absent from TOML → `None` (backward compatible).
+    #[serde(default)]
+    pub s3: Option<SflowS3Config>,
+}
+
+impl Default for SflowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_sflow_enabled(),
+            udp_port: default_sflow_udp_port(),
+            bind_address: default_sflow_bind_address(),
+            s3: None,
+        }
+    }
+}
+
+fn default_sflow_enabled() -> bool { false }
+fn default_sflow_udp_port() -> u16  { 6343 }
+fn default_sflow_bind_address() -> String { "0.0.0.0".to_string() }
+
+/// Per-source S3 persistence config for the sFlow listener.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SflowS3Config {
+    #[serde(flatten)]
+    pub connection: S3ConnectionConfig,
+    #[serde(default = "default_sflow_s3_prefix")]
+    pub prefix: String,
+    #[serde(default = "default_sflow_flush_bytes")]
+    pub flush_threshold_bytes: usize,
+    #[serde(default = "default_sflow_flush_secs")]
+    pub flush_interval_secs: u64,
+    #[serde(default = "default_sflow_channel_capacity")]
+    pub channel_capacity: usize,
+    #[serde(default = "default_sflow_max_buffer_rows")]
+    pub max_buffer_rows: usize,
+}
+
+fn default_sflow_s3_prefix()          -> String { "sflow".to_string() }
+fn default_sflow_flush_bytes()         -> usize  { 100 * 1024 * 1024 }
+fn default_sflow_flush_secs()          -> u64    { 900 }
+fn default_sflow_channel_capacity()    -> usize  { 256 }
+fn default_sflow_max_buffer_rows()     -> usize  { 100_000 }
+
 impl Default for SyslogConfig {
     fn default() -> Self {
         Self {
@@ -514,6 +574,7 @@ impl Default for Config {
             metrics: MetricsConfig::default(),
             syslog: SyslogConfig::default(),
             ipfix: IpfixConfig::default(),
+            sflow: SflowConfig::default(),
             zeek: ZeekConfig::default(),
             suricata: SuricataConfig::default(),
             wef: WefConfig::default(),
@@ -1050,5 +1111,42 @@ prefix     = "syslog-structured"
         let s3 = cfg.syslog.structured_s3.expect("structured_s3 present");
         assert_eq!(s3.connection.bucket, "structured-syslog");
         assert_eq!(s3.prefix, "syslog-structured");
+    }
+
+    #[test]
+    fn sflow_config_defaults_disabled_on_port_6343() {
+        let cfg = Config::default();
+        assert!(!cfg.sflow.enabled, "sflow disabled by default");
+        assert_eq!(cfg.sflow.udp_port, 6343);
+        assert_eq!(cfg.sflow.bind_address, "0.0.0.0");
+        assert!(cfg.sflow.s3.is_none());
+    }
+
+    #[test]
+    fn sflow_s3_flat_toml_deserializes_correctly() {
+        let toml_str = r#"
+[sflow.s3]
+endpoint   = "http://minio:9002"
+bucket     = "sflow-samples"
+region     = "us-east-1"
+access_key = "SKEY"
+secret_key = "SSECRET"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        let s3 = cfg.sflow.s3.expect("present");
+        assert_eq!(s3.connection.endpoint, "http://minio:9002");
+        assert_eq!(s3.connection.bucket, "sflow-samples");
+        assert_eq!(s3.prefix, "sflow");
+        assert_eq!(s3.flush_threshold_bytes, 100 * 1024 * 1024);
+        assert_eq!(s3.flush_interval_secs, 900);
+        assert_eq!(s3.channel_capacity, 256);
+        assert_eq!(s3.max_buffer_rows, 100_000);
+    }
+
+    #[test]
+    fn sflow_s3_absent_means_no_persistence() {
+        let toml_str = "[sflow]\nenabled = true\n";
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.sflow.s3.is_none());
     }
 }
