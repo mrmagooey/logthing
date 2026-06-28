@@ -2055,10 +2055,12 @@ mod tests {
         /// Build a minimal router with the OTLP route and the given bearer_token
         /// configured.  `IngestState.generic_s3 = None` so no S3 sink is needed.
         async fn build_otlp_app(bearer_token: Option<String>) -> axum::Router {
-            let mut config = Config::default();
-            config.otlp = OtlpConfig {
-                enabled: true,
-                bearer_token,
+            let config = Config {
+                otlp: OtlpConfig {
+                    enabled: true,
+                    bearer_token,
+                },
+                ..Default::default()
             };
             let app_state = super::build_state_with_config(config).await;
             let ingest_state = IngestState { generic_s3: None };
@@ -2545,23 +2547,21 @@ pub async fn handle_otlp_logs(
     // ── Bearer auth check ─────────────────────────────────────────────────
     {
         let cfg = app_state.config.read().await;
-        if let Some(ref expected_token) = cfg.otlp.bearer_token {
-            if !expected_token.is_empty() {
-                let provided = headers
-                    .get(axum::http::header::AUTHORIZATION)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.strip_prefix("Bearer "))
-                    .unwrap_or("");
-                let a = expected_token.as_bytes();
-                let b = provided.as_bytes();
-                // Length mismatch is not secret-sensitive; ct_eq only valid for
-                // equal-length slices, so we gate it on length equality first.
-                let ok: bool = a.len() == b.len() && a.ct_eq(b).into();
-                if !ok {
-                    metrics::counter!("otlp_auth_failures").increment(1);
-                    warn!("OTLP bearer auth failure from {}", addr.ip());
-                    return Err(StatusCode::UNAUTHORIZED);
-                }
+        if let Some(ref expected_token) = cfg.otlp.bearer_token && !expected_token.is_empty() {
+            let provided = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "))
+                .unwrap_or("");
+            let a = expected_token.as_bytes();
+            let b = provided.as_bytes();
+            // Length mismatch is not secret-sensitive; ct_eq only valid for
+            // equal-length slices, so we gate it on length equality first.
+            let ok: bool = a.len() == b.len() && a.ct_eq(b).into();
+            if !ok {
+                metrics::counter!("otlp_auth_failures").increment(1);
+                warn!("OTLP bearer auth failure from {}", addr.ip());
+                return Err(StatusCode::UNAUTHORIZED);
             }
         }
         // bearer_token is None or empty → skip auth (dev mode)

@@ -465,9 +465,9 @@ mod tests {
         assert_eq!(any_value_to_json(int_av), json!(42));
 
         let double_av = AnyValue {
-            value: Some(AnyVal::DoubleValue(3.14)),
+            value: Some(AnyVal::DoubleValue(2.5)),
         };
-        assert!((any_value_to_json(double_av).as_f64().unwrap() - 3.14_f64).abs() < 1e-9);
+        assert!((any_value_to_json(double_av).as_f64().unwrap() - 2.5_f64).abs() < 1e-9);
 
         let bool_av = AnyValue {
             value: Some(AnyVal::BoolValue(true)),
