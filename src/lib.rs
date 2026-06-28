@@ -5,6 +5,7 @@ pub mod admin;
 pub mod config;
 pub mod forwarding;
 pub mod ipfix;
+pub mod sflow;
 pub mod middleware;
 pub mod models;
 pub mod parser;
