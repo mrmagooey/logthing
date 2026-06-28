@@ -30,10 +30,10 @@ fn decode_delimiter(s: &str) -> char {
     if s.is_empty() || s == "\\t" || s == "\t" {
         return '\t';
     }
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        if let Ok(n) = u8::from_str_radix(hex, 16) {
-            return n as char;
-        }
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))
+        && let Ok(n) = u8::from_str_radix(hex, 16)
+    {
+        return n as char;
     }
     s.chars().next().unwrap_or('\t')
 }

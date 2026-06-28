@@ -96,13 +96,12 @@ impl SyslogHandler for DefaultSyslogHandler {
             let p = payload::dispatch(&message);
             if let Some(rec) =
                 payload::StructuredSyslogRecord::from_syslog_and_payload(&message, &p)
+                && let Some(handle) = &self.structured_handle
             {
-                if let Some(handle) = &self.structured_handle {
-                    match handle.try_send(rec) {
-                        Ok(()) => {}
-                        Err(_) => {
-                            tracing::warn!("structured_syslog S3 channel full; dropped record");
-                        }
+                match handle.try_send(rec) {
+                    Ok(()) => {}
+                    Err(_) => {
+                        tracing::warn!("structured_syslog S3 channel full; dropped record");
                     }
                 }
             }
@@ -128,12 +127,11 @@ impl<H: SyslogHandler + 'static> SyslogHandler for PayloadDispatchingHandler<H> 
             let p = payload::dispatch(&message);
             if let Some(rec) =
                 payload::StructuredSyslogRecord::from_syslog_and_payload(&message, &p)
+                && let Some(h) = &self.structured_handle
             {
-                if let Some(h) = &self.structured_handle {
-                    match h.try_send(rec) {
-                        Ok(()) => {}
-                        Err(_) => tracing::warn!("structured_syslog channel full; dropped"),
-                    }
+                match h.try_send(rec) {
+                    Ok(()) => {}
+                    Err(_) => tracing::warn!("structured_syslog channel full; dropped"),
                 }
             }
         }
