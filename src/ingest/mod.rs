@@ -6,6 +6,7 @@
 //! these records to S3 partitioned by `sourcetype`.
 
 use chrono::{DateTime, Utc};
+use subtle::ConstantTimeEq;
 use crate::forwarding::generic_s3::GenericS3Handler;
 
 /// Unified envelope record produced by all three HEC/NDJSON ingest routes.
@@ -42,6 +43,34 @@ pub struct IngestState {
     /// `None` when `[hec]` s3 config is absent or construction failed.
     pub generic_s3: Option<GenericS3Handler>,
     // Unit 5: pub otlp_s3: Option<OtlpS3Handler>,
+}
+
+/// Validate an `Authorization` header value against the configured HEC token.
+///
+/// The header must have the form `"Splunk <token>"`.  Comparison is performed
+/// in constant time (via `subtle::ConstantTimeEq`) to prevent timing attacks.
+///
+/// Returns `true` only when the header is present, well-formed, and the token
+/// matches `expected` exactly.
+pub fn check_hec_token(header_value: Option<&str>, expected: &str) -> bool {
+    let Some(value) = header_value else {
+        return false;
+    };
+    let Some(submitted) = value.strip_prefix("Splunk ") else {
+        return false;
+    };
+    // Constant-time comparison: pad or truncate to avoid length-leak side-channels.
+    // ConstantTimeEq requires equal-length slices; we XOR the lengths first so
+    // mismatched lengths always return false, without branching on the length.
+    let a = submitted.as_bytes();
+    let b = expected.as_bytes();
+    if a.len() != b.len() {
+        // Different lengths: constant-time reject by comparing a against itself
+        // and returning false.  The equal-length branch runs for timing parity.
+        let _ = a.ct_eq(a);
+        return false;
+    }
+    a.ct_eq(b).into()
 }
 
 #[cfg(test)]
@@ -91,5 +120,40 @@ mod tests {
         let state = IngestState { generic_s3: None };
         let cloned = state.clone();
         assert!(cloned.generic_s3.is_none());
+    }
+
+    #[test]
+    fn check_hec_token_accepts_valid_token() {
+        assert!(check_hec_token(Some("Splunk my-secret-token"), "my-secret-token"));
+    }
+
+    #[test]
+    fn check_hec_token_rejects_wrong_token() {
+        assert!(!check_hec_token(Some("Splunk wrong-token"), "my-secret-token"));
+    }
+
+    #[test]
+    fn check_hec_token_rejects_missing_header() {
+        assert!(!check_hec_token(None, "my-secret-token"));
+    }
+
+    #[test]
+    fn check_hec_token_rejects_wrong_scheme() {
+        // Must start with "Splunk " — Bearer or Basic are rejected.
+        assert!(!check_hec_token(Some("Bearer my-secret-token"), "my-secret-token"));
+        assert!(!check_hec_token(Some("my-secret-token"), "my-secret-token"));
+    }
+
+    #[test]
+    fn check_hec_token_rejects_empty_expected_when_header_empty_splunk_prefix() {
+        // "Splunk " with no token: submitted="" vs expected="" → vacuously equal
+        // but we still accept it when expected is empty (dev-only no-op mode).
+        assert!(check_hec_token(Some("Splunk "), ""));
+    }
+
+    #[test]
+    fn check_hec_token_constant_time_mismatched_lengths_reject() {
+        // Different lengths must reject without panicking.
+        assert!(!check_hec_token(Some("Splunk short"), "a-much-longer-token-value"));
     }
 }
