@@ -1,6 +1,6 @@
 use logthing::server::Server;
 use logthing::shutdown::await_handles_with_deadline;
-use logthing::{admin, config, forwarding, ipfix, stats, suricata, syslog, zeek};
+use logthing::{admin, config, forwarding, ipfix, sflow, stats, suricata, syslog, zeek};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -260,6 +260,47 @@ async fn async_main() -> anyhow::Result<()> {
                 suricata::listener::SuricataListener::new(listener_config, suricata_handler);
             if let Err(e) = listener.start_with_shutdown(suricata_shutdown_rx).await {
                 error!("Suricata listener error: {}", e);
+            }
+        });
+        listener_handles.push(handle);
+    }
+
+    // -----------------------------------------------------------------------
+    // Start sFlow listener if enabled
+    // -----------------------------------------------------------------------
+    if config.sflow.enabled {
+        let sflow_config_clone = config.clone();
+        let sflow_shutdown_rx = shutdown_rx.clone();
+
+        let sflow_handler: Arc<dyn sflow::listener::SflowHandler> =
+            if let Some(s3_cfg) = sflow_config_clone.sflow.s3.as_ref() {
+                match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
+                    Ok(sink) => {
+                        let (handler, writer_handle) =
+                            forwarding::sflow_s3::sflow_start(s3_cfg, Arc::new(sink));
+                        writer_handles.push(writer_handle);
+                        Arc::new(handler)
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to create S3Sink for sFlow persistence, \
+                                 falling back to DefaultSflowHandler: {e}"
+                        );
+                        Arc::new(sflow::listener::DefaultSflowHandler)
+                    }
+                }
+            } else {
+                Arc::new(sflow::listener::DefaultSflowHandler)
+            };
+
+        let listener_config = sflow::listener::SflowListenerConfig {
+            udp_port: sflow_config_clone.sflow.udp_port,
+            bind_address: sflow_config_clone.sflow.bind_address.clone(),
+        };
+        let handle = tokio::spawn(async move {
+            let listener = sflow::listener::SflowListener::new(listener_config, sflow_handler);
+            if let Err(e) = listener.start_with_shutdown(sflow_shutdown_rx).await {
+                error!("sFlow listener error: {}", e);
             }
         });
         listener_handles.push(handle);

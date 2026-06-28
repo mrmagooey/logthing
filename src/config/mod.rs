@@ -1149,4 +1149,10 @@ secret_key = "SSECRET"
         let cfg: Config = toml::from_str(toml_str).expect("parse");
         assert!(cfg.sflow.s3.is_none());
     }
+
+    #[test]
+    fn sflow_is_disabled_by_default_in_main_config() {
+        let cfg = Config::default();
+        assert!(!cfg.sflow.enabled, "sflow must be opt-in (enabled=false by default)");
+    }
 }
