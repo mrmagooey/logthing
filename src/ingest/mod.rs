@@ -8,6 +8,9 @@
 pub mod handlers;
 pub mod parse;
 
+pub use handlers::{HecQueryParams, handle_hec_event, handle_hec_raw, handle_ndjson};
+pub use parse::{parse_hec_event_body, parse_hec_raw_body, parse_ndjson_body};
+
 use chrono::{DateTime, Utc};
 use subtle::ConstantTimeEq;
 use crate::forwarding::generic_s3::GenericS3Handler;
