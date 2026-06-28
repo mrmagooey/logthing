@@ -1,0 +1,56 @@
+name: Binaries
+
+# Builds static (musl) release binaries for linux/amd64 and linux/arm64 and
+# attaches them to the GitHub Release for the pushed tag. Complements
+# release.yml (which builds the container image on the same `v*` tags) and
+# rust.yml (which runs the test suite on every push/PR).
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual runs validate the (cross-)build via dry-run without needing a tag —
+  # useful for confirming the aarch64-musl build before cutting a real release.
+  workflow_dispatch:
+
+permissions:
+  contents: write # required to attach assets to the GitHub Release
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build static binary and attach to release
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: logthing
+          target: ${{ matrix.target }}
+          # cargo-zigbuild supplies a zig-based cross C toolchain so the native
+          # C dependencies (aws-lc-sys, zstd-sys) cross-compile cleanly to the
+          # musl/arm64 targets. The action installs zig + cargo-zigbuild for us.
+          build-tool: cargo-zigbuild
+          # Default features (otlp on). kerberos-auth is intentionally NOT enabled:
+          # it dynamically links libkrb5 and cannot be linked into a static musl binary.
+          archive: $bin-$tag-$target
+          checksum: sha256
+          include: README.md,logthing.toml
+          # Tag pushes upload assets to the matching GitHub Release. Manual
+          # workflow_dispatch runs (no tag) build + archive only, validating the
+          # cross-compile without a release to upload to.
+          dry-run: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          token: ${{ secrets.GITHUB_TOKEN }}

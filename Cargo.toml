@@ -46,7 +46,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Metrics
 metrics = "0.22"
-metrics-exporter-prometheus = "0.13"
+# default-features disabled: we only use `PrometheusBuilder::build_recorder()`, not the
+# http-listener/push-gateway features — dropping them removes the unused native-tls/openssl-sys
+# C dependency, which keeps static musl release builds buildable and shrinks the binary.
+metrics-exporter-prometheus = { version = "0.13", default-features = false }
 
 # Error handling
 thiserror = "2.0"
