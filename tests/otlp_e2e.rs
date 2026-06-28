@@ -79,10 +79,12 @@ mod otlp_e2e {
     /// in src/server/mod.rs.  All AppState fields are `pub` so no test-only
     /// constructor is required.
     async fn build_app_state(bearer_token: Option<String>) -> Arc<AppState> {
-        let mut config = Config::default();
-        config.otlp = OtlpConfig {
-            enabled: true,
-            bearer_token,
+        let config = Config {
+            otlp: OtlpConfig {
+                enabled: true,
+                bearer_token,
+            },
+            ..Default::default()
         };
         let forwarder = Forwarder::new(config.forwarding.destinations.clone())
             .initialize()
