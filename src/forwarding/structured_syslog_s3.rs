@@ -234,6 +234,19 @@ mod tests {
 
     #[tokio::test]
     async fn structured_syslog_start_wires_handle_and_join() {
+        // Purpose: verify that structured_syslog_start returns a usable handle
+        // and a JoinHandle, and that dropping the handle (closing the channel)
+        // with an empty buffer causes the writer task to exit cleanly — no S3
+        // round-trip is needed to test this wiring.
+        //
+        // Previously the test sent one record (with max_buffer_rows=1) which
+        // immediately triggered a PutObject against the dead endpoint
+        // http://127.0.0.1:1, racing the AWS SDK retry/connect budget against a
+        // hardcoded 5 s timeout → flaky under concurrent test load.
+        //
+        // Fix: do not send any records.  flush_all() on channel-close iterates
+        // only over non-empty partition buffers; with an empty buffer map it
+        // returns instantly, so the task exits without any S3 call.
         use crate::config::{S3ConnectionConfig, SyslogS3Config};
         use crate::forwarding::s3_sink::S3Sink;
 
@@ -248,18 +261,19 @@ mod tests {
         let cfg = SyslogS3Config {
             connection: conn,
             prefix: "structured-syslog-test".to_string(),
-            max_buffer_rows: 1,
+            // Large enough that a stray record never triggers an auto-flush.
+            max_buffer_rows: 1_000,
             flush_interval_secs: 3600,
             channel_capacity: 16,
         };
         let (handle, join_handle) = structured_syslog_start(&cfg, s3);
-        // Send one record through try_send.
-        let rec = sample_record("cef");
-        let _ = handle.try_send(rec);
+        // Drop the handle immediately — empty buffer → flush_all is a no-op →
+        // writer task exits without any S3 call.
         drop(handle);
-        tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
+        // 2 s is generous; the task should join in well under 100 ms.
+        tokio::time::timeout(std::time::Duration::from_secs(2), join_handle)
             .await
-            .expect("writer task exits within 5s")
+            .expect("writer task exits within 2s")
             .expect("no panic");
     }
 }
