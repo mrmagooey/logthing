@@ -1972,6 +1972,22 @@ mod tests {
             "/syslog must remain mounted and functional"
         );
     }
+
+    #[tokio::test]
+    async fn server_take_hec_worker_handle_returns_none_when_hec_disabled() {
+        let mut server = Server::new(
+            Config::default(),
+            Arc::new(RwLock::new(Config::default())),
+            Arc::new(ThroughputStats::new()),
+        )
+        .await
+        .unwrap();
+        let handle = server.take_hec_worker_handle();
+        assert!(
+            handle.is_none(),
+            "hec worker handle must be None when hec.enabled=false"
+        );
+    }
 }
 
 /// Build a `RustlsConfig` from the TLS section of the server config.
