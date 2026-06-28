@@ -2529,7 +2529,7 @@ async fn handle_syslog_examples() -> Json<serde_json::Value> {
 ///   401 — bearer token required but absent or incorrect
 ///   415 — unknown or missing Content-Type
 #[cfg(feature = "otlp")]
-pub(crate) async fn handle_otlp_logs(
+pub async fn handle_otlp_logs(
     State(app_state): State<Arc<AppState>>,
     axum::extract::Extension(ingest): axum::extract::Extension<IngestState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
