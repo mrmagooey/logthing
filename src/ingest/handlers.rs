@@ -245,6 +245,62 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], 2);
+    }
+
+    #[tokio::test]
+    async fn hec_raw_missing_auth_returns_401() {
+        let app = make_router("secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/services/collector/raw")
+            .body(Body::from("raw log line"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], 2);
+    }
+
+    #[tokio::test]
+    async fn hec_raw_wrong_token_returns_401() {
+        let app = make_router("secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/services/collector/raw")
+            .header("Authorization", "Splunk wrong-token")
+            .body(Body::from("raw log line"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn ndjson_missing_auth_returns_401() {
+        let app = make_router("secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/ingest")
+            .body(Body::from("{\"k\":1}\n"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], 2);
+    }
+
+    #[tokio::test]
+    async fn ndjson_wrong_token_returns_401() {
+        let app = make_router("secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/ingest")
+            .header("Authorization", "Splunk wrong-token")
+            .body(Body::from("{\"k\":1}\n"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -339,7 +395,13 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], 6);
     }
+
+    // NOTE: hec_raw has no parse-error path. `parse_hec_raw_body` wraps any
+    // bytes via `String::from_utf8_lossy` and always returns Ok, so the raw
+    // endpoint cannot produce a 400. No parse-error test exists for it.
 
     // --- Metrics counter smoke-test ---
     #[tokio::test]
