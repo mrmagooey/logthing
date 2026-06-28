@@ -251,37 +251,46 @@ fn decode_flow_sample(
 
         if rec_enterprise != 0 {
             // Enterprise-specific — store raw in extra.
-            let data_b64 = hex::encode(rec_body);
+            let data_hex = hex::encode(rec_body);
             unknown_records.push(serde_json::json!({
                 "enterprise": rec_enterprise,
                 "format": rec_format,
                 "length": flow_data_length,
-                "data_base64": data_b64,
+                "data_hex": data_hex,
             }));
             continue;
         }
 
         match rec_format {
             1 => {
-                // raw_packet_header — parse Ethernet/IPv4/IPv6/TCP/UDP to 5-tuple
+                // raw_packet_header — parse Ethernet/IPv4/IPv6/TCP/UDP to 5-tuple.
+                // Soft-catch: a malformed inner header still leaves the flow record
+                // emitted with its sampling/ifindex metadata intact.
                 if let Err(e) = decode_raw_packet_header(rec_body, &mut rec) {
                     tracing::debug!("sflow: raw_packet_header parse error: {e}");
                 }
             }
             3 => {
-                // sampled_ipv4 — carries 5-tuple directly
-                decode_sampled_ipv4(rec_body, &mut rec)?;
+                // sampled_ipv4 — carries 5-tuple directly.
+                // Soft-catch (same convention as raw_packet_header) so a truncated
+                // inner body does not drop the whole flow_sample's metadata.
+                if let Err(e) = decode_sampled_ipv4(rec_body, &mut rec) {
+                    tracing::debug!("sflow: sampled_ipv4 parse error: {e}");
+                }
             }
             4 => {
-                // sampled_ipv6 — carries 5-tuple directly
-                decode_sampled_ipv6(rec_body, &mut rec)?;
+                // sampled_ipv6 — carries 5-tuple directly.
+                // Soft-catch (same convention as raw_packet_header).
+                if let Err(e) = decode_sampled_ipv6(rec_body, &mut rec) {
+                    tracing::debug!("sflow: sampled_ipv6 parse error: {e}");
+                }
             }
             other => {
-                let data_b64 = hex::encode(rec_body);
+                let data_hex = hex::encode(rec_body);
                 unknown_records.push(serde_json::json!({
                     "format": other,
                     "length": flow_data_length,
-                    "data_base64": data_b64,
+                    "data_hex": data_hex,
                 }));
             }
         }
@@ -529,12 +538,12 @@ fn decode_counter_sample(
 
         if rec_enterprise != 0 || rec_format != 1 {
             // Non-generic counter record — store raw in extra.
-            let data_b64 = hex::encode(rec_body);
+            let data_hex = hex::encode(rec_body);
             unknown_records.push(serde_json::json!({
                 "enterprise": rec_enterprise,
                 "format": rec_format,
                 "length": counter_data_length,
-                "data_base64": data_b64,
+                "data_hex": data_hex,
             }));
             continue;
         }
@@ -944,9 +953,46 @@ mod tests {
             extra.is_array() || extra.get("unknown_records").is_some() || {
                 // Accept either array-at-root or object with a key
                 let s = extra.to_string();
-                s.contains("format") || s.contains("data_base64")
+                s.contains("format") || s.contains("data_hex")
             },
             "unknown flow record must appear in extra; got: {extra}"
         );
+        // The unknown record must be tagged with format=99 and carry hex-encoded data.
+        let s = records[0].extra.to_string();
+        assert!(s.contains("\"data_hex\""), "extra must use data_hex key; got: {s}");
+        assert!(!s.contains("data_base64"), "data_base64 key must be gone; got: {s}");
+    }
+
+    #[test]
+    fn truncated_sampled_ipv4_body_still_emits_flow_metadata() {
+        // FIX 2 regression: a truncated sampled_ipv4 inner body must be soft-caught,
+        // leaving the 5-tuple None but preserving the flow_sample metadata
+        // (sampling_rate / input_ifindex / output_ifindex).
+        let mut buf = FIXTURE_SFLOW_SAMPLED_IPV4.to_vec();
+        // flow_data_length is at offset 72 in this fixture (after the 32-byte flow
+        // sample body header which ends at 68, then flow_data_format at 68..72).
+        // Shrink the sampled_ipv4 body from 32 to 4 bytes so it is truncated.
+        buf[72] = 0x00;
+        buf[73] = 0x00;
+        buf[74] = 0x00;
+        buf[75] = 0x04; // flow_data_length = 4 (too short for sampled_ipv4)
+        // Truncate buffer to the new record length: header ends at 76, +4 body = 80.
+        buf.truncate(80);
+        // Fix sample_length at [32..36]: 32 (flow hdr) + 4+4 (rec envelope) + 4 = 44.
+        buf[32] = 0x00;
+        buf[33] = 0x00;
+        buf[34] = 0x00;
+        buf[35] = 0x2C; // 44
+
+        let records = decode_datagram(&buf, exporter()).unwrap();
+        assert_eq!(records.len(), 1, "flow record must still be emitted");
+        let r = &records[0];
+        // 5-tuple absent because the inner body was truncated.
+        assert!(r.src_addr.is_none());
+        assert!(r.dst_addr.is_none());
+        // Metadata from the flow_sample header is preserved.
+        assert_eq!(r.sampling_rate, Some(1000));
+        assert_eq!(r.input_ifindex, Some(3));
+        assert_eq!(r.output_ifindex, Some(4));
     }
 }
