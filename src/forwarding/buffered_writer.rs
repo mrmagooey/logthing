@@ -402,6 +402,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
 // ParquetWriterHandle<S>
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct ParquetWriterHandle<S: ParquetSink> {
     tx: tokio::sync::mpsc::Sender<S::Record>,
     /// Source label captured at `start()` time; used for the drop metric.
