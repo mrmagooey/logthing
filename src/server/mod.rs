@@ -312,22 +312,32 @@ impl Server {
         let cfg_token = Arc::new(self.config.hec.token.clone());
 
         // Protected routes (require authentication).
-        // HEC / NDJSON routes are registered here — BEFORE the .layer() calls —
-        // so they inherit the same IP-whitelist, body-limit, and shared middleware
-        // as the existing WEF / syslog routes.
-        let protected_router = Router::new()
+        let mut protected_router = Router::new()
             .route("/wsman", post(handle_wef_request))
             .route("/wsman/subscriptions", post(handle_subscription))
             .route("/wsman/events", post(handle_events))
             // Syslog endpoints
             .route("/syslog", post(handle_syslog_http))
             .route("/syslog/udp", get(handle_syslog_udp_info))
-            .route("/syslog/examples", get(handle_syslog_examples))
-            // HEC / NDJSON ingest routes — behind IP-whitelist and body-limit
-            .route("/services/collector/event", post(handle_hec_event))
-            .route("/services/collector/raw", post(handle_hec_raw))
-            .route("/ingest", post(handle_ndjson))
-            // Extensions for HEC handlers (harmless to existing WEF/syslog handlers)
+            .route("/syslog/examples", get(handle_syslog_examples));
+
+        // HEC / NDJSON ingest routes are registered ONLY when `hec.enabled` is
+        // true. Per the plan's global constraint, a default deployment (hec
+        // disabled) must see zero behavior change: these routes stay unmounted
+        // and 404, exactly as before this unit. When enabled, they are mounted
+        // BEFORE the .layer() calls below so they inherit the same IP-whitelist
+        // and body-limit middleware as the existing protected routes.
+        if self.config.hec.enabled {
+            protected_router = protected_router
+                .route("/services/collector/event", post(handle_hec_event))
+                .route("/services/collector/raw", post(handle_hec_raw))
+                .route("/ingest", post(handle_ndjson));
+        }
+
+        // Extensions for HEC handlers are harmless to the existing WEF/syslog
+        // handlers and are always layered so the extractors resolve when the
+        // routes are mounted.
+        let protected_router = protected_router
             .layer(axum::Extension(self.ingest_state.clone()))
             .layer(axum::Extension(cfg_token))
             .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE))
@@ -1811,6 +1821,156 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // ------------------------------------------------------------------ //
+    // Task 4.8 (gating): HEC routes registered only when hec.enabled      //
+    // These exercise the REAL create_router path, not the isolated helper.//
+    // ------------------------------------------------------------------ //
+
+    /// Build a full `Server` from a config (S3 absent → no worker, no panic).
+    async fn build_server(config: Config) -> Server {
+        let shared = Arc::new(RwLock::new(config.clone()));
+        let throughput = Arc::new(ThroughputStats::new());
+        Server::new(config, shared, throughput)
+            .await
+            .expect("Server::new must succeed")
+    }
+
+    /// Inject a `ConnectInfo` extension so the ip_whitelist middleware (which
+    /// extracts `ConnectInfo<SocketAddr>`) resolves during a `oneshot` test.
+    fn with_connect_info(
+        mut req: axum::http::Request<axum::body::Body>,
+    ) -> axum::http::Request<axum::body::Body> {
+        let addr: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+        req
+    }
+
+    /// With `hec.enabled = false` (the default), the three HEC routes must NOT
+    /// be mounted on the protected router — `/ingest` must 404, exactly as
+    /// before this unit (zero behavior change for existing deployments).
+    #[tokio::test]
+    async fn hec_routes_not_mounted_when_disabled() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let mut config = Config::default();
+        config.hec.enabled = false;
+        let server = build_server(config).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds");
+
+        let req = with_connect_info(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/ingest")
+                .body(Body::from("{\"k\":1}\n"))
+                .unwrap(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "/ingest must 404 when hec.enabled is false"
+        );
+    }
+
+    /// The other two HEC routes are likewise unmounted when disabled.
+    #[tokio::test]
+    async fn hec_collector_routes_not_mounted_when_disabled() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let config = Config::default(); // hec.enabled defaults to false
+        let server = build_server(config).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds");
+
+        for uri in [
+            "/services/collector/event",
+            "/services/collector/raw",
+        ] {
+            let req = with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .body(Body::from("x"))
+                    .unwrap(),
+            );
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{uri} must 404 when hec.enabled is false"
+            );
+        }
+    }
+
+    /// With `hec.enabled = true`, the routes ARE mounted behind the
+    /// IP-whitelist/body-limit middleware. With the default empty token,
+    /// dev-mode auth is skipped, so a valid NDJSON POST returns 200 (definitely
+    /// not 404 — proving the route exists).
+    #[tokio::test]
+    async fn hec_routes_mounted_when_enabled() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let mut config = Config::default();
+        config.hec.enabled = true; // empty token → dev mode (no auth required)
+        let server = build_server(config).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds");
+
+        let req = with_connect_info(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/ingest?sourcetype=t")
+                .body(Body::from("{\"k\":1}\n"))
+                .unwrap(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "/ingest must be reachable (200) when hec.enabled is true"
+        );
+    }
+
+    /// Existing protected routes are unaffected by the gating: `/syslog` still
+    /// responds (200) regardless of the hec.enabled flag.
+    #[tokio::test]
+    async fn existing_protected_routes_unaffected_by_hec_gating() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let config = Config::default(); // hec disabled
+        let server = build_server(config).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds");
+
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: client 192.168.1.100#12345: query: example.com IN A + (93.184.216.34)";
+        let req = with_connect_info(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/syslog")
+                .body(Body::from(msg))
+                .unwrap(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "/syslog must remain mounted and functional"
+        );
     }
 }
 
