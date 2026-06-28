@@ -244,9 +244,10 @@ mod tests {
 
     #[test]
     fn generic_sink_null_host_produces_null_in_batch() {
-        use arrow::array::{Array, StringArray};
+        use arrow::array::{Array, StringArray, TimestampMillisecondArray};
         let mut rec = make_record("mytype");
         rec.host = None;
+        rec.time = None;
         let schema = GenericSink.schema(Some("mytype"));
         let batch = GenericSink.to_record_batch(&rec, &schema).unwrap();
         let host_col = batch
@@ -256,6 +257,14 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert!(host_col.is_null(0), "null host must produce Arrow null");
+
+        let time_col = batch
+            .column_by_name("time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        assert!(time_col.is_null(0), "null time must produce Arrow null");
     }
 
     #[tokio::test]
