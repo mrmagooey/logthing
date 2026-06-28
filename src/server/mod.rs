@@ -1,3 +1,6 @@
+#[cfg(feature = "otlp")]
+pub mod otlp;
+
 use crate::config::Config;
 use crate::forwarding::Forwarder;
 use crate::ingest::IngestState;
