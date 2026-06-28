@@ -181,10 +181,20 @@ pub struct SyslogConfig {
     #[serde(default = "default_syslog_parse_dns")]
     pub parse_dns: bool,
 
+    /// Enable syslog payload sub-parsing (CEF, LEEF, auditd, DHCP, RADIUS,
+    /// web_access, DNS).  Default false (backward compatible).
+    #[serde(default)]
+    pub parse_payloads: bool,
+
     /// Optional S3 persistence for syslog messages.
     /// Absent from TOML → `None` → no S3 persistence (backward compatible).
     #[serde(default)]
     pub s3: Option<SyslogS3Config>,
+
+    /// Optional S3 persistence for structured (parsed) syslog records.
+    /// Requires `parse_payloads = true` to produce any output.
+    #[serde(default)]
+    pub structured_s3: Option<SyslogS3Config>,
 }
 
 /// Configuration for the IPFIX / NetFlow UDP listener.
@@ -486,7 +496,9 @@ impl Default for SyslogConfig {
             udp_port: default_syslog_udp_port(),
             tcp_port: default_syslog_tcp_port(),
             parse_dns: default_syslog_parse_dns(),
-            s3: None, // backward-compatible default
+            parse_payloads: false,
+            s3: None,
+            structured_s3: None,
         }
     }
 }
@@ -1000,5 +1012,43 @@ secret_key = "SECRET"
         assert!(debug_str.contains("my-bucket"));
         assert!(debug_str.contains("us-east-1"));
         assert!(debug_str.contains("<redacted>"));
+    }
+
+    #[test]
+    fn syslog_parse_payloads_defaults_to_false() {
+        let cfg = Config::default();
+        assert!(!cfg.syslog.parse_payloads,
+            "parse_payloads must default to false");
+    }
+
+    #[test]
+    fn syslog_structured_s3_absent_gives_none() {
+        let cfg = Config::default();
+        assert!(cfg.syslog.structured_s3.is_none(),
+            "structured_s3 must default to None");
+    }
+
+    #[test]
+    fn syslog_parse_payloads_can_be_set_in_toml() {
+        let toml_str = "[syslog]\nparse_payloads = true\n";
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.syslog.parse_payloads);
+    }
+
+    #[test]
+    fn syslog_structured_s3_parses_from_toml() {
+        let toml_str = r#"
+[syslog.structured_s3]
+endpoint   = "http://minio:9000"
+bucket     = "structured-syslog"
+region     = "us-east-1"
+access_key = "KEY"
+secret_key = "SECRET"
+prefix     = "syslog-structured"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        let s3 = cfg.syslog.structured_s3.expect("structured_s3 present");
+        assert_eq!(s3.connection.bucket, "structured-syslog");
+        assert_eq!(s3.prefix, "syslog-structured");
     }
 }
