@@ -138,11 +138,11 @@ pub async fn handle_hec_raw(
 
     metrics::counter!("hec_events_received").increment(1);
 
-    if let Some(ref handler) = ingest.generic_s3 {
-        if handler.try_send(record).is_err() {
-            metrics::counter!("hec_events_dropped").increment(1);
-            tracing::warn!("HEC S3 channel full; dropped raw record");
-        }
+    if let Some(ref handler) = ingest.generic_s3
+        && handler.try_send(record).is_err()
+    {
+        metrics::counter!("hec_events_dropped").increment(1);
+        tracing::warn!("HEC S3 channel full; dropped raw record");
     }
 
     hec_success()
@@ -427,6 +427,9 @@ mod tests {
         let _ = app.oneshot(req).await.unwrap();
 
         let snapshot = snapshotter.snapshot();
+        // metrics_util::CompositeKey contains AtomicBool (interior mutability); the
+        // HashMap is read-only after construction so this lint is a false positive.
+        #[allow(clippy::mutable_key_type)]
         let map = snapshot.into_hashmap();
         let key = CompositeKey::new(
             MetricKind::Counter,
