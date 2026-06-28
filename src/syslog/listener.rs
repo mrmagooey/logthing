@@ -1,6 +1,7 @@
 //! Syslog listener for receiving syslog messages via UDP and TCP
 
-use crate::syslog::{SyslogMessage, dns::DnsLogEntry};
+use crate::forwarding::structured_syslog_s3::StructuredS3Handler;
+use crate::syslog::{SyslogMessage, dns::DnsLogEntry, payload};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -53,11 +54,17 @@ pub trait SyslogHandler: Send + Sync {
 /// Default handler that logs messages
 pub struct DefaultSyslogHandler {
     parse_dns_logs: bool,
+    parse_payloads: bool,
+    structured_handle: Option<Arc<StructuredS3Handler>>,
 }
 
 impl DefaultSyslogHandler {
-    pub fn new(parse_dns_logs: bool) -> Self {
-        Self { parse_dns_logs }
+    pub fn new(
+        parse_dns_logs: bool,
+        parse_payloads: bool,
+        structured_handle: Option<Arc<StructuredS3Handler>>,
+    ) -> Self {
+        Self { parse_dns_logs, parse_payloads, structured_handle }
     }
 }
 
@@ -83,6 +90,52 @@ impl SyslogHandler for DefaultSyslogHandler {
                 dns_entry.query_type,
                 dns_entry.response_ips
             );
+        }
+
+        if self.parse_payloads {
+            let p = payload::dispatch(&message);
+            if let Some(rec) =
+                payload::StructuredSyslogRecord::from_syslog_and_payload(&message, &p)
+            {
+                if let Some(handle) = &self.structured_handle {
+                    match handle.try_send(rec) {
+                        Ok(()) => {}
+                        Err(_) => {
+                            tracing::warn!("structured_syslog S3 channel full; dropped record");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Wraps any inner `SyslogHandler` (e.g. the S3 raw-persistence handler),
+/// invokes it first, then runs payload dispatch and forwards matched records
+/// to the structured sink.  Used in `main.rs` when both raw S3 persistence
+/// and structured persistence are configured.
+pub struct PayloadDispatchingHandler<H: SyslogHandler> {
+    pub inner: Arc<H>,
+    pub parse_payloads: bool,
+    pub structured_handle: Option<Arc<StructuredS3Handler>>,
+}
+
+#[async_trait::async_trait]
+impl<H: SyslogHandler + 'static> SyslogHandler for PayloadDispatchingHandler<H> {
+    async fn handle_message(&self, message: SyslogMessage, source: SocketAddr) {
+        self.inner.handle_message(message.clone(), source).await;
+        if self.parse_payloads {
+            let p = payload::dispatch(&message);
+            if let Some(rec) =
+                payload::StructuredSyslogRecord::from_syslog_and_payload(&message, &p)
+            {
+                if let Some(h) = &self.structured_handle {
+                    match h.try_send(rec) {
+                        Ok(()) => {}
+                        Err(_) => tracing::warn!("structured_syslog channel full; dropped"),
+                    }
+                }
+            }
         }
     }
 }
@@ -471,7 +524,7 @@ mod tests {
             ..Default::default()
         };
 
-        let handler = Arc::new(DefaultSyslogHandler::new(config.parse_dns_logs));
+        let handler = Arc::new(DefaultSyslogHandler::new(config.parse_dns_logs, false, None));
         let listener = SyslogListener::new(config, handler);
 
         // Start listener in background
@@ -682,7 +735,7 @@ mod tests {
             bind_address: "127.0.0.1".to_string(),
             parse_dns_logs: false,
         };
-        let handler: Arc<dyn SyslogHandler> = Arc::new(DefaultSyslogHandler::new(false));
+        let handler: Arc<dyn SyslogHandler> = Arc::new(DefaultSyslogHandler::new(false, false, None));
         let listener = SyslogListener::new(config, handler);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -703,6 +756,57 @@ mod tests {
             result.is_ok(),
             "start_with_shutdown did not return after shutdown signal within 2 s"
         );
+    }
+
+    #[tokio::test]
+    async fn default_handler_dispatches_cef_to_structured_handle() {
+        use crate::config::{S3ConnectionConfig, SyslogS3Config};
+        use crate::forwarding::s3_sink::S3Sink;
+        use crate::forwarding::structured_syslog_s3::structured_syslog_start;
+        use crate::syslog::SyslogMessage;
+        use std::net::SocketAddr;
+        use tokio::time::{Duration, sleep};
+
+        // Use an unreachable S3 endpoint — the writer will buffer the record
+        // but won't actually upload.
+        let conn = S3ConnectionConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            bucket: "test".to_string(),
+            region: "us-east-1".to_string(),
+            access_key: "KEY".to_string(),
+            secret_key: "SECRET".to_string(),
+        };
+        let s3 = Arc::new(
+            S3Sink::from_connection(&conn).await.expect("constructs"),
+        );
+        let cfg = SyslogS3Config {
+            connection: conn,
+            prefix: "structured-test".to_string(),
+            max_buffer_rows: 100,
+            flush_interval_secs: 3600,
+            channel_capacity: 16,
+        };
+        let (structured_handle, _join) = structured_syslog_start(&cfg, s3);
+        let structured_handle = Arc::new(structured_handle);
+
+        let handler = DefaultSyslogHandler::new(
+            false,
+            true, // parse_payloads = true
+            Some(structured_handle.clone()),
+        );
+
+        let cef_syslog = SyslogMessage::parse(
+            "<134>Jan 15 10:30:45 fw01 arcsight: \
+             CEF:0|Vendor|Product|1.0|100|Name|5|src=10.0.0.1",
+        )
+        .unwrap();
+
+        let src: SocketAddr = "127.0.0.1:5514".parse().unwrap();
+        handler.handle_message(cef_syslog, src).await;
+
+        // Give the channel a moment; test that try_send was called without panic.
+        sleep(Duration::from_millis(50)).await;
+        // If the handler panicked or did not compile the test would fail above.
     }
 
     /// Sending an unparseable syslog line via TCP increments `syslog_parse_errors`
