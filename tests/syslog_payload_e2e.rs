@@ -15,7 +15,7 @@ use logthing::syslog::listener::{
 use logthing::syslog::payload::{StructuredSyslogRecord, dispatch};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use tokio::net::UdpSocket;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::{Duration, sleep};
 
 /// A capturing store for structured records produced by dispatch.
@@ -55,12 +55,19 @@ async fn cef_datagram_produces_structured_record_with_cef_payload_type() {
     let udp_port = udp_socket.local_addr().unwrap().port();
     drop(udp_socket);
 
+    // Reserve a separate ephemeral port for TCP so the TCP bind in start()
+    // cannot collide with anything (assuming udp_port+1 is free is a flakiness
+    // hazard: a failed TCP bind aborts the shared select! and drops the UDP arm).
+    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_port = tcp_listener.local_addr().unwrap().port();
+    drop(tcp_listener);
+
     let store = CapturingStore::new();
     let handler = Arc::new(DispatchingTestHandler { store: store.clone() });
 
     let cfg = SyslogListenerConfig {
         udp_port,
-        tcp_port: udp_port + 1, // distinct port; not exercised here
+        tcp_port, // verified-free ephemeral port; not exercised here
         bind_address: "127.0.0.1".to_string(),
         parse_dns_logs: false,
     };
@@ -102,12 +109,17 @@ async fn non_matching_datagram_produces_no_structured_record() {
     let udp_port = udp_socket.local_addr().unwrap().port();
     drop(udp_socket);
 
+    // Reserve a separate ephemeral port for TCP (see note in the CEF test).
+    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_port = tcp_listener.local_addr().unwrap().port();
+    drop(tcp_listener);
+
     let store = CapturingStore::new();
     let handler = Arc::new(DispatchingTestHandler { store: store.clone() });
 
     let cfg = SyslogListenerConfig {
         udp_port,
-        tcp_port: udp_port + 1,
+        tcp_port,
         bind_address: "127.0.0.1".to_string(),
         parse_dns_logs: false,
     };
