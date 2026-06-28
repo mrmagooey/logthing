@@ -1,5 +1,7 @@
 use crate::config::Config;
 use crate::forwarding::Forwarder;
+use crate::ingest::IngestState;
+use crate::ingest::handlers::{handle_hec_event, handle_hec_raw, handle_ndjson};
 use crate::middleware::{IpWhitelist, ip_whitelist_middleware};
 use crate::models::WindowsEvent;
 use crate::parser::GenericEventParser;
@@ -55,6 +57,10 @@ pub struct Server {
     /// JoinHandle for the WEF→S3 Parquet worker task, if one was started.
     /// Awaited during graceful shutdown so buffered data is flushed before exit.
     wef_worker_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Shared extension state for HEC / NDJSON ingest routes.
+    ingest_state: IngestState,
+    /// JoinHandle for the HEC→S3 Parquet worker task, if one was started.
+    hec_worker_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Server {
@@ -190,10 +196,39 @@ impl Server {
             parquet_s3_sender,
         });
 
+        // --- Build IngestState for HEC / NDJSON ingest routes ---
+        let (ingest_state, hec_worker_handle) = if config.hec.enabled {
+            if let Some(s3_cfg) = config.hec.s3.as_ref() {
+                match crate::forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await
+                {
+                    Ok(sink) => {
+                        info!("Initialized HEC Parquet S3 forwarder");
+                        let (handler, join_handle) = crate::forwarding::generic_s3::hec_start(
+                            s3_cfg,
+                            Arc::new(sink),
+                            config.hec.max_sourcetype_partitions,
+                        );
+                        (IngestState { generic_s3: Some(handler) }, Some(join_handle))
+                    }
+                    Err(e) => {
+                        error!("Failed to create S3Sink for HEC ingest: {e}");
+                        (IngestState::default(), None)
+                    }
+                }
+            } else {
+                // HEC enabled but no S3 configured — accept and drop records.
+                (IngestState::default(), None)
+            }
+        } else {
+            (IngestState::default(), None)
+        };
+
         Ok(Self {
             config,
             state,
             wef_worker_handle,
+            ingest_state,
+            hec_worker_handle,
         })
     }
 
@@ -203,6 +238,14 @@ impl Server {
     /// the handle is no longer accessible.
     pub fn take_wef_worker_handle(&mut self) -> Option<tokio::task::JoinHandle<()>> {
         self.wef_worker_handle.take()
+    }
+
+    /// Take the HEC→S3 Parquet worker's JoinHandle for awaiting at shutdown.
+    ///
+    /// Must be called BEFORE `run`/`run_tls`; after the server consumes `self`
+    /// the handle is no longer accessible.
+    pub fn take_hec_worker_handle(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.hec_worker_handle.take()
     }
 
     /// Run the WEF server without TLS (HTTP only).
@@ -266,7 +309,12 @@ impl Server {
             .layer(axum::Extension(ip_whitelist.clone()))
             .with_state(self.state.clone());
 
-        // Protected routes (require authentication)
+        let cfg_token = Arc::new(self.config.hec.token.clone());
+
+        // Protected routes (require authentication).
+        // HEC / NDJSON routes are registered here — BEFORE the .layer() calls —
+        // so they inherit the same IP-whitelist, body-limit, and shared middleware
+        // as the existing WEF / syslog routes.
         let protected_router = Router::new()
             .route("/wsman", post(handle_wef_request))
             .route("/wsman/subscriptions", post(handle_subscription))
@@ -275,6 +323,13 @@ impl Server {
             .route("/syslog", post(handle_syslog_http))
             .route("/syslog/udp", get(handle_syslog_udp_info))
             .route("/syslog/examples", get(handle_syslog_examples))
+            // HEC / NDJSON ingest routes — behind IP-whitelist and body-limit
+            .route("/services/collector/event", post(handle_hec_event))
+            .route("/services/collector/raw", post(handle_hec_raw))
+            .route("/ingest", post(handle_ndjson))
+            // Extensions for HEC handlers (harmless to existing WEF/syslog handlers)
+            .layer(axum::Extension(self.ingest_state.clone()))
+            .layer(axum::Extension(cfg_token))
             .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE))
             .layer(shared_layers)
             .layer(axum::Extension(ip_whitelist))
@@ -1637,6 +1692,125 @@ mod tests {
             ct.contains("application/soap+xml"),
             "heartbeat response must have Content-Type application/soap+xml, got: {ct}"
         );
+    }
+
+    // ------------------------------------------------------------------ //
+    // Task 4.8: HEC / NDJSON route wiring tests                          //
+    // ------------------------------------------------------------------ //
+
+    /// Helper: build a minimal router with the three HEC routes and the same
+    /// body-size limit used in production, for route-level unit testing.
+    async fn build_hec_router(token: &str) -> axum::Router {
+        use axum::{Extension, Router, routing::post};
+        use crate::ingest::{
+            IngestState,
+            handlers::{handle_hec_event, handle_hec_raw, handle_ndjson},
+        };
+        use std::sync::Arc;
+
+        let cfg_token = Arc::new(token.to_string());
+        let ingest_state = IngestState { generic_s3: None };
+
+        Router::new()
+            .route("/services/collector/event", post(handle_hec_event))
+            .route("/services/collector/raw", post(handle_hec_raw))
+            .route("/ingest", post(handle_ndjson))
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE))
+            .layer(Extension(cfg_token))
+            .layer(Extension(ingest_state))
+    }
+
+    #[tokio::test]
+    async fn hec_event_route_accepts_valid_request() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let router = build_hec_router("test-token").await;
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/services/collector/event")
+            .header("Authorization", "Splunk test-token")
+            .body(Body::from(
+                r#"{"event":{"msg":"hello world"},"sourcetype":"myapp"}"#,
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let b = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(j["text"], "Success");
+        assert_eq!(j["code"], 0);
+    }
+
+    #[tokio::test]
+    async fn hec_route_rejects_bad_token() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let router = build_hec_router("correct").await;
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/services/collector/event")
+            .header("Authorization", "Splunk wrong")
+            .body(Body::from(r#"{"event":{"k":1},"sourcetype":"t"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn hec_raw_route_returns_200() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let router = build_hec_router("tok").await;
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/services/collector/raw?sourcetype=raw_src")
+            .header("Authorization", "Splunk tok")
+            .body(Body::from("raw log payload"))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ndjson_route_returns_200() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let router = build_hec_router("tok").await;
+        let body = "{\"host\":\"h1\",\"msg\":\"line1\"}\n{\"host\":\"h2\",\"msg\":\"line2\"}\n";
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/ingest?sourcetype=ndjson_type")
+            .header("Authorization", "Splunk tok")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn hec_routes_enforce_body_size_limit() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let router = build_hec_router("tok").await;
+        let over_limit = vec![0u8; MAX_BODY_SIZE + 1];
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/services/collector/event")
+            .header("Authorization", "Splunk tok")
+            .body(Body::from(over_limit))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
 
