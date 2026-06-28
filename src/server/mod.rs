@@ -337,6 +337,17 @@ impl Server {
                 .route("/ingest", post(handle_ndjson));
         }
 
+        // OTLP log ingest route — registered ONLY when the `otlp` feature is
+        // compiled in AND `config.otlp.enabled` is true.  A default deployment
+        // (otlp disabled) sees zero behavior change: /v1/logs stays unmounted
+        // and returns 404, matching the plan's global constraint.  When enabled
+        // the route is added BEFORE .layer() so it inherits the same IP-whitelist
+        // and body-limit middleware as the other protected routes.
+        #[cfg(feature = "otlp")]
+        if self.config.otlp.enabled {
+            protected_router = protected_router.route("/v1/logs", post(handle_otlp_logs));
+        }
+
         // Extensions for HEC handlers are harmless to the existing WEF/syslog
         // handlers and are always layered so the extractors resolve when the
         // routes are mounted.
@@ -1991,6 +2002,334 @@ mod tests {
             "hec worker handle must be None when hec.enabled=false"
         );
     }
+
+    // ------------------------------------------------------------------ //
+    // Task 5.4: OTLP handler tests                                        //
+    // ------------------------------------------------------------------ //
+
+    #[cfg(feature = "otlp")]
+    mod otlp_handler_tests {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use crate::config::OtlpConfig;
+        use opentelemetry_proto::tonic::collector::logs::v1::{
+            ExportLogsServiceRequest, ExportLogsServiceResponse,
+        };
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value as AnyVal};
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use prost::Message as ProstMessage;
+        use tower::ServiceExt;
+
+        fn make_proto_request() -> ExportLogsServiceRequest {
+            ExportLogsServiceRequest {
+                resource_logs: vec![ResourceLogs {
+                    resource: Some(Resource {
+                        attributes: vec![KeyValue {
+                            key: "service.name".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(AnyVal::StringValue("test-svc".to_string())),
+                            }),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    scope_logs: vec![ScopeLogs {
+                        scope: None,
+                        log_records: vec![LogRecord {
+                            time_unix_nano: 1_700_000_000_000_000_000,
+                            severity_text: "INFO".to_string(),
+                            body: Some(AnyValue {
+                                value: Some(AnyVal::StringValue("e2e test message".to_string())),
+                            }),
+                            ..Default::default()
+                        }],
+                        schema_url: String::new(),
+                    }],
+                    schema_url: String::new(),
+                }],
+            }
+        }
+
+        /// Build a minimal router with the OTLP route and the given bearer_token
+        /// configured.  `IngestState.generic_s3 = None` so no S3 sink is needed.
+        async fn build_otlp_app(bearer_token: Option<String>) -> axum::Router {
+            let mut config = Config::default();
+            config.otlp = OtlpConfig {
+                enabled: true,
+                bearer_token,
+            };
+            let app_state = super::build_state_with_config(config).await;
+            let ingest_state = IngestState { generic_s3: None };
+
+            axum::Router::new()
+                .route("/v1/logs", post(handle_otlp_logs))
+                .layer(axum::Extension(ingest_state))
+                .with_state(app_state)
+        }
+
+        // ── Test A: valid protobuf POST → 200 + valid ExportLogsServiceResponse ──
+
+        #[tokio::test]
+        async fn handle_otlp_logs_proto_returns_200() {
+            let app = build_otlp_app(None).await;
+            let req_bytes = make_proto_request().encode_to_vec();
+
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(req_bytes))
+                    .unwrap(),
+            );
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let body_bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+            let _resp = ExportLogsServiceResponse::decode(body_bytes.as_ref())
+                .expect("response must be valid protobuf ExportLogsServiceResponse");
+        }
+
+        // ── Test B: valid JSON POST → 200 ──────────────────────────────────────
+
+        #[tokio::test]
+        async fn handle_otlp_logs_json_returns_200() {
+            let app = build_otlp_app(None).await;
+            let json_body = serde_json::to_vec(&make_proto_request())
+                .expect("ExportLogsServiceRequest must be serde-serializable via with-serde feature");
+
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json_body))
+                    .unwrap(),
+            );
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        // ── Test C: correct bearer token accepted → 200 ────────────────────────
+
+        #[tokio::test]
+        async fn handle_otlp_logs_correct_bearer_accepted() {
+            let app = build_otlp_app(Some("my-secret-token".to_string())).await;
+            let req_bytes = make_proto_request().encode_to_vec();
+
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .header("authorization", "Bearer my-secret-token")
+                    .body(Body::from(req_bytes))
+                    .unwrap(),
+            );
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        // ── Test D: wrong bearer token rejected → 401 ──────────────────────────
+
+        #[tokio::test]
+        async fn handle_otlp_logs_wrong_bearer_rejected() {
+            let app = build_otlp_app(Some("correct-token".to_string())).await;
+            let req_bytes = make_proto_request().encode_to_vec();
+
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .header("authorization", "Bearer wrong-token")
+                    .body(Body::from(req_bytes))
+                    .unwrap(),
+            );
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // ── Test E: bearer required but absent → 401 ───────────────────────────
+
+        #[tokio::test]
+        async fn handle_otlp_logs_missing_bearer_rejected() {
+            let app = build_otlp_app(Some("required-token".to_string())).await;
+            let req_bytes = make_proto_request().encode_to_vec();
+
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(req_bytes))
+                    .unwrap(),
+            );
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // ── Test F: no bearer_token configured → accepted without auth ─────────
+        // This is the dev-mode / empty-token skip, consistent with HEC behavior.
+
+        #[tokio::test]
+        async fn handle_otlp_logs_unconfigured_bearer_accepts_no_auth() {
+            let app = build_otlp_app(None).await; // bearer_token = None
+            let req_bytes = make_proto_request().encode_to_vec();
+
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    // deliberately NO Authorization header
+                    .body(Body::from(req_bytes))
+                    .unwrap(),
+            );
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "no bearer_token configured → request must be accepted without auth"
+            );
+        }
+
+        // ── Test G: malformed protobuf body → 400 ─────────────────────────────
+
+        #[tokio::test]
+        async fn handle_otlp_logs_malformed_proto_returns_400() {
+            let app = build_otlp_app(None).await;
+
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(b"\xFF\xFE\xFD garbage not valid protobuf".as_ref()))
+                    .unwrap(),
+            );
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "malformed protobuf body must return 400"
+            );
+        }
+
+        // ── Test H: malformed JSON body → 400 ────────────────────────────────
+
+        #[tokio::test]
+        async fn handle_otlp_logs_malformed_json_returns_400() {
+            let app = build_otlp_app(None).await;
+
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(b"{ not valid json ]".as_ref()))
+                    .unwrap(),
+            );
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "malformed JSON body must return 400"
+            );
+        }
+
+        // ── Test I: unknown / missing Content-Type → 415 ──────────────────────
+
+        #[tokio::test]
+        async fn handle_otlp_logs_unknown_content_type_returns_415() {
+            let app = build_otlp_app(None).await;
+
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "text/plain")
+                    .body(Body::from(b"hello".as_ref()))
+                    .unwrap(),
+            );
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unknown Content-Type must return 415"
+            );
+        }
+
+        // ── Test J: route NOT mounted when otlp.enabled = false → 404 ─────────
+        // This verifies the global constraint: default deployments see zero
+        // behavior change (the route is not registered when disabled).
+
+        #[tokio::test]
+        async fn v1_logs_not_mounted_when_otlp_disabled() {
+            let config = Config::default(); // otlp.enabled defaults to false
+            let server = super::build_server(config).await;
+            let router = server
+                .create_router(IpWhitelist::empty())
+                .expect("router must build");
+
+            let req = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(b"".as_ref()))
+                    .unwrap(),
+            );
+
+            let resp = router.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "/v1/logs must return 404 when otlp.enabled is false"
+            );
+        }
+
+        // ── Test K: route IS mounted when otlp.enabled = true ─────────────────
+
+        #[tokio::test]
+        async fn v1_logs_mounted_when_otlp_enabled() {
+            let mut config = Config::default();
+            config.otlp.enabled = true; // bearer_token = None → dev mode
+
+            let server = super::build_server(config).await;
+            let router = server
+                .create_router(IpWhitelist::empty())
+                .expect("router must build");
+
+            let req_bytes = make_proto_request().encode_to_vec();
+            let req = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(req_bytes))
+                    .unwrap(),
+            );
+
+            let resp = router.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "/v1/logs must return 200 when otlp.enabled is true and no token required"
+            );
+        }
+    }
 }
 
 /// Build a `RustlsConfig` from the TLS section of the server config.
@@ -2164,4 +2503,135 @@ async fn handle_syslog_examples() -> Json<serde_json::Value> {
         "powerdns": examples::POWERDNS_QUERIES,
         "rfc5424": examples::RFC5424_DNS_LOGS
     }))
+}
+
+/// POST /v1/logs — OTLP/HTTP protobuf or JSON log ingest.
+///
+/// Content-Type dispatch:
+///   `application/x-protobuf` → prost decode
+///   `application/json`       → serde_json decode (via `with-serde` feature of opentelemetry-proto)
+///   anything else            → 415 Unsupported Media Type
+///
+/// Auth: if `config.otlp.bearer_token` is `Some(token)` AND the token is
+/// non-empty, the request must carry `Authorization: Bearer <token>`.
+/// If `bearer_token` is `None` or an empty string, auth is skipped (dev mode),
+/// consistent with the HEC empty-token skip behavior.
+/// Comparison is constant-time (via `subtle::ConstantTimeEq`) on the equal-length
+/// path; a length mismatch is an early branch (token length is low-sensitivity).
+///
+/// On success: maps each `LogRecord` → `GenericRecord` via `otlp::map_otlp_request`,
+/// forwards through `IngestState.generic_s3` (warn-and-drop on channel full/closed),
+/// and returns an empty `ExportLogsServiceResponse` (200) in the SAME encoding
+/// (protobuf or JSON) as the request.
+///
+/// Error codes:
+///   400 — malformed protobuf or JSON body
+///   401 — bearer token required but absent or incorrect
+///   415 — unknown or missing Content-Type
+#[cfg(feature = "otlp")]
+pub(crate) async fn handle_otlp_logs(
+    State(app_state): State<Arc<AppState>>,
+    axum::extract::Extension(ingest): axum::extract::Extension<IngestState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    use opentelemetry_proto::tonic::collector::logs::v1::{
+        ExportLogsServiceRequest, ExportLogsServiceResponse,
+    };
+    use prost::Message as ProstMessage;
+    use subtle::ConstantTimeEq;
+
+    // ── Bearer auth check ─────────────────────────────────────────────────
+    {
+        let cfg = app_state.config.read().await;
+        if let Some(ref expected_token) = cfg.otlp.bearer_token {
+            if !expected_token.is_empty() {
+                let provided = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.strip_prefix("Bearer "))
+                    .unwrap_or("");
+                let a = expected_token.as_bytes();
+                let b = provided.as_bytes();
+                // Length mismatch is not secret-sensitive; ct_eq only valid for
+                // equal-length slices, so we gate it on length equality first.
+                let ok: bool = a.len() == b.len() && a.ct_eq(b).into();
+                if !ok {
+                    metrics::counter!("otlp_auth_failures").increment(1);
+                    warn!("OTLP bearer auth failure from {}", addr.ip());
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+            }
+        }
+        // bearer_token is None or empty → skip auth (dev mode)
+    }
+
+    // ── Content-Type dispatch ─────────────────────────────────────────────
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let req: ExportLogsServiceRequest = if ct.starts_with("application/x-protobuf")
+        || ct.starts_with("application/protobuf")
+    {
+        ExportLogsServiceRequest::decode(body.as_ref()).map_err(|e| {
+            warn!("OTLP protobuf decode error from {}: {e}", addr.ip());
+            StatusCode::BAD_REQUEST
+        })?
+    } else if ct.starts_with("application/json") {
+        serde_json::from_slice::<ExportLogsServiceRequest>(&body).map_err(|e| {
+            warn!("OTLP JSON decode error from {}: {e}", addr.ip());
+            StatusCode::BAD_REQUEST
+        })?
+    } else {
+        warn!(
+            "OTLP unsupported Content-Type '{}' from {}",
+            ct,
+            addr.ip()
+        );
+        return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    };
+
+    // ── Map to GenericRecords ─────────────────────────────────────────────
+    let source_host = addr.ip().to_string();
+    let records = crate::server::otlp::map_otlp_request(req, source_host);
+    let count = records.len() as u64;
+
+    // ── Route through generic S3 handler ─────────────────────────────────
+    // try_send is non-blocking; channel full / closed → warn and drop,
+    // mirroring the HEC handler pattern in src/ingest/handlers.rs.
+    if let Some(ref handler) = ingest.generic_s3 {
+        for record in records {
+            if let Err(e) = handler.try_send(record) {
+                match e {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        warn!("OTLP generic_s3 channel full, dropping record");
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        error!("OTLP generic_s3 channel closed");
+                    }
+                }
+            }
+        }
+    }
+
+    metrics::counter!("otlp_logs_received").increment(count);
+
+    // ── Respond in the same encoding as the request ───────────────────────
+    let (resp_bytes, response_ct) = if ct.starts_with("application/json") {
+        let json_bytes = serde_json::to_vec(&ExportLogsServiceResponse::default())
+            .unwrap_or_default();
+        (json_bytes, "application/json")
+    } else {
+        let proto_bytes = ExportLogsServiceResponse::default().encode_to_vec();
+        (proto_bytes, "application/x-protobuf")
+    };
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", response_ct)
+        .body(axum::body::Body::from(resp_bytes))
+        .unwrap())
 }
