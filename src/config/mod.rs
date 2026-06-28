@@ -68,6 +68,9 @@ pub struct Config {
 
     #[serde(default)]
     pub wef: WefConfig,
+
+    #[serde(default)]
+    pub hec: HecConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -416,6 +419,67 @@ pub struct WefConfig {
     pub s3: Option<WefS3Config>,
 }
 
+/// Per-source S3 persistence config for HEC ingest.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct HecS3Config {
+    /// Shared S3 connection fields (flattened: `[hec.s3]\nendpoint = …`).
+    #[serde(flatten)]
+    pub connection: S3ConnectionConfig,
+    /// S3 key prefix, slash-free (default: `"hec"`).
+    #[serde(default = "default_hec_s3_prefix")]
+    pub prefix: String,
+    /// Flush when estimated buffer bytes exceeds this (default: 100 MiB).
+    #[serde(default = "default_hec_flush_bytes")]
+    pub flush_threshold_bytes: usize,
+    /// Flush after this many seconds regardless (default: 900).
+    #[serde(default = "default_hec_flush_secs")]
+    pub flush_interval_secs: u64,
+    /// Bounded channel capacity (default: 256).
+    #[serde(default = "default_hec_channel_capacity")]
+    pub channel_capacity: usize,
+    /// Maximum buffered rows before hard cap (default: 100_000).
+    #[serde(default = "default_hec_max_buffer_rows")]
+    pub max_buffer_rows: usize,
+}
+
+fn default_hec_s3_prefix() -> String { "hec".to_string() }
+fn default_hec_flush_bytes() -> usize { 100 * 1024 * 1024 }
+fn default_hec_flush_secs() -> u64 { 900 }
+fn default_hec_channel_capacity() -> usize { 256 }
+fn default_hec_max_buffer_rows() -> usize { 100_000 }
+
+/// Top-level `[hec]` config section.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct HecConfig {
+    /// Enable the HEC ingest routes (default: false).
+    #[serde(default = "default_hec_enabled")]
+    pub enabled: bool,
+    /// Shared secret compared against `Authorization: Splunk <token>`.
+    /// Empty string means any token is accepted — only useful for local dev.
+    #[serde(default)]
+    pub token: String,
+    /// Maximum distinct `sourcetype` partitions before overflow (default: 64).
+    #[serde(default = "default_hec_max_sourcetype_partitions")]
+    pub max_sourcetype_partitions: usize,
+    /// Optional S3 persistence. `None` → records are accepted but not stored.
+    #[serde(default)]
+    pub s3: Option<HecS3Config>,
+}
+
+fn default_hec_enabled() -> bool { false }
+fn default_hec_max_sourcetype_partitions() -> usize { 64 }
+
+impl Default for HecConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_hec_enabled(),
+            token: String::new(),
+            max_sourcetype_partitions: default_hec_max_sourcetype_partitions(),
+            s3: None,
+        }
+    }
+}
+
 /// Per-source S3 persistence config for the syslog listener.
 /// Absent from TOML → `None` → no S3 persistence (backward compatible).
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -578,6 +642,7 @@ impl Default for Config {
             zeek: ZeekConfig::default(),
             suricata: SuricataConfig::default(),
             wef: WefConfig::default(),
+            hec: HecConfig::default(),
         }
     }
 }
@@ -1154,5 +1219,50 @@ secret_key = "SSECRET"
     fn sflow_is_disabled_by_default_in_main_config() {
         let cfg = Config::default();
         assert!(!cfg.sflow.enabled, "sflow must be opt-in (enabled=false by default)");
+    }
+
+    #[test]
+    fn hec_disabled_by_default() {
+        let cfg = Config::default();
+        assert!(!cfg.hec.enabled, "hec must be disabled by default");
+        assert_eq!(
+            cfg.hec.max_sourcetype_partitions, 64,
+            "default max_sourcetype_partitions must be 64"
+        );
+        assert!(cfg.hec.s3.is_none(), "absent [hec.s3] must yield None");
+    }
+
+    #[test]
+    fn hec_s3_flat_toml_deserializes_correctly() {
+        let toml_str = r#"
+[hec]
+enabled = true
+token = "super-secret-token"
+max_sourcetype_partitions = 32
+[hec.s3]
+endpoint   = "http://minio:9000"
+bucket     = "hec-events"
+region     = "us-east-1"
+access_key = "KEY"
+secret_key = "SECRET"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse hec config");
+        assert!(cfg.hec.enabled);
+        assert_eq!(cfg.hec.token, "super-secret-token");
+        assert_eq!(cfg.hec.max_sourcetype_partitions, 32);
+        let s3 = cfg.hec.s3.expect("s3 section present");
+        assert_eq!(s3.connection.bucket, "hec-events");
+        assert_eq!(s3.prefix, "hec"); // default prefix
+        assert_eq!(s3.flush_threshold_bytes, 100 * 1024 * 1024);
+        assert_eq!(s3.flush_interval_secs, 900);
+        assert_eq!(s3.channel_capacity, 256);
+        assert_eq!(s3.max_buffer_rows, 100_000);
+    }
+
+    #[test]
+    fn hec_s3_absent_section_means_no_persistence() {
+        let toml_str = "[hec]\nenabled = true\ntoken = \"tok\"\n";
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.hec.s3.is_none(), "absent [hec.s3] must yield None");
     }
 }
