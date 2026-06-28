@@ -71,6 +71,9 @@ pub struct Config {
 
     #[serde(default)]
     pub hec: HecConfig,
+
+    #[serde(default)]
+    pub otlp: OtlpConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -480,6 +483,35 @@ impl Default for HecConfig {
     }
 }
 
+/// Top-level [otlp] config section (OTLP/HTTP log ingest).
+/// Only present when the `otlp` Cargo feature is enabled; always compiled
+/// into Config so the TOML surface is consistent (the field is inert when
+/// the feature is off — the route is never registered).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OtlpConfig {
+    /// Enable the `POST /v1/logs` OTLP endpoint. Default: false.
+    #[serde(default = "default_otlp_enabled")]
+    pub enabled: bool,
+
+    /// Optional bearer token for the `Authorization: Bearer <token>` header.
+    /// If `None`, no bearer auth is enforced (IP whitelist + TLS still apply).
+    #[serde(default)]
+    pub bearer_token: Option<String>,
+}
+
+fn default_otlp_enabled() -> bool {
+    false
+}
+
+impl Default for OtlpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_otlp_enabled(),
+            bearer_token: None,
+        }
+    }
+}
+
 /// Per-source S3 persistence config for the syslog listener.
 /// Absent from TOML → `None` → no S3 persistence (backward compatible).
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -643,6 +675,7 @@ impl Default for Config {
             suricata: SuricataConfig::default(),
             wef: WefConfig::default(),
             hec: HecConfig::default(),
+            otlp: OtlpConfig::default(),
         }
     }
 }
@@ -1264,5 +1297,32 @@ secret_key = "SECRET"
         let toml_str = "[hec]\nenabled = true\ntoken = \"tok\"\n";
         let cfg: Config = toml::from_str(toml_str).expect("parse");
         assert!(cfg.hec.s3.is_none(), "absent [hec.s3] must yield None");
+    }
+
+    #[test]
+    fn otlp_config_defaults_disabled_no_token() {
+        let cfg = Config::default();
+        assert!(!cfg.otlp.enabled, "otlp must be opt-in (default false)");
+        assert!(cfg.otlp.bearer_token.is_none(), "no bearer_token by default");
+    }
+
+    #[test]
+    fn otlp_config_parses_from_toml() {
+        let toml_str = r#"
+[otlp]
+enabled = true
+bearer_token = "s3cr3t"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.otlp.enabled);
+        assert_eq!(cfg.otlp.bearer_token.as_deref(), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn otlp_config_absent_section_yields_defaults() {
+        let toml_str = "[syslog]\nenabled = true\n";
+        let cfg: Config = toml::from_str(toml_str).expect("parse");
+        assert!(!cfg.otlp.enabled);
+        assert!(cfg.otlp.bearer_token.is_none());
     }
 }
