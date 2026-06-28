@@ -602,7 +602,7 @@ fn decode_counter_sample(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
