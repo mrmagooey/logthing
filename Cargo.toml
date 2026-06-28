@@ -5,8 +5,9 @@ edition = "2024"
 
 
 [features]
-default = []
+default = ["otlp"]
 kerberos-auth = ["axum-negotiate"]
+otlp = ["dep:opentelemetry-proto", "dep:prost"]
 
 [dependencies]
 # Async runtime
@@ -86,6 +87,17 @@ aho-corasick = "1.1"
 argon2 = { version = "0.5", features = ["std", "password-hash", "rand"] }
 rand = "0.9.2"
 subtle = "2"
+
+# OTLP ingest (feature-gated)
+# opentelemetry-proto 0.32 uses prost 0.14 (brief suggested 0.7/prost-0.13 but actual latest is 0.32/prost-0.14)
+# `logs` feature is required to gate tonic::logs::v1 and tonic::collector::logs::v1 modules
+# `trace` is omitted — not needed for logs-only ingest
+opentelemetry-proto = { version = "0.32", optional = true, default-features = false, features = [
+    "gen-tonic-messages",
+    "with-serde",
+    "logs",
+] }
+prost = { version = "0.14", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
