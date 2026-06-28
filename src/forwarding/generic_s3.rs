@@ -18,6 +18,7 @@ use std::sync::Arc;
 // GenericSink — ParquetSink adapter
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct GenericSink;
 
 /// Build the fixed 5-column schema used for all HEC partitions.
