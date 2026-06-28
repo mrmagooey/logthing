@@ -67,6 +67,30 @@ async fn async_main() -> anyhow::Result<()> {
         let config_clone = config.clone();
         let syslog_shutdown_rx = shutdown_rx.clone();
 
+        // Build optional structured sink BEFORE building the primary handler.
+        let structured_handle: Option<Arc<forwarding::structured_syslog_s3::StructuredS3Handler>> =
+            if config_clone.syslog.parse_payloads {
+                if let Some(ss3_cfg) = config_clone.syslog.structured_s3.as_ref() {
+                    match forwarding::s3_sink::S3Sink::from_connection(&ss3_cfg.connection).await {
+                        Ok(sink) => {
+                            let (sh, wh) = forwarding::structured_syslog_s3::structured_syslog_start(
+                                ss3_cfg, Arc::new(sink),
+                            );
+                            writer_handles.push(wh);
+                            Some(Arc::new(sh))
+                        }
+                        Err(e) => {
+                            error!("Failed to create S3Sink for structured syslog: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         // Build the handler BEFORE spawning so we can extract the writer JoinHandle.
         let syslog_handler: Arc<dyn syslog::listener::SyslogHandler> =
             if let Some(s3_cfg) = config_clone.syslog.s3.as_ref() {
@@ -75,7 +99,12 @@ async fn async_main() -> anyhow::Result<()> {
                         let (handler, writer_handle) =
                             forwarding::syslog_s3::syslog_start(s3_cfg, Arc::new(sink));
                         writer_handles.push(writer_handle);
-                        Arc::new(handler)
+                        // Wrap SyslogS3Handler in a payload-dispatching adapter.
+                        Arc::new(syslog::listener::PayloadDispatchingHandler {
+                            inner: Arc::new(handler),
+                            parse_payloads: config_clone.syslog.parse_payloads,
+                            structured_handle: structured_handle.clone(),
+                        })
                     }
                     Err(e) => {
                         error!(
@@ -84,12 +113,16 @@ async fn async_main() -> anyhow::Result<()> {
                         );
                         Arc::new(syslog::listener::DefaultSyslogHandler::new(
                             config_clone.syslog.parse_dns,
+                            config_clone.syslog.parse_payloads,
+                            structured_handle.clone(),
                         ))
                     }
                 }
             } else {
                 Arc::new(syslog::listener::DefaultSyslogHandler::new(
                     config_clone.syslog.parse_dns,
+                    config_clone.syslog.parse_payloads,
+                    structured_handle,
                 ))
             };
 
