@@ -5,6 +5,7 @@
 //! `GenericSink` (Task 4.3) is the `ParquetSink` adapter that persists
 //! these records to S3 partitioned by `sourcetype`.
 
+pub mod handlers;
 pub mod parse;
 
 use chrono::{DateTime, Utc};
