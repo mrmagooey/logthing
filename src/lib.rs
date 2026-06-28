@@ -16,3 +16,4 @@ pub mod stats;
 pub mod syslog;
 pub mod suricata;
 pub mod zeek;
+pub mod ingest;
