@@ -59,6 +59,34 @@ impl S3Sink {
         })
     }
 
+    /// List all object keys with the given prefix. Returns full S3 keys.
+    pub async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
+        let resp = self.client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .send()
+            .await?;
+        let keys = resp
+            .contents()
+            .iter()
+            .filter_map(|obj| obj.key().map(|k| k.to_string()))
+            .collect();
+        Ok(keys)
+    }
+
+    /// Download an object and return its raw bytes.
+    pub async fn get_object(&self, key: &str) -> Result<Vec<u8>> {
+        let resp = self.client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await?;
+        let bytes = resp.body.collect().await?.into_bytes().to_vec();
+        Ok(bytes)
+    }
+
     /// Upload `body` bytes to `key` in the configured bucket.
     /// Mirrors the put_object logic currently in ParquetS3Forwarder::upload_to_s3,
     /// minus the key-generation and file-read (those remain in the caller).
