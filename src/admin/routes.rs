@@ -714,6 +714,135 @@ mod tests {
         assert_eq!(total, 5);
     }
 
+    /// End-to-end: reproduces main.rs's actual wiring — ONE shared
+    /// Arc<SourceHourlyStats> both fed by a real writer and read by the real
+    /// admin server over a live loopback socket. Catches an Arc-identity
+    /// mistake (writer and admin server holding *different* instances) that
+    /// would compile cleanly but leave /stats.json permanently empty.
+    #[tokio::test]
+    async fn e2e_shared_source_stats_reach_stats_json_over_real_socket() {
+        use crate::config::S3ConnectionConfig;
+        use crate::forwarding::buffered_writer::{
+            BufferedWriterConfig, FlushPolicy, PartitionedParquetWriter,
+        };
+        use crate::forwarding::s3_sink::S3Sink;
+        use crate::stats::SourceHourlyStats;
+
+        // Step 1: the ONE shared Arc, exactly as main.rs builds it.
+        let source_stats = Arc::new(SourceHourlyStats::new());
+
+        // Step 2: push a record through a real writer using that shared Arc.
+        let conn = S3ConnectionConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            bucket: "t".to_string(),
+            region: "us-east-1".to_string(),
+            access_key: "K".to_string(),
+            secret_key: "S".to_string(),
+        };
+        let s3 = Arc::new(S3Sink::from_connection(&conn).await.unwrap());
+        let bwc = BufferedWriterConfig {
+            connection: conn,
+            prefix: "e2e".to_string(),
+            max_buffer_rows: 1_000,
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 64,
+            max_partitions: 1,
+        };
+        let policy = FlushPolicy {
+            max_rows: 1_000,
+            max_bytes: usize::MAX,
+            interval: std::time::Duration::from_secs(3600),
+        };
+
+        struct E2eSink;
+        impl crate::forwarding::buffered_writer::ParquetSink for E2eSink {
+            type Record = String;
+            fn source(&self) -> &'static str {
+                "e2e_source"
+            }
+            fn partition(&self, _r: &String) -> Option<String> {
+                None
+            }
+            fn schema(&self, _p: Option<&str>) -> Arc<arrow_schema::Schema> {
+                Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "val",
+                    arrow_schema::DataType::Utf8,
+                    false,
+                )]))
+            }
+            fn to_record_batch(
+                &self,
+                record: &String,
+                schema: &Arc<arrow_schema::Schema>,
+            ) -> anyhow::Result<arrow_array::RecordBatch> {
+                let col = Arc::new(arrow_array::StringArray::from(vec![record.as_str()]));
+                Ok(arrow_array::RecordBatch::try_new(schema.clone(), vec![col])?)
+            }
+        }
+
+        let mut writer = PartitionedParquetWriter::with_source_stats(
+            E2eSink,
+            s3,
+            bwc,
+            policy,
+            source_stats.clone(),
+        );
+        writer.push("hello".to_string()).await.unwrap();
+
+        // Step 3: spawn the real admin router, sharing the SAME Arc.
+        let server_config = AdminServerConfig {
+            bind_address: "127.0.0.1:0".parse().unwrap(),
+            username: "admin".to_string(),
+            password_hash: PasswordHash::hash("admin").unwrap(),
+            allowed_ips: vec![],
+            tls_config: None,
+            enable_csrf: false,
+            enable_rate_limiting: false,
+        };
+        let state = AdminState {
+            config: Arc::new(RwLock::new(Config::default())),
+            server_config,
+            audit_logger: AuditLogger::new(100).await,
+            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
+            request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            source_stats: source_stats.clone(),
+        };
+        let app = axum::Router::new()
+            .route("/stats.json", axum::routing::get(get_stats_json))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let real_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        // Step 4: real HTTP request over the real socket with Basic Auth.
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{real_addr}/stats.json"))
+            .basic_auth("admin", Some("admin"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let rows: Vec<crate::stats::SourceHourlySnapshot> = resp.json().await.unwrap();
+        let row = rows.iter().find(|r| r.source == "e2e_source").unwrap();
+        let total: u64 = row.hours.iter().map(|h| h.count).sum();
+        assert_eq!(
+            total, 1,
+            "count recorded via the writer's Arc must be visible through the \
+             admin server's Arc — they must be the SAME instance"
+        );
+    }
+
     #[tokio::test]
     async fn update_config_with_valid_auth_updates_configuration() {
         let state = test_state().await;

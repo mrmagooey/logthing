@@ -63,7 +63,7 @@ async fn hec_records_appear_as_parquet_in_s3() {
             .expect("S3Sink::from_connection"),
     );
 
-    let (handler, _writer_task) = hec_start(&cfg, sink, 64);
+    let (handler, _writer_task) = hec_start(&cfg, sink, 64, std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()));
     handler.try_send(make_record("access_log", "alice")).expect("send");
     handler.try_send(make_record("access_log", "bob")).expect("send");
     handler.try_send(make_record("audit_log", "charlie")).expect("send");

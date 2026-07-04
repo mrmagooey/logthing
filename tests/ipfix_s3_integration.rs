@@ -76,7 +76,7 @@ async fn ipfix_flow_record_appears_as_parquet_in_s3() {
     );
 
     // ipfix_start returns (handler, writer_join_handle)
-    let (handler, _writer_task) = ipfix_start(&cfg, sink.clone());
+    let (handler, _writer_task) = ipfix_start(&cfg, sink.clone(), std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()));
 
     let flow = make_flow_record();
     let src: std::net::SocketAddr = "127.0.0.1:4739".parse().unwrap();

@@ -96,7 +96,7 @@ async fn sflow_flow_record_appears_as_parquet_in_s3() {
             .await
             .expect("S3Sink::from_connection"),
     );
-    let (handler, _writer_task) = sflow_start(&cfg, sink.clone());
+    let (handler, _writer_task) = sflow_start(&cfg, sink.clone(), std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()));
     let src: std::net::SocketAddr = "127.0.0.1:6343".parse().unwrap();
 
     handler

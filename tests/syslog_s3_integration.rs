@@ -53,7 +53,7 @@ async fn syslog_message_appears_as_parquet_in_s3() {
 
     // `syslog_start` returns (handler, writer_join_handle) for graceful-shutdown support;
     // the test only needs the handler and lets the writer task run in the background.
-    let (handler, _writer_task) = syslog_start(&cfg, sink.clone());
+    let (handler, _writer_task) = syslog_start(&cfg, sink.clone(), std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()));
 
     let msg = SyslogMessage {
         priority: 134,

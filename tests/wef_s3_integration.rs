@@ -85,7 +85,7 @@ async fn wef_event_appears_as_parquet_in_s3() {
 
     // wef_start returns (handle, writer_join_handle).
     // The handle type is ParquetWriterHandle<WefSink> which exposes try_send().
-    let (handle, _writer_task) = wef_start(&cfg, sink.clone());
+    let (handle, _writer_task) = wef_start(&cfg, sink.clone(), std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()));
 
     let event = make_windows_event(4624);
     handle.try_send(event).expect("try_send must succeed");
