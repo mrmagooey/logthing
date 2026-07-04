@@ -100,6 +100,7 @@ impl ParquetSink for WefSink {
 pub fn wef_start(
     cfg: &WefS3Config,
     s3: Arc<crate::forwarding::s3_sink::S3Sink>,
+    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (
     crate::forwarding::buffered_writer::ParquetWriterHandle<WefSink>,
     tokio::task::JoinHandle<()>,
@@ -121,7 +122,7 @@ pub fn wef_start(
         max_bytes: cfg.flush_threshold_bytes,
         interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
     };
-    ParquetWriterHandle::start(WefSink, s3, bwc, policy)
+    ParquetWriterHandle::start_with_stats(WefSink, s3, bwc, policy, source_stats)
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +284,7 @@ mod tests {
             channel_capacity: 256,
             max_buffer_rows: 100_000,
         };
-        let (handle, jh) = wef_start(&cfg, s3);
+        let (handle, jh) = wef_start(&cfg, s3, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
 
         // Send a parsed event — should be accepted
         let event = make_parsed_event(4624);
@@ -347,5 +348,56 @@ mod tests {
             total_rows, 0,
             "unparsed events must not add rows to any buffer"
         );
+    }
+
+    #[tokio::test]
+    async fn wef_sink_reports_into_shared_source_hourly_stats() {
+        use crate::forwarding::buffered_writer::{
+            BufferedWriterConfig, FlushPolicy, PartitionedParquetWriter,
+        };
+        let s3 = std::sync::Arc::new(
+            crate::forwarding::s3_sink::S3Sink::from_connection(
+                &crate::config::S3ConnectionConfig {
+                    endpoint: "http://127.0.0.1:1".to_string(),
+                    bucket: "t".to_string(),
+                    region: "us-east-1".to_string(),
+                    access_key: "K".to_string(),
+                    secret_key: "S".to_string(),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let bwc = BufferedWriterConfig {
+            connection: crate::config::S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "t".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "K".to_string(),
+                secret_key: "S".to_string(),
+            },
+            prefix: "".to_string(),
+            max_buffer_rows: 1_000,
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 64,
+            max_partitions: 0,
+        };
+        let policy = FlushPolicy {
+            max_rows: 1_000,
+            max_bytes: usize::MAX,
+            interval: std::time::Duration::from_secs(3600),
+        };
+        let shared_stats = std::sync::Arc::new(crate::stats::SourceHourlyStats::new());
+
+        let mut writer = PartitionedParquetWriter::with_source_stats(
+            WefSink, s3, bwc, policy, shared_stats.clone(),
+        );
+        writer.push(make_parsed_event(4624)).await.unwrap();
+
+        let snapshot = shared_stats.snapshot();
+        let row = snapshot.iter().find(|r| r.source == "wef").unwrap();
+        let total: u64 = row.hours.iter().map(|h| h.count).sum();
+        assert_eq!(total, 1);
     }
 }

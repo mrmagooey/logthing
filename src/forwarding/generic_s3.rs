@@ -123,6 +123,7 @@ pub fn hec_start(
     cfg: &HecS3Config,
     s3: Arc<crate::forwarding::s3_sink::S3Sink>,
     max_partitions: usize,
+    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (GenericS3Handler, tokio::task::JoinHandle<()>) {
     use crate::forwarding::buffered_writer::{
         BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
@@ -142,7 +143,7 @@ pub fn hec_start(
         max_bytes: cfg.flush_threshold_bytes,
         interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
     };
-    ParquetWriterHandle::start(GenericSink, s3, bwc, policy)
+    ParquetWriterHandle::start_with_stats(GenericSink, s3, bwc, policy, source_stats)
 }
 
 // ---------------------------------------------------------------------------
@@ -368,12 +369,51 @@ mod tests {
             channel_capacity: 256,
             max_buffer_rows: 100_000,
         };
-        let (handler, join_handle) = hec_start(&cfg, s3, 64);
+        let (handler, join_handle) = hec_start(&cfg, s3, 64, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
         handler.try_send(make_record("access_log")).expect("send ok");
         drop(handler);
         tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
             .await
             .expect("writer exits within 5s")
             .expect("writer does not panic");
+    }
+
+    #[tokio::test]
+    async fn generic_sink_reports_into_shared_source_hourly_stats() {
+        use crate::forwarding::buffered_writer::{
+            BufferedWriterConfig, FlushPolicy, PartitionedParquetWriter,
+        };
+        let s3 = unreachable_sink().await;
+        let bwc = BufferedWriterConfig {
+            connection: crate::config::S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "t".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "K".to_string(),
+                secret_key: "S".to_string(),
+            },
+            prefix: "hec".to_string(),
+            max_buffer_rows: 1_000,
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 64,
+            max_partitions: 64,
+        };
+        let policy = FlushPolicy {
+            max_rows: 1_000,
+            max_bytes: usize::MAX,
+            interval: std::time::Duration::from_secs(3600),
+        };
+        let shared_stats = std::sync::Arc::new(crate::stats::SourceHourlyStats::new());
+
+        let mut writer = PartitionedParquetWriter::with_source_stats(
+            GenericSink, s3, bwc, policy, shared_stats.clone(),
+        );
+        writer.push(make_record("access_log")).await.unwrap();
+
+        let snapshot = shared_stats.snapshot();
+        let row = snapshot.iter().find(|r| r.source == "hec").unwrap();
+        let total: u64 = row.hours.iter().map(|h| h.count).sum();
+        assert_eq!(total, 1);
     }
 }

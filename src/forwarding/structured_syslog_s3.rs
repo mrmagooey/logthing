@@ -112,6 +112,7 @@ pub type StructuredS3Handler =
 pub fn structured_syslog_start(
     cfg: &SyslogS3Config,
     s3: Arc<crate::forwarding::s3_sink::S3Sink>,
+    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (StructuredS3Handler, tokio::task::JoinHandle<()>) {
     use crate::forwarding::buffered_writer::{
         BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
@@ -132,7 +133,7 @@ pub fn structured_syslog_start(
         max_bytes: usize::MAX,
         interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
     };
-    ParquetWriterHandle::start(StructuredSyslogSink, s3, bwc, policy)
+    ParquetWriterHandle::start_with_stats(StructuredSyslogSink, s3, bwc, policy, source_stats)
 }
 
 #[cfg(test)]
@@ -266,7 +267,11 @@ mod tests {
             flush_interval_secs: 3600,
             channel_capacity: 16,
         };
-        let (handle, join_handle) = structured_syslog_start(&cfg, s3);
+        let (handle, join_handle) = structured_syslog_start(
+            &cfg,
+            s3,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
         // Drop the handle immediately — empty buffer → flush_all is a no-op →
         // writer task exits without any S3 call.
         drop(handle);
@@ -275,5 +280,56 @@ mod tests {
             .await
             .expect("writer task exits within 2s")
             .expect("no panic");
+    }
+
+    #[tokio::test]
+    async fn structured_syslog_sink_reports_into_shared_source_hourly_stats() {
+        use crate::forwarding::buffered_writer::{
+            BufferedWriterConfig, FlushPolicy, PartitionedParquetWriter,
+        };
+        let s3 = std::sync::Arc::new(
+            crate::forwarding::s3_sink::S3Sink::from_connection(
+                &crate::config::S3ConnectionConfig {
+                    endpoint: "http://127.0.0.1:1".to_string(),
+                    bucket: "t".to_string(),
+                    region: "us-east-1".to_string(),
+                    access_key: "K".to_string(),
+                    secret_key: "S".to_string(),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let bwc = BufferedWriterConfig {
+            connection: crate::config::S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "t".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "K".to_string(),
+                secret_key: "S".to_string(),
+            },
+            prefix: "structured_syslog".to_string(),
+            max_buffer_rows: 1_000,
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 64,
+            max_partitions: 8,
+        };
+        let policy = FlushPolicy {
+            max_rows: 1_000,
+            max_bytes: usize::MAX,
+            interval: std::time::Duration::from_secs(3600),
+        };
+        let shared_stats = std::sync::Arc::new(crate::stats::SourceHourlyStats::new());
+
+        let mut writer = PartitionedParquetWriter::with_source_stats(
+            StructuredSyslogSink, s3, bwc, policy, shared_stats.clone(),
+        );
+        writer.push(sample_record("cef")).await.unwrap();
+
+        let snapshot = shared_stats.snapshot();
+        let row = snapshot.iter().find(|r| r.source == "structured_syslog").unwrap();
+        let total: u64 = row.hours.iter().map(|h| h.count).sum();
+        assert_eq!(total, 1);
     }
 }

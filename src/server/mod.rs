@@ -77,7 +77,7 @@ impl Server {
     /// ```no_run
     /// use logthing::config::Config;
     /// use logthing::server::Server;
-    /// use logthing::stats::ThroughputStats;
+    /// use logthing::stats::{SourceHourlyStats, ThroughputStats};
     /// use std::sync::Arc;
     /// use tokio::sync::RwLock;
     ///
@@ -85,8 +85,9 @@ impl Server {
     ///     let config = Config::load()?;
     ///     let shared_config = Arc::new(RwLock::new(config.clone()));
     ///     let throughput = Arc::new(ThroughputStats::new());
+    ///     let source_stats = Arc::new(SourceHourlyStats::new());
     ///
-    ///     let server = Server::new(config, shared_config, throughput).await?;
+    ///     let server = Server::new(config, shared_config, throughput, source_stats).await?;
     ///     // server.run().await?;
     ///     Ok(())
     /// }
@@ -95,6 +96,7 @@ impl Server {
         config: Config,
         shared_config: Arc<RwLock<Config>>,
         throughput: Arc<ThroughputStats>,
+        source_stats: Arc<crate::stats::SourceHourlyStats>,
     ) -> anyhow::Result<Self> {
         let forwarder = Forwarder::new(config.forwarding.destinations.clone())
             .initialize()
@@ -175,7 +177,7 @@ impl Server {
                 Ok(sink) => {
                     info!("Initialized WEF Parquet S3 forwarder (generic buffered writer)");
                     let (handle, join_handle) =
-                        crate::forwarding::parquet_s3::wef_start(wef_s3_cfg, Arc::new(sink));
+                        crate::forwarding::parquet_s3::wef_start(wef_s3_cfg, Arc::new(sink), source_stats.clone());
                     (Some(handle), Some(join_handle))
                 }
                 Err(e) => {
@@ -210,6 +212,7 @@ impl Server {
                             s3_cfg,
                             Arc::new(sink),
                             config.hec.max_sourcetype_partitions,
+                            source_stats.clone(),
                         );
                         (IngestState { generic_s3: Some(handler) }, Some(join_handle))
                     }
@@ -1846,7 +1849,7 @@ mod tests {
     async fn build_server(config: Config) -> Server {
         let shared = Arc::new(RwLock::new(config.clone()));
         let throughput = Arc::new(ThroughputStats::new());
-        Server::new(config, shared, throughput)
+        Server::new(config, shared, throughput, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()))
             .await
             .expect("Server::new must succeed")
     }
@@ -1993,6 +1996,7 @@ mod tests {
             Config::default(),
             Arc::new(RwLock::new(Config::default())),
             Arc::new(ThroughputStats::new()),
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
         )
         .await
         .unwrap();
