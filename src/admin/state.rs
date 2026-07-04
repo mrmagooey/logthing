@@ -258,6 +258,7 @@ pub struct AdminState {
     pub audit_logger: AuditLogger,
     pub csrf_tokens: Arc<RwLock<Vec<(String, Instant)>>>,
     pub request_counts: Arc<RwLock<std::collections::HashMap<String, (Instant, u32)>>>,
+    pub source_stats: Arc<crate::stats::SourceHourlyStats>,
 }
 
 /// Rate limit error response

@@ -39,6 +39,7 @@ mod tests {
             audit_logger: AuditLogger::new(100).await,
             csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
         }
     }
 
@@ -642,6 +643,7 @@ port = 9090
             audit_logger: AuditLogger::new(100).await,
             csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
         };
 
         axum::Router::new()

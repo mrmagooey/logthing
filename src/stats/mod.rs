@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -264,13 +264,13 @@ impl SourceBuckets {
     }
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct SourceHourlySnapshot {
     pub source: String,
     pub hours: Vec<HourCount>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct HourCount {
     pub hour: DateTime<Utc>,
     pub count: u64,

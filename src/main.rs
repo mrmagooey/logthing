@@ -50,7 +50,8 @@ async fn async_main() -> anyhow::Result<()> {
     info!("Configuration loaded successfully");
 
     let shared_config = Arc::new(RwLock::new(config.clone()));
-    admin::spawn_admin_server(shared_config.clone());
+    let source_stats = Arc::new(stats::SourceHourlyStats::new());
+    admin::spawn_admin_server(shared_config.clone(), source_stats.clone());
     let throughput = Arc::new(stats::ThroughputStats::new());
 
     // Shutdown watch channel — send `true` to trigger graceful shutdown.
@@ -74,7 +75,9 @@ async fn async_main() -> anyhow::Result<()> {
                     match forwarding::s3_sink::S3Sink::from_connection(&ss3_cfg.connection).await {
                         Ok(sink) => {
                             let (sh, wh) = forwarding::structured_syslog_s3::structured_syslog_start(
-                                ss3_cfg, Arc::new(sink),
+                                ss3_cfg,
+                                Arc::new(sink),
+                                source_stats.clone(),
                             );
                             writer_handles.push(wh);
                             Some(Arc::new(sh))
@@ -97,7 +100,7 @@ async fn async_main() -> anyhow::Result<()> {
                 match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
                     Ok(sink) => {
                         let (handler, writer_handle) =
-                            forwarding::syslog_s3::syslog_start(s3_cfg, Arc::new(sink));
+                            forwarding::syslog_s3::syslog_start(s3_cfg, Arc::new(sink), source_stats.clone());
                         writer_handles.push(writer_handle);
                         // Wrap SyslogS3Handler in a payload-dispatching adapter.
                         Arc::new(syslog::listener::PayloadDispatchingHandler {
@@ -153,7 +156,7 @@ async fn async_main() -> anyhow::Result<()> {
                 match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
                     Ok(sink) => {
                         let (handler, writer_handle) =
-                            forwarding::ipfix_s3::ipfix_start(s3_cfg, Arc::new(sink));
+                            forwarding::ipfix_s3::ipfix_start(s3_cfg, Arc::new(sink), source_stats.clone());
                         writer_handles.push(writer_handle);
                         Arc::new(handler)
                     }
@@ -194,7 +197,7 @@ async fn async_main() -> anyhow::Result<()> {
                 match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
                     Ok(sink) => {
                         let (handler, writer_handle) =
-                            forwarding::zeek_s3::zeek_start(s3_cfg, Arc::new(sink));
+                            forwarding::zeek_s3::zeek_start(s3_cfg, Arc::new(sink), source_stats.clone());
                         writer_handles.push(writer_handle);
                         Arc::new(handler)
                     }
@@ -235,7 +238,7 @@ async fn async_main() -> anyhow::Result<()> {
                 match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
                     Ok(sink) => {
                         let (handler, writer_handle) =
-                            forwarding::suricata_s3::suricata_start(s3_cfg, Arc::new(sink));
+                            forwarding::suricata_s3::suricata_start(s3_cfg, Arc::new(sink), source_stats.clone());
                         writer_handles.push(writer_handle);
                         Arc::new(handler)
                     }
@@ -277,7 +280,7 @@ async fn async_main() -> anyhow::Result<()> {
                 match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
                     Ok(sink) => {
                         let (handler, writer_handle) =
-                            forwarding::sflow_s3::sflow_start(s3_cfg, Arc::new(sink));
+                            forwarding::sflow_s3::sflow_start(s3_cfg, Arc::new(sink), source_stats.clone());
                         writer_handles.push(writer_handle);
                         Arc::new(handler)
                     }
@@ -309,7 +312,7 @@ async fn async_main() -> anyhow::Result<()> {
     // -----------------------------------------------------------------------
     // Create axum server
     // -----------------------------------------------------------------------
-    let mut server = Server::new(config, shared_config, throughput).await?;
+    let mut server = Server::new(config, shared_config, throughput, source_stats).await?;
 
     // Gap-b: Extract the WEF→S3 Parquet worker handle BEFORE the server is
     // consumed by run_tls, so we can await it during the shutdown sequence.

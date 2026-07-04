@@ -18,11 +18,14 @@ use crate::admin::state::{AdminServerConfig, AdminState, AuditLogger, load_admin
 use crate::config::Config;
 
 /// Spawn the admin server as a background task
-pub fn spawn_admin_server(config: Arc<RwLock<Config>>) {
+pub fn spawn_admin_server(
+    config: Arc<RwLock<Config>>,
+    source_stats: Arc<crate::stats::SourceHourlyStats>,
+) {
     tokio::spawn(async move {
         match load_admin_config() {
             Ok(server_config) => {
-                if let Err(err) = run_admin_server(config, server_config).await {
+                if let Err(err) = run_admin_server(config, server_config, source_stats).await {
                     error!("Admin server error: {}", err);
                 }
             }
@@ -37,6 +40,7 @@ pub fn spawn_admin_server(config: Arc<RwLock<Config>>) {
 async fn run_admin_server(
     config: Arc<RwLock<Config>>,
     server_config: AdminServerConfig,
+    source_stats: Arc<crate::stats::SourceHourlyStats>,
 ) -> anyhow::Result<()> {
     let audit_logger = AuditLogger::new(1000).await;
     let csrf_tokens: Arc<RwLock<Vec<(String, std::time::Instant)>>> =
@@ -50,6 +54,7 @@ async fn run_admin_server(
         audit_logger: audit_logger.clone(),
         csrf_tokens: csrf_tokens.clone(),
         request_counts: request_counts.clone(),
+        source_stats,
     };
 
     let app = axum::Router::new()
@@ -82,6 +87,8 @@ async fn run_admin_server(
         )
         .route("/health", axum::routing::get(health_check))
         .route("/audit-log", axum::routing::get(get_audit_log))
+        .route("/stats", axum::routing::get(get_stats))
+        .route("/stats.json", axum::routing::get(get_stats_json))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             security_middleware,
@@ -364,6 +371,80 @@ async fn get_audit_log(
     Ok(Json(entries))
 }
 
+/// Render the last-24h per-source hourly ingest table as HTML.
+async fn get_stats(
+    State(state): State<AdminState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    auth: Option<TypedHeader<Authorization<Basic>>>,
+) -> Result<Html<String>, Response> {
+    let client_ip = addr.ip().to_string();
+    let username = ensure_authorized(&state, auth, &client_ip).await?;
+
+    let snapshot = state.source_stats.snapshot();
+
+    // Union of all hour timestamps across sources, sorted ascending, for
+    // consistent column headers.
+    let mut all_hours: Vec<chrono::DateTime<chrono::Utc>> = snapshot
+        .iter()
+        .flat_map(|row| row.hours.iter().map(|h| h.hour))
+        .collect();
+    all_hours.sort();
+    all_hours.dedup();
+
+    let hour_headers: String = all_hours
+        .iter()
+        .map(|h| format!("<th>{}</th>", h.format("%Y-%m-%d %H:00")))
+        .collect();
+
+    let rows: String = snapshot
+        .iter()
+        .map(|row| {
+            let cells: String = all_hours
+                .iter()
+                .map(|h| {
+                    let count = row
+                        .hours
+                        .iter()
+                        .find(|hc| hc.hour == *h)
+                        .map(|hc| hc.count)
+                        .unwrap_or(0);
+                    format!("<td>{count}</td>")
+                })
+                .collect();
+            format!("<tr><td>{}</td>{}</tr>", row.source, cells)
+        })
+        .collect();
+
+    state
+        .audit_logger
+        .log("STATS_PAGE_ACCESS", &username, &client_ip, None)
+        .await;
+
+    let html = include_str!("templates/stats.html")
+        .replace("{{HOUR_HEADERS}}", &hour_headers)
+        .replace("{{STATS_ROWS}}", &rows);
+    Ok(Html(html))
+}
+
+/// Return the last-24h per-source hourly ingest counts as JSON.
+async fn get_stats_json(
+    State(state): State<AdminState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    auth: Option<TypedHeader<Authorization<Basic>>>,
+) -> Result<Json<Vec<crate::stats::SourceHourlySnapshot>>, Response> {
+    let client_ip = addr.ip().to_string();
+    let username = ensure_authorized(&state, auth, &client_ip).await?;
+
+    let snapshot = state.source_stats.snapshot();
+
+    state
+        .audit_logger
+        .log("STATS_JSON_READ", &username, &client_ip, None)
+        .await;
+
+    Ok(Json(snapshot))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +473,7 @@ mod tests {
             audit_logger: AuditLogger::new(100).await,
             csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
         }
     }
 
@@ -579,6 +661,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_stats_requires_auth() {
+        let state = test_state().await;
+        let mut request = create_request_without_auth(Method::GET, "/stats");
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+        let app = axum::Router::new()
+            .route("/stats", axum::routing::get(get_stats))
+            .with_state(state);
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn get_stats_json_requires_auth() {
+        let state = test_state().await;
+        let mut request = create_request_without_auth(Method::GET, "/stats.json");
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+        let app = axum::Router::new()
+            .route("/stats.json", axum::routing::get(get_stats_json))
+            .with_state(state);
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn get_stats_json_returns_recorded_counts_with_valid_auth() {
+        let state = test_state().await;
+        state.source_stats.record("syslog", 5);
+
+        let mut request =
+            create_request_with_auth(Method::GET, "/stats.json", "admin", "admin", None);
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+        let app = axum::Router::new()
+            .route("/stats.json", axum::routing::get(get_stats_json))
+            .with_state(state);
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<crate::stats::SourceHourlySnapshot> =
+            serde_json::from_slice(&body).unwrap();
+        let syslog_row = rows.iter().find(|r| r.source == "syslog").unwrap();
+        let total: u64 = syslog_row.hours.iter().map(|h| h.count).sum();
+        assert_eq!(total, 5);
+    }
+
+    #[tokio::test]
     async fn update_config_with_valid_auth_updates_configuration() {
         let state = test_state().await;
         let new_config = Config::default();
@@ -710,6 +846,7 @@ mod tests {
             audit_logger: AuditLogger::new(100).await,
             csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
         };
 
         let mut request = create_request_with_auth(Method::GET, "/", "admin", "admin", None);
