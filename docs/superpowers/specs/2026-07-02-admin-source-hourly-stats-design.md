@@ -53,7 +53,8 @@ Mirrors the existing `ThroughputStats` in the same file (a `DashMap`-backed,
 lock-free, retention-capped counter), with two deliberate differences:
 
 - Keyed by **pipeline/protocol source** (`"wef"`, `"syslog"`, `"ipfix"`,
-  `"sflow"`, `"zeek"`, `"suricata"`, `"generic"`, `"structured_syslog"`) —
+  `"sflow"`, `"zeek"`, `"suricata"`, `"hec"` (the generic/HEC ingest sink's
+  label — matches its S3 prefix), `"structured_syslog"`) —
   the same string returned by `ParquetSink::source()` in
   `src/forwarding/buffered_writer.rs`, already used as the S3-key and metrics
   label for every source. Chosen over `ThroughputStats`'s finer
