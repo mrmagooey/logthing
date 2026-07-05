@@ -50,24 +50,45 @@ impl UploadSink for LocalDiskSink {
         let parent = dest
             .parent()
             .ok_or_else(|| anyhow::anyhow!("LocalDiskSink: key has no parent: {key:?}"))?;
+
+        // Defense-in-depth against a symlink already present under `root`
+        // (planted by something other than this key) that points outside the
+        // tree — a case the lexical check above cannot see, since it never
+        // touches the filesystem. We must verify this BEFORE creating any
+        // directory: if we called `create_dir_all(parent)` first and only
+        // checked afterward, a symlink one or more components into `parent`
+        // would already have been followed by the OS's normal path
+        // resolution, creating directories outside `root` before we ever got
+        // to the check.
+        //
+        // To close that ordering gap we walk up from `parent` to the deepest
+        // ancestor that already exists on disk (this walk always terminates
+        // at or before `self.root`, since `new()` guarantees `root` itself
+        // exists) and canonicalize *that* — nothing below it has been
+        // created yet, so canonicalizing it fully resolves any symlink in
+        // the existing part of the path without our own mkdir calls having
+        // altered what's there. Only once that ancestor is confirmed to
+        // resolve inside `self.root` do we create the remaining directories.
+        let mut existing_ancestor = parent;
+        while !tokio::fs::try_exists(existing_ancestor).await? {
+            match existing_ancestor.parent() {
+                Some(p) => existing_ancestor = p,
+                None => break,
+            }
+        }
+        let canonical_ancestor = tokio::fs::canonicalize(existing_ancestor).await?;
+        if !canonical_ancestor.starts_with(&self.root) {
+            anyhow::bail!("LocalDiskSink: resolved path escapes root: {key:?}");
+        }
+
         tokio::fs::create_dir_all(parent).await?;
 
-        // Defense-in-depth: even after the lexical check above, verify the
-        // resolved directory is still under the canonical root. This catches
-        // a symlink already present under `root` (planted by something other
-        // than this key) that points outside the tree — a case the lexical
-        // check above cannot see, because it never touches the filesystem.
-        //
-        // Residual risk: if such a symlink exists, `create_dir_all` above may
-        // already have followed it and created directories outside `root`
-        // before we get here. We still bail out rather than proceeding, so at
-        // minimum the actual Parquet write (the write+rename below) can never
-        // land outside `root`. Closing the residual mkdir-side-effect risk
-        // fully would require walking up to the deepest existing ancestor and
-        // canonicalizing that before any `create_dir_all` call; this codebase
-        // doesn't let external input control symlinks under a
-        // logthing-managed local-disk root, so that extra complexity isn't
-        // warranted here.
+        // Second layer, after creation: re-check `parent` itself now that it
+        // exists. This is belt-and-suspenders coverage for the case where a
+        // symlink escape was introduced by an ancestor that got created by
+        // *this* call between the check above and now (e.g. a TOCTOU race
+        // from a concurrent process), and it's what
+        // `rejects_key_escaping_root_via_symlink` exercises directly.
         let canonical_parent = tokio::fs::canonicalize(parent).await?;
         if !canonical_parent.starts_with(&self.root) {
             anyhow::bail!("LocalDiskSink: resolved path escapes root: {key:?}");
@@ -182,6 +203,37 @@ mod tests {
         assert!(
             !outside_dir.path().join("sub/leak.parquet").exists(),
             "must not have written the file outside root"
+        );
+    }
+
+    #[tokio::test]
+    async fn symlink_escape_creates_no_directories_outside_root() {
+        // Proves the ancestor-walk closes the *pre-mkdir* gap, not just the
+        // final write: the key implies several directory levels
+        // (`sub/deep/`) that do not yet exist under the symlink target, so
+        // if `create_dir_all` ran before the ancestor-walk check, it would
+        // have created `sub` and `sub/deep` outside root before any check
+        // could fire. Asserting those directories were never created (not
+        // just that the file wasn't written) demonstrates the escape is
+        // caught before any filesystem mutation happens outside root.
+        let root_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let sink = LocalDiskSink::new(root_dir.path().to_path_buf()).await.unwrap();
+
+        // `root/escape` is a symlink pointing outside `root`; the deeper
+        // `sub/deep` path the key implies does not exist under it yet.
+        std::os::unix::fs::symlink(outside_dir.path(), root_dir.path().join("escape")).unwrap();
+
+        let result = sink
+            .upload("escape/sub/deep/leak.parquet", b"x".to_vec())
+            .await;
+        assert!(
+            result.is_err(),
+            "must reject a key whose parent resolves outside root via a symlink"
+        );
+        assert!(
+            !outside_dir.path().join("sub").exists(),
+            "must not have created any directory outside root, not even the first level"
         );
     }
 
