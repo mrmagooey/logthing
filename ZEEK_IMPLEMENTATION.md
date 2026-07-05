@@ -261,6 +261,36 @@ channel_capacity      = 256
 max_buffer_rows       = 100000
 ```
 
+### `[zeek.local]` block (optional)
+
+Independent of `[zeek.s3]` — either, both, or neither may be configured. When
+both are present, every record is persisted to both destinations (each with
+its own buffer, flush policy, and backpressure — a slow/failing destination
+cannot block the other).
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `directory` | String | — | Root directory Parquet files are written under (created if missing) |
+| `prefix` | String | `"zeek"` | Key prefix under `directory` (same default as `zeek.s3`) |
+| `flush_threshold_bytes` | usize | `104857600` (100 MiB) | Flush when estimated buffer bytes exceed this |
+| `flush_interval_secs` | u64 | `900` | Flush every N seconds regardless of buffer size |
+| `channel_capacity` | usize | `256` | `mpsc` channel capacity between listener and writer |
+| `max_buffer_rows` | usize | `100000` | Soft buffer cap; hard cap is `max_buffer_rows * 4` |
+
+Files land at `{directory}/{prefix}/<log_path>/year={Y}/month={MM}/day={DD}/{uuid}.parquet` — the same relative layout as the S3 key, so the same downstream tooling (DuckDB, Trino, etc.) works against either destination. Writes are atomic (same-directory temp file + rename), so a concurrent reader never observes a partial file.
+
+**Example:**
+
+```toml
+[zeek.local]
+directory             = "/var/log/logthing/zeek"
+prefix                = "zeek"
+flush_threshold_bytes = 104857600
+flush_interval_secs   = 900
+channel_capacity      = 256
+max_buffer_rows       = 100000
+```
+
 ## 7. Hardening
 
 | Mechanism | Implementation |
@@ -298,4 +328,5 @@ All counters are registered at startup and exposed via the existing Prometheus m
 | `src/zeek/listener.rs` | TCP listener, `ZeekListener`, `ZeekHandler` trait, `DefaultZeekHandler` |
 | `src/zeek/schema.rs` | Schema registry, typed schemas (conn/dns/http/ssl/files/notice), envelope fallback, row mappers |
 | `src/forwarding/zeek_s3.rs` | `ZeekS3Handler`, `ZeekS3Writer`, `sanitize_log_path`, `build_zeek_s3_key` |
+| `src/forwarding/local_sink.rs` | `LocalDiskSink` — `UploadSink` implementation for local-disk persistence |
 | `src/config/mod.rs` | `ZeekConfig`, `ZeekS3Config` structs and their `default_*` functions |
