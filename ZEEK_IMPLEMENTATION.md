@@ -222,6 +222,7 @@ A background interval also fires `flush_all_if_needed()` at a fraction of `flush
 | `tcp_port` | u16 | `47760` | Listening TCP port |
 | `bind_address` | String | `"0.0.0.0"` | Bind address |
 | `s3` | optional table | absent | S3 persistence (absent → no persistence) |
+| `local` | optional table | absent | Local-disk persistence (absent → no persistence). Independent of `s3` — either, both, or neither may be configured |
 
 ### `[zeek.s3]` block (optional)
 
@@ -329,4 +330,4 @@ All counters are registered at startup and exposed via the existing Prometheus m
 | `src/zeek/schema.rs` | Schema registry, typed schemas (conn/dns/http/ssl/files/notice), envelope fallback, row mappers |
 | `src/forwarding/zeek_s3.rs` | `ZeekS3Handler`, `ZeekS3Writer`, `sanitize_log_path`, `build_zeek_s3_key` |
 | `src/forwarding/local_sink.rs` | `LocalDiskSink` — `UploadSink` implementation for local-disk persistence |
-| `src/config/mod.rs` | `ZeekConfig`, `ZeekS3Config` structs and their `default_*` functions |
+| `src/config/mod.rs` | `ZeekConfig`, `ZeekS3Config`, `ZeekLocalConfig` structs and their `default_*` functions |
