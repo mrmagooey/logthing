@@ -13,6 +13,7 @@ services:
       - WEF_ADMIN_PASS=e2e
     volumes:
       - ./config/logthing.toml:/etc/logthing/config.toml:ro
+      - zeek-local-data:/var/log/zeek-local
     depends_on:
       - minio
     networks:
@@ -357,6 +358,24 @@ services:
     networks:
       - e2e
 
+  zeek-local-verifier:
+    build:
+      context: .
+      dockerfile: zeek-local-verifier/Dockerfile
+    environment:
+      - ZEEK_LOCAL_DIR=/var/log/zeek-local
+      - E2E_TIMEOUT_SECS=60
+    volumes:
+      - zeek-local-data:/var/log/zeek-local:ro
+    depends_on:
+      - zeek-generator
+      - logthing
+    networks:
+      - e2e
+
 networks:
   e2e:
     driver: bridge
+
+volumes:
+  zeek-local-data:

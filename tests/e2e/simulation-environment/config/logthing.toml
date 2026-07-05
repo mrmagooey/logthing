@@ -50,6 +50,12 @@ prefix     = "zeek"
 flush_threshold_bytes = 1
 flush_interval_secs   = 5
 
+[zeek.local]
+directory             = "/var/log/zeek-local"
+prefix                = "zeek"
+flush_threshold_bytes = 1
+flush_interval_secs   = 5
+
 [forwarding]
 buffer_size = 10000
 retry_attempts = 3
