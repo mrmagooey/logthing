@@ -155,22 +155,54 @@ impl crate::zeek::listener::ZeekHandler
 }
 
 // ---------------------------------------------------------------------------
-// zeek_start — convenience constructor
+// MultiZeekHandler — fan-out to multiple destinations
 // ---------------------------------------------------------------------------
 
-/// Construct a `ZeekS3Handler` (i.e. `ParquetWriterHandle<ZeekSink>`) from a
-/// `ZeekS3Config` and a pre-built `S3Sink`.
-///
-/// `max_partitions` is set to 256 (the old `MAX_ZEEK_STREAMS` value) unless the
-/// config provides a higher or lower value (the config struct does not expose this
-/// field, so we hard-code the default here — matching the old behavior).
-///
-/// Returns `(handler, writer_task_handle)`. The caller should retain the `JoinHandle`
-/// and await it during graceful shutdown, after all `Arc<dyn ZeekHandler>` references
-/// have been dropped so the channel closes and the final flush fires.
-pub fn zeek_start(
-    cfg: &ZeekS3Config,
-    s3: std::sync::Arc<crate::forwarding::s3_sink::S3Sink>,
+/// Fans out each record to every configured handler. Used only when both
+/// `.s3` and `.local` persistence resolve to a live handler for the same
+/// run, so each destination keeps its own independent buffer, flush policy,
+/// backpressure, and hard cap (no shared state between destinations).
+pub struct MultiZeekHandler(pub Vec<std::sync::Arc<dyn crate::zeek::listener::ZeekHandler>>);
+
+#[async_trait::async_trait]
+impl crate::zeek::listener::ZeekHandler for MultiZeekHandler {
+    async fn handle_record(&self, record: ZeekRecord, source: std::net::SocketAddr) {
+        for handler in &self.0 {
+            handler.handle_record(record.clone(), source).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// zeek_start / zeek_local_start — convenience constructors
+// ---------------------------------------------------------------------------
+
+/// `BufferedWriterConfig.connection` is never read by the generic writer once
+/// a pre-built sink is supplied — only `prefix`/`max_buffer_rows`/etc. are used
+/// in `push`/`flush_partition`/`drop_oldest_to_cap`. For a local-disk-only
+/// pipeline there is no S3 connection to report, so this fills the field with
+/// harmless placeholder values rather than changing its required type (which
+/// would ripple into every other source's `BufferedWriterConfig` literal).
+fn unused_s3_connection_placeholder() -> crate::config::S3ConnectionConfig {
+    crate::config::S3ConnectionConfig {
+        endpoint: String::new(),
+        bucket: String::new(),
+        region: String::new(),
+        access_key: String::new(),
+        secret_key: String::new(),
+    }
+}
+
+/// Shared by `zeek_start` (S3) and `zeek_local_start` (local disk): builds a
+/// `ZeekS3Handler` from flush-policy fields and a pre-built, already-typed
+/// `Arc<dyn UploadSink>`.
+fn build_zeek_handle(
+    prefix: String,
+    max_buffer_rows: usize,
+    flush_threshold_bytes: usize,
+    flush_interval_secs: u64,
+    channel_capacity: usize,
+    sink: std::sync::Arc<dyn crate::forwarding::buffered_writer::UploadSink>,
 ) -> (ZeekS3Handler, tokio::task::JoinHandle<()>) {
     use crate::forwarding::buffered_writer::{
         BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
@@ -180,20 +212,58 @@ pub fn zeek_start(
     const DEFAULT_MAX_ZEEK_PARTITIONS: usize = 256;
 
     let bwc = BufferedWriterConfig {
-        connection: cfg.connection.clone(),
-        prefix: cfg.prefix.clone(),
-        max_buffer_rows: cfg.max_buffer_rows,
-        flush_threshold_bytes: cfg.flush_threshold_bytes,
-        flush_interval_secs: cfg.flush_interval_secs,
-        channel_capacity: cfg.channel_capacity,
+        connection: unused_s3_connection_placeholder(),
+        prefix,
+        max_buffer_rows,
+        flush_threshold_bytes,
+        flush_interval_secs,
+        channel_capacity,
         max_partitions: DEFAULT_MAX_ZEEK_PARTITIONS,
     };
     let policy = FlushPolicy {
-        max_rows: cfg.max_buffer_rows,
-        max_bytes: cfg.flush_threshold_bytes,
-        interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
+        max_rows: max_buffer_rows,
+        max_bytes: flush_threshold_bytes,
+        interval: std::time::Duration::from_secs(flush_interval_secs),
     };
-    ParquetWriterHandle::start(ZeekSink, s3, bwc, policy)
+    ParquetWriterHandle::start(ZeekSink, sink, bwc, policy)
+}
+
+/// Construct a `ZeekS3Handler` (i.e. `ParquetWriterHandle<ZeekSink>`) from a
+/// `ZeekS3Config` and a pre-built `S3Sink`.
+///
+/// Returns `(handler, writer_task_handle)`. The caller should retain the `JoinHandle`
+/// and await it during graceful shutdown, after all `Arc<dyn ZeekHandler>` references
+/// have been dropped so the channel closes and the final flush fires.
+pub fn zeek_start(
+    cfg: &ZeekS3Config,
+    s3: std::sync::Arc<crate::forwarding::s3_sink::S3Sink>,
+) -> (ZeekS3Handler, tokio::task::JoinHandle<()>) {
+    build_zeek_handle(
+        cfg.prefix.clone(),
+        cfg.max_buffer_rows,
+        cfg.flush_threshold_bytes,
+        cfg.flush_interval_secs,
+        cfg.channel_capacity,
+        s3,
+    )
+}
+
+/// Construct a `ZeekS3Handler` from a `ZeekLocalConfig` and a pre-built
+/// `LocalDiskSink`. Structurally identical to `zeek_start`, writing to local
+/// disk instead of S3 — same `ZeekSink` adapter, same buffering/flush/cap
+/// machinery, same S3-key-shaped relative path layout on disk.
+pub fn zeek_local_start(
+    cfg: &crate::config::ZeekLocalConfig,
+    sink: std::sync::Arc<crate::forwarding::local_sink::LocalDiskSink>,
+) -> (ZeekS3Handler, tokio::task::JoinHandle<()>) {
+    build_zeek_handle(
+        cfg.prefix.clone(),
+        cfg.max_buffer_rows,
+        cfg.flush_threshold_bytes,
+        cfg.flush_interval_secs,
+        cfg.channel_capacity,
+        sink,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +734,135 @@ mod tests {
             .await
             .expect("writer task must exit within 5s")
             .expect("writer task must not panic");
+    }
+
+    // -----------------------------------------------------------------------
+    // zeek_local_start wires handler and join handle
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn zeek_local_start_wires_handler_and_join_handle() {
+        use crate::config::ZeekLocalConfig;
+        use crate::forwarding::local_sink::LocalDiskSink;
+        use crate::zeek::listener::ZeekHandler;
+        use std::net::SocketAddr;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(
+            LocalDiskSink::new(dir.path().to_path_buf())
+                .await
+                .expect("LocalDiskSink::new"),
+        );
+        let cfg = ZeekLocalConfig {
+            directory: dir.path().to_path_buf(),
+            prefix: "zeek".to_string(),
+            flush_threshold_bytes: 1, // flush on first push
+            flush_interval_secs: 3600,
+            channel_capacity: 256,
+            max_buffer_rows: 100_000,
+        };
+        let (handler, join_handle) = zeek_local_start(&cfg, sink);
+
+        let src: SocketAddr = "127.0.0.1:47760".parse().unwrap();
+        handler.handle_record(make_conn_record("Local1"), src).await;
+
+        // Give the background flush a moment, then drop to trigger shutdown flush.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(handler);
+        tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
+            .await
+            .expect("writer task must exit within 5s")
+            .expect("writer task must not panic");
+
+        // A real Parquet file must exist under zeek/conn/ on disk.
+        let conn_dir = dir.path().join("zeek/conn");
+        let found = std::fs::read_dir(&conn_dir)
+            .expect("zeek/conn directory must exist")
+            .count();
+        assert!(found >= 1, "expected at least one Parquet file under {conn_dir:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // MultiZeekHandler tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn multi_zeek_handler_fans_out_to_every_inner_handler() {
+        use crate::zeek::listener::ZeekHandler;
+        use std::net::SocketAddr;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingHandler(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl ZeekHandler for CountingHandler {
+            async fn handle_record(&self, _record: ZeekRecord, _source: SocketAddr) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let count_a = Arc::new(AtomicUsize::new(0));
+        let count_b = Arc::new(AtomicUsize::new(0));
+        let multi = MultiZeekHandler(vec![
+            Arc::new(CountingHandler(count_a.clone())),
+            Arc::new(CountingHandler(count_b.clone())),
+        ]);
+
+        let src: SocketAddr = "127.0.0.1:47760".parse().unwrap();
+        multi.handle_record(make_conn_record("Fan1"), src).await;
+
+        assert_eq!(count_a.load(Ordering::SeqCst), 1, "handler A must receive the record");
+        assert_eq!(count_b.load(Ordering::SeqCst), 1, "handler B must receive the record");
+    }
+
+    #[tokio::test]
+    async fn multi_zeek_handler_survives_one_inner_handler_dropping() {
+        use crate::zeek::listener::ZeekHandler;
+        use std::net::SocketAddr;
+
+        // A handler backed by a writer with channel_capacity=1 and a slow/unreachable
+        // sink will drop records via try_send rather than blocking — proving that a
+        // struggling destination cannot stall MultiZeekHandler's fan-out to the other.
+        let sink = unreachable_sink().await;
+        let cfg = ZeekS3Config {
+            connection: S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "AKIATEST".to_string(),
+                secret_key: "SECRETTEST".to_string(),
+            },
+            prefix: "zeek".to_string(),
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 1,
+            max_buffer_rows: 1,
+        };
+        let (struggling_handler, _jh) = zeek_start(&cfg, sink);
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingHandler(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl ZeekHandler for CountingHandler {
+            async fn handle_record(&self, _record: ZeekRecord, _source: SocketAddr) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let healthy_count = Arc::new(AtomicUsize::new(0));
+        let multi = MultiZeekHandler(vec![
+            Arc::new(struggling_handler),
+            Arc::new(CountingHandler(healthy_count.clone())),
+        ]);
+
+        let src: SocketAddr = "127.0.0.1:47760".parse().unwrap();
+        for i in 0..20 {
+            multi.handle_record(make_conn_record(&format!("C{i}")), src).await;
+        }
+
+        assert_eq!(
+            healthy_count.load(Ordering::SeqCst),
+            20,
+            "the healthy handler must receive every record even if the struggling one drops some"
+        );
     }
 
     // -----------------------------------------------------------------------
