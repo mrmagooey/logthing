@@ -817,7 +817,15 @@ mod tests {
     #[tokio::test]
     async fn multi_zeek_handler_survives_one_inner_handler_dropping() {
         use crate::zeek::listener::ZeekHandler;
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::DebuggingRecorder;
         use std::net::SocketAddr;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
 
         // A handler backed by a writer with channel_capacity=1 and a slow/unreachable
         // sink will drop records via try_send rather than blocking — proving that a
@@ -862,6 +870,34 @@ mod tests {
             healthy_count.load(Ordering::SeqCst),
             20,
             "the healthy handler must receive every record even if the struggling one drops some"
+        );
+
+        let snapshot = snapshotter.snapshot();
+        let map = snapshot.into_hashmap();
+        let key = CompositeKey::new(
+            MetricKind::Counter,
+            metrics::Key::from_parts(
+                "parquet_s3_dropped",
+                vec![
+                    metrics::Label::new("source", "zeek"),
+                    metrics::Label::new("target", "s3"),
+                ],
+            ),
+        );
+        let dropped = map
+            .get(&key)
+            .map(|(_, _, v)| {
+                if let metrics_util::debugging::DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        assert!(
+            dropped >= 1,
+            "the struggling handler must actually have dropped at least one record \
+             for this test to prove handler isolation (dropped={dropped})"
         );
     }
 
