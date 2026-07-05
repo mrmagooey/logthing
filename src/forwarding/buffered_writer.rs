@@ -196,7 +196,7 @@ pub(crate) fn build_key(
 
 pub struct PartitionedParquetWriter<S: ParquetSink> {
     sink: S,
-    s3: Arc<crate::forwarding::s3_sink::S3Sink>,
+    s3: Arc<dyn UploadSink>,
     config: BufferedWriterConfig,
     policy: FlushPolicy,
     /// `""` key for None-partition sources; sanitized-path / `"event_type=<id>"` for multi-partition.
@@ -206,7 +206,7 @@ pub struct PartitionedParquetWriter<S: ParquetSink> {
 impl<S: ParquetSink> PartitionedParquetWriter<S> {
     pub fn new(
         sink: S,
-        s3: Arc<crate::forwarding::s3_sink::S3Sink>,
+        s3: Arc<dyn UploadSink>,
         config: BufferedWriterConfig,
         policy: FlushPolicy,
     ) -> Self {
@@ -232,7 +232,8 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         {
             raw_key
         } else {
-            metrics::counter!("parquet_s3_partitions_capped", "source" => self.sink.source())
+            metrics::counter!("parquet_s3_partitions_capped",
+                "source" => self.sink.source(), "target" => self.s3.target_label())
                 .increment(1);
             "_overflow".to_string()
         };
@@ -290,7 +291,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 if cap > 0
                     && let Some(b) = self.buffers.get_mut(&effective_key)
                 {
-                    Self::drop_oldest_to_cap(b, cap, source);
+                    Self::drop_oldest_to_cap(b, cap, source, self.s3.target_label());
                 }
                 return Err(e);
             }
@@ -369,11 +370,12 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
 
         let partition_seg = if key.is_empty() { None } else { Some(key) };
         let s3_key = build_key(&self.config.prefix, partition_seg, chrono::Utc::now());
+        let target = self.s3.target_label();
         match self.s3.upload(&s3_key, merged).await {
             Ok(()) => {
-                metrics::counter!("parquet_s3_records_written", "source" => source)
+                metrics::counter!("parquet_s3_records_written", "source" => source, "target" => target)
                     .increment(row_count as u64);
-                metrics::counter!("parquet_s3_uploads", "source" => source).increment(1);
+                metrics::counter!("parquet_s3_uploads", "source" => source, "target" => target).increment(1);
                 let buf = self.buffers.get_mut(key).unwrap();
                 buf.buffer.clear();
                 buf.row_count = 0;
@@ -382,13 +384,13 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 Ok(())
             }
             Err(e) => {
-                metrics::counter!("parquet_s3_upload_errors", "source" => source).increment(1);
+                metrics::counter!("parquet_s3_upload_errors", "source" => source, "target" => target).increment(1);
                 Err(e)
             }
         }
     }
 
-    fn drop_oldest_to_cap(buf: &mut PartitionBuffer, cap: usize, source: &'static str) {
+    fn drop_oldest_to_cap(buf: &mut PartitionBuffer, cap: usize, source: &'static str, target: &'static str) {
         let mut dropped = 0usize;
         while buf.row_count > cap {
             if let Some((batch, est)) = buf.buffer.pop_front() {
@@ -401,7 +403,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             }
         }
         if dropped > 0 {
-            metrics::counter!("parquet_s3_buffer_dropped", "source" => source)
+            metrics::counter!("parquet_s3_buffer_dropped", "source" => source, "target" => target)
                 .increment(dropped as u64);
             let should_warn = buf
                 .last_drop_warn
@@ -411,7 +413,8 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 tracing::warn!(
                     dropped,
                     source,
-                    "parquet_s3: S3 upload failing — dropped oldest rows to stay within hard cap"
+                    target,
+                    "parquet_s3: upload failing — dropped oldest rows to stay within hard cap"
                 );
                 buf.last_drop_warn = Some(Instant::now());
             }
@@ -428,6 +431,8 @@ pub struct ParquetWriterHandle<S: ParquetSink> {
     tx: tokio::sync::mpsc::Sender<S::Record>,
     /// Source label captured at `start()` time; used for the drop metric.
     source: &'static str,
+    /// Target label captured at `start()` time; used for the drop metric.
+    target: &'static str,
 }
 
 impl<S: ParquetSink> ParquetWriterHandle<S> {
@@ -436,13 +441,14 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
     /// graceful shutdown after all senders are dropped.
     pub fn start(
         sink: S,
-        s3: Arc<crate::forwarding::s3_sink::S3Sink>,
+        s3: Arc<dyn UploadSink>,
         config: BufferedWriterConfig,
         policy: FlushPolicy,
     ) -> (Self, tokio::task::JoinHandle<()>) {
         let capacity = config.channel_capacity.max(1);
-        // Capture the source label before `sink` is moved into the task.
+        // Capture the source/target labels before `sink`/`s3` are moved into the task.
         let source = sink.source();
+        let target = s3.target_label();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<S::Record>(capacity);
         let flush_check = crate::forwarding::s3_sink::flush_check_interval(policy.interval);
         let handle = tokio::spawn(async move {
@@ -474,7 +480,7 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                 }
             }
         });
-        (Self { tx, source }, handle)
+        (Self { tx, source, target }, handle)
     }
 
     /// Try to send a record without blocking.
@@ -489,7 +495,8 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
         match self.tx.try_send(record) {
             Ok(()) => Ok(()),
             Err(e) => {
-                metrics::counter!("parquet_s3_dropped", "source" => self.source).increment(1);
+                metrics::counter!("parquet_s3_dropped", "source" => self.source, "target" => self.target)
+                    .increment(1);
                 Err(e)
             }
         }
@@ -698,6 +705,76 @@ max_partitions = 128
         assert_eq!(w.buffers.get("").unwrap().row_count, 4);
     }
 
+    /// Proves `PartitionedParquetWriter` is destination-agnostic: an in-memory
+    /// `UploadSink` (not `S3Sink`) receives the flushed bytes.
+    struct RecordingSink {
+        uploads: std::sync::Arc<std::sync::Mutex<Vec<(String, usize)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl UploadSink for RecordingSink {
+        async fn upload(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()> {
+            self.uploads.lock().unwrap().push((key.to_string(), body.len()));
+            Ok(())
+        }
+        fn target_label(&self) -> &'static str {
+            "recording"
+        }
+    }
+
+    #[tokio::test]
+    async fn partitioned_writer_uploads_via_generic_uploadsink_trait_object() {
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: Arc<dyn UploadSink> = Arc::new(RecordingSink { uploads: uploads.clone() });
+        let (cfg, policy) = test_config(1); // flush on first row
+        let mut w = PartitionedParquetWriter::new(MockSink, sink, cfg, policy);
+
+        w.push("hello".to_string()).await.unwrap();
+
+        let recorded = uploads.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "expected exactly one upload via the non-S3 sink");
+        assert!(recorded[0].1 > 0, "uploaded body must be non-empty Parquet bytes");
+    }
+
+    /// Proves the `target` label reaches `parquet_s3_uploads`/`parquet_s3_upload_errors`.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn flush_metrics_carry_the_target_label() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: Arc<dyn UploadSink> = Arc::new(RecordingSink { uploads });
+        let (cfg, policy) = test_config(1);
+        let mut w = PartitionedParquetWriter::new(MockSink, sink, cfg, policy);
+
+        w.push("hello".to_string()).await.unwrap();
+
+        let snapshot = snapshotter.snapshot();
+        let map = snapshot.into_hashmap();
+        let key = CompositeKey::new(
+            MetricKind::Counter,
+            metrics::Key::from_parts(
+                "parquet_s3_uploads",
+                vec![
+                    metrics::Label::new("source", "test"),
+                    metrics::Label::new("target", "recording"),
+                ],
+            ),
+        );
+        let count = map
+            .get(&key)
+            .map(|(_, _, v)| if let DebugValue::Counter(c) = v { *c } else { 0 })
+            .unwrap_or(0);
+        assert_eq!(count, 1, "expected parquet_s3_uploads{{source=\"test\",target=\"recording\"}} == 1");
+    }
+
     /// Row-threshold flush fails (unreachable S3) but hard cap is enforced.
     #[tokio::test]
     async fn push_enforces_hard_cap_on_flush_failure() {
@@ -832,14 +909,18 @@ max_partitions = 128
         );
 
         // Verify the production code emitted parquet_s3_dropped.
-        // The metric is labeled ("source" => "test"), so we must include labels in the lookup.
+        // The metric is labeled ("source" => "test", "target" => "s3"), so we must include
+        // both labels in the lookup (unreachable_s3() backs this handle with a real S3Sink).
         let snapshot = snapshotter.snapshot();
         let map = snapshot.into_hashmap();
         let labeled_key = CompositeKey::new(
             MetricKind::Counter,
             metrics::Key::from_parts(
                 "parquet_s3_dropped",
-                vec![metrics::Label::new("source", "test")],
+                vec![
+                    metrics::Label::new("source", "test"),
+                    metrics::Label::new("target", "s3"),
+                ],
             ),
         );
         let dropped = map
@@ -854,7 +935,7 @@ max_partitions = 128
             .unwrap_or(0);
         assert!(
             dropped >= 1,
-            "parquet_s3_dropped{{source=\"test\"}} should have been incremented by production try_send, got {dropped}"
+            "parquet_s3_dropped{{source=\"test\",target=\"s3\"}} should have been incremented by production try_send, got {dropped}"
         );
     }
 
@@ -1030,7 +1111,7 @@ secret_key  = "SECRET"
         }
 
         // Drop down to cap = 5 rows.
-        PartitionedParquetWriter::<MockSink>::drop_oldest_to_cap(&mut buf, 5, "test");
+        PartitionedParquetWriter::<MockSink>::drop_oldest_to_cap(&mut buf, 5, "test", "test");
 
         // Verify row_count.
         assert!(buf.row_count <= 5, "row_count={}", buf.row_count);

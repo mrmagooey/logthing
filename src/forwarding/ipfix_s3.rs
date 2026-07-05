@@ -593,7 +593,10 @@ mod tests {
             MetricKind::Counter,
             metrics::Key::from_parts(
                 "parquet_s3_dropped",
-                vec![metrics::Label::new("source", "ipfix")],
+                vec![
+                    metrics::Label::new("source", "ipfix"),
+                    metrics::Label::new("target", "s3"),
+                ],
             ),
         );
         let dropped = map
@@ -668,7 +671,10 @@ mod tests {
                 MetricKind::Counter,
                 metrics::Key::from_parts(
                     "parquet_s3_dropped",
-                    vec![metrics::Label::new("source", "ipfix")],
+                    vec![
+                        metrics::Label::new("source", "ipfix"),
+                        metrics::Label::new("target", "s3"),
+                    ],
                 ),
             );
             let dropped = map
