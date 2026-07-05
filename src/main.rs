@@ -189,26 +189,47 @@ async fn async_main() -> anyhow::Result<()> {
         let zeek_config_clone = config.clone();
         let zeek_shutdown_rx = shutdown_rx.clone();
 
-        let zeek_handler: Arc<dyn zeek::listener::ZeekHandler> =
-            if let Some(s3_cfg) = zeek_config_clone.zeek.s3.as_ref() {
-                match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
-                    Ok(sink) => {
-                        let (handler, writer_handle) =
-                            forwarding::zeek_s3::zeek_start(s3_cfg, Arc::new(sink));
-                        writer_handles.push(writer_handle);
-                        Arc::new(handler)
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to create S3Sink for Zeek persistence, \
-                                 falling back to DefaultZeekHandler: {e}"
-                        );
-                        Arc::new(zeek::listener::DefaultZeekHandler)
-                    }
+        let mut zeek_handlers: Vec<Arc<dyn zeek::listener::ZeekHandler>> = Vec::new();
+
+        if let Some(s3_cfg) = zeek_config_clone.zeek.s3.as_ref() {
+            match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
+                Ok(sink) => {
+                    let (handler, writer_handle) =
+                        forwarding::zeek_s3::zeek_start(s3_cfg, Arc::new(sink));
+                    writer_handles.push(writer_handle);
+                    zeek_handlers.push(Arc::new(handler));
                 }
-            } else {
-                Arc::new(zeek::listener::DefaultZeekHandler)
-            };
+                Err(e) => {
+                    error!(
+                        "Failed to create S3Sink for Zeek persistence, \
+                             skipping S3 target: {e}"
+                    );
+                }
+            }
+        }
+
+        if let Some(local_cfg) = zeek_config_clone.zeek.local.as_ref() {
+            match forwarding::local_sink::LocalDiskSink::new(local_cfg.directory.clone()).await {
+                Ok(sink) => {
+                    let (handler, writer_handle) =
+                        forwarding::zeek_s3::zeek_local_start(local_cfg, Arc::new(sink));
+                    writer_handles.push(writer_handle);
+                    zeek_handlers.push(Arc::new(handler));
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to create LocalDiskSink for Zeek persistence, \
+                             skipping local target: {e}"
+                    );
+                }
+            }
+        }
+
+        let zeek_handler: Arc<dyn zeek::listener::ZeekHandler> = match zeek_handlers.len() {
+            0 => Arc::new(zeek::listener::DefaultZeekHandler),
+            1 => zeek_handlers.into_iter().next().unwrap(),
+            _ => Arc::new(forwarding::zeek_s3::MultiZeekHandler(zeek_handlers)),
+        };
 
         let listener_config = zeek::listener::ZeekListenerConfig {
             tcp_port: zeek_config_clone.zeek.tcp_port,
