@@ -12,6 +12,27 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
+use async_trait::async_trait;
+
+// ---------------------------------------------------------------------------
+// UploadSink trait
+// ---------------------------------------------------------------------------
+
+/// A destination for encoded Parquet bytes. Implemented by `S3Sink` (existing)
+/// and `LocalDiskSink` (local-disk target). `PartitionedParquetWriter` is
+/// generic over this trait so any source can persist to either destination
+/// (or, via two independent writer instances, both at once) without touching
+/// the buffering/flush/cap machinery.
+#[async_trait]
+pub trait UploadSink: Send + Sync {
+    /// Upload `body` at `key` (a relative path, e.g.
+    /// `zeek/conn/year=2026/month=07/day=04/<uuid>.parquet`).
+    async fn upload(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()>;
+
+    /// Stable label for the `target` metric dimension, e.g. `"s3"` | `"local"`.
+    fn target_label(&self) -> &'static str;
+}
+
 // ---------------------------------------------------------------------------
 // ParquetSink trait
 // ---------------------------------------------------------------------------

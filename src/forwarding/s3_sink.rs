@@ -108,6 +108,21 @@ impl S3Sink {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::forwarding::buffered_writer::UploadSink for S3Sink {
+    async fn upload(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()> {
+        // Delegates to the inherent method above — kept as an inherent method too
+        // so existing tests calling `sink.upload(...)` on a concrete `S3Sink`
+        // keep compiling (inherent methods take priority over trait methods of
+        // the same name at the call site).
+        S3Sink::upload(self, key, body).await
+    }
+
+    fn target_label(&self) -> &'static str {
+        "s3"
+    }
+}
+
 /// The cadence at which a writer's background task checks whether a time-based
 /// flush is due. Honors the configured flush interval, but never ticks more
 /// often than once per second (avoids a busy loop for very small intervals).
@@ -164,5 +179,27 @@ mod tests {
         let sink = S3Sink::from_connection(&conn).await.expect("constructs");
         let result = sink.upload("some/key.parquet", b"hello".to_vec()).await;
         assert!(result.is_err(), "upload to unreachable endpoint must fail");
+    }
+
+    #[tokio::test]
+    async fn s3_sink_satisfies_upload_sink_trait() {
+        use crate::forwarding::buffered_writer::UploadSink;
+
+        let conn = S3ConnectionConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key: "AKIATEST".to_string(),
+            secret_key: "SECRETTEST".to_string(),
+        };
+        let sink: std::sync::Arc<dyn UploadSink> =
+            std::sync::Arc::new(S3Sink::from_connection(&conn).await.expect("constructs"));
+
+        assert_eq!(sink.target_label(), "s3");
+        // Unreachable endpoint — proves the trait method dispatches to the same
+        // upload logic as the inherent method (same failure mode as the existing
+        // `upload_returns_err_on_unreachable_endpoint` test).
+        let result = sink.upload("some/key.parquet", b"hello".to_vec()).await;
+        assert!(result.is_err(), "upload via trait object must fail the same way as the inherent method");
     }
 }
