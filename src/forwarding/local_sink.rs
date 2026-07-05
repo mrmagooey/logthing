@@ -8,7 +8,7 @@
 //! concurrent reader scanning the directory never observes a partial file.
 
 use crate::forwarding::buffered_writer::UploadSink;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 /// Writes Parquet objects under a root directory on local disk.
 pub struct LocalDiskSink {
@@ -30,7 +30,20 @@ impl LocalDiskSink {
 #[async_trait::async_trait]
 impl UploadSink for LocalDiskSink {
     async fn upload(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()> {
-        if key.is_empty() || key.contains("..") || key.starts_with('/') {
+        // Lexical safety check, purely on the string/components of `key` —
+        // runs BEFORE any filesystem side effect (in particular before
+        // `create_dir_all`). Only "plain" path components are allowed, so a
+        // key can never lexically climb out of `self.root` (no "..", no
+        // absolute-path root, no Windows drive prefix). This is what
+        // actually closes the ordering gap: without it, `create_dir_all`
+        // would happily follow a malicious ".." segment (or a symlink one
+        // component deeper — see the second check below) and create
+        // directories outside `root` before we ever verified anything.
+        if key.is_empty()
+            || !Path::new(key)
+                .components()
+                .all(|c| matches!(c, Component::Normal(_)))
+        {
             anyhow::bail!("LocalDiskSink: rejected unsafe key: {key:?}");
         }
         let dest = self.root.join(key);
@@ -39,10 +52,22 @@ impl UploadSink for LocalDiskSink {
             .ok_or_else(|| anyhow::anyhow!("LocalDiskSink: key has no parent: {key:?}"))?;
         tokio::fs::create_dir_all(parent).await?;
 
-        // Defense-in-depth: even after the ".."/leading-'/' check above, verify
-        // the resolved directory is still under the canonical root (catches a
-        // symlink planted inside root that could otherwise redirect the write
-        // outside the intended tree).
+        // Defense-in-depth: even after the lexical check above, verify the
+        // resolved directory is still under the canonical root. This catches
+        // a symlink already present under `root` (planted by something other
+        // than this key) that points outside the tree — a case the lexical
+        // check above cannot see, because it never touches the filesystem.
+        //
+        // Residual risk: if such a symlink exists, `create_dir_all` above may
+        // already have followed it and created directories outside `root`
+        // before we get here. We still bail out rather than proceeding, so at
+        // minimum the actual Parquet write (the write+rename below) can never
+        // land outside `root`. Closing the residual mkdir-side-effect risk
+        // fully would require walking up to the deepest existing ancestor and
+        // canonicalizing that before any `create_dir_all` call; this codebase
+        // doesn't let external input control symlinks under a
+        // logthing-managed local-disk root, so that extra complexity isn't
+        // warranted here.
         let canonical_parent = tokio::fs::canonicalize(parent).await?;
         if !canonical_parent.starts_with(&self.root) {
             anyhow::bail!("LocalDiskSink: resolved path escapes root: {key:?}");
@@ -132,6 +157,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sink = LocalDiskSink::new(dir.path().to_path_buf()).await.unwrap();
         assert_eq!(sink.target_label(), "local");
+    }
+
+    #[tokio::test]
+    async fn rejects_key_escaping_root_via_symlink() {
+        // Proves the post-hoc canonicalize+starts_with check is real and
+        // independently load-bearing: this key contains no ".." and no
+        // leading '/', so it sails through the lexical component check.
+        // Only the second, filesystem-aware check can catch it.
+        let root_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let sink = LocalDiskSink::new(root_dir.path().to_path_buf()).await.unwrap();
+
+        // `root/escape` is a symlink pointing outside `root` entirely.
+        std::os::unix::fs::symlink(outside_dir.path(), root_dir.path().join("escape")).unwrap();
+
+        let result = sink
+            .upload("escape/sub/leak.parquet", b"x".to_vec())
+            .await;
+        assert!(
+            result.is_err(),
+            "must reject a key whose parent resolves outside root via a symlink"
+        );
+        assert!(
+            !outside_dir.path().join("sub/leak.parquet").exists(),
+            "must not have written the file outside root"
+        );
     }
 
     #[tokio::test]
