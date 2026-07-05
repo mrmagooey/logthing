@@ -84,11 +84,18 @@ impl UploadSink for LocalDiskSink {
         tokio::fs::create_dir_all(parent).await?;
 
         // Second layer, after creation: re-check `parent` itself now that it
-        // exists. This is belt-and-suspenders coverage for the case where a
-        // symlink escape was introduced by an ancestor that got created by
-        // *this* call between the check above and now (e.g. a TOCTOU race
-        // from a concurrent process), and it's what
-        // `rejects_key_escaping_root_via_symlink` exercises directly.
+        // exists. This is belt-and-suspenders coverage for a TOCTOU race — a
+        // symlink escape introduced by a concurrent process between the
+        // ancestor-walk check above and this `create_dir_all` call. Both
+        // `rejects_key_escaping_root_via_symlink` and
+        // `symlink_escape_creates_no_directories_outside_root` are actually
+        // caught by the ancestor-walk check above (the escaping symlink
+        // already exists on disk in both tests, so it's found as the
+        // "existing ancestor"), not by this second check — there is no
+        // dedicated test for this layer in isolation, since exercising it
+        // requires injecting a concurrent filesystem mutation between the
+        // two checks. Do not remove this layer on the assumption it's
+        // redundant with the tests above; it is not covered by them.
         let canonical_parent = tokio::fs::canonicalize(parent).await?;
         if !canonical_parent.starts_with(&self.root) {
             anyhow::bail!("LocalDiskSink: resolved path escapes root: {key:?}");
