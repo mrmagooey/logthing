@@ -260,6 +260,12 @@ pub struct ZeekConfig {
     /// Optional S3 persistence. Absent from TOML → `None` → no persistence.
     #[serde(default)]
     pub s3: Option<ZeekS3Config>,
+
+    /// Optional local-disk persistence. Absent from TOML → `None` → no
+    /// persistence. Independent of `s3` — both may be configured
+    /// simultaneously, in which case records are written to both.
+    #[serde(default)]
+    pub local: Option<ZeekLocalConfig>,
 }
 
 impl Default for ZeekConfig {
@@ -269,6 +275,7 @@ impl Default for ZeekConfig {
             tcp_port: default_zeek_tcp_port(),
             bind_address: default_zeek_bind_address(),
             s3: None,
+            local: None,
         }
     }
 }
@@ -320,6 +327,30 @@ fn default_zeek_channel_capacity() -> usize {
 }
 fn default_zeek_max_buffer_rows() -> usize {
     100_000
+}
+
+/// Per-source local-disk persistence config for the Zeek listener. Mirrors
+/// `ZeekS3Config`'s flush-policy shape (reusing the same default functions),
+/// swapping the S3 connection for a root directory. Independent of `s3`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ZeekLocalConfig {
+    /// Root directory Parquet files are written under (created if missing).
+    pub directory: PathBuf,
+    /// Key prefix, slash-free (default: `"zeek"` — same default as `zeek.s3`).
+    #[serde(default = "default_zeek_s3_prefix")]
+    pub prefix: String,
+    /// Flush when estimated buffer bytes exceeds this (default: 100 MiB).
+    #[serde(default = "default_zeek_flush_bytes")]
+    pub flush_threshold_bytes: usize,
+    /// Flush after this many seconds regardless of buffer size (default: 900).
+    #[serde(default = "default_zeek_flush_secs")]
+    pub flush_interval_secs: u64,
+    /// Bounded channel capacity (default: 256).
+    #[serde(default = "default_zeek_channel_capacity")]
+    pub channel_capacity: usize,
+    /// Maximum buffered rows before hard cap kicks in (default: 100_000).
+    #[serde(default = "default_zeek_max_buffer_rows")]
+    pub max_buffer_rows: usize,
 }
 
 /// Configuration for the Suricata EVE JSON TCP listener.
@@ -984,6 +1015,66 @@ secret_key = "SECRET"
         let toml_str = "[zeek]\nenabled = true\n";
         let cfg: Config = toml::from_str(toml_str).expect("parse");
         assert!(cfg.zeek.s3.is_none(), "absent [zeek.s3] must yield None");
+    }
+
+    #[test]
+    fn zeek_local_absent_gives_none() {
+        let cfg = Config::default();
+        assert!(
+            cfg.zeek.local.is_none(),
+            "absent [zeek.local] must deserialize to None"
+        );
+    }
+
+    #[test]
+    fn zeek_local_config_deserializes_from_toml() {
+        let toml_str = r#"
+directory = "/var/log/logthing/zeek"
+prefix = "zeek"
+flush_threshold_bytes = 52428800
+flush_interval_secs = 300
+channel_capacity = 512
+max_buffer_rows = 50000
+"#;
+        let cfg: ZeekLocalConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(cfg.directory, std::path::PathBuf::from("/var/log/logthing/zeek"));
+        assert_eq!(cfg.prefix, "zeek");
+        assert_eq!(cfg.flush_threshold_bytes, 52_428_800);
+        assert_eq!(cfg.flush_interval_secs, 300);
+        assert_eq!(cfg.channel_capacity, 512);
+        assert_eq!(cfg.max_buffer_rows, 50_000);
+    }
+
+    #[test]
+    fn zeek_local_config_defaults_apply_when_only_directory_given() {
+        let toml_str = r#"directory = "/data/zeek""#;
+        let cfg: ZeekLocalConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(cfg.prefix, "zeek");
+        assert_eq!(cfg.flush_threshold_bytes, 100 * 1024 * 1024);
+        assert_eq!(cfg.flush_interval_secs, 900);
+        assert_eq!(cfg.channel_capacity, 256);
+        assert_eq!(cfg.max_buffer_rows, 100_000);
+    }
+
+    #[test]
+    fn zeek_s3_and_local_can_both_be_configured_simultaneously() {
+        let toml_str = r#"
+[zeek]
+enabled = true
+
+[zeek.s3]
+endpoint = "http://minio:9000"
+bucket = "b"
+region = "us-east-1"
+access_key = "k"
+secret_key = "s"
+
+[zeek.local]
+directory = "/data/zeek"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("deserialize");
+        assert!(cfg.zeek.s3.is_some(), "s3 must deserialize when both present");
+        assert!(cfg.zeek.local.is_some(), "local must deserialize when both present");
     }
 
     #[test]
