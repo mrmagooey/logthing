@@ -485,8 +485,8 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
 
     /// Try to send a record without blocking.
     ///
-    /// On channel overflow or closed, increments `parquet_s3_dropped{source=<source>}` and
-    /// returns the `TrySendError` to the caller so they can apply any additional handling.
+    /// On channel overflow or closed, increments `parquet_s3_dropped{source=<source>,target=<target>}`
+    /// and returns the `TrySendError` to the caller so they can apply any additional handling.
     #[must_use = "callers should log or handle the TrySendError to avoid silent record loss"]
     pub fn try_send(
         &self,

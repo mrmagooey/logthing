@@ -307,6 +307,11 @@ max_buffer_rows       = 100000
 
 All counters are registered at startup and exposed via the existing Prometheus metrics endpoint.
 
+All `parquet_s3_*` counters below also carry a `target` label (`"s3"` or `"local"`)
+identifying which persistence pipeline emitted them, so a run with both `[zeek.s3]`
+and `[zeek.local]` configured reports each destination's uploads/drops/errors
+independently (e.g. `parquet_s3_uploads{source="zeek",target="local"}`).
+
 | Metric | Description |
 |---|---|
 | `zeek_records_received` | Total Zeek records successfully parsed and dispatched |
@@ -314,12 +319,12 @@ All counters are registered at startup and exposed via the existing Prometheus m
 | `zeek_parse_errors` | Non-UTF-8 or invalid JSON lines skipped |
 | `zeek_missing_path` | Records missing `_path` or with a non-string `_path` |
 | `zeek_oversized_lines` | Lines exceeding `ZEEK_MAX_LINE_BYTES`; triggers connection close |
-| `parquet_s3_records_written{source="zeek"}` | Rows written on a successful S3 flush |
-| `parquet_s3_uploads{source="zeek"}` | Successful S3 uploads |
-| `parquet_s3_upload_errors{source="zeek"}` | Failed S3 uploads |
-| `parquet_s3_dropped{source="zeek"}` | Records dropped due to full channel |
-| `parquet_s3_buffer_dropped{source="zeek"}` | Rows dropped by hard-cap enforcement |
-| `parquet_s3_partitions_capped{source="zeek"}` | Records rerouted to `"unknown"` because `MAX_ZEEK_STREAMS` was reached |
+| `parquet_s3_records_written{source="zeek",target=…}` | Rows written on a successful flush |
+| `parquet_s3_uploads{source="zeek",target=…}` | Successful uploads |
+| `parquet_s3_upload_errors{source="zeek",target=…}` | Failed uploads |
+| `parquet_s3_dropped{source="zeek",target=…}` | Records dropped due to full channel |
+| `parquet_s3_buffer_dropped{source="zeek",target=…}` | Rows dropped by hard-cap enforcement |
+| `parquet_s3_partitions_capped{source="zeek",target=…}` | Records rerouted to `"unknown"` because `MAX_ZEEK_STREAMS` was reached |
 
 ## 9. Files
 
