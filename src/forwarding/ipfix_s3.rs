@@ -1014,7 +1014,10 @@ mod tests {
                 break;
             }
         }
-        assert!(found, "expected at least one Parquet file under {ipfix_dir:?}");
+        assert!(
+            found,
+            "expected at least one Parquet file under {ipfix_dir:?}"
+        );
     }
 
     /// Minimal recursive walk — IPFIX's key layout nests under year=/month=/day=/,
@@ -1065,7 +1068,11 @@ mod tests {
         let src: SocketAddr = "127.0.0.1:4739".parse().unwrap();
         multi
             .handle_flows(
-                vec![make_flow_record(Some("10.0.0.1"), Some(1), serde_json::json!({}))],
+                vec![make_flow_record(
+                    Some("10.0.0.1"),
+                    Some(1),
+                    serde_json::json!({}),
+                )],
                 src,
             )
             .await;
