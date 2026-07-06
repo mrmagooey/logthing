@@ -643,9 +643,7 @@ mod tests {
         ]);
 
         let src: SocketAddr = "127.0.0.1:47761".parse().unwrap();
-        multi
-            .handle_record(make_alert_record("Fan1"), src)
-            .await;
+        multi.handle_record(make_alert_record("Fan1"), src).await;
 
         assert_eq!(
             count_a.load(Ordering::SeqCst),
