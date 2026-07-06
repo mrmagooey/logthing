@@ -61,6 +61,7 @@ pub(crate) fn sanitize_event_type(raw: &str) -> String {
 /// Uses a single envelope schema for all event types — no per-event-type typed registry.
 /// Each distinct `event_type` (after sanitization) gets its own buffer keyed by the
 /// sanitized event type.  Excess partitions overflow to the `"_overflow"` buffer.
+#[derive(Default)]
 pub struct SuricataSink;
 
 impl ParquetSink for SuricataSink {
@@ -144,40 +145,6 @@ impl crate::suricata::listener::SuricataHandler for MultiSuricataHandler {
 /// Replaces the old per-source streams constant.
 const DEFAULT_MAX_SURICATA_PARTITIONS: usize = 256;
 
-/// Shared by `suricata_start` (S3) and `suricata_local_start` (local disk):
-/// builds a `SuricataS3Handler` from flush-policy fields, a pre-built,
-/// already-typed `Arc<dyn UploadSink>`, and the shared `SourceHourlyStats`
-/// every source writer feeds into.
-fn build_suricata_handle(
-    prefix: String,
-    max_buffer_rows: usize,
-    flush_threshold_bytes: usize,
-    flush_interval_secs: u64,
-    channel_capacity: usize,
-    sink: std::sync::Arc<dyn crate::forwarding::buffered_writer::UploadSink>,
-    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
-) -> (SuricataS3Handler, tokio::task::JoinHandle<()>) {
-    use crate::forwarding::buffered_writer::{
-        BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
-    };
-
-    let bwc = BufferedWriterConfig {
-        connection: crate::forwarding::buffered_writer::unused_s3_connection_placeholder(),
-        prefix,
-        max_buffer_rows,
-        flush_threshold_bytes,
-        flush_interval_secs,
-        channel_capacity,
-        max_partitions: DEFAULT_MAX_SURICATA_PARTITIONS,
-    };
-    let policy = FlushPolicy {
-        max_rows: max_buffer_rows,
-        max_bytes: flush_threshold_bytes,
-        interval: std::time::Duration::from_secs(flush_interval_secs),
-    };
-    ParquetWriterHandle::start_with_stats(SuricataSink, sink, bwc, policy, source_stats)
-}
-
 /// Construct a `SuricataS3Handler` (i.e. `ParquetWriterHandle<SuricataSink>`) from a
 /// `SuricataS3Config` and a pre-built `S3Sink`.
 ///
@@ -189,12 +156,13 @@ pub fn suricata_start(
     s3: std::sync::Arc<crate::forwarding::s3_sink::S3Sink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (SuricataS3Handler, tokio::task::JoinHandle<()>) {
-    build_suricata_handle(
+    crate::forwarding::buffered_writer::start_writer::<SuricataSink>(
         cfg.prefix.clone(),
         cfg.max_buffer_rows,
         cfg.flush_threshold_bytes,
         cfg.flush_interval_secs,
         cfg.channel_capacity,
+        DEFAULT_MAX_SURICATA_PARTITIONS,
         s3,
         source_stats,
     )
@@ -210,12 +178,13 @@ pub fn suricata_local_start(
     sink: std::sync::Arc<crate::forwarding::local_sink::LocalDiskSink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (SuricataS3Handler, tokio::task::JoinHandle<()>) {
-    build_suricata_handle(
+    crate::forwarding::buffered_writer::start_writer::<SuricataSink>(
         cfg.prefix.clone(),
         cfg.max_buffer_rows,
         cfg.flush_threshold_bytes,
         cfg.flush_interval_secs,
         cfg.channel_capacity,
+        DEFAULT_MAX_SURICATA_PARTITIONS,
         sink,
         source_stats,
     )

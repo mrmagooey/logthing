@@ -60,6 +60,7 @@ pub(crate) fn sanitize_log_path(raw: &str) -> String {
 /// This is the multi-partition case: each distinct `log_path` (after sanitization)
 /// gets its own buffer keyed by the sanitized path.  Excess partitions overflow to
 /// the `"_overflow"` buffer (generic machinery; configured via `max_partitions`).
+#[derive(Default)]
 pub struct ZeekSink;
 
 impl ParquetSink for ZeekSink {
@@ -177,42 +178,8 @@ impl crate::zeek::listener::ZeekHandler for MultiZeekHandler {
 // zeek_start / zeek_local_start — convenience constructors
 // ---------------------------------------------------------------------------
 
-/// Shared by `zeek_start` (S3) and `zeek_local_start` (local disk): builds a
-/// `ZeekS3Handler` from flush-policy fields, a pre-built, already-typed
-/// `Arc<dyn UploadSink>`, and the shared `SourceHourlyStats` every source
-/// writer feeds into.
-fn build_zeek_handle(
-    prefix: String,
-    max_buffer_rows: usize,
-    flush_threshold_bytes: usize,
-    flush_interval_secs: u64,
-    channel_capacity: usize,
-    sink: std::sync::Arc<dyn crate::forwarding::buffered_writer::UploadSink>,
-    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
-) -> (ZeekS3Handler, tokio::task::JoinHandle<()>) {
-    use crate::forwarding::buffered_writer::{
-        BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
-    };
-
-    /// Replaces the old `MAX_ZEEK_STREAMS` constant.
-    const DEFAULT_MAX_ZEEK_PARTITIONS: usize = 256;
-
-    let bwc = BufferedWriterConfig {
-        connection: crate::forwarding::buffered_writer::unused_s3_connection_placeholder(),
-        prefix,
-        max_buffer_rows,
-        flush_threshold_bytes,
-        flush_interval_secs,
-        channel_capacity,
-        max_partitions: DEFAULT_MAX_ZEEK_PARTITIONS,
-    };
-    let policy = FlushPolicy {
-        max_rows: max_buffer_rows,
-        max_bytes: flush_threshold_bytes,
-        interval: std::time::Duration::from_secs(flush_interval_secs),
-    };
-    ParquetWriterHandle::start_with_stats(ZeekSink, sink, bwc, policy, source_stats)
-}
+/// Replaces the old `MAX_ZEEK_STREAMS` constant.
+const DEFAULT_MAX_ZEEK_PARTITIONS: usize = 256;
 
 /// Construct a `ZeekS3Handler` (i.e. `ParquetWriterHandle<ZeekSink>`) from a
 /// `ZeekS3Config` and a pre-built `S3Sink`.
@@ -229,12 +196,13 @@ pub fn zeek_start(
     s3: std::sync::Arc<crate::forwarding::s3_sink::S3Sink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (ZeekS3Handler, tokio::task::JoinHandle<()>) {
-    build_zeek_handle(
+    crate::forwarding::buffered_writer::start_writer::<ZeekSink>(
         cfg.prefix.clone(),
         cfg.max_buffer_rows,
         cfg.flush_threshold_bytes,
         cfg.flush_interval_secs,
         cfg.channel_capacity,
+        DEFAULT_MAX_ZEEK_PARTITIONS,
         s3,
         source_stats,
     )
@@ -249,12 +217,13 @@ pub fn zeek_local_start(
     sink: std::sync::Arc<crate::forwarding::local_sink::LocalDiskSink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (ZeekS3Handler, tokio::task::JoinHandle<()>) {
-    build_zeek_handle(
+    crate::forwarding::buffered_writer::start_writer::<ZeekSink>(
         cfg.prefix.clone(),
         cfg.max_buffer_rows,
         cfg.flush_threshold_bytes,
         cfg.flush_interval_secs,
         cfg.channel_capacity,
+        DEFAULT_MAX_ZEEK_PARTITIONS,
         sink,
         source_stats,
     )
