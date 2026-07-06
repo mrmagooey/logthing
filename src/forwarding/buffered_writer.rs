@@ -564,6 +564,41 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
     }
 }
 
+/// Generic replacement for each source's former `build_xxx_handle` helper
+/// (e.g. Zeek's `build_zeek_handle`, Suricata's `build_suricata_handle`).
+/// Every such helper did nothing beyond this: assemble
+/// `BufferedWriterConfig`/`FlushPolicy` from flat scalar fields and forward
+/// to `ParquetWriterHandle::start_with_stats` — there was no source-specific
+/// behavior in any of them, only code the `S: ParquetSink` bound already
+/// makes fully generic. `max_partitions` is a parameter (not hardcoded here)
+/// because it differs per source.
+pub(crate) fn start_writer<S: ParquetSink + Default>(
+    prefix: String,
+    max_buffer_rows: usize,
+    flush_threshold_bytes: usize,
+    flush_interval_secs: u64,
+    channel_capacity: usize,
+    max_partitions: usize,
+    sink: Arc<dyn UploadSink>,
+    source_stats: Arc<crate::stats::SourceHourlyStats>,
+) -> (ParquetWriterHandle<S>, tokio::task::JoinHandle<()>) {
+    let bwc = BufferedWriterConfig {
+        connection: unused_s3_connection_placeholder(),
+        prefix,
+        max_buffer_rows,
+        flush_threshold_bytes,
+        flush_interval_secs,
+        channel_capacity,
+        max_partitions,
+    };
+    let policy = FlushPolicy {
+        max_rows: max_buffer_rows,
+        max_bytes: flush_threshold_bytes,
+        interval: std::time::Duration::from_secs(flush_interval_secs),
+    };
+    ParquetWriterHandle::start_with_stats(S::default(), sink, bwc, policy, source_stats)
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -1385,5 +1420,76 @@ secret_key  = "SECRET"
         assert_eq!(rb.num_rows(), 1);
         let col = rb.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(col.value(0), "hello");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 1: start_writer<S> generic helper function test
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn start_writer_wires_a_generic_parquet_sink_and_exits_cleanly() {
+        use std::sync::Arc as StdArc;
+
+        #[derive(Default)]
+        struct TestSink;
+
+        impl ParquetSink for TestSink {
+            type Record = String;
+
+            fn source(&self) -> &'static str {
+                "test_start_writer"
+            }
+
+            fn partition(&self, _record: &Self::Record) -> Option<String> {
+                None
+            }
+
+            fn schema(&self, _partition: Option<&str>) -> Arc<arrow_schema::Schema> {
+                Arc::new(arrow_schema::Schema::new(vec![Field::new(
+                    "value",
+                    DataType::Utf8,
+                    false,
+                )]))
+            }
+
+            fn to_record_batch(
+                &self,
+                record: &Self::Record,
+                schema: &Arc<arrow_schema::Schema>,
+            ) -> anyhow::Result<RecordBatch> {
+                let col = StdArc::new(StringArray::from(vec![record.as_str()]));
+                Ok(RecordBatch::try_new(schema.clone(), vec![col])?)
+            }
+        }
+
+        struct UnreachableUploadSink;
+        #[async_trait::async_trait]
+        impl UploadSink for UnreachableUploadSink {
+            async fn upload(&self, _key: &str, _body: Vec<u8>) -> anyhow::Result<()> {
+                anyhow::bail!("unreachable in this test")
+            }
+            fn target_label(&self) -> &'static str {
+                "test"
+            }
+        }
+
+        let (handle, join_handle) = start_writer::<TestSink>(
+            "test-prefix".to_string(),
+            100_000,
+            usize::MAX,
+            3600,
+            256,
+            1,
+            StdArc::new(UnreachableUploadSink),
+            StdArc::new(crate::stats::SourceHourlyStats::new()),
+        );
+
+        handle.try_send("hello".to_string()).ok();
+        drop(handle);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
+            .await
+            .expect("writer task must exit within 5s")
+            .expect("writer task must not panic");
     }
 }
