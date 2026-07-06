@@ -889,13 +889,29 @@ mod tests {
         );
     }
 
+    // Sandboxes persist_config()'s write path; see config_api::test_support for
+    // why this must be a single lock shared crate-wide across test modules.
+    use crate::admin::config_api::test_support::sandbox_persist_config_path;
+
     #[tokio::test]
     async fn patch_config_with_valid_auth_updates_configuration() {
+        use crate::config::TlsConfig;
+
+        let _sandbox = sandbox_persist_config_path().await;
         let state = test_state().await;
+        // Config::default() has tls.enabled = true with no cert, which fails
+        // validate_config_invariants on its own — give it a valid baseline first.
+        {
+            let mut cfg = state.config.write().await;
+            cfg.tls = TlsConfig {
+                enabled: false,
+                ..TlsConfig::default()
+            };
+        }
         let partial = PartialConfigUpdate::default();
         let json_body = serde_json::to_string(&partial).unwrap();
 
-        let request = axum::http::Request::builder()
+        let mut request = axum::http::Request::builder()
             .method(Method::PATCH)
             .uri("/config")
             .header("content-type", "application/json")
@@ -905,25 +921,36 @@ mod tests {
             )
             .body(Body::from(json_body))
             .unwrap();
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
 
         let app = axum::Router::new()
             .route("/config", axum::routing::patch(patch_config))
             .with_state(state);
 
         let response = app.oneshot(request).await.unwrap();
-        // Will fail because persist_config tries to write to disk
-        assert!(
-            response.status() == StatusCode::OK
-                || response.status() == StatusCode::INTERNAL_SERVER_ERROR
-        );
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn patch_config_with_partial_fields() {
+        use crate::config::TlsConfig;
+
+        let _sandbox = sandbox_persist_config_path().await;
         let state = test_state().await;
+        // Config::default() has tls.enabled = true with no cert, which fails
+        // validate_config_invariants on its own — give it a valid baseline first.
+        {
+            let mut cfg = state.config.write().await;
+            cfg.tls = TlsConfig {
+                enabled: false,
+                ..TlsConfig::default()
+            };
+        }
         let partial = PartialConfigUpdate {
             bind_address: Some("0.0.0.0:9999".parse().unwrap()),
-            tls_enabled: Some(true),
+            // tls_enabled intentionally omitted: enabling TLS via PartialConfigUpdate
+            // with no cert/key path always fails validate_config_invariants (see
+            // patch_config_tls_without_cert_rejected_and_config_unchanged).
             tls_port: Some(9443),
             logging_level: Some("debug".to_string()),
             metrics_enabled: Some(true),
@@ -931,10 +958,11 @@ mod tests {
             syslog_enabled: Some(true),
             syslog_udp_port: Some(5514),
             syslog_tcp_port: Some(5601),
+            ..PartialConfigUpdate::default()
         };
         let json_body = serde_json::to_string(&partial).unwrap();
 
-        let request = axum::http::Request::builder()
+        let mut request = axum::http::Request::builder()
             .method(Method::PATCH)
             .uri("/config")
             .header("content-type", "application/json")
@@ -944,17 +972,14 @@ mod tests {
             )
             .body(Body::from(json_body))
             .unwrap();
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
 
         let app = axum::Router::new()
             .route("/config", axum::routing::patch(patch_config))
             .with_state(state);
 
         let response = app.oneshot(request).await.unwrap();
-        // Will fail because persist_config tries to write to disk
-        assert!(
-            response.status() == StatusCode::OK
-                || response.status() == StatusCode::INTERNAL_SERVER_ERROR
-        );
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1171,25 +1196,14 @@ mod tests {
     ///
     /// We verify that the response body from a successful PATCH uses redacted_config
     /// (i.e., the route returns `redacted_config(&updated_config)` not the raw config).
-    /// Since persist_config writes to disk, we point WEF_CONFIG_DIR at a temp dir.
+    /// persist_config() writes to disk, so we sandbox its target path.
     #[tokio::test]
     async fn patch_config_success_response_redacts_secrets() {
         use crate::config::{S3ConnectionConfig, SyslogS3Config, TlsConfig};
         #[allow(unused_imports)]
         use axum::body::to_bytes;
-        use std::env;
 
-        // Point WEF_CONFIG_DIR to a temp dir so persist_config can write.
-        let tmp = std::env::temp_dir().join(format!(
-            "logthing_test_patch_redact_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-        unsafe { env::set_var("WEF_CONFIG_DIR", &tmp) };
-
+        let _sandbox = sandbox_persist_config_path().await;
         let state = test_state().await;
 
         // Set a valid baseline config with a known S3 secret, TLS disabled.
@@ -1255,9 +1269,5 @@ mod tests {
                 "PATCH success response must not contain plaintext S3 secret; got: {body_str}"
             );
         }
-
-        // Clean up.
-        let _ = std::fs::remove_dir_all(&tmp);
-        unsafe { env::remove_var("WEF_CONFIG_DIR") };
     }
 }

@@ -218,6 +218,10 @@ mod tests {
 
         #[tokio::test]
         async fn persist_config_writes_to_file() {
+            // WEF_ADMIN_OVERRIDE_FILE is process-global; serialize against every
+            // other test that touches it crate-wide (see config_api::test_support).
+            let _lock = config_api::test_support::lock_persist_config_env().await;
+
             let dir = tempdir().unwrap();
             let path = dir.path().join("test-admin.toml");
             unsafe {
@@ -562,6 +566,10 @@ mod tests {
 
         #[tokio::test]
         async fn import_config_accepts_valid_toml() {
+            // import_config() persists on success; sandbox its write path so this
+            // doesn't clobber the real logthing.admin.toml in the repo root.
+            let _sandbox = config_api::test_support::sandbox_persist_config_path().await;
+
             let state = test_state().await;
             use axum_extra::extract::TypedHeader;
             use headers::Authorization;
@@ -919,6 +927,10 @@ port = 9090
 
         #[tokio::test]
         async fn update_config_persists_changes() {
+            // WEF_ADMIN_OVERRIDE_FILE is process-global; serialize against every
+            // other test that touches it crate-wide (see config_api::test_support).
+            let _lock = config_api::test_support::lock_persist_config_env().await;
+
             let dir = tempdir().unwrap();
             let path = dir.path().join("test-config.toml");
             unsafe {
