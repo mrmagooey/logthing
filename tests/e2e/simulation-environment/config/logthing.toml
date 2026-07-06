@@ -75,3 +75,8 @@ secret_key = "miniopassword"
 # prefix defaults to "" (empty) — preserves event_type=.../year=... layout at root
 flush_threshold_bytes = 1
 flush_interval_secs   = 5
+
+[wef.local]
+directory             = "/var/log/wef-local"
+flush_threshold_bytes = 1
+flush_interval_secs   = 5

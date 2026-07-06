@@ -26,6 +26,7 @@ docker compose -f "$COMPOSE_FILE" up -d logthing
 docker compose -f "$COMPOSE_FILE" run --rm wef-generator
 docker compose -f "$COMPOSE_FILE" run --rm syslog-generator
 docker compose -f "$COMPOSE_FILE" run --rm s3-verifier
+docker compose -f "$COMPOSE_FILE" run --rm wef-local-verifier
 
 echo ""
 echo "========================================"
