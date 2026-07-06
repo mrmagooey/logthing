@@ -1050,7 +1050,7 @@ async fn suricata_records_appear_as_parquet_on_local_disk() {
         let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
             .expect("parquet builder for alert");
         let schema = builder.schema().clone();
-        for col in ["event_type", "src_ip", "dest_ip", "payload"] {
+        for col in ["event_type", "received_at", "src_ip", "payload"] {
             assert!(
                 schema.field_with_name(col).is_ok(),
                 "expected column '{col}' in envelope schema"
