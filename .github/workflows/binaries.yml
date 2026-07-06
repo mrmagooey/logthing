@@ -13,11 +13,26 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # required to attach assets to the GitHub Release
+  contents: write # required to create the release / attach assets to it
 
 jobs:
+  # upload-rust-binary-action (below) only attaches assets to an *existing*
+  # GitHub Release — it does not create one. On a real tag push we create it
+  # here first; workflow_dispatch (dry-run) has no tag, so this is skipped and
+  # `build` proceeds without a release to upload to.
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   build:
     name: ${{ matrix.target }}
+    needs: create-release
+    if: always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
