@@ -198,6 +198,7 @@ pub fn finish_batch(
 /// `ParquetSink` adapter for IPFIX flow records.
 /// The `Record` type is `Vec<FlowRecord>` to match the existing
 /// `IpfixHandler::handle_flows` batch API.
+#[derive(Default)]
 pub struct IpfixSink;
 
 impl ParquetSink for IpfixSink {
@@ -257,7 +258,26 @@ impl crate::ipfix::listener::IpfixHandler
 }
 
 // ---------------------------------------------------------------------------
-// ipfix_start — convenience constructor
+// MultiIpfixHandler — fan-out to multiple destinations
+// ---------------------------------------------------------------------------
+
+/// Fans out each flow batch to every configured handler. Used only when both
+/// `.s3` and `.local` persistence resolve to a live handler for the same
+/// run, so each destination keeps its own independent buffer, flush policy,
+/// backpressure, and hard cap (no shared state between destinations).
+pub struct MultiIpfixHandler(pub Vec<std::sync::Arc<dyn crate::ipfix::listener::IpfixHandler>>);
+
+#[async_trait::async_trait]
+impl crate::ipfix::listener::IpfixHandler for MultiIpfixHandler {
+    async fn handle_flows(&self, flows: Vec<FlowRecord>, source: std::net::SocketAddr) {
+        for handler in &self.0 {
+            handler.handle_flows(flows.clone(), source).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ipfix_start / ipfix_local_start — convenience constructors
 // ---------------------------------------------------------------------------
 
 /// Construct an `IpfixS3Handler` (i.e. `ParquetWriterHandle<IpfixSink>`) from an
@@ -271,24 +291,37 @@ pub fn ipfix_start(
     s3: std::sync::Arc<crate::forwarding::s3_sink::S3Sink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (IpfixS3Handler, tokio::task::JoinHandle<()>) {
-    use crate::forwarding::buffered_writer::{
-        BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
-    };
-    let bwc = BufferedWriterConfig {
-        connection: cfg.connection.clone(),
-        prefix: cfg.prefix.clone(),
-        max_buffer_rows: cfg.max_buffer_rows,
-        flush_threshold_bytes: cfg.flush_threshold_bytes,
-        flush_interval_secs: cfg.flush_interval_secs,
-        channel_capacity: cfg.channel_capacity,
-        max_partitions: 1,
-    };
-    let policy = FlushPolicy {
-        max_rows: cfg.max_buffer_rows,
-        max_bytes: cfg.flush_threshold_bytes,
-        interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
-    };
-    ParquetWriterHandle::start_with_stats(IpfixSink, s3, bwc, policy, source_stats)
+    crate::forwarding::buffered_writer::start_writer::<IpfixSink>(
+        cfg.prefix.clone(),
+        cfg.max_buffer_rows,
+        cfg.flush_threshold_bytes,
+        cfg.flush_interval_secs,
+        cfg.channel_capacity,
+        1, // IPFIX is single-partition
+        s3,
+        source_stats,
+    )
+}
+
+/// Construct an `IpfixS3Handler` from an `IpfixLocalConfig` and a pre-built
+/// `LocalDiskSink`. Structurally identical to `ipfix_start`, writing to local
+/// disk instead of S3 — same `IpfixSink` adapter, same buffering/flush/cap
+/// machinery, same S3-key-shaped relative path layout on disk.
+pub fn ipfix_local_start(
+    cfg: &crate::config::IpfixLocalConfig,
+    sink: std::sync::Arc<crate::forwarding::local_sink::LocalDiskSink>,
+    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+) -> (IpfixS3Handler, tokio::task::JoinHandle<()>) {
+    crate::forwarding::buffered_writer::start_writer::<IpfixSink>(
+        cfg.prefix.clone(),
+        cfg.max_buffer_rows,
+        cfg.flush_threshold_bytes,
+        cfg.flush_interval_secs,
+        cfg.channel_capacity,
+        1, // IPFIX is single-partition
+        sink,
+        source_stats,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -923,5 +956,223 @@ mod tests {
         let row = snapshot.iter().find(|r| r.source == "ipfix").unwrap();
         let total: u64 = row.hours.iter().map(|h| h.count).sum();
         assert_eq!(total, 1);
+    }
+
+    // -- ipfix_local_start wires handler and join handle --
+
+    #[tokio::test]
+    async fn ipfix_local_start_wires_handler_and_join_handle() {
+        use crate::config::IpfixLocalConfig;
+        use crate::forwarding::local_sink::LocalDiskSink;
+        use crate::ipfix::listener::IpfixHandler;
+        use std::net::SocketAddr;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(
+            LocalDiskSink::new(dir.path().to_path_buf())
+                .await
+                .expect("LocalDiskSink::new"),
+        );
+        let cfg = IpfixLocalConfig {
+            directory: dir.path().to_path_buf(),
+            prefix: "ipfix".to_string(),
+            flush_threshold_bytes: 1, // flush on first push
+            flush_interval_secs: 3600,
+            channel_capacity: 256,
+            max_buffer_rows: 100_000,
+        };
+        let (handler, join_handle) = ipfix_local_start(
+            &cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
+
+        let src: SocketAddr = "127.0.0.1:4739".parse().unwrap();
+        handler
+            .handle_flows(
+                vec![make_flow_record(
+                    Some("10.0.0.1"),
+                    Some(42),
+                    serde_json::json!({}),
+                )],
+                src,
+            )
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(handler);
+        tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
+            .await
+            .expect("writer task must exit within 5s")
+            .expect("writer task must not panic");
+
+        let ipfix_dir = dir.path().join("ipfix");
+        let mut found = false;
+        for entry in walkdir_flat(&ipfix_dir) {
+            if entry.extension().is_some_and(|e| e == "parquet") {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "expected at least one Parquet file under {ipfix_dir:?}");
+    }
+
+    /// Minimal recursive walk — IPFIX's key layout nests under year=/month=/day=/,
+    /// so a flat `read_dir` on the prefix directory won't find the file directly.
+    fn walkdir_flat(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    // -- MultiIpfixHandler tests --
+
+    #[tokio::test]
+    async fn multi_ipfix_handler_fans_out_to_every_inner_handler() {
+        use crate::ipfix::listener::IpfixHandler;
+        use std::net::SocketAddr;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingHandler(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl IpfixHandler for CountingHandler {
+            async fn handle_flows(&self, _flows: Vec<FlowRecord>, _source: SocketAddr) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let count_a = Arc::new(AtomicUsize::new(0));
+        let count_b = Arc::new(AtomicUsize::new(0));
+        let multi = MultiIpfixHandler(vec![
+            Arc::new(CountingHandler(count_a.clone())),
+            Arc::new(CountingHandler(count_b.clone())),
+        ]);
+
+        let src: SocketAddr = "127.0.0.1:4739".parse().unwrap();
+        multi
+            .handle_flows(
+                vec![make_flow_record(Some("10.0.0.1"), Some(1), serde_json::json!({}))],
+                src,
+            )
+            .await;
+
+        assert_eq!(
+            count_a.load(Ordering::SeqCst),
+            1,
+            "handler A must receive the batch"
+        );
+        assert_eq!(
+            count_b.load(Ordering::SeqCst),
+            1,
+            "handler B must receive the batch"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn multi_ipfix_handler_survives_one_inner_handler_dropping() {
+        use crate::ipfix::listener::IpfixHandler;
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::DebuggingRecorder;
+        use std::net::SocketAddr;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let sink = unreachable_sink().await;
+        let cfg = IpfixS3Config {
+            connection: crate::config::S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "AKIATEST".to_string(),
+                secret_key: "SECRETTEST".to_string(),
+            },
+            prefix: "ipfix".to_string(),
+            flush_threshold_bytes: 1,
+            flush_interval_secs: 3600,
+            channel_capacity: 1,
+            max_buffer_rows: 1,
+        };
+        let (struggling_handler, _jh) = ipfix_start(
+            &cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingHandler(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl IpfixHandler for CountingHandler {
+            async fn handle_flows(&self, _flows: Vec<FlowRecord>, _source: SocketAddr) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let healthy_count = Arc::new(AtomicUsize::new(0));
+        let multi = MultiIpfixHandler(vec![
+            Arc::new(struggling_handler),
+            Arc::new(CountingHandler(healthy_count.clone())),
+        ]);
+
+        let src: SocketAddr = "127.0.0.1:4739".parse().unwrap();
+        for i in 0..20 {
+            multi
+                .handle_flows(
+                    vec![make_flow_record(None, None, serde_json::json!({"i": i}))],
+                    src,
+                )
+                .await;
+        }
+
+        assert_eq!(
+            healthy_count.load(Ordering::SeqCst),
+            20,
+            "the healthy handler must receive every batch even if the struggling one drops some"
+        );
+
+        let snapshot = snapshotter.snapshot();
+        let map = snapshot.into_hashmap();
+        let key = CompositeKey::new(
+            MetricKind::Counter,
+            metrics::Key::from_parts(
+                "parquet_s3_dropped",
+                vec![
+                    metrics::Label::new("source", "ipfix"),
+                    metrics::Label::new("target", "s3"),
+                ],
+            ),
+        );
+        let dropped = map
+            .get(&key)
+            .map(|(_, _, v)| {
+                if let metrics_util::debugging::DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        assert!(
+            dropped >= 1,
+            "the struggling handler must actually have dropped at least one batch \
+             for this test to prove handler isolation (dropped={dropped})"
+        );
     }
 }
