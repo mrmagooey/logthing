@@ -507,12 +507,45 @@ fn default_wef_max_buffer_rows() -> usize {
     100_000
 }
 
+/// Per-source local-disk persistence config for WEF (Windows Event Forwarding).
+/// Mirrors `WefS3Config`'s flush-policy shape (reusing the same default
+/// functions), swapping the S3 connection for a root directory. Independent
+/// of `s3`. `prefix` defaults to empty (bare `#[serde(default)]`, no default
+/// function), preserving the same `event_type=<id>/year=…` root layout as
+/// `WefS3Config`'s empty-prefix default.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WefLocalConfig {
+    /// Root directory Parquet files are written under (created if missing).
+    pub directory: PathBuf,
+    /// Key prefix, slash-free. Default: `""` (empty) — preserves the
+    /// `event_type=<id>/year=…` root layout, same as `WefS3Config`.
+    #[serde(default)]
+    pub prefix: String,
+    /// Flush when estimated buffer bytes exceeds this (default: 100 MiB).
+    #[serde(default = "default_wef_flush_bytes")]
+    pub flush_threshold_bytes: usize,
+    /// Flush after this many seconds regardless (default: 900).
+    #[serde(default = "default_wef_flush_secs")]
+    pub flush_interval_secs: u64,
+    /// Bounded channel capacity (default: 10_000).
+    #[serde(default = "default_wef_channel_capacity")]
+    pub channel_capacity: usize,
+    /// Maximum buffered rows before hard cap (default: 100_000).
+    #[serde(default = "default_wef_max_buffer_rows")]
+    pub max_buffer_rows: usize,
+}
+
 /// Top-level [wef] config section (WEF ingest + optional S3 persistence).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct WefConfig {
     /// Optional S3 persistence. Absent from TOML → `None` → no S3 persistence.
     #[serde(default)]
     pub s3: Option<WefS3Config>,
+    /// Optional local-disk persistence. Absent from TOML → `None` → no
+    /// local persistence. Independent of `s3` — both may be configured
+    /// simultaneously, in which case events are written to both.
+    #[serde(default)]
+    pub local: Option<WefLocalConfig>,
 }
 
 /// Per-source S3 persistence config for HEC ingest.
@@ -1433,6 +1466,51 @@ secret_key = "SECRET"
         assert_eq!(s3.flush_interval_secs, 900);
         assert_eq!(s3.channel_capacity, 10_000);
         assert_eq!(s3.max_buffer_rows, 100_000);
+    }
+
+    #[test]
+    fn wef_local_absent_gives_none() {
+        let cfg = Config::default();
+        assert!(
+            cfg.wef.local.is_none(),
+            "absent [wef.local] must deserialize to None"
+        );
+    }
+
+    #[test]
+    fn wef_local_config_deserializes_from_toml() {
+        let toml_str = r#"
+directory = "/var/log/logthing/wef"
+prefix = "wef"
+flush_threshold_bytes = 52428800
+flush_interval_secs = 300
+channel_capacity = 512
+max_buffer_rows = 50000
+"#;
+        let cfg: WefLocalConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(
+            cfg.directory,
+            std::path::PathBuf::from("/var/log/logthing/wef")
+        );
+        assert_eq!(cfg.prefix, "wef");
+        assert_eq!(cfg.flush_threshold_bytes, 52_428_800);
+        assert_eq!(cfg.flush_interval_secs, 300);
+        assert_eq!(cfg.channel_capacity, 512);
+        assert_eq!(cfg.max_buffer_rows, 50_000);
+    }
+
+    #[test]
+    fn wef_local_config_defaults_apply_when_only_directory_given() {
+        let toml_str = r#"directory = "/data/wef""#;
+        let cfg: WefLocalConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(
+            cfg.prefix, "",
+            "prefix defaults to empty, preserving legacy layout"
+        );
+        assert_eq!(cfg.flush_threshold_bytes, 100 * 1024 * 1024);
+        assert_eq!(cfg.flush_interval_secs, 900);
+        assert_eq!(cfg.channel_capacity, 10_000);
+        assert_eq!(cfg.max_buffer_rows, 100_000);
     }
 
     #[test]
