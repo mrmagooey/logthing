@@ -93,7 +93,7 @@ async fn zeek_records_appear_as_parquet_in_s3() {
     );
 
     // zeek_start returns (handler, writer_join_handle)
-    let (handler, _writer_task) = zeek_start(&cfg, sink.clone());
+    let (handler, _writer_task) = zeek_start(&cfg, sink.clone(), std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()));
 
     let src: std::net::SocketAddr = "127.0.0.1:47760".parse().unwrap();
     handler.handle_record(make_conn_record(), src).await;

@@ -145,6 +145,7 @@ impl crate::sflow::listener::SflowHandler
 pub fn sflow_start(
     cfg: &SflowS3Config,
     s3: Arc<crate::forwarding::s3_sink::S3Sink>,
+    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (SflowS3Handler, tokio::task::JoinHandle<()>) {
     use crate::forwarding::buffered_writer::{BufferedWriterConfig, FlushPolicy, ParquetWriterHandle};
     let bwc = BufferedWriterConfig {
@@ -161,7 +162,7 @@ pub fn sflow_start(
         max_bytes: cfg.flush_threshold_bytes,
         interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
     };
-    ParquetWriterHandle::start(SflowSink, s3, bwc, policy)
+    ParquetWriterHandle::start_with_stats(SflowSink, s3, bwc, policy, source_stats)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -290,5 +291,56 @@ mod tests {
         let if_in_oct = batch.column_by_name("if_in_octets").unwrap()
             .as_any().downcast_ref::<UInt64Array>().unwrap();
         assert_eq!(if_in_oct.value(0), 1_000_000u64);
+    }
+
+    #[tokio::test]
+    async fn sflow_sink_reports_into_shared_source_hourly_stats() {
+        use crate::forwarding::buffered_writer::{
+            BufferedWriterConfig, FlushPolicy, PartitionedParquetWriter,
+        };
+        let s3 = std::sync::Arc::new(
+            crate::forwarding::s3_sink::S3Sink::from_connection(
+                &crate::config::S3ConnectionConfig {
+                    endpoint: "http://127.0.0.1:1".to_string(),
+                    bucket: "t".to_string(),
+                    region: "us-east-1".to_string(),
+                    access_key: "K".to_string(),
+                    secret_key: "S".to_string(),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let bwc = BufferedWriterConfig {
+            connection: crate::config::S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "t".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "K".to_string(),
+                secret_key: "S".to_string(),
+            },
+            prefix: "sflow".to_string(),
+            max_buffer_rows: 1_000,
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 64,
+            max_partitions: 2,
+        };
+        let policy = FlushPolicy {
+            max_rows: 1_000,
+            max_bytes: usize::MAX,
+            interval: std::time::Duration::from_secs(3600),
+        };
+        let shared_stats = std::sync::Arc::new(crate::stats::SourceHourlyStats::new());
+
+        let mut writer = PartitionedParquetWriter::with_source_stats(
+            SflowSink, s3, bwc, policy, shared_stats.clone(),
+        );
+        writer.push(make_flow_record()).await.unwrap();
+
+        let snapshot = shared_stats.snapshot();
+        let row = snapshot.iter().find(|r| r.source == "sflow").unwrap();
+        let total: u64 = row.hours.iter().map(|h| h.count).sum();
+        assert_eq!(total, 1);
     }
 }

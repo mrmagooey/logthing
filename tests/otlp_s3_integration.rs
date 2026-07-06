@@ -101,7 +101,7 @@ mod tests {
         );
 
         // Start the generic HEC handler targeting the S3 sink.
-        let (handler, _writer_task) = hec_start(&cfg, sink.clone(), 64);
+        let (handler, _writer_task) = hec_start(&cfg, sink.clone(), 64, std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()));
 
         // Map the OTLP request to GenericRecords.
         let req = make_otlp_request();

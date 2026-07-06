@@ -269,6 +269,7 @@ impl crate::ipfix::listener::IpfixHandler
 pub fn ipfix_start(
     cfg: &IpfixS3Config,
     s3: std::sync::Arc<crate::forwarding::s3_sink::S3Sink>,
+    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (IpfixS3Handler, tokio::task::JoinHandle<()>) {
     use crate::forwarding::buffered_writer::{
         BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
@@ -287,7 +288,7 @@ pub fn ipfix_start(
         max_bytes: cfg.flush_threshold_bytes,
         interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
     };
-    ParquetWriterHandle::start(IpfixSink, s3, bwc, policy)
+    ParquetWriterHandle::start_with_stats(IpfixSink, s3, bwc, policy, source_stats)
 }
 
 // ---------------------------------------------------------------------------
@@ -572,7 +573,7 @@ mod tests {
             channel_capacity: 1,
             max_buffer_rows: 1,
         };
-        let (handler, _writer_handle) = ipfix_start(&cfg, sink);
+        let (handler, _writer_handle) = ipfix_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
 
         // Yield so the background task starts and blocks inside the S3 upload.
         tokio::task::yield_now().await;
@@ -655,7 +656,7 @@ mod tests {
                 channel_capacity: 1,
                 max_buffer_rows: 1,
             };
-            let (handler, _writer_handle) = ipfix_start(&cfg, sink);
+            let (handler, _writer_handle) = ipfix_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
             tokio::task::yield_now().await;
 
             // Send 30 batches — far more than capacity (1) + the one in-flight with S3.
@@ -714,7 +715,7 @@ mod tests {
                 channel_capacity: 10_000,
                 max_buffer_rows: 100_000,
             };
-            let (handler, _writer_handle) = ipfix_start(&cfg, sink);
+            let (handler, _writer_handle) = ipfix_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
             tokio::task::yield_now().await;
 
             for i in 0..30usize {
@@ -784,7 +785,7 @@ mod tests {
                 .await
                 .expect("S3Sink construct"),
         );
-        let (handler, _writer_handle) = ipfix_start(&s3_cfg, sink);
+        let (handler, _writer_handle) = ipfix_start(&s3_cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
         let src: std::net::SocketAddr = "127.0.0.1:4739".parse().unwrap();
 
         let flows: Vec<FlowRecord> = (0..10)
@@ -860,5 +861,44 @@ mod tests {
             rb.schema().field_with_name("src_addr").is_ok(),
             "schema must have src_addr column"
         );
+    }
+
+    #[tokio::test]
+    async fn ipfix_sink_reports_into_shared_source_hourly_stats() {
+        use crate::forwarding::buffered_writer::{
+            BufferedWriterConfig, FlushPolicy, PartitionedParquetWriter,
+        };
+        let s3 = unreachable_sink().await;
+        let bwc = BufferedWriterConfig {
+            connection: crate::config::S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "t".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "K".to_string(),
+                secret_key: "S".to_string(),
+            },
+            prefix: "ipfix".to_string(),
+            max_buffer_rows: 1_000,
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 64,
+            max_partitions: 1,
+        };
+        let policy = FlushPolicy {
+            max_rows: 1_000,
+            max_bytes: usize::MAX,
+            interval: std::time::Duration::from_secs(3600),
+        };
+        let shared_stats = std::sync::Arc::new(crate::stats::SourceHourlyStats::new());
+
+        let mut writer = PartitionedParquetWriter::with_source_stats(
+            IpfixSink, s3, bwc, policy, shared_stats.clone(),
+        );
+        writer.push(vec![make_flow_record(None, None, serde_json::json!({}))]).await.unwrap();
+
+        let snapshot = shared_stats.snapshot();
+        let row = snapshot.iter().find(|r| r.source == "ipfix").unwrap();
+        let total: u64 = row.hours.iter().map(|h| h.count).sum();
+        assert_eq!(total, 1);
     }
 }

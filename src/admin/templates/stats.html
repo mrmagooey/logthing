@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>logthing admin — ingest stats</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ccc; padding: 0.4rem 0.6rem; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    caption { caption-side: bottom; font-size: 0.85rem; color: #555; margin-top: 0.75rem; text-align: left; }
+  </style>
+</head>
+<body>
+  <h1>Ingested records per source, per hour (last 24h)</h1>
+  <table>
+    <thead><tr><th>Source</th>{{HOUR_HEADERS}}</tr></thead>
+    <tbody>
+      {{STATS_ROWS}}
+    </tbody>
+    <caption>Counts records accepted into the write pipeline; may include a small overcount during a sustained S3 outage (see parquet_s3_upload_errors).</caption>
+  </table>
+</body>
+</html>

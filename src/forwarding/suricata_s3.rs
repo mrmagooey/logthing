@@ -137,6 +137,7 @@ impl crate::suricata::listener::SuricataHandler
 pub fn suricata_start(
     cfg: &SuricataS3Config,
     s3: std::sync::Arc<crate::forwarding::s3_sink::S3Sink>,
+    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (SuricataS3Handler, tokio::task::JoinHandle<()>) {
     use crate::forwarding::buffered_writer::{
         BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
@@ -159,7 +160,7 @@ pub fn suricata_start(
         max_bytes: cfg.flush_threshold_bytes,
         interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
     };
-    ParquetWriterHandle::start(SuricataSink, s3, bwc, policy)
+    ParquetWriterHandle::start_with_stats(SuricataSink, s3, bwc, policy, source_stats)
 }
 
 // ---------------------------------------------------------------------------
@@ -376,7 +377,7 @@ mod tests {
             channel_capacity: 1,
             max_buffer_rows: 1,
         };
-        let (handler, _writer_handle) = suricata_start(&cfg, sink);
+        let (handler, _writer_handle) = suricata_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
         tokio::task::yield_now().await;
 
         let src: SocketAddr = "127.0.0.1:47761".parse().unwrap();
@@ -432,7 +433,7 @@ mod tests {
             channel_capacity: 256,
             max_buffer_rows: 100_000,
         };
-        let (handler, join_handle) = suricata_start(&cfg, sink);
+        let (handler, join_handle) = suricata_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
         let src: SocketAddr = "127.0.0.1:47761".parse().unwrap();
         handler.handle_record(make_alert_record("10.0.0.1"), src).await;
         drop(handler);
@@ -441,5 +442,44 @@ mod tests {
             .await
             .expect("writer task must exit within 5s")
             .expect("writer task must not panic");
+    }
+
+    #[tokio::test]
+    async fn suricata_sink_reports_into_shared_source_hourly_stats() {
+        use crate::forwarding::buffered_writer::{
+            BufferedWriterConfig, FlushPolicy, PartitionedParquetWriter,
+        };
+        let s3 = unreachable_sink().await;
+        let bwc = BufferedWriterConfig {
+            connection: crate::config::S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "t".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "K".to_string(),
+                secret_key: "S".to_string(),
+            },
+            prefix: "suricata".to_string(),
+            max_buffer_rows: 1_000,
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 64,
+            max_partitions: 256,
+        };
+        let policy = FlushPolicy {
+            max_rows: 1_000,
+            max_bytes: usize::MAX,
+            interval: std::time::Duration::from_secs(3600),
+        };
+        let shared_stats = std::sync::Arc::new(crate::stats::SourceHourlyStats::new());
+
+        let mut writer = PartitionedParquetWriter::with_source_stats(
+            SuricataSink, s3, bwc, policy, shared_stats.clone(),
+        );
+        writer.push(make_alert_record("1.1.1.1")).await.unwrap();
+
+        let snapshot = shared_stats.snapshot();
+        let row = snapshot.iter().find(|r| r.source == "suricata").unwrap();
+        let total: u64 = row.hours.iter().map(|h| h.count).sum();
+        assert_eq!(total, 1);
     }
 }

@@ -53,7 +53,7 @@ async fn cef_record_appears_as_parquet_under_cef_partition() {
             .expect("S3Sink::from_connection"),
     );
 
-    let (structured_handle, writer_task) = structured_syslog_start(&cfg, s3.clone());
+    let (structured_handle, writer_task) = structured_syslog_start(&cfg, s3.clone(), std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()));
     let structured_handle = Arc::new(structured_handle);
 
     let handler = DefaultSyslogHandler::new(
@@ -145,7 +145,7 @@ async fn multiple_payload_types_land_in_separate_partitions() {
             .expect("S3Sink::from_connection"),
     );
 
-    let (structured_handle, writer_task) = structured_syslog_start(&cfg, s3.clone());
+    let (structured_handle, writer_task) = structured_syslog_start(&cfg, s3.clone(), std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()));
     let structured_handle = Arc::new(structured_handle);
 
     let handler = DefaultSyslogHandler::new(false, true, Some(structured_handle.clone()));

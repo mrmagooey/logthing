@@ -92,7 +92,7 @@ async fn suricata_records_appear_as_parquet_in_s3() {
             .expect("S3Sink::from_connection"),
     );
 
-    let (handler, _writer_task) = suricata_start(&cfg, sink.clone());
+    let (handler, _writer_task) = suricata_start(&cfg, sink.clone(), std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()));
     let src: std::net::SocketAddr = "127.0.0.1:47761".parse().unwrap();
     handler.handle_record(make_alert_record(), src).await;
     handler.handle_record(make_flow_record(), src).await;

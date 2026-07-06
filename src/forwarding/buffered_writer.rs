@@ -201,6 +201,7 @@ pub struct PartitionedParquetWriter<S: ParquetSink> {
     policy: FlushPolicy,
     /// `""` key for None-partition sources; sanitized-path / `"event_type=<id>"` for multi-partition.
     pub(crate) buffers: HashMap<String, PartitionBuffer>,
+    source_stats: Arc<crate::stats::SourceHourlyStats>,
 }
 
 impl<S: ParquetSink> PartitionedParquetWriter<S> {
@@ -210,12 +211,29 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         config: BufferedWriterConfig,
         policy: FlushPolicy,
     ) -> Self {
+        Self::with_source_stats(
+            sink,
+            s3,
+            config,
+            policy,
+            Arc::new(crate::stats::SourceHourlyStats::default()),
+        )
+    }
+
+    pub fn with_source_stats(
+        sink: S,
+        s3: Arc<dyn UploadSink>,
+        config: BufferedWriterConfig,
+        policy: FlushPolicy,
+        source_stats: Arc<crate::stats::SourceHourlyStats>,
+    ) -> Self {
         Self {
             sink,
             s3,
             config,
             policy,
             buffers: HashMap::new(),
+            source_stats,
         }
     }
 
@@ -267,6 +285,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 return Ok(());
             }
         };
+        self.source_stats.record(self.sink.source(), 1);
 
         let est_bytes = batch.get_array_memory_size();
         let n_rows = batch.num_rows();
@@ -445,6 +464,25 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
         config: BufferedWriterConfig,
         policy: FlushPolicy,
     ) -> (Self, tokio::task::JoinHandle<()>) {
+        Self::start_with_stats(
+            sink,
+            s3,
+            config,
+            policy,
+            Arc::new(crate::stats::SourceHourlyStats::default()),
+        )
+    }
+
+    /// Same as `start`, but records ingested-record counts into a shared,
+    /// externally-owned `SourceHourlyStats` (used to feed the admin `/stats`
+    /// page from every source through one instance).
+    pub fn start_with_stats(
+        sink: S,
+        s3: Arc<dyn UploadSink>,
+        config: BufferedWriterConfig,
+        policy: FlushPolicy,
+        source_stats: Arc<crate::stats::SourceHourlyStats>,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let capacity = config.channel_capacity.max(1);
         // Capture the source/target labels before `sink`/`s3` are moved into the task.
         let source = sink.source();
@@ -452,7 +490,8 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<S::Record>(capacity);
         let flush_check = crate::forwarding::s3_sink::flush_check_interval(policy.interval);
         let handle = tokio::spawn(async move {
-            let mut writer = PartitionedParquetWriter::new(sink, s3, config, policy);
+            let mut writer =
+                PartitionedParquetWriter::with_source_stats(sink, s3, config, policy, source_stats);
             let mut interval = tokio::time::interval(flush_check);
             loop {
                 tokio::select! {
@@ -773,6 +812,31 @@ max_partitions = 128
             .map(|(_, _, v)| if let DebugValue::Counter(c) = v { *c } else { 0 })
             .unwrap_or(0);
         assert_eq!(count, 1, "expected parquet_s3_uploads{{source=\"test\",target=\"recording\"}} == 1");
+    }
+
+    /// `push()` must record into a shared `SourceHourlyStats` once per
+    /// record, independent of whether the record's buffer ever flushes.
+    #[tokio::test]
+    async fn push_records_into_shared_source_hourly_stats() {
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(1_000); // high threshold: nothing flushes
+        let shared_stats = Arc::new(crate::stats::SourceHourlyStats::new());
+        let mut w = PartitionedParquetWriter::with_source_stats(
+            MockSink,
+            s3,
+            cfg,
+            policy,
+            shared_stats.clone(),
+        );
+
+        for i in 0..3 {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+
+        let snapshot = shared_stats.snapshot();
+        let row = snapshot.iter().find(|r| r.source == "test").unwrap();
+        let total: u64 = row.hours.iter().map(|h| h.count).sum();
+        assert_eq!(total, 3, "push() must count records even though nothing flushed");
     }
 
     /// Row-threshold flush fails (unreachable S3) but hard cap is enforced.

@@ -784,7 +784,7 @@ mod tests {
             flush_interval_secs: 3600,
             channel_capacity: 16,
         };
-        let (structured_handle, _join) = structured_syslog_start(&cfg, s3);
+        let (structured_handle, _join) = structured_syslog_start(&cfg, s3, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
         let structured_handle = Arc::new(structured_handle);
 
         let handler = DefaultSyslogHandler::new(

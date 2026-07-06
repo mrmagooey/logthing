@@ -176,6 +176,7 @@ impl crate::syslog::listener::SyslogHandler
 pub fn syslog_start(
     cfg: &SyslogS3Config,
     s3: std::sync::Arc<crate::forwarding::s3_sink::S3Sink>,
+    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (SyslogS3Handler, tokio::task::JoinHandle<()>) {
     use crate::forwarding::buffered_writer::{
         BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
@@ -194,7 +195,7 @@ pub fn syslog_start(
         max_bytes: usize::MAX,
         interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
     };
-    ParquetWriterHandle::start(SyslogSink, s3, bwc, policy)
+    ParquetWriterHandle::start_with_stats(SyslogSink, s3, bwc, policy, source_stats)
 }
 
 // ---------------------------------------------------------------------------
@@ -500,7 +501,7 @@ mod tests {
             channel_capacity: 4096,
         };
 
-        let (handler, join_handle) = syslog_start(&cfg, sink);
+        let (handler, join_handle) = syslog_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
 
         // try_send one message through the handler
         let src: SocketAddr = "127.0.0.1:5514".parse().unwrap();
@@ -514,5 +515,44 @@ mod tests {
             .await
             .expect("writer task must exit within 5s")
             .expect("writer task must not panic");
+    }
+
+    #[tokio::test]
+    async fn syslog_sink_reports_into_shared_source_hourly_stats() {
+        use crate::forwarding::buffered_writer::{
+            BufferedWriterConfig, FlushPolicy, PartitionedParquetWriter,
+        };
+        let s3 = unreachable_sink().await;
+        let bwc = BufferedWriterConfig {
+            connection: crate::config::S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "t".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "K".to_string(),
+                secret_key: "S".to_string(),
+            },
+            prefix: "syslog".to_string(),
+            max_buffer_rows: 1_000,
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 64,
+            max_partitions: 1,
+        };
+        let policy = FlushPolicy {
+            max_rows: 1_000,
+            max_bytes: usize::MAX,
+            interval: std::time::Duration::from_secs(3600),
+        };
+        let shared_stats = std::sync::Arc::new(crate::stats::SourceHourlyStats::new());
+
+        let mut writer = PartitionedParquetWriter::with_source_stats(
+            SyslogSink, s3, bwc, policy, shared_stats.clone(),
+        );
+        writer.push(dummy_msg("test")).await.unwrap();
+
+        let snapshot = shared_stats.snapshot();
+        let row = snapshot.iter().find(|r| r.source == "syslog").unwrap();
+        let total: u64 = row.hours.iter().map(|h| h.count).sum();
+        assert_eq!(total, 1);
     }
 }

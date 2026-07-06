@@ -18,11 +18,14 @@ use crate::admin::state::{AdminServerConfig, AdminState, AuditLogger, load_admin
 use crate::config::Config;
 
 /// Spawn the admin server as a background task
-pub fn spawn_admin_server(config: Arc<RwLock<Config>>) {
+pub fn spawn_admin_server(
+    config: Arc<RwLock<Config>>,
+    source_stats: Arc<crate::stats::SourceHourlyStats>,
+) {
     tokio::spawn(async move {
         match load_admin_config() {
             Ok(server_config) => {
-                if let Err(err) = run_admin_server(config, server_config).await {
+                if let Err(err) = run_admin_server(config, server_config, source_stats).await {
                     error!("Admin server error: {}", err);
                 }
             }
@@ -37,6 +40,7 @@ pub fn spawn_admin_server(config: Arc<RwLock<Config>>) {
 async fn run_admin_server(
     config: Arc<RwLock<Config>>,
     server_config: AdminServerConfig,
+    source_stats: Arc<crate::stats::SourceHourlyStats>,
 ) -> anyhow::Result<()> {
     let audit_logger = AuditLogger::new(1000).await;
     let csrf_tokens: Arc<RwLock<Vec<(String, std::time::Instant)>>> =
@@ -50,6 +54,7 @@ async fn run_admin_server(
         audit_logger: audit_logger.clone(),
         csrf_tokens: csrf_tokens.clone(),
         request_counts: request_counts.clone(),
+        source_stats,
     };
 
     let app = axum::Router::new()
@@ -82,6 +87,8 @@ async fn run_admin_server(
         )
         .route("/health", axum::routing::get(health_check))
         .route("/audit-log", axum::routing::get(get_audit_log))
+        .route("/stats", axum::routing::get(get_stats))
+        .route("/stats.json", axum::routing::get(get_stats_json))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             security_middleware,
@@ -364,6 +371,80 @@ async fn get_audit_log(
     Ok(Json(entries))
 }
 
+/// Render the last-24h per-source hourly ingest table as HTML.
+async fn get_stats(
+    State(state): State<AdminState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    auth: Option<TypedHeader<Authorization<Basic>>>,
+) -> Result<Html<String>, Response> {
+    let client_ip = addr.ip().to_string();
+    let username = ensure_authorized(&state, auth, &client_ip).await?;
+
+    let snapshot = state.source_stats.snapshot();
+
+    // Union of all hour timestamps across sources, sorted ascending, for
+    // consistent column headers.
+    let mut all_hours: Vec<chrono::DateTime<chrono::Utc>> = snapshot
+        .iter()
+        .flat_map(|row| row.hours.iter().map(|h| h.hour))
+        .collect();
+    all_hours.sort();
+    all_hours.dedup();
+
+    let hour_headers: String = all_hours
+        .iter()
+        .map(|h| format!("<th>{}</th>", h.format("%Y-%m-%d %H:00")))
+        .collect();
+
+    let rows: String = snapshot
+        .iter()
+        .map(|row| {
+            let cells: String = all_hours
+                .iter()
+                .map(|h| {
+                    let count = row
+                        .hours
+                        .iter()
+                        .find(|hc| hc.hour == *h)
+                        .map(|hc| hc.count)
+                        .unwrap_or(0);
+                    format!("<td>{count}</td>")
+                })
+                .collect();
+            format!("<tr><td>{}</td>{}</tr>", row.source, cells)
+        })
+        .collect();
+
+    state
+        .audit_logger
+        .log("STATS_PAGE_ACCESS", &username, &client_ip, None)
+        .await;
+
+    let html = include_str!("templates/stats.html")
+        .replace("{{HOUR_HEADERS}}", &hour_headers)
+        .replace("{{STATS_ROWS}}", &rows);
+    Ok(Html(html))
+}
+
+/// Return the last-24h per-source hourly ingest counts as JSON.
+async fn get_stats_json(
+    State(state): State<AdminState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    auth: Option<TypedHeader<Authorization<Basic>>>,
+) -> Result<Json<Vec<crate::stats::SourceHourlySnapshot>>, Response> {
+    let client_ip = addr.ip().to_string();
+    let username = ensure_authorized(&state, auth, &client_ip).await?;
+
+    let snapshot = state.source_stats.snapshot();
+
+    state
+        .audit_logger
+        .log("STATS_JSON_READ", &username, &client_ip, None)
+        .await;
+
+    Ok(Json(snapshot))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +473,7 @@ mod tests {
             audit_logger: AuditLogger::new(100).await,
             csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
         }
     }
 
@@ -579,6 +661,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_stats_requires_auth() {
+        let state = test_state().await;
+        let mut request = create_request_without_auth(Method::GET, "/stats");
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+        let app = axum::Router::new()
+            .route("/stats", axum::routing::get(get_stats))
+            .with_state(state);
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn get_stats_json_requires_auth() {
+        let state = test_state().await;
+        let mut request = create_request_without_auth(Method::GET, "/stats.json");
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+        let app = axum::Router::new()
+            .route("/stats.json", axum::routing::get(get_stats_json))
+            .with_state(state);
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn get_stats_json_returns_recorded_counts_with_valid_auth() {
+        let state = test_state().await;
+        state.source_stats.record("syslog", 5);
+
+        let mut request =
+            create_request_with_auth(Method::GET, "/stats.json", "admin", "admin", None);
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+        let app = axum::Router::new()
+            .route("/stats.json", axum::routing::get(get_stats_json))
+            .with_state(state);
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<crate::stats::SourceHourlySnapshot> =
+            serde_json::from_slice(&body).unwrap();
+        let syslog_row = rows.iter().find(|r| r.source == "syslog").unwrap();
+        let total: u64 = syslog_row.hours.iter().map(|h| h.count).sum();
+        assert_eq!(total, 5);
+    }
+
+    /// End-to-end: reproduces main.rs's actual wiring — ONE shared
+    /// Arc<SourceHourlyStats> both fed by a real writer and read by the real
+    /// admin server over a live loopback socket. Catches an Arc-identity
+    /// mistake (writer and admin server holding *different* instances) that
+    /// would compile cleanly but leave /stats.json permanently empty.
+    #[tokio::test]
+    async fn e2e_shared_source_stats_reach_stats_json_over_real_socket() {
+        use crate::config::S3ConnectionConfig;
+        use crate::forwarding::buffered_writer::{
+            BufferedWriterConfig, FlushPolicy, PartitionedParquetWriter,
+        };
+        use crate::forwarding::s3_sink::S3Sink;
+        use crate::stats::SourceHourlyStats;
+
+        // Step 1: the ONE shared Arc, exactly as main.rs builds it.
+        let source_stats = Arc::new(SourceHourlyStats::new());
+
+        // Step 2: push a record through a real writer using that shared Arc.
+        let conn = S3ConnectionConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            bucket: "t".to_string(),
+            region: "us-east-1".to_string(),
+            access_key: "K".to_string(),
+            secret_key: "S".to_string(),
+        };
+        let s3 = Arc::new(S3Sink::from_connection(&conn).await.unwrap());
+        let bwc = BufferedWriterConfig {
+            connection: conn,
+            prefix: "e2e".to_string(),
+            max_buffer_rows: 1_000,
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 64,
+            max_partitions: 1,
+        };
+        let policy = FlushPolicy {
+            max_rows: 1_000,
+            max_bytes: usize::MAX,
+            interval: std::time::Duration::from_secs(3600),
+        };
+
+        struct E2eSink;
+        impl crate::forwarding::buffered_writer::ParquetSink for E2eSink {
+            type Record = String;
+            fn source(&self) -> &'static str {
+                "e2e_source"
+            }
+            fn partition(&self, _r: &String) -> Option<String> {
+                None
+            }
+            fn schema(&self, _p: Option<&str>) -> Arc<arrow_schema::Schema> {
+                Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "val",
+                    arrow_schema::DataType::Utf8,
+                    false,
+                )]))
+            }
+            fn to_record_batch(
+                &self,
+                record: &String,
+                schema: &Arc<arrow_schema::Schema>,
+            ) -> anyhow::Result<arrow_array::RecordBatch> {
+                let col = Arc::new(arrow_array::StringArray::from(vec![record.as_str()]));
+                Ok(arrow_array::RecordBatch::try_new(schema.clone(), vec![col])?)
+            }
+        }
+
+        let mut writer = PartitionedParquetWriter::with_source_stats(
+            E2eSink,
+            s3,
+            bwc,
+            policy,
+            source_stats.clone(),
+        );
+        writer.push("hello".to_string()).await.unwrap();
+
+        // Step 3: spawn the real admin router, sharing the SAME Arc.
+        let server_config = AdminServerConfig {
+            bind_address: "127.0.0.1:0".parse().unwrap(),
+            username: "admin".to_string(),
+            password_hash: PasswordHash::hash("admin").unwrap(),
+            allowed_ips: vec![],
+            tls_config: None,
+            enable_csrf: false,
+            enable_rate_limiting: false,
+        };
+        let state = AdminState {
+            config: Arc::new(RwLock::new(Config::default())),
+            server_config,
+            audit_logger: AuditLogger::new(100).await,
+            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
+            request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            source_stats: source_stats.clone(),
+        };
+        let app = axum::Router::new()
+            .route("/stats.json", axum::routing::get(get_stats_json))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let real_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        // Step 4: real HTTP request over the real socket with Basic Auth.
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{real_addr}/stats.json"))
+            .basic_auth("admin", Some("admin"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let rows: Vec<crate::stats::SourceHourlySnapshot> = resp.json().await.unwrap();
+        let row = rows.iter().find(|r| r.source == "e2e_source").unwrap();
+        let total: u64 = row.hours.iter().map(|h| h.count).sum();
+        assert_eq!(
+            total, 1,
+            "count recorded via the writer's Arc must be visible through the \
+             admin server's Arc — they must be the SAME instance"
+        );
+    }
+
+    #[tokio::test]
     async fn update_config_with_valid_auth_updates_configuration() {
         let state = test_state().await;
         let new_config = Config::default();
@@ -624,13 +889,29 @@ mod tests {
         );
     }
 
+    // Sandboxes persist_config()'s write path; see config_api::test_support for
+    // why this must be a single lock shared crate-wide across test modules.
+    use crate::admin::config_api::test_support::sandbox_persist_config_path;
+
     #[tokio::test]
     async fn patch_config_with_valid_auth_updates_configuration() {
+        use crate::config::TlsConfig;
+
+        let _sandbox = sandbox_persist_config_path().await;
         let state = test_state().await;
+        // Config::default() has tls.enabled = true with no cert, which fails
+        // validate_config_invariants on its own — give it a valid baseline first.
+        {
+            let mut cfg = state.config.write().await;
+            cfg.tls = TlsConfig {
+                enabled: false,
+                ..TlsConfig::default()
+            };
+        }
         let partial = PartialConfigUpdate::default();
         let json_body = serde_json::to_string(&partial).unwrap();
 
-        let request = axum::http::Request::builder()
+        let mut request = axum::http::Request::builder()
             .method(Method::PATCH)
             .uri("/config")
             .header("content-type", "application/json")
@@ -640,25 +921,36 @@ mod tests {
             )
             .body(Body::from(json_body))
             .unwrap();
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
 
         let app = axum::Router::new()
             .route("/config", axum::routing::patch(patch_config))
             .with_state(state);
 
         let response = app.oneshot(request).await.unwrap();
-        // Will fail because persist_config tries to write to disk
-        assert!(
-            response.status() == StatusCode::OK
-                || response.status() == StatusCode::INTERNAL_SERVER_ERROR
-        );
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn patch_config_with_partial_fields() {
+        use crate::config::TlsConfig;
+
+        let _sandbox = sandbox_persist_config_path().await;
         let state = test_state().await;
+        // Config::default() has tls.enabled = true with no cert, which fails
+        // validate_config_invariants on its own — give it a valid baseline first.
+        {
+            let mut cfg = state.config.write().await;
+            cfg.tls = TlsConfig {
+                enabled: false,
+                ..TlsConfig::default()
+            };
+        }
         let partial = PartialConfigUpdate {
             bind_address: Some("0.0.0.0:9999".parse().unwrap()),
-            tls_enabled: Some(true),
+            // tls_enabled intentionally omitted: enabling TLS via PartialConfigUpdate
+            // with no cert/key path always fails validate_config_invariants (see
+            // patch_config_tls_without_cert_rejected_and_config_unchanged).
             tls_port: Some(9443),
             logging_level: Some("debug".to_string()),
             metrics_enabled: Some(true),
@@ -666,10 +958,11 @@ mod tests {
             syslog_enabled: Some(true),
             syslog_udp_port: Some(5514),
             syslog_tcp_port: Some(5601),
+            ..PartialConfigUpdate::default()
         };
         let json_body = serde_json::to_string(&partial).unwrap();
 
-        let request = axum::http::Request::builder()
+        let mut request = axum::http::Request::builder()
             .method(Method::PATCH)
             .uri("/config")
             .header("content-type", "application/json")
@@ -679,17 +972,14 @@ mod tests {
             )
             .body(Body::from(json_body))
             .unwrap();
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
 
         let app = axum::Router::new()
             .route("/config", axum::routing::patch(patch_config))
             .with_state(state);
 
         let response = app.oneshot(request).await.unwrap();
-        // Will fail because persist_config tries to write to disk
-        assert!(
-            response.status() == StatusCode::OK
-                || response.status() == StatusCode::INTERNAL_SERVER_ERROR
-        );
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -710,6 +1000,7 @@ mod tests {
             audit_logger: AuditLogger::new(100).await,
             csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
         };
 
         let mut request = create_request_with_auth(Method::GET, "/", "admin", "admin", None);
@@ -905,25 +1196,14 @@ mod tests {
     ///
     /// We verify that the response body from a successful PATCH uses redacted_config
     /// (i.e., the route returns `redacted_config(&updated_config)` not the raw config).
-    /// Since persist_config writes to disk, we point WEF_CONFIG_DIR at a temp dir.
+    /// persist_config() writes to disk, so we sandbox its target path.
     #[tokio::test]
     async fn patch_config_success_response_redacts_secrets() {
         use crate::config::{S3ConnectionConfig, SyslogS3Config, TlsConfig};
         #[allow(unused_imports)]
         use axum::body::to_bytes;
-        use std::env;
 
-        // Point WEF_CONFIG_DIR to a temp dir so persist_config can write.
-        let tmp = std::env::temp_dir().join(format!(
-            "logthing_test_patch_redact_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-        unsafe { env::set_var("WEF_CONFIG_DIR", &tmp) };
-
+        let _sandbox = sandbox_persist_config_path().await;
         let state = test_state().await;
 
         // Set a valid baseline config with a known S3 secret, TLS disabled.
@@ -989,9 +1269,5 @@ mod tests {
                 "PATCH success response must not contain plaintext S3 secret; got: {body_str}"
             );
         }
-
-        // Clean up.
-        let _ = std::fs::remove_dir_all(&tmp);
-        unsafe { env::remove_var("WEF_CONFIG_DIR") };
     }
 }

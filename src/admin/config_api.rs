@@ -17,6 +17,58 @@ use crate::config::{ADMIN_OVERRIDE_FILE, Config, S3ConnectionConfig};
 
 const REDACTED: &str = "***REDACTED***";
 
+/// Test-only helpers for sandboxing `persist_config()`'s write path.
+///
+/// `WEF_ADMIN_OVERRIDE_FILE` is a process-global env var, but cargo runs
+/// `#[tokio::test]` functions concurrently within one process. Every test
+/// (in this module or `admin::routes`) that points the var at a temp path
+/// must serialize against every other such test crate-wide, or one test's
+/// cleanup can clear another's override mid-flight and let its
+/// `persist_config()` call fall through to the real `logthing.admin.toml`
+/// in the repo root.
+#[cfg(test)]
+pub(crate) mod test_support {
+    static PERSIST_CONFIG_ENV_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    pub(crate) struct PersistConfigSandbox {
+        tmp: std::path::PathBuf,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for PersistConfigSandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.tmp);
+            unsafe { std::env::remove_var("WEF_ADMIN_OVERRIDE_FILE") };
+        }
+    }
+
+    /// Locks the shared mutex and points `WEF_ADMIN_OVERRIDE_FILE` at a fresh
+    /// temp path. The override (and the lock) is released when the returned
+    /// guard drops, so a panicking assertion mid-test can't leak it into
+    /// later tests.
+    pub(crate) async fn sandbox_persist_config_path() -> PersistConfigSandbox {
+        let lock = PERSIST_CONFIG_ENV_LOCK.lock().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "logthing_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let override_path = tmp.join("logthing.admin.toml");
+        unsafe { std::env::set_var("WEF_ADMIN_OVERRIDE_FILE", &override_path) };
+        PersistConfigSandbox { tmp, _lock: lock }
+    }
+
+    /// For tests that manage their own temp path (e.g. via `tempfile::tempdir()`)
+    /// and just need the env var serialized crate-wide.
+    pub(crate) async fn lock_persist_config_env() -> tokio::sync::MutexGuard<'static, ()> {
+        PERSIST_CONFIG_ENV_LOCK.lock().await
+    }
+}
+
 /// Return a copy of an `S3ConnectionConfig` with credentials replaced by a
 /// placeholder so they can never appear in API responses.
 fn redact_s3_connection(conn: &S3ConnectionConfig) -> S3ConnectionConfig {
@@ -535,6 +587,7 @@ mod tests {
             audit_logger: AuditLogger::new(100).await,
             csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
         }
     }
 
@@ -740,6 +793,10 @@ enabled = true
     // M-12: import_config accepts a body exactly at the limit.
     #[tokio::test]
     async fn import_config_accepts_body_at_limit() {
+        // import_config() persists on success; sandbox its write path so this
+        // doesn't clobber the real logthing.admin.toml in the repo root.
+        let _sandbox = test_support::sandbox_persist_config_path().await;
+
         let state = make_state_with_s3_secrets().await;
 
         use axum_extra::extract::TypedHeader;

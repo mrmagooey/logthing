@@ -194,8 +194,9 @@ fn unused_s3_connection_placeholder() -> crate::config::S3ConnectionConfig {
 }
 
 /// Shared by `zeek_start` (S3) and `zeek_local_start` (local disk): builds a
-/// `ZeekS3Handler` from flush-policy fields and a pre-built, already-typed
-/// `Arc<dyn UploadSink>`.
+/// `ZeekS3Handler` from flush-policy fields, a pre-built, already-typed
+/// `Arc<dyn UploadSink>`, and the shared `SourceHourlyStats` every source
+/// writer feeds into.
 fn build_zeek_handle(
     prefix: String,
     max_buffer_rows: usize,
@@ -203,6 +204,7 @@ fn build_zeek_handle(
     flush_interval_secs: u64,
     channel_capacity: usize,
     sink: std::sync::Arc<dyn crate::forwarding::buffered_writer::UploadSink>,
+    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (ZeekS3Handler, tokio::task::JoinHandle<()>) {
     use crate::forwarding::buffered_writer::{
         BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
@@ -225,11 +227,15 @@ fn build_zeek_handle(
         max_bytes: flush_threshold_bytes,
         interval: std::time::Duration::from_secs(flush_interval_secs),
     };
-    ParquetWriterHandle::start(ZeekSink, sink, bwc, policy)
+    ParquetWriterHandle::start_with_stats(ZeekSink, sink, bwc, policy, source_stats)
 }
 
 /// Construct a `ZeekS3Handler` (i.e. `ParquetWriterHandle<ZeekSink>`) from a
 /// `ZeekS3Config` and a pre-built `S3Sink`.
+///
+/// `max_partitions` is set to 256 (the old `MAX_ZEEK_STREAMS` value) unless the
+/// config provides a higher or lower value (the config struct does not expose this
+/// field, so we hard-code the default here — matching the old behavior).
 ///
 /// Returns `(handler, writer_task_handle)`. The caller should retain the `JoinHandle`
 /// and await it during graceful shutdown, after all `Arc<dyn ZeekHandler>` references
@@ -237,6 +243,7 @@ fn build_zeek_handle(
 pub fn zeek_start(
     cfg: &ZeekS3Config,
     s3: std::sync::Arc<crate::forwarding::s3_sink::S3Sink>,
+    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (ZeekS3Handler, tokio::task::JoinHandle<()>) {
     build_zeek_handle(
         cfg.prefix.clone(),
@@ -245,6 +252,7 @@ pub fn zeek_start(
         cfg.flush_interval_secs,
         cfg.channel_capacity,
         s3,
+        source_stats,
     )
 }
 
@@ -255,6 +263,7 @@ pub fn zeek_start(
 pub fn zeek_local_start(
     cfg: &crate::config::ZeekLocalConfig,
     sink: std::sync::Arc<crate::forwarding::local_sink::LocalDiskSink>,
+    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (ZeekS3Handler, tokio::task::JoinHandle<()>) {
     build_zeek_handle(
         cfg.prefix.clone(),
@@ -263,6 +272,7 @@ pub fn zeek_local_start(
         cfg.flush_interval_secs,
         cfg.channel_capacity,
         sink,
+        source_stats,
     )
 }
 
@@ -659,7 +669,7 @@ mod tests {
             channel_capacity: 1,
             max_buffer_rows: 1,
         };
-        let (handler, _writer_handle) = zeek_start(&cfg, sink);
+        let (handler, _writer_handle) = zeek_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
         tokio::task::yield_now().await;
 
         let src: SocketAddr = "127.0.0.1:47760".parse().unwrap();
@@ -721,7 +731,7 @@ mod tests {
             channel_capacity: 256,
             max_buffer_rows: 100_000,
         };
-        let (handler, join_handle) = zeek_start(&cfg, sink);
+        let (handler, join_handle) = zeek_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
 
         let src: SocketAddr = "127.0.0.1:47760".parse().unwrap();
         handler.handle_record(make_conn_record("C1"), src).await;
@@ -934,7 +944,7 @@ mod tests {
             channel_capacity: 256,
             max_buffer_rows: 100_000,
         };
-        let (handler, _writer_handle) = zeek_start(&cfg, sink);
+        let (handler, _writer_handle) = zeek_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
         let src: std::net::SocketAddr = "127.0.0.1:47760".parse().unwrap();
 
         for i in 0..5usize {
@@ -989,5 +999,44 @@ mod tests {
                 "expected >= 1 Parquet object under {prefix}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn zeek_sink_reports_into_shared_source_hourly_stats() {
+        use crate::forwarding::buffered_writer::{
+            BufferedWriterConfig, FlushPolicy, PartitionedParquetWriter,
+        };
+        let s3 = unreachable_sink().await;
+        let bwc = BufferedWriterConfig {
+            connection: crate::config::S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "t".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "K".to_string(),
+                secret_key: "S".to_string(),
+            },
+            prefix: "zeek".to_string(),
+            max_buffer_rows: 1_000,
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 64,
+            max_partitions: 256,
+        };
+        let policy = FlushPolicy {
+            max_rows: 1_000,
+            max_bytes: usize::MAX,
+            interval: std::time::Duration::from_secs(3600),
+        };
+        let shared_stats = std::sync::Arc::new(crate::stats::SourceHourlyStats::new());
+
+        let mut writer = PartitionedParquetWriter::with_source_stats(
+            ZeekSink, s3, bwc, policy, shared_stats.clone(),
+        );
+        writer.push(make_conn_record("conn")).await.unwrap();
+
+        let snapshot = shared_stats.snapshot();
+        let row = snapshot.iter().find(|r| r.source == "zeek").unwrap();
+        let total: u64 = row.hours.iter().map(|h| h.count).sum();
+        assert_eq!(total, 1);
     }
 }
