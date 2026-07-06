@@ -363,29 +363,53 @@ async fn async_main() -> anyhow::Result<()> {
         let sflow_config_clone = config.clone();
         let sflow_shutdown_rx = shutdown_rx.clone();
 
-        let sflow_handler: Arc<dyn sflow::listener::SflowHandler> =
-            if let Some(s3_cfg) = sflow_config_clone.sflow.s3.as_ref() {
-                match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
-                    Ok(sink) => {
-                        let (handler, writer_handle) = forwarding::sflow_s3::sflow_start(
-                            s3_cfg,
-                            Arc::new(sink),
-                            source_stats.clone(),
-                        );
-                        writer_handles.push(writer_handle);
-                        Arc::new(handler)
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to create S3Sink for sFlow persistence, \
-                                 falling back to DefaultSflowHandler: {e}"
-                        );
-                        Arc::new(sflow::listener::DefaultSflowHandler)
-                    }
+        let mut sflow_handlers: Vec<Arc<dyn sflow::listener::SflowHandler>> = Vec::new();
+
+        if let Some(s3_cfg) = sflow_config_clone.sflow.s3.as_ref() {
+            match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
+                Ok(sink) => {
+                    let (handler, writer_handle) = forwarding::sflow_s3::sflow_start(
+                        s3_cfg,
+                        Arc::new(sink),
+                        source_stats.clone(),
+                    );
+                    writer_handles.push(writer_handle);
+                    sflow_handlers.push(Arc::new(handler));
                 }
-            } else {
-                Arc::new(sflow::listener::DefaultSflowHandler)
-            };
+                Err(e) => {
+                    error!(
+                        "Failed to create S3Sink for sFlow persistence, \
+                             skipping S3 target: {e}"
+                    );
+                }
+            }
+        }
+
+        if let Some(local_cfg) = sflow_config_clone.sflow.local.as_ref() {
+            match forwarding::local_sink::LocalDiskSink::new(local_cfg.directory.clone()).await {
+                Ok(sink) => {
+                    let (handler, writer_handle) = forwarding::sflow_s3::sflow_local_start(
+                        local_cfg,
+                        Arc::new(sink),
+                        source_stats.clone(),
+                    );
+                    writer_handles.push(writer_handle);
+                    sflow_handlers.push(Arc::new(handler));
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to create LocalDiskSink for sFlow persistence, \
+                             skipping local target: {e}"
+                    );
+                }
+            }
+        }
+
+        let sflow_handler: Arc<dyn sflow::listener::SflowHandler> = match sflow_handlers.len() {
+            0 => Arc::new(sflow::listener::DefaultSflowHandler),
+            1 => sflow_handlers.into_iter().next().unwrap(),
+            _ => Arc::new(forwarding::sflow_s3::MultiSflowHandler(sflow_handlers)),
+        };
 
         let listener_config = sflow::listener::SflowListenerConfig {
             udp_port: sflow_config_clone.sflow.udp_port,
