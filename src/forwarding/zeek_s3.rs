@@ -771,7 +771,11 @@ mod tests {
             channel_capacity: 256,
             max_buffer_rows: 100_000,
         };
-        let (handler, join_handle) = zeek_local_start(&cfg, sink);
+        let (handler, join_handle) = zeek_local_start(
+            &cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
 
         let src: SocketAddr = "127.0.0.1:47760".parse().unwrap();
         handler.handle_record(make_conn_record("Local1"), src).await;
@@ -855,7 +859,11 @@ mod tests {
             channel_capacity: 1,
             max_buffer_rows: 1,
         };
-        let (struggling_handler, _jh) = zeek_start(&cfg, sink);
+        let (struggling_handler, _jh) = zeek_start(
+            &cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
 
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct CountingHandler(Arc<AtomicUsize>);

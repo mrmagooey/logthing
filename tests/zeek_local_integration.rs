@@ -68,7 +68,11 @@ async fn zeek_records_appear_as_parquet_on_local_disk() {
         channel_capacity: 256,
     };
 
-    let (handler, _writer_task) = zeek_local_start(&cfg, sink);
+    let (handler, _writer_task) = zeek_local_start(
+        &cfg,
+        sink,
+        Arc::new(logthing::stats::SourceHourlyStats::new()),
+    );
 
     let src: std::net::SocketAddr = "127.0.0.1:47760".parse().unwrap();
     handler.handle_record(make_conn_record("CLocal001"), src).await;
