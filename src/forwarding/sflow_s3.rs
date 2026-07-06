@@ -50,6 +50,7 @@ static COUNTER_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
 
 // ── SflowSink ────────────────────────────────────────────────────────────────
 
+#[derive(Default)]
 pub struct SflowSink;
 
 impl ParquetSink for SflowSink {
@@ -249,31 +250,65 @@ impl crate::sflow::listener::SflowHandler
     }
 }
 
-// ── sflow_start — convenience constructor ────────────────────────────────────
+// ── MultiSflowHandler — fan-out to multiple destinations ────────────────────
+
+/// Fans out each sample batch to every configured handler. Used only when
+/// both `.s3` and `.local` persistence resolve to a live handler for the
+/// same run, so each destination keeps its own independent buffer, flush
+/// policy, backpressure, and hard cap (no shared state between destinations).
+pub struct MultiSflowHandler(pub Vec<std::sync::Arc<dyn crate::sflow::listener::SflowHandler>>);
+
+#[async_trait::async_trait]
+impl crate::sflow::listener::SflowHandler for MultiSflowHandler {
+    async fn handle_samples(&self, samples: Vec<SflowRecord>, source: std::net::SocketAddr) {
+        for handler in &self.0 {
+            handler.handle_samples(samples.clone(), source).await;
+        }
+    }
+}
+
+// ── sflow_start / sflow_local_start — convenience constructors ──────────────
+
+/// sFlow has exactly two fixed partitions: `"flow"` and `"counter"`.
+const SFLOW_MAX_PARTITIONS: usize = 2;
 
 pub fn sflow_start(
     cfg: &SflowS3Config,
     s3: Arc<crate::forwarding::s3_sink::S3Sink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (SflowS3Handler, tokio::task::JoinHandle<()>) {
-    use crate::forwarding::buffered_writer::{
-        BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
-    };
-    let bwc = BufferedWriterConfig {
-        connection: cfg.connection.clone(),
-        prefix: cfg.prefix.clone(),
-        max_buffer_rows: cfg.max_buffer_rows,
-        flush_threshold_bytes: cfg.flush_threshold_bytes,
-        flush_interval_secs: cfg.flush_interval_secs,
-        channel_capacity: cfg.channel_capacity,
-        max_partitions: 2, // "flow" and "counter"
-    };
-    let policy = FlushPolicy {
-        max_rows: cfg.max_buffer_rows,
-        max_bytes: cfg.flush_threshold_bytes,
-        interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
-    };
-    ParquetWriterHandle::start_with_stats(SflowSink, s3, bwc, policy, source_stats)
+    crate::forwarding::buffered_writer::start_writer::<SflowSink>(
+        cfg.prefix.clone(),
+        cfg.max_buffer_rows,
+        cfg.flush_threshold_bytes,
+        cfg.flush_interval_secs,
+        cfg.channel_capacity,
+        SFLOW_MAX_PARTITIONS,
+        s3,
+        source_stats,
+    )
+}
+
+/// Construct an `SflowS3Handler` from an `SflowLocalConfig` and a pre-built
+/// `LocalDiskSink`. Structurally identical to `sflow_start`, writing to
+/// local disk instead of S3 — same `SflowSink` adapter, same
+/// buffering/flush/cap machinery, same S3-key-shaped relative path layout
+/// on disk.
+pub fn sflow_local_start(
+    cfg: &crate::config::SflowLocalConfig,
+    sink: std::sync::Arc<crate::forwarding::local_sink::LocalDiskSink>,
+    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+) -> (SflowS3Handler, tokio::task::JoinHandle<()>) {
+    crate::forwarding::buffered_writer::start_writer::<SflowSink>(
+        cfg.prefix.clone(),
+        cfg.max_buffer_rows,
+        cfg.flush_threshold_bytes,
+        cfg.flush_interval_secs,
+        cfg.channel_capacity,
+        SFLOW_MAX_PARTITIONS,
+        sink,
+        source_stats,
+    )
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -508,5 +543,222 @@ mod tests {
         let row = snapshot.iter().find(|r| r.source == "sflow").unwrap();
         let total: u64 = row.hours.iter().map(|h| h.count).sum();
         assert_eq!(total, 1);
+    }
+
+    // -- sflow_local_start wires handler and join handle --
+
+    #[tokio::test]
+    async fn sflow_local_start_wires_handler_and_join_handle() {
+        use crate::config::SflowLocalConfig;
+        use crate::forwarding::local_sink::LocalDiskSink;
+        use crate::sflow::listener::SflowHandler;
+        use std::net::SocketAddr;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(
+            LocalDiskSink::new(dir.path().to_path_buf())
+                .await
+                .expect("LocalDiskSink::new"),
+        );
+        let cfg = SflowLocalConfig {
+            directory: dir.path().to_path_buf(),
+            prefix: "sflow".to_string(),
+            flush_threshold_bytes: 1, // flush on first push
+            flush_interval_secs: 3600,
+            channel_capacity: 256,
+            max_buffer_rows: 100_000,
+        };
+        let (handler, join_handle) = sflow_local_start(
+            &cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
+
+        let src: SocketAddr = "127.0.0.1:6343".parse().unwrap();
+        handler
+            .handle_samples(vec![make_flow_record(), make_counter_record()], src)
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(handler);
+        tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
+            .await
+            .expect("writer task must exit within 5s")
+            .expect("writer task must not panic");
+
+        for partition in ["flow", "counter"] {
+            let dir_path = dir.path().join("sflow").join(partition);
+            let mut found = false;
+            for entry in walk_all_files(&dir_path) {
+                if entry.extension().is_some_and(|e| e == "parquet") {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(
+                found,
+                "expected at least one Parquet file under {dir_path:?}"
+            );
+        }
+    }
+
+    /// Recursive walk — sFlow's key layout nests under year=/month=/day=/, so
+    /// a flat `read_dir` on the prefix directory alone won't find the file.
+    fn walk_all_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    // -- MultiSflowHandler tests --
+
+    #[tokio::test]
+    async fn multi_sflow_handler_fans_out_to_every_inner_handler() {
+        use crate::sflow::listener::SflowHandler;
+        use std::net::SocketAddr;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingHandler(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl SflowHandler for CountingHandler {
+            async fn handle_samples(&self, _samples: Vec<SflowRecord>, _source: SocketAddr) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let count_a = Arc::new(AtomicUsize::new(0));
+        let count_b = Arc::new(AtomicUsize::new(0));
+        let multi = MultiSflowHandler(vec![
+            Arc::new(CountingHandler(count_a.clone())),
+            Arc::new(CountingHandler(count_b.clone())),
+        ]);
+
+        let src: SocketAddr = "127.0.0.1:6343".parse().unwrap();
+        multi.handle_samples(vec![make_flow_record()], src).await;
+
+        assert_eq!(
+            count_a.load(Ordering::SeqCst),
+            1,
+            "handler A must receive the batch"
+        );
+        assert_eq!(
+            count_b.load(Ordering::SeqCst),
+            1,
+            "handler B must receive the batch"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn multi_sflow_handler_survives_one_inner_handler_dropping() {
+        use crate::config::S3ConnectionConfig;
+        use crate::sflow::listener::SflowHandler;
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::DebuggingRecorder;
+        use std::net::SocketAddr;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let s3 = Arc::new(
+            crate::forwarding::s3_sink::S3Sink::from_connection(&S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "AKIATEST".to_string(),
+                secret_key: "SECRETTEST".to_string(),
+            })
+            .await
+            .unwrap(),
+        );
+        let cfg = SflowS3Config {
+            connection: S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "AKIATEST".to_string(),
+                secret_key: "SECRETTEST".to_string(),
+            },
+            prefix: "sflow".to_string(),
+            flush_threshold_bytes: 1,
+            flush_interval_secs: 3600,
+            channel_capacity: 1,
+            max_buffer_rows: 1,
+        };
+        let (struggling_handler, _jh) = sflow_start(
+            &cfg,
+            s3,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingHandler(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl SflowHandler for CountingHandler {
+            async fn handle_samples(&self, _samples: Vec<SflowRecord>, _source: SocketAddr) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let healthy_count = Arc::new(AtomicUsize::new(0));
+        let multi = MultiSflowHandler(vec![
+            Arc::new(struggling_handler),
+            Arc::new(CountingHandler(healthy_count.clone())),
+        ]);
+
+        let src: SocketAddr = "127.0.0.1:6343".parse().unwrap();
+        for _ in 0..20 {
+            multi.handle_samples(vec![make_flow_record()], src).await;
+        }
+
+        assert_eq!(
+            healthy_count.load(Ordering::SeqCst),
+            20,
+            "the healthy handler must receive every batch even if the struggling one drops some"
+        );
+
+        let snapshot = snapshotter.snapshot();
+        let map = snapshot.into_hashmap();
+        let key = CompositeKey::new(
+            MetricKind::Counter,
+            metrics::Key::from_parts(
+                "parquet_s3_dropped",
+                vec![
+                    metrics::Label::new("source", "sflow"),
+                    metrics::Label::new("target", "s3"),
+                ],
+            ),
+        );
+        let dropped = map
+            .get(&key)
+            .map(|(_, _, v)| {
+                if let metrics_util::debugging::DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        assert!(
+            dropped >= 1,
+            "the struggling handler must actually have dropped at least one batch \
+             for this test to prove handler isolation (dropped={dropped})"
+        );
     }
 }
