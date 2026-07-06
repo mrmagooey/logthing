@@ -88,11 +88,9 @@ async fn syslog_messages_appear_as_parquet_on_local_disk() {
     let mut all_files = Vec::new();
     walk_all_files(tmp.path(), &mut all_files);
     assert!(
-        !all_files.iter().any(|p| p
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with(".tmp-")),
+        !all_files
+            .iter()
+            .any(|p| p.file_name().unwrap().to_string_lossy().contains(".tmp-")),
         "no leftover .tmp- files should remain after flush: {all_files:?}"
     );
 
