@@ -572,6 +572,7 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
 /// behavior in any of them, only code the `S: ParquetSink` bound already
 /// makes fully generic. `max_partitions` is a parameter (not hardcoded here)
 /// because it differs per source.
+#[allow(clippy::too_many_arguments)] // one parameter per BufferedWriterConfig/FlushPolicy field; splitting them into a struct would only move the count, not reduce it
 pub(crate) fn start_writer<S: ParquetSink + Default>(
     prefix: String,
     max_buffer_rows: usize,
