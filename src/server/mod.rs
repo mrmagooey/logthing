@@ -62,8 +62,10 @@ pub struct Server {
     wef_worker_handle: Option<tokio::task::JoinHandle<()>>,
     /// Shared extension state for HEC / NDJSON ingest routes.
     ingest_state: IngestState,
-    /// JoinHandle for the HEC→S3 Parquet worker task, if one was started.
-    hec_worker_handle: Option<tokio::task::JoinHandle<()>>,
+    /// JoinHandles for the HEC→S3 and HEC→local Parquet worker tasks (0, 1, or 2
+    /// present depending on how many of `[hec.s3]` / `[hec.local]` are configured
+    /// and construct successfully). Awaited during graceful shutdown.
+    hec_worker_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Server {
@@ -205,7 +207,11 @@ impl Server {
         });
 
         // --- Build IngestState for HEC / NDJSON ingest routes ---
-        let (ingest_state, hec_worker_handle) = if config.hec.enabled {
+        let mut hec_worker_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut generic_s3_handler = None;
+        let mut generic_local_handler = None;
+
+        if config.hec.enabled {
             if let Some(s3_cfg) = config.hec.s3.as_ref() {
                 match crate::forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await
                 {
@@ -217,25 +223,42 @@ impl Server {
                             config.hec.max_sourcetype_partitions,
                             source_stats.clone(),
                         );
-                        (
-                            IngestState {
-                                generic_s3: Some(handler),
-                                generic_local: None,
-                            },
-                            Some(join_handle),
-                        )
+                        hec_worker_handles.push(join_handle);
+                        generic_s3_handler = Some(handler);
                     }
                     Err(e) => {
-                        error!("Failed to create S3Sink for HEC ingest: {e}");
-                        (IngestState::default(), None)
+                        error!("Failed to create S3Sink for HEC ingest, skipping S3 target: {e}");
                     }
                 }
-            } else {
-                // HEC enabled but no S3 configured — accept and drop records.
-                (IngestState::default(), None)
             }
-        } else {
-            (IngestState::default(), None)
+
+            if let Some(local_cfg) = config.hec.local.as_ref() {
+                match crate::forwarding::local_sink::LocalDiskSink::new(local_cfg.directory.clone())
+                    .await
+                {
+                    Ok(sink) => {
+                        info!("Initialized HEC Parquet local-disk forwarder");
+                        let (handler, join_handle) = crate::forwarding::generic_s3::hec_local_start(
+                            local_cfg,
+                            Arc::new(sink),
+                            config.hec.max_sourcetype_partitions,
+                            source_stats.clone(),
+                        );
+                        hec_worker_handles.push(join_handle);
+                        generic_local_handler = Some(handler);
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to create LocalDiskSink for HEC ingest, skipping local target: {e}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let ingest_state = IngestState {
+            generic_s3: generic_s3_handler,
+            generic_local: generic_local_handler,
         };
 
         Ok(Self {
@@ -243,7 +266,7 @@ impl Server {
             state,
             wef_worker_handle,
             ingest_state,
-            hec_worker_handle,
+            hec_worker_handles,
         })
     }
 
@@ -255,12 +278,14 @@ impl Server {
         self.wef_worker_handle.take()
     }
 
-    /// Take the HEC→S3 Parquet worker's JoinHandle for awaiting at shutdown.
+    /// Take the HEC persistence workers' JoinHandles for awaiting at shutdown.
     ///
     /// Must be called BEFORE `run`/`run_tls`; after the server consumes `self`
-    /// the handle is no longer accessible.
-    pub fn take_hec_worker_handle(&mut self) -> Option<tokio::task::JoinHandle<()>> {
-        self.hec_worker_handle.take()
+    /// the handles are no longer accessible. Returns 0, 1, or 2 handles
+    /// depending on how many of `[hec.s3]` / `[hec.local]` constructed
+    /// successfully.
+    pub fn take_hec_worker_handles(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        std::mem::take(&mut self.hec_worker_handles)
     }
 
     /// Run the WEF server without TLS (HTTP only).
@@ -2005,7 +2030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_take_hec_worker_handle_returns_none_when_hec_disabled() {
+    async fn server_take_hec_worker_handles_returns_empty_when_hec_disabled() {
         let mut server = Server::new(
             Config::default(),
             Arc::new(RwLock::new(Config::default())),
@@ -2014,10 +2039,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let handle = server.take_hec_worker_handle();
+        let handles = server.take_hec_worker_handles();
         assert!(
-            handle.is_none(),
-            "hec worker handle must be None when hec.enabled=false"
+            handles.is_empty(),
+            "hec worker handles must be empty when hec.enabled=false"
         );
     }
 
@@ -2627,16 +2652,28 @@ pub async fn handle_otlp_logs(
     // ── Route through generic S3 handler ─────────────────────────────────
     // try_send is non-blocking; channel full / closed → warn and drop,
     // mirroring the HEC handler pattern in src/ingest/handlers.rs.
-    if let Some(ref handler) = ingest.generic_s3 {
-        for record in records {
-            if let Err(e) = handler.try_send(record) {
-                match e {
-                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                        warn!("OTLP generic_s3 channel full, dropping record");
-                    }
-                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                        error!("OTLP generic_s3 channel closed");
-                    }
+    for record in records {
+        if let Some(ref handler) = ingest.generic_s3
+            && let Err(e) = handler.try_send(record.clone())
+        {
+            match e {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    warn!("OTLP generic_s3 channel full, dropping record");
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    error!("OTLP generic_s3 channel closed");
+                }
+            }
+        }
+        if let Some(ref handler) = ingest.generic_local
+            && let Err(e) = handler.try_send(record)
+        {
+            match e {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    warn!("OTLP generic_local channel full, dropping record");
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    error!("OTLP generic_local channel closed");
                 }
             }
         }
