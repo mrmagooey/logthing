@@ -96,6 +96,7 @@ mod otlp_e2e {
             parser: WefParser::new(),
             event_parser: None,
             parquet_s3_sender: None,
+            parquet_local_sender: None,
         })
     }
 

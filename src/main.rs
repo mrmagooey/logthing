@@ -468,7 +468,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Gap-b: Extract the WEF→S3 Parquet worker handle BEFORE the server is
     // consumed by run_tls, so we can await it during the shutdown sequence.
-    let wef_worker_handle = server.take_wef_worker_handle();
+    let wef_worker_handles = server.take_wef_worker_handles();
     let hec_worker_handles = server.take_hec_worker_handles();
 
     // -----------------------------------------------------------------------
@@ -564,9 +564,7 @@ async fn async_main() -> anyhow::Result<()> {
     //    The worker exits when the axum server drops AppState (closing the channel)
     //    and its None arm calls shutdown_flush.
     let mut all_writer_handles = writer_handles;
-    if let Some(wef_handle) = wef_worker_handle {
-        all_writer_handles.push(wef_handle);
-    }
+    all_writer_handles.extend(wef_worker_handles);
     all_writer_handles.extend(hec_worker_handles);
 
     let total = all_writer_handles.len();

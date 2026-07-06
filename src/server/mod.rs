@@ -52,14 +52,24 @@ pub struct AppState {
             crate::forwarding::parquet_s3::WefSink,
         >,
     >,
+    /// Local-disk counterpart to `parquet_s3_sender`. `None` when `[wef.local]`
+    /// is absent or construction failed. Independent of `parquet_s3_sender` —
+    /// both may be `Some` simultaneously.
+    pub parquet_local_sender: Option<
+        crate::forwarding::buffered_writer::ParquetWriterHandle<
+            crate::forwarding::parquet_s3::WefSink,
+        >,
+    >,
 }
 
 pub struct Server {
     config: Config,
     state: Arc<AppState>,
-    /// JoinHandle for the WEF→S3 Parquet worker task, if one was started.
-    /// Awaited during graceful shutdown so buffered data is flushed before exit.
-    wef_worker_handle: Option<tokio::task::JoinHandle<()>>,
+    /// JoinHandles for the WEF→S3 and WEF→local Parquet worker tasks (0, 1, or 2
+    /// present depending on how many of `[wef.s3]` / `[wef.local]` are configured
+    /// and construct successfully). Awaited during graceful shutdown so buffered
+    /// data is flushed before exit.
+    wef_worker_handles: Vec<tokio::task::JoinHandle<()>>,
     /// Shared extension state for HEC / NDJSON ingest routes.
     ingest_state: IngestState,
     /// JoinHandles for the HEC→S3 and HEC→local Parquet worker tasks (0, 1, or 2
@@ -170,10 +180,15 @@ impl Server {
             None
         };
 
-        // Initialize WEF→S3 Parquet forwarder via generic buffered writer
-        let (parquet_s3_sender, wef_worker_handle) = if let Some(wef_s3_cfg) =
-            config.wef.s3.as_ref()
-        {
+        // Initialize WEF→S3 and WEF→local Parquet forwarders via the generic
+        // buffered writer. Each target is attempted independently — a failed
+        // S3Sink construction does not prevent a healthy `.local` construction
+        // from still populating `parquet_local_sender`, and vice versa.
+        let mut wef_worker_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut parquet_s3_sender = None;
+        let mut parquet_local_sender = None;
+
+        if let Some(wef_s3_cfg) = config.wef.s3.as_ref() {
             match crate::forwarding::s3_sink::S3Sink::from_connection(&wef_s3_cfg.connection).await
             {
                 Ok(sink) => {
@@ -183,19 +198,36 @@ impl Server {
                         Arc::new(sink),
                         source_stats.clone(),
                     );
-                    (Some(handle), Some(join_handle))
+                    wef_worker_handles.push(join_handle);
+                    parquet_s3_sender = Some(handle);
+                }
+                Err(e) => {
+                    error!("Failed to create S3Sink for WEF persistence, skipping S3 target: {e}");
+                }
+            }
+        }
+
+        if let Some(wef_local_cfg) = config.wef.local.as_ref() {
+            match crate::forwarding::local_sink::LocalDiskSink::new(wef_local_cfg.directory.clone())
+                .await
+            {
+                Ok(sink) => {
+                    info!("Initialized WEF Parquet local-disk forwarder");
+                    let (handle, join_handle) = crate::forwarding::parquet_s3::wef_local_start(
+                        wef_local_cfg,
+                        Arc::new(sink),
+                        source_stats.clone(),
+                    );
+                    wef_worker_handles.push(join_handle);
+                    parquet_local_sender = Some(handle);
                 }
                 Err(e) => {
                     error!(
-                        "Failed to create S3Sink for WEF persistence; \
-                             WEF events will not be persisted to S3: {e}"
+                        "Failed to create LocalDiskSink for WEF persistence, skipping local target: {e}"
                     );
-                    (None, None)
                 }
             }
-        } else {
-            (None, None)
-        };
+        }
 
         let state = Arc::new(AppState {
             config: Arc::clone(&shared_config),
@@ -204,6 +236,7 @@ impl Server {
             parser: WefParser::new(),
             event_parser,
             parquet_s3_sender,
+            parquet_local_sender,
         });
 
         // --- Build IngestState for HEC / NDJSON ingest routes ---
@@ -264,18 +297,20 @@ impl Server {
         Ok(Self {
             config,
             state,
-            wef_worker_handle,
+            wef_worker_handles,
             ingest_state,
             hec_worker_handles,
         })
     }
 
-    /// Take the WEF→S3 Parquet worker's JoinHandle for awaiting at shutdown.
+    /// Take the WEF persistence workers' JoinHandles for awaiting at shutdown.
     ///
     /// Must be called BEFORE `run`/`run_tls`; after the server consumes `self`
-    /// the handle is no longer accessible.
-    pub fn take_wef_worker_handle(&mut self) -> Option<tokio::task::JoinHandle<()>> {
-        self.wef_worker_handle.take()
+    /// the handles are no longer accessible. Returns 0, 1, or 2 handles
+    /// depending on how many of `[wef.s3]` / `[wef.local]` constructed
+    /// successfully.
+    pub fn take_wef_worker_handles(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        std::mem::take(&mut self.wef_worker_handles)
     }
 
     /// Take the HEC persistence workers' JoinHandles for awaiting at shutdown.
@@ -660,7 +695,8 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
     // Pass Arc to forwarder (cheap clone of Arc, not the event)
     state.forwarder.forward(event.clone()).await;
 
-    // Send to Parquet S3 via channel (non-blocking)
+    // Send to Parquet S3 and/or local-disk via channel (non-blocking, independent
+    // per target — a full/closed channel on one does not affect the other).
     if let Some(ref sender) = state.parquet_s3_sender
         && let Err(e) = sender.try_send(event.clone())
     {
@@ -670,6 +706,18 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
             }
             tokio::sync::mpsc::error::TrySendError::Closed(_) => {
                 error!("WEF Parquet S3 channel closed");
+            }
+        }
+    }
+    if let Some(ref sender) = state.parquet_local_sender
+        && let Err(e) = sender.try_send(event.clone())
+    {
+        match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                warn!("WEF Parquet local channel full, dropping event");
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                error!("WEF Parquet local channel closed");
             }
         }
     }
@@ -744,6 +792,7 @@ mod tests {
             parser: WefParser::new(),
             event_parser: None,
             parquet_s3_sender: None,
+            parquet_local_sender: None,
         })
     }
 
