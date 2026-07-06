@@ -7,6 +7,8 @@
 //! - `SyslogS3Handler` — type alias for `ParquetWriterHandle<SyslogSink>`
 //! - `syslog_start()` — convenience constructor wiring `SyslogS3Config` → `ParquetWriterHandle`
 
+#[cfg(test)]
+use crate::config::SyslogLocalConfig;
 use crate::config::SyslogS3Config;
 use crate::forwarding::buffered_writer::ParquetSink;
 use crate::syslog::SyslogMessage;
@@ -116,6 +118,7 @@ pub(crate) fn encode_batches_to_parquet(batches: &[RecordBatch]) -> anyhow::Resu
 
 /// `ParquetSink` adapter for syslog messages.
 /// The `Record` type is `SyslogMessage` — one row per message.
+#[derive(Default)]
 pub struct SyslogSink;
 
 impl ParquetSink for SyslogSink {
@@ -178,24 +181,56 @@ pub fn syslog_start(
     s3: std::sync::Arc<crate::forwarding::s3_sink::S3Sink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (SyslogS3Handler, tokio::task::JoinHandle<()>) {
-    use crate::forwarding::buffered_writer::{
-        BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
-    };
-    let bwc = BufferedWriterConfig {
-        connection: cfg.connection.clone(),
-        prefix: cfg.prefix.clone(),
-        max_buffer_rows: cfg.max_buffer_rows,
-        flush_threshold_bytes: usize::MAX, // syslog uses row-count + age triggers only
-        flush_interval_secs: cfg.flush_interval_secs,
-        channel_capacity: cfg.channel_capacity,
-        max_partitions: 1,
-    };
-    let policy = FlushPolicy {
-        max_rows: cfg.max_buffer_rows,
-        max_bytes: usize::MAX,
-        interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
-    };
-    ParquetWriterHandle::start_with_stats(SyslogSink, s3, bwc, policy, source_stats)
+    crate::forwarding::buffered_writer::start_writer::<SyslogSink>(
+        cfg.prefix.clone(),
+        cfg.max_buffer_rows,
+        usize::MAX, // syslog uses row-count + age triggers only
+        cfg.flush_interval_secs,
+        cfg.channel_capacity,
+        1,
+        s3,
+        source_stats,
+    )
+}
+
+/// Construct a `SyslogS3Handler` from a `SyslogLocalConfig` and a pre-built
+/// `LocalDiskSink`. Structurally identical to `syslog_start`, writing to
+/// local disk instead of S3 — same `SyslogSink` adapter, same
+/// buffering/flush/cap machinery, same S3-key-shaped relative path layout
+/// on disk.
+pub fn syslog_local_start(
+    cfg: &crate::config::SyslogLocalConfig,
+    sink: std::sync::Arc<crate::forwarding::local_sink::LocalDiskSink>,
+    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+) -> (SyslogS3Handler, tokio::task::JoinHandle<()>) {
+    crate::forwarding::buffered_writer::start_writer::<SyslogSink>(
+        cfg.prefix.clone(),
+        cfg.max_buffer_rows,
+        usize::MAX, // syslog uses row-count + age triggers only
+        cfg.flush_interval_secs,
+        cfg.channel_capacity,
+        1,
+        sink,
+        source_stats,
+    )
+}
+
+/// Fans out each message to every configured handler. Used only when at
+/// least one of `.s3` / `.local` persistence resolves to a live handler for
+/// this run — `main.rs` always wraps the resulting `MultiSyslogHandler` (or
+/// the sole handler, if that's the only element) as the `inner` of a
+/// `PayloadDispatchingHandler`, never in place of it. Each destination keeps
+/// its own independent buffer, flush policy, backpressure, and hard cap (no
+/// shared state between destinations).
+pub struct MultiSyslogHandler(pub Vec<std::sync::Arc<dyn crate::syslog::listener::SyslogHandler>>);
+
+#[async_trait::async_trait]
+impl crate::syslog::listener::SyslogHandler for MultiSyslogHandler {
+    async fn handle_message(&self, message: SyslogMessage, source: std::net::SocketAddr) {
+        for handler in &self.0 {
+            handler.handle_message(message.clone(), source).await;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +550,113 @@ mod tests {
         drop(handler);
 
         // Join the background task within 5s
+        tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
+            .await
+            .expect("writer task must exit within 5s")
+            .expect("writer task must not panic");
+    }
+
+    #[tokio::test]
+    async fn syslog_local_start_wires_handler_and_join_handle() {
+        use crate::syslog::listener::SyslogHandler as SyslogHandlerTrait;
+        use std::net::SocketAddr;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let sink = Arc::new(
+            crate::forwarding::local_sink::LocalDiskSink::new(dir.path().to_path_buf())
+                .await
+                .expect("constructs"),
+        );
+        let cfg = SyslogLocalConfig {
+            directory: dir.path().to_path_buf(),
+            prefix: "syslog".to_string(),
+            max_buffer_rows: 10_000,
+            flush_interval_secs: 3600,
+            channel_capacity: 4096,
+        };
+
+        let (handler, join_handle) = syslog_local_start(
+            &cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
+
+        let src: SocketAddr = "127.0.0.1:5514".parse().unwrap();
+        handler.handle_message(dummy_msg("hello"), src).await;
+
+        drop(handler);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
+            .await
+            .expect("writer task must exit within 5s")
+            .expect("writer task must not panic");
+    }
+
+    #[tokio::test]
+    async fn multi_syslog_handler_fans_out_to_every_inner_handler() {
+        use crate::syslog::listener::SyslogHandler as SyslogHandlerTrait;
+        use std::net::SocketAddr;
+        use std::sync::Mutex;
+
+        struct CountingHandler {
+            count: Mutex<usize>,
+        }
+
+        #[async_trait::async_trait]
+        impl SyslogHandlerTrait for CountingHandler {
+            async fn handle_message(&self, _message: SyslogMessage, _source: SocketAddr) {
+                *self.count.lock().unwrap() += 1;
+            }
+        }
+
+        let h1 = Arc::new(CountingHandler {
+            count: Mutex::new(0),
+        });
+        let h2 = Arc::new(CountingHandler {
+            count: Mutex::new(0),
+        });
+        let multi = MultiSyslogHandler(vec![h1.clone(), h2.clone()]);
+
+        let src: SocketAddr = "127.0.0.1:5514".parse().unwrap();
+        multi.handle_message(dummy_msg("test"), src).await;
+
+        assert_eq!(*h1.count.lock().unwrap(), 1);
+        assert_eq!(*h2.count.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn multi_syslog_handler_survives_one_inner_handler_dropping() {
+        use crate::syslog::listener::SyslogHandler as SyslogHandlerTrait;
+        use std::net::SocketAddr;
+
+        let sink = unreachable_sink().await;
+        let cfg = SyslogS3Config {
+            connection: crate::config::S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "AKIATEST".to_string(),
+                secret_key: "SECRETTEST".to_string(),
+            },
+            prefix: "syslog".to_string(),
+            max_buffer_rows: 10_000,
+            flush_interval_secs: 3600,
+            channel_capacity: 4096,
+        };
+        let (handler, join_handle) = syslog_start(
+            &cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
+        let live: Arc<dyn SyslogHandlerTrait> = Arc::new(handler);
+
+        let multi = MultiSyslogHandler(vec![live.clone()]);
+        let src: SocketAddr = "127.0.0.1:5514".parse().unwrap();
+        multi.handle_message(dummy_msg("still works"), src).await;
+
+        drop(live);
+        drop(multi);
         tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
             .await
             .expect("writer task must exit within 5s")
