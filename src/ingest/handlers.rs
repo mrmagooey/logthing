@@ -93,9 +93,16 @@ pub async fn handle_hec_event(
 
     if let Some(ref handler) = ingest.generic_s3 {
         for rec in records {
-            if handler.try_send(rec).is_err() {
+            if let Err(e) = handler.try_send(rec) {
                 metrics::counter!("hec_events_dropped").increment(1);
-                tracing::warn!("HEC S3 channel full; dropped 1 record");
+                match e {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        tracing::warn!("HEC S3 channel full; dropped 1 record");
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        tracing::error!("HEC S3 channel closed; dropped 1 record");
+                    }
+                }
             }
         }
     }
@@ -134,10 +141,17 @@ pub async fn handle_hec_raw(
     metrics::counter!("hec_events_received").increment(1);
 
     if let Some(ref handler) = ingest.generic_s3
-        && handler.try_send(record).is_err()
+        && let Err(e) = handler.try_send(record)
     {
         metrics::counter!("hec_events_dropped").increment(1);
-        tracing::warn!("HEC S3 channel full; dropped raw record");
+        match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                tracing::warn!("HEC S3 channel full; dropped raw record");
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                tracing::error!("HEC S3 channel closed; dropped raw record");
+            }
+        }
     }
 
     hec_success()
@@ -175,9 +189,16 @@ pub async fn handle_ndjson(
 
     if let Some(ref handler) = ingest.generic_s3 {
         for rec in records {
-            if handler.try_send(rec).is_err() {
+            if let Err(e) = handler.try_send(rec) {
                 metrics::counter!("hec_events_dropped").increment(1);
-                tracing::warn!("HEC S3 channel full; dropped 1 NDJSON record");
+                match e {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        tracing::warn!("HEC S3 channel full; dropped 1 NDJSON record");
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        tracing::error!("HEC S3 channel closed; dropped 1 NDJSON record");
+                    }
+                }
             }
         }
     }
