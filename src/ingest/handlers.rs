@@ -62,6 +62,54 @@ fn hec_parse_error(msg: &str) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// Shared dispatch — try both persistence targets independently
+// ---------------------------------------------------------------------------
+
+/// Try-send one record to every configured HEC/generic persistence target
+/// (`.s3` and/or `.local`), independently. A full/closed channel on one
+/// target does not affect delivery to the other — each is attempted and
+/// logged separately. `context` is a short phrase describing what was
+/// dropped (e.g. `"1 record"`, `"raw record"`), reused in both targets' log
+/// lines to match the wording already used for the S3-only path.
+///
+/// HEC/generic has no `Handler` trait to abstract a fan-out over (unlike
+/// Zeek/Suricata/IPFIX/sFlow/syslog) — `IngestState` holds concrete sibling
+/// `Option<GenericS3Handler>` fields instead, per the architecture review's
+/// explicit rejection of a `MultiHandler`-style wrapper for this source.
+fn dispatch_generic_record(
+    ingest: &IngestState,
+    record: crate::ingest::GenericRecord,
+    context: &str,
+) {
+    if let Some(ref handler) = ingest.generic_s3
+        && let Err(e) = handler.try_send(record.clone())
+    {
+        metrics::counter!("hec_events_dropped").increment(1);
+        match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                tracing::warn!("HEC S3 channel full; dropped {context}");
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                tracing::error!("HEC S3 channel closed; dropped {context}");
+            }
+        }
+    }
+    if let Some(ref handler) = ingest.generic_local
+        && let Err(e) = handler.try_send(record)
+    {
+        metrics::counter!("hec_events_dropped").increment(1);
+        match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                tracing::warn!("HEC local channel full; dropped {context}");
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                tracing::error!("HEC local channel closed; dropped {context}");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // POST /services/collector/event
 // ---------------------------------------------------------------------------
 
@@ -91,20 +139,8 @@ pub async fn handle_hec_event(
 
     metrics::counter!("hec_events_received").increment(records.len() as u64);
 
-    if let Some(ref handler) = ingest.generic_s3 {
-        for rec in records {
-            if let Err(e) = handler.try_send(rec) {
-                metrics::counter!("hec_events_dropped").increment(1);
-                match e {
-                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                        tracing::warn!("HEC S3 channel full; dropped 1 record");
-                    }
-                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                        tracing::error!("HEC S3 channel closed; dropped 1 record");
-                    }
-                }
-            }
-        }
+    for rec in records {
+        dispatch_generic_record(&ingest, rec, "1 record");
     }
 
     hec_success()
@@ -140,19 +176,7 @@ pub async fn handle_hec_raw(
 
     metrics::counter!("hec_events_received").increment(1);
 
-    if let Some(ref handler) = ingest.generic_s3
-        && let Err(e) = handler.try_send(record)
-    {
-        metrics::counter!("hec_events_dropped").increment(1);
-        match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                tracing::warn!("HEC S3 channel full; dropped raw record");
-            }
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                tracing::error!("HEC S3 channel closed; dropped raw record");
-            }
-        }
-    }
+    dispatch_generic_record(&ingest, record, "raw record");
 
     hec_success()
 }
@@ -187,20 +211,8 @@ pub async fn handle_ndjson(
 
     metrics::counter!("hec_events_received").increment(records.len() as u64);
 
-    if let Some(ref handler) = ingest.generic_s3 {
-        for rec in records {
-            if let Err(e) = handler.try_send(rec) {
-                metrics::counter!("hec_events_dropped").increment(1);
-                match e {
-                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                        tracing::warn!("HEC S3 channel full; dropped 1 NDJSON record");
-                    }
-                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                        tracing::error!("HEC S3 channel closed; dropped 1 NDJSON record");
-                    }
-                }
-            }
-        }
+    for rec in records {
+        dispatch_generic_record(&ingest, rec, "1 NDJSON record");
     }
 
     hec_success()
@@ -218,7 +230,10 @@ mod tests {
     fn make_router(token: &str) -> axum::Router {
         use axum::{Extension, Router, routing::post};
         let cfg_token = Arc::new(token.to_string());
-        let ingest_state = IngestState { generic_s3: None };
+        let ingest_state = IngestState {
+            generic_s3: None,
+            generic_local: None,
+        };
         Router::new()
             .route("/services/collector/event", post(handle_hec_event))
             .route("/services/collector/raw", post(handle_hec_raw))

@@ -26,7 +26,10 @@ const BODY_LIMIT: usize = 64 * 1024 * 1024;
 /// alive for the duration of the test; dropping it aborts the server task.
 async fn spawn_hec_server(token: &str) -> (String, tokio::task::JoinHandle<()>) {
     let cfg_token = Arc::new(token.to_string());
-    let ingest_state = IngestState { generic_s3: None };
+    let ingest_state = IngestState {
+        generic_s3: None,
+        generic_local: None,
+    };
 
     let router: Router = Router::new()
         .route("/services/collector/event", post(handle_hec_event))

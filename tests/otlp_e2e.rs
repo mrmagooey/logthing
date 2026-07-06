@@ -106,7 +106,10 @@ mod otlp_e2e {
         bearer_token: Option<String>,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let app_state = build_app_state(bearer_token).await;
-        let ingest_state = IngestState { generic_s3: None };
+        let ingest_state = IngestState {
+            generic_s3: None,
+            generic_local: None,
+        };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

@@ -220,6 +220,7 @@ impl Server {
                         (
                             IngestState {
                                 generic_s3: Some(handler),
+                                generic_local: None,
                             },
                             Some(join_handle),
                         )
@@ -1744,7 +1745,10 @@ mod tests {
         use std::sync::Arc;
 
         let cfg_token = Arc::new(token.to_string());
-        let ingest_state = IngestState { generic_s3: None };
+        let ingest_state = IngestState {
+            generic_s3: None,
+            generic_local: None,
+        };
 
         Router::new()
             .route("/services/collector/event", post(handle_hec_event))
@@ -2079,7 +2083,10 @@ mod tests {
                 ..Default::default()
             };
             let app_state = super::build_state_with_config(config).await;
-            let ingest_state = IngestState { generic_s3: None };
+            let ingest_state = IngestState {
+                generic_s3: None,
+                generic_local: None,
+            };
 
             axum::Router::new()
                 .route("/v1/logs", post(handle_otlp_logs))

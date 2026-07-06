@@ -46,8 +46,12 @@ pub struct GenericRecord {
 #[derive(Clone, Default)]
 pub struct IngestState {
     /// Generic S3 handler for HEC / NDJSON ingest routes.
-    /// `None` when `[hec]` s3 config is absent or construction failed.
+    /// `None` when `[hec.s3]` is absent or construction failed.
     pub generic_s3: Option<GenericS3Handler>,
+    /// Generic local-disk handler for HEC / NDJSON ingest routes.
+    /// `None` when `[hec.local]` is absent or construction failed.
+    /// Independent of `generic_s3` — both may be `Some` simultaneously.
+    pub generic_local: Option<GenericS3Handler>,
     // Unit 5: pub otlp_s3: Option<OtlpS3Handler>,
 }
 
@@ -120,13 +124,18 @@ mod tests {
     fn ingest_state_default_has_no_handlers() {
         let state = IngestState::default();
         assert!(state.generic_s3.is_none());
+        assert!(state.generic_local.is_none());
     }
 
     #[test]
     fn ingest_state_is_clone() {
-        let state = IngestState { generic_s3: None };
+        let state = IngestState {
+            generic_s3: None,
+            generic_local: None,
+        };
         let cloned = state.clone();
         assert!(cloned.generic_s3.is_none());
+        assert!(cloned.generic_local.is_none());
     }
 
     #[test]
