@@ -33,6 +33,7 @@ use std::sync::Arc;
 /// `event_type=<id>/year=Y/month=MM/day=DD/<uuid>.parquet`
 /// Achieved by using an empty prefix (`""`), so `build_key("", Some("event_type=4624"), now)`
 /// → `event_type=4624/year=…`. No leading slash (verified in generic unit test).
+#[derive(Default)]
 pub struct WefSink;
 
 impl ParquetSink for WefSink {
@@ -105,24 +106,41 @@ pub fn wef_start(
     crate::forwarding::buffered_writer::ParquetWriterHandle<WefSink>,
     tokio::task::JoinHandle<()>,
 ) {
-    use crate::forwarding::buffered_writer::{
-        BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
-    };
-    let bwc = BufferedWriterConfig {
-        connection: cfg.connection.clone(),
-        prefix: cfg.prefix.clone(), // "" for behavior-preserving empty-prefix layout
-        max_buffer_rows: cfg.max_buffer_rows,
-        flush_threshold_bytes: cfg.flush_threshold_bytes,
-        flush_interval_secs: cfg.flush_interval_secs,
-        channel_capacity: cfg.channel_capacity,
-        max_partitions: 0, // unlimited — EventIDs are bounded in practice
-    };
-    let policy = FlushPolicy {
-        max_rows: cfg.max_buffer_rows,
-        max_bytes: cfg.flush_threshold_bytes,
-        interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
-    };
-    ParquetWriterHandle::start_with_stats(WefSink, s3, bwc, policy, source_stats)
+    crate::forwarding::buffered_writer::start_writer::<WefSink>(
+        cfg.prefix.clone(), // "" for behavior-preserving empty-prefix layout
+        cfg.max_buffer_rows,
+        cfg.flush_threshold_bytes,
+        cfg.flush_interval_secs,
+        cfg.channel_capacity,
+        0, // unlimited partitions — EventIDs are bounded in practice
+        s3,
+        source_stats,
+    )
+}
+
+/// Construct a `ParquetWriterHandle<WefSink>` from a `WefLocalConfig` and a
+/// pre-built `LocalDiskSink`. Structurally identical to `wef_start`, writing
+/// to local disk instead of S3 — same `WefSink` adapter, same
+/// buffering/flush/cap machinery, same S3-key-shaped relative path layout
+/// on disk.
+pub fn wef_local_start(
+    cfg: &crate::config::WefLocalConfig,
+    sink: Arc<crate::forwarding::local_sink::LocalDiskSink>,
+    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+) -> (
+    crate::forwarding::buffered_writer::ParquetWriterHandle<WefSink>,
+    tokio::task::JoinHandle<()>,
+) {
+    crate::forwarding::buffered_writer::start_writer::<WefSink>(
+        cfg.prefix.clone(),
+        cfg.max_buffer_rows,
+        cfg.flush_threshold_bytes,
+        cfg.flush_interval_secs,
+        cfg.channel_capacity,
+        0,
+        sink,
+        source_stats,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +313,42 @@ mod tests {
         assert!(handle.try_send(event).is_ok());
 
         // Drop handle → closes channel → writer flushes + exits
+        drop(handle);
+        tokio::time::timeout(std::time::Duration::from_secs(5), jh)
+            .await
+            .expect("writer must exit within 5s")
+            .expect("writer must not panic");
+    }
+
+    #[tokio::test]
+    async fn wef_local_start_spawns_and_exits_cleanly() {
+        use crate::config::WefLocalConfig;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let sink = Arc::new(
+            crate::forwarding::local_sink::LocalDiskSink::new(dir.path().to_path_buf())
+                .await
+                .expect("constructs"),
+        );
+        let cfg = WefLocalConfig {
+            directory: dir.path().to_path_buf(),
+            prefix: "".to_string(),
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 256,
+            max_buffer_rows: 100_000,
+        };
+
+        let (handle, jh) = wef_local_start(
+            &cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
+
+        let event = make_parsed_event(4624);
+        assert!(handle.try_send(event).is_ok());
+
         drop(handle);
         tokio::time::timeout(std::time::Duration::from_secs(5), jh)
             .await
