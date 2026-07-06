@@ -18,7 +18,7 @@ use std::sync::Arc;
 // GenericSink — ParquetSink adapter
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct GenericSink;
 
 /// Build the fixed 5-column schema used for all HEC partitions.
@@ -122,25 +122,38 @@ pub fn hec_start(
     max_partitions: usize,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (GenericS3Handler, tokio::task::JoinHandle<()>) {
-    use crate::forwarding::buffered_writer::{
-        BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
-    };
-
-    let bwc = BufferedWriterConfig {
-        connection: cfg.connection.clone(),
-        prefix: cfg.prefix.clone(),
-        max_buffer_rows: cfg.max_buffer_rows,
-        flush_threshold_bytes: cfg.flush_threshold_bytes,
-        flush_interval_secs: cfg.flush_interval_secs,
-        channel_capacity: cfg.channel_capacity,
+    crate::forwarding::buffered_writer::start_writer::<GenericSink>(
+        cfg.prefix.clone(),
+        cfg.max_buffer_rows,
+        cfg.flush_threshold_bytes,
+        cfg.flush_interval_secs,
+        cfg.channel_capacity,
         max_partitions,
-    };
-    let policy = FlushPolicy {
-        max_rows: cfg.max_buffer_rows,
-        max_bytes: cfg.flush_threshold_bytes,
-        interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
-    };
-    ParquetWriterHandle::start_with_stats(GenericSink, s3, bwc, policy, source_stats)
+        s3,
+        source_stats,
+    )
+}
+
+/// Construct a `GenericS3Handler` from a `GenericLocalConfig` and a pre-built
+/// `LocalDiskSink`. Structurally identical to `hec_start`, writing to local
+/// disk instead of S3 — same `GenericSink` adapter, same buffering/flush/cap
+/// machinery, same S3-key-shaped relative path layout on disk.
+pub fn hec_local_start(
+    cfg: &crate::config::GenericLocalConfig,
+    sink: Arc<crate::forwarding::local_sink::LocalDiskSink>,
+    max_partitions: usize,
+    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+) -> (GenericS3Handler, tokio::task::JoinHandle<()>) {
+    crate::forwarding::buffered_writer::start_writer::<GenericSink>(
+        cfg.prefix.clone(),
+        cfg.max_buffer_rows,
+        cfg.flush_threshold_bytes,
+        cfg.flush_interval_secs,
+        cfg.channel_capacity,
+        max_partitions,
+        sink,
+        source_stats,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +390,42 @@ mod tests {
         let (handler, join_handle) = hec_start(
             &cfg,
             s3,
+            64,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
+        handler
+            .try_send(make_record("access_log"))
+            .expect("send ok");
+        drop(handler);
+        tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
+            .await
+            .expect("writer exits within 5s")
+            .expect("writer does not panic");
+    }
+
+    #[tokio::test]
+    async fn hec_local_start_wires_handler_and_join_handle() {
+        use crate::config::GenericLocalConfig;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let sink = Arc::new(
+            crate::forwarding::local_sink::LocalDiskSink::new(dir.path().to_path_buf())
+                .await
+                .expect("constructs"),
+        );
+        let cfg = GenericLocalConfig {
+            directory: dir.path().to_path_buf(),
+            prefix: "hec".to_string(),
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 256,
+            max_buffer_rows: 100_000,
+        };
+
+        let (handler, join_handle) = hec_local_start(
+            &cfg,
+            sink,
             64,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
         );
