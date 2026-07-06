@@ -117,8 +117,66 @@ impl crate::suricata::listener::SuricataHandler
 }
 
 // ---------------------------------------------------------------------------
-// suricata_start — convenience constructor
+// MultiSuricataHandler — fan-out to multiple destinations
 // ---------------------------------------------------------------------------
+
+/// Fans out each record to every configured handler. Used only when both
+/// `.s3` and `.local` persistence resolve to a live handler for the same
+/// run, so each destination keeps its own independent buffer, flush policy,
+/// backpressure, and hard cap (no shared state between destinations).
+pub struct MultiSuricataHandler(
+    pub Vec<std::sync::Arc<dyn crate::suricata::listener::SuricataHandler>>,
+);
+
+#[async_trait::async_trait]
+impl crate::suricata::listener::SuricataHandler for MultiSuricataHandler {
+    async fn handle_record(&self, record: SuricataRecord, source: std::net::SocketAddr) {
+        for handler in &self.0 {
+            handler.handle_record(record.clone(), source).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// suricata_start / suricata_local_start — convenience constructors
+// ---------------------------------------------------------------------------
+
+/// Replaces the old per-source streams constant.
+const DEFAULT_MAX_SURICATA_PARTITIONS: usize = 256;
+
+/// Shared by `suricata_start` (S3) and `suricata_local_start` (local disk):
+/// builds a `SuricataS3Handler` from flush-policy fields, a pre-built,
+/// already-typed `Arc<dyn UploadSink>`, and the shared `SourceHourlyStats`
+/// every source writer feeds into.
+fn build_suricata_handle(
+    prefix: String,
+    max_buffer_rows: usize,
+    flush_threshold_bytes: usize,
+    flush_interval_secs: u64,
+    channel_capacity: usize,
+    sink: std::sync::Arc<dyn crate::forwarding::buffered_writer::UploadSink>,
+    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+) -> (SuricataS3Handler, tokio::task::JoinHandle<()>) {
+    use crate::forwarding::buffered_writer::{
+        BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
+    };
+
+    let bwc = BufferedWriterConfig {
+        connection: crate::forwarding::buffered_writer::unused_s3_connection_placeholder(),
+        prefix,
+        max_buffer_rows,
+        flush_threshold_bytes,
+        flush_interval_secs,
+        channel_capacity,
+        max_partitions: DEFAULT_MAX_SURICATA_PARTITIONS,
+    };
+    let policy = FlushPolicy {
+        max_rows: max_buffer_rows,
+        max_bytes: flush_threshold_bytes,
+        interval: std::time::Duration::from_secs(flush_interval_secs),
+    };
+    ParquetWriterHandle::start_with_stats(SuricataSink, sink, bwc, policy, source_stats)
+}
 
 /// Construct a `SuricataS3Handler` (i.e. `ParquetWriterHandle<SuricataSink>`) from a
 /// `SuricataS3Config` and a pre-built `S3Sink`.
@@ -131,28 +189,36 @@ pub fn suricata_start(
     s3: std::sync::Arc<crate::forwarding::s3_sink::S3Sink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
 ) -> (SuricataS3Handler, tokio::task::JoinHandle<()>) {
-    use crate::forwarding::buffered_writer::{
-        BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
-    };
+    build_suricata_handle(
+        cfg.prefix.clone(),
+        cfg.max_buffer_rows,
+        cfg.flush_threshold_bytes,
+        cfg.flush_interval_secs,
+        cfg.channel_capacity,
+        s3,
+        source_stats,
+    )
+}
 
-    /// Replaces the old per-source streams constant.
-    const DEFAULT_MAX_SURICATA_PARTITIONS: usize = 256;
-
-    let bwc = BufferedWriterConfig {
-        connection: cfg.connection.clone(),
-        prefix: cfg.prefix.clone(),
-        max_buffer_rows: cfg.max_buffer_rows,
-        flush_threshold_bytes: cfg.flush_threshold_bytes,
-        flush_interval_secs: cfg.flush_interval_secs,
-        channel_capacity: cfg.channel_capacity,
-        max_partitions: DEFAULT_MAX_SURICATA_PARTITIONS,
-    };
-    let policy = FlushPolicy {
-        max_rows: cfg.max_buffer_rows,
-        max_bytes: cfg.flush_threshold_bytes,
-        interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
-    };
-    ParquetWriterHandle::start_with_stats(SuricataSink, s3, bwc, policy, source_stats)
+/// Construct a `SuricataS3Handler` from a `SuricataLocalConfig` and a
+/// pre-built `LocalDiskSink`. Structurally identical to `suricata_start`,
+/// writing to local disk instead of S3 — same `SuricataSink` adapter, same
+/// buffering/flush/cap machinery, same S3-key-shaped relative path layout
+/// on disk.
+pub fn suricata_local_start(
+    cfg: &crate::config::SuricataLocalConfig,
+    sink: std::sync::Arc<crate::forwarding::local_sink::LocalDiskSink>,
+    source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+) -> (SuricataS3Handler, tokio::task::JoinHandle<()>) {
+    build_suricata_handle(
+        cfg.prefix.clone(),
+        cfg.max_buffer_rows,
+        cfg.flush_threshold_bytes,
+        cfg.flush_interval_secs,
+        cfg.channel_capacity,
+        sink,
+        source_stats,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -500,5 +566,188 @@ mod tests {
         let row = snapshot.iter().find(|r| r.source == "suricata").unwrap();
         let total: u64 = row.hours.iter().map(|h| h.count).sum();
         assert_eq!(total, 1);
+    }
+
+    // -- suricata_local_start wires handler and join handle --
+
+    #[tokio::test]
+    async fn suricata_local_start_wires_handler_and_join_handle() {
+        use crate::config::SuricataLocalConfig;
+        use crate::forwarding::local_sink::LocalDiskSink;
+        use crate::suricata::listener::SuricataHandler;
+        use std::net::SocketAddr;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(
+            LocalDiskSink::new(dir.path().to_path_buf())
+                .await
+                .expect("LocalDiskSink::new"),
+        );
+        let cfg = SuricataLocalConfig {
+            directory: dir.path().to_path_buf(),
+            prefix: "suricata".to_string(),
+            flush_threshold_bytes: 1, // flush on first push
+            flush_interval_secs: 3600,
+            channel_capacity: 256,
+            max_buffer_rows: 100_000,
+        };
+        let (handler, join_handle) = suricata_local_start(
+            &cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
+
+        let src: SocketAddr = "127.0.0.1:47761".parse().unwrap();
+        handler
+            .handle_record(make_alert_record("10.0.0.1"), src)
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(handler);
+        tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
+            .await
+            .expect("writer task must exit within 5s")
+            .expect("writer task must not panic");
+
+        let alert_dir = dir.path().join("suricata/alert");
+        let found = std::fs::read_dir(&alert_dir)
+            .expect("suricata/alert directory must exist")
+            .count();
+        assert!(
+            found >= 1,
+            "expected at least one Parquet file under {alert_dir:?}"
+        );
+    }
+
+    // -- MultiSuricataHandler tests --
+
+    #[tokio::test]
+    async fn multi_suricata_handler_fans_out_to_every_inner_handler() {
+        use crate::suricata::listener::SuricataHandler;
+        use std::net::SocketAddr;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingHandler(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl SuricataHandler for CountingHandler {
+            async fn handle_record(&self, _record: SuricataRecord, _source: SocketAddr) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let count_a = Arc::new(AtomicUsize::new(0));
+        let count_b = Arc::new(AtomicUsize::new(0));
+        let multi = MultiSuricataHandler(vec![
+            Arc::new(CountingHandler(count_a.clone())),
+            Arc::new(CountingHandler(count_b.clone())),
+        ]);
+
+        let src: SocketAddr = "127.0.0.1:47761".parse().unwrap();
+        multi
+            .handle_record(make_alert_record("Fan1"), src)
+            .await;
+
+        assert_eq!(
+            count_a.load(Ordering::SeqCst),
+            1,
+            "handler A must receive the record"
+        );
+        assert_eq!(
+            count_b.load(Ordering::SeqCst),
+            1,
+            "handler B must receive the record"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn multi_suricata_handler_survives_one_inner_handler_dropping() {
+        use crate::config::SuricataS3Config;
+        use crate::suricata::listener::SuricataHandler;
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::DebuggingRecorder;
+        use std::net::SocketAddr;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let sink = unreachable_sink().await;
+        let cfg = SuricataS3Config {
+            connection: S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "AKIATEST".to_string(),
+                secret_key: "SECRETTEST".to_string(),
+            },
+            prefix: "suricata".to_string(),
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 1,
+            max_buffer_rows: 1,
+        };
+        let (struggling_handler, _jh) = suricata_start(
+            &cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingHandler(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl SuricataHandler for CountingHandler {
+            async fn handle_record(&self, _record: SuricataRecord, _source: SocketAddr) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let healthy_count = Arc::new(AtomicUsize::new(0));
+        let multi = MultiSuricataHandler(vec![
+            Arc::new(struggling_handler),
+            Arc::new(CountingHandler(healthy_count.clone())),
+        ]);
+
+        let src: SocketAddr = "127.0.0.1:47761".parse().unwrap();
+        for i in 0..20 {
+            multi
+                .handle_record(make_alert_record(&format!("{i}.0.0.1")), src)
+                .await;
+        }
+
+        assert_eq!(
+            healthy_count.load(Ordering::SeqCst),
+            20,
+            "the healthy handler must receive every record even if the struggling one drops some"
+        );
+
+        let snapshot = snapshotter.snapshot();
+        let map = snapshot.into_hashmap();
+        let key = CompositeKey::new(
+            MetricKind::Counter,
+            metrics::Key::from_parts(
+                "parquet_s3_dropped",
+                vec![
+                    metrics::Label::new("source", "suricata"),
+                    metrics::Label::new("target", "s3"),
+                ],
+            ),
+        );
+        let dropped = map
+            .get(&key)
+            .map(|(_, _, v)| {
+                if let metrics_util::debugging::DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        assert!(
+            dropped >= 1,
+            "the struggling handler must actually have dropped at least one record \
+             for this test to prove handler isolation (dropped={dropped})"
+        );
     }
 }
