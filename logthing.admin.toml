@@ -31,10 +31,16 @@ enabled = true
 udp_port = 514
 tcp_port = 601
 parse_dns = true
+parse_payloads = false
 
 [ipfix]
 enabled = false
 udp_port = 4739
+bind_address = "0.0.0.0"
+
+[sflow]
+enabled = false
+udp_port = 6343
 bind_address = "0.0.0.0"
 
 [zeek]
@@ -42,4 +48,17 @@ enabled = false
 tcp_port = 47760
 bind_address = "0.0.0.0"
 
+[suricata]
+enabled = false
+tcp_port = 47761
+bind_address = "0.0.0.0"
+
 [wef]
+
+[hec]
+enabled = false
+token = ""
+max_sourcetype_partitions = 64
+
+[otlp]
+enabled = false
