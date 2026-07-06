@@ -177,22 +177,6 @@ impl crate::zeek::listener::ZeekHandler for MultiZeekHandler {
 // zeek_start / zeek_local_start — convenience constructors
 // ---------------------------------------------------------------------------
 
-/// `BufferedWriterConfig.connection` is never read by the generic writer once
-/// a pre-built sink is supplied — only `prefix`/`max_buffer_rows`/etc. are used
-/// in `push`/`flush_partition`/`drop_oldest_to_cap`. For a local-disk-only
-/// pipeline there is no S3 connection to report, so this fills the field with
-/// harmless placeholder values rather than changing its required type (which
-/// would ripple into every other source's `BufferedWriterConfig` literal).
-fn unused_s3_connection_placeholder() -> crate::config::S3ConnectionConfig {
-    crate::config::S3ConnectionConfig {
-        endpoint: String::new(),
-        bucket: String::new(),
-        region: String::new(),
-        access_key: String::new(),
-        secret_key: String::new(),
-    }
-}
-
 /// Shared by `zeek_start` (S3) and `zeek_local_start` (local disk): builds a
 /// `ZeekS3Handler` from flush-policy fields, a pre-built, already-typed
 /// `Arc<dyn UploadSink>`, and the shared `SourceHourlyStats` every source
@@ -214,7 +198,7 @@ fn build_zeek_handle(
     const DEFAULT_MAX_ZEEK_PARTITIONS: usize = 256;
 
     let bwc = BufferedWriterConfig {
-        connection: unused_s3_connection_placeholder(),
+        connection: crate::forwarding::buffered_writer::unused_s3_connection_placeholder(),
         prefix,
         max_buffer_rows,
         flush_threshold_bytes,

@@ -41,6 +41,7 @@ echo "Running Zeek NDJSON E2E Tests"
 echo "========================================"
 docker compose -f "$COMPOSE_FILE" run --rm zeek-generator
 docker compose -f "$COMPOSE_FILE" run --rm zeek-s3-verifier
+docker compose -f "$COMPOSE_FILE" run --rm zeek-local-verifier
 echo "Zeek E2E Tests Completed Successfully"
 
 echo ""
