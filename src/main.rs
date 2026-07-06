@@ -95,43 +95,80 @@ async fn async_main() -> anyhow::Result<()> {
                 None
             };
 
-        // Build the handler BEFORE spawning so we can extract the writer JoinHandle.
-        let syslog_handler: Arc<dyn syslog::listener::SyslogHandler> =
-            if let Some(s3_cfg) = config_clone.syslog.s3.as_ref() {
-                match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
-                    Ok(sink) => {
-                        let (handler, writer_handle) = forwarding::syslog_s3::syslog_start(
-                            s3_cfg,
-                            Arc::new(sink),
-                            source_stats.clone(),
-                        );
-                        writer_handles.push(writer_handle);
-                        // Wrap SyslogS3Handler in a payload-dispatching adapter.
-                        Arc::new(syslog::listener::PayloadDispatchingHandler {
-                            inner: Arc::new(handler),
-                            parse_payloads: config_clone.syslog.parse_payloads,
-                            structured_handle: structured_handle.clone(),
-                        })
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to create S3Sink for syslog persistence, \
-                                 falling back to DefaultSyslogHandler: {e}"
-                        );
-                        Arc::new(syslog::listener::DefaultSyslogHandler::new(
-                            config_clone.syslog.parse_dns,
-                            config_clone.syslog.parse_payloads,
-                            structured_handle.clone(),
-                        ))
-                    }
+        // Independently attempt each raw-persistence target; each is
+        // logged-and-skipped on its own failure (no fallback to
+        // DefaultSyslogHandler just because one target failed while the
+        // other succeeded).
+        let mut syslog_handlers: Vec<Arc<dyn syslog::listener::SyslogHandler>> = Vec::new();
+
+        if let Some(s3_cfg) = config_clone.syslog.s3.as_ref() {
+            match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
+                Ok(sink) => {
+                    let (handler, writer_handle) = forwarding::syslog_s3::syslog_start(
+                        s3_cfg,
+                        Arc::new(sink),
+                        source_stats.clone(),
+                    );
+                    writer_handles.push(writer_handle);
+                    syslog_handlers.push(Arc::new(handler));
                 }
-            } else {
-                Arc::new(syslog::listener::DefaultSyslogHandler::new(
-                    config_clone.syslog.parse_dns,
-                    config_clone.syslog.parse_payloads,
-                    structured_handle,
-                ))
-            };
+                Err(e) => {
+                    error!(
+                        "Failed to create S3Sink for syslog persistence, \
+                             skipping S3 target: {e}"
+                    );
+                }
+            }
+        }
+
+        if let Some(local_cfg) = config_clone.syslog.local.as_ref() {
+            match forwarding::local_sink::LocalDiskSink::new(local_cfg.directory.clone()).await {
+                Ok(sink) => {
+                    let (handler, writer_handle) = forwarding::syslog_s3::syslog_local_start(
+                        local_cfg,
+                        Arc::new(sink),
+                        source_stats.clone(),
+                    );
+                    writer_handles.push(writer_handle);
+                    syslog_handlers.push(Arc::new(handler));
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to create LocalDiskSink for syslog persistence, \
+                             skipping local target: {e}"
+                    );
+                }
+            }
+        }
+
+        // If at least one persistence target came up, wrap the combined
+        // persistence handler in PayloadDispatchingHandler (payload dispatch
+        // + DNS-log parsing does NOT run in this branch — persistence and
+        // DNS-log parsing remain mutually exclusive, as documented on
+        // SyslogListener). Otherwise fall back to DefaultSyslogHandler,
+        // which handles DNS-log parsing and payload dispatch itself.
+        let syslog_handler: Arc<dyn syslog::listener::SyslogHandler> = if syslog_handlers.is_empty()
+        {
+            Arc::new(syslog::listener::DefaultSyslogHandler::new(
+                config_clone.syslog.parse_dns,
+                config_clone.syslog.parse_payloads,
+                structured_handle,
+            ))
+        } else {
+            // Do NOT annotate `combined` as `Arc<dyn SyslogHandler>` here — leave
+            // it inferred as the concrete `Arc<MultiSyslogHandler>`.
+            // `PayloadDispatchingHandler<H: SyslogHandler>` requires `H: Sized`
+            // (implicit), so its `inner: Arc<H>` field cannot hold an unsized
+            // `Arc<dyn SyslogHandler>` without relaxing that bound to `?Sized` —
+            // which this plan's Global Constraints forbid touching. Keeping
+            // `combined` concrete avoids that entirely.
+            let combined = Arc::new(forwarding::syslog_s3::MultiSyslogHandler(syslog_handlers));
+            Arc::new(syslog::listener::PayloadDispatchingHandler {
+                inner: combined,
+                parse_payloads: config_clone.syslog.parse_payloads,
+                structured_handle,
+            })
+        };
 
         let syslog_config = syslog::listener::SyslogListenerConfig {
             udp_port: config_clone.syslog.udp_port,
