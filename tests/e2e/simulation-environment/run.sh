@@ -33,6 +33,7 @@ echo "Running IPFIX E2E Tests"
 echo "========================================"
 docker compose -f "$COMPOSE_FILE" run --rm ipfix-generator
 docker compose -f "$COMPOSE_FILE" run --rm ipfix-s3-verifier
+docker compose -f "$COMPOSE_FILE" run --rm ipfix-local-verifier
 echo "IPFIX E2E Tests Completed Successfully"
 
 echo ""

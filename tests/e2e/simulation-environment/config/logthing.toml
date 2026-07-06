@@ -36,6 +36,12 @@ prefix     = "ipfix"
 flush_threshold_bytes = 1
 flush_interval_secs   = 5
 
+[ipfix.local]
+directory             = "/var/log/ipfix-local"
+prefix                = "ipfix"
+flush_threshold_bytes = 1
+flush_interval_secs   = 5
+
 [zeek]
 enabled = true
 tcp_port = 47760

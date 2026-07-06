@@ -14,6 +14,7 @@ services:
     volumes:
       - ./config/logthing.toml:/etc/logthing/config.toml:ro
       - zeek-local-data:/var/log/zeek-local
+      - ipfix-local-data:/var/log/ipfix-local
     depends_on:
       - minio
     networks:
@@ -327,6 +328,22 @@ services:
     networks:
       - e2e
 
+  ipfix-local-verifier:
+    build:
+      context: .
+      dockerfile: ipfix-local-verifier/Dockerfile
+    environment:
+      - IPFIX_LOCAL_DIR=/var/log/ipfix-local
+      - EXPECTED_EVENT_TOTAL=5
+      - E2E_TIMEOUT_SECS=60
+    volumes:
+      - ipfix-local-data:/var/log/ipfix-local:ro
+    depends_on:
+      - ipfix-generator
+      - logthing
+    networks:
+      - e2e
+
   zeek-generator:
     build:
       context: .
@@ -379,3 +396,4 @@ networks:
 
 volumes:
   zeek-local-data:
+  ipfix-local-data:
