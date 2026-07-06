@@ -222,6 +222,12 @@ pub struct IpfixConfig {
     /// Absent from TOML → `None` → no S3 persistence (backward compatible).
     #[serde(default)]
     pub s3: Option<IpfixS3Config>,
+
+    /// Optional local-disk persistence. Absent from TOML → `None` → no
+    /// persistence. Independent of `s3` — both may be configured
+    /// simultaneously, in which case records are written to both.
+    #[serde(default)]
+    pub local: Option<IpfixLocalConfig>,
 }
 
 impl Default for IpfixConfig {
@@ -231,6 +237,7 @@ impl Default for IpfixConfig {
             udp_port: default_ipfix_udp_port(),
             bind_address: default_ipfix_bind_address(),
             s3: None,
+            local: None,
         }
     }
 }
@@ -681,6 +688,31 @@ fn default_ipfix_max_buffer_rows() -> usize {
     100_000
 }
 
+/// Per-source local-disk persistence config for the IPFIX listener. Mirrors
+/// `IpfixS3Config`'s flush-policy shape (reusing the same default
+/// functions), swapping the S3 connection for a root directory.
+/// Independent of `s3`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IpfixLocalConfig {
+    /// Root directory Parquet files are written under (created if missing).
+    pub directory: PathBuf,
+    /// Key prefix, slash-free (default: `"ipfix"` — same default as `ipfix.s3`).
+    #[serde(default = "default_ipfix_s3_prefix")]
+    pub prefix: String,
+    /// Flush when estimated buffer bytes exceeds this (default: 100 MiB).
+    #[serde(default = "default_ipfix_flush_bytes")]
+    pub flush_threshold_bytes: usize,
+    /// Flush after this many seconds regardless of buffer size (default: 900).
+    #[serde(default = "default_ipfix_flush_secs")]
+    pub flush_interval_secs: u64,
+    /// Bounded channel capacity (default: 256).
+    #[serde(default = "default_ipfix_channel_capacity")]
+    pub channel_capacity: usize,
+    /// Maximum buffered rows before hard cap kicks in (default: 100_000).
+    #[serde(default = "default_ipfix_max_buffer_rows")]
+    pub max_buffer_rows: usize,
+}
+
 // ── SflowConfig ───────────────────────────────────────────────────────────
 
 /// Configuration for the sFlow v5 UDP listener.
@@ -1053,6 +1085,75 @@ secret_key = "FSKEY"
         assert!(!cfg.ipfix.enabled, "ipfix disabled by default");
         assert_eq!(cfg.ipfix.udp_port, 4739);
         assert_eq!(cfg.ipfix.bind_address, "0.0.0.0");
+    }
+
+    #[test]
+    fn ipfix_local_absent_gives_none() {
+        let cfg = Config::default();
+        assert!(
+            cfg.ipfix.local.is_none(),
+            "absent [ipfix.local] must deserialize to None"
+        );
+    }
+
+    #[test]
+    fn ipfix_local_config_deserializes_from_toml() {
+        let toml_str = r#"
+directory = "/var/log/logthing/ipfix"
+prefix = "ipfix"
+flush_threshold_bytes = 52428800
+flush_interval_secs = 300
+channel_capacity = 512
+max_buffer_rows = 50000
+"#;
+        let cfg: IpfixLocalConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(
+            cfg.directory,
+            std::path::PathBuf::from("/var/log/logthing/ipfix")
+        );
+        assert_eq!(cfg.prefix, "ipfix");
+        assert_eq!(cfg.flush_threshold_bytes, 52_428_800);
+        assert_eq!(cfg.flush_interval_secs, 300);
+        assert_eq!(cfg.channel_capacity, 512);
+        assert_eq!(cfg.max_buffer_rows, 50_000);
+    }
+
+    #[test]
+    fn ipfix_local_config_defaults_apply_when_only_directory_given() {
+        let toml_str = r#"directory = "/data/ipfix""#;
+        let cfg: IpfixLocalConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(cfg.prefix, "ipfix");
+        assert_eq!(cfg.flush_threshold_bytes, 100 * 1024 * 1024);
+        assert_eq!(cfg.flush_interval_secs, 900);
+        assert_eq!(cfg.channel_capacity, 256);
+        assert_eq!(cfg.max_buffer_rows, 100_000);
+    }
+
+    #[test]
+    fn ipfix_s3_and_local_can_both_be_configured_simultaneously() {
+        let toml_str = r#"
+[ipfix]
+enabled = true
+
+[ipfix.s3]
+endpoint = "http://minio:9000"
+bucket = "b"
+region = "us-east-1"
+access_key = "k"
+secret_key = "s"
+
+[ipfix.local]
+directory = "/data/ipfix"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("deserialize");
+        assert!(
+            cfg.ipfix.s3.is_some(),
+            "s3 must deserialize when both present"
+        );
+        assert!(
+            cfg.ipfix.local.is_some(),
+            "local must deserialize when both present"
+        );
     }
 
     #[test]
