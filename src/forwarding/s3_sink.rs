@@ -61,7 +61,8 @@ impl S3Sink {
 
     /// List all object keys with the given prefix. Returns full S3 keys.
     pub async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
-        let resp = self.client
+        let resp = self
+            .client
             .list_objects_v2()
             .bucket(&self.bucket)
             .prefix(prefix)
@@ -77,7 +78,8 @@ impl S3Sink {
 
     /// Download an object and return its raw bytes.
     pub async fn get_object(&self, key: &str) -> Result<Vec<u8>> {
-        let resp = self.client
+        let resp = self
+            .client
             .get_object()
             .bucket(&self.bucket)
             .key(key)
@@ -200,6 +202,9 @@ mod tests {
         // upload logic as the inherent method (same failure mode as the existing
         // `upload_returns_err_on_unreachable_endpoint` test).
         let result = sink.upload("some/key.parquet", b"hello".to_vec()).await;
-        assert!(result.is_err(), "upload via trait object must fail the same way as the inherent method");
+        assert!(
+            result.is_err(),
+            "upload via trait object must fail the same way as the inherent method"
+        );
     }
 }

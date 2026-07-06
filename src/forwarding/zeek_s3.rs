@@ -669,7 +669,11 @@ mod tests {
             channel_capacity: 1,
             max_buffer_rows: 1,
         };
-        let (handler, _writer_handle) = zeek_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
+        let (handler, _writer_handle) = zeek_start(
+            &cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
         tokio::task::yield_now().await;
 
         let src: SocketAddr = "127.0.0.1:47760".parse().unwrap();
@@ -731,7 +735,11 @@ mod tests {
             channel_capacity: 256,
             max_buffer_rows: 100_000,
         };
-        let (handler, join_handle) = zeek_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
+        let (handler, join_handle) = zeek_start(
+            &cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
 
         let src: SocketAddr = "127.0.0.1:47760".parse().unwrap();
         handler.handle_record(make_conn_record("C1"), src).await;
@@ -793,7 +801,10 @@ mod tests {
         let found = std::fs::read_dir(&conn_dir)
             .expect("zeek/conn directory must exist")
             .count();
-        assert!(found >= 1, "expected at least one Parquet file under {conn_dir:?}");
+        assert!(
+            found >= 1,
+            "expected at least one Parquet file under {conn_dir:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -824,8 +835,16 @@ mod tests {
         let src: SocketAddr = "127.0.0.1:47760".parse().unwrap();
         multi.handle_record(make_conn_record("Fan1"), src).await;
 
-        assert_eq!(count_a.load(Ordering::SeqCst), 1, "handler A must receive the record");
-        assert_eq!(count_b.load(Ordering::SeqCst), 1, "handler B must receive the record");
+        assert_eq!(
+            count_a.load(Ordering::SeqCst),
+            1,
+            "handler A must receive the record"
+        );
+        assert_eq!(
+            count_b.load(Ordering::SeqCst),
+            1,
+            "handler B must receive the record"
+        );
     }
 
     #[tokio::test]
@@ -881,7 +900,9 @@ mod tests {
 
         let src: SocketAddr = "127.0.0.1:47760".parse().unwrap();
         for i in 0..20 {
-            multi.handle_record(make_conn_record(&format!("C{i}")), src).await;
+            multi
+                .handle_record(make_conn_record(&format!("C{i}")), src)
+                .await;
         }
 
         assert_eq!(
@@ -952,7 +973,11 @@ mod tests {
             channel_capacity: 256,
             max_buffer_rows: 100_000,
         };
-        let (handler, _writer_handle) = zeek_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
+        let (handler, _writer_handle) = zeek_start(
+            &cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
         let src: std::net::SocketAddr = "127.0.0.1:47760".parse().unwrap();
 
         for i in 0..5usize {
@@ -1038,7 +1063,11 @@ mod tests {
         let shared_stats = std::sync::Arc::new(crate::stats::SourceHourlyStats::new());
 
         let mut writer = PartitionedParquetWriter::with_source_stats(
-            ZeekSink, s3, bwc, policy, shared_stats.clone(),
+            ZeekSink,
+            s3,
+            bwc,
+            policy,
+            shared_stats.clone(),
         );
         writer.push(make_conn_record("conn")).await.unwrap();
 

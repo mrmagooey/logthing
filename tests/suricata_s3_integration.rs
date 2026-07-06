@@ -19,8 +19,7 @@ fn minio_suricata_config(endpoint: &str) -> SuricataS3Config {
     SuricataS3Config {
         connection: S3ConnectionConfig {
             endpoint: endpoint.to_string(),
-            bucket: std::env::var("MINIO_BUCKET")
-                .unwrap_or_else(|_| "suricata-logs".to_string()),
+            bucket: std::env::var("MINIO_BUCKET").unwrap_or_else(|_| "suricata-logs".to_string()),
             region: "us-east-1".to_string(),
             access_key: std::env::var("MINIO_ACCESS_KEY")
                 .unwrap_or_else(|_| "minioadmin".to_string()),
@@ -28,7 +27,7 @@ fn minio_suricata_config(endpoint: &str) -> SuricataS3Config {
                 .unwrap_or_else(|_| "minioadmin".to_string()),
         },
         prefix: "suricata".to_string(),
-        max_buffer_rows: 1,         // flush immediately on first record
+        max_buffer_rows: 1, // flush immediately on first record
         flush_threshold_bytes: 1,
         flush_interval_secs: 3600,
         channel_capacity: 4096,
@@ -92,7 +91,11 @@ async fn suricata_records_appear_as_parquet_in_s3() {
             .expect("S3Sink::from_connection"),
     );
 
-    let (handler, _writer_task) = suricata_start(&cfg, sink.clone(), std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()));
+    let (handler, _writer_task) = suricata_start(
+        &cfg,
+        sink.clone(),
+        std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+    );
     let src: std::net::SocketAddr = "127.0.0.1:47761".parse().unwrap();
     handler.handle_record(make_alert_record(), src).await;
     handler.handle_record(make_flow_record(), src).await;
@@ -146,7 +149,12 @@ async fn suricata_records_appear_as_parquet_in_s3() {
             .await
             .expect("get_object for alert");
 
-        let body_bytes = get_resp.body.collect().await.expect("collect body").into_bytes();
+        let body_bytes = get_resp
+            .body
+            .collect()
+            .await
+            .expect("collect body")
+            .into_bytes();
 
         use bytes::Bytes;
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -214,7 +222,12 @@ async fn suricata_records_appear_as_parquet_in_s3() {
             .await
             .expect("get_object for flow");
 
-        let body_bytes = get_resp.body.collect().await.expect("collect body").into_bytes();
+        let body_bytes = get_resp
+            .body
+            .collect()
+            .await
+            .expect("collect body")
+            .into_bytes();
 
         use bytes::Bytes;
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;

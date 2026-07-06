@@ -99,26 +99,18 @@ impl ParquetSink for SuricataSink {
 // ---------------------------------------------------------------------------
 
 /// `SuricataS3Handler` is a thin alias for the generic `ParquetWriterHandle<SuricataSink>`.
-pub type SuricataS3Handler =
-    crate::forwarding::buffered_writer::ParquetWriterHandle<SuricataSink>;
+pub type SuricataS3Handler = crate::forwarding::buffered_writer::ParquetWriterHandle<SuricataSink>;
 
 #[async_trait::async_trait]
 impl crate::suricata::listener::SuricataHandler
     for crate::forwarding::buffered_writer::ParquetWriterHandle<SuricataSink>
 {
-    async fn handle_record(
-        &self,
-        record: SuricataRecord,
-        source: std::net::SocketAddr,
-    ) {
+    async fn handle_record(&self, record: SuricataRecord, source: std::net::SocketAddr) {
         match self.try_send(record) {
             Ok(()) => {}
             Err(_dropped) => {
                 // parquet_s3_dropped{source="suricata"} is already incremented by try_send.
-                tracing::warn!(
-                    "Suricata S3 channel full; dropped 1 record from {}",
-                    source
-                );
+                tracing::warn!("Suricata S3 channel full; dropped 1 record from {}", source);
             }
         }
     }
@@ -260,7 +252,10 @@ mod tests {
         assert_eq!(SuricataSink.schema(Some("alert")), envelope_schema());
         assert_eq!(SuricataSink.schema(Some("_overflow")), envelope_schema());
         assert_eq!(SuricataSink.schema(None), envelope_schema());
-        assert_eq!(SuricataSink.schema(Some("unknown_anything")), envelope_schema());
+        assert_eq!(
+            SuricataSink.schema(Some("unknown_anything")),
+            envelope_schema()
+        );
     }
 
     #[test]
@@ -334,7 +329,11 @@ mod tests {
         writer.push(make_flow_record()).await.ok();
 
         assert_eq!(
-            writer.buffers.get("alert").map(|b| b.row_count).unwrap_or(0),
+            writer
+                .buffers
+                .get("alert")
+                .map(|b| b.row_count)
+                .unwrap_or(0),
             2,
             "alert buffer should have 2 rows"
         );
@@ -377,12 +376,18 @@ mod tests {
             channel_capacity: 1,
             max_buffer_rows: 1,
         };
-        let (handler, _writer_handle) = suricata_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
+        let (handler, _writer_handle) = suricata_start(
+            &cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
         tokio::task::yield_now().await;
 
         let src: SocketAddr = "127.0.0.1:47761".parse().unwrap();
         for i in 0..50usize {
-            handler.handle_record(make_alert_record(&format!("{i}.0.0.1")), src).await;
+            handler
+                .handle_record(make_alert_record(&format!("{i}.0.0.1")), src)
+                .await;
         }
         tokio::task::yield_now().await;
 
@@ -401,7 +406,11 @@ mod tests {
         let dropped = map
             .get(&key)
             .map(|(_, _, v)| {
-                if let metrics_util::debugging::DebugValue::Counter(c) = v { *c } else { 0 }
+                if let metrics_util::debugging::DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
             })
             .unwrap_or(0);
         assert!(
@@ -433,9 +442,15 @@ mod tests {
             channel_capacity: 256,
             max_buffer_rows: 100_000,
         };
-        let (handler, join_handle) = suricata_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
+        let (handler, join_handle) = suricata_start(
+            &cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
         let src: SocketAddr = "127.0.0.1:47761".parse().unwrap();
-        handler.handle_record(make_alert_record("10.0.0.1"), src).await;
+        handler
+            .handle_record(make_alert_record("10.0.0.1"), src)
+            .await;
         drop(handler);
 
         tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
@@ -473,7 +488,11 @@ mod tests {
         let shared_stats = std::sync::Arc::new(crate::stats::SourceHourlyStats::new());
 
         let mut writer = PartitionedParquetWriter::with_source_stats(
-            SuricataSink, s3, bwc, policy, shared_stats.clone(),
+            SuricataSink,
+            s3,
+            bwc,
+            policy,
+            shared_stats.clone(),
         );
         writer.push(make_alert_record("1.1.1.1")).await.unwrap();
 

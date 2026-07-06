@@ -75,8 +75,12 @@ async fn zeek_records_appear_as_parquet_on_local_disk() {
     );
 
     let src: std::net::SocketAddr = "127.0.0.1:47760".parse().unwrap();
-    handler.handle_record(make_conn_record("CLocal001"), src).await;
-    handler.handle_record(make_dns_record("DLocal001"), src).await;
+    handler
+        .handle_record(make_conn_record("CLocal001"), src)
+        .await;
+    handler
+        .handle_record(make_dns_record("DLocal001"), src)
+        .await;
 
     // Give the background task time to flush (max_buffer_rows=1 and
     // flush_threshold_bytes=1 both trigger flush on the first push per partition).
@@ -94,7 +98,10 @@ async fn zeek_records_appear_as_parquet_on_local_disk() {
             .into_iter()
             .filter(|p| p.extension().is_some_and(|ext| ext == "parquet"))
             .collect();
-        assert!(!parquet_files.is_empty(), "expected at least one Parquet file under {conn_dir:?}");
+        assert!(
+            !parquet_files.is_empty(),
+            "expected at least one Parquet file under {conn_dir:?}"
+        );
 
         let file_path = &parquet_files[0];
         let bytes = std::fs::read(file_path).expect("read parquet file");
@@ -104,11 +111,17 @@ async fn zeek_records_appear_as_parquet_on_local_disk() {
             .expect("parquet builder for conn");
         let schema = builder.schema().clone();
         for col in ["ts", "uid", "id_orig_h", "proto", "conn_state", "_extra"] {
-            assert!(schema.field_with_name(col).is_ok(), "expected column '{col}' in conn schema");
+            assert!(
+                schema.field_with_name(col).is_ok(),
+                "expected column '{col}' in conn schema"
+            );
         }
 
         let mut reader = builder.build().expect("parquet reader for conn");
-        let rb = reader.next().expect("at least one batch").expect("batch ok");
+        let rb = reader
+            .next()
+            .expect("at least one batch")
+            .expect("batch ok");
         assert_eq!(rb.num_rows(), 1);
 
         use arrow::array::StringArray;
@@ -129,7 +142,10 @@ async fn zeek_records_appear_as_parquet_on_local_disk() {
             .into_iter()
             .filter(|p| p.extension().is_some_and(|ext| ext == "parquet"))
             .collect();
-        assert!(!parquet_files.is_empty(), "expected at least one Parquet file under {dns_dir:?}");
+        assert!(
+            !parquet_files.is_empty(),
+            "expected at least one Parquet file under {dns_dir:?}"
+        );
 
         let file_path = &parquet_files[0];
         let bytes = std::fs::read(file_path).expect("read parquet file");
@@ -138,7 +154,10 @@ async fn zeek_records_appear_as_parquet_on_local_disk() {
         let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
             .expect("parquet builder for dns");
         let mut reader = builder.build().expect("parquet reader for dns");
-        let rb = reader.next().expect("at least one batch").expect("batch ok");
+        let rb = reader
+            .next()
+            .expect("at least one batch")
+            .expect("batch ok");
         assert_eq!(rb.num_rows(), 1);
 
         use arrow::array::StringArray;
@@ -154,7 +173,10 @@ async fn zeek_records_appear_as_parquet_on_local_disk() {
     // --- No stray temp files left behind anywhere under the root ---
     for entry in walk_all_files(dir.path()) {
         let name = entry.file_name().unwrap().to_string_lossy();
-        assert!(!name.contains(".tmp-"), "found leftover temp file: {entry:?}");
+        assert!(
+            !name.contains(".tmp-"),
+            "found leftover temp file: {entry:?}"
+        );
     }
 }
 

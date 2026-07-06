@@ -31,8 +31,14 @@ fn unescape_header(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.peek() {
-                Some('|') => { out.push('|');  chars.next(); }
-                Some('\\') => { out.push('\\'); chars.next(); }
+                Some('|') => {
+                    out.push('|');
+                    chars.next();
+                }
+                Some('\\') => {
+                    out.push('\\');
+                    chars.next();
+                }
                 _ => out.push(c),
             }
         } else {
@@ -49,9 +55,18 @@ fn unescape_ext(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.peek() {
-                Some('|')  => { out.push('|');  chars.next(); }
-                Some('\\') => { out.push('\\'); chars.next(); }
-                Some('=')  => { out.push('=');  chars.next(); }
+                Some('|') => {
+                    out.push('|');
+                    chars.next();
+                }
+                Some('\\') => {
+                    out.push('\\');
+                    chars.next();
+                }
+                Some('=') => {
+                    out.push('=');
+                    chars.next();
+                }
                 _ => out.push(c),
             }
         } else {
@@ -109,8 +124,12 @@ fn parse_extensions(ext: &str) -> HashMap<String, String> {
     let mut i = 0usize;
     while i < len {
         // Skip whitespace between pairs.
-        while i < len && bytes[i] == b' ' { i += 1; }
-        if i >= len { break; }
+        while i < len && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
         let key_start = i;
         // Read key characters: alpha, digit, underscore.
         while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
@@ -122,7 +141,9 @@ fn parse_extensions(ext: &str) -> HashMap<String, String> {
             i += 1; // skip '='
         } else {
             // Not a valid key=; skip to next space.
-            while i < len && bytes[i] != b' ' { i += 1; }
+            while i < len && bytes[i] != b' ' {
+                i += 1;
+            }
         }
     }
 
@@ -170,12 +191,12 @@ pub fn try_parse(msg: &SyslogMessage) -> Option<CefRecord> {
     };
     Some(CefRecord {
         version,
-        device_vendor:  parts[1].clone(),
+        device_vendor: parts[1].clone(),
         device_product: parts[2].clone(),
         device_version: parts[3].clone(),
-        signature_id:   parts[4].clone(),
-        name:           parts[5].clone(),
-        severity:       parts[6].clone(),
+        signature_id: parts[4].clone(),
+        name: parts[5].clone(),
+        severity: parts[6].clone(),
         extensions,
     })
 }
@@ -187,29 +208,29 @@ mod tests {
 
     fn msg(text: &str) -> SyslogMessage {
         SyslogMessage {
-            priority: 86, severity: 6, facility: 10,
-            timestamp: None, hostname: Some("fw01".into()),
+            priority: 86,
+            severity: 6,
+            facility: 10,
+            timestamp: None,
+            hostname: Some("fw01".into()),
             app_name: Some("ArcSight".into()),
-            proc_id: None, msg_id: None,
+            proc_id: None,
+            msg_id: None,
             message: text.to_string(),
             structured_data: None,
             protocol: SyslogProtocol::Rfc3164,
         }
     }
 
-    const BASIC_CEF: &str =
-        "CEF:0|ArcSight|ArcSight Management Center|2.0|base:system:remotelogin:success|\
+    const BASIC_CEF: &str = "CEF:0|ArcSight|ArcSight Management Center|2.0|base:system:remotelogin:success|\
          Remote Login Success|3|src=10.0.0.1 dst=10.0.0.2 spt=51234 dpt=22";
 
-    const CEF_ESCAPED: &str =
-        r"CEF:0|Vendor|Product|1.0|100|Event with \| pipe and \\ backslash|5|\
+    const CEF_ESCAPED: &str = r"CEF:0|Vendor|Product|1.0|100|Event with \| pipe and \\ backslash|5|\
           msg=value\\with\\backslash cs1=foo\=bar";
 
-    const LEEF_LINE: &str =
-        "LEEF:1.0|Vendor|Product|1.0|EventID|key=value";
+    const LEEF_LINE: &str = "LEEF:1.0|Vendor|Product|1.0|EventID|key=value";
 
-    const NOT_CEF: &str =
-        "type=SYSCALL msg=audit(1609459200.000:1234): syscall=59";
+    const NOT_CEF: &str = "type=SYSCALL msg=audit(1609459200.000:1234): syscall=59";
 
     #[test]
     fn parses_basic_cef_header_and_extensions() {
@@ -221,8 +242,14 @@ mod tests {
         assert_eq!(rec.signature_id, "base:system:remotelogin:success");
         assert_eq!(rec.name, "Remote Login Success");
         assert_eq!(rec.severity, "3");
-        assert_eq!(rec.extensions.get("src").map(|s| s.as_str()), Some("10.0.0.1"));
-        assert_eq!(rec.extensions.get("dst").map(|s| s.as_str()), Some("10.0.0.2"));
+        assert_eq!(
+            rec.extensions.get("src").map(|s| s.as_str()),
+            Some("10.0.0.1")
+        );
+        assert_eq!(
+            rec.extensions.get("dst").map(|s| s.as_str()),
+            Some("10.0.0.2")
+        );
         assert_eq!(rec.extensions.get("spt").map(|s| s.as_str()), Some("51234"));
     }
 
@@ -230,8 +257,11 @@ mod tests {
     fn parses_cef_escaped_pipe_and_backslash() {
         let rec = try_parse(&msg(CEF_ESCAPED)).expect("must parse");
         // Header field containing \| should unescape to literal |
-        assert!(rec.name.contains('|') || rec.name.contains('\\'),
-            "escaped pipe or backslash must survive: {:?}", rec.name);
+        assert!(
+            rec.name.contains('|') || rec.name.contains('\\'),
+            "escaped pipe or backslash must survive: {:?}",
+            rec.name
+        );
         // Extension value: cs1=foo\=bar → value is "foo=bar"
         if let Some(v) = rec.extensions.get("cs1") {
             assert_eq!(v, "foo=bar", "\\= should unescape to =");

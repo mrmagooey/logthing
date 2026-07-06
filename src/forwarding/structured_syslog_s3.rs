@@ -19,15 +19,15 @@ use std::sync::{Arc, LazyLock};
 
 static STRUCTURED_SYSLOG_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
-        Field::new("priority",     DataType::UInt8, false),
-        Field::new("severity",     DataType::UInt8, false),
-        Field::new("facility",     DataType::UInt8, false),
-        Field::new("timestamp",    DataType::Utf8,  true),
-        Field::new("hostname",     DataType::Utf8,  true),
-        Field::new("app_name",     DataType::Utf8,  true),
-        Field::new("received_at",  DataType::Utf8,  false),
-        Field::new("payload_type", DataType::Utf8,  false),
-        Field::new("parsed",       DataType::Utf8,  false),
+        Field::new("priority", DataType::UInt8, false),
+        Field::new("severity", DataType::UInt8, false),
+        Field::new("facility", DataType::UInt8, false),
+        Field::new("timestamp", DataType::Utf8, true),
+        Field::new("hostname", DataType::Utf8, true),
+        Field::new("app_name", DataType::Utf8, true),
+        Field::new("received_at", DataType::Utf8, false),
+        Field::new("payload_type", DataType::Utf8, false),
+        Field::new("parsed", DataType::Utf8, false),
     ]))
 });
 
@@ -43,17 +43,16 @@ pub fn structured_syslog_record_to_batch(
     rec: &StructuredSyslogRecord,
 ) -> anyhow::Result<RecordBatch> {
     let schema = structured_syslog_schema();
-    let priority    = Arc::new(UInt8Array::from(vec![rec.priority]))    as ArrayRef;
-    let severity    = Arc::new(UInt8Array::from(vec![rec.severity]))    as ArrayRef;
-    let facility    = Arc::new(UInt8Array::from(vec![rec.facility]))    as ArrayRef;
-    let timestamp   = Arc::new(StringArray::from(vec![
+    let priority = Arc::new(UInt8Array::from(vec![rec.priority])) as ArrayRef;
+    let severity = Arc::new(UInt8Array::from(vec![rec.severity])) as ArrayRef;
+    let facility = Arc::new(UInt8Array::from(vec![rec.facility])) as ArrayRef;
+    let timestamp = Arc::new(StringArray::from(vec![
         rec.timestamp.as_ref().map(|t| t.to_rfc3339()),
     ])) as ArrayRef;
-    let hostname    = Arc::new(StringArray::from(vec![rec.hostname.clone()]))   as ArrayRef;
-    let app_name    = Arc::new(StringArray::from(vec![rec.app_name.clone()]))   as ArrayRef;
-    let received_at = Arc::new(StringArray::from(vec![
-        Some(rec.received_at.to_rfc3339()),
-    ])) as ArrayRef;
+    let hostname = Arc::new(StringArray::from(vec![rec.hostname.clone()])) as ArrayRef;
+    let app_name = Arc::new(StringArray::from(vec![rec.app_name.clone()])) as ArrayRef;
+    let received_at =
+        Arc::new(StringArray::from(vec![Some(rec.received_at.to_rfc3339())])) as ArrayRef;
     let payload_type = Arc::new(StringArray::from(vec![rec.payload_type])) as ArrayRef;
     let parsed = Arc::new(StringArray::from(vec![
         serde_json::to_string(&rec.parsed).unwrap_or_else(|_| "null".to_string()),
@@ -62,8 +61,15 @@ pub fn structured_syslog_record_to_batch(
     Ok(RecordBatch::try_new(
         schema,
         vec![
-            priority, severity, facility, timestamp, hostname,
-            app_name, received_at, payload_type, parsed,
+            priority,
+            severity,
+            facility,
+            timestamp,
+            hostname,
+            app_name,
+            received_at,
+            payload_type,
+            parsed,
         ],
     )?)
 }
@@ -164,8 +170,12 @@ mod tests {
     #[test]
     fn schema_has_nine_columns() {
         let schema = structured_syslog_schema();
-        assert_eq!(schema.fields().len(), 9,
-            "expected 9 fields, got {}", schema.fields().len());
+        assert_eq!(
+            schema.fields().len(),
+            9,
+            "expected 9 fields, got {}",
+            schema.fields().len()
+        );
     }
 
     #[test]
@@ -207,7 +217,11 @@ mod tests {
 
         assert_eq!(batch.num_rows(), 1);
 
-        let priority = batch.column(0).as_any().downcast_ref::<UInt8Array>().unwrap();
+        let priority = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap();
         assert_eq!(priority.value(0), 134);
 
         let ptype_col = batch.column_by_name("payload_type").unwrap();
@@ -323,12 +337,19 @@ mod tests {
         let shared_stats = std::sync::Arc::new(crate::stats::SourceHourlyStats::new());
 
         let mut writer = PartitionedParquetWriter::with_source_stats(
-            StructuredSyslogSink, s3, bwc, policy, shared_stats.clone(),
+            StructuredSyslogSink,
+            s3,
+            bwc,
+            policy,
+            shared_stats.clone(),
         );
         writer.push(sample_record("cef")).await.unwrap();
 
         let snapshot = shared_stats.snapshot();
-        let row = snapshot.iter().find(|r| r.source == "structured_syslog").unwrap();
+        let row = snapshot
+            .iter()
+            .find(|r| r.source == "structured_syslog")
+            .unwrap();
         let total: u64 = row.hours.iter().map(|h| h.count).sum();
         assert_eq!(total, 1);
     }

@@ -501,7 +501,11 @@ mod tests {
             channel_capacity: 4096,
         };
 
-        let (handler, join_handle) = syslog_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
+        let (handler, join_handle) = syslog_start(
+            &cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
 
         // try_send one message through the handler
         let src: SocketAddr = "127.0.0.1:5514".parse().unwrap();
@@ -546,7 +550,11 @@ mod tests {
         let shared_stats = std::sync::Arc::new(crate::stats::SourceHourlyStats::new());
 
         let mut writer = PartitionedParquetWriter::with_source_stats(
-            SyslogSink, s3, bwc, policy, shared_stats.clone(),
+            SyslogSink,
+            s3,
+            bwc,
+            policy,
+            shared_stats.clone(),
         );
         writer.push(dummy_msg("test")).await.unwrap();
 

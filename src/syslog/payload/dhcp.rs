@@ -28,10 +28,8 @@ static DHCP_FROM_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// DHCPDISCOVER — "from <mac>" with no IP.
 /// Groups: (mac, hostname?, interface?)
 static DHCP_DISCOVER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"^DHCPDISCOVER\s+from\s+([\da-fA-F:]+)(?:\s+\(([^)]+)\))?(?:\s+via\s+(\S+))?",
-    )
-    .unwrap()
+    Regex::new(r"^DHCPDISCOVER\s+from\s+([\da-fA-F:]+)(?:\s+\(([^)]+)\))?(?:\s+via\s+(\S+))?")
+        .unwrap()
 });
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,30 +47,30 @@ pub fn try_parse(msg: &SyslogMessage) -> Option<DhcpRecord> {
     if let Some(caps) = DHCP_ON_RE.captures(m) {
         return Some(DhcpRecord {
             message_type: caps.get(1)?.as_str().to_string(),
-            ip_address:   Some(caps.get(2)?.as_str().to_string()),
-            mac_address:  Some(caps.get(3)?.as_str().to_string()),
-            hostname:     caps.get(4).map(|m| m.as_str().to_string()),
-            interface:    caps.get(5).map(|m| m.as_str().to_string()),
+            ip_address: Some(caps.get(2)?.as_str().to_string()),
+            mac_address: Some(caps.get(3)?.as_str().to_string()),
+            hostname: caps.get(4).map(|m| m.as_str().to_string()),
+            interface: caps.get(5).map(|m| m.as_str().to_string()),
         });
     }
 
     if let Some(caps) = DHCP_FROM_RE.captures(m) {
         return Some(DhcpRecord {
             message_type: caps.get(1)?.as_str().to_string(),
-            ip_address:   Some(caps.get(2)?.as_str().to_string()),
-            mac_address:  Some(caps.get(3)?.as_str().to_string()),
-            hostname:     caps.get(4).map(|m| m.as_str().to_string()),
-            interface:    caps.get(5).map(|m| m.as_str().to_string()),
+            ip_address: Some(caps.get(2)?.as_str().to_string()),
+            mac_address: Some(caps.get(3)?.as_str().to_string()),
+            hostname: caps.get(4).map(|m| m.as_str().to_string()),
+            interface: caps.get(5).map(|m| m.as_str().to_string()),
         });
     }
 
     if let Some(caps) = DHCP_DISCOVER_RE.captures(m) {
         return Some(DhcpRecord {
             message_type: "DHCPDISCOVER".to_string(),
-            ip_address:   None,
-            mac_address:  Some(caps.get(1)?.as_str().to_string()),
-            hostname:     caps.get(2).map(|m| m.as_str().to_string()),
-            interface:    caps.get(3).map(|m| m.as_str().to_string()),
+            ip_address: None,
+            mac_address: Some(caps.get(1)?.as_str().to_string()),
+            hostname: caps.get(2).map(|m| m.as_str().to_string()),
+            interface: caps.get(3).map(|m| m.as_str().to_string()),
         });
     }
 
@@ -86,30 +84,27 @@ mod tests {
 
     fn msg(text: &str) -> SyslogMessage {
         SyslogMessage {
-            priority: 30, severity: 6, facility: 3,
-            timestamp: None, hostname: Some("dhcp-server".into()),
+            priority: 30,
+            severity: 6,
+            facility: 3,
+            timestamp: None,
+            hostname: Some("dhcp-server".into()),
             app_name: Some("dhcpd".into()),
-            proc_id: None, msg_id: None,
+            proc_id: None,
+            msg_id: None,
             message: text.to_string(),
             structured_data: None,
             protocol: SyslogProtocol::Rfc3164,
         }
     }
 
-    const DHCPACK: &str =
-        "DHCPACK on 10.0.0.5 to aa:bb:cc:dd:ee:ff (myhost) via eth0";
-    const DHCPOFFER: &str =
-        "DHCPOFFER on 10.0.0.100 to cc:dd:ee:ff:00:11 via eth1";
-    const DHCPREQUEST: &str =
-        "DHCPREQUEST for 10.0.0.5 from aa:bb:cc:dd:ee:ff (myhost) via eth0";
-    const DHCPDISCOVER: &str =
-        "DHCPDISCOVER from aa:bb:cc:dd:ee:ff (myhost) via eth0";
-    const DHCPRELEASE: &str =
-        "DHCPRELEASE of 10.0.0.5 from aa:bb:cc:dd:ee:ff (myhost) via eth0";
-    const DHCPNAK: &str =
-        "DHCPNAK on 10.0.0.5 to aa:bb:cc:dd:ee:ff";
-    const NOT_DHCP: &str =
-        "Login OK: [alice] (from client vpn port 10)";
+    const DHCPACK: &str = "DHCPACK on 10.0.0.5 to aa:bb:cc:dd:ee:ff (myhost) via eth0";
+    const DHCPOFFER: &str = "DHCPOFFER on 10.0.0.100 to cc:dd:ee:ff:00:11 via eth1";
+    const DHCPREQUEST: &str = "DHCPREQUEST for 10.0.0.5 from aa:bb:cc:dd:ee:ff (myhost) via eth0";
+    const DHCPDISCOVER: &str = "DHCPDISCOVER from aa:bb:cc:dd:ee:ff (myhost) via eth0";
+    const DHCPRELEASE: &str = "DHCPRELEASE of 10.0.0.5 from aa:bb:cc:dd:ee:ff (myhost) via eth0";
+    const DHCPNAK: &str = "DHCPNAK on 10.0.0.5 to aa:bb:cc:dd:ee:ff";
+    const NOT_DHCP: &str = "Login OK: [alice] (from client vpn port 10)";
 
     #[test]
     fn parses_dhcpack() {

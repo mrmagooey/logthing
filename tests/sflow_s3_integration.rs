@@ -28,7 +28,7 @@ fn minio_sflow_config(endpoint: &str) -> SflowS3Config {
                 .unwrap_or_else(|_| "minioadmin".to_string()),
         },
         prefix: "sflow".to_string(),
-        max_buffer_rows: 1,           // flush on first record
+        max_buffer_rows: 1, // flush on first record
         flush_threshold_bytes: 1,
         flush_interval_secs: 3600,
         channel_capacity: 4096,
@@ -48,10 +48,16 @@ fn make_flow_record() -> SflowRecord {
         sampling_rate: Some(512),
         input_ifindex: Some(1),
         output_ifindex: Some(2),
-        if_index: None, if_type: None, if_speed: None, if_direction: None,
-        if_in_octets: None, if_out_octets: None,
-        if_in_ucast_pkts: None, if_out_ucast_pkts: None,
-        if_in_errors: None, if_out_errors: None,
+        if_index: None,
+        if_type: None,
+        if_speed: None,
+        if_direction: None,
+        if_in_octets: None,
+        if_out_octets: None,
+        if_in_ucast_pkts: None,
+        if_out_ucast_pkts: None,
+        if_in_errors: None,
+        if_out_errors: None,
         extra: serde_json::json!([]),
     }
 }
@@ -62,9 +68,14 @@ fn make_counter_record() -> SflowRecord {
         exporter: "10.0.0.1".parse().unwrap(),
         received_at: chrono::Utc::now(),
         // flow-only fields absent for counter records
-        src_addr: None, dst_addr: None, src_port: None, dst_port: None,
-        ip_protocol: None, sampling_rate: None,
-        input_ifindex: None, output_ifindex: None,
+        src_addr: None,
+        dst_addr: None,
+        src_port: None,
+        dst_port: None,
+        ip_protocol: None,
+        sampling_rate: None,
+        input_ifindex: None,
+        output_ifindex: None,
         // counter fields populated
         if_index: Some(7),
         if_type: Some(6),
@@ -96,7 +107,11 @@ async fn sflow_flow_record_appears_as_parquet_in_s3() {
             .await
             .expect("S3Sink::from_connection"),
     );
-    let (handler, _writer_task) = sflow_start(&cfg, sink.clone(), std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()));
+    let (handler, _writer_task) = sflow_start(
+        &cfg,
+        sink.clone(),
+        std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+    );
     let src: std::net::SocketAddr = "127.0.0.1:6343".parse().unwrap();
 
     handler
@@ -110,7 +125,9 @@ async fn sflow_flow_record_appears_as_parquet_in_s3() {
     let credentials = aws_credential_types::Credentials::new(
         cfg.connection.access_key.clone(),
         cfg.connection.secret_key.clone(),
-        None, None, "test",
+        None,
+        None,
+        "test",
     );
     let sdk_cfg = aws_config::from_env()
         .region(region)
@@ -127,7 +144,7 @@ async fn sflow_flow_record_appears_as_parquet_in_s3() {
     let list = s3
         .list_objects_v2()
         .bucket(&cfg.connection.bucket)
-        .prefix("sflow/flow/")   // partitioned by sample_type
+        .prefix("sflow/flow/") // partitioned by sample_type
         .send()
         .await
         .expect("list_objects_v2");
@@ -153,23 +170,33 @@ async fn sflow_flow_record_appears_as_parquet_in_s3() {
     let builder = ParquetRecordBatchReaderBuilder::try_new(buf).expect("parquet builder");
     let schema = builder.schema().clone();
 
-    assert!(schema.field_with_name("src_addr").is_ok(), "schema must have src_addr");
-    assert!(schema.field_with_name("sampling_rate").is_ok(), "schema must have sampling_rate");
+    assert!(
+        schema.field_with_name("src_addr").is_ok(),
+        "schema must have src_addr"
+    );
+    assert!(
+        schema.field_with_name("sampling_rate").is_ok(),
+        "schema must have sampling_rate"
+    );
 
     let mut reader = builder.build().expect("reader");
     let rb = reader.next().expect("batch").expect("ok");
     assert_eq!(rb.num_rows(), 1, "expected exactly 1 row");
 
     use arrow::array::StringArray;
-    let src_col = rb.column_by_name("src_addr").unwrap()
-        .as_any().downcast_ref::<StringArray>().unwrap();
+    let src_col = rb
+        .column_by_name("src_addr")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(src_col.value(0), "192.168.1.10");
 
     // ── counter partition (COUNTER_SCHEMA, 14 fields) ──────────────────────────
     let counter_list = s3
         .list_objects_v2()
         .bucket(&cfg.connection.bucket)
-        .prefix("sflow/counter/")   // partitioned by sample_type
+        .prefix("sflow/counter/") // partitioned by sample_type
         .send()
         .await
         .expect("list_objects_v2 for counter");
@@ -187,7 +214,12 @@ async fn sflow_flow_record_appears_as_parquet_in_s3() {
         .send()
         .await
         .expect("get_object for counter");
-    let counter_bytes = counter_resp.body.collect().await.expect("counter body").into_bytes();
+    let counter_bytes = counter_resp
+        .body
+        .collect()
+        .await
+        .expect("counter body")
+        .into_bytes();
 
     let counter_buf = Bytes::from(counter_bytes.to_vec());
     let counter_builder =
@@ -208,19 +240,34 @@ async fn sflow_flow_record_appears_as_parquet_in_s3() {
     );
 
     let mut counter_reader = counter_builder.build().expect("counter reader");
-    let counter_rb = counter_reader.next().expect("counter batch").expect("counter ok");
+    let counter_rb = counter_reader
+        .next()
+        .expect("counter batch")
+        .expect("counter ok");
     assert_eq!(counter_rb.num_rows(), 1, "expected exactly 1 counter row");
 
     use arrow::array::{UInt32Array, UInt64Array};
-    let if_index_col = counter_rb.column_by_name("if_index").unwrap()
-        .as_any().downcast_ref::<UInt32Array>().unwrap();
+    let if_index_col = counter_rb
+        .column_by_name("if_index")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
     assert_eq!(if_index_col.value(0), 7);
 
-    let if_in_octets_col = counter_rb.column_by_name("if_in_octets").unwrap()
-        .as_any().downcast_ref::<UInt64Array>().unwrap();
+    let if_in_octets_col = counter_rb
+        .column_by_name("if_in_octets")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
     assert_eq!(if_in_octets_col.value(0), 123_456u64);
 
-    let if_out_octets_col = counter_rb.column_by_name("if_out_octets").unwrap()
-        .as_any().downcast_ref::<UInt64Array>().unwrap();
+    let if_out_octets_col = counter_rb
+        .column_by_name("if_out_octets")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
     assert_eq!(if_out_octets_col.value(0), 654_321u64);
 }

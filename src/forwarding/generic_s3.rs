@@ -74,9 +74,7 @@ impl ParquetSink for GenericSink {
         // IMPORTANT: must call .with_timezone("UTC") so the array's DataType
         // matches the schema field's Timestamp(Millisecond, Some("UTC")).
         let time_col = match &record.time {
-            Some(dt) => {
-                TimestampMillisecondArray::from(vec![Some(dt.timestamp_millis())])
-            }
+            Some(dt) => TimestampMillisecondArray::from(vec![Some(dt.timestamp_millis())]),
             None => TimestampMillisecondArray::from(vec![None::<i64>]),
         }
         .with_timezone("UTC");
@@ -87,8 +85,8 @@ impl ParquetSink for GenericSink {
                 .with_timezone("UTC");
 
         // col 4: fields (Utf8, non-null) — JSON-serialized
-        let fields_json = serde_json::to_string(&record.fields)
-            .unwrap_or_else(|_| "{}".to_string());
+        let fields_json =
+            serde_json::to_string(&record.fields).unwrap_or_else(|_| "{}".to_string());
         let fields_col = StringArray::from(vec![fields_json.as_str()]);
 
         RecordBatch::try_new(
@@ -110,8 +108,7 @@ impl ParquetSink for GenericSink {
 // ---------------------------------------------------------------------------
 
 /// `GenericS3Handler` is a thin alias for `ParquetWriterHandle<GenericSink>`.
-pub type GenericS3Handler =
-    crate::forwarding::buffered_writer::ParquetWriterHandle<GenericSink>;
+pub type GenericS3Handler = crate::forwarding::buffered_writer::ParquetWriterHandle<GenericSink>;
 
 /// Construct a `GenericS3Handler` from a `HecS3Config`, a pre-built `S3Sink`,
 /// and the maximum distinct sourcetype partition count.
@@ -299,11 +296,19 @@ mod tests {
         writer.push(make_record("audit_log")).await.ok();
 
         assert_eq!(
-            writer.buffers.get("access_log").map(|b| b.row_count).unwrap_or(0),
+            writer
+                .buffers
+                .get("access_log")
+                .map(|b| b.row_count)
+                .unwrap_or(0),
             2
         );
         assert_eq!(
-            writer.buffers.get("audit_log").map(|b| b.row_count).unwrap_or(0),
+            writer
+                .buffers
+                .get("audit_log")
+                .map(|b| b.row_count)
+                .unwrap_or(0),
             1
         );
     }
@@ -369,8 +374,15 @@ mod tests {
             channel_capacity: 256,
             max_buffer_rows: 100_000,
         };
-        let (handler, join_handle) = hec_start(&cfg, s3, 64, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
-        handler.try_send(make_record("access_log")).expect("send ok");
+        let (handler, join_handle) = hec_start(
+            &cfg,
+            s3,
+            64,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
+        handler
+            .try_send(make_record("access_log"))
+            .expect("send ok");
         drop(handler);
         tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
             .await
@@ -407,7 +419,11 @@ mod tests {
         let shared_stats = std::sync::Arc::new(crate::stats::SourceHourlyStats::new());
 
         let mut writer = PartitionedParquetWriter::with_source_stats(
-            GenericSink, s3, bwc, policy, shared_stats.clone(),
+            GenericSink,
+            s3,
+            bwc,
+            policy,
+            shared_stats.clone(),
         );
         writer.push(make_record("access_log")).await.unwrap();
 

@@ -63,10 +63,10 @@ pub fn map_envelope(record: &SuricataRecord) -> anyhow::Result<RecordBatch> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::suricata::SuricataRecord;
     use arrow::array::StringArray;
     use arrow::datatypes::DataType;
     use chrono::Utc;
-    use crate::suricata::SuricataRecord;
 
     fn make_alert_record() -> SuricataRecord {
         SuricataRecord {
@@ -85,7 +85,8 @@ mod tests {
     fn envelope_schema_has_required_columns() {
         let s = envelope_schema();
         s.field_with_name("event_type").expect("event_type column");
-        s.field_with_name("received_at").expect("received_at column");
+        s.field_with_name("received_at")
+            .expect("received_at column");
         s.field_with_name("src_ip").expect("src_ip column");
         s.field_with_name("payload").expect("payload column");
 
@@ -97,7 +98,10 @@ mod tests {
         assert!(!f.is_nullable(), "event_type must not be nullable");
 
         let f = s.field_with_name("src_ip").unwrap();
-        assert!(f.is_nullable(), "src_ip is opportunistic — must be nullable");
+        assert!(
+            f.is_nullable(),
+            "src_ip is opportunistic — must be nullable"
+        );
     }
 
     #[test]

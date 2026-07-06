@@ -83,8 +83,7 @@ pub fn map_otlp_request(req: ExportLogsServiceRequest, source_host: String) -> V
 
                 // Timestamp: None when time_unix_nano is 0 (OTLP "unset") or
                 // would overflow i64 (after year 2262). No panic path.
-                let time: Option<DateTime<Utc>> =
-                    nanos_to_datetime(log_record.time_unix_nano);
+                let time: Option<DateTime<Utc>> = nanos_to_datetime(log_record.time_unix_nano);
 
                 records.push(GenericRecord {
                     sourcetype: "otlp".to_string(),
@@ -278,7 +277,13 @@ mod tests {
     #[test]
     fn map_otlp_request_sets_sourcetype_and_time() {
         // time_unix_nano = 1_700_000_000_000_000_000 ns = 2023-11-14T22:13:20Z
-        let req = make_request(vec![], vec![], vec![], 1_700_000_000_000_000_000, "hello world");
+        let req = make_request(
+            vec![],
+            vec![],
+            vec![],
+            1_700_000_000_000_000_000,
+            "hello world",
+        );
         let records = map_otlp_request(req, "10.0.0.1".to_string());
         assert_eq!(records.len(), 1);
         let r = &records[0];
@@ -286,12 +291,20 @@ mod tests {
         // host is Option<String> — the REAL GenericRecord type
         assert_eq!(r.host.as_deref(), Some("10.0.0.1"));
         // time is Option<DateTime<Utc>> — the REAL GenericRecord type
-        let t = r.time.expect("time must be Some for non-zero time_unix_nano");
+        let t = r
+            .time
+            .expect("time must be Some for non-zero time_unix_nano");
         assert!(t.timestamp() > 0, "timestamp must be after epoch");
         // body field
-        assert_eq!(r.fields.get("body").and_then(|v| v.as_str()), Some("hello world"));
+        assert_eq!(
+            r.fields.get("body").and_then(|v| v.as_str()),
+            Some("hello world")
+        );
         // severity
-        assert_eq!(r.fields.get("severity_text").and_then(|v| v.as_str()), Some("INFO"));
+        assert_eq!(
+            r.fields.get("severity_text").and_then(|v| v.as_str()),
+            Some("INFO")
+        );
     }
 
     // ── Test 2: resource + scope + log attribute flattening ─────────────────

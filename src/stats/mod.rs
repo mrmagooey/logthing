@@ -313,7 +313,8 @@ mod tests {
         stats.record("syslog", 2);
 
         let snapshot = stats.snapshot();
-        let mut by_source: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut by_source: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
         for row in snapshot {
             let total: u64 = row.hours.iter().map(|h| h.count).sum();
             by_source.insert(row.source, total);
@@ -330,7 +331,11 @@ mod tests {
 
         let snapshot = stats.snapshot();
         let row = snapshot.iter().find(|r| r.source == "zeek").unwrap();
-        assert_eq!(row.hours.len(), 1, "expected exactly one hour bucket so far");
+        assert_eq!(
+            row.hours.len(),
+            1,
+            "expected exactly one hour bucket so far"
+        );
         assert_eq!(row.hours[0].count, 7);
     }
 
@@ -349,7 +354,11 @@ mod tests {
         }
         let snapshot = stats.snapshot();
         let row = snapshot.iter().find(|r| r.source == "wef").unwrap();
-        assert_eq!(row.hours.len(), 1, "same-hour records coalesce into one bucket");
+        assert_eq!(
+            row.hours.len(),
+            1,
+            "same-hour records coalesce into one bucket"
+        );
         assert_eq!(row.hours[0].count, 100);
     }
 

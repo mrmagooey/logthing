@@ -127,9 +127,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sink = LocalDiskSink::new(dir.path().to_path_buf()).await.unwrap();
 
-        sink.upload("zeek/conn/year=2026/month=07/day=04/abc.parquet", b"hello".to_vec())
-            .await
-            .unwrap();
+        sink.upload(
+            "zeek/conn/year=2026/month=07/day=04/abc.parquet",
+            b"hello".to_vec(),
+        )
+        .await
+        .unwrap();
 
         let written = dir
             .path()
@@ -159,7 +162,11 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(entries, vec!["f.parquet".to_string()], "no stray .tmp file: {entries:?}");
+        assert_eq!(
+            entries,
+            vec!["f.parquet".to_string()],
+            "no stray .tmp file: {entries:?}"
+        );
     }
 
     #[tokio::test]
@@ -195,14 +202,14 @@ mod tests {
         // Only the second, filesystem-aware check can catch it.
         let root_dir = tempfile::tempdir().unwrap();
         let outside_dir = tempfile::tempdir().unwrap();
-        let sink = LocalDiskSink::new(root_dir.path().to_path_buf()).await.unwrap();
+        let sink = LocalDiskSink::new(root_dir.path().to_path_buf())
+            .await
+            .unwrap();
 
         // `root/escape` is a symlink pointing outside `root` entirely.
         std::os::unix::fs::symlink(outside_dir.path(), root_dir.path().join("escape")).unwrap();
 
-        let result = sink
-            .upload("escape/sub/leak.parquet", b"x".to_vec())
-            .await;
+        let result = sink.upload("escape/sub/leak.parquet", b"x".to_vec()).await;
         assert!(
             result.is_err(),
             "must reject a key whose parent resolves outside root via a symlink"
@@ -225,7 +232,9 @@ mod tests {
         // caught before any filesystem mutation happens outside root.
         let root_dir = tempfile::tempdir().unwrap();
         let outside_dir = tempfile::tempdir().unwrap();
-        let sink = LocalDiskSink::new(root_dir.path().to_path_buf()).await.unwrap();
+        let sink = LocalDiskSink::new(root_dir.path().to_path_buf())
+            .await
+            .unwrap();
 
         // `root/escape` is a symlink pointing outside `root`; the deeper
         // `sub/deep` path the key implies does not exist under it yet.

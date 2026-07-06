@@ -11,9 +11,9 @@ pub mod parse;
 pub use handlers::{HecQueryParams, handle_hec_event, handle_hec_raw, handle_ndjson};
 pub use parse::{parse_hec_event_body, parse_hec_raw_body, parse_ndjson_body};
 
+use crate::forwarding::generic_s3::GenericS3Handler;
 use chrono::{DateTime, Utc};
 use subtle::ConstantTimeEq;
-use crate::forwarding::generic_s3::GenericS3Handler;
 
 /// Unified envelope record produced by all three HEC/NDJSON ingest routes.
 ///
@@ -131,12 +131,18 @@ mod tests {
 
     #[test]
     fn check_hec_token_accepts_valid_token() {
-        assert!(check_hec_token(Some("Splunk my-secret-token"), "my-secret-token"));
+        assert!(check_hec_token(
+            Some("Splunk my-secret-token"),
+            "my-secret-token"
+        ));
     }
 
     #[test]
     fn check_hec_token_rejects_wrong_token() {
-        assert!(!check_hec_token(Some("Splunk wrong-token"), "my-secret-token"));
+        assert!(!check_hec_token(
+            Some("Splunk wrong-token"),
+            "my-secret-token"
+        ));
     }
 
     #[test]
@@ -147,7 +153,10 @@ mod tests {
     #[test]
     fn check_hec_token_rejects_wrong_scheme() {
         // Must start with "Splunk " — Bearer or Basic are rejected.
-        assert!(!check_hec_token(Some("Bearer my-secret-token"), "my-secret-token"));
+        assert!(!check_hec_token(
+            Some("Bearer my-secret-token"),
+            "my-secret-token"
+        ));
         assert!(!check_hec_token(Some("my-secret-token"), "my-secret-token"));
     }
 
@@ -161,6 +170,9 @@ mod tests {
     #[test]
     fn check_hec_token_constant_time_mismatched_lengths_reject() {
         // Different lengths must reject without panicking.
-        assert!(!check_hec_token(Some("Splunk short"), "a-much-longer-token-value"));
+        assert!(!check_hec_token(
+            Some("Splunk short"),
+            "a-much-longer-token-value"
+        ));
     }
 }

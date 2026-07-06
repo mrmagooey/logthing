@@ -278,7 +278,9 @@ mod tests {
 
     impl CapturingHandler {
         fn new() -> Arc<Self> {
-            Arc::new(Self { records: Mutex::new(Vec::new()) })
+            Arc::new(Self {
+                records: Mutex::new(Vec::new()),
+            })
         }
         fn take_records(&self) -> Vec<SuricataRecord> {
             self.records.lock().unwrap().drain(..).collect()
@@ -352,7 +354,10 @@ mod tests {
         sleep(Duration::from_millis(50)).await;
         shutdown_tx.send(true).unwrap();
         let result = timeout(Duration::from_secs(2), task).await;
-        assert!(result.is_ok(), "start_with_shutdown did not return within 2s");
+        assert!(
+            result.is_ok(),
+            "start_with_shutdown did not return within 2s"
+        );
     }
 
     // -- Integration: TCP listener receives records --
@@ -383,7 +388,12 @@ mod tests {
         task.abort();
 
         let records = handler.take_records();
-        assert_eq!(records.len(), 2, "expected 2 records, got {}", records.len());
+        assert_eq!(
+            records.len(),
+            2,
+            "expected 2 records, got {}",
+            records.len()
+        );
         assert_eq!(records[0].event_type, "alert");
         assert_eq!(records[1].event_type, "flow");
     }
@@ -413,7 +423,11 @@ mod tests {
         task.abort();
 
         let records = handler.take_records();
-        assert_eq!(records.len(), 1, "only the valid record should be dispatched");
+        assert_eq!(
+            records.len(),
+            1,
+            "only the valid record should be dispatched"
+        );
         assert_eq!(records[0].event_type, "dns");
     }
 
@@ -430,7 +444,10 @@ mod tests {
         sleep(Duration::from_millis(20)).await;
 
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        stream.write_all(b"{\"src_ip\":\"9.9.9.9\"}\n").await.unwrap();
+        stream
+            .write_all(b"{\"src_ip\":\"9.9.9.9\"}\n")
+            .await
+            .unwrap();
         drop(stream);
 
         sleep(Duration::from_millis(150)).await;
@@ -472,7 +489,12 @@ mod tests {
         task.abort();
 
         let records = handler.take_records();
-        assert_eq!(records.len(), 3, "expected 3 records, got {}", records.len());
+        assert_eq!(
+            records.len(),
+            3,
+            "expected 3 records, got {}",
+            records.len()
+        );
 
         let event_types: Vec<&str> = records.iter().map(|r| r.event_type.as_str()).collect();
         assert_eq!(event_types, vec!["alert", "flow", "dns"]);
@@ -561,12 +583,18 @@ mod tests {
             stream.read_to_end(&mut sink).await
         })
         .await;
-        assert!(result.is_ok(), "server did not close oversized connection within 2s");
+        assert!(
+            result.is_ok(),
+            "server did not close oversized connection within 2s"
+        );
 
         sleep(Duration::from_millis(50)).await;
         task.abort();
 
-        assert!(handler.take_records().is_empty(), "oversized input must not produce a record");
+        assert!(
+            handler.take_records().is_empty(),
+            "oversized input must not produce a record"
+        );
 
         let snapshot = snapshotter.snapshot();
         let map = snapshot.into_hashmap();
@@ -577,9 +605,16 @@ mod tests {
         let count = map
             .get(&key)
             .map(|(_, _, v)| {
-                if let metrics_util::debugging::DebugValue::Counter(c) = v { *c } else { 0 }
+                if let metrics_util::debugging::DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
             })
             .unwrap_or(0);
-        assert_eq!(count, 1, "suricata_oversized_lines counter must be 1; got {count}");
+        assert_eq!(
+            count, 1,
+            "suricata_oversized_lines counter must be 1; got {count}"
+        );
     }
 }

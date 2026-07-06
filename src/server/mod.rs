@@ -176,8 +176,11 @@ impl Server {
             {
                 Ok(sink) => {
                     info!("Initialized WEF Parquet S3 forwarder (generic buffered writer)");
-                    let (handle, join_handle) =
-                        crate::forwarding::parquet_s3::wef_start(wef_s3_cfg, Arc::new(sink), source_stats.clone());
+                    let (handle, join_handle) = crate::forwarding::parquet_s3::wef_start(
+                        wef_s3_cfg,
+                        Arc::new(sink),
+                        source_stats.clone(),
+                    );
                     (Some(handle), Some(join_handle))
                 }
                 Err(e) => {
@@ -214,7 +217,12 @@ impl Server {
                             config.hec.max_sourcetype_partitions,
                             source_stats.clone(),
                         );
-                        (IngestState { generic_s3: Some(handler) }, Some(join_handle))
+                        (
+                            IngestState {
+                                generic_s3: Some(handler),
+                            },
+                            Some(join_handle),
+                        )
                     }
                     Err(e) => {
                         error!("Failed to create S3Sink for HEC ingest: {e}");
@@ -1728,11 +1736,11 @@ mod tests {
     /// Helper: build a minimal router with the three HEC routes and the same
     /// body-size limit used in production, for route-level unit testing.
     async fn build_hec_router(token: &str) -> axum::Router {
-        use axum::{Extension, Router, routing::post};
         use crate::ingest::{
             IngestState,
             handlers::{handle_hec_event, handle_hec_raw, handle_ndjson},
         };
+        use axum::{Extension, Router, routing::post};
         use std::sync::Arc;
 
         let cfg_token = Arc::new(token.to_string());
@@ -1849,9 +1857,14 @@ mod tests {
     async fn build_server(config: Config) -> Server {
         let shared = Arc::new(RwLock::new(config.clone()));
         let throughput = Arc::new(ThroughputStats::new());
-        Server::new(config, shared, throughput, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()))
-            .await
-            .expect("Server::new must succeed")
+        Server::new(
+            config,
+            shared,
+            throughput,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        )
+        .await
+        .expect("Server::new must succeed")
     }
 
     /// Inject a `ConnectInfo` extension so the ip_whitelist middleware (which
@@ -1908,10 +1921,7 @@ mod tests {
             .create_router(IpWhitelist::empty())
             .expect("router builds");
 
-        for uri in [
-            "/services/collector/event",
-            "/services/collector/raw",
-        ] {
+        for uri in ["/services/collector/event", "/services/collector/raw"] {
             let req = with_connect_info(
                 HttpRequest::builder()
                     .method("POST")
@@ -2014,13 +2024,15 @@ mod tests {
     #[cfg(feature = "otlp")]
     mod otlp_handler_tests {
         use super::*;
+        use crate::config::OtlpConfig;
         use axum::body::Body;
         use axum::http::Request as HttpRequest;
-        use crate::config::OtlpConfig;
         use opentelemetry_proto::tonic::collector::logs::v1::{
             ExportLogsServiceRequest, ExportLogsServiceResponse,
         };
-        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value as AnyVal};
+        use opentelemetry_proto::tonic::common::v1::{
+            AnyValue, KeyValue, any_value::Value as AnyVal,
+        };
         use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
         use opentelemetry_proto::tonic::resource::v1::Resource;
         use prost::Message as ProstMessage;
@@ -2094,7 +2106,9 @@ mod tests {
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
 
-            let body_bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+            let body_bytes = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
             let _resp = ExportLogsServiceResponse::decode(body_bytes.as_ref())
                 .expect("response must be valid protobuf ExportLogsServiceResponse");
         }
@@ -2104,8 +2118,9 @@ mod tests {
         #[tokio::test]
         async fn handle_otlp_logs_json_returns_200() {
             let app = build_otlp_app(None).await;
-            let json_body = serde_json::to_vec(&make_proto_request())
-                .expect("ExportLogsServiceRequest must be serde-serializable via with-serde feature");
+            let json_body = serde_json::to_vec(&make_proto_request()).expect(
+                "ExportLogsServiceRequest must be serde-serializable via with-serde feature",
+            );
 
             let request = super::with_connect_info(
                 HttpRequest::builder()
@@ -2219,7 +2234,9 @@ mod tests {
                     .method("POST")
                     .uri("/v1/logs")
                     .header("content-type", "application/x-protobuf")
-                    .body(Body::from(b"\xFF\xFE\xFD garbage not valid protobuf".as_ref()))
+                    .body(Body::from(
+                        b"\xFF\xFE\xFD garbage not valid protobuf".as_ref(),
+                    ))
                     .unwrap(),
             );
 
@@ -2551,7 +2568,9 @@ pub async fn handle_otlp_logs(
     // ── Bearer auth check ─────────────────────────────────────────────────
     {
         let cfg = app_state.config.read().await;
-        if let Some(ref expected_token) = cfg.otlp.bearer_token && !expected_token.is_empty() {
+        if let Some(ref expected_token) = cfg.otlp.bearer_token
+            && !expected_token.is_empty()
+        {
             let provided = headers
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok())
@@ -2577,26 +2596,21 @@ pub async fn handle_otlp_logs(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let req: ExportLogsServiceRequest = if ct.starts_with("application/x-protobuf")
-        || ct.starts_with("application/protobuf")
-    {
-        ExportLogsServiceRequest::decode(body.as_ref()).map_err(|e| {
-            warn!("OTLP protobuf decode error from {}: {e}", addr.ip());
-            StatusCode::BAD_REQUEST
-        })?
-    } else if ct.starts_with("application/json") {
-        serde_json::from_slice::<ExportLogsServiceRequest>(&body).map_err(|e| {
-            warn!("OTLP JSON decode error from {}: {e}", addr.ip());
-            StatusCode::BAD_REQUEST
-        })?
-    } else {
-        warn!(
-            "OTLP unsupported Content-Type '{}' from {}",
-            ct,
-            addr.ip()
-        );
-        return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    };
+    let req: ExportLogsServiceRequest =
+        if ct.starts_with("application/x-protobuf") || ct.starts_with("application/protobuf") {
+            ExportLogsServiceRequest::decode(body.as_ref()).map_err(|e| {
+                warn!("OTLP protobuf decode error from {}: {e}", addr.ip());
+                StatusCode::BAD_REQUEST
+            })?
+        } else if ct.starts_with("application/json") {
+            serde_json::from_slice::<ExportLogsServiceRequest>(&body).map_err(|e| {
+                warn!("OTLP JSON decode error from {}: {e}", addr.ip());
+                StatusCode::BAD_REQUEST
+            })?
+        } else {
+            warn!("OTLP unsupported Content-Type '{}' from {}", ct, addr.ip());
+            return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        };
 
     // ── Map to GenericRecords ─────────────────────────────────────────────
     let source_host = addr.ip().to_string();
@@ -2625,8 +2639,8 @@ pub async fn handle_otlp_logs(
 
     // ── Respond in the same encoding as the request ───────────────────────
     let (resp_bytes, response_ct) = if ct.starts_with("application/json") {
-        let json_bytes = serde_json::to_vec(&ExportLogsServiceResponse::default())
-            .unwrap_or_default();
+        let json_bytes =
+            serde_json::to_vec(&ExportLogsServiceResponse::default()).unwrap_or_default();
         (json_bytes, "application/json")
     } else {
         let proto_bytes = ExportLogsServiceResponse::default().encode_to_vec();

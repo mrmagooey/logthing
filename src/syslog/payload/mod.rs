@@ -39,28 +39,28 @@ impl SyslogPayload {
     /// Returns `None` for `SyslogPayload::None` (caller must gate on this).
     pub fn payload_type(&self) -> Option<&'static str> {
         match self {
-            SyslogPayload::Cef(_)       => Some("cef"),
-            SyslogPayload::Leef(_)      => Some("leef"),
-            SyslogPayload::Auditd(_)    => Some("auditd"),
-            SyslogPayload::Dhcp(_)      => Some("dhcp"),
-            SyslogPayload::Radius(_)    => Some("radius"),
+            SyslogPayload::Cef(_) => Some("cef"),
+            SyslogPayload::Leef(_) => Some("leef"),
+            SyslogPayload::Auditd(_) => Some("auditd"),
+            SyslogPayload::Dhcp(_) => Some("dhcp"),
+            SyslogPayload::Radius(_) => Some("radius"),
             SyslogPayload::WebAccess(_) => Some("web_access"),
-            SyslogPayload::Dns(_)       => Some("dns"),
-            SyslogPayload::None         => Option::None,
+            SyslogPayload::Dns(_) => Some("dns"),
+            SyslogPayload::None => Option::None,
         }
     }
 
     /// Serialize the inner parsed struct to a JSON `Value`.
     pub fn to_json(&self) -> Value {
         match self {
-            SyslogPayload::Cef(r)       => serde_json::to_value(r).unwrap_or(Value::Null),
-            SyslogPayload::Leef(r)      => serde_json::to_value(r).unwrap_or(Value::Null),
-            SyslogPayload::Auditd(r)    => serde_json::to_value(r).unwrap_or(Value::Null),
-            SyslogPayload::Dhcp(r)      => serde_json::to_value(r).unwrap_or(Value::Null),
-            SyslogPayload::Radius(r)    => serde_json::to_value(r).unwrap_or(Value::Null),
+            SyslogPayload::Cef(r) => serde_json::to_value(r).unwrap_or(Value::Null),
+            SyslogPayload::Leef(r) => serde_json::to_value(r).unwrap_or(Value::Null),
+            SyslogPayload::Auditd(r) => serde_json::to_value(r).unwrap_or(Value::Null),
+            SyslogPayload::Dhcp(r) => serde_json::to_value(r).unwrap_or(Value::Null),
+            SyslogPayload::Radius(r) => serde_json::to_value(r).unwrap_or(Value::Null),
             SyslogPayload::WebAccess(r) => serde_json::to_value(r).unwrap_or(Value::Null),
-            SyslogPayload::Dns(r)       => serde_json::to_value(r).unwrap_or(Value::Null),
-            SyslogPayload::None         => Value::Null,
+            SyslogPayload::Dns(r) => serde_json::to_value(r).unwrap_or(Value::Null),
+            SyslogPayload::None => Value::Null,
         }
     }
 }
@@ -86,10 +86,7 @@ pub struct StructuredSyslogRecord {
 impl StructuredSyslogRecord {
     /// Build from a `SyslogMessage` and a matched `SyslogPayload`.
     /// Returns `None` when `payload` is `SyslogPayload::None`.
-    pub fn from_syslog_and_payload(
-        msg: &SyslogMessage,
-        payload: &SyslogPayload,
-    ) -> Option<Self> {
+    pub fn from_syslog_and_payload(msg: &SyslogMessage, payload: &SyslogPayload) -> Option<Self> {
         let payload_type = payload.payload_type()?;
         Some(Self {
             priority: msg.priority,
@@ -130,11 +127,11 @@ pub fn dispatch(msg: &SyslogMessage) -> SyslogPayload {
         };
     }
 
-    try_parser!(Cef,       cef);
-    try_parser!(Leef,      leef);
-    try_parser!(Auditd,    auditd);
-    try_parser!(Dhcp,      dhcp);
-    try_parser!(Radius,    radius);
+    try_parser!(Cef, cef);
+    try_parser!(Leef, leef);
+    try_parser!(Auditd, auditd);
+    try_parser!(Dhcp, dhcp);
+    try_parser!(Radius, radius);
     try_parser!(WebAccess, web_access);
 
     if let Some(r) = crate::syslog::dns::DnsLogEntry::from_syslog(msg) {
@@ -168,9 +165,7 @@ mod tests {
 
     #[test]
     fn dispatch_cef_message_returns_cef_variant() {
-        let m = bare_msg(
-            "CEF:0|Vendor|Product|1.0|100|Login|5|src=10.0.0.1 dst=10.0.0.2",
-        );
+        let m = bare_msg("CEF:0|Vendor|Product|1.0|100|Login|5|src=10.0.0.1 dst=10.0.0.2");
         let p = dispatch(&m);
         assert!(
             matches!(p, SyslogPayload::Cef(_)),
@@ -213,9 +208,7 @@ mod tests {
 
     #[test]
     fn dispatch_dns_bind_returns_dns_variant() {
-        let m = bare_msg(
-            "client 192.168.1.10#12345: query: example.com IN A + (93.184.216.34)",
-        );
+        let m = bare_msg("client 192.168.1.10#12345: query: example.com IN A + (93.184.216.34)");
         assert!(matches!(dispatch(&m), SyslogPayload::Dns(_)));
     }
 
@@ -226,8 +219,12 @@ mod tests {
         assert_eq!(
             SyslogPayload::Dhcp(crate::syslog::payload::dhcp::DhcpRecord {
                 message_type: "DHCPACK".into(),
-                ip_address: None, mac_address: None, hostname: None, interface: None,
-            }).payload_type(),
+                ip_address: None,
+                mac_address: None,
+                hostname: None,
+                interface: None,
+            })
+            .payload_type(),
             Some("dhcp")
         );
     }

@@ -102,7 +102,9 @@ mod otlp_e2e {
     /// Bind to an ephemeral port, spin up the OTLP router, and return the
     /// base URL + join handle.  The listener is bound *before* spawn so the
     /// port is immediately known and no race exists.
-    async fn start_test_server(bearer_token: Option<String>) -> (String, tokio::task::JoinHandle<()>) {
+    async fn start_test_server(
+        bearer_token: Option<String>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let app_state = build_app_state(bearer_token).await;
         let ingest_state = IngestState { generic_s3: None };
 

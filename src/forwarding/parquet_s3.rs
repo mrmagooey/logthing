@@ -284,7 +284,11 @@ mod tests {
             channel_capacity: 256,
             max_buffer_rows: 100_000,
         };
-        let (handle, jh) = wef_start(&cfg, s3, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
+        let (handle, jh) = wef_start(
+            &cfg,
+            s3,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
 
         // Send a parsed event — should be accepted
         let event = make_parsed_event(4624);
@@ -391,7 +395,11 @@ mod tests {
         let shared_stats = std::sync::Arc::new(crate::stats::SourceHourlyStats::new());
 
         let mut writer = PartitionedParquetWriter::with_source_stats(
-            WefSink, s3, bwc, policy, shared_stats.clone(),
+            WefSink,
+            s3,
+            bwc,
+            policy,
+            shared_stats.clone(),
         );
         writer.push(make_parsed_event(4624)).await.unwrap();
 

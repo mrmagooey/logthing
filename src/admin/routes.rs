@@ -707,8 +707,7 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let rows: Vec<crate::stats::SourceHourlySnapshot> =
-            serde_json::from_slice(&body).unwrap();
+        let rows: Vec<crate::stats::SourceHourlySnapshot> = serde_json::from_slice(&body).unwrap();
         let syslog_row = rows.iter().find(|r| r.source == "syslog").unwrap();
         let total: u64 = syslog_row.hours.iter().map(|h| h.count).sum();
         assert_eq!(total, 5);
@@ -777,7 +776,10 @@ mod tests {
                 schema: &Arc<arrow_schema::Schema>,
             ) -> anyhow::Result<arrow_array::RecordBatch> {
                 let col = Arc::new(arrow_array::StringArray::from(vec![record.as_str()]));
-                Ok(arrow_array::RecordBatch::try_new(schema.clone(), vec![col])?)
+                Ok(arrow_array::RecordBatch::try_new(
+                    schema.clone(),
+                    vec![col],
+                )?)
             }
         }
 

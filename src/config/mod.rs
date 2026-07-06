@@ -381,9 +381,15 @@ impl Default for SuricataConfig {
     }
 }
 
-fn default_suricata_enabled() -> bool { false }
-fn default_suricata_tcp_port() -> u16 { 47761 }
-fn default_suricata_bind_address() -> String { "0.0.0.0".to_string() }
+fn default_suricata_enabled() -> bool {
+    false
+}
+fn default_suricata_tcp_port() -> u16 {
+    47761
+}
+fn default_suricata_bind_address() -> String {
+    "0.0.0.0".to_string()
+}
 
 /// Per-source S3 persistence config for the Suricata listener.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -402,11 +408,21 @@ pub struct SuricataS3Config {
     pub max_buffer_rows: usize,
 }
 
-fn default_suricata_s3_prefix() -> String { "suricata".to_string() }
-fn default_suricata_flush_bytes() -> usize { 100 * 1024 * 1024 }
-fn default_suricata_flush_secs() -> u64 { 900 }
-fn default_suricata_channel_capacity() -> usize { 256 }
-fn default_suricata_max_buffer_rows() -> usize { 100_000 }
+fn default_suricata_s3_prefix() -> String {
+    "suricata".to_string()
+}
+fn default_suricata_flush_bytes() -> usize {
+    100 * 1024 * 1024
+}
+fn default_suricata_flush_secs() -> u64 {
+    900
+}
+fn default_suricata_channel_capacity() -> usize {
+    256
+}
+fn default_suricata_max_buffer_rows() -> usize {
+    100_000
+}
 
 /// Per-source S3 persistence config for WEF (Windows Event Forwarding).
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -476,11 +492,21 @@ pub struct HecS3Config {
     pub max_buffer_rows: usize,
 }
 
-fn default_hec_s3_prefix() -> String { "hec".to_string() }
-fn default_hec_flush_bytes() -> usize { 100 * 1024 * 1024 }
-fn default_hec_flush_secs() -> u64 { 900 }
-fn default_hec_channel_capacity() -> usize { 256 }
-fn default_hec_max_buffer_rows() -> usize { 100_000 }
+fn default_hec_s3_prefix() -> String {
+    "hec".to_string()
+}
+fn default_hec_flush_bytes() -> usize {
+    100 * 1024 * 1024
+}
+fn default_hec_flush_secs() -> u64 {
+    900
+}
+fn default_hec_channel_capacity() -> usize {
+    256
+}
+fn default_hec_max_buffer_rows() -> usize {
+    100_000
+}
 
 /// Top-level `[hec]` config section.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -500,8 +526,12 @@ pub struct HecConfig {
     pub s3: Option<HecS3Config>,
 }
 
-fn default_hec_enabled() -> bool { false }
-fn default_hec_max_sourcetype_partitions() -> usize { 64 }
+fn default_hec_enabled() -> bool {
+    false
+}
+fn default_hec_max_sourcetype_partitions() -> usize {
+    64
+}
 
 impl Default for HecConfig {
     fn default() -> Self {
@@ -649,9 +679,15 @@ impl Default for SflowConfig {
     }
 }
 
-fn default_sflow_enabled() -> bool { false }
-fn default_sflow_udp_port() -> u16  { 6343 }
-fn default_sflow_bind_address() -> String { "0.0.0.0".to_string() }
+fn default_sflow_enabled() -> bool {
+    false
+}
+fn default_sflow_udp_port() -> u16 {
+    6343
+}
+fn default_sflow_bind_address() -> String {
+    "0.0.0.0".to_string()
+}
 
 /// Per-source S3 persistence config for the sFlow listener.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -670,11 +706,21 @@ pub struct SflowS3Config {
     pub max_buffer_rows: usize,
 }
 
-fn default_sflow_s3_prefix()          -> String { "sflow".to_string() }
-fn default_sflow_flush_bytes()         -> usize  { 100 * 1024 * 1024 }
-fn default_sflow_flush_secs()          -> u64    { 900 }
-fn default_sflow_channel_capacity()    -> usize  { 256 }
-fn default_sflow_max_buffer_rows()     -> usize  { 100_000 }
+fn default_sflow_s3_prefix() -> String {
+    "sflow".to_string()
+}
+fn default_sflow_flush_bytes() -> usize {
+    100 * 1024 * 1024
+}
+fn default_sflow_flush_secs() -> u64 {
+    900
+}
+fn default_sflow_channel_capacity() -> usize {
+    256
+}
+fn default_sflow_max_buffer_rows() -> usize {
+    100_000
+}
 
 impl Default for SyslogConfig {
     fn default() -> Self {
@@ -1037,7 +1083,10 @@ channel_capacity = 512
 max_buffer_rows = 50000
 "#;
         let cfg: ZeekLocalConfig = toml::from_str(toml_str).expect("deserialize");
-        assert_eq!(cfg.directory, std::path::PathBuf::from("/var/log/logthing/zeek"));
+        assert_eq!(
+            cfg.directory,
+            std::path::PathBuf::from("/var/log/logthing/zeek")
+        );
         assert_eq!(cfg.prefix, "zeek");
         assert_eq!(cfg.flush_threshold_bytes, 52_428_800);
         assert_eq!(cfg.flush_interval_secs, 300);
@@ -1073,8 +1122,14 @@ secret_key = "s"
 directory = "/data/zeek"
 "#;
         let cfg: Config = toml::from_str(toml_str).expect("deserialize");
-        assert!(cfg.zeek.s3.is_some(), "s3 must deserialize when both present");
-        assert!(cfg.zeek.local.is_some(), "local must deserialize when both present");
+        assert!(
+            cfg.zeek.s3.is_some(),
+            "s3 must deserialize when both present"
+        );
+        assert!(
+            cfg.zeek.local.is_some(),
+            "local must deserialize when both present"
+        );
     }
 
     #[test]
@@ -1193,7 +1248,10 @@ secret_key = "secret"
         assert!(!cfg.suricata.enabled, "suricata disabled by default");
         assert_eq!(cfg.suricata.tcp_port, 47761);
         assert_eq!(cfg.suricata.bind_address, "0.0.0.0");
-        assert!(cfg.suricata.s3.is_none(), "absent [suricata.s3] must be None");
+        assert!(
+            cfg.suricata.s3.is_none(),
+            "absent [suricata.s3] must be None"
+        );
     }
 
     #[test]
@@ -1224,7 +1282,10 @@ secret_key = "SECRET"
     fn suricata_s3_absent_section_means_no_persistence() {
         let toml_str = "[suricata]\nenabled = true\n";
         let cfg: Config = toml::from_str(toml_str).expect("parse");
-        assert!(cfg.suricata.s3.is_none(), "absent [suricata.s3] must yield None");
+        assert!(
+            cfg.suricata.s3.is_none(),
+            "absent [suricata.s3] must yield None"
+        );
     }
 
     #[test]
@@ -1267,15 +1328,19 @@ secret_key = "SECRET"
     #[test]
     fn syslog_parse_payloads_defaults_to_false() {
         let cfg = Config::default();
-        assert!(!cfg.syslog.parse_payloads,
-            "parse_payloads must default to false");
+        assert!(
+            !cfg.syslog.parse_payloads,
+            "parse_payloads must default to false"
+        );
     }
 
     #[test]
     fn syslog_structured_s3_absent_gives_none() {
         let cfg = Config::default();
-        assert!(cfg.syslog.structured_s3.is_none(),
-            "structured_s3 must default to None");
+        assert!(
+            cfg.syslog.structured_s3.is_none(),
+            "structured_s3 must default to None"
+        );
     }
 
     #[test]
@@ -1342,7 +1407,10 @@ secret_key = "SSECRET"
     #[test]
     fn sflow_is_disabled_by_default_in_main_config() {
         let cfg = Config::default();
-        assert!(!cfg.sflow.enabled, "sflow must be opt-in (enabled=false by default)");
+        assert!(
+            !cfg.sflow.enabled,
+            "sflow must be opt-in (enabled=false by default)"
+        );
     }
 
     #[test]
@@ -1394,7 +1462,10 @@ secret_key = "SECRET"
     fn otlp_config_defaults_disabled_no_token() {
         let cfg = Config::default();
         assert!(!cfg.otlp.enabled, "otlp must be opt-in (default false)");
-        assert!(cfg.otlp.bearer_token.is_none(), "no bearer_token by default");
+        assert!(
+            cfg.otlp.bearer_token.is_none(),
+            "no bearer_token by default"
+        );
     }
 
     #[test]

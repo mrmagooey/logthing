@@ -9,9 +9,7 @@
 //! No MinIO required — uses a capturing store instead of a real S3 handler.
 
 use logthing::syslog::SyslogMessage;
-use logthing::syslog::listener::{
-    SyslogHandler, SyslogListener, SyslogListenerConfig,
-};
+use logthing::syslog::listener::{SyslogHandler, SyslogListener, SyslogListenerConfig};
 use logthing::syslog::payload::{StructuredSyslogRecord, dispatch};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -25,7 +23,9 @@ struct CapturingStore {
 
 impl CapturingStore {
     fn new() -> Arc<Self> {
-        Arc::new(Self { records: Mutex::new(Vec::new()) })
+        Arc::new(Self {
+            records: Mutex::new(Vec::new()),
+        })
     }
     fn take(&self) -> Vec<StructuredSyslogRecord> {
         self.records.lock().unwrap().drain(..).collect()
@@ -41,9 +41,7 @@ struct DispatchingTestHandler {
 impl SyslogHandler for DispatchingTestHandler {
     async fn handle_message(&self, message: SyslogMessage, _source: SocketAddr) {
         let payload = dispatch(&message);
-        if let Some(rec) =
-            StructuredSyslogRecord::from_syslog_and_payload(&message, &payload)
-        {
+        if let Some(rec) = StructuredSyslogRecord::from_syslog_and_payload(&message, &payload) {
             self.store.records.lock().unwrap().push(rec);
         }
     }
@@ -63,7 +61,9 @@ async fn cef_datagram_produces_structured_record_with_cef_payload_type() {
     drop(tcp_listener);
 
     let store = CapturingStore::new();
-    let handler = Arc::new(DispatchingTestHandler { store: store.clone() });
+    let handler = Arc::new(DispatchingTestHandler {
+        store: store.clone(),
+    });
 
     let cfg = SyslogListenerConfig {
         udp_port,
@@ -94,7 +94,12 @@ async fn cef_datagram_produces_structured_record_with_cef_payload_type() {
     task.abort();
 
     let records = store.take();
-    assert_eq!(records.len(), 1, "expected 1 structured record, got {}", records.len());
+    assert_eq!(
+        records.len(),
+        1,
+        "expected 1 structured record, got {}",
+        records.len()
+    );
     let rec = &records[0];
     assert_eq!(rec.payload_type, "cef");
 
@@ -115,7 +120,9 @@ async fn non_matching_datagram_produces_no_structured_record() {
     drop(tcp_listener);
 
     let store = CapturingStore::new();
-    let handler = Arc::new(DispatchingTestHandler { store: store.clone() });
+    let handler = Arc::new(DispatchingTestHandler {
+        store: store.clone(),
+    });
 
     let cfg = SyslogListenerConfig {
         udp_port,
@@ -124,7 +131,9 @@ async fn non_matching_datagram_produces_no_structured_record() {
         parse_dns_logs: false,
     };
     let listener = SyslogListener::new(cfg, handler);
-    let task = tokio::spawn(async move { listener.start().await.ok(); });
+    let task = tokio::spawn(async move {
+        listener.start().await.ok();
+    });
     sleep(Duration::from_millis(100)).await;
 
     let send_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -139,5 +148,8 @@ async fn non_matching_datagram_produces_no_structured_record() {
     task.abort();
 
     let records = store.take();
-    assert!(records.is_empty(), "non-matching message must produce no structured record");
+    assert!(
+        records.is_empty(),
+        "non-matching message must produce no structured record"
+    );
 }

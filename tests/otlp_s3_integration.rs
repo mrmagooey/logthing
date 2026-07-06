@@ -28,8 +28,7 @@ mod tests {
         HecS3Config {
             connection: S3ConnectionConfig {
                 endpoint: endpoint.to_string(),
-                bucket: std::env::var("MINIO_BUCKET")
-                    .unwrap_or_else(|_| "otlp-test".to_string()),
+                bucket: std::env::var("MINIO_BUCKET").unwrap_or_else(|_| "otlp-test".to_string()),
                 region: "us-east-1".to_string(),
                 access_key: std::env::var("MINIO_ACCESS_KEY")
                     .unwrap_or_else(|_| "minioadmin".to_string()),
@@ -37,8 +36,8 @@ mod tests {
                     .unwrap_or_else(|_| "minioadmin".to_string()),
             },
             prefix: "otlp-integration".to_string(),
-            max_buffer_rows: 1,         // flush immediately on first record
-            flush_threshold_bytes: 1,   // flush immediately on first byte
+            max_buffer_rows: 1,       // flush immediately on first record
+            flush_threshold_bytes: 1, // flush immediately on first byte
             flush_interval_secs: 3600,
             channel_capacity: 256,
         }
@@ -63,9 +62,7 @@ mod tests {
                         time_unix_nano: 1_700_000_000_000_000_000,
                         severity_text: "WARN".to_string(),
                         body: Some(AnyValue {
-                            value: Some(AnyVal::StringValue(
-                                "integration test log".to_string(),
-                            )),
+                            value: Some(AnyVal::StringValue("integration test log".to_string())),
                         }),
                         attributes: vec![KeyValue {
                             key: "test.run".to_string(),
@@ -101,7 +98,12 @@ mod tests {
         );
 
         // Start the generic HEC handler targeting the S3 sink.
-        let (handler, _writer_task) = hec_start(&cfg, sink.clone(), 64, std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()));
+        let (handler, _writer_task) = hec_start(
+            &cfg,
+            sink.clone(),
+            64,
+            std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        );
 
         // Map the OTLP request to GenericRecords.
         let req = make_otlp_request();
@@ -182,8 +184,7 @@ mod tests {
         use bytes::Bytes;
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         let buf = Bytes::from(body_bytes.to_vec());
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(buf).expect("parquet builder");
+        let builder = ParquetRecordBatchReaderBuilder::try_new(buf).expect("parquet builder");
         let schema = builder.schema().clone();
 
         // Must have the 5 HEC columns.
@@ -193,11 +194,21 @@ mod tests {
                 "Schema under {prefix} must have column '{col}'"
             );
         }
-        assert_eq!(schema.fields().len(), 5, "HEC schema must have exactly 5 columns");
+        assert_eq!(
+            schema.fields().len(),
+            5,
+            "HEC schema must have exactly 5 columns"
+        );
 
         let mut reader = builder.build().expect("parquet reader");
-        let rb = reader.next().expect("at least one batch").expect("batch ok");
-        assert!(rb.num_rows() >= 1, "Parquet under {prefix} must have >= 1 row");
+        let rb = reader
+            .next()
+            .expect("at least one batch")
+            .expect("batch ok");
+        assert!(
+            rb.num_rows() >= 1,
+            "Parquet under {prefix} must have >= 1 row"
+        );
 
         use arrow::array::StringArray;
         let st = rb

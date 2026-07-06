@@ -74,11 +74,12 @@ async fn async_main() -> anyhow::Result<()> {
                 if let Some(ss3_cfg) = config_clone.syslog.structured_s3.as_ref() {
                     match forwarding::s3_sink::S3Sink::from_connection(&ss3_cfg.connection).await {
                         Ok(sink) => {
-                            let (sh, wh) = forwarding::structured_syslog_s3::structured_syslog_start(
-                                ss3_cfg,
-                                Arc::new(sink),
-                                source_stats.clone(),
-                            );
+                            let (sh, wh) =
+                                forwarding::structured_syslog_s3::structured_syslog_start(
+                                    ss3_cfg,
+                                    Arc::new(sink),
+                                    source_stats.clone(),
+                                );
                             writer_handles.push(wh);
                             Some(Arc::new(sh))
                         }
@@ -99,8 +100,11 @@ async fn async_main() -> anyhow::Result<()> {
             if let Some(s3_cfg) = config_clone.syslog.s3.as_ref() {
                 match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
                     Ok(sink) => {
-                        let (handler, writer_handle) =
-                            forwarding::syslog_s3::syslog_start(s3_cfg, Arc::new(sink), source_stats.clone());
+                        let (handler, writer_handle) = forwarding::syslog_s3::syslog_start(
+                            s3_cfg,
+                            Arc::new(sink),
+                            source_stats.clone(),
+                        );
                         writer_handles.push(writer_handle);
                         // Wrap SyslogS3Handler in a payload-dispatching adapter.
                         Arc::new(syslog::listener::PayloadDispatchingHandler {
@@ -155,8 +159,11 @@ async fn async_main() -> anyhow::Result<()> {
             if let Some(s3_cfg) = ipfix_config_clone.ipfix.s3.as_ref() {
                 match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
                     Ok(sink) => {
-                        let (handler, writer_handle) =
-                            forwarding::ipfix_s3::ipfix_start(s3_cfg, Arc::new(sink), source_stats.clone());
+                        let (handler, writer_handle) = forwarding::ipfix_s3::ipfix_start(
+                            s3_cfg,
+                            Arc::new(sink),
+                            source_stats.clone(),
+                        );
                         writer_handles.push(writer_handle);
                         Arc::new(handler)
                     }
@@ -264,8 +271,11 @@ async fn async_main() -> anyhow::Result<()> {
             if let Some(s3_cfg) = suricata_config_clone.suricata.s3.as_ref() {
                 match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
                     Ok(sink) => {
-                        let (handler, writer_handle) =
-                            forwarding::suricata_s3::suricata_start(s3_cfg, Arc::new(sink), source_stats.clone());
+                        let (handler, writer_handle) = forwarding::suricata_s3::suricata_start(
+                            s3_cfg,
+                            Arc::new(sink),
+                            source_stats.clone(),
+                        );
                         writer_handles.push(writer_handle);
                         Arc::new(handler)
                     }
@@ -306,8 +316,11 @@ async fn async_main() -> anyhow::Result<()> {
             if let Some(s3_cfg) = sflow_config_clone.sflow.s3.as_ref() {
                 match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
                     Ok(sink) => {
-                        let (handler, writer_handle) =
-                            forwarding::sflow_s3::sflow_start(s3_cfg, Arc::new(sink), source_stats.clone());
+                        let (handler, writer_handle) = forwarding::sflow_s3::sflow_start(
+                            s3_cfg,
+                            Arc::new(sink),
+                            source_stats.clone(),
+                        );
                         writer_handles.push(writer_handle);
                         Arc::new(handler)
                     }

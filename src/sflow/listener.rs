@@ -150,7 +150,7 @@ impl SflowListener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sflow::decoder::tests::{FIXTURE_SFLOW_FLOW_RAW_HEADER, FIXTURE_SFLOW_COUNTER};
+    use crate::sflow::decoder::tests::{FIXTURE_SFLOW_COUNTER, FIXTURE_SFLOW_FLOW_RAW_HEADER};
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::net::UdpSocket;
@@ -162,7 +162,9 @@ mod tests {
 
     impl CapturingHandler {
         fn new() -> Arc<Self> {
-            Arc::new(Self { received: Mutex::new(Vec::new()) })
+            Arc::new(Self {
+                received: Mutex::new(Vec::new()),
+            })
         }
         fn batches(&self) -> Vec<Vec<SflowRecord>> {
             self.received.lock().unwrap().clone()
@@ -180,7 +182,7 @@ mod tests {
     #[tokio::test]
     async fn listener_receives_sflow_datagram_and_calls_handler() {
         let listener_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let listener_addr   = listener_socket.local_addr().unwrap();
+        let listener_addr = listener_socket.local_addr().unwrap();
 
         let handler = CapturingHandler::new();
         let handler_clone = handler.clone();
@@ -192,12 +194,20 @@ mod tests {
         sleep(Duration::from_millis(20)).await;
 
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sender.send_to(FIXTURE_SFLOW_FLOW_RAW_HEADER, listener_addr).await.unwrap();
+        sender
+            .send_to(FIXTURE_SFLOW_FLOW_RAW_HEADER, listener_addr)
+            .await
+            .unwrap();
         sleep(Duration::from_millis(100)).await;
         task.abort();
 
         let batches = handler.batches();
-        assert_eq!(batches.len(), 1, "expected one batch; got {}", batches.len());
+        assert_eq!(
+            batches.len(),
+            1,
+            "expected one batch; got {}",
+            batches.len()
+        );
         assert_eq!(batches[0].len(), 1, "expected one record in batch");
 
         use std::net::{IpAddr, Ipv4Addr};
@@ -232,14 +242,17 @@ mod tests {
         shutdown_tx.send(true).unwrap();
 
         let result = timeout(Duration::from_secs(2), task).await;
-        assert!(result.is_ok(), "start_with_shutdown did not return within 2s after signal");
+        assert!(
+            result.is_ok(),
+            "start_with_shutdown did not return within 2s after signal"
+        );
     }
 
     // ── robustness: malformed datagram is ignored, next valid one processed ──
     #[tokio::test]
     async fn listener_ignores_malformed_datagrams_and_continues() {
         let listener_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let listener_addr   = listener_socket.local_addr().unwrap();
+        let listener_addr = listener_socket.local_addr().unwrap();
 
         let handler = CapturingHandler::new();
         let handler_clone = handler.clone();
@@ -251,14 +264,24 @@ mod tests {
         sleep(Duration::from_millis(20)).await;
 
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sender.send_to(b"\xFF\xFF\xFF\xFF", listener_addr).await.unwrap();
+        sender
+            .send_to(b"\xFF\xFF\xFF\xFF", listener_addr)
+            .await
+            .unwrap();
         sleep(Duration::from_millis(30)).await;
-        sender.send_to(FIXTURE_SFLOW_COUNTER, listener_addr).await.unwrap();
+        sender
+            .send_to(FIXTURE_SFLOW_COUNTER, listener_addr)
+            .await
+            .unwrap();
         sleep(Duration::from_millis(100)).await;
         task.abort();
 
         let batches = handler.batches();
-        assert_eq!(batches.len(), 1, "valid datagram must still produce one batch after malformed one");
+        assert_eq!(
+            batches.len(),
+            1,
+            "valid datagram must still produce one batch after malformed one"
+        );
         assert_eq!(batches[0][0].sample_type, crate::sflow::SampleType::Counter);
     }
 }

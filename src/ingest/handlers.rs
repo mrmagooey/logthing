@@ -10,8 +10,7 @@
 //! 5. Return the HEC canonical success envelope or an error response.
 
 use crate::ingest::{
-    IngestState,
-    check_hec_token,
+    IngestState, check_hec_token,
     parse::{parse_hec_event_body, parse_hec_raw_body, parse_ndjson_body},
 };
 use axum::{
@@ -79,9 +78,7 @@ pub async fn handle_hec_event(
     Extension(ingest): Extension<IngestState>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let auth = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok());
+    let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
     if !cfg_token.is_empty() && !check_hec_token(auth, &cfg_token) {
         return hec_auth_error();
     }
@@ -123,9 +120,7 @@ pub async fn handle_hec_raw(
     Extension(ingest): Extension<IngestState>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let auth = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok());
+    let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
     if !cfg_token.is_empty() && !check_hec_token(auth, &cfg_token) {
         return hec_auth_error();
     }
@@ -165,9 +160,7 @@ pub async fn handle_ndjson(
     Extension(ingest): Extension<IngestState>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let auth = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok());
+    let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
     if !cfg_token.is_empty() && !check_hec_token(auth, &cfg_token) {
         return hec_auth_error();
     }
@@ -226,7 +219,9 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri("/services/collector/event")
-            .body(Body::from(br#"{"event":{"k":1},"sourcetype":"t"}"#.as_ref()))
+            .body(Body::from(
+                br#"{"event":{"k":1},"sourcetype":"t"}"#.as_ref(),
+            ))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -241,7 +236,9 @@ mod tests {
             .method("POST")
             .uri("/services/collector/event")
             .header("Authorization", "Splunk wrong-token")
-            .body(Body::from(br#"{"event":{"k":1},"sourcetype":"t"}"#.as_ref()))
+            .body(Body::from(
+                br#"{"event":{"k":1},"sourcetype":"t"}"#.as_ref(),
+            ))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -445,7 +442,10 @@ mod tests {
                 }
             })
             .unwrap_or(0);
-        assert!(count >= 1, "hec_events_received must be >= 1 after one POST");
+        assert!(
+            count >= 1,
+            "hec_events_received must be >= 1 after one POST"
+        );
     }
 
     // --- Empty-token dev mode tests ---

@@ -37,22 +37,22 @@ fn opt_hyphen(s: &str) -> Option<String> {
 
 pub fn try_parse(msg: &SyslogMessage) -> Option<WebAccessRecord> {
     let caps = COMBINED_RE.captures(&msg.message)?;
-    let client_ip     = caps.get(1)?.as_str().to_string();
+    let client_ip = caps.get(1)?.as_str().to_string();
     // ident preserves the raw value (including "-") as Some — it is an
     // RFC 1413 identifier token, not an optional absent marker.
-    let ident         = caps.get(2).map(|m| m.as_str().to_string());
-    let authuser      = caps.get(3).and_then(|m| opt_hyphen(m.as_str()));
+    let ident = caps.get(2).map(|m| m.as_str().to_string());
+    let authuser = caps.get(3).and_then(|m| opt_hyphen(m.as_str()));
     let timestamp_str = caps.get(4)?.as_str().to_string();
-    let method        = caps.get(5)?.as_str().to_string();
-    let path          = caps.get(6)?.as_str().to_string();
-    let protocol      = caps.get(7)?.as_str().to_string();
-    let status: u16   = caps.get(8)?.as_str().parse().ok()?;
-    let bytes         = caps.get(9).and_then(|m| {
+    let method = caps.get(5)?.as_str().to_string();
+    let path = caps.get(6)?.as_str().to_string();
+    let protocol = caps.get(7)?.as_str().to_string();
+    let status: u16 = caps.get(8)?.as_str().parse().ok()?;
+    let bytes = caps.get(9).and_then(|m| {
         let s = m.as_str();
         if s == "-" { None } else { s.parse().ok() }
     });
-    let referer       = caps.get(10).and_then(|m| opt_hyphen(m.as_str()));
-    let user_agent    = caps.get(11).and_then(|m| opt_hyphen(m.as_str()));
+    let referer = caps.get(10).and_then(|m| opt_hyphen(m.as_str()));
+    let user_agent = caps.get(11).and_then(|m| opt_hyphen(m.as_str()));
 
     Some(WebAccessRecord {
         client_ip,
@@ -76,10 +76,14 @@ mod tests {
 
     fn msg(text: &str) -> SyslogMessage {
         SyslogMessage {
-            priority: 134, severity: 6, facility: 16,
-            timestamp: None, hostname: Some("web01".into()),
+            priority: 134,
+            severity: 6,
+            facility: 16,
+            timestamp: None,
+            hostname: Some("web01".into()),
             app_name: Some("nginx".into()),
-            proc_id: None, msg_id: None,
+            proc_id: None,
+            msg_id: None,
             message: text.to_string(),
             structured_data: None,
             protocol: SyslogProtocol::Rfc3164,
@@ -93,7 +97,8 @@ mod tests {
     const ANON: &str = r#"10.0.0.1 - - [15/Jan/2024:10:31:00 +0000] "POST /login HTTP/1.1" 302 0 "-" "curl/7.68.0""#;
 
     // 404 response.
-    const NOT_FOUND: &str = r#"172.16.0.5 - - [15/Jan/2024:10:32:15 +0000] "GET /missing HTTP/2.0" 404 162 "-" "-""#;
+    const NOT_FOUND: &str =
+        r#"172.16.0.5 - - [15/Jan/2024:10:32:15 +0000] "GET /missing HTTP/2.0" 404 162 "-" "-""#;
 
     const NOT_WEB: &str = "type=SYSCALL msg=audit(1609459200.000:1): syscall=59";
 

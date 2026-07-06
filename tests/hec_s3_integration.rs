@@ -63,10 +63,21 @@ async fn hec_records_appear_as_parquet_in_s3() {
             .expect("S3Sink::from_connection"),
     );
 
-    let (handler, _writer_task) = hec_start(&cfg, sink, 64, std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()));
-    handler.try_send(make_record("access_log", "alice")).expect("send");
-    handler.try_send(make_record("access_log", "bob")).expect("send");
-    handler.try_send(make_record("audit_log", "charlie")).expect("send");
+    let (handler, _writer_task) = hec_start(
+        &cfg,
+        sink,
+        64,
+        std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+    );
+    handler
+        .try_send(make_record("access_log", "alice"))
+        .expect("send");
+    handler
+        .try_send(make_record("access_log", "bob"))
+        .expect("send");
+    handler
+        .try_send(make_record("audit_log", "charlie"))
+        .expect("send");
 
     // Wait for background flush (max_buffer_rows=1 triggers immediately).
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
@@ -129,8 +140,7 @@ async fn hec_records_appear_as_parquet_in_s3() {
         use bytes::Bytes;
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         let buf = Bytes::from(body_bytes.to_vec());
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(buf).expect("parquet builder");
+        let builder = ParquetRecordBatchReaderBuilder::try_new(buf).expect("parquet builder");
         let schema = builder.schema().clone();
 
         // Must have the 5 HEC columns.
@@ -140,11 +150,21 @@ async fn hec_records_appear_as_parquet_in_s3() {
                 "Schema under {prefix} must have column '{col}'"
             );
         }
-        assert_eq!(schema.fields().len(), 5, "HEC schema must have exactly 5 columns");
+        assert_eq!(
+            schema.fields().len(),
+            5,
+            "HEC schema must have exactly 5 columns"
+        );
 
         let mut reader = builder.build().expect("parquet reader");
-        let rb = reader.next().expect("at least one batch").expect("batch ok");
-        assert!(rb.num_rows() >= 1, "Parquet under {prefix} must have >= 1 row");
+        let rb = reader
+            .next()
+            .expect("at least one batch")
+            .expect("batch ok");
+        assert!(
+            rb.num_rows() >= 1,
+            "Parquet under {prefix} must have >= 1 row"
+        );
 
         use arrow::array::StringArray;
         let st = rb

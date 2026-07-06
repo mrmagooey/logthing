@@ -53,14 +53,14 @@ async fn cef_record_appears_as_parquet_under_cef_partition() {
             .expect("S3Sink::from_connection"),
     );
 
-    let (structured_handle, writer_task) = structured_syslog_start(&cfg, s3.clone(), std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()));
+    let (structured_handle, writer_task) = structured_syslog_start(
+        &cfg,
+        s3.clone(),
+        std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+    );
     let structured_handle = Arc::new(structured_handle);
 
-    let handler = DefaultSyslogHandler::new(
-        false,
-        true,
-        Some(structured_handle.clone()),
-    );
+    let handler = DefaultSyslogHandler::new(false, true, Some(structured_handle.clone()));
 
     // A realistic CEF syslog message.
     let raw = "<134>Jan 15 10:30:45 fw01 arcsight: CEF:0|Vendor|FW|1.0|SIG001|\
@@ -95,11 +95,13 @@ async fn cef_record_appears_as_parquet_under_cef_partition() {
     let key = &objects[0];
     let data = s3.get_object(key).await.expect("get_object");
     let bytes = bytes::Bytes::from(data);
-    let builder =
-        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
-            .expect("parquet reader");
+    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .expect("parquet reader");
     let mut reader = builder.build().expect("build reader");
-    let batch = reader.next().expect("at least one batch").expect("batch ok");
+    let batch = reader
+        .next()
+        .expect("at least one batch")
+        .expect("batch ok");
 
     assert_eq!(batch.num_rows(), 1);
 
@@ -120,8 +122,7 @@ async fn cef_record_appears_as_parquet_under_cef_partition() {
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    let parsed: serde_json::Value =
-        serde_json::from_str(parsed_col.value(0)).expect("valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(parsed_col.value(0)).expect("valid JSON");
     assert_eq!(
         parsed["device_vendor"].as_str().unwrap_or(""),
         "Vendor",
@@ -145,7 +146,11 @@ async fn multiple_payload_types_land_in_separate_partitions() {
             .expect("S3Sink::from_connection"),
     );
 
-    let (structured_handle, writer_task) = structured_syslog_start(&cfg, s3.clone(), std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()));
+    let (structured_handle, writer_task) = structured_syslog_start(
+        &cfg,
+        s3.clone(),
+        std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+    );
     let structured_handle = Arc::new(structured_handle);
 
     let handler = DefaultSyslogHandler::new(false, true, Some(structured_handle.clone()));
@@ -169,9 +174,21 @@ async fn multiple_payload_types_land_in_separate_partitions() {
         .expect("writer done")
         .expect("no panic");
 
-    let cef_objs = s3.list_objects(&format!("{}/cef/", prefix)).await.expect("list cef");
-    let dhcp_objs = s3.list_objects(&format!("{}/dhcp/", prefix)).await.expect("list dhcp");
+    let cef_objs = s3
+        .list_objects(&format!("{}/cef/", prefix))
+        .await
+        .expect("list cef");
+    let dhcp_objs = s3
+        .list_objects(&format!("{}/dhcp/", prefix))
+        .await
+        .expect("list dhcp");
 
-    assert!(!cef_objs.is_empty(),  "CEF partition must have at least one object");
-    assert!(!dhcp_objs.is_empty(), "DHCP partition must have at least one object");
+    assert!(
+        !cef_objs.is_empty(),
+        "CEF partition must have at least one object"
+    );
+    assert!(
+        !dhcp_objs.is_empty(),
+        "DHCP partition must have at least one object"
+    );
 }

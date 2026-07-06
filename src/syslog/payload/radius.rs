@@ -43,22 +43,22 @@ pub fn try_parse(msg: &SyslogMessage) -> Option<RadiusRecord> {
 
     if let Some(caps) = RADIUS_OK_RE.captures(m) {
         return Some(RadiusRecord {
-            outcome:   "ok".to_string(),
-            username:  caps.get(1).map(|m| m.as_str().to_string()),
-            method:    None,
-            client:    caps.get(2).map(|m| m.as_str().to_string()),
-            port:      caps.get(3).map(|m| m.as_str().to_string()),
+            outcome: "ok".to_string(),
+            username: caps.get(1).map(|m| m.as_str().to_string()),
+            method: None,
+            client: caps.get(2).map(|m| m.as_str().to_string()),
+            port: caps.get(3).map(|m| m.as_str().to_string()),
             client_ip: caps.get(4).map(|m| m.as_str().to_string()),
         });
     }
 
     if let Some(caps) = RADIUS_FAIL_RE.captures(m) {
         return Some(RadiusRecord {
-            outcome:   "fail".to_string(),
-            method:    caps.get(1).map(|m| m.as_str().to_string()),
-            username:  caps.get(2).map(|m| m.as_str().to_string()),
-            client:    caps.get(3).map(|m| m.as_str().to_string()),
-            port:      caps.get(4).map(|m| m.as_str().to_string()),
+            outcome: "fail".to_string(),
+            method: caps.get(1).map(|m| m.as_str().to_string()),
+            username: caps.get(2).map(|m| m.as_str().to_string()),
+            client: caps.get(3).map(|m| m.as_str().to_string()),
+            port: caps.get(4).map(|m| m.as_str().to_string()),
             client_ip: caps.get(5).map(|m| m.as_str().to_string()),
         });
     }
@@ -73,26 +73,26 @@ mod tests {
 
     fn msg(text: &str) -> SyslogMessage {
         SyslogMessage {
-            priority: 85, severity: 5, facility: 10,
-            timestamp: None, hostname: Some("radius-server".into()),
+            priority: 85,
+            severity: 5,
+            facility: 10,
+            timestamp: None,
+            hostname: Some("radius-server".into()),
             app_name: Some("radiusd".into()),
-            proc_id: None, msg_id: None,
+            proc_id: None,
+            msg_id: None,
             message: text.to_string(),
             structured_data: None,
             protocol: SyslogProtocol::Rfc3164,
         }
     }
 
-    const LOGIN_OK: &str =
-        "Login OK: [alice] (from client vpn port 10 cli 10.0.0.5)";
-    const LOGIN_OK_NO_CLI: &str =
-        "Login OK: [bob] (from client corp port 2)";
+    const LOGIN_OK: &str = "Login OK: [alice] (from client vpn port 10 cli 10.0.0.5)";
+    const LOGIN_OK_NO_CLI: &str = "Login OK: [bob] (from client corp port 2)";
     const LOGIN_FAIL: &str =
         "Login incorrect (PAP): [charlie] (from client vpn port 10 cli 10.0.0.7)";
-    const LOGIN_FAIL_SIMPLE: &str =
-        "Login incorrect: [dave] (from client corp port 5)";
-    const NOT_RADIUS: &str =
-        "DHCPACK on 10.0.0.5 to aa:bb:cc:dd:ee:ff via eth0";
+    const LOGIN_FAIL_SIMPLE: &str = "Login incorrect: [dave] (from client corp port 5)";
+    const NOT_RADIUS: &str = "DHCPACK on 10.0.0.5 to aa:bb:cc:dd:ee:ff via eth0";
 
     #[test]
     fn parses_login_ok() {

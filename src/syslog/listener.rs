@@ -64,7 +64,11 @@ impl DefaultSyslogHandler {
         parse_payloads: bool,
         structured_handle: Option<Arc<StructuredS3Handler>>,
     ) -> Self {
-        Self { parse_dns_logs, parse_payloads, structured_handle }
+        Self {
+            parse_dns_logs,
+            parse_payloads,
+            structured_handle,
+        }
     }
 }
 
@@ -522,7 +526,11 @@ mod tests {
             ..Default::default()
         };
 
-        let handler = Arc::new(DefaultSyslogHandler::new(config.parse_dns_logs, false, None));
+        let handler = Arc::new(DefaultSyslogHandler::new(
+            config.parse_dns_logs,
+            false,
+            None,
+        ));
         let listener = SyslogListener::new(config, handler);
 
         // Start listener in background
@@ -733,7 +741,8 @@ mod tests {
             bind_address: "127.0.0.1".to_string(),
             parse_dns_logs: false,
         };
-        let handler: Arc<dyn SyslogHandler> = Arc::new(DefaultSyslogHandler::new(false, false, None));
+        let handler: Arc<dyn SyslogHandler> =
+            Arc::new(DefaultSyslogHandler::new(false, false, None));
         let listener = SyslogListener::new(config, handler);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -774,9 +783,7 @@ mod tests {
             access_key: "KEY".to_string(),
             secret_key: "SECRET".to_string(),
         };
-        let s3 = Arc::new(
-            S3Sink::from_connection(&conn).await.expect("constructs"),
-        );
+        let s3 = Arc::new(S3Sink::from_connection(&conn).await.expect("constructs"));
         let cfg = SyslogS3Config {
             connection: conn,
             prefix: "structured-test".to_string(),
@@ -784,7 +791,11 @@ mod tests {
             flush_interval_secs: 3600,
             channel_capacity: 16,
         };
-        let (structured_handle, _join) = structured_syslog_start(&cfg, s3, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
+        let (structured_handle, _join) = structured_syslog_start(
+            &cfg,
+            s3,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
         let structured_handle = Arc::new(structured_handle);
 
         let handler = DefaultSyslogHandler::new(

@@ -573,7 +573,11 @@ mod tests {
             channel_capacity: 1,
             max_buffer_rows: 1,
         };
-        let (handler, _writer_handle) = ipfix_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
+        let (handler, _writer_handle) = ipfix_start(
+            &cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
 
         // Yield so the background task starts and blocks inside the S3 upload.
         tokio::task::yield_now().await;
@@ -656,7 +660,11 @@ mod tests {
                 channel_capacity: 1,
                 max_buffer_rows: 1,
             };
-            let (handler, _writer_handle) = ipfix_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
+            let (handler, _writer_handle) = ipfix_start(
+                &cfg,
+                sink,
+                std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            );
             tokio::task::yield_now().await;
 
             // Send 30 batches — far more than capacity (1) + the one in-flight with S3.
@@ -715,7 +723,11 @@ mod tests {
                 channel_capacity: 10_000,
                 max_buffer_rows: 100_000,
             };
-            let (handler, _writer_handle) = ipfix_start(&cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
+            let (handler, _writer_handle) = ipfix_start(
+                &cfg,
+                sink,
+                std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            );
             tokio::task::yield_now().await;
 
             for i in 0..30usize {
@@ -785,7 +797,11 @@ mod tests {
                 .await
                 .expect("S3Sink construct"),
         );
-        let (handler, _writer_handle) = ipfix_start(&s3_cfg, sink, std::sync::Arc::new(crate::stats::SourceHourlyStats::new()));
+        let (handler, _writer_handle) = ipfix_start(
+            &s3_cfg,
+            sink,
+            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+        );
         let src: std::net::SocketAddr = "127.0.0.1:4739".parse().unwrap();
 
         let flows: Vec<FlowRecord> = (0..10)
@@ -892,9 +908,16 @@ mod tests {
         let shared_stats = std::sync::Arc::new(crate::stats::SourceHourlyStats::new());
 
         let mut writer = PartitionedParquetWriter::with_source_stats(
-            IpfixSink, s3, bwc, policy, shared_stats.clone(),
+            IpfixSink,
+            s3,
+            bwc,
+            policy,
+            shared_stats.clone(),
         );
-        writer.push(vec![make_flow_record(None, None, serde_json::json!({}))]).await.unwrap();
+        writer
+            .push(vec![make_flow_record(None, None, serde_json::json!({}))])
+            .await
+            .unwrap();
 
         let snapshot = shared_stats.snapshot();
         let row = snapshot.iter().find(|r| r.source == "ipfix").unwrap();

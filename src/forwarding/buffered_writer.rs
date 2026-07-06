@@ -252,7 +252,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         } else {
             metrics::counter!("parquet_s3_partitions_capped",
                 "source" => self.sink.source(), "target" => self.s3.target_label())
-                .increment(1);
+            .increment(1);
             "_overflow".to_string()
         };
 
@@ -394,7 +394,8 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             Ok(()) => {
                 metrics::counter!("parquet_s3_records_written", "source" => source, "target" => target)
                     .increment(row_count as u64);
-                metrics::counter!("parquet_s3_uploads", "source" => source, "target" => target).increment(1);
+                metrics::counter!("parquet_s3_uploads", "source" => source, "target" => target)
+                    .increment(1);
                 let buf = self.buffers.get_mut(key).unwrap();
                 buf.buffer.clear();
                 buf.row_count = 0;
@@ -409,7 +410,12 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         }
     }
 
-    fn drop_oldest_to_cap(buf: &mut PartitionBuffer, cap: usize, source: &'static str, target: &'static str) {
+    fn drop_oldest_to_cap(
+        buf: &mut PartitionBuffer,
+        cap: usize,
+        source: &'static str,
+        target: &'static str,
+    ) {
         let mut dropped = 0usize;
         while buf.row_count > cap {
             if let Some((batch, est)) = buf.buffer.pop_front() {
@@ -753,7 +759,10 @@ max_partitions = 128
     #[async_trait::async_trait]
     impl UploadSink for RecordingSink {
         async fn upload(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()> {
-            self.uploads.lock().unwrap().push((key.to_string(), body.len()));
+            self.uploads
+                .lock()
+                .unwrap()
+                .push((key.to_string(), body.len()));
             Ok(())
         }
         fn target_label(&self) -> &'static str {
@@ -764,15 +773,24 @@ max_partitions = 128
     #[tokio::test]
     async fn partitioned_writer_uploads_via_generic_uploadsink_trait_object() {
         let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink: Arc<dyn UploadSink> = Arc::new(RecordingSink { uploads: uploads.clone() });
+        let sink: Arc<dyn UploadSink> = Arc::new(RecordingSink {
+            uploads: uploads.clone(),
+        });
         let (cfg, policy) = test_config(1); // flush on first row
         let mut w = PartitionedParquetWriter::new(MockSink, sink, cfg, policy);
 
         w.push("hello".to_string()).await.unwrap();
 
         let recorded = uploads.lock().unwrap();
-        assert_eq!(recorded.len(), 1, "expected exactly one upload via the non-S3 sink");
-        assert!(recorded[0].1 > 0, "uploaded body must be non-empty Parquet bytes");
+        assert_eq!(
+            recorded.len(),
+            1,
+            "expected exactly one upload via the non-S3 sink"
+        );
+        assert!(
+            recorded[0].1 > 0,
+            "uploaded body must be non-empty Parquet bytes"
+        );
     }
 
     /// Proves the `target` label reaches `parquet_s3_uploads`/`parquet_s3_upload_errors`.
@@ -809,9 +827,18 @@ max_partitions = 128
         );
         let count = map
             .get(&key)
-            .map(|(_, _, v)| if let DebugValue::Counter(c) = v { *c } else { 0 })
+            .map(|(_, _, v)| {
+                if let DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
+            })
             .unwrap_or(0);
-        assert_eq!(count, 1, "expected parquet_s3_uploads{{source=\"test\",target=\"recording\"}} == 1");
+        assert_eq!(
+            count, 1,
+            "expected parquet_s3_uploads{{source=\"test\",target=\"recording\"}} == 1"
+        );
     }
 
     /// `push()` must record into a shared `SourceHourlyStats` once per
@@ -836,7 +863,10 @@ max_partitions = 128
         let snapshot = shared_stats.snapshot();
         let row = snapshot.iter().find(|r| r.source == "test").unwrap();
         let total: u64 = row.hours.iter().map(|h| h.count).sum();
-        assert_eq!(total, 3, "push() must count records even though nothing flushed");
+        assert_eq!(
+            total, 3,
+            "push() must count records even though nothing flushed"
+        );
     }
 
     /// Row-threshold flush fails (unreachable S3) but hard cap is enforced.

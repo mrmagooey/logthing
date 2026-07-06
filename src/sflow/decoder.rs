@@ -181,7 +181,13 @@ fn decode_flow_sample(
         let input_ifindex = read_u32(body, 20)?;
         let output_ifindex = read_u32(body, 24)?;
         let num_records = read_u32(body, 28)?;
-        (sampling_rate, input_ifindex, output_ifindex, num_records, 32usize)
+        (
+            sampling_rate,
+            input_ifindex,
+            output_ifindex,
+            num_records,
+            32usize,
+        )
     } else {
         // expanded_flow_sample (format 3)
         if body.len() < 44 {
@@ -195,7 +201,13 @@ fn decode_flow_sample(
         let input_ifindex = read_u32(body, 28)?; // input if_value
         let output_ifindex = read_u32(body, 36)?; // output if_value
         let num_records = read_u32(body, 40)?;
-        (sampling_rate, input_ifindex, output_ifindex, num_records, 44usize)
+        (
+            sampling_rate,
+            input_ifindex,
+            output_ifindex,
+            num_records,
+            44usize,
+        )
     };
 
     // Start with an empty record; update 5-tuple fields from flow records.
@@ -315,17 +327,15 @@ fn decode_raw_packet_header(body: &[u8], rec: &mut SflowRecord) -> anyhow::Resul
     let header_protocol = read_u32(body, 0)?;
     let header_length = read_u32(body, 12)? as usize;
 
-    let header_bytes = read_bytes(body, 16, header_length)
-        .context("raw_packet_header: header_bytes truncated")?;
+    let header_bytes =
+        read_bytes(body, 16, header_length).context("raw_packet_header: header_bytes truncated")?;
 
     match header_protocol {
-        1 => parse_ethernet(header_bytes, rec),  // ETHERNET
-        11 => parse_ipv4(header_bytes, rec),     // IPv4 (raw)
-        12 => parse_ipv6(header_bytes, rec),     // IPv6 (raw)
+        1 => parse_ethernet(header_bytes, rec), // ETHERNET
+        11 => parse_ipv4(header_bytes, rec),    // IPv4 (raw)
+        12 => parse_ipv6(header_bytes, rec),    // IPv6 (raw)
         _ => {
-            tracing::debug!(
-                "sflow: raw_packet_header: unsupported protocol {header_protocol}"
-            );
+            tracing::debug!("sflow: raw_packet_header: unsupported protocol {header_protocol}");
             Ok(())
         }
     }
@@ -678,15 +688,15 @@ pub(crate) mod tests {
         // ── Ethernet (14 bytes) ──
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // dst MAC = broadcast
         0x00, 0x11, 0x22, 0x33, 0x44, 0x55, // src MAC
-        0x08, 0x00,                         // ethertype = IPv4
+        0x08, 0x00, // ethertype = IPv4
         // ── IPv4 (20 bytes) ──
-        0x45,       // version=4, IHL=5
-        0x00,       // DSCP/ECN
+        0x45, // version=4, IHL=5
+        0x00, // DSCP/ECN
         0x00, 0x54, // total length = 84
         0x00, 0x00, // identification = 0
         0x00, 0x00, // flags + fragment offset = 0
-        0x40,       // TTL = 64
-        0x06,       // protocol = 6 (TCP)
+        0x40, // TTL = 64
+        0x06, // protocol = 6 (TCP)
         0x00, 0x00, // header checksum = 0
         0xC0, 0xA8, 0x01, 0x0A, // src = 192.168.1.10
         0x0A, 0x00, 0x00, 0x02, // dst = 10.0.0.2
@@ -695,8 +705,8 @@ pub(crate) mod tests {
         0x00, 0x50, // dst_port = 80
         0x00, 0x00, 0x00, 0x00, // seq = 0
         0x00, 0x00, 0x00, 0x00, // ack = 0
-        0x50,       // data offset = 5 (20 bytes)
-        0x02,       // flags = SYN
+        0x50, // data offset = 5 (20 bytes)
+        0x02, // flags = SYN
         0x00, 0x00, // window = 0
         0x00, 0x00, // checksum = 0
         0x00, 0x00, // urgent = 0
@@ -807,19 +817,16 @@ pub(crate) mod tests {
     pub(crate) const FIXTURE_SFLOW_TRUNCATED: &[u8] = &[
         0x00, 0x00, 0x00, 0x05, // version = 5
         0x00, 0x00, 0x00, 0x01, // agent_addr_type = 1 (IPv4)
-        0x0A, 0x00, 0x00, 0x01, // agent_addr = 10.0.0.1
-        // missing: sub_agent_id, sequence_number, uptime_ms, num_samples
+        0x0A, 0x00, 0x00,
+        0x01, // agent_addr = 10.0.0.1
+              // missing: sub_agent_id, sequence_number, uptime_ms, num_samples
     ];
 
     // ── fixture: wrong version (version=4 is not sFlow v5) ──
     pub(crate) const FIXTURE_SFLOW_BAD_VERSION: &[u8] = &[
         0x00, 0x00, 0x00, 0x04, // version = 4 (wrong)
-        0x00, 0x00, 0x00, 0x01,
-        0x0A, 0x00, 0x00, 0x01,
-        0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x01,
-        0x00, 0x00, 0x03, 0xE8,
-        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x0A, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x03, 0xE8, 0x00, 0x00, 0x00, 0x00,
     ];
 
     #[test]
@@ -829,14 +836,8 @@ pub(crate) mod tests {
         let r = &records[0];
         assert_eq!(r.sample_type, crate::sflow::SampleType::Flow);
         assert_eq!(r.exporter, exporter());
-        assert_eq!(
-            r.src_addr,
-            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)))
-        );
-        assert_eq!(
-            r.dst_addr,
-            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))
-        );
+        assert_eq!(r.src_addr, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))));
+        assert_eq!(r.dst_addr, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
         assert_eq!(r.src_port, Some(8080));
         assert_eq!(r.dst_port, Some(80));
         assert_eq!(r.ip_protocol, Some(6)); // TCP
@@ -851,14 +852,8 @@ pub(crate) mod tests {
         assert_eq!(records.len(), 1, "expected 1 flow record");
         let r = &records[0];
         assert_eq!(r.sample_type, crate::sflow::SampleType::Flow);
-        assert_eq!(
-            r.src_addr,
-            Some(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)))
-        );
-        assert_eq!(
-            r.dst_addr,
-            Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))
-        );
+        assert_eq!(r.src_addr, Some(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert_eq!(r.dst_addr, Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
         assert_eq!(r.src_port, Some(49210));
         assert_eq!(r.dst_port, Some(53));
         assert_eq!(r.ip_protocol, Some(17)); // UDP
@@ -957,8 +952,14 @@ pub(crate) mod tests {
         );
         // The unknown record must be tagged with format=99 and carry hex-encoded data.
         let s = records[0].extra.to_string();
-        assert!(s.contains("\"data_hex\""), "extra must use data_hex key; got: {s}");
-        assert!(!s.contains("data_base64"), "data_base64 key must be gone; got: {s}");
+        assert!(
+            s.contains("\"data_hex\""),
+            "extra must use data_hex key; got: {s}"
+        );
+        assert!(
+            !s.contains("data_base64"),
+            "data_base64 key must be gone; got: {s}"
+        );
     }
 
     #[test]

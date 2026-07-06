@@ -65,10 +65,10 @@ pub fn try_parse(msg: &SyslogMessage) -> Option<LeefRecord> {
     // (including any embedded '|' delimiters in the attribute blob).
     let mut parts = rest.splitn(7, '|');
     let leef_version = parts.next()?.to_string();
-    let vendor       = parts.next()?.to_string();
-    let product      = parts.next()?.to_string();
-    let version      = parts.next()?.to_string();
-    let event_id     = parts.next()?.to_string();
+    let vendor = parts.next()?.to_string();
+    let product = parts.next()?.to_string();
+    let version = parts.next()?.to_string();
+    let event_id = parts.next()?.to_string();
 
     // seg6 is the 6th pipe-segment:
     //   LEEF 1.0 → the entire tab-separated attribute blob
@@ -126,9 +126,14 @@ mod tests {
 
     fn msg(text: &str) -> SyslogMessage {
         SyslogMessage {
-            priority: 14, severity: 6, facility: 1,
-            timestamp: None, hostname: Some("qradar".into()),
-            app_name: None, proc_id: None, msg_id: None,
+            priority: 14,
+            severity: 6,
+            facility: 1,
+            timestamp: None,
+            hostname: Some("qradar".into()),
+            app_name: None,
+            proc_id: None,
+            msg_id: None,
             message: text.to_string(),
             structured_data: None,
             protocol: SyslogProtocol::Rfc3164,
@@ -157,8 +162,14 @@ mod tests {
         assert_eq!(rec.product, "Product");
         assert_eq!(rec.version, "1.0");
         assert_eq!(rec.event_id, "LoginSuccess");
-        assert_eq!(rec.attributes.get("src").map(|s| s.as_str()), Some("192.168.1.10"));
-        assert_eq!(rec.attributes.get("usrName").map(|s| s.as_str()), Some("bob"));
+        assert_eq!(
+            rec.attributes.get("src").map(|s| s.as_str()),
+            Some("192.168.1.10")
+        );
+        assert_eq!(
+            rec.attributes.get("usrName").map(|s| s.as_str()),
+            Some("bob")
+        );
         assert!(rec.delimiter.is_none(), "LEEF 1.0 has no delimiter field");
     }
 
@@ -168,8 +179,14 @@ mod tests {
         assert_eq!(rec.leef_version, "2.0");
         assert_eq!(rec.event_id, "EventID");
         assert_eq!(rec.delimiter, Some('|'));
-        assert_eq!(rec.attributes.get("dst").map(|s| s.as_str()), Some("10.0.0.1"));
-        assert_eq!(rec.attributes.get("usrName").map(|s| s.as_str()), Some("alice"));
+        assert_eq!(
+            rec.attributes.get("dst").map(|s| s.as_str()),
+            Some("10.0.0.1")
+        );
+        assert_eq!(
+            rec.attributes.get("usrName").map(|s| s.as_str()),
+            Some("alice")
+        );
     }
 
     #[test]
@@ -178,7 +195,10 @@ mod tests {
         assert_eq!(rec.leef_version, "2.0");
         // delimiter field is "\t" → '\t'
         assert_eq!(rec.delimiter, Some('\t'));
-        assert_eq!(rec.attributes.get("src").map(|s| s.as_str()), Some("192.168.1.10"));
+        assert_eq!(
+            rec.attributes.get("src").map(|s| s.as_str()),
+            Some("192.168.1.10")
+        );
     }
 
     #[test]
