@@ -204,6 +204,13 @@ pub struct SyslogConfig {
     /// Requires `parse_payloads = true` to produce any output.
     #[serde(default)]
     pub structured_s3: Option<SyslogS3Config>,
+
+    /// Optional local-disk persistence for raw syslog messages. Absent from
+    /// TOML → `None` → no local persistence (backward compatible).
+    /// Independent of `s3` — both may be configured simultaneously, in which
+    /// case messages are written to both.
+    #[serde(default)]
+    pub local: Option<SyslogLocalConfig>,
 }
 
 /// Configuration for the IPFIX / NetFlow UDP listener.
@@ -647,6 +654,29 @@ fn default_syslog_s3_channel_capacity() -> usize {
     4_096
 }
 
+/// Per-source local-disk persistence config for the syslog listener.
+/// Mirrors `SyslogS3Config`'s flush-policy shape (reusing the same
+/// default functions), swapping the S3 connection for a root directory.
+/// Independent of `s3`. No `flush_threshold_bytes` field — syslog uses
+/// row-count + age triggers only, same as `SyslogS3Config`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SyslogLocalConfig {
+    /// Root directory Parquet files are written under (created if missing).
+    pub directory: PathBuf,
+    /// Key prefix, slash-free (default: `"syslog"` — same default as `syslog.s3`).
+    #[serde(default = "default_syslog_s3_prefix")]
+    pub prefix: String,
+    /// Flush when row count reaches this threshold (default 10 000).
+    #[serde(default = "default_syslog_s3_max_rows")]
+    pub max_buffer_rows: usize,
+    /// Flush after this many seconds regardless of row count (default 900).
+    #[serde(default = "default_syslog_s3_flush_interval_secs")]
+    pub flush_interval_secs: u64,
+    /// Bounded channel capacity (default 4096).
+    #[serde(default = "default_syslog_s3_channel_capacity")]
+    pub channel_capacity: usize,
+}
+
 /// Per-source S3 persistence config for the IPFIX listener.
 /// Absent from TOML → `None` → no S3 persistence (backward compatible).
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -828,6 +858,7 @@ impl Default for SyslogConfig {
             parse_payloads: false,
             s3: None,
             structured_s3: None,
+            local: None,
         }
     }
 }
@@ -1090,6 +1121,45 @@ secret_key = "SKEY"
         assert_eq!(s3.connection.region, "eu-west-1");
         assert_eq!(s3.connection.access_key, "AKEY");
         assert_eq!(s3.connection.secret_key, "SKEY");
+    }
+
+    #[test]
+    fn syslog_local_absent_gives_none() {
+        let cfg = Config::default();
+        assert!(
+            cfg.syslog.local.is_none(),
+            "absent [syslog.local] must deserialize to None"
+        );
+    }
+
+    #[test]
+    fn syslog_local_config_deserializes_from_toml() {
+        let toml_str = r#"
+directory = "/var/log/logthing/syslog"
+prefix = "syslog"
+max_buffer_rows = 5000
+flush_interval_secs = 300
+channel_capacity = 512
+"#;
+        let cfg: SyslogLocalConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(
+            cfg.directory,
+            std::path::PathBuf::from("/var/log/logthing/syslog")
+        );
+        assert_eq!(cfg.prefix, "syslog");
+        assert_eq!(cfg.max_buffer_rows, 5_000);
+        assert_eq!(cfg.flush_interval_secs, 300);
+        assert_eq!(cfg.channel_capacity, 512);
+    }
+
+    #[test]
+    fn syslog_local_config_defaults_apply_when_only_directory_given() {
+        let toml_str = r#"directory = "/data/syslog""#;
+        let cfg: SyslogLocalConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(cfg.prefix, "syslog");
+        assert_eq!(cfg.max_buffer_rows, 10_000);
+        assert_eq!(cfg.flush_interval_secs, 900);
+        assert_eq!(cfg.channel_capacity, 4_096);
     }
 
     #[test]
