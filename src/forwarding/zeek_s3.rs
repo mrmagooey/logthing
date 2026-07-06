@@ -848,6 +848,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
     async fn multi_zeek_handler_survives_one_inner_handler_dropping() {
         use crate::zeek::listener::ZeekHandler;
         use metrics::set_default_local_recorder;
