@@ -90,6 +90,13 @@ Configuration is loaded from multiple sources (in order of precedence):
 
 The admin override file is useful for runtime configuration changes without modifying the main config file.
 
+Every config field is reachable this way, including each listener's bind
+port: `WEF__SYSLOG__UDP_PORT`, `WEF__SYSLOG__TCP_PORT`,
+`WEF__IPFIX__UDP_PORT`, `WEF__ZEEK__TCP_PORT`, `WEF__SURICATA__TCP_PORT`,
+`WEF__SFLOW__UDP_PORT`. Ipfix, Zeek, Suricata, and sFlow additionally accept
+`WEF__<SECTION>__BIND_ADDRESS` to change which interface they listen on;
+syslog's bind address is fixed at `0.0.0.0` and has no such override.
+
 ### Kerberos Client Authentication
 
 Require inbound clients (e.g., Windows Event Forwarding collectors) to authenticate with SPNEGO/Negotiate.
@@ -566,7 +573,18 @@ WEF__BIND_ADDRESS=0.0.0.0:5985 WEF__TLS__ENABLED=true ./logthing
 
 # For nested configuration values
 WEF__SECURITY__MAX_CONNECTIONS=5000 WEF__METRICS__PORT=8080 ./logthing
+
+# Every listener's bind port (and, except for syslog, its bind address) can
+# be overridden the same way — no code or config-file changes needed:
+WEF__SYSLOG__UDP_PORT=5514 WEF__SYSLOG__TCP_PORT=5601 ./logthing
+WEF__IPFIX__UDP_PORT=14739 WEF__IPFIX__BIND_ADDRESS=127.0.0.1 ./logthing
+WEF__ZEEK__TCP_PORT=47760 WEF__ZEEK__BIND_ADDRESS=127.0.0.1 ./logthing
+WEF__SURICATA__TCP_PORT=47761 WEF__SURICATA__BIND_ADDRESS=127.0.0.1 ./logthing
+WEF__SFLOW__UDP_PORT=6343 WEF__SFLOW__BIND_ADDRESS=127.0.0.1 ./logthing
 ```
+
+Note: syslog has no `WEF__SYSLOG__BIND_ADDRESS` — its listener always binds
+`0.0.0.0` (not configurable), unlike ipfix/zeek/suricata/sflow above.
 
 ## Windows Client Configuration
 
