@@ -273,6 +273,14 @@ mod tests {
         let sink = LocalDiskSink::new(dir.path().to_path_buf()).await.unwrap();
         let hint = sink.location_hint();
         assert!(hint.starts_with("file://"), "got: {hint}");
-        assert!(hint.contains(&dir.path().file_name().unwrap().to_string_lossy().to_string()));
+        assert!(
+            hint.contains(
+                &dir.path()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            )
+        );
     }
 }

@@ -33,7 +33,10 @@ async fn env_var_override_binds_ipfix_listener_on_overridden_address_and_port() 
         std::env::remove_var("WEF__IPFIX__BIND_ADDRESS");
     }
 
-    assert_eq!(cfg.ipfix.udp_port, port, "env override did not reach Config");
+    assert_eq!(
+        cfg.ipfix.udp_port, port,
+        "env override did not reach Config"
+    );
     assert_eq!(
         cfg.ipfix.bind_address, "127.0.0.1",
         "env override did not reach Config"
@@ -66,7 +69,10 @@ async fn env_var_override_binds_ipfix_listener_on_overridden_address_and_port() 
     // Shut the listener down and confirm the port is released afterward.
     shutdown_tx.send(true).unwrap();
     let result = timeout(Duration::from_secs(2), task).await;
-    assert!(result.is_ok(), "listener did not exit after shutdown signal");
+    assert!(
+        result.is_ok(),
+        "listener did not exit after shutdown signal"
+    );
 
     let rebind = UdpSocket::bind(format!("127.0.0.1:{port}")).await;
     assert!(

@@ -185,10 +185,7 @@ mod tests {
 
     #[test]
     fn build_descriptor_key_swaps_parquet_suffix_for_json() {
-        let key = build_descriptor_key(
-            "",
-            "zeek/conn/year=2026/month=07/day=10/abc-123.parquet",
-        );
+        let key = build_descriptor_key("", "zeek/conn/year=2026/month=07/day=10/abc-123.parquet");
         assert_eq!(key, "zeek/conn/year=2026/month=07/day=10/abc-123.json");
     }
 

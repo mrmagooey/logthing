@@ -192,7 +192,9 @@ impl Server {
             crate::forwarding::buffered_writer::build_iceberg_descriptor_sink(&config.iceberg)
                 .await
                 .unwrap_or_else(|e| {
-                    error!("Failed to construct Iceberg descriptor sink, descriptors disabled: {e}");
+                    error!(
+                        "Failed to construct Iceberg descriptor sink, descriptors disabled: {e}"
+                    );
                     None
                 });
 

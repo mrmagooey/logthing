@@ -2236,7 +2236,10 @@ prefix    = "_iceberg_descriptors"
         };
         let err = validate_iceberg_config(&cfg).expect_err("must reject both configured");
         let msg = err.to_string();
-        assert!(msg.contains("my-bucket"), "error must name the s3 bucket: {msg}");
+        assert!(
+            msg.contains("my-bucket"),
+            "error must name the s3 bucket: {msg}"
+        );
         assert!(
             msg.contains("/data/iceberg"),
             "error must name the local directory: {msg}"
@@ -2258,7 +2261,10 @@ prefix    = "_iceberg_descriptors"
         }
         let result = std::panic::catch_unwind(|| {
             let cfg = Config::load().expect("config loads with env overrides");
-            let s3 = cfg.iceberg.s3.expect("iceberg.s3 must be present via env vars");
+            let s3 = cfg
+                .iceberg
+                .s3
+                .expect("iceberg.s3 must be present via env vars");
             assert_eq!(s3.connection.endpoint, "http://minio-test:9000");
             assert_eq!(s3.connection.bucket, "env-override-bucket");
             assert_eq!(s3.connection.region, "eu-west-1");

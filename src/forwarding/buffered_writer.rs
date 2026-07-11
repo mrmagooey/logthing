@@ -758,7 +758,14 @@ pub(crate) fn start_writer<S: ParquetSink + Default>(
         max_bytes: flush_threshold_bytes,
         interval: std::time::Duration::from_secs(flush_interval_secs),
     };
-    ParquetWriterHandle::start_with_stats(S::default(), sink, bwc, policy, source_stats, descriptor_sink)
+    ParquetWriterHandle::start_with_stats(
+        S::default(),
+        sink,
+        bwc,
+        policy,
+        source_stats,
+        descriptor_sink,
+    )
 }
 
 /// Wraps another `UploadSink`, transparently prepending a fixed prefix to
@@ -1813,7 +1820,10 @@ secret_key  = "SECRET"
             "descriptor key must end in .json, got: {}",
             descriptor_calls[0].0
         );
-        assert!(descriptor_calls[0].1 > 0, "descriptor body must be non-empty");
+        assert!(
+            descriptor_calls[0].1 > 0,
+            "descriptor body must be non-empty"
+        );
     }
 
     #[tokio::test]
@@ -1880,7 +1890,10 @@ secret_key  = "SECRET"
             uploads: uploads.clone(),
         });
         let prefixed = wrap_with_prefix(inner, "_iceberg_descriptors");
-        prefixed.upload("zeek/conn/abc.json", vec![1, 2, 3]).await.unwrap();
+        prefixed
+            .upload("zeek/conn/abc.json", vec![1, 2, 3])
+            .await
+            .unwrap();
         let calls = uploads.lock().unwrap();
         assert_eq!(calls[0].0, "_iceberg_descriptors/zeek/conn/abc.json");
     }

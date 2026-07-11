@@ -243,9 +243,7 @@ async fn sflow_local_start_emits_iceberg_descriptor_when_configured() {
     );
 
     let src: std::net::SocketAddr = "127.0.0.1:6343".parse().unwrap();
-    handler
-        .handle_samples(vec![make_flow_record()], src)
-        .await;
+    handler.handle_samples(vec![make_flow_record()], src).await;
 
     // Drop the handler to close the channel; background task flushes on exit.
     drop(handler);
