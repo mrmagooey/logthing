@@ -789,6 +789,7 @@ mod tests {
             bwc,
             policy,
             source_stats.clone(),
+            None,
         );
         writer.push("hello".to_string()).await.unwrap();
 

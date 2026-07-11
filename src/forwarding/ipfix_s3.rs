@@ -300,6 +300,7 @@ pub fn ipfix_start(
         1, // IPFIX is single-partition
         s3,
         source_stats,
+        None,
     )
 }
 
@@ -321,6 +322,7 @@ pub fn ipfix_local_start(
         1, // IPFIX is single-partition
         sink,
         source_stats,
+        None,
     )
 }
 
@@ -946,6 +948,7 @@ mod tests {
             bwc,
             policy,
             shared_stats.clone(),
+            None,
         );
         writer
             .push(vec![make_flow_record(None, None, serde_json::json!({}))])

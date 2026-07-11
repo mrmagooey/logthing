@@ -286,6 +286,7 @@ pub fn sflow_start(
         SFLOW_MAX_PARTITIONS,
         s3,
         source_stats,
+        None,
     )
 }
 
@@ -308,6 +309,7 @@ pub fn sflow_local_start(
         SFLOW_MAX_PARTITIONS,
         sink,
         source_stats,
+        None,
     )
 }
 
@@ -536,6 +538,7 @@ mod tests {
             bwc,
             policy,
             shared_stats.clone(),
+            None,
         );
         writer.push(make_flow_record()).await.unwrap();
 

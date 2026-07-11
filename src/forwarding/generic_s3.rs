@@ -131,6 +131,7 @@ pub fn hec_start(
         max_partitions,
         s3,
         source_stats,
+        None,
     )
 }
 
@@ -153,6 +154,7 @@ pub fn hec_local_start(
         max_partitions,
         sink,
         source_stats,
+        None,
     )
 }
 
@@ -473,6 +475,7 @@ mod tests {
             bwc,
             policy,
             shared_stats.clone(),
+            None,
         );
         writer.push(make_record("access_log")).await.unwrap();
 

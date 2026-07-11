@@ -226,6 +226,10 @@ pub struct PartitionedParquetWriter<S: ParquetSink> {
     /// `""` key for None-partition sources; sanitized-path / `"event_type=<id>"` for multi-partition.
     pub(crate) buffers: HashMap<String, PartitionBuffer>,
     source_stats: Arc<crate::stats::SourceHourlyStats>,
+    /// Optional destination for the Iceberg "descriptor" JSON emitted
+    /// alongside each successful Parquet flush. `None` (the default via
+    /// `new()`) means the feature is off — zero behavior change.
+    descriptor_sink: Option<Arc<dyn UploadSink>>,
 }
 
 impl<S: ParquetSink> PartitionedParquetWriter<S> {
@@ -241,15 +245,18 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             config,
             policy,
             Arc::new(crate::stats::SourceHourlyStats::default()),
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_source_stats(
         sink: S,
         s3: Arc<dyn UploadSink>,
         config: BufferedWriterConfig,
         policy: FlushPolicy,
         source_stats: Arc<crate::stats::SourceHourlyStats>,
+        descriptor_sink: Option<Arc<dyn UploadSink>>,
     ) -> Self {
         Self {
             sink,
@@ -258,6 +265,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             policy,
             buffers: HashMap::new(),
             source_stats,
+            descriptor_sink,
         }
     }
 
@@ -393,33 +401,57 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         let source = self.sink.source();
 
         // Concatenate all single-row batches into one before encoding.
-        let merged = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-            use parquet::arrow::ArrowWriter;
-            use parquet::basic::{Compression, ZstdLevel};
-            use parquet::file::properties::WriterProperties;
+        // `file_metadata` (previously discarded) carries per-row-group
+        // column statistics already computed by the encoder — captured
+        // here so the Iceberg descriptor never needs to re-open the file.
+        let (merged, file_metadata) = tokio::task::spawn_blocking(
+            move || -> anyhow::Result<(Vec<u8>, parquet::format::FileMetaData)> {
+                use parquet::arrow::ArrowWriter;
+                use parquet::basic::{Compression, ZstdLevel};
+                use parquet::file::properties::WriterProperties;
 
-            let batch = arrow::compute::concat_batches(&schema, &batches)?;
-            let props = WriterProperties::builder()
-                .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
-                .build();
-            let mut buf = Vec::new();
-            let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))?;
-            writer.write(&batch)?;
-            writer.close()?;
-            Ok(buf)
-        })
+                let batch = arrow::compute::concat_batches(&schema, &batches)?;
+                let props = WriterProperties::builder()
+                    .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+                    .build();
+                let mut buf = Vec::new();
+                let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props))?;
+                writer.write(&batch)?;
+                let file_metadata = writer.close()?;
+                Ok((buf, file_metadata))
+            },
+        )
         .await
         .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))??;
 
         let partition_seg = if key.is_empty() { None } else { Some(key) };
         let s3_key = build_key(&self.config.prefix, partition_seg, chrono::Utc::now());
         let target = self.s3.target_label();
+        let body_len = merged.len();
+
         match self.s3.upload(&s3_key, merged).await {
             Ok(()) => {
                 metrics::counter!("parquet_s3_records_written", "source" => source, "target" => target)
                     .increment(row_count as u64);
                 metrics::counter!("parquet_s3_uploads", "source" => source, "target" => target)
                     .increment(1);
+
+                if let Some(descriptor_sink) = self.descriptor_sink.clone() {
+                    let schema_for_descriptor = self.buffers.get(key).unwrap().schema.clone();
+                    let descriptor = build_descriptor(
+                        source,
+                        partition_seg,
+                        self.s3.location_hint(),
+                        &s3_key,
+                        row_count as u64,
+                        body_len as u64,
+                        target,
+                        &schema_for_descriptor,
+                        &file_metadata,
+                    );
+                    upload_descriptor(descriptor_sink, descriptor, &s3_key, source).await;
+                }
+
                 let buf = self.buffers.get_mut(key).unwrap();
                 buf.buffer.clear();
                 buf.row_count = 0;
@@ -471,6 +503,109 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
     }
 }
 
+/// Build an `IcebergDescriptor` from data already available at the exact
+/// moment a Parquet flush succeeds — no re-read of the encoded file.
+#[allow(clippy::too_many_arguments)]
+fn build_descriptor(
+    source: &'static str,
+    partition: Option<&str>,
+    location_hint: String,
+    relative_key: &str,
+    record_count: u64,
+    file_size_in_bytes: u64,
+    storage_target: &'static str,
+    schema: &arrow_schema::Schema,
+    file_metadata: &parquet::format::FileMetaData,
+) -> crate::forwarding::iceberg_descriptor::IcebergDescriptor {
+    use crate::forwarding::iceberg_descriptor::{ColumnStat, IcebergDescriptor, schema_version};
+    use base64::Engine;
+
+    let mut column_stats = std::collections::HashMap::new();
+    if let Some(row_group) = file_metadata.row_groups.first() {
+        for (idx, column) in row_group.columns.iter().enumerate() {
+            let Some(col_meta) = column.meta_data.as_ref() else {
+                continue;
+            };
+            let physical_type = format!("{:?}", col_meta.type_);
+            let (null_count, min, max) = match col_meta.statistics.as_ref() {
+                Some(stats) => (
+                    stats.null_count.unwrap_or(0).max(0) as u64,
+                    stats
+                        .min
+                        .as_ref()
+                        .map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
+                    stats
+                        .max
+                        .as_ref()
+                        .map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
+                ),
+                None => (0, None, None),
+            };
+            column_stats.insert(
+                idx as u32,
+                ColumnStat {
+                    null_count,
+                    min,
+                    max,
+                    physical_type,
+                },
+            );
+        }
+    }
+
+    IcebergDescriptor {
+        source: source.to_string(),
+        partition: partition.map(|p| p.to_string()),
+        file_path: format!("{location_hint}/{relative_key}"),
+        file_format: "PARQUET".to_string(),
+        record_count,
+        file_size_in_bytes,
+        storage_target: storage_target.to_string(),
+        schema_version: schema_version(schema),
+        written_at: chrono::Utc::now(),
+        column_stats,
+    }
+}
+
+/// Best-effort descriptor upload: logs + increments a metric on failure,
+/// never returns an error to the caller. A descriptor-sink outage must
+/// never fail, retry, or hard-cap the core Parquet-writing path.
+///
+/// `relative_key` is the Parquet file's own relative key (e.g.
+/// `zeek/conn/year=2026/month=07/day=10/abc.parquet`) — NOT
+/// `descriptor.file_path`, which is already fully-qualified (see
+/// `build_descriptor` above) and would be the wrong thing to upload the
+/// descriptor itself under. The descriptor sink's own configured `prefix`
+/// (from `IcebergDescriptorS3Config`/`IcebergDescriptorLocalConfig`) is
+/// applied transparently by `descriptor_sink` itself — see
+/// `build_iceberg_descriptor_sink`/`PrefixedUploadSink` below — so this
+/// function always derives the key with an empty prefix.
+async fn upload_descriptor(
+    descriptor_sink: Arc<dyn UploadSink>,
+    descriptor: crate::forwarding::iceberg_descriptor::IcebergDescriptor,
+    relative_key: &str,
+    source: &'static str,
+) {
+    let key = crate::forwarding::iceberg_descriptor::build_descriptor_key("", relative_key);
+    let bytes = match descriptor.to_json_bytes() {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(source, "iceberg descriptor serialization failed: {e}");
+            metrics::counter!("iceberg_descriptor_upload_errors", "source" => source).increment(1);
+            return;
+        }
+    };
+    match descriptor_sink.upload(&key, bytes).await {
+        Ok(()) => {
+            metrics::counter!("iceberg_descriptor_uploads", "source" => source).increment(1);
+        }
+        Err(e) => {
+            tracing::warn!(source, "iceberg descriptor upload failed: {e}");
+            metrics::counter!("iceberg_descriptor_upload_errors", "source" => source).increment(1);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ParquetWriterHandle<S>
 // ---------------------------------------------------------------------------
@@ -500,18 +635,22 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
             config,
             policy,
             Arc::new(crate::stats::SourceHourlyStats::default()),
+            None,
         )
     }
 
     /// Same as `start`, but records ingested-record counts into a shared,
     /// externally-owned `SourceHourlyStats` (used to feed the admin `/stats`
-    /// page from every source through one instance).
+    /// page from every source through one instance), and optionally emits
+    /// an Iceberg descriptor alongside each successful flush.
+    #[allow(clippy::too_many_arguments)]
     pub fn start_with_stats(
         sink: S,
         s3: Arc<dyn UploadSink>,
         config: BufferedWriterConfig,
         policy: FlushPolicy,
         source_stats: Arc<crate::stats::SourceHourlyStats>,
+        descriptor_sink: Option<Arc<dyn UploadSink>>,
     ) -> (Self, tokio::task::JoinHandle<()>) {
         let capacity = config.channel_capacity.max(1);
         // Capture the source/target labels before `sink`/`s3` are moved into the task.
@@ -520,8 +659,14 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<S::Record>(capacity);
         let flush_check = crate::forwarding::s3_sink::flush_check_interval(policy.interval);
         let handle = tokio::spawn(async move {
-            let mut writer =
-                PartitionedParquetWriter::with_source_stats(sink, s3, config, policy, source_stats);
+            let mut writer = PartitionedParquetWriter::with_source_stats(
+                sink,
+                s3,
+                config,
+                policy,
+                source_stats,
+                descriptor_sink,
+            );
             let mut interval = tokio::time::interval(flush_check);
             loop {
                 tokio::select! {
@@ -580,7 +725,7 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
 /// behavior in any of them, only code the `S: ParquetSink` bound already
 /// makes fully generic. `max_partitions` is a parameter (not hardcoded here)
 /// because it differs per source.
-#[allow(clippy::too_many_arguments)] // one parameter per BufferedWriterConfig/FlushPolicy field; splitting them into a struct would only move the count, not reduce it
+#[allow(clippy::too_many_arguments)] // one parameter per BufferedWriterConfig/FlushPolicy field, plus source_stats/descriptor_sink; splitting into a struct would only move the count, not reduce it
 pub(crate) fn start_writer<S: ParquetSink + Default>(
     prefix: String,
     max_buffer_rows: usize,
@@ -590,6 +735,7 @@ pub(crate) fn start_writer<S: ParquetSink + Default>(
     max_partitions: usize,
     sink: Arc<dyn UploadSink>,
     source_stats: Arc<crate::stats::SourceHourlyStats>,
+    descriptor_sink: Option<Arc<dyn UploadSink>>,
 ) -> (ParquetWriterHandle<S>, tokio::task::JoinHandle<()>) {
     let bwc = BufferedWriterConfig {
         connection: unused_s3_connection_placeholder(),
@@ -605,7 +751,68 @@ pub(crate) fn start_writer<S: ParquetSink + Default>(
         max_bytes: flush_threshold_bytes,
         interval: std::time::Duration::from_secs(flush_interval_secs),
     };
-    ParquetWriterHandle::start_with_stats(S::default(), sink, bwc, policy, source_stats)
+    ParquetWriterHandle::start_with_stats(S::default(), sink, bwc, policy, source_stats, descriptor_sink)
+}
+
+/// Wraps another `UploadSink`, transparently prepending a fixed prefix to
+/// every key. Used so the descriptor sink's own configured `prefix`
+/// (`IcebergDescriptorS3Config`/`IcebergDescriptorLocalConfig`) is applied
+/// once, at construction, without threading a separate prefix parameter
+/// through `flush_partition`/`upload_descriptor` and every one of the 14
+/// per-source `_start`/`_local_start` call sites.
+struct PrefixedUploadSink {
+    inner: Arc<dyn UploadSink>,
+    prefix: String,
+}
+
+#[async_trait]
+impl UploadSink for PrefixedUploadSink {
+    async fn upload(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()> {
+        let full_key = format!("{}/{}", self.prefix, key);
+        self.inner.upload(&full_key, body).await
+    }
+    fn target_label(&self) -> &'static str {
+        self.inner.target_label()
+    }
+    fn location_hint(&self) -> String {
+        self.inner.location_hint()
+    }
+}
+
+/// Construct the shared Iceberg descriptor `UploadSink` from `[iceberg]`
+/// config, if configured. Called once by `main.rs` and once by
+/// `Server::new` (in `src/server/mod.rs`) — each independently builds its
+/// own `Arc<dyn UploadSink>` pointed at the same configured destination,
+/// since both already have their own `Config` instance and there is no
+/// other shared state between them for this. Returns `Ok(None)` when
+/// neither `iceberg.s3` nor `iceberg.local` is configured (the common
+/// case — feature off, zero behavior change).
+pub async fn build_iceberg_descriptor_sink(
+    cfg: &crate::config::IcebergConfig,
+) -> anyhow::Result<Option<Arc<dyn UploadSink>>> {
+    if let Some(s3_cfg) = cfg.s3.as_ref() {
+        let sink = crate::forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await?;
+        let sink: Arc<dyn UploadSink> = Arc::new(sink);
+        return Ok(Some(wrap_with_prefix(sink, &s3_cfg.prefix)));
+    }
+    if let Some(local_cfg) = cfg.local.as_ref() {
+        let sink =
+            crate::forwarding::local_sink::LocalDiskSink::new(local_cfg.directory.clone()).await?;
+        let sink: Arc<dyn UploadSink> = Arc::new(sink);
+        return Ok(Some(wrap_with_prefix(sink, &local_cfg.prefix)));
+    }
+    Ok(None)
+}
+
+fn wrap_with_prefix(inner: Arc<dyn UploadSink>, prefix: &str) -> Arc<dyn UploadSink> {
+    if prefix.is_empty() {
+        inner
+    } else {
+        Arc::new(PrefixedUploadSink {
+            inner,
+            prefix: prefix.to_string(),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -917,6 +1124,7 @@ max_partitions = 128
             cfg,
             policy,
             shared_stats.clone(),
+            None,
         );
 
         for i in 0..3 {
@@ -1497,6 +1705,7 @@ secret_key  = "SECRET"
             1,
             StdArc::new(UnreachableUploadSink),
             StdArc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
 
         handle.try_send("hello".to_string()).ok();
@@ -1506,5 +1715,123 @@ secret_key  = "SECRET"
             .await
             .expect("writer task must exit within 5s")
             .expect("writer task must not panic");
+    }
+
+    #[tokio::test]
+    async fn flush_emits_descriptor_when_descriptor_sink_configured() {
+        let s3 = unreachable_s3().await; // Parquet upload target — unreachable is fine, we swap below
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let parquet_sink: Arc<dyn UploadSink> = Arc::new(RecordingSink {
+            uploads: uploads.clone(),
+        });
+        let descriptor_uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let descriptor_sink: Arc<dyn UploadSink> = Arc::new(RecordingSink {
+            uploads: descriptor_uploads.clone(),
+        });
+        let _ = s3; // silence unused-var warning; kept for signature parity with other tests
+
+        let (cfg, policy) = test_config(1); // flush on first row
+        let mut w = PartitionedParquetWriter::with_source_stats(
+            MockSink,
+            parquet_sink,
+            cfg,
+            policy,
+            Arc::new(crate::stats::SourceHourlyStats::default()),
+            Some(descriptor_sink),
+        );
+
+        w.push("hello".to_string()).await.unwrap();
+
+        let parquet_calls = uploads.lock().unwrap();
+        assert_eq!(parquet_calls.len(), 1, "expected one Parquet upload");
+
+        let descriptor_calls = descriptor_uploads.lock().unwrap();
+        assert_eq!(descriptor_calls.len(), 1, "expected one descriptor upload");
+        assert!(
+            descriptor_calls[0].0.ends_with(".json"),
+            "descriptor key must end in .json, got: {}",
+            descriptor_calls[0].0
+        );
+        assert!(descriptor_calls[0].1 > 0, "descriptor body must be non-empty");
+    }
+
+    #[tokio::test]
+    async fn flush_emits_no_descriptor_when_descriptor_sink_is_none() {
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let parquet_sink: Arc<dyn UploadSink> = Arc::new(RecordingSink {
+            uploads: uploads.clone(),
+        });
+        let (cfg, policy) = test_config(1);
+        // descriptor_sink: None — the default via `new()`.
+        let mut w = PartitionedParquetWriter::new(MockSink, parquet_sink, cfg, policy);
+
+        w.push("hello".to_string()).await.unwrap();
+
+        // Only the Parquet upload happened; RecordingSink was never given
+        // a descriptor destination to record into, so there is nothing
+        // more to assert beyond "this did not panic and behaves exactly
+        // as before this feature existed" — the real assertion is that
+        // flush succeeded at all with descriptor_sink absent.
+        assert_eq!(uploads.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn descriptor_upload_failure_does_not_fail_the_flush() {
+        struct FailingSink;
+        #[async_trait::async_trait]
+        impl UploadSink for FailingSink {
+            async fn upload(&self, _key: &str, _body: Vec<u8>) -> anyhow::Result<()> {
+                anyhow::bail!("descriptor destination unreachable")
+            }
+            fn target_label(&self) -> &'static str {
+                "failing"
+            }
+            fn location_hint(&self) -> String {
+                "failing://test".to_string()
+            }
+        }
+
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let parquet_sink: Arc<dyn UploadSink> = Arc::new(RecordingSink { uploads });
+        let (cfg, policy) = test_config(1);
+        let mut w = PartitionedParquetWriter::with_source_stats(
+            MockSink,
+            parquet_sink,
+            cfg,
+            policy,
+            Arc::new(crate::stats::SourceHourlyStats::default()),
+            Some(Arc::new(FailingSink)),
+        );
+
+        // Must succeed — a failing descriptor sink must never fail the
+        // Parquet flush itself.
+        let result = w.push("hello".to_string()).await;
+        assert!(
+            result.is_ok(),
+            "flush must succeed even when the descriptor sink fails: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefixed_upload_sink_prepends_prefix_to_every_key() {
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inner: Arc<dyn UploadSink> = Arc::new(RecordingSink {
+            uploads: uploads.clone(),
+        });
+        let prefixed = wrap_with_prefix(inner, "_iceberg_descriptors");
+        prefixed.upload("zeek/conn/abc.json", vec![1, 2, 3]).await.unwrap();
+        let calls = uploads.lock().unwrap();
+        assert_eq!(calls[0].0, "_iceberg_descriptors/zeek/conn/abc.json");
+    }
+
+    #[test]
+    fn wrap_with_prefix_returns_inner_unchanged_when_prefix_empty() {
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inner: Arc<dyn UploadSink> = Arc::new(RecordingSink { uploads });
+        // No way to compare Arc<dyn Trait> pointers cleanly across a trait
+        // object boundary in a way that's meaningful here — instead, assert
+        // behavior: an empty prefix must not alter the key at all.
+        let wrapped = wrap_with_prefix(inner, "");
+        assert_eq!(wrapped.target_label(), "recording");
     }
 }

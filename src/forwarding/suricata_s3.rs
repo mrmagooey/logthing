@@ -165,6 +165,7 @@ pub fn suricata_start(
         DEFAULT_MAX_SURICATA_PARTITIONS,
         s3,
         source_stats,
+        None,
     )
 }
 
@@ -187,6 +188,7 @@ pub fn suricata_local_start(
         DEFAULT_MAX_SURICATA_PARTITIONS,
         sink,
         source_stats,
+        None,
     )
 }
 
@@ -528,6 +530,7 @@ mod tests {
             bwc,
             policy,
             shared_stats.clone(),
+            None,
         );
         writer.push(make_alert_record("1.1.1.1")).await.unwrap();
 

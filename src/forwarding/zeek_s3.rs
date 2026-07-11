@@ -205,6 +205,7 @@ pub fn zeek_start(
         DEFAULT_MAX_ZEEK_PARTITIONS,
         s3,
         source_stats,
+        None,
     )
 }
 
@@ -226,6 +227,7 @@ pub fn zeek_local_start(
         DEFAULT_MAX_ZEEK_PARTITIONS,
         sink,
         source_stats,
+        None,
     )
 }
 
@@ -1022,6 +1024,7 @@ mod tests {
             bwc,
             policy,
             shared_stats.clone(),
+            None,
         );
         writer.push(make_conn_record("conn")).await.unwrap();
 

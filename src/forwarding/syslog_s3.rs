@@ -190,6 +190,7 @@ pub fn syslog_start(
         1,
         s3,
         source_stats,
+        None,
     )
 }
 
@@ -212,6 +213,7 @@ pub fn syslog_local_start(
         1,
         sink,
         source_stats,
+        None,
     )
 }
 
@@ -697,6 +699,7 @@ mod tests {
             bwc,
             policy,
             shared_stats.clone(),
+            None,
         );
         writer.push(dummy_msg("test")).await.unwrap();
 

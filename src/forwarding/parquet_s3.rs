@@ -115,6 +115,7 @@ pub fn wef_start(
         0, // unlimited partitions — EventIDs are bounded in practice
         s3,
         source_stats,
+        None,
     )
 }
 
@@ -140,6 +141,7 @@ pub fn wef_local_start(
         0,
         sink,
         source_stats,
+        None,
     )
 }
 
@@ -454,6 +456,7 @@ mod tests {
             bwc,
             policy,
             shared_stats.clone(),
+            None,
         );
         writer.push(make_parsed_event(4624)).await.unwrap();
 

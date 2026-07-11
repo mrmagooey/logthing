@@ -139,7 +139,7 @@ pub fn structured_syslog_start(
         max_bytes: usize::MAX,
         interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
     };
-    ParquetWriterHandle::start_with_stats(StructuredSyslogSink, s3, bwc, policy, source_stats)
+    ParquetWriterHandle::start_with_stats(StructuredSyslogSink, s3, bwc, policy, source_stats, None)
 }
 
 #[cfg(test)]
@@ -342,6 +342,7 @@ mod tests {
             bwc,
             policy,
             shared_stats.clone(),
+            None,
         );
         writer.push(sample_record("cef")).await.unwrap();
 
