@@ -355,6 +355,7 @@ async fn async_main() -> anyhow::Result<()> {
                         s3_cfg,
                         Arc::new(sink),
                         source_stats.clone(),
+                        descriptor_sink.clone(),
                     );
                     writer_handles.push(writer_handle);
                     suricata_handlers.push(Arc::new(handler));
@@ -375,6 +376,7 @@ async fn async_main() -> anyhow::Result<()> {
                         local_cfg,
                         Arc::new(sink),
                         source_stats.clone(),
+                        descriptor_sink.clone(),
                     );
                     writer_handles.push(writer_handle);
                     suricata_handlers.push(Arc::new(handler));

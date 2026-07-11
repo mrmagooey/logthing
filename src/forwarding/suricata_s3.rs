@@ -155,6 +155,7 @@ pub fn suricata_start(
     cfg: &SuricataS3Config,
     s3: std::sync::Arc<crate::forwarding::s3_sink::S3Sink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+    descriptor_sink: Option<std::sync::Arc<dyn crate::forwarding::buffered_writer::UploadSink>>,
 ) -> (SuricataS3Handler, tokio::task::JoinHandle<()>) {
     crate::forwarding::buffered_writer::start_writer::<SuricataSink>(
         cfg.prefix.clone(),
@@ -165,7 +166,7 @@ pub fn suricata_start(
         DEFAULT_MAX_SURICATA_PARTITIONS,
         s3,
         source_stats,
-        None,
+        descriptor_sink,
     )
 }
 
@@ -178,6 +179,7 @@ pub fn suricata_local_start(
     cfg: &crate::config::SuricataLocalConfig,
     sink: std::sync::Arc<crate::forwarding::local_sink::LocalDiskSink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+    descriptor_sink: Option<std::sync::Arc<dyn crate::forwarding::buffered_writer::UploadSink>>,
 ) -> (SuricataS3Handler, tokio::task::JoinHandle<()>) {
     crate::forwarding::buffered_writer::start_writer::<SuricataSink>(
         cfg.prefix.clone(),
@@ -188,7 +190,7 @@ pub fn suricata_local_start(
         DEFAULT_MAX_SURICATA_PARTITIONS,
         sink,
         source_stats,
-        None,
+        descriptor_sink,
     )
 }
 
@@ -417,6 +419,7 @@ mod tests {
             &cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
         tokio::task::yield_now().await;
 
@@ -483,6 +486,7 @@ mod tests {
             &cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
         let src: SocketAddr = "127.0.0.1:47761".parse().unwrap();
         handler
@@ -567,6 +571,7 @@ mod tests {
             &cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
 
         let src: SocketAddr = "127.0.0.1:47761".parse().unwrap();
@@ -663,6 +668,7 @@ mod tests {
             &cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
 
         use std::sync::atomic::{AtomicUsize, Ordering};
