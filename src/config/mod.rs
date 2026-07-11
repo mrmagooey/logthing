@@ -1541,6 +1541,63 @@ max_buffer_rows = 50000
     }
 
     #[test]
+    fn env_vars_override_bind_ports_for_all_log_types() {
+        // `WEF__<SECTION>__<FIELD>` env vars are process-global, and cargo
+        // runs unit tests in this file's binary on multiple threads by
+        // default. No other test in this file (or reachable from this test
+        // binary) reads these particular fields, so no cross-test lock is
+        // needed — but we still wrap set/load/assert in catch_unwind and
+        // guarantee cleanup runs even on a failed assertion, so a panic here
+        // can never leak `WEF__*` state into a test added later. This
+        // mirrors the `load_reads_configuration_file` test's rename/restore
+        // safety pattern above.
+        let vars: &[(&str, &str)] = &[
+            ("WEF__BIND_ADDRESS", "127.0.0.1:15985"),
+            ("WEF__TLS__PORT", "15986"),
+            ("WEF__METRICS__PORT", "19090"),
+            ("WEF__SYSLOG__UDP_PORT", "15140"),
+            ("WEF__SYSLOG__TCP_PORT", "16010"),
+            ("WEF__IPFIX__UDP_PORT", "14739"),
+            ("WEF__IPFIX__BIND_ADDRESS", "127.0.0.2"),
+            ("WEF__ZEEK__TCP_PORT", "14776"),
+            ("WEF__ZEEK__BIND_ADDRESS", "127.0.0.3"),
+            ("WEF__SURICATA__TCP_PORT", "14777"),
+            ("WEF__SURICATA__BIND_ADDRESS", "127.0.0.4"),
+            ("WEF__SFLOW__UDP_PORT", "16343"),
+            ("WEF__SFLOW__BIND_ADDRESS", "127.0.0.5"),
+        ];
+
+        for (k, v) in vars {
+            unsafe { std::env::set_var(k, v) };
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let cfg = Config::load().expect("config loads with env overrides");
+            assert_eq!(cfg.bind_address, "127.0.0.1:15985".parse().unwrap());
+            assert_eq!(cfg.tls.port, 15986);
+            assert_eq!(cfg.metrics.port, 19090);
+            assert_eq!(cfg.syslog.udp_port, 15140);
+            assert_eq!(cfg.syslog.tcp_port, 16010);
+            assert_eq!(cfg.ipfix.udp_port, 14739);
+            assert_eq!(cfg.ipfix.bind_address, "127.0.0.2");
+            assert_eq!(cfg.zeek.tcp_port, 14776);
+            assert_eq!(cfg.zeek.bind_address, "127.0.0.3");
+            assert_eq!(cfg.suricata.tcp_port, 14777);
+            assert_eq!(cfg.suricata.bind_address, "127.0.0.4");
+            assert_eq!(cfg.sflow.udp_port, 16343);
+            assert_eq!(cfg.sflow.bind_address, "127.0.0.5");
+        });
+
+        for (k, _) in vars {
+            unsafe { std::env::remove_var(k) };
+        }
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
     fn ipfix_config_defaults() {
         let cfg = Config::default();
         assert!(!cfg.ipfix.enabled);
