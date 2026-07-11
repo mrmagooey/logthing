@@ -2367,6 +2367,7 @@ dependencies = [
  "axum-extra",
  "axum-negotiate",
  "axum-server",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "config",
