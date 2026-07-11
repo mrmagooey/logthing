@@ -276,6 +276,7 @@ pub fn sflow_start(
     cfg: &SflowS3Config,
     s3: Arc<crate::forwarding::s3_sink::S3Sink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+    descriptor_sink: Option<std::sync::Arc<dyn crate::forwarding::buffered_writer::UploadSink>>,
 ) -> (SflowS3Handler, tokio::task::JoinHandle<()>) {
     crate::forwarding::buffered_writer::start_writer::<SflowSink>(
         cfg.prefix.clone(),
@@ -286,7 +287,7 @@ pub fn sflow_start(
         SFLOW_MAX_PARTITIONS,
         s3,
         source_stats,
-        None,
+        descriptor_sink,
     )
 }
 
@@ -299,6 +300,7 @@ pub fn sflow_local_start(
     cfg: &crate::config::SflowLocalConfig,
     sink: std::sync::Arc<crate::forwarding::local_sink::LocalDiskSink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+    descriptor_sink: Option<std::sync::Arc<dyn crate::forwarding::buffered_writer::UploadSink>>,
 ) -> (SflowS3Handler, tokio::task::JoinHandle<()>) {
     crate::forwarding::buffered_writer::start_writer::<SflowSink>(
         cfg.prefix.clone(),
@@ -309,7 +311,7 @@ pub fn sflow_local_start(
         SFLOW_MAX_PARTITIONS,
         sink,
         source_stats,
-        None,
+        descriptor_sink,
     )
 }
 
@@ -575,6 +577,7 @@ mod tests {
             &cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
 
         let src: SocketAddr = "127.0.0.1:6343".parse().unwrap();
@@ -709,6 +712,7 @@ mod tests {
             &cfg,
             s3,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
 
         use std::sync::atomic::{AtomicUsize, Ordering};

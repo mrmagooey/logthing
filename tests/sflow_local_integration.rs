@@ -88,6 +88,7 @@ async fn sflow_samples_appear_as_parquet_on_local_disk() {
         &cfg,
         sink,
         Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
     );
 
     let src: std::net::SocketAddr = "127.0.0.1:6343".parse().unwrap();
@@ -207,4 +208,72 @@ fn walk_all_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+#[tokio::test]
+async fn sflow_local_start_emits_iceberg_descriptor_when_configured() {
+    let parquet_dir = tempfile::tempdir().expect("parquet tempdir");
+    let descriptor_dir = tempfile::tempdir().expect("descriptor tempdir");
+
+    let parquet_sink = Arc::new(
+        LocalDiskSink::new(parquet_dir.path().to_path_buf())
+            .await
+            .expect("LocalDiskSink::new (parquet)"),
+    );
+    let descriptor_sink: Arc<dyn logthing::forwarding::buffered_writer::UploadSink> = Arc::new(
+        LocalDiskSink::new(descriptor_dir.path().to_path_buf())
+            .await
+            .expect("LocalDiskSink::new (descriptor)"),
+    );
+
+    let cfg = SflowLocalConfig {
+        directory: parquet_dir.path().to_path_buf(),
+        prefix: "sflow".to_string(),
+        max_buffer_rows: 1, // flush immediately on first push per partition
+        flush_threshold_bytes: 1,
+        flush_interval_secs: 3600,
+        channel_capacity: 64,
+    };
+
+    let (handler, writer_task) = sflow_local_start(
+        &cfg,
+        parquet_sink,
+        Arc::new(logthing::stats::SourceHourlyStats::new()),
+        Some(descriptor_sink),
+    );
+
+    let src: std::net::SocketAddr = "127.0.0.1:6343".parse().unwrap();
+    handler
+        .handle_samples(vec![make_flow_record()], src)
+        .await;
+
+    // Drop the handler to close the channel; background task flushes on exit.
+    drop(handler);
+    tokio::time::timeout(std::time::Duration::from_secs(5), writer_task)
+        .await
+        .expect("writer task exits within 5s")
+        .expect("writer task must not panic");
+
+    // A descriptor JSON must exist somewhere under descriptor_dir.
+    let mut found = false;
+    let mut stack = vec![descriptor_dir.path().to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut entries = tokio::fs::read_dir(&dir).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                found = true;
+                let contents = tokio::fs::read_to_string(&path).await.unwrap();
+                let v: serde_json::Value = serde_json::from_str(&contents).unwrap();
+                assert_eq!(v["source"], "sflow");
+                assert_eq!(v["file_format"], "PARQUET");
+            }
+        }
+    }
+    assert!(
+        found,
+        "expected at least one descriptor .json file under {descriptor_dir:?}"
+    );
 }
