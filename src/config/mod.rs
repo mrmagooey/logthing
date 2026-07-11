@@ -74,6 +74,9 @@ pub struct Config {
 
     #[serde(default)]
     pub otlp: OtlpConfig,
+
+    #[serde(default)]
+    pub iceberg: IcebergConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -683,6 +686,69 @@ impl Default for OtlpConfig {
     }
 }
 
+/// Top-level `[iceberg]` config section — emits a small JSON "descriptor"
+/// alongside each Parquet flush from every source, describing the file
+/// for an external Iceberg committer (logthing has no Iceberg library
+/// dependency and never talks to a catalog itself). Absent from TOML →
+/// both `s3`/`local` are `None` → the feature is off (zero behavior
+/// change to existing Parquet writing).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct IcebergConfig {
+    /// Optional S3 destination for descriptors. Configuring this AND
+    /// `local` simultaneously is a config error (see `validate_iceberg_config`)
+    /// — unlike every other source's `.s3`/`.local` pair, which may both be
+    /// configured and both get written to, `[iceberg]` requires exactly one
+    /// destination: a descriptor is a lightweight pointer, not data at risk
+    /// of loss, so dual-write isn't needed.
+    #[serde(default)]
+    pub s3: Option<IcebergDescriptorS3Config>,
+    /// Optional local-disk destination for descriptors. See `s3` docs.
+    #[serde(default)]
+    pub local: Option<IcebergDescriptorLocalConfig>,
+}
+
+/// S3 destination config for Iceberg descriptors. Deliberately simpler
+/// than other sources' `*S3Config` structs — no buffering fields, since
+/// descriptors are uploaded synchronously as part of a flush that already
+/// happened (nothing to batch).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IcebergDescriptorS3Config {
+    #[serde(flatten)]
+    pub connection: S3ConnectionConfig,
+    /// Key prefix, slash-free (default: `""`).
+    #[serde(default)]
+    pub prefix: String,
+}
+
+/// Local-disk destination config for Iceberg descriptors. See
+/// `IcebergDescriptorS3Config` docs.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IcebergDescriptorLocalConfig {
+    pub directory: PathBuf,
+    /// Key prefix, slash-free (default: `""`).
+    #[serde(default)]
+    pub prefix: String,
+}
+
+/// Rejects a config where both `iceberg.s3` and `iceberg.local` are
+/// configured simultaneously. Because `config::Config::builder()` merges
+/// all layers (file → admin-override-file → env vars) before
+/// `try_deserialize()` runs, which *layer* set which value is not
+/// recoverable here — the error names the resolved values instead, which
+/// is the most an operator can be told given that constraint.
+pub fn validate_iceberg_config(cfg: &IcebergConfig) -> anyhow::Result<()> {
+    if let (Some(s3), Some(local)) = (cfg.s3.as_ref(), cfg.local.as_ref()) {
+        anyhow::bail!(
+            "iceberg.s3.bucket = '{}' and iceberg.local.directory = '{}' are both configured; \
+             set only one — the [iceberg] descriptor sink does not support writing to both \
+             destinations simultaneously",
+            s3.connection.bucket,
+            local.directory.display()
+        );
+    }
+    Ok(())
+}
+
 /// Per-source S3 persistence config for the syslog listener.
 /// Absent from TOML → `None` → no S3 persistence (backward compatible).
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -944,6 +1010,7 @@ impl Default for Config {
             wef: WefConfig::default(),
             hec: HecConfig::default(),
             otlp: OtlpConfig::default(),
+            iceberg: IcebergConfig::default(),
         }
     }
 }
@@ -1102,7 +1169,9 @@ impl Config {
         builder = builder.add_source(config::Environment::with_prefix("WEF").separator("__"));
 
         let config = builder.build()?;
-        Ok(config.try_deserialize()?)
+        let config: Config = config.try_deserialize()?;
+        validate_iceberg_config(&config.iceberg)?;
+        Ok(config)
     }
 }
 
@@ -2067,5 +2136,139 @@ bearer_token = "s3cr3t"
         let cfg: Config = toml::from_str(toml_str).expect("parse");
         assert!(!cfg.otlp.enabled);
         assert!(cfg.otlp.bearer_token.is_none());
+    }
+
+    #[test]
+    fn iceberg_config_absent_gives_none_none() {
+        let cfg = Config::default();
+        assert!(cfg.iceberg.s3.is_none());
+        assert!(cfg.iceberg.local.is_none());
+    }
+
+    #[test]
+    fn iceberg_s3_flat_toml_deserializes_correctly() {
+        let toml_str = r#"
+[iceberg.s3]
+endpoint   = "http://minio:9000"
+bucket     = "iceberg-descriptors"
+region     = "us-east-1"
+access_key = "KEY"
+secret_key = "SECRET"
+prefix     = "_iceberg_descriptors"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse config");
+        let s3 = cfg.iceberg.s3.expect("s3 present");
+        assert_eq!(s3.connection.bucket, "iceberg-descriptors");
+        assert_eq!(s3.prefix, "_iceberg_descriptors");
+        assert!(cfg.iceberg.local.is_none());
+    }
+
+    #[test]
+    fn iceberg_s3_prefix_defaults_to_empty_when_absent() {
+        let toml_str = r#"
+[iceberg.s3]
+endpoint   = "http://minio:9000"
+bucket     = "iceberg-descriptors"
+region     = "us-east-1"
+access_key = "KEY"
+secret_key = "SECRET"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse config");
+        assert_eq!(cfg.iceberg.s3.unwrap().prefix, "");
+    }
+
+    #[test]
+    fn iceberg_local_config_deserializes_from_toml() {
+        let toml_str = r#"
+[iceberg.local]
+directory = "/var/log/logthing/iceberg-descriptors"
+prefix    = "_iceberg_descriptors"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse config");
+        let local = cfg.iceberg.local.expect("local present");
+        assert_eq!(
+            local.directory,
+            std::path::PathBuf::from("/var/log/logthing/iceberg-descriptors")
+        );
+        assert_eq!(local.prefix, "_iceberg_descriptors");
+    }
+
+    #[test]
+    fn validate_iceberg_config_ok_when_only_s3_set() {
+        let cfg = IcebergConfig {
+            s3: Some(IcebergDescriptorS3Config {
+                connection: S3ConnectionConfig {
+                    endpoint: "http://minio:9000".to_string(),
+                    bucket: "b".to_string(),
+                    region: "us-east-1".to_string(),
+                    access_key: "k".to_string(),
+                    secret_key: "s".to_string(),
+                },
+                prefix: String::new(),
+            }),
+            local: None,
+        };
+        assert!(validate_iceberg_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_iceberg_config_ok_when_neither_set() {
+        assert!(validate_iceberg_config(&IcebergConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn validate_iceberg_config_errs_when_both_s3_and_local_set() {
+        let cfg = IcebergConfig {
+            s3: Some(IcebergDescriptorS3Config {
+                connection: S3ConnectionConfig {
+                    endpoint: "http://minio:9000".to_string(),
+                    bucket: "my-bucket".to_string(),
+                    region: "us-east-1".to_string(),
+                    access_key: "k".to_string(),
+                    secret_key: "s".to_string(),
+                },
+                prefix: String::new(),
+            }),
+            local: Some(IcebergDescriptorLocalConfig {
+                directory: std::path::PathBuf::from("/data/iceberg"),
+                prefix: String::new(),
+            }),
+        };
+        let err = validate_iceberg_config(&cfg).expect_err("must reject both configured");
+        let msg = err.to_string();
+        assert!(msg.contains("my-bucket"), "error must name the s3 bucket: {msg}");
+        assert!(
+            msg.contains("/data/iceberg"),
+            "error must name the local directory: {msg}"
+        );
+    }
+
+    #[test]
+    fn env_vars_override_iceberg_s3_config() {
+        let vars: &[(&str, &str)] = &[
+            ("WEF__ICEBERG__S3__ENDPOINT", "http://minio-test:9000"),
+            ("WEF__ICEBERG__S3__BUCKET", "env-override-bucket"),
+            ("WEF__ICEBERG__S3__REGION", "eu-west-1"),
+            ("WEF__ICEBERG__S3__ACCESS_KEY", "envkey"),
+            ("WEF__ICEBERG__S3__SECRET_KEY", "envsecret"),
+            ("WEF__ICEBERG__S3__PREFIX", "env-prefix"),
+        ];
+        for (k, v) in vars {
+            unsafe { std::env::set_var(k, v) };
+        }
+        let result = std::panic::catch_unwind(|| {
+            let cfg = Config::load().expect("config loads with env overrides");
+            let s3 = cfg.iceberg.s3.expect("iceberg.s3 must be present via env vars");
+            assert_eq!(s3.connection.endpoint, "http://minio-test:9000");
+            assert_eq!(s3.connection.bucket, "env-override-bucket");
+            assert_eq!(s3.connection.region, "eu-west-1");
+            assert_eq!(s3.prefix, "env-prefix");
+        });
+        for (k, _) in vars {
+            unsafe { std::env::remove_var(k) };
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 }
