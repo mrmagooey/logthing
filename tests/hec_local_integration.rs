@@ -44,6 +44,7 @@ async fn hec_records_appear_as_parquet_on_local_disk() {
         sink,
         64,
         std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
     );
 
     let rec1 = GenericRecord {
@@ -123,4 +124,78 @@ async fn hec_records_appear_as_parquet_on_local_disk() {
     let parsed: serde_json::Value =
         serde_json::from_str(fields_col.value(0)).expect("fields must be valid JSON");
     assert_eq!(parsed["user"], "alice");
+}
+
+#[tokio::test]
+async fn hec_local_start_emits_iceberg_descriptor_when_configured() {
+    let parquet_dir = tempfile::tempdir().expect("parquet tempdir");
+    let descriptor_dir = tempfile::tempdir().expect("descriptor tempdir");
+
+    let parquet_sink = std::sync::Arc::new(
+        LocalDiskSink::new(parquet_dir.path().to_path_buf())
+            .await
+            .expect("LocalDiskSink::new (parquet)"),
+    );
+    let descriptor_sink: std::sync::Arc<dyn logthing::forwarding::buffered_writer::UploadSink> =
+        std::sync::Arc::new(
+            LocalDiskSink::new(descriptor_dir.path().to_path_buf())
+                .await
+                .expect("LocalDiskSink::new (descriptor)"),
+        );
+
+    let cfg = GenericLocalConfig {
+        directory: parquet_dir.path().to_path_buf(),
+        prefix: "hec".to_string(),
+        max_buffer_rows: 1, // flush immediately on first push per partition
+        flush_threshold_bytes: 1,
+        flush_interval_secs: 3600,
+        channel_capacity: 64,
+    };
+
+    let (handler, join_handle) = hec_local_start(
+        &cfg,
+        parquet_sink,
+        64,
+        std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        Some(descriptor_sink),
+    );
+
+    let rec = GenericRecord {
+        sourcetype: "access_log".to_string(),
+        host: Some("host-a".to_string()),
+        time: Some(chrono::Utc::now()),
+        fields: serde_json::json!({"action": "login", "user": "alice"}),
+        received_at: chrono::Utc::now(),
+    };
+    handler.try_send(rec).expect("send rec");
+
+    // Drop the handler to close the channel and trigger the shutdown flush.
+    drop(handler);
+    tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
+        .await
+        .expect("writer task must exit within 5s")
+        .expect("writer task must not panic");
+
+    // A descriptor JSON must exist somewhere under descriptor_dir.
+    let mut found = false;
+    let mut stack = vec![descriptor_dir.path().to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut entries = tokio::fs::read_dir(&dir).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                found = true;
+                let contents = tokio::fs::read_to_string(&path).await.unwrap();
+                let v: serde_json::Value = serde_json::from_str(&contents).unwrap();
+                assert_eq!(v["source"], "hec");
+                assert_eq!(v["file_format"], "PARQUET");
+            }
+        }
+    }
+    assert!(
+        found,
+        "expected at least one descriptor .json file under {descriptor_dir:?}"
+    );
 }

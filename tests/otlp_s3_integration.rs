@@ -103,6 +103,7 @@ mod tests {
             sink.clone(),
             64,
             std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+            None,
         );
 
         // Map the OTLP request to GenericRecords.

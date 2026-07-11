@@ -265,6 +265,7 @@ impl Server {
                             Arc::new(sink),
                             config.hec.max_sourcetype_partitions,
                             source_stats.clone(),
+                            descriptor_sink.clone(),
                         );
                         hec_worker_handles.push(join_handle);
                         generic_s3_handler = Some(handler);
@@ -286,6 +287,7 @@ impl Server {
                             Arc::new(sink),
                             config.hec.max_sourcetype_partitions,
                             source_stats.clone(),
+                            descriptor_sink.clone(),
                         );
                         hec_worker_handles.push(join_handle);
                         generic_local_handler = Some(handler);

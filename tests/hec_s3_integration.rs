@@ -68,6 +68,7 @@ async fn hec_records_appear_as_parquet_in_s3() {
         sink,
         64,
         std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
     );
     handler
         .try_send(make_record("access_log", "alice"))

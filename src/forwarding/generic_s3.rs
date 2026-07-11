@@ -121,6 +121,7 @@ pub fn hec_start(
     s3: Arc<crate::forwarding::s3_sink::S3Sink>,
     max_partitions: usize,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+    descriptor_sink: Option<Arc<dyn crate::forwarding::buffered_writer::UploadSink>>,
 ) -> (GenericS3Handler, tokio::task::JoinHandle<()>) {
     crate::forwarding::buffered_writer::start_writer::<GenericSink>(
         cfg.prefix.clone(),
@@ -131,7 +132,7 @@ pub fn hec_start(
         max_partitions,
         s3,
         source_stats,
-        None,
+        descriptor_sink,
     )
 }
 
@@ -144,6 +145,7 @@ pub fn hec_local_start(
     sink: Arc<crate::forwarding::local_sink::LocalDiskSink>,
     max_partitions: usize,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+    descriptor_sink: Option<Arc<dyn crate::forwarding::buffered_writer::UploadSink>>,
 ) -> (GenericS3Handler, tokio::task::JoinHandle<()>) {
     crate::forwarding::buffered_writer::start_writer::<GenericSink>(
         cfg.prefix.clone(),
@@ -154,7 +156,7 @@ pub fn hec_local_start(
         max_partitions,
         sink,
         source_stats,
-        None,
+        descriptor_sink,
     )
 }
 
@@ -394,6 +396,7 @@ mod tests {
             s3,
             64,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
         handler
             .try_send(make_record("access_log"))
@@ -430,6 +433,7 @@ mod tests {
             sink,
             64,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
         handler
             .try_send(make_record("access_log"))
