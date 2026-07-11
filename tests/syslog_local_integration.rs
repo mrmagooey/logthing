@@ -44,6 +44,7 @@ async fn syslog_messages_appear_as_parquet_on_local_disk() {
         &cfg,
         sink,
         std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
     );
 
     let src: SocketAddr = "127.0.0.1:5514".parse().unwrap();
@@ -122,4 +123,83 @@ async fn syslog_messages_appear_as_parquet_on_local_disk() {
     assert_eq!(hostnames.value(0), "host-a");
     assert_eq!(hostnames.value(1), "host-b");
     assert!(!hostnames.is_null(0));
+}
+
+#[tokio::test]
+async fn syslog_local_start_emits_iceberg_descriptor_when_configured() {
+    let parquet_dir = tempfile::tempdir().expect("parquet tempdir");
+    let descriptor_dir = tempfile::tempdir().expect("descriptor tempdir");
+
+    let parquet_sink = std::sync::Arc::new(
+        LocalDiskSink::new(parquet_dir.path().to_path_buf())
+            .await
+            .expect("LocalDiskSink::new (parquet)"),
+    );
+    let descriptor_sink: std::sync::Arc<dyn logthing::forwarding::buffered_writer::UploadSink> =
+        std::sync::Arc::new(
+            LocalDiskSink::new(descriptor_dir.path().to_path_buf())
+                .await
+                .expect("LocalDiskSink::new (descriptor)"),
+        );
+
+    let cfg = SyslogLocalConfig {
+        directory: parquet_dir.path().to_path_buf(),
+        prefix: "syslog".to_string(),
+        max_buffer_rows: 1, // flush immediately on first row
+        flush_interval_secs: 3600,
+        channel_capacity: 64,
+    };
+
+    let (handler, writer_task) = syslog_local_start(
+        &cfg,
+        parquet_sink,
+        std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        Some(descriptor_sink),
+    );
+
+    let src: SocketAddr = "127.0.0.1:5514".parse().unwrap();
+    let msg = SyslogMessage {
+        priority: 34,
+        severity: 2,
+        facility: 4,
+        timestamp: Some(chrono::Utc::now()),
+        hostname: Some("host-a".to_string()),
+        app_name: Some("sshd".to_string()),
+        proc_id: None,
+        msg_id: None,
+        message: "authentication failure".to_string(),
+        structured_data: None,
+        protocol: SyslogProtocol::Rfc3164,
+    };
+    handler.handle_message(msg, src).await;
+
+    // Drop the handler to close the channel; background task flushes on exit.
+    drop(handler);
+    tokio::time::timeout(std::time::Duration::from_secs(5), writer_task)
+        .await
+        .expect("writer task exits within 5s")
+        .expect("writer task must not panic");
+
+    // A descriptor JSON must exist somewhere under descriptor_dir.
+    let mut found = false;
+    let mut stack = vec![descriptor_dir.path().to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut entries = tokio::fs::read_dir(&dir).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                found = true;
+                let contents = tokio::fs::read_to_string(&path).await.unwrap();
+                let v: serde_json::Value = serde_json::from_str(&contents).unwrap();
+                assert_eq!(v["source"], "syslog");
+                assert_eq!(v["file_format"], "PARQUET");
+            }
+        }
+    }
+    assert!(
+        found,
+        "expected at least one descriptor .json file under {descriptor_dir:?}"
+    );
 }

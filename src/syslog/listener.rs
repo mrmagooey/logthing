@@ -795,6 +795,7 @@ mod tests {
             &cfg,
             s3,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
         let structured_handle = Arc::new(structured_handle);
 

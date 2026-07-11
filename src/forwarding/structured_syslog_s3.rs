@@ -119,6 +119,7 @@ pub fn structured_syslog_start(
     cfg: &SyslogS3Config,
     s3: Arc<crate::forwarding::s3_sink::S3Sink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+    descriptor_sink: Option<Arc<dyn crate::forwarding::buffered_writer::UploadSink>>,
 ) -> (StructuredS3Handler, tokio::task::JoinHandle<()>) {
     use crate::forwarding::buffered_writer::{
         BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
@@ -139,7 +140,14 @@ pub fn structured_syslog_start(
         max_bytes: usize::MAX,
         interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
     };
-    ParquetWriterHandle::start_with_stats(StructuredSyslogSink, s3, bwc, policy, source_stats, None)
+    ParquetWriterHandle::start_with_stats(
+        StructuredSyslogSink,
+        s3,
+        bwc,
+        policy,
+        source_stats,
+        descriptor_sink,
+    )
 }
 
 #[cfg(test)]
@@ -285,6 +293,7 @@ mod tests {
             &cfg,
             s3,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
         // Drop the handle immediately — empty buffer → flush_all is a no-op →
         // writer task exits without any S3 call.

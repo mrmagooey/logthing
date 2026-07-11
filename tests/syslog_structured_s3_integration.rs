@@ -57,6 +57,7 @@ async fn cef_record_appears_as_parquet_under_cef_partition() {
         &cfg,
         s3.clone(),
         std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
     );
     let structured_handle = Arc::new(structured_handle);
 
@@ -150,6 +151,7 @@ async fn multiple_payload_types_land_in_separate_partitions() {
         &cfg,
         s3.clone(),
         std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
     );
     let structured_handle = Arc::new(structured_handle);
 

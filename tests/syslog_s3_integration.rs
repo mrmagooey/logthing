@@ -57,6 +57,7 @@ async fn syslog_message_appears_as_parquet_in_s3() {
         &cfg,
         sink.clone(),
         std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
     );
 
     let msg = SyslogMessage {

@@ -180,6 +180,7 @@ pub fn syslog_start(
     cfg: &SyslogS3Config,
     s3: std::sync::Arc<crate::forwarding::s3_sink::S3Sink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+    descriptor_sink: Option<std::sync::Arc<dyn crate::forwarding::buffered_writer::UploadSink>>,
 ) -> (SyslogS3Handler, tokio::task::JoinHandle<()>) {
     crate::forwarding::buffered_writer::start_writer::<SyslogSink>(
         cfg.prefix.clone(),
@@ -190,7 +191,7 @@ pub fn syslog_start(
         1,
         s3,
         source_stats,
-        None,
+        descriptor_sink,
     )
 }
 
@@ -203,6 +204,7 @@ pub fn syslog_local_start(
     cfg: &crate::config::SyslogLocalConfig,
     sink: std::sync::Arc<crate::forwarding::local_sink::LocalDiskSink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+    descriptor_sink: Option<std::sync::Arc<dyn crate::forwarding::buffered_writer::UploadSink>>,
 ) -> (SyslogS3Handler, tokio::task::JoinHandle<()>) {
     crate::forwarding::buffered_writer::start_writer::<SyslogSink>(
         cfg.prefix.clone(),
@@ -213,7 +215,7 @@ pub fn syslog_local_start(
         1,
         sink,
         source_stats,
-        None,
+        descriptor_sink,
     )
 }
 
@@ -542,6 +544,7 @@ mod tests {
             &cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
 
         // try_send one message through the handler
@@ -582,6 +585,7 @@ mod tests {
             &cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
 
         let src: SocketAddr = "127.0.0.1:5514".parse().unwrap();
@@ -650,6 +654,7 @@ mod tests {
             &cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
         let live: Arc<dyn SyslogHandlerTrait> = Arc::new(handler);
 
