@@ -110,6 +110,45 @@ both `iceberg.s3` and `iceberg.local` simultaneously is a startup error —
 unlike other sources, the descriptor sink supports exactly one
 destination.
 
+#### Suggested deployment pattern
+
+logthing only ever writes Parquet + descriptor files — it never talks to
+an Iceberg catalog. Turning those descriptors into real Iceberg tables is
+the job of a separate, standalone **committer** process that you run
+alongside logthing:
+
+```
+logthing ──writes──▶ Parquet files   (existing [<source>.s3]/[<source>.local])
+         └─writes──▶ descriptor JSON  ([iceberg.s3]/[iceberg.local])
+                            │
+                            ▼
+                    committer (external, not part of logthing)
+                    reads descriptor JSON only — never re-reads Parquet
+                            │
+                            ▼
+                      Iceberg catalog + tables
+```
+
+- **Committer**: a small, independently-deployed job (batch or
+  long-running) that lists new descriptor files, builds Iceberg manifests
+  from their contents, and commits snapshots. PyIceberg's `add_files` is
+  the lowest-friction way to start; a native Rust committer using
+  `iceberg-rust` is a reasonable next step once its write API has matured
+  further.
+- **Catalog**: [Lakekeeper](https://github.com/lakekeeper/lakekeeper) (a
+  single-binary, no-JVM, self-hosted REST catalog) for self-hosted/dev
+  deployments; AWS Glue Data Catalog for AWS deployments — both require
+  no new infrastructure beyond what you likely already run.
+- **Compaction**: run as a separate, periodic batch job (e.g. Trino/Spark
+  `OPTIMIZE`) rather than folding it into the committer — neither
+  PyIceberg nor `iceberg-rust` currently ships an atomic file-rewrite
+  action, so merging small files is best treated as independent
+  table-maintenance, not part of every commit.
+
+This keeps logthing decoupled from Iceberg's release cadence: the
+committer and catalog can be swapped or upgraded independently, and a
+logthing deploy never blocks on either.
+
 ### Kerberos Client Authentication
 
 Require inbound clients (e.g., Windows Event Forwarding collectors) to authenticate with SPNEGO/Negotiate.
