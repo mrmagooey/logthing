@@ -97,6 +97,19 @@ port: `WEF__SYSLOG__UDP_PORT`, `WEF__SYSLOG__TCP_PORT`,
 `WEF__<SECTION>__BIND_ADDRESS` to change which interface they listen on;
 syslog's bind address is fixed at `0.0.0.0` and has no such override.
 
+### Iceberg descriptor output
+
+Optionally, logthing can emit a small JSON "descriptor" file alongside
+every Parquet file it writes, describing the file (row count, byte size,
+partition, per-column stats, fully-qualified location) for an external
+Apache Iceberg committer process — logthing itself has no Iceberg
+dependency and never talks to a catalog. Enable it with `[iceberg.s3]` or
+`[iceberg.local]` in `logthing.toml` (mirroring every other source's
+`.s3`/`.local` shape), or via `WEF__ICEBERG__S3__BUCKET` etc. Configuring
+both `iceberg.s3` and `iceberg.local` simultaneously is a startup error —
+unlike other sources, the descriptor sink supports exactly one
+destination.
+
 ### Kerberos Client Authentication
 
 Require inbound clients (e.g., Windows Event Forwarding collectors) to authenticate with SPNEGO/Negotiate.

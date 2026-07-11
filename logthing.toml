@@ -106,3 +106,15 @@ bind_address = "0.0.0.0"   # env: WEF__IPFIX__BIND_ADDRESS
 # flush_interval_secs   = 900                     # flush after N seconds (default 900)
 # channel_capacity      = 256                     # channel depth (default 256)
 # max_buffer_rows       = 100000                  # hard-cap before oldest rows dropped (default 100 000)
+
+# Optional: emit a small JSON "descriptor" alongside every Parquet file,
+# for an external Apache Iceberg committer process. logthing has no
+# Iceberg dependency itself. Configure at most one of [iceberg.s3] /
+# [iceberg.local] — configuring both is a startup error.
+# [iceberg.s3]
+# endpoint   = "http://localhost:9000"
+# bucket     = "logthing-iceberg-descriptors"
+# region     = "us-east-1"
+# access_key = "minioadmin"
+# secret_key = "minioadmin"
+# prefix     = "_iceberg_descriptors"   # env: WEF__ICEBERG__S3__PREFIX
