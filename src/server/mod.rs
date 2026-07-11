@@ -188,6 +188,14 @@ impl Server {
         let mut parquet_s3_sender = None;
         let mut parquet_local_sender = None;
 
+        let descriptor_sink =
+            crate::forwarding::buffered_writer::build_iceberg_descriptor_sink(&config.iceberg)
+                .await
+                .unwrap_or_else(|e| {
+                    error!("Failed to construct Iceberg descriptor sink, descriptors disabled: {e}");
+                    None
+                });
+
         if let Some(wef_s3_cfg) = config.wef.s3.as_ref() {
             match crate::forwarding::s3_sink::S3Sink::from_connection(&wef_s3_cfg.connection).await
             {
@@ -197,6 +205,7 @@ impl Server {
                         wef_s3_cfg,
                         Arc::new(sink),
                         source_stats.clone(),
+                        descriptor_sink.clone(),
                     );
                     wef_worker_handles.push(join_handle);
                     parquet_s3_sender = Some(handle);
@@ -217,6 +226,7 @@ impl Server {
                         wef_local_cfg,
                         Arc::new(sink),
                         source_stats.clone(),
+                        descriptor_sink.clone(),
                     );
                     wef_worker_handles.push(join_handle);
                     parquet_local_sender = Some(handle);

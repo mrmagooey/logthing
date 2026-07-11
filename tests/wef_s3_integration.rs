@@ -89,6 +89,7 @@ async fn wef_event_appears_as_parquet_in_s3() {
         &cfg,
         sink.clone(),
         std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
     );
 
     let event = make_windows_event(4624);

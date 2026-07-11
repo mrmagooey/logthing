@@ -102,6 +102,7 @@ pub fn wef_start(
     cfg: &WefS3Config,
     s3: Arc<crate::forwarding::s3_sink::S3Sink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+    descriptor_sink: Option<Arc<dyn crate::forwarding::buffered_writer::UploadSink>>,
 ) -> (
     crate::forwarding::buffered_writer::ParquetWriterHandle<WefSink>,
     tokio::task::JoinHandle<()>,
@@ -115,7 +116,7 @@ pub fn wef_start(
         0, // unlimited partitions — EventIDs are bounded in practice
         s3,
         source_stats,
-        None,
+        descriptor_sink,
     )
 }
 
@@ -128,6 +129,7 @@ pub fn wef_local_start(
     cfg: &crate::config::WefLocalConfig,
     sink: Arc<crate::forwarding::local_sink::LocalDiskSink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+    descriptor_sink: Option<Arc<dyn crate::forwarding::buffered_writer::UploadSink>>,
 ) -> (
     crate::forwarding::buffered_writer::ParquetWriterHandle<WefSink>,
     tokio::task::JoinHandle<()>,
@@ -141,7 +143,7 @@ pub fn wef_local_start(
         0,
         sink,
         source_stats,
-        None,
+        descriptor_sink,
     )
 }
 
@@ -308,6 +310,7 @@ mod tests {
             &cfg,
             s3,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
 
         // Send a parsed event — should be accepted
@@ -346,6 +349,7 @@ mod tests {
             &cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
 
         let event = make_parsed_event(4624);
