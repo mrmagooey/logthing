@@ -80,3 +80,7 @@ flush_interval_secs   = 5
 directory             = "/var/log/wef-local"
 flush_threshold_bytes = 1
 flush_interval_secs   = 5
+
+[iceberg.local]
+directory = "/var/log/iceberg-local"
+prefix    = "_iceberg_descriptors"

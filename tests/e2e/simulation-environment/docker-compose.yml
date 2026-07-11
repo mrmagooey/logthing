@@ -16,6 +16,7 @@ services:
       - zeek-local-data:/var/log/zeek-local
       - ipfix-local-data:/var/log/ipfix-local
       - wef-local-data:/var/log/wef-local
+      - iceberg-local-data:/var/log/iceberg-local
     depends_on:
       - minio
     networks:
@@ -117,8 +118,10 @@ services:
       - WEF_LOCAL_DIR=/var/log/wef-local
       - EXPECTED_EVENT_TOTAL=50
       - E2E_TIMEOUT_SECS=60
+      - ICEBERG_LOCAL_DIR=/var/log/iceberg-local
     volumes:
       - wef-local-data:/var/log/wef-local:ro
+      - iceberg-local-data:/var/log/iceberg-local:ro
     depends_on:
       - wef-generator
       - logthing
@@ -415,3 +418,4 @@ volumes:
   zeek-local-data:
   ipfix-local-data:
   wef-local-data:
+  iceberg-local-data:

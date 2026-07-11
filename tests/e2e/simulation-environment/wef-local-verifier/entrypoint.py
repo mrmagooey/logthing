@@ -7,9 +7,18 @@ for Parquet objects under event_type=*/, downloads each, and validates
 schema and row count. Mirrors ipfix-local-verifier/entrypoint.py's checks,
 applied to WEF's empty-prefix event_type=<id>/year=… layout instead of a
 fixed source-name prefix.
+
+Also polls a second shared volume (the `[iceberg.local]` destination
+configured alongside WEF's own `[wef.local]` in config/logthing.toml) for
+at least one Iceberg descriptor JSON file, and validates its shape. The
+descriptor sink is shared across every enabled source in the `logthing`
+container (syslog, ipfix, zeek, wef, ...), so this only proves that *some*
+source produced a well-formed descriptor — it does not require the
+descriptor to specifically describe a WEF-sourced Parquet file.
 """
 
 import glob
+import json
 import os
 import sys
 import time
@@ -20,6 +29,8 @@ WEF_LOCAL_DIR = os.environ.get("WEF_LOCAL_DIR", "/var/log/wef-local")
 TIMEOUT = int(os.environ.get("E2E_TIMEOUT_SECS", "60"))
 MIN_ROWS = int(os.environ.get("EXPECTED_EVENT_TOTAL", "5"))
 
+ICEBERG_LOCAL_DIR = os.environ.get("ICEBERG_LOCAL_DIR", "/var/log/iceberg-local")
+
 REQUIRED_COLUMNS = [
     "event_id",
     "timestamp",
@@ -27,6 +38,8 @@ REQUIRED_COLUMNS = [
     "subscription_id",
     "event_data",
 ]
+
+REQUIRED_DESCRIPTOR_KEYS = ["source", "file_path", "record_count"]
 
 
 def scan_dir():
@@ -43,12 +56,43 @@ def scan_dir():
     return total_rows, columns, len(files)
 
 
+def scan_iceberg_descriptors():
+    """Read every .json file under ICEBERG_LOCAL_DIR/**, return the first
+    one that parses and has a sane shape, or None if none qualify yet."""
+    pattern = os.path.join(ICEBERG_LOCAL_DIR, "**", "*.json")
+    files = glob.glob(pattern, recursive=True)
+    for path in files:
+        try:
+            with open(path) as f:
+                descriptor = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            # Descriptor write is rename-into-place, but tolerate a file
+            # still being written/renamed at the moment we glob it.
+            continue
+        missing = [k for k in REQUIRED_DESCRIPTOR_KEYS if k not in descriptor]
+        if missing:
+            continue
+        if (
+            not isinstance(descriptor["source"], str)
+            or not descriptor["source"]
+            or not isinstance(descriptor["file_path"], str)
+            or not descriptor["file_path"]
+            or not isinstance(descriptor["record_count"], int)
+            or descriptor["record_count"] <= 0
+        ):
+            continue
+        return path, descriptor
+    return None, None
+
+
 def main():
     deadline = time.time() + TIMEOUT
     total_rows, columns, n = 0, set(), 0
+    descriptor_path, descriptor = None, None
     while time.time() < deadline:
         total_rows, columns, n = scan_dir()
-        if total_rows >= MIN_ROWS:
+        descriptor_path, descriptor = scan_iceberg_descriptors()
+        if total_rows >= MIN_ROWS and descriptor is not None:
             break
         time.sleep(3)
 
@@ -66,10 +110,21 @@ def main():
             file=sys.stderr,
         )
         sys.exit(1)
+    if descriptor is None:
+        print(
+            f"ERROR: no valid Iceberg descriptor JSON found under {ICEBERG_LOCAL_DIR} "
+            f"within {TIMEOUT}s (need keys {REQUIRED_DESCRIPTOR_KEYS} with sane values)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     print(
         f"OK: {total_rows} row(s) across {n} file(s), {len(columns)} column(s): "
         f"{sorted(columns)}"
+    )
+    print(
+        f"OK: Iceberg descriptor at {descriptor_path}: source={descriptor['source']!r} "
+        f"file_path={descriptor['file_path']!r} record_count={descriptor['record_count']}"
     )
     print("WEF local-disk verifier succeeded")
     sys.stdout.flush()
