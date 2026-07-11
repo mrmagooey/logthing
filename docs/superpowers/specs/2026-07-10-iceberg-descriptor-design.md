@@ -100,8 +100,8 @@ prefix = "_iceberg_descriptors"   # optional, default ""
   "schema_version": "a1b2c3d4",
   "written_at": "2026-07-10T12:00:00Z",
   "column_stats": {
-    "0": { "null_count": 0, "min": "10.0.0.1", "max": "10.0.0.9" },
-    "1": { "null_count": 3, "min": "80", "max": "8443" }
+    "0": { "null_count": 0, "min": "Cgo0AAA=", "max": "CgoxAAA=", "physical_type": "INT32" },
+    "1": { "null_count": 3, "min": null, "max": null, "physical_type": "BYTE_ARRAY" }
   }
 }
 ```
@@ -127,14 +127,26 @@ prefix = "_iceberg_descriptors"   # optional, default ""
     files) needs a trivial implementation added.
 - `column_stats`: keyed by **Parquet column index** (0-based physical
   position in the file), NOT Iceberg field ID. Sourced from
-  `ArrowWriter::close()`'s return value (`FileMetaData`), which is
-  currently discarded (only the encoded `Vec<u8>` bytes are kept today) —
-  capture it instead. `parquet::file::metadata::FileMetaData`'s row-group
-  → `ColumnChunkMetaData` already exposes `.statistics()` (min/max/null
-  count) computed by the encoder; no new computation needed, only
-  capturing an already-computed value. Min/max are stringified for JSON
-  simplicity — the committer reconstructs typed bounds using its own
-  knowledge of the source's schema.
+  `ArrowWriter::close()`'s return value — `Result<parquet::format::FileMetaData>`
+  (verified against the actually-pinned `parquet = "53.4.1"` source, not
+  assumed), which is currently discarded (only the encoded `Vec<u8>`
+  bytes are kept today) — capture it instead.
+  `FileMetaData.row_groups[0].columns[i].meta_data.statistics` (thrift
+  `Statistics { min: Option<Vec<u8>>, max: Option<Vec<u8>>, null_count:
+  Option<i64>, .. }`) is already computed by the encoder; no new
+  computation needed, only capturing an already-computed value. **Min/max
+  are base64-encoded raw bytes, exactly as Parquet's own PLAIN encoding
+  stores them — NOT decoded into a human-readable string.** (Corrected
+  during plan-writing after reading the real `parquet` crate source:
+  `Statistics.min`/`max` are type-encoded binary, requiring per-physical-type
+  decode logic to turn into a readable value — logthing does not do that
+  decoding.) This is a **more correct** design than originally specified,
+  not a scope cut: Iceberg's own `DataFile.lower_bounds`/`upper_bounds`
+  spec fields are ALSO raw type-encoded binary, not human-readable
+  strings — so passing the bytes through unchanged, plus the column's
+  `physical_type` (e.g. `"INT32"`, `"BYTE_ARRAY"`) needed to decode them,
+  is what the committer actually needs, and avoids logthing decoding into
+  a lossy string that would need re-encoding downstream anyway.
   Index-keying is **valid only within one `schema_version`** — if a
   source's Arrow schema changes, column index-to-meaning can shift; the
   committer must key any cross-version aggregation by `schema_version`,
