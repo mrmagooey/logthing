@@ -526,7 +526,14 @@ fn build_descriptor(
             let Some(col_meta) = column.meta_data.as_ref() else {
                 continue;
             };
-            let physical_type = format!("{:?}", col_meta.type_);
+            // `col_meta.type_` is the raw thrift `parquet::format::Type` newtype
+            // (`Type(1)`, `Type(6)`, ...) — its derived `Debug` is useless for the
+            // committer contract. Convert to `parquet::basic::Type`, whose derived
+            // `Debug` gives the human-readable name (`INT32`, `BYTE_ARRAY`, ...)
+            // that callers need to decode the base64 min/max bytes below.
+            let physical_type = parquet::basic::Type::try_from(col_meta.type_)
+                .map(|t| format!("{t:?}"))
+                .unwrap_or_else(|_| format!("UNKNOWN({})", col_meta.type_.0));
             let (null_count, min, max) = match col_meta.statistics.as_ref() {
                 Some(stats) => (
                     stats.null_count.unwrap_or(0).max(0) as u64,
@@ -1640,6 +1647,60 @@ secret_key  = "SECRET"
         assert_eq!(rb.num_rows(), 1);
         let col = rb.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(col.value(0), "hello");
+    }
+
+    /// Regression test for a bug where `physical_type` was built via
+    /// `format!("{:?}", col_meta.type_)` on `parquet::format::Type` — a
+    /// thrift-generated newtype (`pub struct Type(pub i32)`) whose derived
+    /// `Debug` yields `"Type(1)"`, not the human-readable `"INT32"` that
+    /// `IcebergDescriptor`'s contract promises to the external committer
+    /// (which decodes the base64 min/max bytes using this field).
+    ///
+    /// This exercises the REAL extraction path: a real Arrow `RecordBatch`
+    /// with an `Int32` column is encoded through the real `ArrowWriter`
+    /// (the same path `flush_partition` uses), and `build_descriptor` is
+    /// called on the resulting real `parquet::format::FileMetaData` — not a
+    /// hand-built `ColumnStat` fixture, which is what let this bug slip
+    /// through prior reviews.
+    #[test]
+    fn build_descriptor_reports_human_readable_physical_type_for_int32_column() {
+        use arrow::array::Int32Array;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as _],
+        )
+        .unwrap();
+
+        let props = parquet::file::properties::WriterProperties::builder().build();
+        let mut buf = Vec::new();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        let file_metadata = writer.close().unwrap();
+
+        let descriptor = build_descriptor(
+            "test_source",
+            None,
+            "s3://bucket".to_string(),
+            "path/to/file.parquet",
+            3,
+            buf.len() as u64,
+            "test_target",
+            &schema,
+            &file_metadata,
+        );
+
+        let stat = descriptor
+            .column_stats
+            .get(&0)
+            .expect("column 0 stat present");
+        assert_eq!(
+            stat.physical_type, "INT32",
+            "physical_type must be the human-readable enum name (\"INT32\"), not the raw \
+             thrift Debug output (e.g. \"Type(1)\")"
+        );
     }
 
     // -----------------------------------------------------------------------
