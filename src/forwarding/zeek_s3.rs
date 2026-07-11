@@ -195,6 +195,7 @@ pub fn zeek_start(
     cfg: &ZeekS3Config,
     s3: std::sync::Arc<crate::forwarding::s3_sink::S3Sink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+    descriptor_sink: Option<std::sync::Arc<dyn crate::forwarding::buffered_writer::UploadSink>>,
 ) -> (ZeekS3Handler, tokio::task::JoinHandle<()>) {
     crate::forwarding::buffered_writer::start_writer::<ZeekSink>(
         cfg.prefix.clone(),
@@ -205,7 +206,7 @@ pub fn zeek_start(
         DEFAULT_MAX_ZEEK_PARTITIONS,
         s3,
         source_stats,
-        None,
+        descriptor_sink,
     )
 }
 
@@ -217,6 +218,7 @@ pub fn zeek_local_start(
     cfg: &crate::config::ZeekLocalConfig,
     sink: std::sync::Arc<crate::forwarding::local_sink::LocalDiskSink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+    descriptor_sink: Option<std::sync::Arc<dyn crate::forwarding::buffered_writer::UploadSink>>,
 ) -> (ZeekS3Handler, tokio::task::JoinHandle<()>) {
     crate::forwarding::buffered_writer::start_writer::<ZeekSink>(
         cfg.prefix.clone(),
@@ -227,7 +229,7 @@ pub fn zeek_local_start(
         DEFAULT_MAX_ZEEK_PARTITIONS,
         sink,
         source_stats,
-        None,
+        descriptor_sink,
     )
 }
 
@@ -628,6 +630,7 @@ mod tests {
             &cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
         tokio::task::yield_now().await;
 
@@ -694,6 +697,7 @@ mod tests {
             &cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
 
         let src: SocketAddr = "127.0.0.1:47760".parse().unwrap();
@@ -738,6 +742,7 @@ mod tests {
             &cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
 
         let src: SocketAddr = "127.0.0.1:47760".parse().unwrap();
@@ -838,6 +843,7 @@ mod tests {
             &cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
 
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -933,6 +939,7 @@ mod tests {
             &cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
         let src: std::net::SocketAddr = "127.0.0.1:47760".parse().unwrap();
 
