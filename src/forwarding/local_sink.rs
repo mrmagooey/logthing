@@ -116,6 +116,10 @@ impl UploadSink for LocalDiskSink {
     fn target_label(&self) -> &'static str {
         "local"
     }
+
+    fn location_hint(&self) -> String {
+        format!("file://{}", self.root.display())
+    }
 }
 
 #[cfg(test)]
@@ -261,5 +265,14 @@ mod tests {
         assert!(missing_root.exists());
         sink.upload("f.parquet", b"x".to_vec()).await.unwrap();
         assert!(missing_root.join("f.parquet").exists());
+    }
+
+    #[tokio::test]
+    async fn location_hint_is_a_file_uri_rooted_at_the_canonical_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = LocalDiskSink::new(dir.path().to_path_buf()).await.unwrap();
+        let hint = sink.location_hint();
+        assert!(hint.starts_with("file://"), "got: {hint}");
+        assert!(hint.contains(&dir.path().file_name().unwrap().to_string_lossy().to_string()));
     }
 }

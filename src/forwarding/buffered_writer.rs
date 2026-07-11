@@ -31,6 +31,14 @@ pub trait UploadSink: Send + Sync {
 
     /// Stable label for the `target` metric dimension, e.g. `"s3"` | `"local"`.
     fn target_label(&self) -> &'static str;
+
+    /// A fully-qualified location prefix for objects this sink uploads,
+    /// e.g. `"http://minio:9000/my-bucket"` (S3) or `"file:///data/zeek"`
+    /// (local disk). Used to build a fully-qualified `file_path` in
+    /// `IcebergDescriptor` (a bare relative key alone doesn't tell an
+    /// external reader which bucket/directory a file lives in — different
+    /// sources may point at different buckets).
+    fn location_hint(&self) -> String;
 }
 
 // ---------------------------------------------------------------------------
@@ -820,6 +828,9 @@ max_partitions = 128
         fn target_label(&self) -> &'static str {
             "recording"
         }
+        fn location_hint(&self) -> String {
+            "recording://test".to_string()
+        }
     }
 
     #[tokio::test]
@@ -1471,6 +1482,9 @@ secret_key  = "SECRET"
             }
             fn target_label(&self) -> &'static str {
                 "test"
+            }
+            fn location_hint(&self) -> String {
+                "unreachable://test".to_string()
             }
         }
 

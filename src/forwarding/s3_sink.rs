@@ -11,6 +11,7 @@ use tracing::info;
 pub struct S3Sink {
     client: S3Client,
     pub bucket: String,
+    pub endpoint: String,
 }
 
 impl S3Sink {
@@ -56,6 +57,7 @@ impl S3Sink {
         Ok(Self {
             client,
             bucket: cfg.bucket.clone(),
+            endpoint: cfg.endpoint.clone(),
         })
     }
 
@@ -122,6 +124,10 @@ impl crate::forwarding::buffered_writer::UploadSink for S3Sink {
 
     fn target_label(&self) -> &'static str {
         "s3"
+    }
+
+    fn location_hint(&self) -> String {
+        format!("{}/{}", self.endpoint.trim_end_matches('/'), self.bucket)
     }
 }
 
@@ -205,6 +211,24 @@ mod tests {
         assert!(
             result.is_err(),
             "upload via trait object must fail the same way as the inherent method"
+        );
+    }
+
+    #[tokio::test]
+    async fn location_hint_combines_endpoint_and_bucket() {
+        use crate::config::S3ConnectionConfig;
+        let sink = S3Sink::from_connection(&S3ConnectionConfig {
+            endpoint: "http://minio:9000/".to_string(), // trailing slash
+            bucket: "my-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key: "K".to_string(),
+            secret_key: "S".to_string(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::forwarding::buffered_writer::UploadSink::location_hint(&sink),
+            "http://minio:9000/my-bucket"
         );
     }
 }
