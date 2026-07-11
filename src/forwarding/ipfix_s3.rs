@@ -290,6 +290,7 @@ pub fn ipfix_start(
     cfg: &IpfixS3Config,
     s3: std::sync::Arc<crate::forwarding::s3_sink::S3Sink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+    descriptor_sink: Option<std::sync::Arc<dyn crate::forwarding::buffered_writer::UploadSink>>,
 ) -> (IpfixS3Handler, tokio::task::JoinHandle<()>) {
     crate::forwarding::buffered_writer::start_writer::<IpfixSink>(
         cfg.prefix.clone(),
@@ -300,7 +301,7 @@ pub fn ipfix_start(
         1, // IPFIX is single-partition
         s3,
         source_stats,
-        None,
+        descriptor_sink,
     )
 }
 
@@ -312,6 +313,7 @@ pub fn ipfix_local_start(
     cfg: &crate::config::IpfixLocalConfig,
     sink: std::sync::Arc<crate::forwarding::local_sink::LocalDiskSink>,
     source_stats: std::sync::Arc<crate::stats::SourceHourlyStats>,
+    descriptor_sink: Option<std::sync::Arc<dyn crate::forwarding::buffered_writer::UploadSink>>,
 ) -> (IpfixS3Handler, tokio::task::JoinHandle<()>) {
     crate::forwarding::buffered_writer::start_writer::<IpfixSink>(
         cfg.prefix.clone(),
@@ -322,7 +324,7 @@ pub fn ipfix_local_start(
         1, // IPFIX is single-partition
         sink,
         source_stats,
-        None,
+        descriptor_sink,
     )
 }
 
@@ -612,6 +614,7 @@ mod tests {
             &cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
 
         // Yield so the background task starts and blocks inside the S3 upload.
@@ -699,6 +702,7 @@ mod tests {
                 &cfg,
                 sink,
                 std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+                None,
             );
             tokio::task::yield_now().await;
 
@@ -762,6 +766,7 @@ mod tests {
                 &cfg,
                 sink,
                 std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+                None,
             );
             tokio::task::yield_now().await;
 
@@ -836,6 +841,7 @@ mod tests {
             &s3_cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
         let src: std::net::SocketAddr = "127.0.0.1:4739".parse().unwrap();
 
@@ -988,6 +994,7 @@ mod tests {
             &cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
 
         let src: SocketAddr = "127.0.0.1:4739".parse().unwrap();
@@ -1125,6 +1132,7 @@ mod tests {
             &cfg,
             sink,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
         );
 
         use std::sync::atomic::{AtomicUsize, Ordering};

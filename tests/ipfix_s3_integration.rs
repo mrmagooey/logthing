@@ -80,6 +80,7 @@ async fn ipfix_flow_record_appears_as_parquet_in_s3() {
         &cfg,
         sink.clone(),
         std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
     );
 
     let flow = make_flow_record();

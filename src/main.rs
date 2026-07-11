@@ -61,20 +61,23 @@ async fn async_main() -> anyhow::Result<()> {
     let mut writer_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
+    // Shared Iceberg descriptor sink, built once and reused by every source's
+    // writer construction below (syslog, ipfix, and future sources) so they
+    // all emit descriptors to the same configured destination.
+    let descriptor_sink =
+        crate::forwarding::buffered_writer::build_iceberg_descriptor_sink(&config.iceberg)
+            .await
+            .unwrap_or_else(|e| {
+                error!("Failed to construct Iceberg descriptor sink, descriptors disabled: {e}");
+                None
+            });
+
     // -----------------------------------------------------------------------
     // Start syslog listener if enabled
     // -----------------------------------------------------------------------
     if config.syslog.enabled {
         let config_clone = config.clone();
         let syslog_shutdown_rx = shutdown_rx.clone();
-
-        let descriptor_sink =
-            crate::forwarding::buffered_writer::build_iceberg_descriptor_sink(&config.iceberg)
-                .await
-                .unwrap_or_else(|e| {
-                    error!("Failed to construct Iceberg descriptor sink, descriptors disabled: {e}");
-                    None
-                });
 
         // Build optional structured sink BEFORE building the primary handler.
         let structured_handle: Option<Arc<forwarding::structured_syslog_s3::StructuredS3Handler>> =
@@ -212,6 +215,7 @@ async fn async_main() -> anyhow::Result<()> {
                         s3_cfg,
                         Arc::new(sink),
                         source_stats.clone(),
+                        descriptor_sink.clone(),
                     );
                     writer_handles.push(writer_handle);
                     ipfix_handlers.push(Arc::new(handler));
@@ -232,6 +236,7 @@ async fn async_main() -> anyhow::Result<()> {
                         local_cfg,
                         Arc::new(sink),
                         source_stats.clone(),
+                        descriptor_sink.clone(),
                     );
                     writer_handles.push(writer_handle);
                     ipfix_handlers.push(Arc::new(handler));
