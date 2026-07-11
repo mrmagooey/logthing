@@ -123,18 +123,29 @@ logthing ──writes──▶ Parquet files   (existing [<source>.s3]/[<source>
                             │
                             ▼
                     committer (external, not part of logthing)
-                    reads descriptor JSON only — never re-reads Parquet
                             │
                             ▼
                       Iceberg catalog + tables
 ```
 
 - **Committer**: a small, independently-deployed job (batch or
-  long-running) that lists new descriptor files, builds Iceberg manifests
-  from their contents, and commits snapshots. PyIceberg's `add_files` is
-  the lowest-friction way to start; a native Rust committer using
-  `iceberg-rust` is a reasonable next step once its write API has matured
-  further.
+  long-running) that lists new descriptor files and builds Iceberg
+  manifests from their contents. Two options, with a real tradeoff between
+  them:
+  - **PyIceberg's `add_files`** — fastest to stand up, but it does not
+    use the descriptor's pre-computed stats: it opens each Parquet file
+    itself and reads its footer to derive row count, byte size, column
+    stats, and partition values. This still works fine, but it re-reads
+    every file (a footer-only range-read, not a full download, but still
+    I/O against the Parquet object) and doesn't need the descriptor JSON
+    at all — it could just as well list the S3 prefix directly.
+  - **A custom committer** built on `iceberg-rust`'s low-level primitives
+    (`DataFileBuilder`, `ManifestWriter`, `ManifestListWriter`), populated
+    directly from the descriptor JSON's `record_count`/`file_size_in_bytes`/
+    `column_stats` fields — this is the option that actually delivers on
+    "never re-reads Parquet," since it never opens the Parquet file at
+    all. More work to build than reaching for `add_files`, but it's the
+    only path that uses the descriptor for what it was designed for.
 - **Catalog**: [Lakekeeper](https://github.com/lakekeeper/lakekeeper) (a
   single-binary, no-JVM, self-hosted REST catalog) for self-hosted/dev
   deployments; AWS Glue Data Catalog for AWS deployments — both require
