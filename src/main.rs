@@ -51,7 +51,12 @@ async fn async_main() -> anyhow::Result<()> {
 
     let shared_config = Arc::new(RwLock::new(config.clone()));
     let source_stats = Arc::new(stats::SourceHourlyStats::new());
-    admin::spawn_admin_server(shared_config.clone(), source_stats.clone());
+    let flush_registry = forwarding::flush_registry::FlushIntervalRegistry::new();
+    admin::spawn_admin_server(
+        shared_config.clone(),
+        source_stats.clone(),
+        flush_registry.clone(),
+    );
     let throughput = Arc::new(stats::ThroughputStats::new());
 
     // Shutdown watch channel — send `true` to trigger graceful shutdown.
@@ -93,6 +98,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     descriptor_sink.clone(),
                                 );
                             writer_handles.push(wh);
+                            flush_registry.register("syslog.structured_s3", sh.flush_interval());
                             Some(Arc::new(sh))
                         }
                         Err(e) => {
@@ -123,6 +129,7 @@ async fn async_main() -> anyhow::Result<()> {
                         descriptor_sink.clone(),
                     );
                     writer_handles.push(writer_handle);
+                    flush_registry.register("syslog.s3", handler.flush_interval());
                     syslog_handlers.push(Arc::new(handler));
                 }
                 Err(e) => {
@@ -144,6 +151,7 @@ async fn async_main() -> anyhow::Result<()> {
                         descriptor_sink.clone(),
                     );
                     writer_handles.push(writer_handle);
+                    flush_registry.register("syslog.local", handler.flush_interval());
                     syslog_handlers.push(Arc::new(handler));
                 }
                 Err(e) => {
@@ -218,6 +226,7 @@ async fn async_main() -> anyhow::Result<()> {
                         descriptor_sink.clone(),
                     );
                     writer_handles.push(writer_handle);
+                    flush_registry.register("ipfix.s3", handler.flush_interval());
                     ipfix_handlers.push(Arc::new(handler));
                 }
                 Err(e) => {
@@ -239,6 +248,7 @@ async fn async_main() -> anyhow::Result<()> {
                         descriptor_sink.clone(),
                     );
                     writer_handles.push(writer_handle);
+                    flush_registry.register("ipfix.local", handler.flush_interval());
                     ipfix_handlers.push(Arc::new(handler));
                 }
                 Err(e) => {
@@ -288,6 +298,7 @@ async fn async_main() -> anyhow::Result<()> {
                         descriptor_sink.clone(),
                     );
                     writer_handles.push(writer_handle);
+                    flush_registry.register("zeek.s3", handler.flush_interval());
                     zeek_handlers.push(Arc::new(handler));
                 }
                 Err(e) => {
@@ -309,6 +320,7 @@ async fn async_main() -> anyhow::Result<()> {
                         descriptor_sink.clone(),
                     );
                     writer_handles.push(writer_handle);
+                    flush_registry.register("zeek.local", handler.flush_interval());
                     zeek_handlers.push(Arc::new(handler));
                 }
                 Err(e) => {
@@ -358,6 +370,7 @@ async fn async_main() -> anyhow::Result<()> {
                         descriptor_sink.clone(),
                     );
                     writer_handles.push(writer_handle);
+                    flush_registry.register("suricata.s3", handler.flush_interval());
                     suricata_handlers.push(Arc::new(handler));
                 }
                 Err(e) => {
@@ -379,6 +392,7 @@ async fn async_main() -> anyhow::Result<()> {
                         descriptor_sink.clone(),
                     );
                     writer_handles.push(writer_handle);
+                    flush_registry.register("suricata.local", handler.flush_interval());
                     suricata_handlers.push(Arc::new(handler));
                 }
                 Err(e) => {
@@ -432,6 +446,7 @@ async fn async_main() -> anyhow::Result<()> {
                         descriptor_sink.clone(),
                     );
                     writer_handles.push(writer_handle);
+                    flush_registry.register("sflow.s3", handler.flush_interval());
                     sflow_handlers.push(Arc::new(handler));
                 }
                 Err(e) => {
@@ -453,6 +468,7 @@ async fn async_main() -> anyhow::Result<()> {
                         descriptor_sink.clone(),
                     );
                     writer_handles.push(writer_handle);
+                    flush_registry.register("sflow.local", handler.flush_interval());
                     sflow_handlers.push(Arc::new(handler));
                 }
                 Err(e) => {
@@ -486,7 +502,14 @@ async fn async_main() -> anyhow::Result<()> {
     // -----------------------------------------------------------------------
     // Create axum server
     // -----------------------------------------------------------------------
-    let mut server = Server::new(config, shared_config, throughput, source_stats).await?;
+    let mut server = Server::new(
+        config,
+        shared_config,
+        throughput,
+        source_stats,
+        flush_registry,
+    )
+    .await?;
 
     // Gap-b: Extract the WEF→S3 Parquet worker handle BEFORE the server is
     // consumed by run_tls, so we can await it during the shutdown sequence.

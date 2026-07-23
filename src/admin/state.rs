@@ -259,6 +259,11 @@ pub struct AdminState {
     pub csrf_tokens: Arc<RwLock<Vec<(String, Instant)>>>,
     pub request_counts: Arc<RwLock<std::collections::HashMap<String, (Instant, u32)>>>,
     pub source_stats: Arc<crate::stats::SourceHourlyStats>,
+    /// Registry of every running writer's live flush interval, so a full
+    /// config replace via the admin API (`PUT /config`, `/config/reload`,
+    /// `/config/import`) can push updated `flush_interval_secs` values into
+    /// already-running writer tasks without a process restart.
+    pub flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry,
 }
 
 /// Rate limit error response

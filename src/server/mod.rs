@@ -99,7 +99,8 @@ impl Server {
     ///     let throughput = Arc::new(ThroughputStats::new());
     ///     let source_stats = Arc::new(SourceHourlyStats::new());
     ///
-    ///     let server = Server::new(config, shared_config, throughput, source_stats).await?;
+    ///     let flush_registry = logthing::forwarding::flush_registry::FlushIntervalRegistry::new();
+    ///     let server = Server::new(config, shared_config, throughput, source_stats, flush_registry).await?;
     ///     // server.run().await?;
     ///     Ok(())
     /// }
@@ -109,6 +110,7 @@ impl Server {
         shared_config: Arc<RwLock<Config>>,
         throughput: Arc<ThroughputStats>,
         source_stats: Arc<crate::stats::SourceHourlyStats>,
+        flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry,
     ) -> anyhow::Result<Self> {
         let forwarder = Forwarder::new(config.forwarding.destinations.clone())
             .initialize()
@@ -210,6 +212,7 @@ impl Server {
                         descriptor_sink.clone(),
                     );
                     wef_worker_handles.push(join_handle);
+                    flush_registry.register("wef.s3", handle.flush_interval());
                     parquet_s3_sender = Some(handle);
                 }
                 Err(e) => {
@@ -231,6 +234,7 @@ impl Server {
                         descriptor_sink.clone(),
                     );
                     wef_worker_handles.push(join_handle);
+                    flush_registry.register("wef.local", handle.flush_interval());
                     parquet_local_sender = Some(handle);
                 }
                 Err(e) => {
@@ -270,6 +274,7 @@ impl Server {
                             descriptor_sink.clone(),
                         );
                         hec_worker_handles.push(join_handle);
+                        flush_registry.register("hec.s3", handler.flush_interval());
                         generic_s3_handler = Some(handler);
                     }
                     Err(e) => {
@@ -292,6 +297,7 @@ impl Server {
                             descriptor_sink.clone(),
                         );
                         hec_worker_handles.push(join_handle);
+                        flush_registry.register("hec.local", handler.flush_interval());
                         generic_local_handler = Some(handler);
                     }
                     Err(e) => {
@@ -1954,6 +1960,7 @@ mod tests {
             shared,
             throughput,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
         )
         .await
         .expect("Server::new must succeed")
@@ -2099,6 +2106,7 @@ mod tests {
             Arc::new(RwLock::new(Config::default())),
             Arc::new(ThroughputStats::new()),
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
+            crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
         )
         .await
         .unwrap();

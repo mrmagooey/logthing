@@ -11,7 +11,8 @@ use tracing::{error, info};
 
 use crate::admin::auth::{ensure_authorized, generate_csrf_token};
 use crate::admin::config_api::{
-    PartialConfigUpdate, persist_config, redacted_config, validate_config_invariants,
+    PartialConfigUpdate, apply_flush_intervals, persist_config, redacted_config,
+    validate_config_invariants,
 };
 use crate::admin::middleware::security_middleware;
 use crate::admin::state::{AdminServerConfig, AdminState, AuditLogger, load_admin_config};
@@ -21,11 +22,14 @@ use crate::config::Config;
 pub fn spawn_admin_server(
     config: Arc<RwLock<Config>>,
     source_stats: Arc<crate::stats::SourceHourlyStats>,
+    flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry,
 ) {
     tokio::spawn(async move {
         match load_admin_config() {
             Ok(server_config) => {
-                if let Err(err) = run_admin_server(config, server_config, source_stats).await {
+                if let Err(err) =
+                    run_admin_server(config, server_config, source_stats, flush_registry).await
+                {
                     error!("Admin server error: {}", err);
                 }
             }
@@ -41,6 +45,7 @@ async fn run_admin_server(
     config: Arc<RwLock<Config>>,
     server_config: AdminServerConfig,
     source_stats: Arc<crate::stats::SourceHourlyStats>,
+    flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry,
 ) -> anyhow::Result<()> {
     let audit_logger = AuditLogger::new(1000).await;
     let csrf_tokens: Arc<RwLock<Vec<(String, std::time::Instant)>>> =
@@ -55,6 +60,7 @@ async fn run_admin_server(
         csrf_tokens: csrf_tokens.clone(),
         request_counts: request_counts.clone(),
         source_stats,
+        flush_registry,
     };
 
     let app = axum::Router::new()
@@ -242,6 +248,8 @@ async fn update_config(
         *cfg = new_config;
         cfg.clone()
     };
+
+    apply_flush_intervals(&state.flush_registry, &updated_config);
 
     // Log the change
     state
@@ -474,6 +482,7 @@ mod tests {
             csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
+            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
         }
     }
 
@@ -751,7 +760,9 @@ mod tests {
         let policy = FlushPolicy {
             max_rows: 1_000,
             max_bytes: usize::MAX,
-            interval: std::time::Duration::from_secs(3600),
+            interval: crate::forwarding::buffered_writer::LiveInterval::new(
+                std::time::Duration::from_secs(3600),
+            ),
         };
 
         struct E2eSink;
@@ -810,6 +821,7 @@ mod tests {
             csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: source_stats.clone(),
+            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
         };
         let app = axum::Router::new()
             .route("/stats.json", axum::routing::get(get_stats_json))
@@ -1004,6 +1016,7 @@ mod tests {
             csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
+            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
         };
 
         let mut request = create_request_with_auth(Method::GET, "/", "admin", "admin", None);
@@ -1272,5 +1285,83 @@ mod tests {
                 "PATCH success response must not contain plaintext S3 secret; got: {body_str}"
             );
         }
+    }
+
+    /// End-to-end regression test for the live-reload flush-interval fix,
+    /// exercised through the actual HTTP path (not just unit-level plumbing):
+    /// a `PUT /config` request whose `syslog.s3.flush_interval_secs` differs
+    /// from an already-registered writer's current value must push the new
+    /// value into that writer's `LiveInterval` handle.
+    #[tokio::test]
+    async fn put_config_pushes_flush_interval_change_into_registered_live_writer() {
+        use crate::config::{S3ConnectionConfig, SyslogS3Config, TlsConfig};
+        use crate::forwarding::buffered_writer::LiveInterval;
+        use crate::forwarding::flush_registry::FlushIntervalRegistry;
+
+        let _sandbox = sandbox_persist_config_path().await;
+        let mut state = test_state().await;
+
+        // Register a `LiveInterval` under "syslog.s3", exactly as a running
+        // writer would at startup via
+        // `flush_registry.register("syslog.s3", handler.flush_interval())`.
+        let live = LiveInterval::new(std::time::Duration::from_secs(900));
+        let registry = FlushIntervalRegistry::new();
+        registry.register("syslog.s3", live.clone());
+        state.flush_registry = registry;
+
+        // Build a new config whose syslog.s3.flush_interval_secs (5s) differs
+        // from the registered writer's current value (900s).
+        let mut new_config = Config {
+            tls: TlsConfig {
+                enabled: false,
+                ..TlsConfig::default()
+            },
+            ..Config::default()
+        };
+        new_config.syslog.s3 = Some(SyslogS3Config {
+            connection: S3ConnectionConfig {
+                endpoint: "https://s3.example.com".to_string(),
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
+                secret_key: "super-secret-key".to_string(),
+            },
+            prefix: "syslog".to_string(),
+            max_buffer_rows: 1000,
+            flush_interval_secs: 5,
+            channel_capacity: 100,
+        });
+
+        let json_body = serde_json::to_string(&new_config).unwrap();
+        let mut request = axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri("/config")
+            .header("content-type", "application/json")
+            .header(
+                "Authorization",
+                format!("Basic {}", encode_base64("admin:admin")),
+            )
+            .body(Body::from(json_body))
+            .unwrap();
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+        let app = axum::Router::new()
+            .route("/config", axum::routing::put(update_config))
+            .with_state(state);
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "PUT /config must succeed for a valid config"
+        );
+
+        assert_eq!(
+            live.get(),
+            std::time::Duration::from_secs(5),
+            "PUT /config must push the new flush_interval_secs into the \
+             already-registered live writer handle — this is the actual bug \
+             fix, exercised end-to-end through the HTTP path"
+        );
     }
 }

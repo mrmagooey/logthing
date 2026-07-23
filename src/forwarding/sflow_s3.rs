@@ -530,7 +530,9 @@ mod tests {
         let policy = FlushPolicy {
             max_rows: 1_000,
             max_bytes: usize::MAX,
-            interval: std::time::Duration::from_secs(3600),
+            interval: crate::forwarding::buffered_writer::LiveInterval::new(
+                std::time::Duration::from_secs(3600),
+            ),
         };
         let shared_stats = std::sync::Arc::new(crate::stats::SourceHourlyStats::new());
 

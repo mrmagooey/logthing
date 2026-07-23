@@ -10,9 +10,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use tokio::sync::Notify;
 
 // ---------------------------------------------------------------------------
 // UploadSink trait
@@ -86,7 +88,90 @@ pub struct FlushPolicy {
     /// Flush when estimated buffered bytes >= this value.
     pub max_bytes: usize,
     /// Flush when oldest buffered batch age >= this duration (wall-clock).
-    pub interval: std::time::Duration,
+    /// Live-updatable: see `LiveInterval`.
+    pub interval: LiveInterval,
+}
+
+// ---------------------------------------------------------------------------
+// LiveInterval
+// ---------------------------------------------------------------------------
+
+/// A whole-seconds `Duration` that a writer's background task reads on every
+/// flush check, and that can be updated live (e.g. from the admin API)
+/// without restarting the task.
+#[derive(Clone)]
+pub struct LiveInterval {
+    secs: Arc<AtomicU64>,
+    changed: Arc<Notify>,
+}
+
+impl std::fmt::Debug for LiveInterval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveInterval")
+            .field("secs", &self.secs.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl LiveInterval {
+    pub fn new(initial: Duration) -> Self {
+        Self {
+            secs: Arc::new(AtomicU64::new(initial.as_secs())),
+            changed: Arc::new(Notify::new()),
+        }
+    }
+
+    pub fn get(&self) -> Duration {
+        Duration::from_secs(self.secs.load(Ordering::Relaxed))
+    }
+
+    /// Update the live value and wake a writer task waiting in `changed()`.
+    pub fn set_secs(&self, secs: u64) {
+        self.secs.store(secs, Ordering::Relaxed);
+        self.changed.notify_one();
+    }
+
+    /// Resolves the next time `set_secs` is called. `Notify` coalesces
+    /// multiple sets into a single stored permit if nothing is currently
+    /// awaiting, so no update is lost.
+    pub async fn changed(&self) {
+        self.changed.notified().await;
+    }
+}
+
+#[cfg(test)]
+mod live_interval_tests {
+    use super::*;
+
+    #[test]
+    fn get_returns_constructed_value() {
+        let li = LiveInterval::new(Duration::from_secs(42));
+        assert_eq!(li.get(), Duration::from_secs(42));
+    }
+
+    #[test]
+    fn set_secs_updates_get() {
+        let li = LiveInterval::new(Duration::from_secs(42));
+        li.set_secs(7);
+        assert_eq!(li.get(), Duration::from_secs(7));
+    }
+
+    #[tokio::test]
+    async fn changed_resolves_promptly_after_set_secs() {
+        let li = LiveInterval::new(Duration::from_secs(3600));
+        let waiter = li.clone();
+        let wait_fut = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(2), waiter.changed()).await
+        });
+        // Give the spawned task a chance to start waiting before we notify.
+        tokio::task::yield_now().await;
+        li.set_secs(1);
+        let result = wait_fut.await.expect("task did not panic");
+        assert!(
+            result.is_ok(),
+            "changed() must resolve promptly after set_secs"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +415,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         // Check flush policy.
         let should_flush = buf.row_count >= self.policy.max_rows
             || buf.byte_count >= self.policy.max_bytes
-            || buf.last_flush.elapsed() >= self.policy.interval;
+            || buf.last_flush.elapsed() >= self.policy.interval.get();
 
         if should_flush {
             let cap = self.config.max_buffer_rows.saturating_mul(4);
@@ -377,7 +462,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 } else {
                     buf.row_count >= self.policy.max_rows
                         || buf.byte_count >= self.policy.max_bytes
-                        || buf.last_flush.elapsed() >= self.policy.interval
+                        || buf.last_flush.elapsed() >= self.policy.interval.get()
                 }
             };
             if should_flush && let Err(e) = self.flush_partition(&key).await {
@@ -624,6 +709,10 @@ pub struct ParquetWriterHandle<S: ParquetSink> {
     source: &'static str,
     /// Target label captured at `start()` time; used for the drop metric.
     target: &'static str,
+    /// Live handle onto this writer's flush-age interval, so the admin API
+    /// (via `FlushIntervalRegistry`) can change the flush cadence of an
+    /// already-running writer without a restart.
+    flush_interval: LiveInterval,
 }
 
 impl<S: ParquetSink> ParquetWriterHandle<S> {
@@ -664,7 +753,14 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
         let source = sink.source();
         let target = s3.target_label();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<S::Record>(capacity);
-        let flush_check = crate::forwarding::s3_sink::flush_check_interval(policy.interval);
+        // Clone the live-interval handle before `policy` is moved into the
+        // writer below, so both the writer (flush-age comparisons) and this
+        // task (ticker rebuild) share the same underlying live value. A third
+        // clone is kept on the returned `Self` so external callers (e.g. the
+        // admin API's flush-interval registry) can update it live too.
+        let interval_handle = policy.interval.clone();
+        let handle_flush_interval = interval_handle.clone();
+        let flush_check = crate::forwarding::s3_sink::flush_check_interval(interval_handle.get());
         let handle = tokio::spawn(async move {
             let mut writer = PartitionedParquetWriter::with_source_stats(
                 sink,
@@ -674,7 +770,7 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                 source_stats,
                 descriptor_sink,
             );
-            let mut interval = tokio::time::interval(flush_check);
+            let mut ticker = tokio::time::interval(flush_check);
             loop {
                 tokio::select! {
                     msg = rx.recv() => {
@@ -693,15 +789,33 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                             }
                         }
                     }
-                    _ = interval.tick() => {
+                    _ = ticker.tick() => {
                         if let Err(e) = writer.flush_all_if_needed().await {
                             tracing::warn!("parquet_s3 flush_all_if_needed: {e}");
                         }
                     }
+                    _ = interval_handle.changed() => {
+                        ticker = tokio::time::interval(crate::forwarding::s3_sink::flush_check_interval(interval_handle.get()));
+                    }
                 }
             }
         });
-        (Self { tx, source, target }, handle)
+        (
+            Self {
+                tx,
+                source,
+                target,
+                flush_interval: handle_flush_interval,
+            },
+            handle,
+        )
+    }
+
+    /// Live handle onto this writer's flush-age interval. Cloning this and
+    /// registering it (e.g. in `FlushIntervalRegistry`) lets external callers
+    /// change the writer's flush cadence without restarting it.
+    pub fn flush_interval(&self) -> LiveInterval {
+        self.flush_interval.clone()
     }
 
     /// Try to send a record without blocking.
@@ -756,7 +870,7 @@ pub(crate) fn start_writer<S: ParquetSink + Default>(
     let policy = FlushPolicy {
         max_rows: max_buffer_rows,
         max_bytes: flush_threshold_bytes,
-        interval: std::time::Duration::from_secs(flush_interval_secs),
+        interval: LiveInterval::new(std::time::Duration::from_secs(flush_interval_secs)),
     };
     ParquetWriterHandle::start_with_stats(
         S::default(),
@@ -874,11 +988,11 @@ max_partitions = 128
         let p = FlushPolicy {
             max_rows: 10_000,
             max_bytes: 100 * 1024 * 1024,
-            interval: std::time::Duration::from_secs(900),
+            interval: LiveInterval::new(std::time::Duration::from_secs(900)),
         };
         assert_eq!(p.max_rows, 10_000);
         assert_eq!(p.max_bytes, 100 * 1024 * 1024);
-        assert_eq!(p.interval.as_secs(), 900);
+        assert_eq!(p.interval.get().as_secs(), 900);
     }
 
     // -----------------------------------------------------------------------
@@ -1010,7 +1124,7 @@ max_partitions = 128
         let policy = FlushPolicy {
             max_rows,
             max_bytes: usize::MAX,
-            interval: std::time::Duration::from_secs(3600),
+            interval: LiveInterval::new(std::time::Duration::from_secs(3600)),
         };
         (cfg, policy)
     }
@@ -1270,7 +1384,7 @@ max_partitions = 128
         let policy = FlushPolicy {
             max_rows: 10_000,
             max_bytes: usize::MAX,
-            interval: std::time::Duration::from_secs(3600),
+            interval: LiveInterval::new(std::time::Duration::from_secs(3600)),
         };
         let (handle, _jh) = ParquetWriterHandle::start(MockSink, s3, cfg, policy);
 
@@ -1348,7 +1462,7 @@ max_partitions = 128
         let policy = FlushPolicy {
             max_rows: 10_000,
             max_bytes: 1, // triggers immediately
-            interval: std::time::Duration::from_secs(3600),
+            interval: LiveInterval::new(std::time::Duration::from_secs(3600)),
         };
         let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
         // push returns Err (unreachable S3) but must not panic
@@ -1571,7 +1685,7 @@ secret_key  = "SECRET"
         let policy = FlushPolicy {
             max_rows: 10_000,
             max_bytes: 1, // triggers on the very first push
-            interval: std::time::Duration::from_secs(3600),
+            interval: LiveInterval::new(std::time::Duration::from_secs(3600)),
         };
         let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
 
@@ -1616,6 +1730,76 @@ secret_key  = "SECRET"
             flush_result.is_err(),
             "flush_all_if_needed should have attempted a flush and returned Err on unreachable S3"
         );
+    }
+
+    /// Core regression test for the live-reload flush-interval bug: an
+    /// ALREADY-RUNNING writer (spawned via `start_with_stats`, not a freshly
+    /// constructed one) must pick up a changed flush interval without being
+    /// restarted. Spawns a writer with a long (3600s) `flush_interval_secs`,
+    /// pushes a record (which alone would never trip the row/byte/age
+    /// thresholds), then calls `.set_secs(1)` on the handle's live interval —
+    /// exactly what `FlushIntervalRegistry::set_secs` does when the admin API
+    /// pushes a config change — and asserts the flush lands within a short
+    /// bounded wait.
+    #[tokio::test]
+    async fn already_running_writer_picks_up_live_flush_interval_change() {
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: Arc<dyn UploadSink> = Arc::new(RecordingSink {
+            uploads: uploads.clone(),
+        });
+
+        let cfg = BufferedWriterConfig {
+            connection: unused_s3_connection_placeholder(),
+            prefix: "test".to_string(),
+            max_buffer_rows: 10_000,
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 64,
+            max_partitions: 8,
+        };
+        let policy = FlushPolicy {
+            max_rows: 10_000,
+            max_bytes: usize::MAX,
+            interval: LiveInterval::new(Duration::from_secs(3600)),
+        };
+
+        let (handle, _jh) = ParquetWriterHandle::start_with_stats(
+            MockSink,
+            sink,
+            cfg,
+            policy,
+            Arc::new(crate::stats::SourceHourlyStats::default()),
+            None,
+        );
+
+        // Push a record — with a 3600s interval and no row/byte threshold
+        // hit, this alone would never trigger a flush.
+        handle.try_send("hello".to_string()).expect("try_send ok");
+
+        // Give the background task a moment to actually consume the record
+        // before we change the interval underneath it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Simulate the admin API changing flush_interval_secs on the
+        // ALREADY-RUNNING writer via its registered live handle — no restart.
+        handle.flush_interval().set_secs(1);
+
+        // The ticker rebuild is edge-triggered via `Notify`, not a fixed
+        // 1-second poll — so poll briefly here (test-side) for the flush to
+        // land instead of waiting out the original 3600s interval.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if !uploads.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "writer did not flush within 3s of set_secs(1) on its live interval handle"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(uploads.lock().unwrap().len(), 1);
     }
 
     /// Encode round-trip: a schema + RecordBatch round-trips through Parquet encoding

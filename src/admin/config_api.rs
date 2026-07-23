@@ -17,6 +17,65 @@ use crate::config::{ADMIN_OVERRIDE_FILE, Config, S3ConnectionConfig};
 
 const REDACTED: &str = "***REDACTED***";
 
+/// Push each configured `flush_interval_secs` into the corresponding
+/// already-running writer's `LiveInterval` (if one is registered), so a full
+/// config replace (`PUT /config`, `/config/reload`, `/config/import`) changes
+/// the actual flush cadence of already-running writers — no restart needed.
+///
+/// Must be called AFTER the config swap succeeds. Intentionally NOT called
+/// from `patch_config` (`PATCH /config`), which only ever touches a small
+/// fixed set of non-forwarding fields and never `flush_interval_secs`.
+pub(crate) fn apply_flush_intervals(
+    registry: &crate::forwarding::flush_registry::FlushIntervalRegistry,
+    cfg: &Config,
+) {
+    if let Some(s3) = &cfg.syslog.s3 {
+        registry.set_secs("syslog.s3", s3.flush_interval_secs);
+    }
+    if let Some(local) = &cfg.syslog.local {
+        registry.set_secs("syslog.local", local.flush_interval_secs);
+    }
+    if let Some(s3) = &cfg.syslog.structured_s3 {
+        registry.set_secs("syslog.structured_s3", s3.flush_interval_secs);
+    }
+    if let Some(s3) = &cfg.ipfix.s3 {
+        registry.set_secs("ipfix.s3", s3.flush_interval_secs);
+    }
+    if let Some(local) = &cfg.ipfix.local {
+        registry.set_secs("ipfix.local", local.flush_interval_secs);
+    }
+    if let Some(s3) = &cfg.sflow.s3 {
+        registry.set_secs("sflow.s3", s3.flush_interval_secs);
+    }
+    if let Some(local) = &cfg.sflow.local {
+        registry.set_secs("sflow.local", local.flush_interval_secs);
+    }
+    if let Some(s3) = &cfg.zeek.s3 {
+        registry.set_secs("zeek.s3", s3.flush_interval_secs);
+    }
+    if let Some(local) = &cfg.zeek.local {
+        registry.set_secs("zeek.local", local.flush_interval_secs);
+    }
+    if let Some(s3) = &cfg.suricata.s3 {
+        registry.set_secs("suricata.s3", s3.flush_interval_secs);
+    }
+    if let Some(local) = &cfg.suricata.local {
+        registry.set_secs("suricata.local", local.flush_interval_secs);
+    }
+    if let Some(s3) = &cfg.wef.s3 {
+        registry.set_secs("wef.s3", s3.flush_interval_secs);
+    }
+    if let Some(local) = &cfg.wef.local {
+        registry.set_secs("wef.local", local.flush_interval_secs);
+    }
+    if let Some(s3) = &cfg.hec.s3 {
+        registry.set_secs("hec.s3", s3.flush_interval_secs);
+    }
+    if let Some(local) = &cfg.hec.local {
+        registry.set_secs("hec.local", local.flush_interval_secs);
+    }
+}
+
 /// Test-only helpers for sandboxing `persist_config()`'s write path.
 ///
 /// `WEF_ADMIN_OVERRIDE_FILE` is a process-global env var, but cargo runs
@@ -438,6 +497,8 @@ pub async fn import_config(
         cfg.clone()
     };
 
+    apply_flush_intervals(&state.flush_registry, &updated_config);
+
     state
         .audit_logger
         .log("CONFIG_IMPORTED", &username, &client_ip, None)
@@ -486,6 +547,8 @@ pub async fn reload_config(
         *cfg = reloaded_config;
         cfg.clone()
     };
+
+    apply_flush_intervals(&state.flush_registry, &updated_config);
 
     state
         .audit_logger
@@ -588,6 +651,7 @@ mod tests {
             csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
+            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
         }
     }
 

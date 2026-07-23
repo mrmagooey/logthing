@@ -122,7 +122,7 @@ pub fn structured_syslog_start(
     descriptor_sink: Option<Arc<dyn crate::forwarding::buffered_writer::UploadSink>>,
 ) -> (StructuredS3Handler, tokio::task::JoinHandle<()>) {
     use crate::forwarding::buffered_writer::{
-        BufferedWriterConfig, FlushPolicy, ParquetWriterHandle,
+        BufferedWriterConfig, FlushPolicy, LiveInterval, ParquetWriterHandle,
     };
 
     let bwc = BufferedWriterConfig {
@@ -138,7 +138,7 @@ pub fn structured_syslog_start(
     let policy = FlushPolicy {
         max_rows: cfg.max_buffer_rows,
         max_bytes: usize::MAX,
-        interval: std::time::Duration::from_secs(cfg.flush_interval_secs),
+        interval: LiveInterval::new(std::time::Duration::from_secs(cfg.flush_interval_secs)),
     };
     ParquetWriterHandle::start_with_stats(
         StructuredSyslogSink,
@@ -341,7 +341,9 @@ mod tests {
         let policy = FlushPolicy {
             max_rows: 1_000,
             max_bytes: usize::MAX,
-            interval: std::time::Duration::from_secs(3600),
+            interval: crate::forwarding::buffered_writer::LiveInterval::new(
+                std::time::Duration::from_secs(3600),
+            ),
         };
         let shared_stats = std::sync::Arc::new(crate::stats::SourceHourlyStats::new());
 
