@@ -1587,7 +1587,13 @@ max_partitions = 128
                 .snapshot()
                 .into_hashmap()
                 .get(&gauge_key)
-                .map(|(_, _, v)| if let DebugValue::Gauge(g) = v { g.into_inner() } else { 0.0 })
+                .map(|(_, _, v)| {
+                    if let DebugValue::Gauge(g) = v {
+                        g.into_inner()
+                    } else {
+                        0.0
+                    }
+                })
                 .unwrap_or(0.0)
         };
 
