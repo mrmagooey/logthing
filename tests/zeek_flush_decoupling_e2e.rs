@@ -189,7 +189,13 @@ async fn zeek_tcp_ingest_does_not_drop_records_at_the_channel_during_a_slow_flus
         .snapshot()
         .into_hashmap()
         .get(&key)
-        .map(|(_, _, v)| if let DebugValue::Counter(c) = v { *c } else { 0 })
+        .map(|(_, _, v)| {
+            if let DebugValue::Counter(c) = v {
+                *c
+            } else {
+                0
+            }
+        })
         .unwrap_or(0);
     assert_eq!(
         dropped, 0,
