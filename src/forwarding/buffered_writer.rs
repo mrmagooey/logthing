@@ -2506,4 +2506,183 @@ secret_key  = "SECRET"
         let wrapped = wrap_with_prefix(inner, "");
         assert_eq!(wrapped.target_label(), "recording");
     }
+
+    // -----------------------------------------------------------------------
+    // Task 6 — concurrency-guarantee tests for the decoupling mechanism
+    // -----------------------------------------------------------------------
+
+    /// A second threshold-crossing while a flush is already in-flight for
+    /// the same partition must NOT spawn a second flush -- it must fall
+    /// back to `drop_oldest_to_cap` on the live buffer instead (spec
+    /// decision #2). Proven here by using a sink that blocks forever until
+    /// released, so if a second flush WERE spawned, this test would hang
+    /// (caught by the outer test timeout) instead of passing.
+    ///
+    /// The gate is a `Semaphore` starting at 0 permits, not a `Notify`, so
+    /// that releasing it (`add_permits`) is race-free regardless of whether
+    /// the release happens before or after a waiter calls `acquire()` --
+    /// unlike `Notify::notify_waiters()`, permits added to a `Semaphore` are
+    /// never lost if no one is waiting yet (deliberate deviation from the
+    /// brief's literal `Notify`-based helper; see task-6-report.md for why).
+    struct BlockingSink {
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+    #[async_trait::async_trait]
+    impl UploadSink for BlockingSink {
+        async fn upload(&self, _key: &str, _body: Vec<u8>) -> anyhow::Result<()> {
+            self.gate.acquire().await.unwrap().forget();
+            Ok(())
+        }
+        fn target_label(&self) -> &'static str {
+            "blocking"
+        }
+        fn location_hint(&self) -> String {
+            "blocking://test".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn second_threshold_crossing_while_in_flight_hard_caps_instead_of_double_flushing() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let sink: Arc<dyn UploadSink> = Arc::new(BlockingSink { gate: gate.clone() });
+        let max_rows = 1usize;
+        let (cfg, policy) = test_config(max_rows);
+        let hard_cap = max_rows.saturating_mul(4); // 4
+        let mut w = PartitionedParquetWriter::new(MockSink, sink, cfg, policy);
+
+        // First push triggers a flush that will block forever until `gate` fires.
+        w.push("r0".to_string()).await.unwrap();
+        assert!(
+            w.buffers.get("").unwrap().in_flight,
+            "first push must mark the partition in-flight"
+        );
+
+        // Push more than hard_cap while the first flush is stuck in-flight.
+        for i in 1..(hard_cap * 3) {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+
+        let buf = w.buffers.get("").unwrap();
+        assert!(
+            buf.row_count <= hard_cap,
+            "row_count {} must be capped at {} even while a flush is stuck in-flight",
+            buf.row_count,
+            hard_cap
+        );
+        assert!(
+            buf.in_flight,
+            "the ORIGINAL flush must still be the only one in-flight (still blocked on the gate)"
+        );
+
+        // Release the blocked upload so the test can clean up without hanging.
+        gate.add_permits(1);
+        w.drain_pending_flushes().await;
+    }
+
+    /// A failed flush's data must be merged back onto the live buffer
+    /// (prepended -- older data first) AND `last_flush` must be re-staled
+    /// so the age trigger fires on the very next check, matching today's
+    /// behavior where a failed flush simply never touches `last_flush`
+    /// (spec decision #12).
+    #[tokio::test]
+    async fn failed_flush_merges_batches_back_and_restales_last_flush_for_prompt_retry() {
+        let s3 = unreachable_s3().await; // every upload fails fast
+        let max_rows = 100usize; // high enough that only the AGE trigger fires
+        let (cfg, mut policy) = test_config(max_rows);
+        policy.interval = LiveInterval::new(std::time::Duration::from_secs(900));
+        let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
+
+        // Force the age trigger by backdating last_flush before the buffer exists.
+        w.push("r0".to_string()).await.unwrap();
+        w.buffers.get_mut("").unwrap().last_flush =
+            Instant::now() - std::time::Duration::from_secs(901);
+
+        // This push crosses the age threshold and triggers (and fails) a flush.
+        w.push("r1".to_string()).await.unwrap();
+        w.drain_pending_flushes().await;
+
+        let buf = w.buffers.get("").unwrap();
+        assert_eq!(
+            buf.row_count, 2,
+            "both records must still be present after the failed flush merges back"
+        );
+        assert!(
+            buf.last_flush.elapsed() >= std::time::Duration::from_secs(900),
+            "last_flush must be re-staled past the interval so the next check retries almost immediately, not after a full 900s wait"
+        );
+    }
+
+    /// `apply_flush_outcome`'s last_flush re-staling must not panic when
+    /// `Instant::now()` hasn't been running long enough to subtract a large
+    /// configured interval from (e.g. shortly after process start with a
+    /// long flush_interval_secs) -- it must fall back to "not re-staled"
+    /// instead (spec decision #12's checked_sub fix).
+    #[tokio::test]
+    async fn restale_last_flush_does_not_panic_when_interval_exceeds_process_uptime() {
+        let s3 = unreachable_s3().await;
+        let max_rows = 1usize;
+        let (cfg, mut policy) = test_config(max_rows);
+        // A deliberately enormous interval -- far longer than this test (or
+        // realistically, this process) has been running.
+        policy.interval = LiveInterval::new(std::time::Duration::from_secs(365 * 24 * 3600));
+        let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
+
+        // Triggers and fails a flush; must not panic during outcome handling.
+        w.push("r0".to_string()).await.unwrap();
+        w.drain_pending_flushes().await;
+
+        assert_eq!(
+            w.buffers.get("").unwrap().row_count,
+            1,
+            "the record must still be present after the (non-panicking) failed flush"
+        );
+    }
+
+    /// `try_flush_partition_async` must return immediately even when the
+    /// writer's flush semaphore is fully saturated -- proving the permit is
+    /// acquired INSIDE the spawned task, not in the caller. If this were
+    /// wrong (acquired before spawning), this test would hang.
+    #[tokio::test]
+    async fn spawning_a_flush_does_not_block_even_when_semaphore_is_saturated() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let sink: Arc<dyn UploadSink> = Arc::new(BlockingSink { gate: gate.clone() });
+        let (cfg, policy) = test_config(1);
+        // Multi-partition sink so distinct keys each get their own buffer,
+        // letting us saturate the semaphore (MAX_CONCURRENT_FLUSHES_PER_WRITER = 4)
+        // with more than 4 simultaneously in-flight, blocked, flushes.
+        struct MultiKeySink;
+        impl ParquetSink for MultiKeySink {
+            type Record = (String, String); // (partition, value)
+            fn source(&self) -> &'static str {
+                "test"
+            }
+            fn partition(&self, r: &Self::Record) -> Option<String> {
+                Some(r.0.clone())
+            }
+            fn schema(&self, _p: Option<&str>) -> Arc<Schema> {
+                test_schema()
+            }
+            fn to_record_batch(
+                &self,
+                record: &Self::Record,
+                schema: &Arc<Schema>,
+            ) -> anyhow::Result<RecordBatch> {
+                let col = Arc::new(StringArray::from(vec![record.1.as_str()]));
+                Ok(RecordBatch::try_new(schema.clone(), vec![col])?)
+            }
+        }
+        let mut w = PartitionedParquetWriter::new(MultiKeySink, sink, cfg, policy);
+
+        // Trigger 6 partitions' flushes (> the semaphore's 4 permits), all
+        // blocked on `gate`. Every push() call below must return promptly.
+        for i in 0..6 {
+            w.push((format!("p{i}"), "v".to_string())).await.unwrap();
+        }
+
+        // `add_permits` (unlike `Notify::notify_waiters`) is race-free: it
+        // is never lost even if called before any of the 6 spawned flushes
+        // has reached `gate.acquire()` -- see `BlockingSink` above.
+        gate.add_permits(6);
+        w.drain_pending_flushes().await;
+    }
 }
