@@ -30,6 +30,15 @@ use tokio::task::JoinSet;
 pub trait UploadSink: Send + Sync {
     /// Upload `body` at `key` (a relative path, e.g.
     /// `zeek/conn/year=2026/month=07/day=04/<uuid>.parquet`).
+    ///
+    /// Implementations MUST NOT panic from `upload` -- always return `Err`
+    /// instead. A panicking upload surfaces as a `JoinError` from the
+    /// `flush_tasks` `JoinSet` (in `ParquetWriterHandle::start_with_stats`'s
+    /// `select!` loop and in `drain_pending_flushes`), which is logged but
+    /// loses the partition key -- that partition's `in_flight` flag and
+    /// `parquet_s3_flushes_in_flight` gauge entry would never be cleared,
+    /// permanently stranding it (every future threshold crossing would fall
+    /// through to `drop_oldest_to_cap` instead of ever flushing again).
     async fn upload(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()>;
 
     /// Stable label for the `target` metric dimension, e.g. `"s3"` | `"local"`.
@@ -1016,6 +1025,9 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                     msg = rx.recv() => {
                         match msg {
                             Some(record) => {
+                                // push() always returns Ok now (flush failures surface async via
+                                // apply_flush_outcome) -- kept as Result to avoid churning callers;
+                                // this branch is currently unreachable.
                                 if let Err(e) = writer.push(record).await {
                                     tracing::warn!("parquet_s3 writer push error: {e}");
                                 }
@@ -1034,6 +1046,9 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                         }
                     }
                     _ = ticker.tick() => {
+                        // flush_all_if_needed() always returns Ok now (flush failures surface
+                        // async via apply_flush_outcome) -- kept as Result to avoid churning
+                        // callers; this branch is currently unreachable.
                         if let Err(e) = writer.flush_all_if_needed().await {
                             tracing::warn!("parquet_s3 flush_all_if_needed: {e}");
                         }

@@ -36,10 +36,12 @@
 //!    background consumer task (which emits the gauge) is scheduled onto a
 //!    different OS thread than the one that installed the recorder, so its
 //!    metric calls were silently invisible to the snapshot. The final
-//!    `parquet_s3_dropped` assertion below does NOT have this problem: it
-//!    only observes `try_send`'s own counter increment, and `try_send` is
-//!    called directly by this test's own thread, which is the same thread
-//!    that installs the recorder.
+//!    `parquet_s3_dropped` assertion is a secondary check -- the
+//!    `assert_eq!(send_errors, 0)` assertion above it is the primary,
+//!    recorder-independent proof and would already have caught any real
+//!    regression; even if the metrics snapshot were to miss an increment
+//!    due to a thread migration, it would only read back the
+//!    already-expected value of 0, so this check can't mask a failure.
 //! 2. Each push in the burst is followed by a real (if tiny)
 //!    `tokio::time::sleep`, not a bare cooperative `yield_now()` -- a
 //!    sleep actually parks the task and hands real wall-clock time to the
