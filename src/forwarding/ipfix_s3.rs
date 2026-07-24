@@ -562,16 +562,12 @@ mod tests {
         let mut writer = PartitionedParquetWriter::new(IpfixSink, sink_s3, bwc, policy);
 
         let total_pushes = hard_cap * 3;
-        let mut flush_errors = 0usize;
         for _ in 0..total_pushes {
             let record = make_flow_record(None, None, serde_json::json!({}));
-            let result = writer.push(vec![record]).await;
-            if result.is_err() {
-                flush_errors += 1;
-            }
+            writer.push(vec![record]).await.unwrap();
+            writer.drain_pending_flushes().await;
         }
 
-        assert!(flush_errors > 0, "expected at least some flush errors");
         let buf = writer.buffers.get("").unwrap();
         assert!(
             buf.row_count <= hard_cap,

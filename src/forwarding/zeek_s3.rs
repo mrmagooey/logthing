@@ -535,14 +535,11 @@ mod tests {
 
         let mut writer = PartitionedParquetWriter::new(ZeekSink, sink, bwc, policy);
         let total = hard_cap * 3;
-        let mut errors = 0usize;
         for i in 0..total {
             let rec = make_conn_record(&format!("C{i}"));
-            if writer.push(rec).await.is_err() {
-                errors += 1;
-            }
+            writer.push(rec).await.unwrap();
+            writer.drain_pending_flushes().await;
         }
-        assert!(errors > 0, "expected flush errors under S3 outage");
         assert!(
             writer.buffers.get("conn").map(|b| b.row_count).unwrap_or(0) <= hard_cap,
             "conn buffer must stay at or below hard cap ({hard_cap})"

@@ -231,7 +231,7 @@ pub struct BufferedWriterConfig {
 
 /// `BufferedWriterConfig.connection` is never read by the generic writer once
 /// a pre-built sink is supplied — only `prefix`/`max_buffer_rows`/etc. are used
-/// in `push`/`flush_partition`/`drop_oldest_to_cap`. For a local-disk-only
+/// in `push`/`try_flush_partition_async`/`drop_oldest_to_cap`. For a local-disk-only
 /// pipeline there is no S3 connection to report, so this fills the field with
 /// harmless placeholder values rather than changing its required type (which
 /// would ripple into every other source's `BufferedWriterConfig` literal).
@@ -402,7 +402,8 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
 
     /// Push one record: map to RecordBatch, append to partition buffer,
     /// enforce partition cap (overflow to `"_overflow"`), check flush policy,
-    /// call `flush_partition` + `drop_oldest_to_cap` on failure.
+    /// call `try_flush_partition_async` (spawns a background flush) or
+    /// `drop_oldest_to_cap` (if one is already in-flight for this partition).
     pub async fn push(&mut self, record: S::Record) -> anyhow::Result<()> {
         let raw_key = self.sink.partition(&record).unwrap_or_default();
 
@@ -550,58 +551,6 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         Ok(())
     }
 
-    async fn flush_partition(&mut self, key: &str) -> anyhow::Result<()> {
-        let buf = match self.buffers.get_mut(key) {
-            Some(b) if !b.buffer.is_empty() => b,
-            _ => return Ok(()),
-        };
-        let schema = buf.schema.clone();
-        let batches = std::mem::take(&mut buf.buffer);
-        let row_count = buf.row_count;
-        let byte_count = buf.byte_count;
-
-        let outcome = encode_and_upload(
-            key.to_string(),
-            batches,
-            row_count,
-            byte_count,
-            schema,
-            self.s3.clone(),
-            self.descriptor_sink.clone(),
-            self.config.prefix.clone(),
-            self.sink.source(),
-            self.flush_semaphore.clone(),
-        )
-        .await;
-
-        match outcome {
-            FlushOutcome::Success { key } => {
-                let buf = self.buffers.get_mut(&key).unwrap();
-                buf.row_count = 0;
-                buf.byte_count = 0;
-                buf.last_flush = Instant::now();
-                Ok(())
-            }
-            FlushOutcome::Failure {
-                key,
-                batches,
-                row_count,
-                byte_count,
-                error,
-            } => {
-                // Put the data back exactly as flush_partition's callers
-                // (push/flush_all/flush_all_if_needed) expect on failure
-                // today: still present in the buffer, untouched, to be
-                // retried on the next threshold crossing.
-                let buf = self.buffers.get_mut(&key).unwrap();
-                buf.buffer = batches;
-                buf.row_count = row_count;
-                buf.byte_count = byte_count;
-                Err(anyhow::anyhow!(error))
-            }
-        }
-    }
-
     /// If `key`'s partition has no flush currently in-flight, detach its
     /// buffered batches (swapping in a fresh, empty `PartitionBuffer` so new
     /// records keep accumulating without waiting on the flush) and spawn
@@ -720,7 +669,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
     /// callers await it expecting persistence to be genuinely finished) and
     /// reused by tests for deterministic waiting instead of sleep-based
     /// polling.
-    async fn drain_pending_flushes(&mut self) {
+    pub(crate) async fn drain_pending_flushes(&mut self) {
         while let Some(result) = self.flush_tasks.join_next().await {
             match result {
                 Ok(outcome) => self.apply_flush_outcome(outcome),
@@ -769,10 +718,10 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
 }
 
 /// Encode+upload one partition's already-detached batch of records. Called
-/// two ways: synchronously (awaited inline) from `flush_partition` in this
-/// task (unchanged behavior — Task 1), and, from Task 2 onward, from inside
-/// a spawned background task via `try_flush_partition_async`, decoupled
-/// from the writer's channel-draining loop.
+/// two ways: synchronously (awaited inline) from `flush_all` (at shutdown,
+/// where there is no concurrency to gain from spawning), and asynchronously
+/// (spawned) from `try_flush_partition_async` during steady-state operation,
+/// decoupled from the writer's channel-draining loop.
 ///
 /// Acquires `semaphore` INSIDE this function, never before calling it —
 /// this is load-bearing once this is called from a spawned task (Task 2):
@@ -1193,7 +1142,7 @@ pub(crate) fn start_writer<S: ParquetSink + Default>(
 /// every key. Used so the descriptor sink's own configured `prefix`
 /// (`IcebergDescriptorS3Config`/`IcebergDescriptorLocalConfig`) is applied
 /// once, at construction, without threading a separate prefix parameter
-/// through `flush_partition`/`upload_descriptor` and every one of the 14
+/// through `encode_and_upload`/`upload_descriptor` and every one of the 14
 /// per-source `_start`/`_local_start` call sites.
 struct PrefixedUploadSink {
     inner: Arc<dyn UploadSink>,
@@ -2228,7 +2177,7 @@ secret_key  = "SECRET"
         )
         .unwrap();
 
-        // Simulate what flush_partition does: concat_batches + ArrowWriter
+        // Simulate what encode_and_upload does: concat_batches + ArrowWriter
         let merged = arrow::compute::concat_batches(&schema, &[batch]).unwrap();
         let props = parquet::file::properties::WriterProperties::builder()
             .set_compression(parquet::basic::Compression::ZSTD(
@@ -2261,7 +2210,7 @@ secret_key  = "SECRET"
     ///
     /// This exercises the REAL extraction path: a real Arrow `RecordBatch`
     /// with an `Int32` column is encoded through the real `ArrowWriter`
-    /// (the same path `flush_partition` uses), and `build_descriptor` is
+    /// (the same path `encode_and_upload` uses), and `build_descriptor` is
     /// called on the resulting real `parquet::format::FileMetaData` — not a
     /// hand-built `ColumnStat` fixture, which is what let this bug slip
     /// through prior reviews.
