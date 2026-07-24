@@ -2074,9 +2074,22 @@ secret_key  = "SECRET"
     }
 
     /// Age-flush trigger: after backdating last_flush and calling flush_all_if_needed,
-    /// the flush path was entered — evidenced by Err (unreachable S3 guarantees attempt made).
+    /// the flush path was entered — evidenced by the upload-errors metric incrementing
+    /// (unreachable S3 guarantees an attempt was made and failed), not merely by the
+    /// record's row_count being unchanged (which would also be true if the age trigger
+    /// silently never fired at all).
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
     async fn age_threshold_flush_if_needed_enters_flush_path() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
         let s3 = unreachable_s3().await;
         let (cfg, policy) = test_config(10_000);
         let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
@@ -2091,8 +2104,39 @@ secret_key  = "SECRET"
         // flush_all_if_needed will attempt flush (will fail, unreachable S3).
         w.flush_all_if_needed().await.unwrap(); // flush_all_if_needed() no longer fails synchronously
         w.drain_pending_flushes().await;
+
+        // Prove the flush path was genuinely entered and failed: the upload-errors
+        // metric only increments if encode_and_upload's upload step actually ran.
+        let snapshot = snapshotter.snapshot();
+        let map = snapshot.into_hashmap();
+        let key = CompositeKey::new(
+            MetricKind::Counter,
+            metrics::Key::from_parts(
+                "parquet_s3_upload_errors",
+                vec![
+                    metrics::Label::new("source", "test"),
+                    metrics::Label::new("target", "s3"),
+                ],
+            ),
+        );
+        let count = map
+            .get(&key)
+            .map(|(_, _, v)| {
+                if let DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        assert!(
+            count >= 1,
+            "expected parquet_s3_upload_errors{{source=\"test\",target=\"s3\"}} >= 1, \
+             proving the age-triggered flush was actually attempted and failed"
+        );
+
         // The flush path was entered and failed (unreachable S3): the merge-back-on-failure
-        // logic must have put the record back, proving an attempt was made rather than silently skipped.
+        // logic must have put the record back, proving the data wasn't lost.
         assert_eq!(
             w.buffers.get("").unwrap().row_count,
             1,
