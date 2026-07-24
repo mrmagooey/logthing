@@ -1485,6 +1485,7 @@ max_partitions = 128
         let mut w = PartitionedParquetWriter::new(MockSink, sink, cfg, policy);
 
         w.push("hello".to_string()).await.unwrap();
+        w.drain_pending_flushes().await;
 
         let recorded = uploads.lock().unwrap();
         assert_eq!(
@@ -1517,6 +1518,7 @@ max_partitions = 128
         let mut w = PartitionedParquetWriter::new(MockSink, sink, cfg, policy);
 
         w.push("hello".to_string()).await.unwrap();
+        w.drain_pending_flushes().await;
 
         let snapshot = snapshotter.snapshot();
         let map = snapshot.into_hashmap();
@@ -1641,13 +1643,10 @@ max_partitions = 128
         let (cfg, policy) = test_config(max_rows);
         let hard_cap = max_rows.saturating_mul(4);
         let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
-        let mut errors = 0usize;
         for i in 0..(hard_cap * 3) {
-            if w.push(format!("r{i}")).await.is_err() {
-                errors += 1;
-            }
+            w.push(format!("r{i}")).await.unwrap(); // push() itself no longer fails -- flush failures surface asynchronously
+            w.drain_pending_flushes().await; // deterministically wait for the just-triggered flush attempt (and its merge-back) to finish before pushing more
         }
-        assert!(errors > 0);
         let buf = w.buffers.get("").unwrap();
         assert!(
             buf.row_count <= hard_cap,
@@ -2055,12 +2054,8 @@ secret_key  = "SECRET"
         let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
 
         // Push one record; this should trigger a flush attempt (which fails on unreachable S3).
-        let result = w.push("r1".to_string()).await;
-        // The flush should have been attempted (returned Err due to unreachable S3).
-        assert!(
-            result.is_err(),
-            "flush attempt on unreachable S3 should return Err"
-        );
+        w.push("r1".to_string()).await.unwrap(); // push() no longer fails synchronously when a flush fails
+        w.drain_pending_flushes().await; // deterministically wait for the triggered flush attempt (and its merge-back) to finish
         // After failed flush the hard cap kicks in; row_count must be <= cap.
         let buf = w.buffers.get("").unwrap();
         let hard_cap = 10_000usize * 4;
@@ -2088,12 +2083,14 @@ secret_key  = "SECRET"
         }
 
         // flush_all_if_needed will attempt flush (will fail, unreachable S3).
-        let flush_result = w.flush_all_if_needed().await;
-
-        // The flush path was entered: unreachable S3 guarantees the attempt was made.
-        assert!(
-            flush_result.is_err(),
-            "flush_all_if_needed should have attempted a flush and returned Err on unreachable S3"
+        w.flush_all_if_needed().await.unwrap(); // flush_all_if_needed() no longer fails synchronously
+        w.drain_pending_flushes().await;
+        // The flush path was entered and failed (unreachable S3): the merge-back-on-failure
+        // logic must have put the record back, proving an attempt was made rather than silently skipped.
+        assert_eq!(
+            w.buffers.get("").unwrap().row_count,
+            1,
+            "the record must still be present -- a failed flush merges its data back rather than losing it"
         );
     }
 
@@ -2358,6 +2355,7 @@ secret_key  = "SECRET"
         );
 
         w.push("hello".to_string()).await.unwrap();
+        w.drain_pending_flushes().await;
 
         let parquet_calls = uploads.lock().unwrap();
         assert_eq!(parquet_calls.len(), 1, "expected one Parquet upload");
@@ -2386,6 +2384,7 @@ secret_key  = "SECRET"
         let mut w = PartitionedParquetWriter::new(MockSink, parquet_sink, cfg, policy);
 
         w.push("hello".to_string()).await.unwrap();
+        w.drain_pending_flushes().await;
 
         // Only the Parquet upload happened; RecordingSink was never given
         // a descriptor destination to record into, so there is nothing
