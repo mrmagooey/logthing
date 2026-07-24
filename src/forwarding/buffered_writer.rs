@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::sync::Notify;
+use tokio::task::JoinSet;
 
 // ---------------------------------------------------------------------------
 // UploadSink trait
@@ -255,6 +256,10 @@ pub(crate) struct PartitionBuffer {
     pub(crate) byte_count: usize,
     pub(crate) last_flush: Instant,
     pub(crate) last_drop_warn: Option<Instant>,
+    /// True while a background flush task owns this partition's previously
+    /// buffered data. At most one flush is ever in-flight per partition —
+    /// see `try_flush_partition_async`.
+    pub(crate) in_flight: bool,
 }
 
 impl PartitionBuffer {
@@ -266,6 +271,7 @@ impl PartitionBuffer {
             byte_count: 0,
             last_flush: Instant::now(),
             last_drop_warn: None,
+            in_flight: false,
         }
     }
 }
@@ -303,6 +309,33 @@ pub(crate) fn build_key(
 // PartitionedParquetWriter<S>
 // ---------------------------------------------------------------------------
 
+/// Maximum number of flushes (across all of a writer's partitions) allowed
+/// to run concurrently. Bounds worst-case memory/network footprint when
+/// many partitions cross their flush threshold around the same time (e.g.
+/// Zeek's up to 256 partitions all created near service start) and, after
+/// a failed flush's `last_flush` is deliberately re-staled to retry almost
+/// immediately (see `apply_flush_outcome`), prevents a systemic backend
+/// outage from causing many partitions to retry in lockstep.
+const MAX_CONCURRENT_FLUSHES_PER_WRITER: usize = 4;
+
+/// Outcome of a background flush task (see `encode_and_upload`), reported
+/// back to the single task that owns `PartitionedParquetWriter::buffers`
+/// via `flush_tasks: JoinSet`. Never constructed with a partial/ambiguous
+/// state: either the upload succeeded, or it didn't and the caller gets
+/// back everything needed to retry.
+enum FlushOutcome {
+    Success {
+        key: String,
+    },
+    Failure {
+        key: String,
+        batches: VecDeque<(arrow_array::RecordBatch, usize)>,
+        row_count: usize,
+        byte_count: usize,
+        error: String,
+    },
+}
+
 pub struct PartitionedParquetWriter<S: ParquetSink> {
     sink: S,
     s3: Arc<dyn UploadSink>,
@@ -315,6 +348,15 @@ pub struct PartitionedParquetWriter<S: ParquetSink> {
     /// alongside each successful Parquet flush. `None` (the default via
     /// `new()`) means the feature is off — zero behavior change.
     descriptor_sink: Option<Arc<dyn UploadSink>>,
+    /// Background flush tasks spawned by `try_flush_partition_async`,
+    /// reaped by the guarded `select!` branch in
+    /// `ParquetWriterHandle::start_with_stats` (steady state) or by
+    /// `drain_pending_flushes` (shutdown / tests).
+    flush_tasks: JoinSet<FlushOutcome>,
+    /// Bounds concurrent flushes across all of this writer's partitions.
+    /// Acquired INSIDE the spawned task (`encode_and_upload`), never
+    /// before spawning — see `MAX_CONCURRENT_FLUSHES_PER_WRITER`.
+    flush_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl<S: ParquetSink> PartitionedParquetWriter<S> {
@@ -351,6 +393,10 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             buffers: HashMap::new(),
             source_stats,
             descriptor_sink,
+            flush_tasks: JoinSet::new(),
+            flush_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_FLUSHES_PER_WRITER,
+            )),
         }
     }
 
@@ -480,73 +526,49 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             Some(b) if !b.buffer.is_empty() => b,
             _ => return Ok(()),
         };
-        let batches: Vec<_> = buf.buffer.iter().map(|(b, _)| b.clone()).collect();
-        let row_count = buf.row_count;
         let schema = buf.schema.clone();
-        let source = self.sink.source();
+        let batches = std::mem::take(&mut buf.buffer);
+        let row_count = buf.row_count;
+        let byte_count = buf.byte_count;
 
-        // Concatenate all single-row batches into one before encoding.
-        // `file_metadata` (previously discarded) carries per-row-group
-        // column statistics already computed by the encoder — captured
-        // here so the Iceberg descriptor never needs to re-open the file.
-        let (merged, file_metadata) = tokio::task::spawn_blocking(
-            move || -> anyhow::Result<(Vec<u8>, parquet::format::FileMetaData)> {
-                use parquet::arrow::ArrowWriter;
-                use parquet::basic::{Compression, ZstdLevel};
-                use parquet::file::properties::WriterProperties;
-
-                let batch = arrow::compute::concat_batches(&schema, &batches)?;
-                let props = WriterProperties::builder()
-                    .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
-                    .build();
-                let mut buf = Vec::new();
-                let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props))?;
-                writer.write(&batch)?;
-                let file_metadata = writer.close()?;
-                Ok((buf, file_metadata))
-            },
+        let outcome = encode_and_upload(
+            key.to_string(),
+            batches,
+            row_count,
+            byte_count,
+            schema,
+            self.s3.clone(),
+            self.descriptor_sink.clone(),
+            self.config.prefix.clone(),
+            self.sink.source(),
+            self.flush_semaphore.clone(),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))??;
+        .await;
 
-        let partition_seg = if key.is_empty() { None } else { Some(key) };
-        let s3_key = build_key(&self.config.prefix, partition_seg, chrono::Utc::now());
-        let target = self.s3.target_label();
-        let body_len = merged.len();
-
-        match self.s3.upload(&s3_key, merged).await {
-            Ok(()) => {
-                metrics::counter!("parquet_s3_records_written", "source" => source, "target" => target)
-                    .increment(row_count as u64);
-                metrics::counter!("parquet_s3_uploads", "source" => source, "target" => target)
-                    .increment(1);
-
-                if let Some(descriptor_sink) = self.descriptor_sink.clone() {
-                    let schema_for_descriptor = self.buffers.get(key).unwrap().schema.clone();
-                    let descriptor = build_descriptor(
-                        source,
-                        partition_seg,
-                        self.s3.location_hint(),
-                        &s3_key,
-                        row_count as u64,
-                        body_len as u64,
-                        target,
-                        &schema_for_descriptor,
-                        &file_metadata,
-                    );
-                    upload_descriptor(descriptor_sink, descriptor, &s3_key, source).await;
-                }
-
-                let buf = self.buffers.get_mut(key).unwrap();
-                buf.buffer.clear();
+        match outcome {
+            FlushOutcome::Success { key } => {
+                let buf = self.buffers.get_mut(&key).unwrap();
                 buf.row_count = 0;
                 buf.byte_count = 0;
                 buf.last_flush = Instant::now();
                 Ok(())
             }
-            Err(e) => {
-                metrics::counter!("parquet_s3_upload_errors", "source" => source, "target" => target).increment(1);
-                Err(e)
+            FlushOutcome::Failure {
+                key,
+                batches,
+                row_count,
+                byte_count,
+                error,
+            } => {
+                // Put the data back exactly as flush_partition's callers
+                // (push/flush_all/flush_all_if_needed) expect on failure
+                // today: still present in the buffer, untouched, to be
+                // retried on the next threshold crossing.
+                let buf = self.buffers.get_mut(&key).unwrap();
+                buf.buffer = batches;
+                buf.row_count = row_count;
+                buf.byte_count = byte_count;
+                Err(anyhow::anyhow!(error))
             }
         }
     }
@@ -583,6 +605,113 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                     "parquet_s3: upload failing — dropped oldest rows to stay within hard cap"
                 );
                 buf.last_drop_warn = Some(Instant::now());
+            }
+        }
+    }
+}
+
+/// Encode+upload one partition's already-detached batch of records. Called
+/// two ways: synchronously (awaited inline) from `flush_partition` in this
+/// task (unchanged behavior — Task 1), and, from Task 2 onward, from inside
+/// a spawned background task via `try_flush_partition_async`, decoupled
+/// from the writer's channel-draining loop.
+///
+/// Acquires `semaphore` INSIDE this function, never before calling it —
+/// this is load-bearing once this is called from a spawned task (Task 2):
+/// acquiring the permit in the *caller* (the main `select!` loop) would
+/// block that loop the instant the semaphore saturates, reintroducing the
+/// exact bug this change fixes.
+#[allow(clippy::too_many_arguments)]
+async fn encode_and_upload(
+    key: String,
+    batches: VecDeque<(arrow_array::RecordBatch, usize)>,
+    row_count: usize,
+    byte_count: usize,
+    schema: Arc<arrow_schema::Schema>,
+    s3: Arc<dyn UploadSink>,
+    descriptor_sink: Option<Arc<dyn UploadSink>>,
+    prefix: String,
+    source: &'static str,
+    semaphore: Arc<tokio::sync::Semaphore>,
+) -> FlushOutcome {
+    let _permit = semaphore
+        .acquire_owned()
+        .await
+        .expect("flush semaphore is never closed");
+
+    let to_concat: Vec<arrow_array::RecordBatch> = batches.iter().map(|(b, _)| b.clone()).collect();
+    let schema_for_encode = schema.clone();
+    let encode_result = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(Vec<u8>, parquet::format::FileMetaData)> {
+            use parquet::arrow::ArrowWriter;
+            use parquet::basic::{Compression, ZstdLevel};
+            use parquet::file::properties::WriterProperties;
+
+            let batch = arrow::compute::concat_batches(&schema_for_encode, &to_concat)?;
+            let props = WriterProperties::builder()
+                .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+                .build();
+            let mut buf = Vec::new();
+            let mut writer =
+                ArrowWriter::try_new(&mut buf, schema_for_encode.clone(), Some(props))?;
+            writer.write(&batch)?;
+            let file_metadata = writer.close()?;
+            Ok((buf, file_metadata))
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"));
+
+    let (merged, file_metadata) = match encode_result.and_then(|r| r) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return FlushOutcome::Failure {
+                key,
+                batches,
+                row_count,
+                byte_count,
+                error: format!("{e}"),
+            };
+        }
+    };
+
+    let partition_seg = if key.is_empty() { None } else { Some(key.as_str()) };
+    let s3_key = build_key(&prefix, partition_seg, chrono::Utc::now());
+    let target = s3.target_label();
+    let body_len = merged.len();
+
+    match s3.upload(&s3_key, merged).await {
+        Ok(()) => {
+            metrics::counter!("parquet_s3_records_written", "source" => source, "target" => target)
+                .increment(row_count as u64);
+            metrics::counter!("parquet_s3_uploads", "source" => source, "target" => target)
+                .increment(1);
+
+            if let Some(descriptor_sink) = descriptor_sink {
+                let descriptor = build_descriptor(
+                    source,
+                    partition_seg,
+                    s3.location_hint(),
+                    &s3_key,
+                    row_count as u64,
+                    body_len as u64,
+                    target,
+                    &schema,
+                    &file_metadata,
+                );
+                upload_descriptor(descriptor_sink, descriptor, &s3_key, source).await;
+            }
+            FlushOutcome::Success { key }
+        }
+        Err(e) => {
+            metrics::counter!("parquet_s3_upload_errors", "source" => source, "target" => target)
+                .increment(1);
+            FlushOutcome::Failure {
+                key,
+                batches,
+                row_count,
+                byte_count,
+                error: format!("{e}"),
             }
         }
     }
