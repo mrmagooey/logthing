@@ -464,30 +464,63 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             || buf.last_flush.elapsed() >= self.policy.interval.get();
 
         if should_flush {
-            let cap = self.config.max_buffer_rows.saturating_mul(4);
-            let source = self.sink.source();
-            if let Err(e) = self.flush_partition(&effective_key).await {
-                // Flush failed — enforce hard cap.
-                // Defense-in-depth: cap == 0 means "no hard cap"; skip drop so a zero can never
-                // drain the entire buffer on S3 failure.
-                if cap > 0
-                    && let Some(b) = self.buffers.get_mut(&effective_key)
-                {
-                    Self::drop_oldest_to_cap(b, cap, source, self.s3.target_label());
-                }
-                return Err(e);
-            }
+            self.try_flush_partition_async(&effective_key);
         }
         Ok(())
     }
 
-    /// Flush all partitions unconditionally (called on shutdown).
+    /// Flush all partitions unconditionally (called on shutdown, after
+    /// `drain_pending_flushes` has settled any in-flight background work).
+    /// Deliberately still synchronous/inline — at shutdown there is no
+    /// channel left to keep draining, so there is no benefit to spawning,
+    /// only a need for a single definitive attempt per partition.
     pub async fn flush_all(&mut self) -> anyhow::Result<()> {
         let keys: Vec<String> = self.buffers.keys().cloned().collect();
         let mut last_err: Option<anyhow::Error> = None;
         for key in keys {
-            if let Err(e) = self.flush_partition(&key).await {
-                last_err = Some(e);
+            let taken = {
+                let Some(buf) = self.buffers.get_mut(&key) else {
+                    continue;
+                };
+                if buf.buffer.is_empty() {
+                    continue;
+                }
+                let schema = buf.schema.clone();
+                let batches = std::mem::take(&mut buf.buffer);
+                let row_count = buf.row_count;
+                let byte_count = buf.byte_count;
+                (schema, batches, row_count, byte_count)
+            };
+            let (schema, batches, row_count, byte_count) = taken;
+
+            let outcome = encode_and_upload(
+                key.clone(),
+                batches,
+                row_count,
+                byte_count,
+                schema,
+                self.s3.clone(),
+                self.descriptor_sink.clone(),
+                self.config.prefix.clone(),
+                self.sink.source(),
+                self.flush_semaphore.clone(),
+            )
+            .await;
+
+            if let FlushOutcome::Failure {
+                key,
+                batches,
+                row_count,
+                byte_count,
+                error,
+            } = outcome
+            {
+                if let Some(buf) = self.buffers.get_mut(&key) {
+                    buf.buffer = batches;
+                    buf.row_count = row_count;
+                    buf.byte_count = byte_count;
+                }
+                last_err = Some(anyhow::anyhow!(error));
             }
         }
         match last_err {
@@ -499,7 +532,6 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
     /// Flush partitions whose flush policy is triggered (called by timer).
     pub async fn flush_all_if_needed(&mut self) -> anyhow::Result<()> {
         let keys: Vec<String> = self.buffers.keys().cloned().collect();
-        let mut last_err: Option<anyhow::Error> = None;
         for key in keys {
             let should_flush = {
                 let buf = self.buffers.get(&key).unwrap();
@@ -511,14 +543,11 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                         || buf.last_flush.elapsed() >= self.policy.interval.get()
                 }
             };
-            if should_flush && let Err(e) = self.flush_partition(&key).await {
-                last_err = Some(e);
+            if should_flush {
+                self.try_flush_partition_async(&key);
             }
         }
-        match last_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     async fn flush_partition(&mut self, key: &str) -> anyhow::Result<()> {
@@ -569,6 +598,135 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 buf.row_count = row_count;
                 buf.byte_count = byte_count;
                 Err(anyhow::anyhow!(error))
+            }
+        }
+    }
+
+    /// If `key`'s partition has no flush currently in-flight, detach its
+    /// buffered batches (swapping in a fresh, empty `PartitionBuffer` so new
+    /// records keep accumulating without waiting on the flush) and spawn
+    /// `encode_and_upload` for them in the background. If a flush IS
+    /// already in-flight for `key`, does not spawn a second one — applies
+    /// the existing `drop_oldest_to_cap` to the live (still-growing) buffer
+    /// instead, exactly as today's flush-failure path already does, just
+    /// from a second call site.
+    fn try_flush_partition_async(&mut self, key: &str) {
+        let in_flight = self.buffers.get(key).map(|b| b.in_flight).unwrap_or(false);
+        let source = self.sink.source();
+        let target = self.s3.target_label();
+
+        if in_flight {
+            let cap = self.config.max_buffer_rows.saturating_mul(4);
+            if cap > 0
+                && let Some(b) = self.buffers.get_mut(key)
+            {
+                Self::drop_oldest_to_cap(b, cap, source, target);
+            }
+            return;
+        }
+
+        let Some(buf) = self.buffers.get_mut(key) else {
+            return;
+        };
+        if buf.buffer.is_empty() {
+            return;
+        }
+
+        let schema = buf.schema.clone();
+        let taken_batches = std::mem::take(&mut buf.buffer);
+        let row_count = buf.row_count;
+        let byte_count = buf.byte_count;
+        buf.row_count = 0;
+        buf.byte_count = 0;
+        buf.last_flush = Instant::now();
+        buf.in_flight = true;
+
+        metrics::gauge!("parquet_s3_flushes_in_flight", "source" => source, "target" => target)
+            .increment(1.0);
+
+        self.flush_tasks.spawn(encode_and_upload(
+            key.to_string(),
+            taken_batches,
+            row_count,
+            byte_count,
+            schema,
+            self.s3.clone(),
+            self.descriptor_sink.clone(),
+            self.config.prefix.clone(),
+            source,
+            self.flush_semaphore.clone(),
+        ));
+    }
+
+    /// Apply one completed background flush's outcome. On success, clears
+    /// in-flight for that partition. On failure, clears in-flight AND
+    /// merges the returned batches back onto the FRONT of the (possibly
+    /// already-refilling) live buffer -- they're older, so
+    /// `drop_oldest_to_cap` (which pops from the front) drops the stalest
+    /// data first if the merged total exceeds the cap -- then re-stales
+    /// `last_flush` so the age-based flush trigger fires on the very next
+    /// check, reproducing today's behavior (a failed flush's `last_flush`
+    /// is simply never touched, so it's already stale and retries almost
+    /// immediately) that the fresh-buffer-gets-"now"-at-swap-time design
+    /// would otherwise silently break.
+    fn apply_flush_outcome(&mut self, outcome: FlushOutcome) {
+        let source = self.sink.source();
+        let target = self.s3.target_label();
+        metrics::gauge!("parquet_s3_flushes_in_flight", "source" => source, "target" => target)
+            .decrement(1.0);
+
+        match outcome {
+            FlushOutcome::Success { key } => {
+                if let Some(buf) = self.buffers.get_mut(&key) {
+                    buf.in_flight = false;
+                }
+            }
+            FlushOutcome::Failure {
+                key,
+                mut batches,
+                row_count,
+                byte_count,
+                error,
+            } => {
+                tracing::warn!("parquet_s3 writer push error: {error}");
+
+                let Some(buf) = self.buffers.get_mut(&key) else {
+                    return;
+                };
+                buf.in_flight = false;
+
+                while let Some(entry) = batches.pop_back() {
+                    buf.buffer.push_front(entry);
+                }
+                buf.row_count += row_count;
+                buf.byte_count += byte_count;
+
+                let interval = self.policy.interval.get();
+                buf.last_flush = Instant::now()
+                    .checked_sub(interval + std::time::Duration::from_secs(1))
+                    .unwrap_or_else(Instant::now);
+
+                let cap = self.config.max_buffer_rows.saturating_mul(4);
+                if cap > 0 {
+                    Self::drop_oldest_to_cap(buf, cap, source, target);
+                }
+            }
+        }
+    }
+
+    /// Drain all in-flight background flushes to completion, applying each
+    /// outcome as it arrives. Used at graceful shutdown (so the writer's
+    /// `JoinHandle` doesn't complete while a flush is still outstanding —
+    /// callers await it expecting persistence to be genuinely finished) and
+    /// reused by tests for deterministic waiting instead of sleep-based
+    /// polling.
+    async fn drain_pending_flushes(&mut self) {
+        while let Some(result) = self.flush_tasks.join_next().await {
+            match result {
+                Ok(outcome) => self.apply_flush_outcome(outcome),
+                Err(join_err) => {
+                    tracing::warn!("parquet_s3 flush task panicked: {join_err}");
+                }
             }
         }
     }
@@ -914,7 +1072,11 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                                 }
                             }
                             None => {
-                                // Channel closed — flush all and exit.
+                                // Channel closed — drain any in-flight background
+                                // flushes first (so a late failure's data gets
+                                // merged back for the final flush below to
+                                // pick up), THEN flush whatever remains.
+                                writer.drain_pending_flushes().await;
                                 if let Err(e) = writer.flush_all().await {
                                     tracing::warn!("parquet_s3 flush_all on shutdown: {e}");
                                 }
@@ -929,6 +1091,18 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                     }
                     _ = interval_handle.changed() => {
                         ticker = tokio::time::interval(crate::forwarding::s3_sink::flush_check_interval(interval_handle.get()));
+                    }
+                    // Reap completed background flushes. The `if !is_empty()`
+                    // guard is load-bearing: `JoinSet::join_next()` on an
+                    // empty set resolves immediately to `None`, so an
+                    // unguarded branch would busy-spin this loop.
+                    Some(result) = writer.flush_tasks.join_next(), if !writer.flush_tasks.is_empty() => {
+                        match result {
+                            Ok(outcome) => writer.apply_flush_outcome(outcome),
+                            Err(join_err) => {
+                                tracing::warn!("parquet_s3 flush task panicked: {join_err}");
+                            }
+                        }
                     }
                 }
             }
