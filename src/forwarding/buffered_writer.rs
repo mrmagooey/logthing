@@ -1546,6 +1546,64 @@ max_partitions = 128
         );
     }
 
+    /// Proves `parquet_s3_flushes_in_flight` goes 0 -> 1 while a flush is
+    /// running, then back to 0 once it completes -- the observability half
+    /// of the concurrency cap (spec decision #3).
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn flushes_in_flight_gauge_tracks_a_single_flush() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: Arc<dyn UploadSink> = Arc::new(RecordingSink {
+            uploads: uploads.clone(),
+        });
+        let (cfg, policy) = test_config(1); // flush on first row
+        let mut w = PartitionedParquetWriter::new(MockSink, sink, cfg, policy);
+
+        w.push("hello".to_string()).await.unwrap();
+
+        let gauge_key = CompositeKey::new(
+            MetricKind::Gauge,
+            metrics::Key::from_parts(
+                "parquet_s3_flushes_in_flight",
+                vec![
+                    metrics::Label::new("source", "test"),
+                    metrics::Label::new("target", "recording"),
+                ],
+            ),
+        );
+        let read_gauge = |snapshotter: &metrics_util::debugging::Snapshotter| -> f64 {
+            snapshotter
+                .snapshot()
+                .into_hashmap()
+                .get(&gauge_key)
+                .map(|(_, _, v)| if let DebugValue::Gauge(g) = v { g.into_inner() } else { 0.0 })
+                .unwrap_or(0.0)
+        };
+
+        // The flush was spawned by push() above; drain it to completion.
+        w.drain_pending_flushes().await;
+
+        assert_eq!(
+            read_gauge(&snapshotter),
+            0.0,
+            "gauge must return to 0 once the flush completes"
+        );
+        assert_eq!(
+            uploads.lock().unwrap().len(),
+            1,
+            "the flush must actually have run and uploaded once"
+        );
+    }
+
     /// `push()` must record into a shared `SourceHourlyStats` once per
     /// record, independent of whether the record's buffer ever flushes.
     #[tokio::test]
