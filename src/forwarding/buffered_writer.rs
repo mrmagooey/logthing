@@ -675,7 +675,11 @@ async fn encode_and_upload(
         }
     };
 
-    let partition_seg = if key.is_empty() { None } else { Some(key.as_str()) };
+    let partition_seg = if key.is_empty() {
+        None
+    } else {
+        Some(key.as_str())
+    };
     let s3_key = build_key(&prefix, partition_seg, chrono::Utc::now());
     let target = s3.target_label();
     let body_len = merged.len();
