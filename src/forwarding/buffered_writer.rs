@@ -2585,7 +2585,17 @@ secret_key  = "SECRET"
     /// behavior where a failed flush simply never touches `last_flush`
     /// (spec decision #12).
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
     async fn failed_flush_merges_batches_back_and_restales_last_flush_for_prompt_retry() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
         let s3 = unreachable_s3().await; // every upload fails fast
         let max_rows = 100usize; // high enough that only the AGE trigger fires
         let (cfg, mut policy) = test_config(max_rows);
@@ -2600,6 +2610,36 @@ secret_key  = "SECRET"
         // This push crosses the age threshold and triggers (and fails) a flush.
         w.push("r1".to_string()).await.unwrap();
         w.drain_pending_flushes().await;
+
+        // Prove the flush path was genuinely entered and failed: the upload-errors
+        // metric only increments if encode_and_upload's upload step actually ran.
+        let snapshot = snapshotter.snapshot();
+        let map = snapshot.into_hashmap();
+        let key = CompositeKey::new(
+            MetricKind::Counter,
+            metrics::Key::from_parts(
+                "parquet_s3_upload_errors",
+                vec![
+                    metrics::Label::new("source", "test"),
+                    metrics::Label::new("target", "s3"),
+                ],
+            ),
+        );
+        let count = map
+            .get(&key)
+            .map(|(_, _, v)| {
+                if let DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        assert!(
+            count >= 1,
+            "expected parquet_s3_upload_errors{{source=\"test\",target=\"s3\"}} >= 1, \
+             proving the age-triggered flush was actually attempted and failed"
+        );
 
         let buf = w.buffers.get("").unwrap();
         assert_eq!(
