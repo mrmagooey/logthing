@@ -125,6 +125,10 @@ harness = false
 name = "ipfix_flow_batch_to_record_batch"
 harness = false
 
+[[bench]]
+name = "syslog_message_to_record_batch"
+harness = false
+
 [profile.profiling]
 inherits = "release"
 debug = true
