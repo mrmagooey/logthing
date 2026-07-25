@@ -597,6 +597,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 let Some(buf) = self.buffers.get_mut(&key) else {
                     continue;
                 };
+                Self::materialize_live_builder(buf);
                 if buf.buffer.is_empty() {
                     continue;
                 }
@@ -650,7 +651,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         for key in keys {
             let should_flush = {
                 let buf = self.buffers.get(&key).unwrap();
-                if buf.buffer.is_empty() {
+                if buf.row_count == 0 {
                     false
                 } else {
                     buf.row_count >= self.policy.max_rows
@@ -674,6 +675,10 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
     /// instead, exactly as today's flush-failure path already does, just
     /// from a second call site.
     fn try_flush_partition_async(&mut self, key: &str) {
+        if let Some(buf) = self.buffers.get_mut(key) {
+            Self::materialize_live_builder(buf);
+        }
+
         let in_flight = self.buffers.get(key).map(|b| b.in_flight).unwrap_or(false);
         let source = self.sink.source();
         let target = self.s3.target_label();
@@ -819,6 +824,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         source: &'static str,
         target: &'static str,
     ) {
+        Self::materialize_live_builder(buf);
         let mut dropped = 0usize;
         while buf.row_count > cap {
             if let Some((batch, est)) = buf.buffer.pop_front() {
@@ -1732,6 +1738,125 @@ max_partitions = 128
             buf.live_builder.as_ref().map(|b| b.len()),
             Some(1),
             "the one record past the threshold must remain in the live builder"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_materializes_pending_live_builder_rows() {
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: Arc<dyn UploadSink> = Arc::new(RecordingSink {
+            uploads: uploads.clone(),
+        });
+        let (cfg, policy) = test_config(3); // flush once row_count >= 3
+        let mut w = PartitionedParquetWriter::new(AmortizingMockSink, sink, cfg, policy);
+
+        // 3 records accepted into the live builder, none materialized yet
+        // (below BUILDER_BATCH_ROWS), but should_flush fires on the 3rd push.
+        for i in 0..3 {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+        w.drain_pending_flushes().await;
+
+        let recorded = uploads.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the flush must have actually uploaded, proving the live builder's \
+             pending rows were materialized before the buffer was taken"
+        );
+        assert!(recorded[0].1 > 0, "uploaded body must be non-empty");
+    }
+
+    #[tokio::test]
+    async fn flush_all_materializes_pending_live_builder_rows_at_shutdown() {
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: Arc<dyn UploadSink> = Arc::new(RecordingSink {
+            uploads: uploads.clone(),
+        });
+        let (cfg, policy) = test_config(1_000_000); // nothing flushes on its own
+        let mut w = PartitionedParquetWriter::new(AmortizingMockSink, sink, cfg, policy);
+
+        for i in 0..3 {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+        // Nothing should have flushed yet -- all 3 rows sit in the live builder.
+        assert!(uploads.lock().unwrap().is_empty());
+
+        w.flush_all().await.unwrap();
+
+        let recorded = uploads.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "flush_all (graceful shutdown) must not silently drop rows sitting \
+             in an unmaterialized live builder"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_all_if_needed_flushes_a_partition_whose_only_pending_data_is_in_the_live_builder()
+     {
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: Arc<dyn UploadSink> = Arc::new(RecordingSink {
+            uploads: uploads.clone(),
+        });
+        // max_rows=2 so 3 pushes trip the row-count flush trigger, but
+        // nothing crosses BUILDER_BATCH_ROWS, so buf.buffer stays empty
+        // (everything is in the live builder) until flush_all_if_needed runs.
+        let (cfg, policy) = test_config(2);
+        let mut w = PartitionedParquetWriter::new(AmortizingMockSink, sink, cfg, policy);
+
+        for i in 0..3 {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+        w.flush_all_if_needed().await.unwrap();
+        w.drain_pending_flushes().await;
+
+        let recorded = uploads.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "flush_all_if_needed must detect a pending flush even when buf.buffer \
+             (as opposed to row_count) is empty"
+        );
+    }
+
+    /// Discriminates specifically the `flush_all_if_needed` ticker-gate fix
+    /// (as opposed to `push()`'s own inline `should_flush` check, which by
+    /// the `try_flush_partition_async` materialize fix already handles the
+    /// row-count trigger on its own). `max_rows` is set high enough that
+    /// `push()` never trips its own flush, and the age trigger is set to
+    /// fire almost immediately -- so the only way this test's flush can
+    /// happen is via `flush_all_if_needed` correctly detecting pending rows
+    /// sitting in the live builder despite `buf.buffer` being empty.
+    #[tokio::test]
+    async fn flush_all_if_needed_flushes_via_age_trigger_when_only_the_live_builder_is_pending() {
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: Arc<dyn UploadSink> = Arc::new(RecordingSink {
+            uploads: uploads.clone(),
+        });
+        let (cfg, mut policy) = test_config(1_000_000);
+        policy.interval = LiveInterval::new(std::time::Duration::from_millis(1));
+        let mut w = PartitionedParquetWriter::new(AmortizingMockSink, sink, cfg, policy);
+
+        for i in 0..3 {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+        assert!(
+            uploads.lock().unwrap().is_empty(),
+            "nothing should have flushed yet -- rows sit only in the live builder"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        w.flush_all_if_needed().await.unwrap();
+        w.drain_pending_flushes().await;
+
+        let recorded = uploads.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "flush_all_if_needed's age trigger must fire for rows sitting only \
+             in the live builder, even though buf.buffer is empty"
         );
     }
 
@@ -3023,6 +3148,47 @@ secret_key  = "SECRET"
         );
 
         // Release the blocked upload so the test can clean up without hanging.
+        gate.add_permits(1);
+        w.drain_pending_flushes().await;
+    }
+
+    /// The scenario 3 rounds of design review focused on: while a flush is
+    /// stuck in-flight, every subsequent push accumulates into the live
+    /// builder (below `BUILDER_BATCH_ROWS`, so `buf.buffer` never sees them
+    /// directly). If `drop_oldest_to_cap` didn't self-materialize those
+    /// pending rows first, it would have nothing poppable from `buf.buffer`
+    /// and `row_count` would grow unbounded despite the hard cap.
+    #[tokio::test]
+    async fn in_flight_flush_still_hard_caps_rows_accumulating_in_the_live_builder() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let sink: Arc<dyn UploadSink> = Arc::new(BlockingSink { gate: gate.clone() });
+        let max_rows = 1usize;
+        let (cfg, policy) = test_config(max_rows);
+        let hard_cap = max_rows.saturating_mul(4); // 4
+        let mut w = PartitionedParquetWriter::new(AmortizingMockSink, sink, cfg, policy);
+
+        // First push triggers a flush that blocks forever until `gate` fires.
+        w.push("r0".to_string()).await.unwrap();
+        assert!(w.buffers.get("").unwrap().in_flight);
+
+        // Push far more than hard_cap while the first flush is stuck
+        // in-flight, WITHOUT draining -- every one of these accumulates in
+        // the live builder (below BUILDER_BATCH_ROWS), which is exactly the
+        // scenario that would leave drop_oldest_to_cap with nothing
+        // poppable if materialize_live_builder weren't wired into it.
+        for i in 1..(hard_cap * 3) {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+
+        let buf = w.buffers.get("").unwrap();
+        assert!(
+            buf.row_count <= hard_cap,
+            "row_count {} must be capped at {} even while rows are accumulating \
+             in the live builder during an in-flight flush",
+            buf.row_count,
+            hard_cap
+        );
+
         gate.add_permits(1);
         w.drain_pending_flushes().await;
     }
