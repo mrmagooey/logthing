@@ -222,11 +222,10 @@ fn json_array_str(v: &serde_json::Value, key: &str) -> Option<String> {
 /// Build the `_extra` JSON string: all top-level keys in `value` that are NOT in `promoted`,
 /// plus any keys whose values had type mismatches (passed in `mismatch_keys`).
 fn build_extra(value: &serde_json::Value, promoted: &[&str], mismatch_keys: &[&str]) -> String {
-    let promoted_set: std::collections::HashSet<&str> = promoted.iter().copied().collect();
     let mut extra = serde_json::Map::new();
     if let Some(obj) = value.as_object() {
         for (k, v) in obj {
-            if !promoted_set.contains(k.as_str()) || mismatch_keys.contains(&k.as_str()) {
+            if !promoted.contains(&k.as_str()) || mismatch_keys.contains(&k.as_str()) {
                 extra.insert(k.clone(), v.clone());
             }
         }
