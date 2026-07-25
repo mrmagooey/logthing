@@ -9,6 +9,7 @@ pub mod ipfix;
 pub mod middleware;
 pub mod models;
 pub mod parser;
+pub mod profiling;
 pub mod protocol;
 pub mod server;
 pub mod sflow;
