@@ -181,6 +181,119 @@ async fn zeek_records_appear_as_parquet_on_local_disk() {
     }
 }
 
+/// Pushes 1500 real conn records through the real pipeline (`ZeekS3Handler`
+/// → `PartitionedParquetWriter` → `LocalDiskSink`), crossing the
+/// `BUILDER_BATCH_ROWS` (1000) threshold in `ConnAccumulator`'s live builder
+/// mid-burst — proving the amortized builder correctly materializes once at
+/// row 1000 and resumes accumulating the remaining 500 rows in a fresh
+/// builder, rather than silently dropping or corrupting rows across that
+/// boundary. Flush thresholds are set high so the only disk flush is the
+/// synchronous `flush_all` fired when the writer task's channel closes,
+/// which merges the materialized 1000-row batch and the 500-row remainder
+/// into a single real Parquet file via the real `ArrowWriter`/`concat_batches`
+/// path — read back here with the real `parquet::arrow::arrow_reader`.
+#[tokio::test]
+async fn zeek_local_burst_of_1500_conn_records_crosses_builder_batch_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = Arc::new(
+        LocalDiskSink::new(dir.path().to_path_buf())
+            .await
+            .expect("LocalDiskSink::new"),
+    );
+    // Row/byte/time thresholds all high enough that no in-loop flush fires;
+    // the only flush is the shutdown `flush_all` once the handler is
+    // dropped. `channel_capacity` is comfortably above the record count so
+    // `try_send` (non-blocking) never drops a record under the
+    // single-threaded test runtime.
+    let cfg = ZeekLocalConfig {
+        directory: dir.path().to_path_buf(),
+        prefix: "zeek".to_string(),
+        max_buffer_rows: 100_000,
+        flush_threshold_bytes: 100_000_000,
+        flush_interval_secs: 3600,
+        channel_capacity: 2000,
+    };
+
+    let (handler, writer_task) = zeek_local_start(
+        &cfg,
+        sink,
+        Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+
+    let src: std::net::SocketAddr = "127.0.0.1:47761".parse().unwrap();
+    const N: usize = 1500;
+    for i in 0..N {
+        handler
+            .handle_record(make_conn_record(&format!("CBurst{i:04}")), src)
+            .await;
+    }
+
+    // Drop the handler to close the channel; the writer task's shutdown
+    // path drains any in-flight flushes and then performs one final,
+    // synchronous `flush_all` covering everything still buffered.
+    drop(handler);
+    tokio::time::timeout(std::time::Duration::from_secs(10), writer_task)
+        .await
+        .expect("writer task exits within 10s")
+        .expect("writer task must not panic");
+
+    let conn_dir = dir.path().join("zeek/conn");
+    assert!(conn_dir.is_dir(), "expected {conn_dir:?} to exist");
+    let parquet_files: Vec<_> = walk_all_files(&conn_dir)
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|ext| ext == "parquet"))
+        .collect();
+    assert!(
+        !parquet_files.is_empty(),
+        "expected at least one Parquet file under {conn_dir:?}"
+    );
+
+    use arrow::array::StringArray;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let mut uids: Vec<String> = Vec::with_capacity(N);
+    for file_path in &parquet_files {
+        let bytes = std::fs::read(file_path).expect("read parquet file");
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .expect("parquet builder for conn burst");
+        let reader = builder.build().expect("parquet reader for conn burst");
+        for rb in reader {
+            let rb = rb.expect("batch ok");
+            let uid_col = rb
+                .column_by_name("uid")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..rb.num_rows() {
+                uids.push(uid_col.value(i).to_string());
+            }
+        }
+    }
+
+    assert_eq!(
+        uids.len(),
+        N,
+        "expected exactly {N} rows across all conn Parquet files, proving the \
+         BUILDER_BATCH_ROWS (1000) materialize threshold was crossed at least \
+         once mid-burst without losing or duplicating rows"
+    );
+    assert_eq!(
+        uids[0], "CBurst0000",
+        "first record's uid must survive the round trip"
+    );
+    assert_eq!(
+        uids[500], "CBurst0500",
+        "record just past the BUILDER_BATCH_ROWS materialize boundary must survive the round trip"
+    );
+    assert_eq!(
+        uids[N - 1],
+        "CBurst1499",
+        "last record's uid must survive the round trip"
+    );
+}
+
 fn walk_all_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
