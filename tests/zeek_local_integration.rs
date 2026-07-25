@@ -285,7 +285,7 @@ async fn zeek_local_burst_of_1500_conn_records_crosses_builder_batch_rows() {
     );
     assert_eq!(
         uids[500], "CBurst0500",
-        "record just past the BUILDER_BATCH_ROWS materialize boundary must survive the round trip"
+        "a mid-burst record (inside the first materialized 1000-row batch) must survive the round trip"
     );
     assert_eq!(
         uids[N - 1],
