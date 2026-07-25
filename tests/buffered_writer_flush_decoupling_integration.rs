@@ -230,3 +230,124 @@ async fn records_pushed_during_a_slow_flush_are_not_dropped_at_the_channel() {
         "parquet_s3_dropped must stay at 0 -- the channel must never report Full while a flush is in flight"
     );
 }
+
+struct PanicUploadSink;
+#[async_trait::async_trait]
+impl UploadSink for PanicUploadSink {
+    async fn upload(&self, _key: &str, _body: Vec<u8>) -> anyhow::Result<()> {
+        panic!("intentional test panic to exercise flush-task panic handling")
+    }
+    fn target_label(&self) -> &'static str {
+        "panicky"
+    }
+    fn location_hint(&self) -> String {
+        "panic://test".to_string()
+    }
+}
+
+#[derive(Default, Clone, Debug)]
+struct CapturedEvent {
+    message: String,
+    fields: std::collections::HashMap<String, String>,
+}
+
+struct FieldVisitor(CapturedEvent);
+impl tracing::field::Visit for FieldVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let s = format!("{value:?}").trim_matches('"').to_string();
+        if field.name() == "message" {
+            self.0.message = s;
+        } else {
+            self.0.fields.insert(field.name().to_string(), s);
+        }
+    }
+}
+
+struct CaptureLayer {
+    events: Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let mut visitor = FieldVisitor(CapturedEvent::default());
+        event.record(&mut visitor);
+        self.events.lock().unwrap().push(visitor.0);
+    }
+}
+
+/// Line 1067: a flush task panics while the writer's background task is
+/// still in its steady-state select! loop (not shutdown) -- the panic must
+/// surface via the outer `Some(result) = writer.flush_tasks.join_next()`
+/// branch with `source`/`target` fields attached. Uses default
+/// (current-thread) `#[tokio::test]` flavor so the background task's
+/// tracing events land on the same thread this test's subscriber guard
+/// installs on -- see this file's own top-of-file doc comment for why a
+/// multi_thread flavor would silently miss them.
+#[tokio::test]
+async fn flush_task_panic_during_steady_state_logs_source_and_target() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let layer = CaptureLayer {
+        events: events.clone(),
+    };
+    let subscriber = tracing_subscriber::registry().with(layer);
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let cfg = BufferedWriterConfig {
+        connection: logthing::config::S3ConnectionConfig {
+            endpoint: String::new(),
+            bucket: String::new(),
+            region: String::new(),
+            access_key: String::new(),
+            secret_key: String::new(),
+        },
+        prefix: "zeek".to_string(),
+        max_buffer_rows: 1, // flush on every push
+        flush_threshold_bytes: usize::MAX,
+        flush_interval_secs: 3600,
+        channel_capacity: 4,
+        max_partitions: 8,
+    };
+    let policy = FlushPolicy {
+        max_rows: 1,
+        max_bytes: usize::MAX,
+        interval: LiveInterval::new(Duration::from_secs(3600)),
+    };
+    let panic_sink: Arc<dyn UploadSink> = Arc::new(PanicUploadSink);
+
+    let (handler, _join_handle) = ParquetWriterHandle::<SimpleFastSink>::start_with_stats(
+        SimpleFastSink,
+        panic_sink,
+        cfg,
+        policy,
+        Arc::new(SourceHourlyStats::new()),
+        None,
+    );
+
+    handler
+        .try_send("record-0".to_string())
+        .expect("first try_send must succeed on a fresh, empty channel");
+
+    // Poll (bounded) for the panic-handling warning to appear, rather than
+    // a fixed sleep -- the flush task's panic is asynchronous.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut found = false;
+    while tokio::time::Instant::now() < deadline {
+        let snapshot = events.lock().unwrap().clone();
+        found = snapshot.iter().any(|e| {
+            e.message.contains("flush task panicked")
+                && e.fields.get("source").map(String::as_str) == Some("zeek")
+                && e.fields.get("target").map(String::as_str) == Some("panicky")
+        });
+        if found {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        found,
+        "expected a warn event with source=\"zeek\" target=\"panicky\" for the steady-state flush-task panic, got: {:?}",
+        events.lock().unwrap()
+    );
+}

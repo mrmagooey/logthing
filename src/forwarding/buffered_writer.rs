@@ -646,7 +646,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 byte_count,
                 error,
             } => {
-                tracing::warn!("parquet_s3 writer push error: {error}");
+                tracing::warn!(source, target, "parquet_s3 writer push error: {error}");
 
                 let Some(buf) = self.buffers.get_mut(&key) else {
                     return;
@@ -683,7 +683,11 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             match result {
                 Ok(outcome) => self.apply_flush_outcome(outcome),
                 Err(join_err) => {
-                    tracing::warn!("parquet_s3 flush task panicked: {join_err}");
+                    tracing::warn!(
+                        source = self.sink.source(),
+                        target = self.s3.target_label(),
+                        "parquet_s3 flush task panicked: {join_err}"
+                    );
                 }
             }
         }
@@ -1025,11 +1029,14 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                     msg = rx.recv() => {
                         match msg {
                             Some(record) => {
+                                // NOTE: unreachable today (see comment below) -- no test
+                                // exercises this branch; source/target fields verified by
+                                // code review + successful compilation only.
                                 // push() always returns Ok now (flush failures surface async via
                                 // apply_flush_outcome) -- kept as Result to avoid churning callers;
                                 // this branch is currently unreachable.
                                 if let Err(e) = writer.push(record).await {
-                                    tracing::warn!("parquet_s3 writer push error: {e}");
+                                    tracing::warn!(source, target, "parquet_s3 writer push error: {e}");
                                 }
                             }
                             None => {
@@ -1039,18 +1046,21 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                                 // pick up), THEN flush whatever remains.
                                 writer.drain_pending_flushes().await;
                                 if let Err(e) = writer.flush_all().await {
-                                    tracing::warn!("parquet_s3 flush_all on shutdown: {e}");
+                                    tracing::warn!(source, target, "parquet_s3 flush_all on shutdown: {e}");
                                 }
                                 break;
                             }
                         }
                     }
                     _ = ticker.tick() => {
+                        // NOTE: unreachable today (see comment below) -- no test
+                        // exercises this branch; source/target fields verified by
+                        // code review + successful compilation only.
                         // flush_all_if_needed() always returns Ok now (flush failures surface
                         // async via apply_flush_outcome) -- kept as Result to avoid churning
                         // callers; this branch is currently unreachable.
                         if let Err(e) = writer.flush_all_if_needed().await {
-                            tracing::warn!("parquet_s3 flush_all_if_needed: {e}");
+                            tracing::warn!(source, target, "parquet_s3 flush_all_if_needed: {e}");
                         }
                     }
                     _ = interval_handle.changed() => {
@@ -1064,7 +1074,7 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                         match result {
                             Ok(outcome) => writer.apply_flush_outcome(outcome),
                             Err(join_err) => {
-                                tracing::warn!("parquet_s3 flush task panicked: {join_err}");
+                                tracing::warn!(source, target, "parquet_s3 flush task panicked: {join_err}");
                             }
                         }
                     }
@@ -1338,6 +1348,91 @@ max_partitions = 128
         Arc::new(Schema::new(vec![Field::new("val", DataType::Utf8, false)]))
     }
 
+    // -----------------------------------------------------------------------
+    // In-test tracing field capture (for asserting `source`/`target` fields
+    // on warn! calls -- uses only already-present `tracing`/`tracing-subscriber`
+    // deps, not a new external test crate).
+    // -----------------------------------------------------------------------
+
+    #[derive(Default, Clone, Debug)]
+    struct CapturedEvent {
+        message: String,
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    struct FieldVisitor(CapturedEvent);
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let s = format!("{value:?}").trim_matches('"').to_string();
+            if field.name() == "message" {
+                self.0.message = s;
+            } else {
+                self.0.fields.insert(field.name().to_string(), s);
+            }
+        }
+    }
+
+    struct CaptureLayer {
+        events: std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = FieldVisitor(CapturedEvent::default());
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(visitor.0);
+        }
+    }
+
+    /// Installs a thread-local tracing subscriber for the lifetime of the
+    /// returned guard. Must be used with the default (current-thread)
+    /// `#[tokio::test]` flavor so any background-task-emitted events land
+    /// on the same OS thread this installs on.
+    struct TestTracingCapture {
+        events: std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    impl TestTracingCapture {
+        fn install() -> Self {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let layer = CaptureLayer {
+                events: events.clone(),
+            };
+            let subscriber = tracing_subscriber::registry().with(layer);
+            let guard = tracing::subscriber::set_default(subscriber);
+            Self {
+                events,
+                _guard: guard,
+            }
+        }
+
+        fn events(&self) -> Vec<CapturedEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    /// Upload sink whose `upload()` always panics -- used to exercise the
+    /// flush-task-panicked warning paths (lines 686, 1067).
+    struct PanicUploadSink;
+    #[async_trait::async_trait]
+    impl UploadSink for PanicUploadSink {
+        async fn upload(&self, _key: &str, _body: Vec<u8>) -> anyhow::Result<()> {
+            panic!("intentional test panic to exercise flush-task panic handling")
+        }
+        fn target_label(&self) -> &'static str {
+            "panicky"
+        }
+        fn location_hint(&self) -> String {
+            "panic://test".to_string()
+        }
+    }
+
     struct MockSink;
     impl ParquetSink for MockSink {
         type Record = String;
@@ -1573,6 +1668,63 @@ max_partitions = 128
             uploads.lock().unwrap().len(),
             1,
             "the flush must actually have run and uploaded once"
+        );
+    }
+
+    /// Line 649 (`apply_flush_outcome`'s failure branch) must log both
+    /// `source` and `target` as structured fields, not just interpolate
+    /// them into the message.
+    #[tokio::test]
+    async fn apply_flush_outcome_failure_logs_source_and_target_fields() {
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: Arc<dyn UploadSink> = Arc::new(RecordingSink { uploads });
+        let (cfg, policy) = test_config(5);
+        let mut w = PartitionedParquetWriter::new(MockSink, sink, cfg, policy);
+
+        let capture = TestTracingCapture::install();
+        w.apply_flush_outcome(FlushOutcome::Failure {
+            key: "".to_string(),
+            batches: std::collections::VecDeque::new(),
+            row_count: 0,
+            byte_count: 0,
+            error: "simulated upload failure".to_string(),
+        });
+
+        let events = capture.events();
+        let found = events.iter().any(|e| {
+            e.message.contains("writer push error")
+                && e.fields.get("source").map(String::as_str) == Some("test")
+                && e.fields.get("target").map(String::as_str) == Some("recording")
+        });
+        assert!(
+            found,
+            "expected a warn event with source=\"test\" target=\"recording\", got: {events:?}"
+        );
+    }
+
+    /// Line 686 (`drain_pending_flushes`'s panic branch) must log both
+    /// `source` and `target` -- neither is a local in that function, so
+    /// they must be fetched via `self.sink.source()` / `self.s3.target_label()`.
+    #[tokio::test]
+    async fn drain_pending_flushes_panic_logs_source_and_target_fields() {
+        let sink: Arc<dyn UploadSink> = Arc::new(PanicUploadSink);
+        let (cfg, policy) = test_config(1); // flush on first row
+        let mut w = PartitionedParquetWriter::new(MockSink, sink, cfg, policy);
+
+        w.push("hello".to_string()).await.unwrap(); // spawns the flush task, which will panic inside upload()
+
+        let capture = TestTracingCapture::install();
+        w.drain_pending_flushes().await;
+
+        let events = capture.events();
+        let found = events.iter().any(|e| {
+            e.message.contains("flush task panicked")
+                && e.fields.get("source").map(String::as_str) == Some("test")
+                && e.fields.get("target").map(String::as_str) == Some("panicky")
+        });
+        assert!(
+            found,
+            "expected a warn event with source=\"test\" target=\"panicky\", got: {events:?}"
         );
     }
 
