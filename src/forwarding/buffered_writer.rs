@@ -367,6 +367,16 @@ pub(crate) fn build_key(
 /// outage from causing many partitions to retry in lockstep.
 const MAX_CONCURRENT_FLUSHES_PER_WRITER: usize = 4;
 
+/// Row-count threshold at which a partition's live (in-progress) amortized
+/// builder is force-materialized into a real, stored `RecordBatch` entry,
+/// independent of any flush. Bounds two things: the maximum size of a
+/// single amortization unit, and the maximum number of rows that can be
+/// "invisible" to `drop_oldest_to_cap`'s hard-cap enforcement at any given
+/// instant (small relative to the default hard cap of
+/// `max_buffer_rows.saturating_mul(4)` = 400,000 at the 100,000-row
+/// default). See the design doc's "BUILDER_BATCH_ROWS" section.
+const BUILDER_BATCH_ROWS: usize = 1000;
+
 /// Outcome of a background flush task (see `encode_and_upload`), reported
 /// back to the single task that owns `PartitionedParquetWriter::buffers`
 /// via `flush_tasks: JoinSet`. Never constructed with a partial/ambiguous
@@ -485,28 +495,89 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 .insert(effective_key.clone(), PartitionBuffer::new(s));
         }
 
-        // Convert record → RecordBatch.
-        let buf = self.buffers.get(&effective_key).unwrap();
+        // Convert record → RecordBatch, using the amortized live-builder
+        // path if the sink opted in for this partition's schema, else the
+        // unchanged one-call-per-record fallback.
+        let buf = self.buffers.get_mut(&effective_key).unwrap();
         let schema = buf.schema.clone();
-        let batch = match self.sink.to_record_batch(&record, &schema) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    source = self.sink.source(),
-                    "to_record_batch failed, skipping record: {e}"
-                );
-                return Ok(());
+
+        if buf.live_builder.is_none() {
+            buf.live_builder = self.sink.new_batch(&schema);
+        }
+
+        let (n_rows, byte_delta) = if let Some(builder) = buf.live_builder.as_mut() {
+            match builder.try_append(&record) {
+                Ok(true) => {
+                    // Accepted into the live builder. row_count is exact and
+                    // immediate; byte_count is deliberately deferred to
+                    // materialization time (see design doc §5).
+                    (1usize, 0usize)
+                }
+                Ok(false) => {
+                    // Rejected: this record doesn't match the accumulator's
+                    // schema (e.g. Zeek's raw/sanitized log_path mismatch
+                    // case). Fall back to today's exact per-record path for
+                    // just this one record.
+                    match self.sink.to_record_batch(&record, &schema) {
+                        Ok(b) => {
+                            let est_bytes = b.get_array_memory_size();
+                            let n = b.num_rows();
+                            buf.buffer.push_back((b, est_bytes));
+                            (n, est_bytes)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                source = self.sink.source(),
+                                "to_record_batch failed, skipping record: {e}"
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        source = self.sink.source(),
+                        "live builder append failed, skipping record: {e}"
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            // Adapter never opted in for this schema: unchanged behavior.
+            match self.sink.to_record_batch(&record, &schema) {
+                Ok(b) => {
+                    let est_bytes = b.get_array_memory_size();
+                    let n = b.num_rows();
+                    buf.buffer.push_back((b, est_bytes));
+                    (n, est_bytes)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        source = self.sink.source(),
+                        "to_record_batch failed, skipping record: {e}"
+                    );
+                    return Ok(());
+                }
             }
         };
         self.source_stats.record(self.sink.source(), 1);
 
-        let est_bytes = batch.get_array_memory_size();
-        let n_rows = batch.num_rows();
-
         let buf = self.buffers.get_mut(&effective_key).unwrap();
-        buf.buffer.push_back((batch, est_bytes));
         buf.row_count += n_rows;
-        buf.byte_count += est_bytes;
+        buf.byte_count += byte_delta;
+
+        // Bound the live builder's own size independent of any flush, so
+        // drop_oldest_to_cap always has fine-enough-grained entries to trim
+        // under sustained backpressure (see design doc §3).
+        if buf
+            .live_builder
+            .as_ref()
+            .map(|b| b.len())
+            .unwrap_or(0)
+            >= BUILDER_BATCH_ROWS
+        {
+            Self::materialize_live_builder(buf);
+        }
 
         // Check flush policy.
         let should_flush = buf.row_count >= self.policy.max_rows
@@ -1315,7 +1386,7 @@ fn wrap_with_prefix(inner: Arc<dyn UploadSink>, prefix: &str) -> Arc<dyn UploadS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::StringArray;
+    use arrow::array::{StringArray, StringBuilder};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
@@ -1544,6 +1615,123 @@ max_partitions = 128
         assert!(
             MockSink.new_batch(&test_schema()).is_none(),
             "MockSink does not override new_batch, so it must default to None"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Amortized-builder tests (generic mechanism, proven with a trivial
+    // test-only accumulator before the real ZeekSink conversion)
+    // -----------------------------------------------------------------------
+
+    struct MockAccumulator {
+        builder: StringBuilder,
+        rows: usize,
+    }
+
+    impl MockAccumulator {
+        fn new() -> Self {
+            Self {
+                builder: StringBuilder::new(),
+                rows: 0,
+            }
+        }
+    }
+
+    impl RecordBatchAccumulator<String> for MockAccumulator {
+        fn try_append(&mut self, record: &String) -> anyhow::Result<bool> {
+            self.builder.append_value(record);
+            self.rows += 1;
+            Ok(true)
+        }
+        fn len(&self) -> usize {
+            self.rows
+        }
+        fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+            let col: Arc<dyn arrow::array::Array> = Arc::new(self.builder.finish());
+            self.rows = 0;
+            Ok(RecordBatch::try_new(test_schema(), vec![col])?)
+        }
+    }
+
+    struct AmortizingMockSink;
+    impl ParquetSink for AmortizingMockSink {
+        type Record = String;
+        fn source(&self) -> &'static str {
+            "test"
+        }
+        fn partition(&self, _r: &String) -> Option<String> {
+            None
+        }
+        fn schema(&self, _p: Option<&str>) -> Arc<Schema> {
+            test_schema()
+        }
+        fn to_record_batch(
+            &self,
+            record: &String,
+            schema: &Arc<Schema>,
+        ) -> anyhow::Result<RecordBatch> {
+            let col = Arc::new(StringArray::from(vec![record.as_str()]));
+            Ok(RecordBatch::try_new(schema.clone(), vec![col])?)
+        }
+        fn new_batch(&self, _schema: &Arc<Schema>) -> Option<Box<dyn RecordBatchAccumulator<String>>> {
+            Some(Box::new(MockAccumulator::new()))
+        }
+    }
+
+    #[tokio::test]
+    async fn push_accepts_records_into_the_live_builder() {
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(1_000_000); // nothing flushes
+        let mut w = PartitionedParquetWriter::new(AmortizingMockSink, s3, cfg, policy);
+
+        for i in 0..5 {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+
+        let buf = w.buffers.get("").unwrap();
+        assert_eq!(buf.row_count, 5, "row_count must reflect all 5 accepted records");
+        assert_eq!(
+            buf.buffer.len(),
+            0,
+            "below BUILDER_BATCH_ROWS and no flush yet, nothing should be materialized into buf.buffer"
+        );
+        assert_eq!(
+            buf.live_builder.as_ref().map(|b| b.len()),
+            Some(5),
+            "all 5 records should be sitting in the live builder"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_materializes_at_the_builder_batch_rows_threshold() {
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(1_000_000); // nothing flushes on row/byte count
+        let mut w = PartitionedParquetWriter::new(AmortizingMockSink, s3, cfg, policy);
+
+        for i in 0..(BUILDER_BATCH_ROWS + 1) {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+
+        let buf = w.buffers.get("").unwrap();
+        assert_eq!(
+            buf.row_count,
+            BUILDER_BATCH_ROWS + 1,
+            "row_count must reflect every accepted record"
+        );
+        assert_eq!(
+            buf.buffer.len(),
+            1,
+            "crossing the threshold must materialize exactly one stored batch"
+        );
+        assert_eq!(
+            buf.buffer.front().map(|(b, _)| b.num_rows()),
+            Some(BUILDER_BATCH_ROWS),
+            "the materialized batch must contain exactly BUILDER_BATCH_ROWS rows"
+        );
+        assert_eq!(
+            buf.live_builder.as_ref().map(|b| b.len()),
+            Some(1),
+            "the one record past the threshold must remain in the live builder"
         );
     }
 
