@@ -268,7 +268,11 @@ struct CaptureLayer {
 }
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         let mut visitor = FieldVisitor(CapturedEvent::default());
         event.record(&mut visitor);
         self.events.lock().unwrap().push(visitor.0);
