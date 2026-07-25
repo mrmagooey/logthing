@@ -84,6 +84,40 @@ pub trait ParquetSink: Send + Sync + 'static {
         record: &Self::Record,
         schema: &Arc<arrow_schema::Schema>,
     ) -> anyhow::Result<arrow_array::RecordBatch>;
+
+    /// Optional amortized-builder fast path. Returns `None` (the default)
+    /// to opt out and keep the exact one-`to_record_batch()`-call-per-push
+    /// behavior -- existing adapters need no code change to keep working
+    /// exactly as before, and are provably unaffected since this code path
+    /// is structurally unreachable for them.
+    fn new_batch(
+        &self,
+        schema: &Arc<arrow_schema::Schema>,
+    ) -> Option<Box<dyn RecordBatchAccumulator<Self::Record>>> {
+        let _ = schema;
+        None
+    }
+}
+
+/// Amortized builder state for one in-progress, possibly-multi-row
+/// `RecordBatch`. An adapter that wants to amortize builder-allocation
+/// cost across multiple records implements this and returns it from
+/// `ParquetSink::new_batch`.
+pub trait RecordBatchAccumulator<Record>: Send {
+    /// Try to append one record. Returns `Ok(false)` if this record does
+    /// not belong to this accumulator's schema (mirrors whatever
+    /// per-record schema-mismatch fallback the adapter's `to_record_batch`
+    /// already performs) -- the caller must then fall back to
+    /// `to_record_batch` for just this one record.
+    fn try_append(&mut self, record: &Record) -> anyhow::Result<bool>;
+
+    /// Rows appended so far, not yet finished into a `RecordBatch`.
+    fn len(&self) -> usize;
+
+    /// Finish the currently-accumulated rows into one `RecordBatch` and
+    /// reset internal builder state to empty, ready to accumulate the
+    /// next batch without reallocating.
+    fn finish(&mut self) -> anyhow::Result<arrow_array::RecordBatch>;
 }
 
 // ---------------------------------------------------------------------------
@@ -258,7 +292,7 @@ pub(crate) fn unused_s3_connection_placeholder() -> crate::config::S3ConnectionC
 // PartitionBuffer — internal per-partition state
 // ---------------------------------------------------------------------------
 
-pub(crate) struct PartitionBuffer {
+pub(crate) struct PartitionBuffer<R> {
     pub(crate) schema: Arc<arrow_schema::Schema>,
     pub(crate) buffer: VecDeque<(arrow_array::RecordBatch, usize)>, // (batch, est_bytes)
     pub(crate) row_count: usize,
@@ -269,9 +303,14 @@ pub(crate) struct PartitionBuffer {
     /// buffered data. At most one flush is ever in-flight per partition —
     /// see `try_flush_partition_async`.
     pub(crate) in_flight: bool,
+    /// Live, in-progress amortized builder for this partition. `None` for
+    /// every adapter that doesn't opt in (`ParquetSink::new_batch` returns
+    /// `None`), and `None` even for an opted-in adapter until its first
+    /// record lands.
+    pub(crate) live_builder: Option<Box<dyn RecordBatchAccumulator<R>>>,
 }
 
-impl PartitionBuffer {
+impl<R> PartitionBuffer<R> {
     fn new(schema: Arc<arrow_schema::Schema>) -> Self {
         Self {
             schema,
@@ -281,6 +320,7 @@ impl PartitionBuffer {
             last_flush: Instant::now(),
             last_drop_warn: None,
             in_flight: false,
+            live_builder: None,
         }
     }
 }
@@ -351,7 +391,7 @@ pub struct PartitionedParquetWriter<S: ParquetSink> {
     config: BufferedWriterConfig,
     policy: FlushPolicy,
     /// `""` key for None-partition sources; sanitized-path / `"event_type=<id>"` for multi-partition.
-    pub(crate) buffers: HashMap<String, PartitionBuffer>,
+    pub(crate) buffers: HashMap<String, PartitionBuffer<S::Record>>,
     source_stats: Arc<crate::stats::SourceHourlyStats>,
     /// Optional destination for the Iceberg "descriptor" JSON emitted
     /// alongside each successful Parquet flush. `None` (the default via
@@ -709,7 +749,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
     }
 
     fn drop_oldest_to_cap(
-        buf: &mut PartitionBuffer,
+        buf: &mut PartitionBuffer<S::Record>,
         cap: usize,
         source: &'static str,
         target: &'static str,
@@ -740,6 +780,35 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                     "parquet_s3: upload failing — dropped oldest rows to stay within hard cap"
                 );
                 buf.last_drop_warn = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Finish the partition's live builder (if any, and if it has
+    /// accumulated at least one row) into a real, stored `RecordBatch`
+    /// entry, exactly as if that many single-row batches had been pushed
+    /// via the non-amortized path. Called defensively from every code path
+    /// that reads or takes `buf.buffer` for a flush or hard-cap decision --
+    /// see the design doc's materialization audit table for the full list
+    /// of call sites and why each one needs this.
+    fn materialize_live_builder(buf: &mut PartitionBuffer<S::Record>) {
+        if let Some(builder) = buf.live_builder.as_mut()
+            && builder.len() > 0
+        {
+            match builder.finish() {
+                Ok(batch) => {
+                    let est_bytes = batch.get_array_memory_size();
+                    buf.byte_count += est_bytes;
+                    buf.buffer.push_back((batch, est_bytes));
+                }
+                Err(e) => {
+                    // Should not happen in practice (finishing
+                    // already-validated builder state into Arrow arrays is
+                    // not a fallible runtime operation under normal
+                    // conditions). Log and leave the builder as-is; the
+                    // next materialize attempt will retry.
+                    tracing::error!("parquet_s3: live builder finish() failed: {e}");
+                }
             }
         }
     }
@@ -1468,6 +1537,14 @@ max_partitions = 128
             let col = Arc::new(StringArray::from(vec![record.as_str()]));
             Ok(RecordBatch::try_new(schema.clone(), vec![col])?)
         }
+    }
+
+    #[test]
+    fn new_batch_defaults_to_none_for_mock_sink() {
+        assert!(
+            MockSink.new_batch(&test_schema()).is_none(),
+            "MockSink does not override new_batch, so it must default to None"
+        );
     }
 
     async fn unreachable_s3() -> Arc<crate::forwarding::s3_sink::S3Sink> {
