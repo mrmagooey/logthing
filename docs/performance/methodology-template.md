@@ -18,6 +18,11 @@ X" rather than deleting it, so future readers can tell "not measured" from "meas
 - **Buffer-policy values in effect** (per the "never compare across differing flush-threshold
   configs" rule — restate these explicitly every time, even if unchanged from a prior run):
   `max_buffer_rows`, `flush_threshold_bytes`, `flush_interval_secs`, `channel_capacity`
+  Note: some local sinks hardcode this to `usize::MAX` (no byte-size trigger at all, e.g.
+  syslog's `syslog_local_start()` in `src/forwarding/syslog_s3.rs`) — verify against the sink's
+  actual `*_local_start` function before assuming the generic `BufferedWriterConfig` default of
+  128 MiB applies; see `docs/performance/2026-07-24-syslog-udp-baseline-results.md` for a worked
+  example of this exact correction.
 - **Exact commands run** (verbatim, including every flag)
 
 ## 2. Goals & metrics captured
