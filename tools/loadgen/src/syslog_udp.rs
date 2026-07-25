@@ -97,20 +97,26 @@ pub async fn run(args: SyslogUdpArgs) -> anyhow::Result<()> {
         // batching multiple sends per tick instead of chasing unrealistic
         // per-record timer precision.
         let per_tick_interval = Duration::from_micros(1000);
-        let mut records_per_tick =
-            (args.target_rate as f64 * per_tick_interval.as_secs_f64()).round() as u64;
-        if records_per_tick < 1 {
-            records_per_tick = 1;
-        }
+        let records_per_tick_target = args.target_rate as f64 * per_tick_interval.as_secs_f64();
         let mut ticker = tokio::time::interval(per_tick_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
+        // Fractional accumulator: at low rates `records_per_tick_target` is
+        // below 1 (e.g. target_rate=100 -> 0.1/tick), so rounding per tick
+        // would floor to 0 forever or clamp to 1 forever -- either loses the
+        // requested rate entirely. Accumulating the fractional remainder and
+        // emitting whenever it crosses an integer boundary honors the target
+        // rate exactly over many ticks instead.
+        let mut carry: f64 = 0.0;
 
         'send_loop: loop {
             if start.elapsed() >= duration {
                 break;
             }
             ticker.tick().await;
-            for _ in 0..records_per_tick {
+            carry += records_per_tick_target;
+            let records_this_tick = carry.floor() as u64;
+            carry -= records_this_tick as f64;
+            for _ in 0..records_this_tick {
                 if start.elapsed() >= duration {
                     break 'send_loop;
                 }
