@@ -196,12 +196,11 @@ fn parse_counter(rendered: &str, metric_with_labels: &str) -> f64 {
         if line.starts_with('#') {
             continue;
         }
-        if line.starts_with(metric_with_labels) {
-            if let Some(value_str) = line.rsplit(' ').next() {
-                if let Ok(v) = value_str.parse::<f64>() {
-                    return v;
-                }
-            }
+        if line.starts_with(metric_with_labels)
+            && let Some(value_str) = line.rsplit(' ').next()
+            && let Ok(v) = value_str.parse::<f64>()
+        {
+            return v;
         }
     }
     0.0
