@@ -355,3 +355,99 @@ async fn flush_task_panic_during_steady_state_logs_source_and_target() {
         events.lock().unwrap()
     );
 }
+
+/// Both new gauges must be observable via the real spawned writer task
+/// once its periodic ticker has fired at least once. Uses a 1-second
+/// flush interval (the minimum `flush_check_interval` clamps to) and
+/// polls (bounded) rather than sleeping a fixed amount, to avoid flakiness.
+#[tokio::test]
+#[allow(clippy::mutable_key_type)]
+async fn channel_and_buffer_gauges_appear_after_a_tick() {
+    use metrics::set_default_local_recorder;
+    use metrics_util::CompositeKey;
+    use metrics_util::MetricKind;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = set_default_local_recorder(&recorder);
+
+    let cfg = BufferedWriterConfig {
+        connection: logthing::config::S3ConnectionConfig {
+            endpoint: String::new(),
+            bucket: String::new(),
+            region: String::new(),
+            access_key: String::new(),
+            secret_key: String::new(),
+        },
+        prefix: "zeek".to_string(),
+        max_buffer_rows: 1_000_000, // nothing flushes on its own during this test
+        flush_threshold_bytes: usize::MAX,
+        flush_interval_secs: 1, // minimum flush_check_interval clamps to 1s
+        channel_capacity: 16,
+        max_partitions: 8,
+    };
+    let policy = FlushPolicy {
+        max_rows: 1_000_000,
+        max_bytes: usize::MAX,
+        interval: LiveInterval::new(Duration::from_secs(1)),
+    };
+    let sink: Arc<dyn UploadSink> = Arc::new(SlowUploadSink {
+        delay: Duration::from_millis(1),
+        started: Arc::new(tokio::sync::Notify::new()),
+    });
+
+    let (handler, _join_handle) = ParquetWriterHandle::<SimpleFastSink>::start_with_stats(
+        SimpleFastSink,
+        sink,
+        cfg,
+        policy,
+        Arc::new(SourceHourlyStats::new()),
+        None,
+    );
+
+    for i in 0..3 {
+        handler
+            .try_send(format!("record-{i}"))
+            .expect("try_send must succeed on a fresh channel");
+    }
+
+    let buffer_rows_key = CompositeKey::new(
+        MetricKind::Gauge,
+        metrics::Key::from_parts(
+            "parquet_s3_buffer_rows",
+            vec![
+                metrics::Label::new("source", "zeek"),
+                metrics::Label::new("target", "slow"),
+                metrics::Label::new("partition", "conn"),
+            ],
+        ),
+    );
+    let channel_available_key = CompositeKey::new(
+        MetricKind::Gauge,
+        metrics::Key::from_parts(
+            "parquet_s3_channel_available",
+            vec![
+                metrics::Label::new("source", "zeek"),
+                metrics::Label::new("target", "slow"),
+            ],
+        ),
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut both_present = false;
+    while tokio::time::Instant::now() < deadline {
+        let map = snapshotter.snapshot().into_hashmap();
+        both_present =
+            map.contains_key(&buffer_rows_key) && map.contains_key(&channel_available_key);
+        if both_present {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        both_present,
+        "expected both parquet_s3_buffer_rows{{source=zeek,target=slow,partition=conn}} and \
+         parquet_s3_channel_available{{source=zeek,target=slow}} to appear within 5s of the ticker firing"
+    );
+}

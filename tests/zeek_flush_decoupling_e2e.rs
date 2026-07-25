@@ -98,14 +98,14 @@ async fn zeek_tcp_ingest_does_not_drop_records_at_the_channel_during_a_slow_flus
         prefix: "zeek".to_string(),
         max_buffer_rows: 1,
         flush_threshold_bytes: usize::MAX,
-        flush_interval_secs: 3600,
+        flush_interval_secs: 1,
         channel_capacity: 4,
         max_partitions: 8,
     };
     let policy = FlushPolicy {
         max_rows: 1,
         max_bytes: usize::MAX,
-        interval: LiveInterval::new(Duration::from_secs(3600)),
+        interval: LiveInterval::new(Duration::from_secs(1)),
     };
     let slow_sink: Arc<dyn UploadSink> = Arc::new(SlowUploadSink {
         delay: Duration::from_millis(200),
@@ -200,5 +200,23 @@ async fn zeek_tcp_ingest_does_not_drop_records_at_the_channel_during_a_slow_flus
     assert_eq!(
         dropped, 0,
         "parquet_s3_dropped must stay at 0 through the real TCP ingest path while a flush is in flight"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut has_buffer_rows_gauge = false;
+    while tokio::time::Instant::now() < deadline {
+        has_buffer_rows_gauge = snapshotter
+            .snapshot()
+            .into_hashmap()
+            .keys()
+            .any(|k| k.key().name() == "parquet_s3_buffer_rows");
+        if has_buffer_rows_gauge {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        has_buffer_rows_gauge,
+        "expected at least one parquet_s3_buffer_rows series through the real TCP ingest path"
     );
 }

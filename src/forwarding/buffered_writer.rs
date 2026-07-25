@@ -672,6 +672,21 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         }
     }
 
+    /// Report each partition's live buffered row count as a leading
+    /// indicator of backpressure. Called only from the writer's periodic
+    /// ticker (see `ParquetWriterHandle::start_with_stats`), never from
+    /// `push()` -- `push()` is the hottest call in this file and must not
+    /// gain unconditional per-record work.
+    pub(crate) fn update_buffer_gauges(&self) {
+        let source = self.sink.source();
+        let target = self.s3.target_label();
+        for (partition, buf) in &self.buffers {
+            metrics::gauge!("parquet_s3_buffer_rows",
+                "source" => source, "target" => target, "partition" => partition.clone())
+            .set(buf.row_count as f64);
+        }
+    }
+
     /// Drain all in-flight background flushes to completion, applying each
     /// outcome as it arrives. Used at graceful shutdown (so the writer's
     /// `JoinHandle` doesn't complete while a flush is still outstanding —
@@ -1053,9 +1068,9 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                         }
                     }
                     _ = ticker.tick() => {
-                        // NOTE: unreachable today (see comment below) -- no test
-                        // exercises this branch; source/target fields verified by
-                        // code review + successful compilation only.
+                        metrics::gauge!("parquet_s3_channel_available", "source" => source, "target" => target)
+                            .set(rx.capacity() as f64);
+                        writer.update_buffer_gauges();
                         // flush_all_if_needed() always returns Ok now (flush failures surface
                         // async via apply_flush_outcome) -- kept as Result to avoid churning
                         // callers; this branch is currently unreachable.
@@ -1668,6 +1683,58 @@ max_partitions = 128
             uploads.lock().unwrap().len(),
             1,
             "the flush must actually have run and uploaded once"
+        );
+    }
+
+    /// `update_buffer_gauges()` must set `parquet_s3_buffer_rows` to each
+    /// partition's live `row_count`, labeled by source/target/partition.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn update_buffer_gauges_reports_live_row_counts() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(1_000); // high threshold: nothing flushes
+        let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
+
+        for i in 0..7 {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+        w.update_buffer_gauges();
+
+        let key = CompositeKey::new(
+            MetricKind::Gauge,
+            metrics::Key::from_parts(
+                "parquet_s3_buffer_rows",
+                vec![
+                    metrics::Label::new("source", "test"),
+                    metrics::Label::new("target", "s3"),
+                    metrics::Label::new("partition", ""),
+                ],
+            ),
+        );
+        let value = snapshotter
+            .snapshot()
+            .into_hashmap()
+            .get(&key)
+            .map(|(_, _, v)| {
+                if let DebugValue::Gauge(g) = v {
+                    g.into_inner()
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+        assert_eq!(
+            value, 7.0,
+            "expected parquet_s3_buffer_rows{{source=\"test\",target=\"s3\",partition=\"\"}} == 7.0"
         );
     }
 
