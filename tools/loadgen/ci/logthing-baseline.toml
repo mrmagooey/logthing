@@ -1,0 +1,25 @@
+# Config for tools/loadgen's syslog-udp baseline run. Local disk, not MinIO,
+# per docs/superpowers/specs/2026-07-05-performance-testing-strategy-design.md
+# §6 -- isolates ingestion/buffering-path throughput from S3/network/Docker
+# variables the design doc explicitly calls out as not what this measures.
+#
+# udp_port is 15514, NOT the real default 514: binding <1024 requires root,
+# and this file is also used by the CI job in Task 12, whose runner does not
+# have that privilege.
+bind_address = "0.0.0.0:5985"
+
+[tls]
+enabled = false
+
+[metrics]
+enabled = true
+port = 9090
+
+[syslog]
+enabled = true
+udp_port = 15514
+tcp_port = 15601
+parse_payloads = true
+
+[syslog.local]
+directory = "/tmp/logthing-perf-local"
