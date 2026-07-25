@@ -141,7 +141,7 @@ Rows 1–3 were decided by the user directly and are not open for revision.
 | 19 | Self-validation | `profile-metadata.json` + loud ERROR on an unrepresentative window | cannot *prevent* a race against an externally-started generator; can make it impossible to pass silently |
 | 20 | Overhead metric | **CPU-sec per received datagram**, 3 repeats, otherwise-idle box | normalises out the kernel-drop nonlinearity that confounds the raw counter |
 | 21 | CI | `build-pprof` job mirroring `build-kerberos` | verified convention at `rust.yml:54`; otherwise the feature and its gated tests never compile in CI |
-| 22 | Dep declaration | `default-features = false`, features `["flamegraph","prost-codec"]` | row 13's rationale requires controlling transitive pull-in; `prost` is already a dependency |
+| 22 | Dep declaration | `default-features = false`, features `["flamegraph","protobuf-codec"]` | row 13's rationale requires controlling transitive pull-in. **`prost-codec` was rejected on inspection:** pprof 0.14.1 requires `prost ^0.12` while logthing resolves `prost 0.14.4` — an incompatible major, so `prost-codec` would add a *second* prost rather than reuse the existing one. `protobuf-codec` uses `protobuf ^2.0`, which is pure Rust (no C dependency, so musl-safe) and conflicts with nothing already present |
 | 23 | `run-with-profiling.sh` | Keep — noticed, deliberately excluded | no perf/flamegraph dependency; unrelated WEF/S3 env runner |
 
 ## 5. Architecture
@@ -155,8 +155,13 @@ New `src/profiling/mod.rs` behind an off-by-default cargo feature `pprof`:
 pprof = ["dep:pprof"]
 
 [dependencies]
-pprof = { version = "0.14", default-features = false, features = ["flamegraph", "prost-codec"], optional = true }
+pprof = { version = "0.14", default-features = false, features = ["flamegraph", "protobuf-codec"], optional = true }
 ```
+
+`protobuf-codec` (rust-protobuf 2.x) is chosen over `prost-codec` because pprof 0.14.1 pins
+`prost ^0.12` while this crate resolves `prost 0.14.4`; `prost-codec` would therefore add a
+second, incompatible prost rather than reuse the existing one. `protobuf` 2.x is pure Rust,
+so it introduces no C dependency and does not threaten the musl cross-builds (row 13).
 
 Two implementations of one small interface — a real sampler when the feature is on, a no-op
 stub when off — so `src/main.rs` gets exactly one unconditional call site and no scattered
