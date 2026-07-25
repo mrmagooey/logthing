@@ -121,6 +121,10 @@ harness = false
 name = "sflow_to_record_batch"
 harness = false
 
+[[bench]]
+name = "ipfix_flow_batch_to_record_batch"
+harness = false
+
 [profile.profiling]
 inherits = "release"
 debug = true
