@@ -113,6 +113,10 @@ criterion = "0.5"
 name = "zeek_conn_batch_amortization"
 harness = false
 
+[[bench]]
+name = "suricata_envelope_to_record_batch"
+harness = false
+
 [profile.profiling]
 inherits = "release"
 debug = true
