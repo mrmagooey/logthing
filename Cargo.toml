@@ -3,6 +3,14 @@ name = "logthing"
 version = "0.9.0"
 edition = "2024"
 
+[workspace]
+members = ["tools/loadgen"]
+# Plain `cargo build`/`cargo test`/`cargo clippy` at the repo root (what
+# rust.yml runs on every push) must keep building/testing ONLY the logthing
+# package -- tools/loadgen is a manually-invoked concern
+# (docs/superpowers/plans/2026-07-24-performance-testing-infrastructure.md),
+# not a per-push one.
+default-members = ["."]
 
 [features]
 default = ["otlp"]
