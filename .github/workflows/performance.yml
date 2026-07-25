@@ -1,0 +1,98 @@
+name: Performance
+
+# Manually-triggered performance-testing tier, deliberately separate from
+# rust.yml's per-push job -- see
+# docs/superpowers/specs/2026-07-05-performance-testing-strategy-design.md §8
+# and docs/superpowers/plans/2026-07-24-performance-testing-infrastructure.md
+# Task 7/12: sustained load runs and full-sampled criterion benchmarks cost
+# minutes, not seconds, and measure throughput/latency/resource-usage, not
+# pass/fail correctness -- a different signal than what runs on every push.
+# Mirrors binaries.yml's workflow_dispatch pattern (the only other workflow
+# with one).
+on:
+  workflow_dispatch:
+    inputs:
+      target_rate:
+        description: 'loadgen syslog-udp target rate (records/sec, 0 = unbounded)'
+        required: false
+        default: '10000'
+      duration_secs:
+        description: 'loadgen syslog-udp run duration (seconds)'
+        required: false
+        default: '60'
+
+env:
+  CC: /usr/bin/gcc
+  CXX: /usr/bin/g++
+
+jobs:
+  criterion:
+    name: Criterion benchmarks (full sampled run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run all criterion benchmarks
+        run: cargo bench
+
+  syslog-udp-baseline:
+    name: loadgen syslog-udp baseline run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build logthing (profiling profile)
+        run: cargo build --profile profiling
+
+      - name: Build loadgen (release)
+        run: cargo build -p loadgen --release
+
+      - name: Start logthing against the baseline config
+        run: |
+          mkdir -p /tmp/logthing-perf-local
+          cp tools/loadgen/ci/logthing-baseline.toml ./logthing.toml
+          ./target/profiling/logthing &
+          echo $! > logthing.pid
+          for i in $(seq 1 20); do
+            curl -sf http://127.0.0.1:9090/metrics > /dev/null && break
+            sleep 0.5
+          done
+          curl -sf http://127.0.0.1:9090/metrics > /dev/null || { echo "logthing did not come up"; exit 1; }
+
+      - name: Capture pre-run metrics
+        run: curl -s http://127.0.0.1:9090/metrics > metrics-before.txt
+
+      - name: Run loadgen syslog-udp
+        run: |
+          ./target/release/loadgen syslog-udp \
+            --host 127.0.0.1 --port 15514 \
+            --target-rate ${{ github.event.inputs.target_rate }} \
+            --duration-secs ${{ github.event.inputs.duration_secs }}
+
+      - name: Drain and capture post-run metrics
+        run: |
+          sleep 3
+          curl -s http://127.0.0.1:9090/metrics > metrics-after.txt
+
+      - name: Sample resource usage
+        run: ps -o pid,rss,pcpu,etime -p "$(cat logthing.pid)" > resource-usage.txt
+
+      - name: Stop logthing
+        if: always()
+        run: kill "$(cat logthing.pid)" || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syslog-udp-baseline-results
+          path: |
+            metrics-before.txt
+            metrics-after.txt
+            resource-usage.txt
