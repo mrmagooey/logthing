@@ -390,11 +390,10 @@ impl ConnAccumulator {
         self.rows += 1;
     }
 
-    /// Test/internal helper: append a raw JSON value directly (bypassing
-    /// the `ZeekRecord`-level schema-match check `try_append` performs).
-    /// Used by `map_conn`'s wrapper (which is only ever invoked once the
-    /// caller has already confirmed this is a conn record) and by unit
-    /// tests that construct raw JSON fixtures.
+    /// Test-only helper: append a raw JSON value directly (bypassing the
+    /// `ZeekRecord`-level schema-match check `try_append` performs), for
+    /// unit tests that construct raw JSON fixtures.
+    #[cfg(test)]
     fn try_append_value(&mut self, value: &serde_json::Value) -> anyhow::Result<bool> {
         self.append_conn_value(value);
         Ok(true)
