@@ -27,6 +27,15 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
+    - name: Compile-check criterion benchmarks (no execution)
+      # Full sampled criterion runs are deliberately NOT run on every push --
+      # see docs/superpowers/plans/2026-07-24-performance-testing-infrastructure.md
+      # Task 7 for the measured-cost justification. This step only proves the
+      # benchmark files still compile against the current ParquetSink trait
+      # surface; actual timing runs live in the manually-triggered
+      # performance.yml workflow.
+      run: cargo bench --no-run --verbose
+
     - name: Check formatting
       run: cargo fmt --all -- --check
 
