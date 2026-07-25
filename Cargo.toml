@@ -133,6 +133,10 @@ harness = false
 name = "generic_hec_to_record_batch"
 harness = false
 
+[[bench]]
+name = "wef_to_record_batch"
+harness = false
+
 [profile.profiling]
 inherits = "release"
 debug = true
