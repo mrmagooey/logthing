@@ -237,147 +237,223 @@ fn build_extra(value: &serde_json::Value, promoted: &[&str], mismatch_keys: &[&s
 // Per-stream row mappers
 // ---------------------------------------------------------------------------
 
+/// Amortized builder set for the "conn" schema. Holds the same 16 Arrow
+/// builders `map_conn` used to create fresh on every call, as persistent
+/// fields, so they can be reused across many records via `finish(&mut
+/// self)` instead of reallocated per record or per batch.
+pub(crate) struct ConnAccumulator {
+    b_ts: Float64Builder,
+    b_uid: StringBuilder,
+    b_id_orig_h: StringBuilder,
+    b_id_orig_p: UInt16Builder,
+    b_id_resp_h: StringBuilder,
+    b_id_resp_p: UInt16Builder,
+    b_proto: StringBuilder,
+    b_service: StringBuilder,
+    b_duration: Float64Builder,
+    b_orig_bytes: UInt64Builder,
+    b_resp_bytes: UInt64Builder,
+    b_conn_state: StringBuilder,
+    b_history: StringBuilder,
+    b_orig_pkts: UInt64Builder,
+    b_resp_pkts: UInt64Builder,
+    b_extra: StringBuilder,
+    rows: usize,
+}
+
+impl ConnAccumulator {
+    pub(crate) fn new() -> Self {
+        Self {
+            b_ts: Float64Builder::new(),
+            b_uid: StringBuilder::new(),
+            b_id_orig_h: StringBuilder::new(),
+            b_id_orig_p: UInt16Builder::new(),
+            b_id_resp_h: StringBuilder::new(),
+            b_id_resp_p: UInt16Builder::new(),
+            b_proto: StringBuilder::new(),
+            b_service: StringBuilder::new(),
+            b_duration: Float64Builder::new(),
+            b_orig_bytes: UInt64Builder::new(),
+            b_resp_bytes: UInt64Builder::new(),
+            b_conn_state: StringBuilder::new(),
+            b_history: StringBuilder::new(),
+            b_orig_pkts: UInt64Builder::new(),
+            b_resp_pkts: UInt64Builder::new(),
+            b_extra: StringBuilder::new(),
+            rows: 0,
+        }
+    }
+
+    /// Append one already-parsed JSON `value` (the `conn` fields object).
+    /// Shared by both the amortized path (`RecordBatchAccumulator::try_append`)
+    /// and `map_conn`'s single-record fallback wrapper below -- identical
+    /// extraction/mismatch-detection/`_extra`-building logic either way.
+    fn append_conn_value(&mut self, value: &serde_json::Value) {
+        let promoted = &[
+            "ts",
+            "uid",
+            "id.orig_h",
+            "id.orig_p",
+            "id.resp_h",
+            "id.resp_p",
+            "proto",
+            "service",
+            "duration",
+            "orig_bytes",
+            "resp_bytes",
+            "conn_state",
+            "history",
+            "orig_pkts",
+            "resp_pkts",
+        ];
+        let mut mismatches: Vec<&str> = Vec::new();
+
+        let ts = json_f64(value, "ts");
+        if value.get("ts").is_some() && ts.is_none() {
+            mismatches.push("ts");
+        }
+        let uid = json_str(value, "uid");
+        if value.get("uid").is_some() && uid.is_none() {
+            mismatches.push("uid");
+        }
+        let id_orig_h = json_str(value, "id.orig_h");
+        if value.get("id.orig_h").is_some() && id_orig_h.is_none() {
+            mismatches.push("id.orig_h");
+        }
+        let id_orig_p = json_u16(value, "id.orig_p");
+        if value.get("id.orig_p").is_some() && id_orig_p.is_none() {
+            mismatches.push("id.orig_p");
+        }
+        let id_resp_h = json_str(value, "id.resp_h");
+        if value.get("id.resp_h").is_some() && id_resp_h.is_none() {
+            mismatches.push("id.resp_h");
+        }
+        let id_resp_p = json_u16(value, "id.resp_p");
+        if value.get("id.resp_p").is_some() && id_resp_p.is_none() {
+            mismatches.push("id.resp_p");
+        }
+        let proto = json_str(value, "proto");
+        if value.get("proto").is_some() && proto.is_none() {
+            mismatches.push("proto");
+        }
+        let service = json_str(value, "service");
+        if value.get("service").is_some() && service.is_none() {
+            mismatches.push("service");
+        }
+        let duration = json_f64(value, "duration");
+        if value.get("duration").is_some() && duration.is_none() {
+            mismatches.push("duration");
+        }
+        let orig_bytes = json_u64(value, "orig_bytes");
+        if value.get("orig_bytes").is_some() && orig_bytes.is_none() {
+            mismatches.push("orig_bytes");
+        }
+        let resp_bytes = json_u64(value, "resp_bytes");
+        if value.get("resp_bytes").is_some() && resp_bytes.is_none() {
+            mismatches.push("resp_bytes");
+        }
+        let conn_state = json_str(value, "conn_state");
+        if value.get("conn_state").is_some() && conn_state.is_none() {
+            mismatches.push("conn_state");
+        }
+        let history = json_str(value, "history");
+        if value.get("history").is_some() && history.is_none() {
+            mismatches.push("history");
+        }
+        let orig_pkts = json_u64(value, "orig_pkts");
+        if value.get("orig_pkts").is_some() && orig_pkts.is_none() {
+            mismatches.push("orig_pkts");
+        }
+        let resp_pkts = json_u64(value, "resp_pkts");
+        if value.get("resp_pkts").is_some() && resp_pkts.is_none() {
+            mismatches.push("resp_pkts");
+        }
+
+        let extra = build_extra(value, promoted, &mismatches);
+
+        self.b_ts.append_option(ts);
+        self.b_uid.append_option(uid.as_deref());
+        self.b_id_orig_h.append_option(id_orig_h.as_deref());
+        self.b_id_orig_p.append_option(id_orig_p);
+        self.b_id_resp_h.append_option(id_resp_h.as_deref());
+        self.b_id_resp_p.append_option(id_resp_p);
+        self.b_proto.append_option(proto.as_deref());
+        self.b_service.append_option(service.as_deref());
+        self.b_duration.append_option(duration);
+        self.b_orig_bytes.append_option(orig_bytes);
+        self.b_resp_bytes.append_option(resp_bytes);
+        self.b_conn_state.append_option(conn_state.as_deref());
+        self.b_history.append_option(history.as_deref());
+        self.b_orig_pkts.append_option(orig_pkts);
+        self.b_resp_pkts.append_option(resp_pkts);
+        self.b_extra.append_value(&extra);
+        self.rows += 1;
+    }
+
+    /// Test/internal helper: append a raw JSON value directly (bypassing
+    /// the `ZeekRecord`-level schema-match check `try_append` performs).
+    /// Used by `map_conn`'s wrapper (which is only ever invoked once the
+    /// caller has already confirmed this is a conn record) and by unit
+    /// tests that construct raw JSON fixtures.
+    fn try_append_value(&mut self, value: &serde_json::Value) -> anyhow::Result<bool> {
+        self.append_conn_value(value);
+        Ok(true)
+    }
+
+    fn finish_batch(&mut self) -> anyhow::Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.b_ts.finish()),
+            Arc::new(self.b_uid.finish()),
+            Arc::new(self.b_id_orig_h.finish()),
+            Arc::new(self.b_id_orig_p.finish()),
+            Arc::new(self.b_id_resp_h.finish()),
+            Arc::new(self.b_id_resp_p.finish()),
+            Arc::new(self.b_proto.finish()),
+            Arc::new(self.b_service.finish()),
+            Arc::new(self.b_duration.finish()),
+            Arc::new(self.b_orig_bytes.finish()),
+            Arc::new(self.b_resp_bytes.finish()),
+            Arc::new(self.b_conn_state.finish()),
+            Arc::new(self.b_history.finish()),
+            Arc::new(self.b_orig_pkts.finish()),
+            Arc::new(self.b_resp_pkts.finish()),
+            Arc::new(self.b_extra.finish()),
+        ];
+        self.rows = 0;
+        Ok(RecordBatch::try_new(conn_schema(), columns)?)
+    }
+}
+
+impl crate::forwarding::buffered_writer::RecordBatchAccumulator<crate::zeek::ZeekRecord>
+    for ConnAccumulator
+{
+    fn try_append(&mut self, record: &crate::zeek::ZeekRecord) -> anyhow::Result<bool> {
+        // Mirror to_record_batch's existing per-record fallback check: only
+        // accept a record whose RAW log_path resolves (via the registry) to
+        // exactly the conn schema. A mismatch (e.g. raw "Conn" vs the
+        // sanitized "conn" partition) must fall back to to_record_batch for
+        // just this one record, exactly as today.
+        let entry = get_schema_entry(&record.log_path);
+        if !Arc::ptr_eq(&entry.schema, &conn_schema()) {
+            return Ok(false);
+        }
+        self.append_conn_value(&record.fields);
+        Ok(true)
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+        self.finish_batch()
+    }
+}
+
 fn map_conn(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
-    let schema = conn_schema();
-    // Promoted JSON keys (Zeek dot-notation for id fields)
-    let promoted = &[
-        "ts",
-        "uid",
-        "id.orig_h",
-        "id.orig_p",
-        "id.resp_h",
-        "id.resp_p",
-        "proto",
-        "service",
-        "duration",
-        "orig_bytes",
-        "resp_bytes",
-        "conn_state",
-        "history",
-        "orig_pkts",
-        "resp_pkts",
-    ];
-
-    let mut mismatches: Vec<&str> = Vec::new();
-
-    // Extract each field; record mismatch if present but wrong type.
-    let ts = json_f64(value, "ts");
-    if value.get("ts").is_some() && ts.is_none() {
-        mismatches.push("ts");
-    }
-
-    let uid = json_str(value, "uid");
-    if value.get("uid").is_some() && uid.is_none() {
-        mismatches.push("uid");
-    }
-    let id_orig_h = json_str(value, "id.orig_h");
-    if value.get("id.orig_h").is_some() && id_orig_h.is_none() {
-        mismatches.push("id.orig_h");
-    }
-    let id_orig_p = json_u16(value, "id.orig_p");
-    if value.get("id.orig_p").is_some() && id_orig_p.is_none() {
-        mismatches.push("id.orig_p");
-    }
-    let id_resp_h = json_str(value, "id.resp_h");
-    if value.get("id.resp_h").is_some() && id_resp_h.is_none() {
-        mismatches.push("id.resp_h");
-    }
-    let id_resp_p = json_u16(value, "id.resp_p");
-    if value.get("id.resp_p").is_some() && id_resp_p.is_none() {
-        mismatches.push("id.resp_p");
-    }
-    let proto = json_str(value, "proto");
-    if value.get("proto").is_some() && proto.is_none() {
-        mismatches.push("proto");
-    }
-    let service = json_str(value, "service");
-    if value.get("service").is_some() && service.is_none() {
-        mismatches.push("service");
-    }
-    let duration = json_f64(value, "duration");
-    if value.get("duration").is_some() && duration.is_none() {
-        mismatches.push("duration");
-    }
-    let orig_bytes = json_u64(value, "orig_bytes");
-    if value.get("orig_bytes").is_some() && orig_bytes.is_none() {
-        mismatches.push("orig_bytes");
-    }
-    let resp_bytes = json_u64(value, "resp_bytes");
-    if value.get("resp_bytes").is_some() && resp_bytes.is_none() {
-        mismatches.push("resp_bytes");
-    }
-    let conn_state = json_str(value, "conn_state");
-    if value.get("conn_state").is_some() && conn_state.is_none() {
-        mismatches.push("conn_state");
-    }
-    let history = json_str(value, "history");
-    if value.get("history").is_some() && history.is_none() {
-        mismatches.push("history");
-    }
-    let orig_pkts = json_u64(value, "orig_pkts");
-    if value.get("orig_pkts").is_some() && orig_pkts.is_none() {
-        mismatches.push("orig_pkts");
-    }
-    let resp_pkts = json_u64(value, "resp_pkts");
-    if value.get("resp_pkts").is_some() && resp_pkts.is_none() {
-        mismatches.push("resp_pkts");
-    }
-
-    let extra = build_extra(value, promoted, &mismatches);
-
-    let mut b_ts = Float64Builder::new();
-    let mut b_uid = StringBuilder::new();
-    let mut b_id_orig_h = StringBuilder::new();
-    let mut b_id_orig_p = UInt16Builder::new();
-    let mut b_id_resp_h = StringBuilder::new();
-    let mut b_id_resp_p = UInt16Builder::new();
-    let mut b_proto = StringBuilder::new();
-    let mut b_service = StringBuilder::new();
-    let mut b_duration = Float64Builder::new();
-    let mut b_orig_bytes = UInt64Builder::new();
-    let mut b_resp_bytes = UInt64Builder::new();
-    let mut b_conn_state = StringBuilder::new();
-    let mut b_history = StringBuilder::new();
-    let mut b_orig_pkts = UInt64Builder::new();
-    let mut b_resp_pkts = UInt64Builder::new();
-    let mut b_extra = StringBuilder::new();
-
-    b_ts.append_option(ts);
-    b_uid.append_option(uid.as_deref());
-    b_id_orig_h.append_option(id_orig_h.as_deref());
-    b_id_orig_p.append_option(id_orig_p);
-    b_id_resp_h.append_option(id_resp_h.as_deref());
-    b_id_resp_p.append_option(id_resp_p);
-    b_proto.append_option(proto.as_deref());
-    b_service.append_option(service.as_deref());
-    b_duration.append_option(duration);
-    b_orig_bytes.append_option(orig_bytes);
-    b_resp_bytes.append_option(resp_bytes);
-    b_conn_state.append_option(conn_state.as_deref());
-    b_history.append_option(history.as_deref());
-    b_orig_pkts.append_option(orig_pkts);
-    b_resp_pkts.append_option(resp_pkts);
-    b_extra.append_value(&extra);
-
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(b_ts.finish()),
-        Arc::new(b_uid.finish()),
-        Arc::new(b_id_orig_h.finish()),
-        Arc::new(b_id_orig_p.finish()),
-        Arc::new(b_id_resp_h.finish()),
-        Arc::new(b_id_resp_p.finish()),
-        Arc::new(b_proto.finish()),
-        Arc::new(b_service.finish()),
-        Arc::new(b_duration.finish()),
-        Arc::new(b_orig_bytes.finish()),
-        Arc::new(b_resp_bytes.finish()),
-        Arc::new(b_conn_state.finish()),
-        Arc::new(b_history.finish()),
-        Arc::new(b_orig_pkts.finish()),
-        Arc::new(b_resp_pkts.finish()),
-        Arc::new(b_extra.finish()),
-    ];
-    Ok(RecordBatch::try_new(schema, columns)?)
+    let mut acc = ConnAccumulator::new();
+    acc.append_conn_value(value);
+    acc.finish_batch()
 }
 
 fn map_dns(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
@@ -1034,9 +1110,63 @@ pub fn get_schema_entry(log_path: &str) -> Arc<SchemaEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forwarding::buffered_writer::RecordBatchAccumulator;
     use arrow::array::{Array, Float64Array, StringArray, UInt16Array, UInt64Array};
 
     // --- conn schema tests ---
+
+    #[test]
+    fn conn_accumulator_matches_map_conn_output_row_for_row() {
+        let records: Vec<serde_json::Value> = (0..5)
+            .map(|i| {
+                serde_json::json!({
+                    "ts": 1700000000.0 + i as f64,
+                    "uid": format!("C{i}"),
+                    "id.orig_h": "10.0.0.1",
+                    "id.orig_p": 12345u16 + i as u16,
+                    "id.resp_h": "10.0.0.2",
+                    "id.resp_p": 443u16,
+                    "proto": "tcp",
+                    "duration": 1.5,
+                    "orig_bytes": 100u64 + i as u64,
+                    "resp_bytes": 200u64,
+                    "conn_state": "SF",
+                    "orig_pkts": 3u64,
+                    "resp_pkts": 4u64,
+                })
+            })
+            .collect();
+
+        // Baseline: today's exact per-record path, N single-row batches concatenated.
+        let single_row_batches: Vec<RecordBatch> =
+            records.iter().map(|v| map_conn(v).unwrap()).collect();
+        let expected = arrow::compute::concat_batches(&conn_schema(), &single_row_batches).unwrap();
+
+        // Amortized path: one accumulator, N appends, one finish.
+        let mut acc = ConnAccumulator::new();
+        for v in &records {
+            assert!(acc.try_append_value(v).unwrap());
+        }
+        let actual = acc.finish().unwrap();
+
+        assert_eq!(actual.num_rows(), expected.num_rows());
+        assert_eq!(actual.schema(), expected.schema());
+        for col_idx in 0..expected.num_columns() {
+            assert_eq!(
+                format!("{:?}", actual.column(col_idx)),
+                format!("{:?}", expected.column(col_idx)),
+                "column {col_idx} differs between amortized and per-record paths"
+            );
+        }
+    }
+
+    #[test]
+    fn map_conn_still_produces_a_single_row_batch() {
+        let v = serde_json::json!({"ts": 1700000000.0, "uid": "C1", "proto": "tcp"});
+        let batch = map_conn(&v).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.schema(), conn_schema());
+    }
 
     #[test]
     fn conn_schema_has_correct_fields() {

@@ -131,6 +131,18 @@ impl ParquetSink for ZeekSink {
             })
         }
     }
+
+    fn new_batch(
+        &self,
+        schema: &Arc<arrow_schema::Schema>,
+    ) -> Option<Box<dyn crate::forwarding::buffered_writer::RecordBatchAccumulator<ZeekRecord>>>
+    {
+        if Arc::ptr_eq(schema, &crate::zeek::schema::conn_schema()) {
+            Some(Box::new(crate::zeek::schema::ConnAccumulator::new()))
+        } else {
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +601,41 @@ mod tests {
         assert!(
             !ov.schema.fields().is_empty(),
             "_overflow must have a valid schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_raw_log_path_falls_back_to_envelope_not_conn_accumulator() {
+        let sink = unreachable_sink().await;
+        let (bwc, policy) = make_zeek_cfg(100_000, usize::MAX, 256);
+        let mut writer = PartitionedParquetWriter::new(ZeekSink, sink, bwc, policy);
+
+        // Raw log_path "Conn" (mixed case) sanitizes to partition "conn"
+        // (ZeekSink::new_batch will offer a ConnAccumulator for that
+        // partition's schema), but the raw-path registry lookup inside
+        // ConnAccumulator::try_append is case-sensitive and misses -- this
+        // record must be rejected and fall back to the envelope mapper,
+        // exactly as to_record_batch's pre-existing fallback already does.
+        let rec = ZeekRecord {
+            log_path: "Conn".to_string(),
+            fields: serde_json::json!({"_path": "Conn", "ts": 1700000000.0, "uid": "C1"}),
+            received_at: Utc::now(),
+        };
+        writer.push(rec).await.unwrap();
+
+        let buf = writer.buffers.get("conn").unwrap();
+        assert_eq!(
+            buf.row_count, 1,
+            "the record must still be counted, just via the fallback path"
+        );
+        assert!(
+            buf.live_builder.as_ref().map(|b| b.len()).unwrap_or(0) == 0,
+            "the mismatched record must NOT have been accepted into the conn live builder"
+        );
+        assert_eq!(
+            buf.buffer.len(),
+            1,
+            "the rejected record's fallback batch must be pushed directly onto buf.buffer"
         );
     }
 
