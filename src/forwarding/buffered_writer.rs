@@ -569,13 +569,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         // Bound the live builder's own size independent of any flush, so
         // drop_oldest_to_cap always has fine-enough-grained entries to trim
         // under sustained backpressure (see design doc §3).
-        if buf
-            .live_builder
-            .as_ref()
-            .map(|b| b.len())
-            .unwrap_or(0)
-            >= BUILDER_BATCH_ROWS
-        {
+        if buf.live_builder.as_ref().map(|b| b.len()).unwrap_or(0) >= BUILDER_BATCH_ROWS {
             Self::materialize_live_builder(buf);
         }
 
@@ -1673,7 +1667,10 @@ max_partitions = 128
             let col = Arc::new(StringArray::from(vec![record.as_str()]));
             Ok(RecordBatch::try_new(schema.clone(), vec![col])?)
         }
-        fn new_batch(&self, _schema: &Arc<Schema>) -> Option<Box<dyn RecordBatchAccumulator<String>>> {
+        fn new_batch(
+            &self,
+            _schema: &Arc<Schema>,
+        ) -> Option<Box<dyn RecordBatchAccumulator<String>>> {
             Some(Box::new(MockAccumulator::new()))
         }
     }
@@ -1689,7 +1686,10 @@ max_partitions = 128
         }
 
         let buf = w.buffers.get("").unwrap();
-        assert_eq!(buf.row_count, 5, "row_count must reflect all 5 accepted records");
+        assert_eq!(
+            buf.row_count, 5,
+            "row_count must reflect all 5 accepted records"
+        );
         assert_eq!(
             buf.buffer.len(),
             0,
