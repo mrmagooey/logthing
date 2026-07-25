@@ -117,6 +117,10 @@ harness = false
 name = "suricata_envelope_to_record_batch"
 harness = false
 
+[[bench]]
+name = "sflow_to_record_batch"
+harness = false
+
 [profile.profiling]
 inherits = "release"
 debug = true
