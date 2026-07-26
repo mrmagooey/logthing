@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 pub mod buffered_writer;
+pub mod drop_log;
 pub mod flush_registry;
 pub mod generic_s3;
 pub mod iceberg_descriptor;
