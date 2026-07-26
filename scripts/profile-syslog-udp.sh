@@ -35,6 +35,25 @@ trap restore EXIT INT TERM
 
 rm -f logthing.admin.toml
 cp tools/loadgen/ci/logthing-baseline.toml logthing.toml
+
+# Force log level to `error` for the duration of the profile. This is NOT
+# cosmetic -- it is required for the run to survive at saturating rates.
+#
+# Every dropped record emits its own tracing::warn! (forwarding/syslog_s3.rs,
+# syslog/listener.rs). At RATE=50000 that is ~19,000 warn lines/sec (861,891
+# lines observed in a 45s run), and pprof's SIGPROF handler unwinds via
+# `backtrace`, which is not async-signal-safe against the allocator and stdout
+# locks that tracing holds. Measured directly: level=info segfaults (exit 139)
+# reproducibly at 50k with the sampler active; level=error survives and yields
+# a representative profile (6,656 samples, activity_delta=940,525).
+#
+# Consequence to state in any write-up: the resulting profile EXCLUDES logging
+# cost. That is desirable for isolating the ingest path, but it means the log
+# storm itself -- an unbounded per-drop log with no rate limiting -- is a
+# separate finding, not something this profile measures.
+LOG_LEVEL="${LOG_LEVEL:-error}"
+printf '\n[logging]\nlevel = "%s"\nformat = "pretty"\n' "$LOG_LEVEL" >> logthing.toml
+
 rm -rf /tmp/logthing-perf-local "$OUT"
 mkdir -p /tmp/logthing-perf-local
 
