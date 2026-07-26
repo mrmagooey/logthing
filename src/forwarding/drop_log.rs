@@ -10,6 +10,14 @@
 //! `parquet_s3_dropped{source,target}` remains the authoritative per-drop
 //! record; these logs become a human-facing summary.
 //!
+//! Per-drop cost on the hot path: `check_at`'s `fetch_add`, atomic load, and
+//! `compare_exchange` attempt, plus `process_nanos()`'s clock read (a
+//! `OnceLock` load, an `Instant::now()` call — `clock_gettime(CLOCK_MONOTONIC)`,
+//! ~20-25ns via vDSO where available, a real syscall otherwise — and a
+//! `u128` -> `u64` narrowing conversion). No allocation, no locking; still
+//! roughly three orders of magnitude below a formatted, stdout-locking
+//! `tracing` emission.
+//!
 //! See `docs/superpowers/specs/2026-07-25-drop-log-throttle-design.md`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,19 +61,39 @@ impl<R> From<&TrySendError<R>> for DropKind {
 /// HEC's first-occurrence line for a full interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropSite {
+    /// WEF ingest, `ParquetWriterHandle<WefSink>` (`server/mod.rs`).
     Wef = 0,
+    /// HEC/NDJSON ingest, `ParquetWriterHandle<GenericSink>` (`ingest/handlers.rs`).
+    /// Shares its handle with `Otlp` — see the struct-level note above.
     Hec = 1,
+    /// OTLP ingest, `ParquetWriterHandle<GenericSink>` (`server/mod.rs`).
+    /// Shares its handle with `Hec` — see the struct-level note above.
     Otlp = 2,
+    /// sFlow ingest (`forwarding/sflow_s3.rs`).
     Sflow = 3,
+    /// Zeek ingest (`forwarding/zeek_s3.rs`).
     Zeek = 4,
+    /// Suricata ingest (`forwarding/suricata_s3.rs`).
     Suricata = 5,
+    /// IPFIX ingest (`forwarding/ipfix_s3.rs`).
     Ipfix = 6,
+    /// Raw syslog persistence (`forwarding/syslog_s3.rs`).
     Syslog = 7,
+    /// Structured (parsed-payload) syslog persistence (`syslog/listener.rs`).
+    /// Shared by `DefaultSyslogHandler` and `PayloadDispatchingHandler`, which
+    /// `main.rs` wires up as mutually exclusive.
     StructuredSyslog = 8,
 }
 
 /// Number of `DropSite` variants; the slot array is `DROP_SITE_COUNT * 2`.
 pub const DROP_SITE_COUNT: usize = 9;
+
+/// Compile-time guard: if a `DropSite` variant is added or removed without
+/// updating `DROP_SITE_COUNT` to match, this fails the build instead of
+/// letting `DropLogThrottles::check_at`'s `slots[site as usize * 2 + kind as
+/// usize]` index out of bounds and panic on the hot path at runtime. Update
+/// this alongside any new `DropSite` variant.
+const _: () = assert!(DropSite::StructuredSyslog as usize + 1 == DROP_SITE_COUNT);
 
 /// One throttle: a monotonic drop count plus the time of the last emitted line.
 ///
@@ -121,7 +149,12 @@ impl DropLogThrottle {
     }
 
     /// Total drops recorded since process start. Never reset.
-    pub fn total(&self) -> u64 {
+    ///
+    /// No production caller — `check_at`'s `Some(running_total)` return is
+    /// how production code observes the count. Kept `#[cfg(test)]` so unit
+    /// tests can assert the running total without needing to win a log slot.
+    #[cfg(test)]
+    pub(crate) fn total(&self) -> u64 {
         self.total.load(Ordering::Relaxed)
     }
 }

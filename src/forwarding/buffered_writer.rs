@@ -1129,8 +1129,12 @@ pub struct ParquetWriterHandle<S: ParquetSink> {
     /// already-running writer without a restart.
     flush_interval: LiveInterval,
     /// Per-(site, kind) log throttles. `Arc` because this struct is `Clone`
-    /// and both `AppState` and `IngestState` clone it per request — per-clone
-    /// throttle state would reset constantly and restore the log storm.
+    /// and `IngestState` clones its `GenericS3Handler` fields (`generic_s3`,
+    /// `generic_local`) per request (`AppState` is held behind
+    /// `Arc<AppState>` and is not itself `Clone`; `ParquetWriterHandle<WefSink>`
+    /// isn't `Clone` either, since `WefSink` doesn't implement `Clone`) —
+    /// per-clone throttle state would reset constantly and restore the log
+    /// storm.
     drop_log: Arc<DropLogThrottles>,
 }
 
@@ -3375,10 +3379,12 @@ secret_key  = "SECRET"
         let (cfg, policy) = test_config(10_000);
         let (handle, _join) = ParquetWriterHandle::start(MockSink, s3, cfg, policy);
 
-        // ParquetWriterHandle is #[derive(Clone)] and AppState/IngestState
-        // clone it per request. If throttle state were per-clone rather than
-        // Arc-shared, every request would get a fresh throttle and the log
-        // storm would silently return.
+        // ParquetWriterHandle is #[derive(Clone)] and IngestState clones its
+        // handles per request (AppState is held behind Arc<AppState> and
+        // isn't itself Clone; ParquetWriterHandle<WefSink> isn't Clone either,
+        // since WefSink isn't Clone). If throttle state were per-clone rather
+        // than Arc-shared, every request would get a fresh throttle and the
+        // log storm would silently return.
         let clone = handle.clone();
         assert_eq!(
             handle.drop_log_due(DropSite::Wef, DropKind::Full),

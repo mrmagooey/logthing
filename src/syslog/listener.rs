@@ -106,6 +106,12 @@ impl SyslogHandler for DefaultSyslogHandler {
                 match handle.try_send(rec) {
                     Ok(()) => {}
                     Err(e) => {
+                        // Safe to share DropSite::StructuredSyslog with the
+                        // PayloadDispatchingHandler call site below even
+                        // though the message text differs: main.rs wires
+                        // DefaultSyslogHandler and PayloadDispatchingHandler
+                        // as mutually exclusive, so only one of the two ever
+                        // runs against a given `structured_handle`.
                         if let Some(dropped_total) =
                             handle.drop_log_due(DropSite::StructuredSyslog, DropKind::from(&e))
                         {
@@ -144,6 +150,12 @@ impl<H: SyslogHandler + 'static> SyslogHandler for PayloadDispatchingHandler<H> 
                 match h.try_send(rec) {
                     Ok(()) => {}
                     Err(e) => {
+                        // Safe to share DropSite::StructuredSyslog with the
+                        // DefaultSyslogHandler call site above even though
+                        // the message text differs: main.rs wires
+                        // DefaultSyslogHandler and PayloadDispatchingHandler
+                        // as mutually exclusive, so only one of the two ever
+                        // runs against a given `structured_handle`.
                         if let Some(dropped_total) =
                             h.drop_log_due(DropSite::StructuredSyslog, DropKind::from(&e))
                         {
