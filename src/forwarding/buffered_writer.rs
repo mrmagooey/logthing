@@ -17,6 +17,8 @@ use async_trait::async_trait;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
+use crate::forwarding::drop_log::{DropKind, DropLogThrottles, DropSite};
+
 // ---------------------------------------------------------------------------
 // UploadSink trait
 // ---------------------------------------------------------------------------
@@ -1126,6 +1128,14 @@ pub struct ParquetWriterHandle<S: ParquetSink> {
     /// (via `FlushIntervalRegistry`) can change the flush cadence of an
     /// already-running writer without a restart.
     flush_interval: LiveInterval,
+    /// Per-(site, kind) log throttles. `Arc` because this struct is `Clone`
+    /// and `IngestState` clones its `GenericS3Handler` fields (`generic_s3`,
+    /// `generic_local`) per request (`AppState` is held behind
+    /// `Arc<AppState>` and is not itself `Clone`; `ParquetWriterHandle<WefSink>`
+    /// isn't `Clone` either, since `WefSink` doesn't implement `Clone`) —
+    /// per-clone throttle state would reset constantly and restore the log
+    /// storm.
+    drop_log: Arc<DropLogThrottles>,
 }
 
 impl<S: ParquetSink> ParquetWriterHandle<S> {
@@ -1247,6 +1257,7 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                 source,
                 target,
                 flush_interval: handle_flush_interval,
+                drop_log: Arc::new(DropLogThrottles::new()),
             },
             handle,
         )
@@ -1276,6 +1287,20 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                 Err(e)
             }
         }
+    }
+
+    /// Record one dropped record for `(site, kind)` and report whether a log
+    /// line is due.
+    ///
+    /// `parquet_s3_dropped{source,target}` — incremented by `try_send` —
+    /// stays the authoritative count. This only rate-limits the human-facing
+    /// line.
+    ///
+    /// `site` is passed by the caller rather than derived from this handle
+    /// because OTLP and HEC/NDJSON share the same `ParquetWriterHandle`
+    /// instances; keying by handle alone would let one mute the other.
+    pub fn drop_log_due(&self, site: DropSite, kind: DropKind) -> Option<u64> {
+        self.drop_log.check(site, kind)
     }
 }
 
@@ -1593,6 +1618,7 @@ max_partitions = 128
         }
     }
 
+    #[derive(Clone)]
     struct MockSink;
     impl ParquetSink for MockSink {
         type Record = String;
@@ -3343,5 +3369,32 @@ secret_key  = "SECRET"
         // has reached `gate.acquire()` -- see `BlockingSink` above.
         gate.add_permits(6);
         w.drain_pending_flushes().await;
+    }
+
+    #[tokio::test]
+    async fn drop_log_throttle_is_shared_across_handle_clones() {
+        use crate::forwarding::drop_log::{DropKind, DropSite};
+
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(10_000);
+        let (handle, _join) = ParquetWriterHandle::start(MockSink, s3, cfg, policy);
+
+        // ParquetWriterHandle is #[derive(Clone)] and IngestState clones its
+        // handles per request (AppState is held behind Arc<AppState> and
+        // isn't itself Clone; ParquetWriterHandle<WefSink> isn't Clone either,
+        // since WefSink isn't Clone). If throttle state were per-clone rather
+        // than Arc-shared, every request would get a fresh throttle and the
+        // log storm would silently return.
+        let clone = handle.clone();
+        assert_eq!(
+            handle.drop_log_due(DropSite::Wef, DropKind::Full),
+            Some(1),
+            "first drop on the original handle must log"
+        );
+        assert_eq!(
+            clone.drop_log_due(DropSite::Wef, DropKind::Full),
+            None,
+            "a clone must share the throttle, not reset it"
+        );
     }
 }

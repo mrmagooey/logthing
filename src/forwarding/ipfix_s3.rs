@@ -10,6 +10,7 @@
 
 use crate::config::IpfixS3Config;
 use crate::forwarding::buffered_writer::ParquetSink;
+use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::ipfix::FlowRecord;
 use arrow::array::{
     ArrayRef, StringBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
@@ -244,14 +245,18 @@ impl crate::ipfix::listener::IpfixHandler
         let count = flows.len() as u64;
         match self.try_send(flows) {
             Ok(()) => {}
-            Err(_dropped) => {
+            Err(e) => {
                 // parquet_s3_dropped{source="ipfix"} is already incremented by try_send;
                 // just warn here.
-                tracing::warn!(
-                    "IPFIX S3 channel full; dropped {} flows from {}",
-                    count,
-                    source
-                );
+                if let Some(dropped_total) = self.drop_log_due(DropSite::Ipfix, DropKind::from(&e))
+                {
+                    tracing::warn!(
+                        dropped_total,
+                        "IPFIX S3 channel full; dropped {} flows from {}",
+                        count,
+                        source
+                    );
+                }
             }
         }
     }

@@ -438,6 +438,10 @@ The `[wef.s3]` block is optional; when absent, WEF events are not persisted to S
 - **Time-Based Partitioning**: Files organized by `event_type/year/month/day/`
 - **Compression**: ZSTD compression for efficient storage
 - **Backpressure**: Bounded channel; drops are counted by `parquet_s3_dropped{source="wef"}`
+- **Drop-log throttling**: The human-facing "channel full/closed" log line for a dropped record
+  is capped at one line per 30 seconds per (call site, drop reason) pair; its `dropped_total`
+  field is cumulative since process start, not a per-window count — `parquet_s3_dropped` remains
+  the authoritative per-drop metric
 
 **S3 Path Structure**:
 ```

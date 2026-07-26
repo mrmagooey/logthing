@@ -11,6 +11,7 @@
 use crate::config::SyslogLocalConfig;
 use crate::config::SyslogS3Config;
 use crate::forwarding::buffered_writer::ParquetSink;
+use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::syslog::SyslogMessage;
 use arrow::array::{ArrayRef, StringArray, UInt8Array};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -159,8 +160,11 @@ impl crate::syslog::listener::SyslogHandler
     async fn handle_message(&self, message: SyslogMessage, _source: std::net::SocketAddr) {
         match self.try_send(message) {
             Ok(()) => {}
-            Err(_dropped) => {
-                tracing::warn!("Syslog S3 channel full; dropped message");
+            Err(e) => {
+                if let Some(dropped_total) = self.drop_log_due(DropSite::Syslog, DropKind::from(&e))
+                {
+                    tracing::warn!(dropped_total, "Syslog S3 channel full; dropped message");
+                }
             }
         }
     }

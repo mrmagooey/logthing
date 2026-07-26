@@ -9,6 +9,7 @@
 //! 4. If `ingest.generic_s3` is `Some`, call `try_send` for each record.
 //! 5. Return the HEC canonical success envelope or an error response.
 
+use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::ingest::{
     IngestState, check_hec_token,
     parse::{parse_hec_event_body, parse_hec_raw_body, parse_ndjson_body},
@@ -85,12 +86,15 @@ fn dispatch_generic_record(
         && let Err(e) = handler.try_send(record.clone())
     {
         metrics::counter!("hec_events_dropped").increment(1);
-        match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                tracing::warn!("HEC S3 channel full; dropped {context}");
-            }
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                tracing::error!("HEC S3 channel closed; dropped {context}");
+        let kind = DropKind::from(&e);
+        if let Some(dropped_total) = handler.drop_log_due(DropSite::Hec, kind) {
+            match kind {
+                DropKind::Full => {
+                    tracing::warn!(dropped_total, "HEC S3 channel full; dropped {context}");
+                }
+                DropKind::Closed => {
+                    tracing::error!(dropped_total, "HEC S3 channel closed; dropped {context}");
+                }
             }
         }
     }
@@ -98,12 +102,15 @@ fn dispatch_generic_record(
         && let Err(e) = handler.try_send(record)
     {
         metrics::counter!("hec_events_dropped").increment(1);
-        match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                tracing::warn!("HEC local channel full; dropped {context}");
-            }
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                tracing::error!("HEC local channel closed; dropped {context}");
+        let kind = DropKind::from(&e);
+        if let Some(dropped_total) = handler.drop_log_due(DropSite::Hec, kind) {
+            match kind {
+                DropKind::Full => {
+                    tracing::warn!(dropped_total, "HEC local channel full; dropped {context}");
+                }
+                DropKind::Closed => {
+                    tracing::error!(dropped_total, "HEC local channel closed; dropped {context}");
+                }
             }
         }
     }

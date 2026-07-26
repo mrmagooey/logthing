@@ -18,6 +18,7 @@
 
 use crate::config::ZeekS3Config;
 use crate::forwarding::buffered_writer::ParquetSink;
+use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::zeek::ZeekRecord;
 use crate::zeek::schema::{envelope_schema, get_schema_entry};
 use std::sync::Arc;
@@ -159,9 +160,15 @@ impl crate::zeek::listener::ZeekHandler
     async fn handle_record(&self, record: ZeekRecord, source: std::net::SocketAddr) {
         match self.try_send(record) {
             Ok(()) => {}
-            Err(_dropped) => {
+            Err(e) => {
                 // parquet_s3_dropped{source="zeek"} is already incremented by try_send.
-                tracing::warn!("Zeek S3 channel full; dropped 1 record from {}", source);
+                if let Some(dropped_total) = self.drop_log_due(DropSite::Zeek, DropKind::from(&e)) {
+                    tracing::warn!(
+                        dropped_total,
+                        "Zeek S3 channel full; dropped 1 record from {}",
+                        source
+                    );
+                }
             }
         }
     }
