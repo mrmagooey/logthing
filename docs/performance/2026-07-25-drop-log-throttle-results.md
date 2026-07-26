@@ -71,7 +71,7 @@ are used as the point of comparison the fix should approach (see §5).
 | post-fix mean | 87.18 | 1,080,310 | **80.70** | 42 | 553,846 |
 | pre-fix run 1 (baseline) | 85.97 | 852,799 | 100.8 | 1,176,360 | *(not captured pre-fix)* |
 | pre-fix run 2 (baseline) | 84.17 | 839,702 | 100.2 | — | *(not captured pre-fix)* |
-| pre-fix mean | 85.07 | 846,251 | 100.53 | 1,176,360 | — |
+| pre-fix mean | 85.07 | 846,251 | 100.53 | 1,176,360 (n=1; run 2 not captured) | — |
 | pre-fix `error` run 1 (logging-off ceiling) | 88.04 | 1,054,868 | 83.46 | 0 | — |
 | pre-fix `error` run 2 (logging-off ceiling) | 86.23 | 991,117 | 87.00 | 0 | — |
 | pre-fix `error` mean | 87.14 | 1,022,993 | 85.18 | 0 | — |
@@ -87,15 +87,31 @@ was 85.18 µs. The post-fix number is not just between those two — it is **bel
 throttled `info` path in this measurement was slightly cheaper per datagram than the pre-fix
 "no drop logging at all" condition.
 
-**Improvement vs. pre-fix `info`:** 100.53 → 80.70 µs, a reduction of **≈19.8 µs/datagram**. The
-design predicted ~15 µs. The measured improvement is *larger* than predicted, not smaller — see
-§5 for why this number should still be read cautiously (it is not free of the same "smaller/larger
-than predicted" honesty obligation just because it goes the favorable direction).
+**The defensible, within-session figure: ≈15.35 µs/datagram, matching the ~15 µs prediction.**
+Pre-fix `info` and pre-fix `error` were both captured in the same measurement session (the
+design's §1.1 baseline, reproduced in the pre-fix rows above): 100.53 − 85.18 = **15.35 µs**. This
+is the attributable recovery from removing per-drop drop-log overhead, and it lines up almost
+exactly with the design's ~15 µs prediction.
+
+**Cross-session delta (post-fix `info` vs. pre-fix `info`): 100.53 → 80.70 µs, ≈19.8 µs/datagram.**
+This spans two different measurement sessions (see §5), whose own analysis attributes roughly
+4.5 µs of that 19.8 to probable session-to-session bias rather than to the change itself — the
+post-fix `info` result (80.70 µs) measures *below* the pre-fix `error`/logging-fully-off ceiling
+(85.18 µs), which cannot be a real effect of removing drop-log calls (there is no drop logging in
+the `error` condition left to remove, so `info` cannot legitimately end up cheaper than it). Read
+≈19.8 µs as a cross-session delta inflated by that bias, not as the number to cite for what the
+throttle recovered; ≈15.35 µs is the defensible, within-session figure.
 
 ### Log-line collapse
 
-Post-fix, both runs emitted exactly **42 total log lines**, of which only **2** are drop-related,
-and only **one** of those two is a product of this task's throttle:
+Post-fix, both runs emitted exactly **42 total log lines** (a raw `wc -l` count of physical output
+lines). Of that output, only **2 drop-related log events** (i.e. 2 distinct `tracing` macro
+invocations, not necessarily 2 physical lines) fired, and only **one** of those two events is a
+product of this task's throttle. Note the units differ: "42" counts physical lines; "2" counts
+events. The `pretty` formatter emits ≈3 physical lines per event (§1.2 of the design spec), so
+these 2 events plausibly account for something like 4-6 of the 42 physical lines, not exactly 2 —
+no precise physical-line split is claimed here, only that drop-related content is a small minority
+of the 42 lines by either count:
 
 - `Syslog S3 channel full; dropped message` (from `src/forwarding/syslog_s3.rs:166`) — this is the
   genuinely-converted site. It calls `self.drop_log_due(DropSite::Syslog, DropKind::from(&e))` and
@@ -114,22 +130,24 @@ and only **one** of those two is a product of this task's throttle:
   is unsurprising that only one emission landed in a 30s run; this is old behavior, not a new result
   of Tasks 1–5.
 
-The other ~40 lines are one-time startup/admin-interface log lines unrelated to drops, identical
-across both runs.
+The remaining physical lines are one-time startup/admin-interface log lines unrelated to drops,
+identical across both runs.
 
 Against the pre-fix baseline of 1,176,360 log lines in a comparable run:
 - **Total lines:** 1,176,360 → 42, a ≈28,009× reduction. This figure is unaffected by the
-  misattribution above and stands as reported.
-- **Drop-attributable lines specifically:** 1,176,360 → 2, but crediting the new throttle with both
-  of those 2 would overstate its effect. One of the two (`buffered_writer.rs:854`) was already
-  throttled before this task and would have appeared at essentially the same rate (once per 30s
-  window) with or without Tasks 1–5 — it is not evidence of what the new throttle did. I do not
-  have a pre-fix, per-site breakdown of the 1,176,360 baseline lines that would let me attribute a
-  specific before/after count to the syslog site alone, so no numeric reduction ratio is claimed for
-  the new throttle's contribution in isolation — only that the total collapse from ~1.18M lines to
-  42 is real and correctly reported above, and that of the 2 surviving drop lines, 1
-  (`syslog_s3.rs:166`) is this task's doing and 1 (`buffered_writer.rs:854`) predates it and merely
-  happens to also appear in this run's output.
+  misattribution above and stands as reported (both counts are physical `wc -l` lines).
+- **Drop-attributable events specifically:** the pre-fix baseline does not have a per-event count
+  to compare against (only the 1,176,360 physical-line total was captured), so post-fix's 2 events
+  cannot be turned into a like-for-like before/after event ratio. Crediting the new throttle with
+  both of the 2 post-fix events would also overstate its effect regardless: one of the two
+  (`buffered_writer.rs:854`) was already throttled before this task and would have appeared at
+  essentially the same rate (once per 30s window) with or without Tasks 1–5 — it is not evidence of
+  what the new throttle did. I do not have a pre-fix, per-site breakdown of the 1,176,360 baseline
+  lines that would let me attribute a specific before/after count to the syslog site alone, so no
+  numeric reduction ratio is claimed for the new throttle's contribution in isolation — only that
+  the total collapse from ~1.18M lines to 42 is real and correctly reported above, and that of the
+  2 surviving drop events, 1 (`syslog_s3.rs:166`) is this task's doing and 1
+  (`buffered_writer.rs:854`) predates it and merely happens to also appear in this run's output.
 
 ### Step 4 — pprof segfault re-check, `LOG_LEVEL=info`, five runs of `scripts/profile-syslog-udp.sh`
 
@@ -156,8 +174,9 @@ point in the run.
 
 ## 5. Honest read
 
-**The throughput number is a genuine, clear win, and it is larger than the ~15 µs predicted** —
-but the fact that it lands *below* the pre-fix "logging fully off" ceiling deserves scrutiny rather
+**The throughput number is a genuine win, and the defensible within-session figure (≈15.35 µs)
+lines up almost exactly with the ~15 µs predicted** — but the larger, cross-session 19.8 µs delta,
+and the fact that it lands *below* the pre-fix "logging fully off" ceiling, deserve scrutiny rather
 than a victory lap. The pre-fix `error` baseline (85.18 µs mean) and this run's post-fix `info`
 result (80.70 µs mean) were captured in different sessions, on the same machine but not
 back-to-back, and the pre-fix baseline doc itself documents order-of-magnitude run-to-run swings
@@ -188,13 +207,15 @@ full. The bottleneck moved downstream, from "logging is too slow" to "the writer
 small for this rate" — which is the outcome the throttle was supposed to produce, not a new
 problem it introduced.
 
-**The pprof crash is not fixed, and the observed rate is higher than "reduced, not eliminated"
-might suggest.** 3 of 5 runs (60%) crashed even with total log-line volume cut by ~28,009× (see
-§4's log-line collapse). This sample is far too small to pin down a precise rate (a 3/5 empirical
-result has a wide binomial confidence interval — roughly 23%–88% at 95% confidence), so I am not
-reporting "the crash rate is 60%" as a stable figure. What the sample *does* establish: the crash
-is still easy to hit in practice, not a rare edge case. What it does *not* establish: any precise
-probability, or that the mechanism is fully understood — the timing correlation with a log
+**The pprof crash is not fixed.** 3 of 5 runs (60%) crashed even with total log-line volume cut by
+~28,009× (see §4's log-line collapse). This sample is far too small to pin down a precise rate (a
+3/5 empirical result has a wide Jeffreys binomial confidence interval — roughly 23%–88% at 95%
+confidence), so I am not reporting "the crash rate is 60%" as a stable figure, and I have no
+pre-fix crash-rate measurement to compare it against (see Limitations) — so this cannot be read as
+evidence that the rate did or did not fall relative to pre-fix; it only establishes the post-fix
+rate on its own. What the sample *does* establish: the crash is still easy to hit in practice, not
+a rare edge case. What it does *not* establish: any precise probability, or that the mechanism is
+fully understood — the timing correlation with a log
 emission landing inside the sampling window is consistent with the design's stated cause, but I
 have not instrumented the signal handler itself to confirm it, and it remains plausible that the
 collision probability is dominated by per-emission fixed cost (lock acquisition, write syscall
@@ -213,14 +234,25 @@ fraction of the time and should not treat a handful of clean runs as proof it's 
   back-to-back sweep. The 2026-07-24 baseline doc documents this environment's own run-to-run
   variance (kernel socket-buffer drops, achieved-rate variance); I cannot fully separate "the
   throttle fix" from "ordinary session-to-session noise" for the last few µs of the comparison,
-  though the ~19.8 µs headline improvement is far larger than the variance documented in that
-  baseline and is not in doubt.
+  though the ~15.35 µs within-session gap (pre-fix `info` vs. pre-fix `error`, both from the same
+  session) is the defensible headline figure and matches the ~15 µs prediction almost exactly. The
+  larger ~19.8 µs cross-session delta (pre-fix `info` vs. this run's post-fix `info`) is real as a
+  raw before/after number, but §5 attributes roughly 4.5 µs of it to probable session-to-session
+  bias rather than to the change itself, so it should not be read as a tighter bound on the
+  improvement than ≈15.35 µs.
 - **Single machine, no repeats beyond what's stated.** No statistical treatment beyond reporting
   both raw runs; where the signal is large (log-line collapse, ~20 µs/datagram shift) it's treated
   as real, where it's a few µs (post-fix vs. the logging-off ceiling) it is explicitly flagged as
   within probable noise.
 - **The pprof crash-rate sample (n=5) is too small for a precise rate estimate.** 3/5 is reported
-  as-is; no confidence interval narrower than "roughly 23%–88%" should be inferred from it.
+  as-is; no confidence interval narrower than the Jeffreys interval's "roughly 23%–88%" should be
+  inferred from it.
+- **There is no pre-fix crash-rate measurement to compare the post-fix 3/5 against.** The only
+  prior evidence is the design spec's "reproducibly segfaults," which does not establish a
+  denominator or a rate — it could have been 5/5, in which case 3/5 *is* a reduction, or something
+  lower. 3/5 establishes that the crash is still easy to hit ("reduced, not eliminated" per the
+  design's row 15′), but it cannot establish whether the underlying rate rose, fell, or stayed flat,
+  because there is no comparable pre-fix rate on record.
 - **The new throttle's window length was not independently verified against Tasks 1–5's source in
   this task.** Only one of the 2 surviving drop lines (`syslog_s3.rs:166`) is governed by the new
   `(DropSite, DropKind)` throttle; its `dropped_total: 1` value is consistent with a window at

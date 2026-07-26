@@ -131,7 +131,7 @@ throttle possible.
 | 14 | Short-burst visibility | accept and document | a burst shorter than the interval emits only its first line, so the log understates. `parquet_s3_dropped` is authoritative. A reaper task plus a throttle registry is real machinery for a signal Prometheus already carries exactly |
 | 15′ | pprof crash | **reduced, not eliminated** | ~190,000× fewer emissions makes a SIGPROF/stdout-lock collision very unlikely but not impossible; must not be oversold |
 | 16 | Exclusions | explicit and verified | see §2.1 |
-| 17 | Clone hazard | `Arc`-shared throttle state | `ParquetWriterHandle` is `#[derive(Clone)]` (`buffered_writer.rs:1118`) and both `AppState` and `IngestState` clone per request. Plain `AtomicU64` fields would give every clone its own throttle, silently resetting it and restoring the storm. Precedent in the same struct: `flush_interval: LiveInterval` already wraps `Arc<AtomicU64>` |
+| 17 | Clone hazard | `Arc`-shared throttle state | `ParquetWriterHandle` is `#[derive(Clone)]` (`buffered_writer.rs:1118`) and `IngestState` clones its `GenericS3Handler` fields per request (`AppState` is held behind `Arc<AppState>` and is not itself `Clone`; `ParquetWriterHandle<WefSink>` isn't `Clone` either, since `WefSink` isn't `Clone`). Plain `AtomicU64` fields would give every clone its own throttle, silently resetting it and restoring the storm. Precedent in the same struct: `flush_interval: LiveInterval` already wraps `Arc<AtomicU64>` |
 | 18 | Shared-handle conflation | throttles keyed by a closed `DropSite` enum | `generic_s3`/`generic_local` are the **same handles** for OTLP and HEC/NDJSON (`GenericSink::source()` is hardcoded `"hec"`). Per-handle-only keying would let an OTLP burst mute HEC's textually-distinct first-occurrence line for 30s, contradicting the design's own goal for 8 of 19 sites |
 | 19 | E2E scope | also re-measure µs/datagram and throughput | otherwise nothing closes the loop on the ~15µs/−21% claim that motivated the work |
 | 11″ | Full/Closed look-alike lines | accept and document | at the 7 sites whose text doesn't distinguish the two, a one-time Full→Closed transition may emit two similar-looking lines. Bounded to a single occurrence, not a recurring storm |
@@ -188,8 +188,12 @@ Message text and levels are preserved **verbatim**; only the `dropped_total` fie
 `parquet_s3_dropped{source,target}` remains the precise per-drop record; the log becomes a
 human-facing summary.
 
-Per-drop cost: one `fetch_add` plus one atomic load, replacing a formatted, stdout-locking,
-~3-line write.
+Per-drop cost: `check_at`'s `fetch_add`, atomic load, and `compare_exchange` attempt, plus
+`process_nanos()`'s clock read — a `OnceLock` load, an `Instant::now()` call
+(`clock_gettime(CLOCK_MONOTONIC)`, ~20-25ns via vDSO where available, a real syscall otherwise),
+and a `u128` → `u64` narrowing conversion. Still no allocation and no locking, and still roughly
+three orders of magnitude below a formatted, stdout-locking, ~3-line `tracing` write — but more
+than "one `fetch_add` plus one atomic load" alone.
 
 ## 6. Testing
 
