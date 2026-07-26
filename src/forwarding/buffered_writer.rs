@@ -114,6 +114,11 @@ pub trait RecordBatchAccumulator<Record>: Send {
     /// Rows appended so far, not yet finished into a `RecordBatch`.
     fn len(&self) -> usize;
 
+    /// True when no rows have been appended yet.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Finish the currently-accumulated rows into one `RecordBatch` and
     /// reset internal builder state to empty, ready to accumulate the
     /// next batch without reallocating.
@@ -864,7 +869,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
     /// of call sites and why each one needs this.
     fn materialize_live_builder(buf: &mut PartitionBuffer<S::Record>) {
         if let Some(builder) = buf.live_builder.as_mut()
-            && builder.len() > 0
+            && !builder.is_empty()
         {
             match builder.finish() {
                 Ok(batch) => {

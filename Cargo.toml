@@ -16,6 +16,7 @@ default-members = ["."]
 default = ["otlp"]
 kerberos-auth = ["axum-negotiate"]
 otlp = ["dep:opentelemetry-proto", "dep:prost"]
+pprof = ["dep:pprof"]
 
 [dependencies]
 # Async runtime
@@ -110,6 +111,17 @@ opentelemetry-proto = { version = "0.32", optional = true, default-features = fa
     "logs",
 ] }
 prost = { version = "0.14", optional = true }
+
+# CPU sampling profiler. Optional and excluded from `default` on purpose:
+# binaries.yml cross-compiles static musl with default features only, and this
+# repo has a history of C dependencies breaking those builds.
+# `protobuf-codec` (pure-Rust rust-protobuf 2.x) rather than `prost-codec`:
+# pprof 0.14 pins prost ^0.12 while this crate resolves prost 0.14, so
+# prost-codec would add a second, incompatible prost rather than reuse ours.
+pprof = { version = "0.14", default-features = false, features = [
+    "flamegraph",
+    "protobuf-codec",
+], optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

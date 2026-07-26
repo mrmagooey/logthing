@@ -1,6 +1,7 @@
 /target
 log/*
 perf.data
+profiling-results/
 
 # subagent-driven-development scratch
 .superpowers/

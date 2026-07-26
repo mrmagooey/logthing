@@ -1,0 +1,68 @@
+TOTAL SELF SAMPLES: 6968  (99 Hz of process CPU-time => 70.4 CPU-seconds)
+
+=== SELF (leaf) TIME, all frames >=0.2% ===
+ 12.00%    836  free
+  8.98%    626  posix_memalign
+  7.06%    492  malloc
+  5.68%    396  core::ptr::non_null::NonNull<T>::as_ref
+  5.14%    358  __lll_lock_wake_private
+  5.08%    354  core::sync::atomic::atomic_sub
+  3.89%    271  epoll_wait
+  3.47%    242  regex_automata::nfa::thompson::backtrack::Visited::insert
+  3.39%    236  __lll_lock_wait_private
+  3.19%    222  recvfrom
+  3.16%    220  alloc::vec::Vec<T,A>::push_mut
+  1.46%    102  core::sync::atomic::atomic_load
+  1.39%     97  core::ptr::copy_nonoverlapping
+  1.26%     88  regex_automata::nfa::thompson::backtrack::BoundedBacktracker::step
+  1.25%     87  core::sync::atomic::atomic_add
+  1.06%     74  arrow_buffer::buffer::immutable::Buffer::len
+  0.89%     62  <arrow_schema::datatype::DataType as core::cmp::PartialEq>::eq
+  0.89%     62  clock_gettime
+  0.79%     55  alloc::alloc::alloc
+  0.67%     47  tokio-runtime-w
+  0.65%     45  arrow_select::concat::binary_capacity
+  0.65%     45  mprotect
+  0.62%     43  regex_automata::nfa::thompson::nfa::Inner::group_info
+  0.62%     43  regex_automata::hybrid::dfa::DFA::next_state_untagged_unchecked
+  0.60%     42  regex_automata::hybrid::dfa::LazyRef::get_cached_start_id
+  0.59%     41  arrow_data::transform::utils::extend_offsets::{{closure}}
+  0.55%     38  core::option::Option<T>::as_ref
+  0.50%     35  <alloc::raw_vec::RawVec<T,A> as core::ops::drop::Drop>::drop
+  0.46%     32  core::sync::atomic::atomic_compare_exchange
+  0.46%     32  regex_automata::meta::regex::RegexInfo::is_impossible
+  0.42%     29  core::ptr::write
+  0.39%     27  alloc::alloc::dealloc_nonnull
+  0.37%     26  <arrow_schema::datatype::DataType as core::clone::Clone>::clone
+  0.34%     24  core::sync::atomic::atomic_swap
+  0.34%     24  regex_automata::nfa::thompson::backtrack::Visited::setup_search
+  0.33%     23  arrow_data::data::ArrayDataBuilder::nulls
+  0.33%     23  core::ptr::copy_nonoverlapping::<u8>
+  0.32%     22  <alloc::string::String>::from_utf8_lossy
+  0.32%     22  core::ptr::read
+  0.32%     22  regex_automata::util::search::Input::get_anchored
+  0.30%     21  core::ptr::drop_in_place<arrow_schema::datatype::DataType>
+  0.30%     21  arrow_array::record_batch::RecordBatch::try_new_impl
+  0.27%     19  core::ptr::drop_in_place<logthing::syslog::SyslogMessage>
+  0.26%     18  alloc::boxed::box_new_uninit
+  0.26%     18  <T as alloc::slice::<impl [T]>::to_vec_in::ConvertVec>::to_vec
+  0.24%     17  <std::sys::pal::unix::time::Timespec>::now
+  0.24%     17  <alloc::sync::Arc<T,A> as core::ops::drop::Drop>::drop
+  0.24%     17  core::option::Option<T>::unwrap_or
+  0.24%     17  regex_automata::meta::regex::Regex::search_slots
+  0.23%     16  core::ptr::drop_in_place<tokio::task::coop::RestoreOnPending>
+  0.23%     16  std::sys::pal::unix::cvt::<isize>
+  0.23%     16  std::sys::alloc::unix::aligned_malloc
+  0.22%     15  <regex_automata::meta::strategy::Core as regex_automata::meta::strategy::Strategy>::search_slots
+  0.22%     15  alloc::vec::Vec<T,A>::set_len
+  0.22%     15  core::sync::atomic::atomic_compare_exchange_weak
+  0.22%     15  logthing::forwarding::buffered_writer::PartitionedParquetWriter<S>::push::{{closure}}
+  0.20%     14  <A as core::slice::cmp::SlicePartialEq<B>>::equal_same_length
+
+=== GROUPED ===
+ 29.56%   2060  allocator (malloc/free/posix_memalign/alloc/RawVec drop)
+  8.52%    594  futex lock wait/wake
+  7.79%    543  atomics (Arc refcount etc)
+  9.99%    696  regex engine
+  6.07%    423  arrow
+  7.08%    493  syscalls (epoll/recvfrom)
