@@ -172,6 +172,19 @@ pub struct ProfileMetadata {
     pub activity_delta: Option<u64>,
     /// Whether these artifacts can be trusted to describe loaded behaviour.
     pub representative: bool,
+    /// Whether the activity probe returned a value when the sampling window
+    /// opened (i.e. `activity_before` is `Some`).
+    ///
+    /// `false` means the representativeness gate degraded to sample-count
+    /// alone for this run: at the default `LOGTHING_PROFILE_DELAY_SECS=0`,
+    /// the sampler's first `probe()` call races the metrics recorder's
+    /// installation and can run before `METRICS_HANDLE` is set, in which
+    /// case it returns `None` indistinguishably from "metrics disabled".
+    /// `representative` itself is not affected by this field -- see
+    /// [`is_representative`] -- but a caller should treat `representative:
+    /// true` with `activity_probe_available: false` as a weaker signal than
+    /// `representative: true` with the probe available.
+    pub activity_probe_available: bool,
 }
 
 impl ProfileMetadata {
@@ -195,15 +208,24 @@ impl ProfileMetadata {
             activity_after,
             activity_delta,
             representative: is_representative(sample_count, activity_delta),
+            activity_probe_available: activity_before.is_some(),
         }
     }
 }
 
 /// Start CPU profiling if `LOGTHING_PROFILE_SECS` requests it.
 ///
-/// Safe and cheap to call unconditionally: when profiling is not requested it
-/// returns immediately, and when the binary was built without the `pprof`
-/// feature it warns rather than silently doing nothing.
+/// Cheap to call unconditionally: when profiling is not requested it returns
+/// immediately, and when the binary was built without the `pprof` feature it
+/// warns rather than silently doing nothing. However, when the `pprof`
+/// feature *is* enabled and `LOGTHING_PROFILE_SECS` *is* set, this calls
+/// `tokio::spawn` internally and therefore **must be called from within a
+/// running Tokio runtime**, or it will panic.
+///
+/// For the representativeness gate to be meaningful (as opposed to a silent
+/// no-op -- see [`ProfileMetadata::activity_probe_available`]), also set
+/// `LOGTHING_PROFILE_DELAY_SECS` to a non-zero value so the sampling window
+/// opens after the metrics recorder has been installed.
 pub fn maybe_start(probe: Option<ActivityProbe>) {
     let Some(cfg) = ProfileConfig::from_env() else {
         return;
@@ -261,6 +283,12 @@ mod sampler {
             );
             tokio::time::sleep(Duration::from_secs(cfg.duration_secs)).await;
 
+            // Read immediately after the sampling sleep ends and before
+            // `report().build()`, which symbolicates every collected stack
+            // and can take seconds -- reading activity_after afterwards
+            // would widen the window this counter is meant to measure.
+            let activity_after = probe.as_ref().and_then(|p| p());
+
             let report = match guard.report().build() {
                 Ok(report) => report,
                 Err(e) => {
@@ -270,10 +298,22 @@ mod sampler {
             };
             drop(guard);
 
-            let activity_after = probe.as_ref().and_then(|p| p());
             let sample_count: usize = report.data.values().map(|count| *count as usize).sum();
             let metadata =
                 ProfileMetadata::new(&cfg, sample_count, activity_before, activity_after);
+
+            if !metadata.activity_probe_available {
+                tracing::warn!(
+                    "CPU profiling representativeness gate is degraded: the activity probe \
+                     returned no value when the sampling window opened (activity_before is \
+                     None), so `representative` was decided on sample_count alone. This is \
+                     expected when LOGTHING_PROFILE_DELAY_SECS is 0 (the default) and the \
+                     sampler's first probe() call races the metrics recorder's installation \
+                     -- indistinguishable here from metrics being disabled outright. Set \
+                     LOGTHING_PROFILE_DELAY_SECS to a non-zero value (e.g. 5) so the window \
+                     opens after metrics are installed and this gate is fully meaningful."
+                );
+            }
 
             if let Err(e) = write_artifacts(&cfg, &report, &metadata) {
                 tracing::error!("failed to write profiling artifacts: {e}");
@@ -333,6 +373,65 @@ mod sampler {
             .with_context(|| format!("writing {}", meta_path.display()))?;
 
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::path::PathBuf;
+
+        fn test_cfg(output_dir: PathBuf) -> ProfileConfig {
+            ProfileConfig {
+                duration_secs: 1,
+                delay_secs: 0,
+                frequency_hz: 99,
+                output_dir,
+            }
+        }
+
+        fn empty_report() -> pprof::Report {
+            pprof::Report {
+                data: std::collections::HashMap::new(),
+                timing: Default::default(),
+            }
+        }
+
+        /// Pins the ordering guarantee write_artifacts relies on: flamegraph,
+        /// then protobuf, then metadata *last*. If an earlier artifact write
+        /// fails, metadata must never be written -- a refactor that hoisted
+        /// the metadata write earlier would leave metadata.json claiming a
+        /// successful profile even though flamegraph.svg never landed.
+        #[test]
+        fn metadata_is_absent_when_an_earlier_artifact_write_fails() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cfg = test_cfg(dir.path().to_path_buf());
+            let report = empty_report();
+            let metadata = ProfileMetadata::new(&cfg, 0, None, None);
+
+            // Occupy flamegraph.svg's path with a directory so
+            // `File::create` for it fails with EISDIR. This is deliberately
+            // not a permission-bit trick (e.g. chmod 0o500): that approach
+            // is silently bypassed when tests run as root, whereas "a
+            // directory sits where a regular file is expected" fails for
+            // every user including root.
+            std::fs::create_dir_all(dir.path().join("flamegraph.svg"))
+                .expect("create blocking directory");
+
+            let result = write_artifacts(&cfg, &report, &metadata);
+
+            assert!(
+                result.is_err(),
+                "expected flamegraph.svg creation to fail because a directory occupies its path"
+            );
+            assert!(
+                !dir.path().join("profile.pb").exists(),
+                "profile.pb must not be written after an earlier artifact (flamegraph.svg) failed"
+            );
+            assert!(
+                !dir.path().join("profile-metadata.json").exists(),
+                "metadata must not exist when an earlier artifact write failed"
+            );
+        }
     }
 }
 
@@ -495,6 +594,7 @@ other_metric 999
         assert!(meta.representative);
         assert_eq!(meta.sample_count, 5_000);
         assert_eq!(meta.frequency_hz, 99);
+        assert!(meta.activity_probe_available);
     }
 
     #[test]
@@ -508,6 +608,38 @@ other_metric 999
         let meta = ProfileMetadata::new(&cfg, 5_000, Some(7), Some(7));
         assert_eq!(meta.activity_delta, Some(0));
         assert!(!meta.representative);
+        assert!(meta.activity_probe_available);
+    }
+
+    #[test]
+    fn activity_probe_available_is_true_when_before_is_some() {
+        let cfg = ProfileConfig {
+            duration_secs: 30,
+            delay_secs: 5,
+            frequency_hz: 99,
+            output_dir: PathBuf::from("/tmp"),
+        };
+        let meta = ProfileMetadata::new(&cfg, 5_000, Some(0), Some(0));
+        assert!(meta.activity_probe_available);
+    }
+
+    #[test]
+    fn activity_probe_available_is_false_when_before_is_none() {
+        // This is the degraded-gate case: at LOGTHING_PROFILE_DELAY_SECS=0
+        // the probe can race METRICS_HANDLE's installation and return None,
+        // which is indistinguishable from metrics being disabled. The
+        // sample-count-only gate can still pass (`representative: true`)
+        // even though the probe was unavailable -- that combination is
+        // exactly what activity_probe_available exists to surface.
+        let cfg = ProfileConfig {
+            duration_secs: 30,
+            delay_secs: 0,
+            frequency_hz: 99,
+            output_dir: PathBuf::from("/tmp"),
+        };
+        let meta = ProfileMetadata::new(&cfg, 5_000, None, None);
+        assert!(!meta.activity_probe_available);
+        assert!(meta.representative);
     }
 
     #[test]

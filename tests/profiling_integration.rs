@@ -37,7 +37,16 @@ const ARTIFACT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 async fn sampler_attributes_cpu_burned_on_a_different_thread() {
     let dir = tempfile::tempdir().expect("tempdir");
 
-    // SAFETY: single-threaded setup before any profiling task is spawned.
+    // SAFETY: `set_var`/`remove_var` are unsound if another thread is
+    // concurrently reading the environment (e.g. via `getenv`). That is NOT
+    // guaranteed by "setup runs before any profiling task is spawned" --
+    // `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]` starts
+    // its worker threads before this function body runs, so other threads
+    // are already live at this point. Soundness here instead rests on this
+    // being the only test in this binary: nothing else in this process ever
+    // calls `getenv`/`setenv` concurrently. Do NOT add a second test to this
+    // file without revisiting this -- a second `#[tokio::test]` here would
+    // race this one's env mutation against its own.
     unsafe {
         std::env::set_var("LOGTHING_PROFILE_SECS", "2");
         std::env::set_var("LOGTHING_PROFILE_HZ", "99");
@@ -88,5 +97,15 @@ async fn sampler_attributes_cpu_burned_on_a_different_thread() {
     assert!(
         meta["sample_count"].as_u64().unwrap() > 0,
         "no samples collected"
+    );
+    // The probe passed to maybe_start above always returns Some(0), so
+    // activity_delta is always Some(0) and is_representative's activity
+    // check fails -- this run is expected to be reported unrepresentative
+    // even though real samples were collected. Pin that the artifacts still
+    // get written (asserted above) alongside an honest, non-true verdict,
+    // rather than the verdict silently going unchecked.
+    assert_eq!(
+        meta["representative"], false,
+        "constant-zero probe should make this run unrepresentative"
     );
 }

@@ -8,6 +8,10 @@
 #
 # Restores repo config files on every exit path -- logthing.admin.toml is
 # git-tracked and overrides logthing.toml, a trap documented in commit 87b1d5e.
+#
+# Build the profiling binary before running this script:
+#   export CC=/usr/bin/gcc CXX=/usr/bin/g++
+#   cargo build --profile profiling --features pprof
 set -u
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,22 +20,49 @@ RATE="${RATE:-50000}"
 DURATION="${DURATION:-30}"
 DELAY="${DELAY:-5}"
 HZ="${HZ:-99}"
-BK="$(mktemp -d)"
+BIN="$REPO/target/profiling/logthing"
 
-cd "$REPO"
-cp logthing.toml "$BK/logthing.toml.orig"
-cp logthing.admin.toml "$BK/logthing.admin.toml.orig"
+if [ ! -x "$BIN" ]; then
+    echo "FATAL: $BIN not found. Build it first:"
+    echo "  export CC=/usr/bin/gcc CXX=/usr/bin/g++"
+    echo "  cargo build --profile profiling --features pprof"
+    exit 1
+fi
+if command -v strings >/dev/null 2>&1 \
+    && strings "$BIN" 2>/dev/null | grep -q 'built without the `pprof` feature'; then
+    echo "FATAL: $BIN was built without the pprof feature. Rebuild with:"
+    echo "  cargo build --profile profiling --features pprof"
+    exit 1
+fi
+
+BK="$(mktemp -d)" || { echo "FATAL: mktemp -d failed"; exit 1; }
+
+cd "$REPO" || { echo "FATAL: cd to $REPO failed"; exit 1; }
+cp logthing.toml "$BK/logthing.toml.orig" \
+    || { echo "FATAL: backup of logthing.toml failed"; exit 1; }
+cp logthing.admin.toml "$BK/logthing.admin.toml.orig" \
+    || { echo "FATAL: backup of logthing.admin.toml failed"; exit 1; }
 
 SRV_PID=""
 restore() {
     [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
     sleep 1
     [ -n "$SRV_PID" ] && kill -9 "$SRV_PID" 2>/dev/null
+    # Idempotent: the INT/TERM trap below calls restore() explicitly and then
+    # exits, which in turn fires the EXIT trap, which would call restore()
+    # again. Guard on $BK still existing so the second call is a harmless
+    # no-op instead of re-copying from a backup dir that's already gone.
+    [ -d "$BK" ] || return 0
     cp "$BK/logthing.toml.orig" "$REPO/logthing.toml"
     cp "$BK/logthing.admin.toml.orig" "$REPO/logthing.admin.toml"
     rm -rf "$BK"
 }
-trap restore EXIT INT TERM
+trap restore EXIT
+# A plain `trap restore INT TERM` would restore config but then let the
+# script fall through to its normal (0) exit path -- silently discarding the
+# interruption and defeating the exit-code gate this script exists to
+# provide. Exit 130 (128+SIGINT) makes an interrupted run visibly non-zero.
+trap 'restore; exit 130' INT TERM
 
 rm -f logthing.admin.toml
 cp tools/loadgen/ci/logthing-baseline.toml logthing.toml
