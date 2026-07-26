@@ -63,9 +63,10 @@ Artifacts consumed by this write-up, all under `profiling-results/`:
 
 `activity_before`/`activity_after` are a monotonic ingest-activity counter (not the same thing
 as `syslog_messages_received` — see `scripts/profile-syslog-udp.sh`'s embedded check) sampled
-immediately before and after the profiling window; `activity_delta = 1,192,375` over the 30s
-window confirms the server was doing substantial, non-idle work throughout the capture, not
-just at its edges. `representative: true` is the script's own gate — a run producing `false`
+immediately before and after the profiling window; `activity_delta = 1,192,375` — over a window
+that runs slightly wider than the 30s sampling window itself (~37s; see §5, caveat 3 for why) —
+confirms the server was doing substantial, non-idle work throughout the capture, not just at its
+edges. `representative: true` is the script's own gate — a run producing `false`
 here fails the script outright (non-zero exit) rather than emitting artifacts for analysis.
 This run passed that gate on its own terms; it is not being asserted representative solely
 because a human said so after the fact.
@@ -179,7 +180,7 @@ measured.
   the 30s sampling window ≈ **2.35 cores** average utilization during the window.
 - **Independent per-thread measurement** (`/proc/<pid>/task/*/stat`, the method behind the
   original 94.6µs figure), at the same 50k offered rate but at `info` logging: **81.54 CPU-sec**
-  ≈ **2.72 cores**, measured over its own window.
+  ≈ **2.72 cores**, measured over its own 30s window (no profiler running — see §5, caveat 3).
 
 **70.4 vs. 81.54 CPU-seconds — two independent measurement methods (sampling profiler vs.
 `/proc` accounting) agreeing to within ~14%.** That gap is plausibly explained by the regime
@@ -224,10 +225,23 @@ gross calibration error, not a precise measurement of the logging tax.
    The ~14% gap in §4.4 is presented as an *observation* (two differently-configured runs, one
    at `error` with the sampler, one at `info` via `/proc` accounting, landing within ~14% of each
    other), not as a validated measurement of logging's specific cost. There is also a
-   window-alignment mismatch to flag: this profile's sampling window is 30s (inside a 45s load
-   run), while the `activity_delta`/81.54-CPU-sec comparison figure's own window is roughly 37s
-   by its own accounting — the two are not sampled over identically-sized windows, which is a
-   further reason the ~14% gap is read as directional corroboration, not a precise reconciliation.
+   window-alignment point to flag, and it belongs entirely to *this* profile, not to the
+   baseline it is being compared against: the 6,968 samples in §3 cover exactly the 30s sampling
+   window (`DURATION=30`), but this profile's own `activity_delta` counter (§2) spans a slightly
+   wider ~37s. `activity_before` is read at `t≈5s` (`DELAY=5`), *before* the `pprof` guard is
+   built; `ProfilerGuardBuilder::build()` then spends ~7s on one-time backtrace symbolication
+   before sampling actually starts, so sampling runs `t≈12s→t≈42s` and `activity_after` is read
+   at `t≈42s` — hence the counter delta spans `t≈5s→t≈42s ≈ 37s`, wider than the 30s the samples
+   themselves cover. The separate 81.54 CPU-sec baseline used in §4.4 was measured over its own
+   30s window, with no profiler running at all — it is not the source of the ~37s figure, and
+   §4.4's `81.54 / 30 ≈ 2.72 cores` arithmetic is unaffected by any of this. The one practical
+   consequence: because this profile's `activity_delta` counter covers a slightly wider window
+   (~37s) than the samples it is meant to corroborate (30s), it includes some ingest activity
+   from datagrams that arrived just outside the sampled window — so any per-datagram figure
+   derived by dividing sample-based CPU-time by `activity_delta` would be **conservative**
+   (denominator inflated relative to the numerator's actual window), not inflated. This is a
+   separate point from the ~14% gap discussed above and does not change that gap's
+   interpretation.
 
 4. **Bottom-up criterion benches for the syslog receive path were never completed — the
    top-down/bottom-up reconciliation cannot be done yet.** `perf/syslog-recv-path-benches` was
@@ -293,4 +307,31 @@ amortization.
   the brief's Step 4 overhead-validation exercise (repeated with/without profiling, comparing
   CPU-sec/received-datagram) was not run for this document — it is out of scope for a write-up
   task that must not re-run the 60s capture script, and is noted here as unexecuted rather than
-  silently assumed negligible.
+  silently assumed negligible. See the dedicated subsection immediately below for why the
+  received-datagram counter specifically is not a safe stand-in for that missing measurement.
+
+### Profiler overhead: not validated
+
+The task brief for this profiling work called for a validation step that this document does not
+contain: three repeats with the `pprof` sampler enabled and three repeats without it, on an
+otherwise-idle box, comparing **CPU-seconds per received datagram** between the two conditions
+— not the raw `syslog_messages_received` counter. **That experiment was not performed. Profiler
+overhead is unquantified in this document** — nothing here bounds how much of any number in this
+write-up (the 70.4 CPU-sec figure in §4.4 included) reflects the `pprof` sampler's own
+signal-handling and stack-unwinding cost rather than the ingest/parse/buffer path itself.
+
+The reason the comparison would need to use CPU-sec *per received datagram*, rather than a
+simple before/after comparison of the raw received-datagram counter, is itself part of the
+caveat: at this offered rate, a large share of datagrams (~42%) are already being dropped by the
+kernel UDP socket receive buffer before the application ever sees them, and that drop rate is a
+nonlinear function of how much CPU is available to drain the socket. If enabling the profiler
+consumes additional CPU, the expected effect is not merely "the same datagrams take longer to
+process" — it is a shift in the kernel's drop rate, which moves the received-count denominator
+itself. A raw before/after comparison of the received counter could therefore not cleanly
+separate profiler overhead from that denominator shift, or from ordinary run-to-run variance;
+only a per-received-datagram CPU-seconds ratio, computed the same way on both sides of the
+comparison, would isolate the sampler's own cost.
+
+Closing this gap would require exactly that experiment — three repeats with the sampler on and
+three without, on an otherwise-idle box, comparing CPU-sec/received-datagram between the two —
+and it was not attempted for this document.
