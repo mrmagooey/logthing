@@ -199,6 +199,38 @@ impl ProfileMetadata {
     }
 }
 
+/// Start CPU profiling if `LOGTHING_PROFILE_SECS` requests it.
+///
+/// Safe and cheap to call unconditionally: when profiling is not requested it
+/// returns immediately, and when the binary was built without the `pprof`
+/// feature it warns rather than silently doing nothing.
+// The `pprof` feature itself is not declared in Cargo.toml yet (Task 3 adds
+// it along with the `sampler` module it gates); until then rustc's
+// check-cfg lint flags both branches below as referencing an unknown
+// feature value. Silence that locally rather than declaring the feature
+// early or stubbing out `sampler`.
+#[allow(unexpected_cfgs)]
+pub fn maybe_start(probe: Option<ActivityProbe>) {
+    let Some(cfg) = ProfileConfig::from_env() else {
+        return;
+    };
+
+    #[cfg(feature = "pprof")]
+    {
+        sampler::spawn(cfg, probe);
+    }
+
+    #[cfg(not(feature = "pprof"))]
+    {
+        let _ = probe;
+        tracing::warn!(
+            duration_secs = cfg.duration_secs,
+            "LOGTHING_PROFILE_SECS is set but this binary was built without the `pprof` \
+             feature, so no profile will be produced. Rebuild with `--features pprof`."
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +403,12 @@ other_metric 999
         let meta = ProfileMetadata::new(&cfg, 5_000, Some(7), Some(7));
         assert_eq!(meta.activity_delta, Some(0));
         assert!(!meta.representative);
+    }
+
+    #[test]
+    fn maybe_start_is_a_noop_when_disabled() {
+        // No LOGTHING_PROFILE_SECS in the test environment: must not panic,
+        // must not spawn, must not require a tokio runtime.
+        maybe_start(None);
     }
 }

@@ -33,6 +33,12 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+/// Handle onto the installed Prometheus recorder, published so profiling can
+/// read counters to verify a sampling window overlapped real traffic.
+/// `OnceLock` because the recorder is installed exactly once, at startup.
+pub static METRICS_HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
+    std::sync::OnceLock::new();
+
 /// Maximum allowed body size for WEF/syslog ingest requests (64 MiB).
 /// Prevents unbounded memory allocation from large or malicious payloads.
 const MAX_BODY_SIZE: usize = 64 * 1024 * 1024;
@@ -2554,6 +2560,8 @@ async fn start_metrics_server(addr: SocketAddr) {
     let recorder = PrometheusBuilder::new().build_recorder();
 
     let handle = recorder.handle();
+
+    let _ = METRICS_HANDLE.set(handle.clone());
 
     metrics::set_global_recorder(recorder).expect("Failed to install Prometheus recorder");
 

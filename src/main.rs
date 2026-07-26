@@ -49,6 +49,13 @@ async fn async_main() -> anyhow::Result<()> {
     info!("Starting WEF Server v{}", env!("CARGO_PKG_VERSION"));
     info!("Configuration loaded successfully");
 
+    // Start CPU profiling if requested. No-op unless LOGTHING_PROFILE_SECS is
+    // set; warns if set on a binary built without the `pprof` feature.
+    logthing::profiling::maybe_start(Some(Box::new(|| {
+        let handle = logthing::server::METRICS_HANDLE.get()?;
+        logthing::profiling::parse_counter(&handle.render(), logthing::profiling::ACTIVITY_METRIC)
+    })));
+
     let shared_config = Arc::new(RwLock::new(config.clone()));
     let source_stats = Arc::new(stats::SourceHourlyStats::new());
     let flush_registry = forwarding::flush_registry::FlushIntervalRegistry::new();
