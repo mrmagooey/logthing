@@ -45,7 +45,9 @@ cp tools/loadgen/ci/logthing-baseline.toml logthing.toml
 # `backtrace`, which is not async-signal-safe against the allocator and stdout
 # locks that tracing holds. Measured directly: level=info segfaults (exit 139)
 # reproducibly at 50k with the sampler active; level=error survives and yields
-# a representative profile (6,656 samples, activity_delta=940,525).
+# a representative profile across repeated runs (two confirming runs: 6,656
+# samples / delta 940,525, and 6,968 samples / delta 1,192,375 -- sampling has
+# normal run-to-run variance, these are not one number).
 #
 # Consequence to state in any write-up: the resulting profile EXCLUDES logging
 # cost. That is desirable for isolating the ingest path, but it means the log
@@ -90,4 +92,14 @@ if not m["representative"]:
              f"(samples={m['sample_count']}, delta={m['activity_delta']})")
 print("OK: representative profile")
 PY
+# Propagate the check's verdict. Without this the script always exits 0:
+# there is no `set -e`, so a failing heredoc is silently followed by the
+# echo below, which succeeds and becomes the script's exit status. A caller
+# gating on $? would then read an unrepresentative profile as success --
+# defeating the entire point of the assertion.
+CHECK_RC=$?
+if [ "$CHECK_RC" -ne 0 ]; then
+    echo "artifacts in $OUT (NOT representative -- do not use for analysis)"
+    exit "$CHECK_RC"
+fi
 echo "artifacts in $OUT"
