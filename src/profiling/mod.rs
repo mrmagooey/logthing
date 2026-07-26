@@ -204,12 +204,6 @@ impl ProfileMetadata {
 /// Safe and cheap to call unconditionally: when profiling is not requested it
 /// returns immediately, and when the binary was built without the `pprof`
 /// feature it warns rather than silently doing nothing.
-// The `pprof` feature itself is not declared in Cargo.toml yet (Task 3 adds
-// it along with the `sampler` module it gates); until then rustc's
-// check-cfg lint flags both branches below as referencing an unknown
-// feature value. Silence that locally rather than declaring the feature
-// early or stubbing out `sampler`.
-#[allow(unexpected_cfgs)]
 pub fn maybe_start(probe: Option<ActivityProbe>) {
     let Some(cfg) = ProfileConfig::from_env() else {
         return;
@@ -228,6 +222,117 @@ pub fn maybe_start(probe: Option<ActivityProbe>) {
             "LOGTHING_PROFILE_SECS is set but this binary was built without the `pprof` \
              feature, so no profile will be produced. Rebuild with `--features pprof`."
         );
+    }
+}
+
+#[cfg(feature = "pprof")]
+mod sampler {
+    use std::io::Write;
+    use std::time::Duration;
+
+    use super::{ActivityProbe, ProfileConfig, ProfileMetadata};
+
+    /// Spawn the background sampling task. Never blocks startup; every failure
+    /// is logged and swallowed, because a profiler must not be able to take
+    /// down the daemon it is observing.
+    pub(super) fn spawn(cfg: ProfileConfig, probe: Option<ActivityProbe>) {
+        tokio::spawn(async move {
+            if cfg.delay_secs > 0 {
+                tokio::time::sleep(Duration::from_secs(cfg.delay_secs)).await;
+            }
+
+            let activity_before = probe.as_ref().and_then(|p| p());
+
+            let guard = match pprof::ProfilerGuardBuilder::default()
+                .frequency(cfg.frequency_hz)
+                .build()
+            {
+                Ok(guard) => guard,
+                Err(e) => {
+                    tracing::error!("failed to start CPU profiler: {e}");
+                    return;
+                }
+            };
+
+            tracing::info!(
+                duration_secs = cfg.duration_secs,
+                frequency_hz = cfg.frequency_hz,
+                "CPU profiling started"
+            );
+            tokio::time::sleep(Duration::from_secs(cfg.duration_secs)).await;
+
+            let report = match guard.report().build() {
+                Ok(report) => report,
+                Err(e) => {
+                    tracing::error!("failed to build CPU profile report: {e}");
+                    return;
+                }
+            };
+            drop(guard);
+
+            let activity_after = probe.as_ref().and_then(|p| p());
+            let sample_count: usize = report.data.values().map(|count| *count as usize).sum();
+            let metadata =
+                ProfileMetadata::new(&cfg, sample_count, activity_before, activity_after);
+
+            if let Err(e) = write_artifacts(&cfg, &report, &metadata) {
+                tracing::error!("failed to write profiling artifacts: {e}");
+                return;
+            }
+
+            if metadata.representative {
+                tracing::info!(
+                    dir = %cfg.output_dir.display(),
+                    sample_count,
+                    activity_delta = ?metadata.activity_delta,
+                    "CPU profile written"
+                );
+            } else {
+                tracing::error!(
+                    dir = %cfg.output_dir.display(),
+                    sample_count,
+                    activity_delta = ?metadata.activity_delta,
+                    "profile did not overlap load; artifacts are not representative"
+                );
+            }
+        });
+    }
+
+    /// Write the flamegraph, the pprof protobuf, and the metadata record.
+    fn write_artifacts(
+        cfg: &ProfileConfig,
+        report: &pprof::Report,
+        metadata: &ProfileMetadata,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        use pprof::protos::Message;
+
+        std::fs::create_dir_all(&cfg.output_dir)
+            .with_context(|| format!("creating {}", cfg.output_dir.display()))?;
+
+        let svg_path = cfg.output_dir.join("flamegraph.svg");
+        let svg = std::fs::File::create(&svg_path)
+            .with_context(|| format!("creating {}", svg_path.display()))?;
+        report
+            .flamegraph(svg)
+            .with_context(|| format!("writing {}", svg_path.display()))?;
+
+        let pb_path = cfg.output_dir.join("profile.pb");
+        let profile = report.pprof().context("building pprof protobuf")?;
+        let mut pb = std::fs::File::create(&pb_path)
+            .with_context(|| format!("creating {}", pb_path.display()))?;
+        pb.write_all(
+            &profile
+                .write_to_bytes()
+                .context("encoding pprof protobuf")?,
+        )
+        .with_context(|| format!("writing {}", pb_path.display()))?;
+
+        let meta_path = cfg.output_dir.join("profile-metadata.json");
+        std::fs::write(&meta_path, serde_json::to_vec_pretty(metadata)?)
+            .with_context(|| format!("writing {}", meta_path.display()))?;
+
+        Ok(())
     }
 }
 
