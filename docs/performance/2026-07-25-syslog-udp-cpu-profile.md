@@ -61,8 +61,9 @@ Artifacts consumed by this write-up, all under `profiling-results/`:
 }
 ```
 
-`activity_before`/`activity_after` are a monotonic ingest-activity counter (not the same thing
-as `syslog_messages_received` — see `scripts/profile-syslog-udp.sh`'s embedded check) sampled
+`activity_before`/`activity_after` are readings of the `syslog_messages_received` Prometheus
+counter itself — `src/profiling/mod.rs` sets `ACTIVITY_METRIC = "syslog_messages_received"` and
+`src/main.rs` passes that constant to `parse_counter` when building the probe — sampled
 immediately before and after the profiling window; `activity_delta = 1,192,375` — over a window
 that runs slightly wider than the 30s sampling window itself (~37s; see §5, caveat 3 for why) —
 confirms the server was doing substantial, non-idle work throughout the capture, not just at its
@@ -77,7 +78,13 @@ cross-check in §4.2.
 ## 3. Self-time table (leaf samples, from the flamegraph)
 
 Extracted per Step 3 of the task brief (title-attribute parse of `flamegraph.svg`); full output
-in `.superpowers/sdd/selftime-50k.txt`. Grouped:
+in `docs/performance/2026-07-25-syslog-udp-cpu-profile-selftime.txt`, committed alongside this
+document (an earlier draft cited `.superpowers/sdd/selftime-50k.txt`, which is gitignored and
+does not exist for anyone checking out this branch). That file's own header floors it at
+0.2% self-time per leaf, and the script used to derive it from `profile.pb`/`flamegraph.svg` was
+not committed with this branch — the sub-0.2% long tail (part of the ~31% remainder discussed in
+§4.2) cannot currently be regenerated or independently reproduced from anything in this
+repository; only the >=0.2% leaves and the group totals below are reconstructable. Grouped:
 
 | Group | Self % | Self samples |
 |---|---:|---:|
@@ -173,24 +180,43 @@ to** — but a clean "X µs is regex, Y µs is Arrow, Z µs is unexplained" tabl
 94.6µs number is not something this data supports, and forcing one would overstate what was
 measured.
 
-### 4.4 Independent cross-check: two methods, ~14% apart
+### 4.4 Independent cross-check: two methods, normalized per-datagram gap
 
 - **This profile:** `sample_count = 6968` at `frequency_hz = 99` Hz (pprof's `ITIMER_PROF`
   samples process CPU-time, not wall-clock time) → `6968 / 99 = 70.4` CPU-seconds consumed over
-  the 30s sampling window ≈ **2.35 cores** average utilization during the window.
+  the sampling window ≈ **2.35 cores** average utilization. This run's own `activity_delta`
+  (§2) is `1,192,375` datagrams, but that count spans the counter's own wider ~37s window, not
+  the 30s the 6,968 samples cover (§5, caveat 3). Scaled down to a 30s-equivalent window —
+  `1,192,375 × 30/37 ≈ 966,800` datagrams — for comparability with the baseline below.
 - **Independent per-thread measurement** (`/proc/<pid>/task/*/stat`, the method behind the
   original 94.6µs figure), at the same 50k offered rate but at `info` logging: **81.54 CPU-sec**
-  ≈ **2.72 cores**, measured over its own 30s window (no profiler running — see §5, caveat 3).
+  ≈ **2.72 cores**, over its own 30s window, with **862,145** datagrams received in that window
+  (no profiler running — see §5, caveat 3).
 
-**70.4 vs. 81.54 CPU-seconds — two independent measurement methods (sampling profiler vs.
-`/proc` accounting) agreeing to within ~14%.** That gap is plausibly explained by the regime
-difference: the 81.54 figure's run had `info`-level logging active with the per-drop warn storm
-running (§5, caveat 1), which this profile's run suppressed. A ~14% CPU difference attributable
-to ~19,000 `tracing::warn!` calls/sec plus their formatting/write cost is a plausible order of
-magnitude, but this is **not verified** — see caveat 3 below on why it was not tested directly.
-Two methods landing this close to each other, despite measuring different runs by different
-mechanisms, is itself the useful finding: it's corroborating evidence that neither method has a
-gross calibration error, not a precise measurement of the logging tax.
+**Raw CPU-seconds, 70.4 vs. 81.54, differ by only ~14% — but the two runs ingested different
+volumes of datagrams (~966,800 scaled vs. 862,145), so comparing raw totals is not sound.** §7's
+overhead discussion makes this same point for a different pair of runs: at this offered rate a
+large share of datagrams are dropped by the kernel before the application sees them, and that
+drop rate is a nonlinear function of available CPU, so only **CPU-seconds per received
+datagram** — not a raw CPU-second total — isolates a cost difference between two unequal-volume
+runs. Normalizing:
+
+- This profile: `70.4 CPU-sec / ~966,800 datagrams` (30s-equivalent) ≈ **72.8µs/datagram**.
+- Baseline: `81.54 CPU-sec / 862,145 datagrams` = **94.6µs/datagram** — the original design-doc
+  figure being reconciled against.
+
+That is a **~23% gap** (72.8µs vs. 94.6µs), not ~14%. Using this profile's own *unscaled*
+`activity_delta` instead (`1,192,375` over its real ~37s window) gives `70.4 / 1,192,375 ≈
+59.0µs/datagram` — a **~38% gap**. The two normalizations disagree with each other by roughly 15
+percentage points, which itself says something: this cross-check is sensitive to exactly how the
+window mismatch is handled, so it should be read as **indicative of a real gap in the same
+direction (this profile's run used less CPU per datagram), not as a precise measurement of that
+gap's size.** A gap in this range is plausibly explained by the regime difference — the 81.54
+figure's run had `info`-level logging active with the per-drop warn storm running (§5, caveat
+1), which this profile's run suppressed — but that attribution is **not verified**; see caveat 3
+below on why it was not tested directly. What is not supportable is the original, unnormalized
+"~14%" framing: it compared absolute CPU-seconds over runs of unequal throughput, which the
+rest of this document's own reasoning (§7) says not to do.
 
 ## 5. Caveats that must be read alongside §4
 
@@ -222,26 +248,29 @@ gross calibration error, not a precise measurement of the logging tax.
 
 3. **The logging-cost contribution was not measured, and must not be estimated by re-running at
    `info` with the sampler on** — that is exactly the crashing combination described in caveat 2.
-   The ~14% gap in §4.4 is presented as an *observation* (two differently-configured runs, one
-   at `error` with the sampler, one at `info` via `/proc` accounting, landing within ~14% of each
-   other), not as a validated measurement of logging's specific cost. There is also a
-   window-alignment point to flag, and it belongs entirely to *this* profile, not to the
-   baseline it is being compared against: the 6,968 samples in §3 cover exactly the 30s sampling
-   window (`DURATION=30`), but this profile's own `activity_delta` counter (§2) spans a slightly
-   wider ~37s. `activity_before` is read at `t≈5s` (`DELAY=5`), *before* the `pprof` guard is
-   built; `ProfilerGuardBuilder::build()` then spends ~7s on one-time backtrace symbolication
-   before sampling actually starts, so sampling runs `t≈12s→t≈42s` and `activity_after` is read
-   at `t≈42s` — hence the counter delta spans `t≈5s→t≈42s ≈ 37s`, wider than the 30s the samples
-   themselves cover. The separate 81.54 CPU-sec baseline used in §4.4 was measured over its own
-   30s window, with no profiler running at all — it is not the source of the ~37s figure, and
-   §4.4's `81.54 / 30 ≈ 2.72 cores` arithmetic is unaffected by any of this. The one practical
-   consequence: because this profile's `activity_delta` counter covers a slightly wider window
-   (~37s) than the samples it is meant to corroborate (30s), it includes some ingest activity
-   from datagrams that arrived just outside the sampled window — so any per-datagram figure
-   derived by dividing sample-based CPU-time by `activity_delta` would be **conservative**
-   (denominator inflated relative to the numerator's actual window), not inflated. This is a
-   separate point from the ~14% gap discussed above and does not change that gap's
-   interpretation.
+   The normalized ~23%–~38% per-datagram gap in §4.4 is presented as an *observation* (two
+   differently-configured runs, one at `error` with the sampler, one at `info` via `/proc`
+   accounting, landing in that range of each other depending on window normalization), not as a
+   validated measurement of logging's specific cost. There is also a window-alignment point to
+   flag, and it belongs entirely to *this* profile, not to the baseline it is being compared
+   against: the 6,968 samples in §3 cover exactly the 30s sampling window (`DURATION=30`), but
+   this profile's own `activity_delta` counter (§2) spans a slightly wider ~37s. `activity_before`
+   is read at `t≈5s` (`DELAY=5`), *before* the `pprof` guard is built; `ProfilerGuardBuilder::build()`
+   then spends ~7s on one-time backtrace symbolication before sampling actually starts, so sampling
+   runs `t≈12s→t≈42s` and `activity_after` is read at `t≈42s` (immediately after the sampling sleep
+   ends, before the report is symbolicated) — hence the counter delta spans `t≈5s→t≈42s ≈ 37s`,
+   wider than the 30s the samples themselves cover. The separate 81.54 CPU-sec baseline used in
+   §4.4 was measured over its own 30s window, with no profiler running at all — it is not the
+   source of the ~37s figure, and §4.4's `81.54 / 30 ≈ 2.72 cores` arithmetic is unaffected by any
+   of this. The practical consequence, and the direct reason §4.4 computes the gap two ways: because
+   this profile's `activity_delta` counter covers a slightly wider window (~37s) than the samples
+   it is meant to corroborate (30s), dividing sample-based CPU-time by the *unscaled*
+   `activity_delta` (§4.4's ~59.0µs/datagram figure) is **conservative** — the denominator is
+   inflated relative to the numerator's actual 30s window, which understates the per-datagram
+   cost — while scaling `activity_delta` down to a 30s-equivalent first (§4.4's ~72.8µs/datagram
+   figure) corrects for that but introduces its own assumption (uniform ingest rate across the
+   ~37s span). Neither figure is more "correct" than the other; that disagreement is exactly why
+   §4.4 reports both a ~23% and a ~38% gap rather than a single number.
 
 4. **Bottom-up criterion benches for the syslog receive path were never completed — the
    top-down/bottom-up reconciliation cannot be done yet.** `perf/syslog-recv-path-benches` was
@@ -265,16 +294,43 @@ than the plan's figure. At the measured syslog cost of 7.07µs/record × 516,746
 during the run that produced the 94.6µs figure = **3.65 CPU-sec, or 4.5%** of that run's 81.54
 CPU-sec total.
 
-**This profile independently corroborates that the plan's §2.1 figure is wrong, not just that
-the benchmark contradicts it.** The Arrow group here — `arrow_buffer`/`arrow_schema`/
-`arrow_select`/`arrow_data`, which is what `to_record_batch` and its Parquet-encode neighbors
-actually touch — is **6.07%** of self-time, in a completely independent measurement (a sampling
-profiler under live load, vs. an isolated criterion micro-benchmark). Two independent methods
-now agree that Arrow mapping is a single-digit-percent cost, not the dominant one. The plan's
-§2.1 characterization of `to_record_batch` as "the single highest-value performance improvement"
-should be treated as superseded: the evidence, from two independent angles, points at allocator
-pressure and lock contention (§4) as the larger opportunity, not per-record Arrow builder
-amortization.
+**This profile does not add a second, independent measurement of Arrow's cost on top of the
+bench comparison above — an earlier draft of this section claimed it did, and that claim did
+not hold up.** The Arrow group in §3 (`arrow_buffer`/`arrow_schema`/`arrow_select`/`arrow_data`)
+is **6.07% of self-time only**: it counts CPU spent inside Arrow's own functions, not the
+allocator calls those functions trigger. §4.1 already establishes why that matters here — leaf
+samples name allocator entry points, not their call sites, so a `malloc`/`free`/`posix_memalign`
+sample caused by an Arrow builder growing its backing buffer, or by the single-row `RecordBatch`
+construction in `to_record_batch` (both named in §4.1 as candidates for the 29.56% allocator
+bucket), is indistinguishable in this data from an allocation triggered anywhere else in the
+ingest path. **6.07% is therefore a lower bound on Arrow's true CPU cost, not a measurement of
+it.**
+
+One concrete piece of evidence that the true share is higher: `posix_memalign` is the
+second-largest individual leaf in §3 at **8.98%** (626 samples), with
+`std::sys::alloc::unix::aligned_malloc` appearing directly above it in the same stacks. glibc's
+`malloc` does not route through `posix_memalign` — Rust's allocator only calls `posix_memalign`
+for over-aligned allocations, and in this codebase those are overwhelmingly Arrow's 64-byte-aligned
+buffers. So a substantial, currently unquantified share of that 8.98% is plausibly
+Arrow-attributable, on top of the 6.07% self-time already counted. This is consistent with the
+inclusive-time figures in §3 — `PartitionedParquetWriter::push` (25.01% inclusive) and
+`ParquetWriterHandle::start_with_stats` (25.65% inclusive) — which necessarily include not just
+Arrow's own instructions but all of the allocator/lock-contention time their call subtrees
+trigger, and are consequently far larger than Arrow's 6.07% self-time figure alone.
+
+Note also that batching `to_record_batch` is itself an allocation-pressure reduction: it would
+remove the single-row `RecordBatch` construction §4.1 already lists as a candidate contributor to
+the 29.56% allocator bucket. The allocator-pressure finding in §4 and the plan's `to_record_batch`
+batching recommendation are therefore not competing hypotheses about where the cost is — the
+allocator bucket may substantially be *composed of* the cost that batching would remove.
+
+**This profile cannot rank Arrow-amortization work against general allocator/lock-contention
+work as the higher-value fix, and it is not evidence that one matters more than the other.**
+Doing that ranking would require call-site attribution this extraction does not have —
+inclusive-time call-graph analysis per allocation site, or an allocator-tracing tool such as
+`heaptrack`, neither of which was run for this task. The plan's §2.1 `to_record_batch` batching
+recommendation is **not superseded** by this profile; it remains one of several plausible
+allocator-pressure contributors that this data cannot distinguish between.
 
 ## 7. Limitations
 
@@ -288,6 +344,16 @@ amortization.
   extraction alone. The 0.2% floor used for the self-time table (§3) also means the full leaf
   list is truncated; the ~31% unattributed remainder in §4.2 partly reflects that floor, not
   necessarily "genuinely unexplainable" cost.
+- **A specific symbolication red flag bounds confidence in every percentage in §3.**
+  `core::ptr::non_null::NonNull<T>::as_ref` is the 4th-largest individual leaf at **5.68%** (396
+  samples) — a trivial, almost-certainly-inlined pointer dereference that has no plausible reason
+  to itself consume 5.68% of sampled CPU. Its presence at that magnitude is more consistent with
+  unwind/frame-attribution noise (samples landing on a thin, frequently-inlined function that sits
+  low in many unrelated call stacks) than with genuine cost concentrated in that one line. This
+  does not invalidate the accounting in §3–§4, but it is concrete evidence that leaf-level
+  percentages in this document carry a symbolication-fidelity error this task did not quantify —
+  every percentage in §3 should be read with that in mind, not just the allocator/Arrow figures
+  discussed above.
 - **Logging excluded by construction (caveat 1), and its cost not independently measured
   (caveat 3).** This is the single biggest interpretive limitation of the whole document: this
   profile is a clean measurement of a *different* (quieter) regime than the one the 94.6µs
