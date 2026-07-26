@@ -92,4 +92,8 @@ jobs:
       run: cargo test --features pprof --verbose
 
     - name: Clippy (pprof)
-      run: cargo clippy --features pprof -- -D warnings
+      # --all-targets, unlike build-kerberos: tests/profiling_integration.rs is
+      # wholly #![cfg(feature = "pprof")], so this job is the only place in CI
+      # where it is ever linted. kerberos has no feature-gated test file, so its
+      # omission of the flag costs nothing; here it would be a real gap.
+      run: cargo clippy --features pprof --all-targets -- -D warnings
