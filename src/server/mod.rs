@@ -3,6 +3,7 @@ pub mod otlp;
 
 use crate::config::Config;
 use crate::forwarding::Forwarder;
+use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::ingest::IngestState;
 use crate::ingest::handlers::{handle_hec_event, handle_hec_raw, handle_ndjson};
 use crate::middleware::{IpWhitelist, ip_whitelist_middleware};
@@ -726,24 +727,33 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
     if let Some(ref sender) = state.parquet_s3_sender
         && let Err(e) = sender.try_send(event.clone())
     {
-        match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                warn!("WEF Parquet S3 channel full, dropping event");
-            }
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                error!("WEF Parquet S3 channel closed");
+        let kind = DropKind::from(&e);
+        if let Some(dropped_total) = sender.drop_log_due(DropSite::Wef, kind) {
+            match kind {
+                DropKind::Full => {
+                    warn!(dropped_total, "WEF Parquet S3 channel full, dropping event");
+                }
+                DropKind::Closed => {
+                    error!(dropped_total, "WEF Parquet S3 channel closed");
+                }
             }
         }
     }
     if let Some(ref sender) = state.parquet_local_sender
         && let Err(e) = sender.try_send(event.clone())
     {
-        match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                warn!("WEF Parquet local channel full, dropping event");
-            }
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                error!("WEF Parquet local channel closed");
+        let kind = DropKind::from(&e);
+        if let Some(dropped_total) = sender.drop_log_due(DropSite::Wef, kind) {
+            match kind {
+                DropKind::Full => {
+                    warn!(
+                        dropped_total,
+                        "WEF Parquet local channel full, dropping event"
+                    );
+                }
+                DropKind::Closed => {
+                    error!(dropped_total, "WEF Parquet local channel closed");
+                }
             }
         }
     }
@@ -2735,24 +2745,36 @@ pub async fn handle_otlp_logs(
         if let Some(ref handler) = ingest.generic_s3
             && let Err(e) = handler.try_send(record.clone())
         {
-            match e {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                    warn!("OTLP generic_s3 channel full, dropping record");
-                }
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                    error!("OTLP generic_s3 channel closed");
+            let kind = DropKind::from(&e);
+            if let Some(dropped_total) = handler.drop_log_due(DropSite::Otlp, kind) {
+                match kind {
+                    DropKind::Full => {
+                        warn!(
+                            dropped_total,
+                            "OTLP generic_s3 channel full, dropping record"
+                        );
+                    }
+                    DropKind::Closed => {
+                        error!(dropped_total, "OTLP generic_s3 channel closed");
+                    }
                 }
             }
         }
         if let Some(ref handler) = ingest.generic_local
             && let Err(e) = handler.try_send(record)
         {
-            match e {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                    warn!("OTLP generic_local channel full, dropping record");
-                }
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                    error!("OTLP generic_local channel closed");
+            let kind = DropKind::from(&e);
+            if let Some(dropped_total) = handler.drop_log_due(DropSite::Otlp, kind) {
+                match kind {
+                    DropKind::Full => {
+                        warn!(
+                            dropped_total,
+                            "OTLP generic_local channel full, dropping record"
+                        );
+                    }
+                    DropKind::Closed => {
+                        error!(dropped_total, "OTLP generic_local channel closed");
+                    }
                 }
             }
         }
