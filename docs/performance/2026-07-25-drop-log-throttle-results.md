@@ -71,41 +71,65 @@ are used as the point of comparison the fix should approach (see §5).
 | post-fix mean | 87.18 | 1,080,310 | **80.70** | 42 | 553,846 |
 | pre-fix run 1 (baseline) | 85.97 | 852,799 | 100.8 | 1,176,360 | *(not captured pre-fix)* |
 | pre-fix run 2 (baseline) | 84.17 | 839,702 | 100.2 | — | *(not captured pre-fix)* |
-| pre-fix mean | 85.07 | 846,251 | 100.52 | 1,176,360 | — |
+| pre-fix mean | 85.07 | 846,251 | 100.53 | 1,176,360 | — |
 | pre-fix `error` run 1 (logging-off ceiling) | 88.04 | 1,054,868 | 83.46 | 0 | — |
 | pre-fix `error` run 2 (logging-off ceiling) | 86.23 | 991,117 | 87.00 | 0 | — |
-| pre-fix `error` mean | 87.14 | 1,022,993 | 85.23 | 0 | — |
+| pre-fix `error` mean | 87.14 | 1,022,993 | 85.18 | 0 | — |
+
+Both mean µs/datagram figures above are computed the same way, summed-CPU ÷ summed-received
+across the two runs of the condition (not a simple average of the two per-run ratios): `info` —
+170.14 CPU-sec ÷ 1,692,501 received → 100.53 µs; `error` — 174.27 CPU-sec ÷ 2,045,985 received →
+85.18 µs. This matches the method already used for the post-fix mean row above.
 
 **Where the result lands:** post-fix `info` measures **80.6–80.8 µs/received-datagram (mean
-80.70)**. The pre-fix `info` mean was 100.52 µs; the pre-fix `error` (logging fully disabled) mean
-was 85.23 µs. The post-fix number is not just between those two — it is **below both**, i.e. the
+80.70)**. The pre-fix `info` mean was 100.53 µs; the pre-fix `error` (logging fully disabled) mean
+was 85.18 µs. The post-fix number is not just between those two — it is **below both**, i.e. the
 throttled `info` path in this measurement was slightly cheaper per datagram than the pre-fix
 "no drop logging at all" condition.
 
-**Improvement vs. pre-fix `info`:** 100.52 → 80.70 µs, a reduction of **≈19.8 µs/datagram**. The
+**Improvement vs. pre-fix `info`:** 100.53 → 80.70 µs, a reduction of **≈19.8 µs/datagram**. The
 design predicted ~15 µs. The measured improvement is *larger* than predicted, not smaller — see
 §5 for why this number should still be read cautiously (it is not free of the same "smaller/larger
 than predicted" honesty obligation just because it goes the favorable direction).
 
 ### Log-line collapse
 
-Post-fix, both runs emitted exactly **42 total log lines**, of which only **2** are drop-related:
-one throttled emission of `Syslog S3 channel full; dropped message` (from
-`src/forwarding/syslog_s3.rs:166`) and one throttled emission of `parquet_s3: upload failing —
-dropped oldest rows to stay within hard cap` (from `src/forwarding/buffered_writer.rs:854`). The
-other ~40 lines are one-time startup/admin-interface log lines unrelated to drops, identical
-across both runs. Each of the two drop lines carries `dropped_total: 1` / `dropped: 1` — the
-throttle fired on the very first drop of that `(DropSite, DropKind)` pair and then stayed quiet for
-the rest of the 30s window (the throttle window is evidently longer than 30s, so the run ended
-before a second emission for either site/kind became due).
+Post-fix, both runs emitted exactly **42 total log lines**, of which only **2** are drop-related,
+and only **one** of those two is a product of this task's throttle:
+
+- `Syslog S3 channel full; dropped message` (from `src/forwarding/syslog_s3.rs:166`) — this is the
+  genuinely-converted site. It calls `self.drop_log_due(DropSite::Syslog, DropKind::from(&e))` and
+  emits a `dropped_total` field, i.e. it goes through the new `(DropSite, DropKind)` throttle built
+  in Tasks 1–5. This line carries `dropped_total: 1` — the throttle fired on the very first drop of
+  that pair and then stayed quiet for the rest of the 30s window.
+- `parquet_s3: upload failing — dropped oldest rows to stay within hard cap` (from
+  `src/forwarding/buffered_writer.rs:854`, inside `drop_oldest_to_cap`) — **this is not a throttled
+  emission of the new mechanism.** It is a pre-existing, already-throttled, deliberately-excluded
+  line: the design spec (§2.1, "Deliberate exclusions") explicitly excludes `buffered_writer.rs`'s
+  `drop_oldest_to_cap` from this work because it already had its own wall-clock throttle —
+  `last_drop_warn ... elapsed().as_secs() >= 30` at `buffered_writer.rs:848-852`, which predates
+  this feature entirely. Confirming in source: this call site emits `dropped, source, target`
+  fields and takes no `DropSite`/`DropKind` argument at all, unlike the syslog site above. Its
+  window is exactly and explicitly 30 seconds (`>= 30` in the source), not an inferred value, so it
+  is unsurprising that only one emission landed in a 30s run; this is old behavior, not a new result
+  of Tasks 1–5.
+
+The other ~40 lines are one-time startup/admin-interface log lines unrelated to drops, identical
+across both runs.
 
 Against the pre-fix baseline of 1,176,360 log lines in a comparable run:
-- **Total lines:** 1,176,360 → 42, a ≈28,009× reduction.
-- **Drop-attributable lines specifically:** 1,176,360 → 2, a ≈588,180× reduction — larger than the
-  design's own ~190,000× estimate, though both are "several orders of magnitude," and I would not
-  hang much weight on the precise ratio given `n=1` on the pre-fix side and the throttle-window
-  edge effect described above (a longer-duration run would show more than 2 drop lines, since the
-  throttle window would elapse and re-arm).
+- **Total lines:** 1,176,360 → 42, a ≈28,009× reduction. This figure is unaffected by the
+  misattribution above and stands as reported.
+- **Drop-attributable lines specifically:** 1,176,360 → 2, but crediting the new throttle with both
+  of those 2 would overstate its effect. One of the two (`buffered_writer.rs:854`) was already
+  throttled before this task and would have appeared at essentially the same rate (once per 30s
+  window) with or without Tasks 1–5 — it is not evidence of what the new throttle did. I do not
+  have a pre-fix, per-site breakdown of the 1,176,360 baseline lines that would let me attribute a
+  specific before/after count to the syslog site alone, so no numeric reduction ratio is claimed for
+  the new throttle's contribution in isolation — only that the total collapse from ~1.18M lines to
+  42 is real and correctly reported above, and that of the 2 surviving drop lines, 1
+  (`syslog_s3.rs:166`) is this task's doing and 1 (`buffered_writer.rs:854`) predates it and merely
+  happens to also appear in this run's output.
 
 ### Step 4 — pprof segfault re-check, `LOG_LEVEL=info`, five runs of `scripts/profile-syslog-udp.sh`
 
@@ -134,46 +158,50 @@ point in the run.
 
 **The throughput number is a genuine, clear win, and it is larger than the ~15 µs predicted** —
 but the fact that it lands *below* the pre-fix "logging fully off" ceiling deserves scrutiny rather
-than a victory lap. The pre-fix `error` baseline (85.23 µs mean) and this run's post-fix `info`
+than a victory lap. The pre-fix `error` baseline (85.18 µs mean) and this run's post-fix `info`
 result (80.70 µs mean) were captured in different sessions, on the same machine but not
 back-to-back, and the pre-fix baseline doc itself documents order-of-magnitude run-to-run swings
 in this environment (kernel UDP receive-buffer drops, achieved send rate variance, etc.). I am not
 confident the post-fix number is *actually* cheaper than a hypothetical logging-fully-disabled
 run of the current code — more likely, the "logging off" ceiling itself has session-to-session
-noise of a similar magnitude to the ~4.6 µs by which post-fix `info` sits below it. What I *am*
+noise of a similar magnitude to the ~4.5 µs by which post-fix `info` sits below it. What I *am*
 confident of, because it's an internally consistent same-code-base comparison across the two runs
 taken back-to-back in this session: **the throttle removed essentially all of the drop-log
 overhead that pre-fix `info` was paying**, moving it from clearly worse than "no drop logging" to
 indistinguishable from it within this measurement's noise band.
 
 **The log-line collapse is unambiguous and is the strongest single result in this report.** Going
-from 1,176,360 lines to 2 drop-attributable lines in an identical 30-second, 50k-target-rate run
-is not a subtle effect — it is the throttle doing exactly what it was built to do, and it explains
-why the CPU-bound cost of drop logging effectively disappeared.
+from 1,176,360 total lines to 42 in an identical 30-second, 50k-target-rate run is not a subtle
+effect, and it explains why the CPU-bound cost of drop logging effectively disappeared. Of the 2
+drop-attributable lines that remain, only 1 (the `syslog_s3.rs:166` channel-full warning) is this
+throttle's doing; the other (`buffered_writer.rs:854`) was already throttled before this task and
+would have shown up regardless — see §4 for the detail. The throttle is doing exactly what it was
+built to do at the site it actually touches; it should not be credited for the pre-existing
+throttling elsewhere.
 
 **`parquet_s3_dropped` rose sharply post-fix (552,093 / 555,599 in 30s) — this is expected, not a
 regression.** Pre-fix, the drop-log storm itself was consuming enough CPU that fewer datagrams
 were ever accepted into the pipeline in the first place (852,799 / 839,702 received vs. 1,074,436
-/ 1,086,184 post-fix — roughly 27–29% more datagrams got in). With that CPU pressure relieved, more
+/ 1,086,184 post-fix — roughly 26–29% more datagrams got in). With that CPU pressure relieved, more
 datagrams now reach the bounded writer channel, and a correspondingly larger number hit it while
 full. The bottleneck moved downstream, from "logging is too slow" to "the writer channel is too
 small for this rate" — which is the outcome the throttle was supposed to produce, not a new
 problem it introduced.
 
 **The pprof crash is not fixed, and the observed rate is higher than "reduced, not eliminated"
-might suggest.** 3 of 5 runs (60%) crashed even with drop-log volume cut by ~588,000×. This
-sample is far too small to pin down a precise rate (a 3/5 empirical result has a wide binomial
-confidence interval — roughly 23%–88% at 95% confidence), so I am not reporting "the crash rate is
-60%" as a stable figure. What the sample *does* establish: the crash is still easy to hit in
-practice, not a rare edge case. What it does *not* establish: any precise probability, or that the
-mechanism is fully understood — the timing correlation with a log emission landing inside the
-sampling window is consistent with the design's stated cause, but I have not instrumented the
-signal handler itself to confirm it, and it remains plausible that the collision probability is
-dominated by per-emission fixed cost (lock acquisition, write syscall latency) rather than by raw
-emission count, which would explain why cutting emissions by ~588,000× did not cut the crash rate
-anywhere near proportionally. Anyone relying on `scripts/profile-syslog-udp.sh` at `LOG_LEVEL=info`
-should still expect it to crash a meaningful fraction of the time and should not treat a handful of
-clean runs as proof it's resolved.
+might suggest.** 3 of 5 runs (60%) crashed even with total log-line volume cut by ~28,009× (see
+§4's log-line collapse). This sample is far too small to pin down a precise rate (a 3/5 empirical
+result has a wide binomial confidence interval — roughly 23%–88% at 95% confidence), so I am not
+reporting "the crash rate is 60%" as a stable figure. What the sample *does* establish: the crash
+is still easy to hit in practice, not a rare edge case. What it does *not* establish: any precise
+probability, or that the mechanism is fully understood — the timing correlation with a log
+emission landing inside the sampling window is consistent with the design's stated cause, but I
+have not instrumented the signal handler itself to confirm it, and it remains plausible that the
+collision probability is dominated by per-emission fixed cost (lock acquisition, write syscall
+latency) rather than by raw emission count, which would explain why cutting total log-line volume
+by ~28,009× did not cut the crash rate anywhere near proportionally. Anyone relying on
+`scripts/profile-syslog-udp.sh` at `LOG_LEVEL=info` should still expect it to crash a meaningful
+fraction of the time and should not treat a handful of clean runs as proof it's resolved.
 
 ## 6. Limitations
 
@@ -193,10 +221,14 @@ clean runs as proof it's resolved.
   within probable noise.
 - **The pprof crash-rate sample (n=5) is too small for a precise rate estimate.** 3/5 is reported
   as-is; no confidence interval narrower than "roughly 23%–88%" should be inferred from it.
-- **The throttle-window re-arm behavior (why only 2 drop lines fired in 30s despite 550k+ drops)
-  was not independently verified against the throttle's source in this task** — it's inferred from
-  the observed `dropped_total: 1` / `dropped: 1` values and is consistent with a throttle window
-  longer than 30s, but Task 6 did not re-derive the exact window length from Tasks 1–5's code.
+- **The new throttle's window length was not independently verified against Tasks 1–5's source in
+  this task.** Only one of the 2 surviving drop lines (`syslog_s3.rs:166`) is governed by the new
+  `(DropSite, DropKind)` throttle; its `dropped_total: 1` value is consistent with a window at
+  least as long as the 30s run, but Task 6 did not re-derive the exact window length from Tasks
+  1–5's code, so "at least 30s" is inferred, not confirmed. The other surviving drop line
+  (`buffered_writer.rs:854`) is unrelated to this task — its window is the pre-existing, explicit
+  30-second wall-clock check at `buffered_writer.rs:848-852`, already verified in source, and its
+  single emission in a 30s run is expected rather than informative about the new throttle.
 - **`ps`/`/proc` CPU accounting reflects the whole process**, not isolated per-thread attribution
   to the drop-log path specifically; the throughput comparison is a whole-run before/after, not an
   isolated cost of the log calls alone.
