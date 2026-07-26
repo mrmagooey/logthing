@@ -73,3 +73,23 @@ jobs:
 
     - name: Clippy (kerberos-auth feature)
       run: cargo clippy --features kerberos-auth -- -D warnings
+
+  build-pprof:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install stable Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+
+    - name: Build (pprof)
+      run: cargo build --features pprof --verbose
+
+    - name: Run tests (pprof)
+      run: cargo test --features pprof --verbose
+
+    - name: Clippy (pprof)
+      run: cargo clippy --features pprof -- -D warnings
