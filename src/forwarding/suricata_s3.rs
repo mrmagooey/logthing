@@ -19,6 +19,7 @@
 
 use crate::config::SuricataS3Config;
 use crate::forwarding::buffered_writer::ParquetSink;
+use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::suricata::SuricataRecord;
 use crate::suricata::schema::{envelope_schema, map_envelope};
 use std::sync::Arc;
@@ -109,9 +110,17 @@ impl crate::suricata::listener::SuricataHandler
     async fn handle_record(&self, record: SuricataRecord, source: std::net::SocketAddr) {
         match self.try_send(record) {
             Ok(()) => {}
-            Err(_dropped) => {
+            Err(e) => {
                 // parquet_s3_dropped{source="suricata"} is already incremented by try_send.
-                tracing::warn!("Suricata S3 channel full; dropped 1 record from {}", source);
+                if let Some(dropped_total) =
+                    self.drop_log_due(DropSite::Suricata, DropKind::from(&e))
+                {
+                    tracing::warn!(
+                        dropped_total,
+                        "Suricata S3 channel full; dropped 1 record from {}",
+                        source
+                    );
+                }
             }
         }
     }

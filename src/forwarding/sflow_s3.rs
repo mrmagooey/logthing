@@ -2,6 +2,7 @@
 
 use crate::config::SflowS3Config;
 use crate::forwarding::buffered_writer::ParquetSink;
+use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::sflow::{SampleType, SflowRecord};
 use arrow::array::{
     ArrayRef, StringBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
@@ -243,8 +244,14 @@ impl crate::sflow::listener::SflowHandler
 {
     async fn handle_samples(&self, samples: Vec<SflowRecord>, source: std::net::SocketAddr) {
         for record in samples {
-            if let Err(_dropped) = self.try_send(record) {
-                tracing::warn!("sFlow S3 channel full; dropped record from {}", source);
+            if let Err(e) = self.try_send(record)
+                && let Some(dropped_total) = self.drop_log_due(DropSite::Sflow, DropKind::from(&e))
+            {
+                tracing::warn!(
+                    dropped_total,
+                    "sFlow S3 channel full; dropped record from {}",
+                    source
+                );
             }
         }
     }
