@@ -1,10 +1,15 @@
-//! Criterion micro-benchmarks: the syslog UDP *receive-path* cost -- everything
-//! that runs once per ingested datagram on the listener task, upstream of the
-//! `ParquetSink::to_record_batch` layer the other benches in this suite cover.
-//! They measure `String::from_utf8_lossy` -> `SyslogMessage::parse` ->
+//! Criterion micro-benchmarks: the syslog UDP *receive-path* message-parsing
+//! cost that runs once per ingested datagram on the listener task, upstream of
+//! the `ParquetSink::to_record_batch` layer the other benches in this suite
+//! cover. They measure `String::from_utf8_lossy` -> `SyslogMessage::parse` ->
 //! `payload::dispatch`, exactly as `SyslogListener`'s UDP receive arm runs them
 //! (see `src/syslog/listener.rs`'s `result = udp_socket.recv_from(..)` arm and
 //! `DefaultSyslogHandler::handle_message`).
+//!
+//! This is the parsing work only, not the whole per-datagram cost:
+//! `handle_message` also emits an `info!` line, runs a DNS-log check, and (when
+//! `parse_payloads` is set) builds a `StructuredSyslogRecord` and `try_send`s it
+//! to the writer channel. None of that is measured here.
 //!
 //! This path had zero benchmark coverage before this file existed. The headline
 //! finding is that the **RFC 3164 envelope parse dominates it**: on the default
@@ -30,9 +35,12 @@
 //! Figures above are medians across two runs on one machine; treat them as
 //! magnitudes, and re-run rather than trusting them as committed constants.
 //!
-//! Wire payloads are reproduced here (not imported from `tools/loadgen`,
-//! which is a separate, non-default workspace member) to match exactly what
-//! `loadgen syslog-udp`'s `build_message(n, structured)` sends:
+//! Wire payloads are reproduced here (not imported from `tools/loadgen`, which
+//! is a separate, non-default workspace member) to match what `loadgen
+//! syslog-udp`'s `build_message(n, structured)` sends. The one deviation is the
+//! tag's pid: loadgen uses `std::process::id()`, this file hardcodes 4242, so
+//! real traffic carries a pid of a few more digits. `RFC3164_TAG_RE` captures it
+//! with `\d+`, so the digit count does not measurably affect parse cost.
 //! - `structured = false` (the default): a plain RFC 3164 line whose message
 //!   body matches NO payload sub-parser, so all seven are attempted and all
 //!   reject -- the most attempts for `dispatch`, though not the most expensive
