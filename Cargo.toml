@@ -157,6 +157,10 @@ harness = false
 name = "wef_to_record_batch"
 harness = false
 
+[[bench]]
+name = "syslog_parse_recv_path"
+harness = false
+
 [profile.profiling]
 inherits = "release"
 debug = true
