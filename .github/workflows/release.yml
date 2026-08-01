@@ -51,5 +51,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Registry cache rather than type=gha: the v0.9.0 release died after
+          # 1h57m with `failed to solve: not_found` -- a GHA-cache blob that was
+          # evicted (10GB per-repo LRU, shared with the rust.yml/binaries.yml
+          # caches) partway through the ~2h emulated arm64 build. GHCR is
+          # already authenticated above and has no such eviction window.
+          # ignore-error keeps a cache hiccup from failing a release outright.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max,ignore-error=true
