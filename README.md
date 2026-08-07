@@ -693,7 +693,7 @@ Example `subscription.xml`:
 </Subscription>
 ```
 
-### 3. Configure Windows Client
+### 3. Configure Forwarder
 
 Set the collector server:
 ```powershell
@@ -736,6 +736,19 @@ The server exposes Prometheus metrics on port 9090:
                     │       ↓                ↓           │
                     │  ┌─────────────────────────────┐   │
                     │  │   Event Processors          │   │
+                    │  │   - Parser                  │   │
+                    │  │   - DNS Log Parser          │   │
+                    │  └──────────────┬──────────────┘   │
+                    │                 │                  │
+                    │       ┌─────────┴─────────┐        │
+                    │       ↓                   ↓        │
+                    │  ┌──────────┐        ┌──────────┐  │
+                    │  │ Prometheus│       │ Parquet  │  │
+                    │  │ Metrics   │       │ S3 Store │  │
+                    │  └──────────┘       └────┬─────┘  │
+                    └──────────────────────────┼─────────┘
+                                               ↓
+                                          S3 Storage
 ```
 
 ## Security Considerations
