@@ -161,28 +161,6 @@ docker compose run --rm performance-test-10k-sustained \
 | `AWS_ACCESS_KEY_ID` | S3 access key | miniouser |
 | `AWS_SECRET_ACCESS_KEY` | S3 secret key | miniopassword |
 
-### Server Configuration (Sustained 10k Test)
-
-The `config/logthing-10k-sustained.toml` configures the server for the sustained test:
-
-```toml
-[forwarding]
-buffer_size = 10
-retry_attempts = 1
-
-[[forwarding.destinations]]
-name = "parquet"
-url = "s3://wef-events/archive"
-protocol = "http"
-enabled = true
-
-[forwarding.destinations.headers]
-endpoint = "http://minio:9000"
-"max-size-mb" = "100"          # 100MB parquet file limit
-"flush-interval-secs" = "5"     # Flush every 5 seconds
-"buffer-path" = "/tmp/wef-events"
-```
-
 ## Exit Codes
 
 - `0`: Test passed (≥95% of target rate achieved, S3 verification passed if enabled)

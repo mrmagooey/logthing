@@ -13,7 +13,6 @@ A high-performance TCP server written in Rust for receiving Windows Event Logs f
 - **Parquet S3 Storage**: Aggregate events into Parquet files and store in S3-compatible storage
 - **TLS/SSL Encryption**: Secure connections with certificate support
 - **IP Whitelisting**: Control which hosts can connect
-- **Multiple Output Formats**: Forward to HTTP, TCP, UDP, Syslog, or S3 destinations
 - **High Performance**: Async I/O with Tokio for handling 100+ hosts
 - **Metrics & Monitoring**: Prometheus metrics endpoint
 - **Structured Logging**: JSON or pretty-printed logs
@@ -55,18 +54,6 @@ require_client_cert = false           # Set to true to enforce mTLS
 allowed_ips = ["192.168.1.0/24", "10.0.0.0/8"]
 max_connections = 10000
 connection_timeout_secs = 300
-
-[[forwarding.destinations]]
-name = "elasticsearch"
-url = "https://elasticsearch:9200/events"
-protocol = "https"
-enabled = true
-
-[[forwarding.destinations]]
-name = "syslog"
-url = "syslog://log-server:514"
-protocol = "syslog"
-enabled = true
 
 [metrics]
 enabled = true
@@ -706,7 +693,7 @@ Example `subscription.xml`:
 </Subscription>
 ```
 
-### 3. Configure Forwarder
+### 3. Configure Windows Client
 
 Set the collector server:
 ```powershell
@@ -741,27 +728,14 @@ The server exposes Prometheus metrics on port 9090:
 ```
                     ┌─────────────────────────────────────┐
                     │           WEF Server                │
-  Windows Hosts →   │  ┌─────────┐  ┌─────────────────┐  │   → Forwarders
-      (HTTPS)       │  │  WEF    │  │  Syslog Parser  │  │        ↓
-                    │  │Handler  │  │  (RFC 3164/5424)│  │   ┌─────────────┐
-                    │  └────┬────┘  └────────┬────────┘  │   │  HTTP/HTTPS │
-                    │       │                │           │   │  TCP/UDP    │
-                    │       ↓                ↓           │   │  S3         │
-                    │  ┌─────────────────────────────┐   │   └─────────────┘
+  Windows Hosts →   │  ┌─────────┐  ┌─────────────────┐  │   → S3 (Parquet)
+      (HTTPS)       │  │  WEF    │  │  Syslog Parser  │  │
+                    │  │Handler  │  │  (RFC 3164/5424)│  │
+                    │  └────┬────┘  └────────┬────────┘  │
+                    │       │                │           │
+                    │       ↓                ↓           │
+                    │  ┌─────────────────────────────┐   │
                     │  │   Event Processors          │   │
-                    │  │   - Parser                  │   │
-                    │  │   - DNS Log Parser          │   │
-                    │  └──────────────┬──────────────┘   │
-                    │                 │                  │
-                    │       ┌─────────┴─────────┐        │
-                    │       ↓                   ↓        │
-                    │  ┌──────────┐        ┌──────────┐  │
-                    │  │ Prometheus│       │ Parquet  │  │
-                    │  │ Metrics   │       │ S3 Store │  │
-                    │  └──────────┘       └────┬─────┘  │
-                    └──────────────────────────┼─────────┘
-                                               ↓
-                                          S3 Storage
 ```
 
 ## Security Considerations
