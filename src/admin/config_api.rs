@@ -233,19 +233,6 @@ pub async fn validate_config(
         }
     }
 
-    // Validate forwarding destinations
-    for dest in &config_to_validate.forwarding.destinations {
-        if dest.name.is_empty() {
-            errors.push("Forwarding destination name cannot be empty".to_string());
-        }
-        if dest.url.is_empty() {
-            errors.push(format!(
-                "Forwarding destination '{}' URL cannot be empty",
-                dest.name
-            ));
-        }
-    }
-
     // Validate metrics port
     if config_to_validate.metrics.enabled && config_to_validate.metrics.port == 0 {
         warnings.push("Metrics port is set to 0, metrics server may fail to start".to_string());

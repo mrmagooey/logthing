@@ -2,7 +2,6 @@
 pub mod otlp;
 
 use crate::config::Config;
-use crate::forwarding::Forwarder;
 use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::ingest::IngestState;
 use crate::ingest::handlers::{handle_hec_event, handle_hec_raw, handle_ndjson};
@@ -51,7 +50,6 @@ const MAX_CONCURRENT_EVENT_PROCESSING: usize = 16;
 pub struct AppState {
     pub config: Arc<RwLock<Config>>,
     pub throughput: Arc<ThroughputStats>,
-    pub forwarder: Forwarder,
     pub parser: WefParser,
     pub event_parser: Option<GenericEventParser>,
     pub parquet_s3_sender: Option<
@@ -88,7 +86,7 @@ pub struct Server {
 impl Server {
     /// Create a new WEF server instance.
     ///
-    /// Initializes all components including the forwarder, parser, and optional
+    /// Initializes all components including the parser and optional
     /// Parquet S3 forwarder.
     ///
     /// # Examples
@@ -119,10 +117,6 @@ impl Server {
         source_stats: Arc<crate::stats::SourceHourlyStats>,
         flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry,
     ) -> anyhow::Result<Self> {
-        let forwarder = Forwarder::new(config.forwarding.destinations.clone())
-            .initialize()
-            .await;
-
         #[cfg(feature = "kerberos-auth")]
         {
             if config.security.kerberos.enabled {
@@ -255,7 +249,6 @@ impl Server {
         let state = Arc::new(AppState {
             config: Arc::clone(&shared_config),
             throughput,
-            forwarder,
             parser: WefParser::new(),
             event_parser,
             parquet_s3_sender,
@@ -702,7 +695,6 @@ async fn handle_events(
 }
 
 async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
-    // Wrap event in Arc to avoid cloning for each forwarder
     let event = Arc::new(event);
 
     if let (Some(event_parser), Some(parsed)) = (&state.event_parser, &event.parsed)
@@ -718,9 +710,6 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
 
     let event_type = describe_event_type(&event);
     state.throughput.record_event(event_type).await;
-
-    // Pass Arc to forwarder (cheap clone of Arc, not the event)
-    state.forwarder.forward(event.clone()).await;
 
     // Send to Parquet S3 and/or local-disk via channel (non-blocking, independent
     // per target — a full/closed channel on one does not affect the other).
@@ -818,13 +807,9 @@ mod tests {
     }
 
     async fn build_state_with_config(config: Config) -> Arc<AppState> {
-        let forwarder = Forwarder::new(config.forwarding.destinations.clone())
-            .initialize()
-            .await;
         Arc::new(AppState {
             config: Arc::new(RwLock::new(config)),
             throughput: Arc::new(ThroughputStats::new()),
-            forwarder,
             parser: WefParser::new(),
             event_parser: None,
             parquet_s3_sender: None,

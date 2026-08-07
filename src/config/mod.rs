@@ -43,9 +43,6 @@ pub struct Config {
     pub security: SecurityConfig,
 
     #[serde(default)]
-    pub forwarding: ForwardingConfig,
-
-    #[serde(default)]
     pub logging: LoggingConfig,
 
     #[serde(default)]
@@ -110,47 +107,12 @@ pub struct SecurityConfig {
     pub kerberos: KerberosSecurityConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ForwardingConfig {
-    #[serde(default)]
-    pub destinations: Vec<DestinationConfig>,
-
-    #[serde(default = "default_buffer_size")]
-    pub buffer_size: usize,
-
-    #[serde(default = "default_retry_attempts")]
-    pub retry_attempts: u32,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DestinationConfig {
-    pub name: String,
-    pub url: String,
-    #[serde(default)]
-    pub protocol: ForwardProtocol,
-    #[serde(default = "default_destination_enabled")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub headers: std::collections::HashMap<String, String>,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct KerberosSecurityConfig {
     #[serde(default)]
     pub enabled: bool,
     pub spn: Option<String>,
     pub keytab: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum ForwardProtocol {
-    #[default]
-    Http,
-    Https,
-    Tcp,
-    Udp,
-    Syslog,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -999,7 +961,6 @@ impl Default for Config {
             bind_address: default_bind_address(),
             tls: TlsConfig::default(),
             security: SecurityConfig::default(),
-            forwarding: ForwardingConfig::default(),
             logging: LoggingConfig::default(),
             metrics: MetricsConfig::default(),
             syslog: SyslogConfig::default(),
@@ -1035,16 +996,6 @@ impl Default for SecurityConfig {
             max_connections: default_max_connections(),
             connection_timeout_secs: default_connection_timeout_secs(),
             kerberos: KerberosSecurityConfig::default(),
-        }
-    }
-}
-
-impl Default for ForwardingConfig {
-    fn default() -> Self {
-        Self {
-            destinations: Vec::new(),
-            buffer_size: default_buffer_size(),
-            retry_attempts: default_retry_attempts(),
         }
     }
 }
@@ -1092,14 +1043,6 @@ fn default_connection_timeout_secs() -> u64 {
     300
 }
 
-fn default_buffer_size() -> usize {
-    10000
-}
-
-fn default_retry_attempts() -> u32 {
-    3
-}
-
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -1110,10 +1053,6 @@ fn default_metrics_enabled() -> bool {
 
 fn default_metrics_port() -> u16 {
     9090
-}
-
-fn default_destination_enabled() -> bool {
-    true
 }
 
 fn default_syslog_enabled() -> bool {
@@ -1596,7 +1535,6 @@ max_buffer_rows = 50000
         let result = std::panic::catch_unwind(|| {
             let cfg = Config::load().expect("config loads");
             assert!(!cfg.tls.enabled, "logthing.toml disables TLS");
-            assert!(!cfg.forwarding.destinations.is_empty());
         });
 
         // Restore admin override file

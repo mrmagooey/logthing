@@ -33,7 +33,6 @@
 mod otlp_e2e {
     use axum::{Extension, Router, routing::post};
     use logthing::config::{Config, OtlpConfig};
-    use logthing::forwarding::Forwarder;
     use logthing::ingest::IngestState;
     use logthing::protocol::WefParser;
     use logthing::server::{AppState, handle_otlp_logs};
@@ -86,13 +85,9 @@ mod otlp_e2e {
             },
             ..Default::default()
         };
-        let forwarder = Forwarder::new(config.forwarding.destinations.clone())
-            .initialize()
-            .await;
         Arc::new(AppState {
             config: Arc::new(RwLock::new(config)),
             throughput: Arc::new(ThroughputStats::new()),
-            forwarder,
             parser: WefParser::new(),
             event_parser: None,
             parquet_s3_sender: None,
