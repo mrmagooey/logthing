@@ -12,10 +12,6 @@ udp_port = 5514
 tcp_port = 5601
 parse_dns = true
 
-[forwarding]
-buffer_size = 100000
-retry_attempts = 3
-
 [wef.s3]
 endpoint   = "http://minio:9000"
 bucket     = "wef-events"

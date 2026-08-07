@@ -30,10 +30,6 @@ spn = "{{ wef_kerberos_spn }}"
 keytab = "{{ wef_keytab_path }}"
 {% endif %}
 
-[forwarding]
-buffer_size = 1000
-retry_attempts = 3
-
 # Forward WEF events to S3
 [wef.s3]
 endpoint   = "{{ s3_endpoint }}"

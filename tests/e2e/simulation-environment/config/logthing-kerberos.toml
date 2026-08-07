@@ -15,10 +15,6 @@ parse_dns = true
 [security]
 kerberos = { enabled = true, spn = "HTTP/wef-server@EXAMPLE.COM", keytab = "/etc/wef-server/keytabs/wef.keytab" }
 
-[forwarding]
-buffer_size = 10
-retry_attempts = 1
-
 [wef.s3]
 endpoint   = "http://minio:9000"
 bucket     = "wef-events"

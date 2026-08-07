@@ -13,31 +13,6 @@ allowed_ips = []
 max_connections = 10000
 connection_timeout_secs = 300
 
-[forwarding]
-buffer_size = 10000
-retry_attempts = 3
-
-[[forwarding.destinations]]
-name = "example"
-url = "http://localhost:9200/events"
-protocol = "http"
-enabled = false
-
-# Parquet S3 Forwarder Example (stores events in S3-compatible storage as Parquet files)
-[[forwarding.destinations]]
-name = "parquet-s3"
-url = "s3://wef-events"
-protocol = "http"
-enabled = false
-[forwarding.destinations.headers]
-endpoint = "http://localhost:9000"  # S3-compatible endpoint (MinIO, etc.)
-region = "us-east-1"
-access-key = "minioadmin"
-secret-key = "minioadmin"
-max-size-mb = "100"          # Flush when buffer reaches 100MB
-flush-interval-secs = "900"  # Flush every 15 minutes (900 seconds)
-buffer-path = "/tmp/wef-events"  # Local temp directory for Parquet files
-
 [metrics]
 enabled = true
 port = 9090

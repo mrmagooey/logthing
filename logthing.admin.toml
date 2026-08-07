@@ -13,11 +13,6 @@ connection_timeout_secs = 300
 [security.kerberos]
 enabled = false
 
-[forwarding]
-destinations = []
-buffer_size = 10000
-retry_attempts = 3
-
 [logging]
 level = "debug"
 format = "pretty"
