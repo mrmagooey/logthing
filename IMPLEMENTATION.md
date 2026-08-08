@@ -26,13 +26,6 @@ A high-performance Windows Event Forwarding (WEF) server written in Rust, capabl
 │  └───────────────────────┬────────────────────────┘         │
 │                          │                                  │
 │  ┌───────────────────────┴────────────────────────┐         │
-│  │         Event Forwarding System                │         │
-│  │  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐  │         │
-│  │  │ HTTP   │ │  TCP   │ │  UDP   │ │ Syslog │  │         │
-│  │  └────────┘ └────────┘ └────────┘ └────────┘  │         │
-│  └────────────────────────────────────────────────┘         │
-│                          │                                  │
-│  ┌───────────────────────┴────────────────────────┐         │
 │  │          Monitoring & Observability             │         │
 │  │  ┌────────────┐  ┌────────────┐  ┌──────────┐  │         │
 │  │  │  Tracing   │  │  Metrics   │  │ Prometheus│  │         │
@@ -52,7 +45,6 @@ A high-performance Windows Event Forwarding (WEF) server written in Rust, capabl
   - Network binding (address/port)
   - TLS certificate paths
   - IP whitelist (CIDR support)
-  - Forwarding destinations
   - Logging configuration
 
 ### 2. Server Core (`src/server/mod.rs`)
@@ -112,19 +104,6 @@ Implements Windows Event Forwarding protocol (WS-Management):
   - Timestamp
   - Computer name
   - Message content
-
-### 6. Forwarding System (`src/forwarding/mod.rs`)
-Multi-protocol output support:
-- **HTTP/HTTPS**: JSON POST with custom headers
-- **TCP**: Line-delimited JSON streaming
-- **UDP**: Lightweight syslog-compatible
-- **Syslog**: RFC 5424 formatted messages
-
-**Features**:
-- Async channel-based queuing
-- Per-destination retry logic
-- Circuit breaker pattern
-- Configurable buffer sizes
 
 ### 7. IPFIX / NetFlow Ingestion (`src/ipfix/`)
 
@@ -246,11 +225,6 @@ require_client_cert = true
 [security]
 allowed_ips = ["10.0.0.0/8"]
 max_connections = 10000
-
-[[forwarding.destinations]]
-name = "siem"
-url = "https://siem.company.com/events"
-protocol = "https"
 ```
 
 ### Environment Variables
@@ -271,7 +245,6 @@ export WEF_SECURITY_ALLOWED_IPS="192.168.1.0/24,10.0.0.0/8"
 ### 2. Integration Tests
 - HTTP endpoint testing
 - TLS handshake
-- Event forwarding
 - Metrics collection
 
 ### 3. Load Testing

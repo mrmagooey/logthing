@@ -115,7 +115,7 @@ use crate::models::WindowsEvent;
 src/
   admin/        # Admin API and hot-reload
   config/       # Configuration loading
-  forwarding/   # Event forwarding to destinations
+  forwarding/   # Parquet/S3 and local-disk sinks
   ipfix/        # IPFIX / NetFlow flow ingestion
   middleware/   # HTTP middleware
   models/       # Data structures

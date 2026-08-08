@@ -74,7 +74,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
 futures = "0.3"
 
-# HTTP client for forwarding
+# HTTP client for tests / admin proxy
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Parquet file handling
