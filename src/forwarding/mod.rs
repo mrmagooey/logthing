@@ -1,4 +1,5 @@
 pub mod buffered_writer;
+pub mod channel_budget;
 pub mod drop_log;
 pub mod flush_registry;
 pub mod generic_s3;
