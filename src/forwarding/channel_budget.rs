@@ -383,7 +383,10 @@ mod tests {
             .collect();
         let measured = std::mem::size_of::<Vec<FlowRecord>>()
             + flows.capacity() * std::mem::size_of::<FlowRecord>()
-            + flows.iter().map(|f| json_heap_bytes(&f.extra)).sum::<usize>();
+            + flows
+                .iter()
+                .map(|f| json_heap_bytes(&f.extra))
+                .sum::<usize>();
         assert_within_2x(measured, IPFIX_DATAGRAM_BYTES, "IPFIX Vec<FlowRecord>");
     }
 
