@@ -83,22 +83,27 @@ pub const SYSLOG_MESSAGE_BYTES: usize = 1024;
 pub const SFLOW_RECORD_BYTES: usize = 256;
 
 /// Measured footprint of one IPFIX channel message, which is a `Vec<FlowRecord>`
-/// holding **all flows from one UDP datagram**: 1944 bytes measured for the
-/// 10-flow representative datagram used by this repo's IPFIX fixtures,
-/// rounded up to 2048.
+/// holding **all flows from one UDP datagram**: 4184 bytes measured for the
+/// 10-flow representative datagram used by this repo's IPFIX fixtures — each
+/// flow carrying a handful of non-curated IEs in `extra` (ToS, TTLs,
+/// flow-end reason, biflow direction), as a real export template does —
+/// rounded up to 8192.
 ///
 /// **Average-case, not a ceiling.** Flows-per-datagram is variable; this uses a
 /// representative count from the repo's IPFIX test fixtures. Datagrams denser
 /// than that average will push this source past `CHANNEL_BUDGET_BYTES`. Known
 /// and accepted limitation — see the spec §4.3.
-pub const IPFIX_DATAGRAM_BYTES: usize = 2048;
+pub const IPFIX_DATAGRAM_BYTES: usize = 8192;
 
 /// Measured footprint of one `Arc<WindowsEvent>` — the **pointee**, not the
 /// 8-byte pointer in the channel slot. Each queued `Arc` is a distinct event;
 /// the `Arc` is a transfer mechanism, not sharing. WEF fan-out to `.s3` and
 /// `.local` clones the same `Arc` into both channels, so counting it once per
-/// channel overcounts, which is the safe direction. Dominated by `raw_xml`:
-/// 11548 bytes measured for a ~5.6KB raw event, rounded up to 16384.
+/// channel overcounts, which is the safe direction. Dominated by `raw_xml`
+/// plus a populated `ParsedEvent.message` (real events are parsed on receipt,
+/// not left `None` — see `measured_wef_event_bytes_counts_the_pointee_not_the_pointer`):
+/// 12146 bytes measured for a ~5.6KB raw event with a representative parsed
+/// Security-log message, rounded up to 16384.
 pub const WEF_EVENT_BYTES: usize = 16384;
 
 #[cfg(test)]
@@ -361,7 +366,19 @@ mod tests {
                 tcp_flags: Some(0x18),
                 input_interface: Some(1),
                 output_interface: Some(2),
-                extra: serde_json::json!({}),
+                // Real templates carry IEs beyond the curated set above —
+                // `apply_field_to_record` (`src/ipfix/decoder.rs:671-770`)
+                // routes anything not explicitly matched (ToS, TTLs, flow-end
+                // reason, biflow direction, vendor/enterprise IEs, ...) into
+                // `extra`. An empty `extra` on every flow understates a
+                // typical router's export template.
+                extra: serde_json::json!({
+                    "ipClassOfService": 0,
+                    "minimumTTL": 64,
+                    "maximumTTL": 64,
+                    "flowEndReason": 3,
+                    "biflowDirection": 1
+                }),
             })
             .collect();
         let measured = std::mem::size_of::<Vec<FlowRecord>>()
@@ -372,19 +389,65 @@ mod tests {
 
     #[test]
     fn measured_wef_event_bytes_counts_the_pointee_not_the_pointer() {
-        use crate::models::WindowsEvent;
+        use crate::models::{EventLevel, ParsedEvent, WindowsEvent};
+        // `parsed` must be `Some(..)`, not `None`: on the real ingest path
+        // `parse_single_event` (`src/protocol/mod.rs:187-196`) always attaches a
+        // `ParsedEvent` — `parse_event_data` has no `Err` path that fires in
+        // practice, malformed XML just truncates the read loop and still
+        // returns `Ok`. A `parsed: None` fixture measures a record shape that
+        // essentially never reaches the channel.
+        let parsed = ParsedEvent {
+            provider: "Microsoft-Windows-Security-Auditing".to_string(),
+            event_id: 4624,
+            level: EventLevel::Information,
+            task: 12544,
+            opcode: 0,
+            keywords: 0x8020000000000000,
+            time_created: chrono::Utc::now(),
+            event_record_id: 918273645,
+            process_id: Some(656),
+            thread_id: Some(29384),
+            // Always empty on the real path: `parse_event_data` never writes
+            // to `channel` (src/protocol/mod.rs:307-323).
+            channel: String::new(),
+            computer: "dc01.corp.example".to_string(),
+            security_user_id: None,
+            // `message` is populated from the XML `Message`/`Data` tag
+            // whenever present — representative Security-log logon text, not
+            // a placeholder.
+            message: Some(
+                "An account was successfully logged on.\n\nSubject:\n\tSecurity ID:\t\tS-1-5-18\n\t\
+                 Account Name:\t\tDC01$\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7\n\n\
+                 Logon Information:\n\tLogon Type:\t\t3\n\tRestricted Admin Mode:\t-\n\t\
+                 Virtual Account:\t\tNo\n\tElevated Token:\t\tYes\n\nImpersonation Level:\t\tImpersonation\n\n\
+                 New Logon:\n\tSecurity ID:\t\tS-1-5-21-1234567890-1234567890-1234567890-1001\n\t\
+                 Account Name:\t\tjdoe\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x1A2B3C4\n\t\
+                 Linked Logon ID:\t\t0x0\n\tNetwork Account Name:\t-\n\tNetwork Account Domain:\t-\n\t\
+                 Logon GUID:\t\t{00000000-0000-0000-0000-000000000000}"
+                    .to_string(),
+            ),
+            // Always None on the real path: `parse_event_data` never sets it.
+            data: None,
+        };
         let event = WindowsEvent {
             id: uuid::Uuid::new_v4(),
             received_at: chrono::Utc::now(),
             source_host: "dc01.corp.example".to_string(),
             subscription_id: Some("sub-1".to_string()),
             raw_xml: "<Event>".to_string() + &"<Data>x</Data>".repeat(400) + "</Event>",
-            parsed: None,
+            parsed: Some(parsed),
         };
         let measured = std::mem::size_of::<WindowsEvent>()
             + event.source_host.capacity()
             + event.subscription_id.as_ref().map_or(0, |s| s.capacity())
-            + event.raw_xml.capacity();
+            + event.raw_xml.capacity()
+            + event.parsed.as_ref().map_or(0, |p| {
+                p.provider.capacity()
+                    + p.channel.capacity()
+                    + p.computer.capacity()
+                    + p.message.as_ref().map_or(0, |m| m.capacity())
+                    + p.data.as_ref().map_or(0, json_heap_bytes)
+            });
         // Guard the methodology itself: an Arc slot is 8 bytes, so measuring the
         // pointer instead of the pointee would yield a capacity in the millions.
         assert!(
