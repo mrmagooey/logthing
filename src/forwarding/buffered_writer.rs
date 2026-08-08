@@ -2390,22 +2390,84 @@ max_partitions = 128
         assert!(handle.send_or_drop("hello".to_string()).await.is_ok());
     }
 
+    /// Exercises `ParquetWriterHandle::send_or_drop`'s actual timeout path
+    /// (not a bare `tokio::mpsc::Sender`): a hand-built handle around a
+    /// capacity-1 channel whose receiver is held but never polled, so the
+    /// channel genuinely never drains (no writer task to race against).
+    /// Proves three things the vacuous predecessor test proved none of:
+    /// `send_or_drop` itself times out, the dropped record is handed back
+    /// in the error (no silent swallow), and `parquet_s3_dropped` is
+    /// incremented by the production code. Also exercises `with_send_timeout`,
+    /// which was otherwise dead.
     #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
     async fn send_or_drop_times_out_and_reports_full_when_the_writer_never_drains() {
-        // Capacity 1 and a writer that is never polled: the first send fills the
-        // channel, the second must wait the full timeout and then report Timeout.
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        // Capacity 1, receiver bound but never polled: the first send fills
+        // the channel and it stays full for the rest of the test.
         let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
-        tx.send("first".to_string()).await.unwrap();
+        tx.try_send("first".to_string()).unwrap();
+        let handle = ParquetWriterHandle::<MockSink> {
+            tx,
+            source: "test",
+            target: "s3",
+            flush_interval: LiveInterval::new(Duration::from_secs(900)),
+            drop_log: Arc::new(DropLogThrottles::new()),
+            send_timeout: SEND_TIMEOUT_DEFAULT,
+        }
+        .with_send_timeout(Duration::from_millis(50));
+
         let start = std::time::Instant::now();
-        let err = tx
-            .send_timeout("second".to_string(), Duration::from_millis(50))
+        let err = handle
+            .send_or_drop("second".to_string())
             .await
             .expect_err("must time out against a full, undrained channel");
-        assert!(matches!(
-            err,
-            tokio::sync::mpsc::error::SendTimeoutError::Timeout(_)
-        ));
         assert!(start.elapsed() >= Duration::from_millis(50));
+
+        match err {
+            tokio::sync::mpsc::error::SendTimeoutError::Timeout(record) => {
+                assert_eq!(
+                    record, "second",
+                    "the dropped record must be handed back, not silently swallowed"
+                );
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+
+        let key = CompositeKey::new(
+            MetricKind::Counter,
+            metrics::Key::from_parts(
+                "parquet_s3_dropped",
+                vec![
+                    metrics::Label::new("source", "test"),
+                    metrics::Label::new("target", "s3"),
+                ],
+            ),
+        );
+        let dropped = snapshotter
+            .snapshot()
+            .into_hashmap()
+            .get(&key)
+            .map(|(_, _, v)| {
+                if let DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            dropped, 1,
+            "parquet_s3_dropped{{source=\"test\",target=\"s3\"}} should be incremented by send_or_drop on timeout"
+        );
     }
 
     #[test]
