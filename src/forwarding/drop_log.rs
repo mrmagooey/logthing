@@ -53,6 +53,18 @@ impl<R> From<&TrySendError<R>> for DropKind {
     }
 }
 
+impl<R> From<&tokio::sync::mpsc::error::SendTimeoutError<R>> for DropKind {
+    fn from(err: &tokio::sync::mpsc::error::SendTimeoutError<R>) -> Self {
+        use tokio::sync::mpsc::error::SendTimeoutError;
+        match err {
+            // The channel stayed full for the entire bounded wait. Operationally
+            // identical to Full: transient backpressure that outlasted patience.
+            SendTimeoutError::Timeout(_) => DropKind::Full,
+            SendTimeoutError::Closed(_) => DropKind::Closed,
+        }
+    }
+}
+
 /// Which logical call site is reporting.
 ///
 /// This is deliberately finer-grained than the owning `ParquetWriterHandle`:
@@ -306,6 +318,17 @@ mod tests {
         let full: TrySendError<u8> = TrySendError::Full(1);
         let closed: TrySendError<u8> = TrySendError::Closed(1);
         assert_eq!(DropKind::from(&full), DropKind::Full);
+        assert_eq!(DropKind::from(&closed), DropKind::Closed);
+    }
+
+    #[test]
+    fn drop_kind_derives_from_send_timeout_error() {
+        use tokio::sync::mpsc::error::SendTimeoutError;
+        let timeout: SendTimeoutError<u8> = SendTimeoutError::Timeout(1);
+        let closed: SendTimeoutError<u8> = SendTimeoutError::Closed(1);
+        // A timeout means the channel stayed full for the whole wait — same
+        // operator-facing meaning as Full, and it must not be muted by a Closed.
+        assert_eq!(DropKind::from(&timeout), DropKind::Full);
         assert_eq!(DropKind::from(&closed), DropKind::Closed);
     }
 }

@@ -374,6 +374,18 @@ pub(crate) fn build_key(
 /// outage from causing many partitions to retry in lockstep.
 const MAX_CONCURRENT_FLUSHES_PER_WRITER: usize = 4;
 
+/// How long a backpressure-aware sender waits for channel capacity before
+/// giving up and dropping the record.
+///
+/// Far longer than any plausible writer hiccup (a `spawn_blocking` zstd encode,
+/// a metrics scrape), far shorter than sensor and TCP timeouts. Deliberately
+/// not a config key — no evidence anyone needs to tune it, and promoting a
+/// const to a config field later is trivial.
+///
+/// ponytail: const + per-handle override; promote to `BufferedWriterConfig` if
+/// an operator ever needs it per-source.
+pub const SEND_TIMEOUT_DEFAULT: Duration = Duration::from_secs(5);
+
 /// Row-count threshold at which a partition's live (in-progress) amortized
 /// builder is force-materialized into a real, stored `RecordBatch` entry,
 /// independent of any flush. Bounds two things: the maximum size of a
@@ -1136,6 +1148,10 @@ pub struct ParquetWriterHandle<S: ParquetSink> {
     /// per-clone throttle state would reset constantly and restore the log
     /// storm.
     drop_log: Arc<DropLogThrottles>,
+    /// Bounded wait applied by `send_or_drop`. A field rather than a bare
+    /// constant so tests can shorten it — otherwise every test that must
+    /// observe the drop-after-timeout path would stall for 5 real seconds.
+    send_timeout: Duration,
 }
 
 impl<S: ParquetSink> ParquetWriterHandle<S> {
@@ -1258,6 +1274,7 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                 target,
                 flush_interval: handle_flush_interval,
                 drop_log: Arc::new(DropLogThrottles::new()),
+                send_timeout: SEND_TIMEOUT_DEFAULT,
             },
             handle,
         )
@@ -1280,6 +1297,40 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
         record: S::Record,
     ) -> Result<(), tokio::sync::mpsc::error::TrySendError<S::Record>> {
         match self.tx.try_send(record) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                metrics::counter!("parquet_s3_dropped", "source" => self.source, "target" => self.target)
+                    .increment(1);
+                Err(e)
+            }
+        }
+    }
+
+    /// Override the bounded-wait timeout used by `send_or_drop`. Test seam.
+    #[must_use]
+    pub fn with_send_timeout(mut self, timeout: Duration) -> Self {
+        self.send_timeout = timeout;
+        self
+    }
+
+    /// Send one record, waiting up to `send_timeout` for channel capacity.
+    ///
+    /// This is the backpressure-aware counterpart to `try_send`, for sources
+    /// whose transport can absorb the wait: awaiting here stops the caller's
+    /// per-connection task from reading its socket, which closes the TCP
+    /// window and pushes the queue back to the sender. Only use it from a task
+    /// that owns a single connection — never from a task shared across
+    /// connections or transports (see the spec's §3.1 note on syslog).
+    ///
+    /// On timeout or a closed channel the record is dropped and
+    /// `parquet_s3_dropped{source,target}` is incremented, exactly as
+    /// `try_send` does, so the existing safety valve and metrics are unchanged.
+    #[must_use = "callers should log or handle the error to avoid silent record loss"]
+    pub async fn send_or_drop(
+        &self,
+        record: S::Record,
+    ) -> Result<(), tokio::sync::mpsc::error::SendTimeoutError<S::Record>> {
+        match self.tx.send_timeout(record, self.send_timeout).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 metrics::counter!("parquet_s3_dropped", "source" => self.source, "target" => self.target)
@@ -2328,6 +2379,38 @@ max_partitions = 128
             .await
             .expect("join within timeout")
             .expect("task did not panic");
+    }
+
+    #[tokio::test]
+    async fn send_or_drop_delivers_when_capacity_is_available() {
+        let s3 = unreachable_s3().await;
+        let (mut cfg, policy) = test_config(10_000);
+        cfg.channel_capacity = 4;
+        let (handle, _task) = ParquetWriterHandle::start(MockSink, s3, cfg, policy);
+        assert!(handle.send_or_drop("hello".to_string()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn send_or_drop_times_out_and_reports_full_when_the_writer_never_drains() {
+        // Capacity 1 and a writer that is never polled: the first send fills the
+        // channel, the second must wait the full timeout and then report Timeout.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
+        tx.send("first".to_string()).await.unwrap();
+        let start = std::time::Instant::now();
+        let err = tx
+            .send_timeout("second".to_string(), Duration::from_millis(50))
+            .await
+            .expect_err("must time out against a full, undrained channel");
+        assert!(matches!(
+            err,
+            tokio::sync::mpsc::error::SendTimeoutError::Timeout(_)
+        ));
+        assert!(start.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn send_timeout_default_is_five_seconds() {
+        assert_eq!(SEND_TIMEOUT_DEFAULT, Duration::from_secs(5));
     }
 
     /// I3: channel-overflow metric is now incremented by the PRODUCTION `try_send` path,
