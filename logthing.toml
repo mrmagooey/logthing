@@ -38,7 +38,7 @@ parse_dns = true    # Enable DNS log parsing
 # prefix               = "syslog"                 # default: "syslog"
 # max_buffer_rows      = 10000                    # flush after this many rows (default 10 000)
 # flush_interval_secs  = 900                      # flush after N seconds (default 900)
-# channel_capacity     = 4096                     # channel depth between listener and writer (default 4096)
+# channel_capacity     = 102400                   # channel depth (default: 100 MiB budget / ~1 KiB per message)
 
 # Zeek NDJSON TCP listener.
 # Disabled by default — set enabled = true to activate.
@@ -58,7 +58,7 @@ bind_address = "0.0.0.0"   # env: WEF__ZEEK__BIND_ADDRESS
 # prefix                = "zeek"                  # default: "zeek"
 # flush_threshold_bytes = 104857600               # flush at 100 MiB (default)
 # flush_interval_secs   = 900                     # flush after N seconds (default 900)
-# channel_capacity      = 256                     # channel depth (default 256)
+# channel_capacity      = 102400                   # channel depth (default: 100 MiB budget / ~1 KiB per record)
 # max_buffer_rows       = 100000                  # hard-cap before oldest rows dropped (default 100 000)
 
 # IPFIX / NetFlow flow ingestion listener.
@@ -79,7 +79,7 @@ bind_address = "0.0.0.0"   # env: WEF__IPFIX__BIND_ADDRESS
 # prefix                = "ipfix"                 # default: "ipfix"
 # flush_threshold_bytes = 104857600               # flush at 100 MiB (default)
 # flush_interval_secs   = 900                     # flush after N seconds (default 900)
-# channel_capacity      = 256                     # channel depth (default 256)
+# channel_capacity      = 12800                    # channel depth (default: 100 MiB budget / ~8 KiB per datagram)
 # max_buffer_rows       = 100000                  # hard-cap before oldest rows dropped (default 100 000)
 
 # Optional: emit a small JSON "descriptor" alongside every Parquet file,
