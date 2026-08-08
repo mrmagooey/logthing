@@ -1313,6 +1313,34 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
         self
     }
 
+    /// Test seam (like `with_send_timeout`): build a handle around a
+    /// caller-supplied `Sender` whose receiver the caller controls (and may
+    /// simply never poll). Other modules' overflow tests -- including
+    /// integration tests, which compile against this crate without
+    /// `cfg(test)` and so cannot see `#[cfg(test)]`-gated items -- need
+    /// this to genuinely stall a channel: going through `start()`'s real
+    /// writer task doesn't work for that purpose, because `push()` never
+    /// awaits the upload (flushes are spawned into `flush_tasks`, decoupled
+    /// from the channel-draining loop -- see `try_flush_partition_async`),
+    /// so a real writer drains a healthy channel in microseconds regardless
+    /// of how broken the sink is, and a capacity-1 channel never actually
+    /// stays full long enough to time out.
+    #[must_use]
+    pub fn for_test(
+        tx: tokio::sync::mpsc::Sender<S::Record>,
+        source: &'static str,
+        target: &'static str,
+    ) -> Self {
+        Self {
+            tx,
+            source,
+            target,
+            flush_interval: LiveInterval::new(Duration::from_secs(900)),
+            drop_log: Arc::new(DropLogThrottles::new()),
+            send_timeout: SEND_TIMEOUT_DEFAULT,
+        }
+    }
+
     /// Send one record, waiting up to `send_timeout` for channel capacity.
     ///
     /// This is the backpressure-aware counterpart to `try_send`, for sources
@@ -2431,6 +2459,11 @@ max_partitions = 128
             .await
             .expect_err("must time out against a full, undrained channel");
         assert!(start.elapsed() >= Duration::from_millis(50));
+        // Upper bound: proves the shortened per-handle timeout (50ms) was
+        // actually honoured, not `SEND_TIMEOUT_DEFAULT` (5s) hardcoded in
+        // place of `self.send_timeout` -- that mutation would still pass the
+        // lower-bound assertion above, just five seconds slower.
+        assert!(start.elapsed() < Duration::from_millis(500));
 
         match err {
             tokio::sync::mpsc::error::SendTimeoutError::Timeout(record) => {
