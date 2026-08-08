@@ -1325,6 +1325,7 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
     /// so a real writer drains a healthy channel in microseconds regardless
     /// of how broken the sink is, and a capacity-1 channel never actually
     /// stays full long enough to time out.
+    #[doc(hidden)]
     #[must_use]
     pub fn for_test(
         tx: tokio::sync::mpsc::Sender<S::Record>,

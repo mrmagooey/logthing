@@ -6,7 +6,10 @@
 
 use logthing::forwarding::buffered_writer::ParquetWriterHandle;
 use logthing::forwarding::local_sink::LocalDiskSink;
+use logthing::forwarding::suricata_s3::suricata_local_start;
 use logthing::forwarding::zeek_s3::{MultiZeekHandler, ZeekSink, zeek_local_start};
+use logthing::suricata::SuricataRecord;
+use logthing::suricata::listener::SuricataHandler;
 use logthing::zeek::ZeekRecord;
 use logthing::zeek::listener::ZeekHandler;
 use std::sync::Arc;
@@ -32,10 +35,27 @@ fn make_conn_record(uid: &str) -> ZeekRecord {
     }
 }
 
-/// Read `parquet_s3_dropped{source="zeek",target=<target>}` from a
+fn make_alert_record(src_ip: &str) -> SuricataRecord {
+    SuricataRecord {
+        event_type: "alert".to_string(),
+        fields: serde_json::json!({
+            "event_type": "alert",
+            "src_ip": src_ip,
+            "dest_ip": "1.2.3.4",
+            "alert": {"signature": "ET TEST"}
+        }),
+        received_at: chrono::Utc::now(),
+    }
+}
+
+/// Read `parquet_s3_dropped{source=<source>,target=<target>}` from a
 /// `metrics_util::debugging::Snapshotter`.
 #[allow(clippy::mutable_key_type)]
-fn dropped_count(snapshotter: &metrics_util::debugging::Snapshotter, target: &'static str) -> u64 {
+fn dropped_count(
+    snapshotter: &metrics_util::debugging::Snapshotter,
+    source: &'static str,
+    target: &'static str,
+) -> u64 {
     use metrics_util::CompositeKey;
     use metrics_util::MetricKind;
     use metrics_util::debugging::DebugValue;
@@ -45,7 +65,7 @@ fn dropped_count(snapshotter: &metrics_util::debugging::Snapshotter, target: &'s
         metrics::Key::from_parts(
             "parquet_s3_dropped",
             vec![
-                metrics::Label::new("source", "zeek"),
+                metrics::Label::new("source", source),
                 metrics::Label::new("target", target),
             ],
         ),
@@ -144,7 +164,7 @@ async fn full_channel_blocks_then_succeeds_once_the_writer_drains() {
     // completed well under the send timeout, proving it waited for the
     // writer to drain rather than dropping.
     assert_eq!(
-        dropped_count(&snapshotter, "local"),
+        dropped_count(&snapshotter, "zeek", "local"),
         0,
         "no record should be dropped: send_or_drop must wait for capacity, not give up"
     );
@@ -162,6 +182,73 @@ async fn full_channel_blocks_then_succeeds_once_the_writer_drains() {
     let conn_dir = dir.path().join("zeek/conn");
     assert_eq!(
         count_parquet_rows(&conn_dir),
+        N,
+        "all {N} rows must have reached Parquet"
+    );
+}
+
+/// Suricata half of the same proof as `full_channel_blocks_then_succeeds_once_the_writer_drains`.
+/// Without this, `src/forwarding/suricata_s3.rs:110`'s `send_or_drop` has no
+/// mutation-killing coverage: reverting it to `try_send` still passes every
+/// other Suricata test (`handler_overflow_increments_dropped_counter`
+/// increments the same counter on overflow either way), so a future
+/// regression back to record-destroying `try_send` would go unnoticed.
+#[tokio::test]
+async fn suricata_full_channel_blocks_then_succeeds_once_the_writer_drains() {
+    use metrics::set_default_local_recorder;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = set_default_local_recorder(&recorder);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = Arc::new(
+        LocalDiskSink::new(dir.path().to_path_buf())
+            .await
+            .expect("LocalDiskSink::new"),
+    );
+    let cfg = logthing::config::SuricataLocalConfig {
+        directory: dir.path().to_path_buf(),
+        prefix: "suricata".to_string(),
+        max_buffer_rows: 100_000,
+        flush_threshold_bytes: 100_000_000,
+        flush_interval_secs: 3600,
+        channel_capacity: 4,
+    };
+    let (handler, writer_task) = suricata_local_start(
+        &cfg,
+        sink,
+        Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+
+    let src: std::net::SocketAddr = "127.0.0.1:47761".parse().unwrap();
+    const N: usize = 200;
+    for i in 0..N {
+        handler
+            .handle_record(
+                make_alert_record(&format!("10.0.{}.{}", i / 256, i % 256)),
+                src,
+            )
+            .await;
+    }
+
+    assert_eq!(
+        dropped_count(&snapshotter, "suricata", "local"),
+        0,
+        "no record should be dropped: send_or_drop must wait for capacity, not give up"
+    );
+
+    drop(handler);
+    tokio::time::timeout(Duration::from_secs(10), writer_task)
+        .await
+        .expect("writer task exits within 10s")
+        .expect("writer task must not panic");
+
+    let alert_dir = dir.path().join("suricata/alert");
+    assert_eq!(
+        count_parquet_rows(&alert_dir),
         N,
         "all {N} rows must have reached Parquet"
     );
@@ -208,7 +295,7 @@ async fn wedged_writer_drops_after_the_timeout() {
     let elapsed = start.elapsed();
 
     assert!(
-        dropped_count(&snapshotter, "s3") >= 1,
+        dropped_count(&snapshotter, "zeek", "s3") >= 1,
         "a channel that never drains must eventually drop"
     );
     assert!(
@@ -218,21 +305,20 @@ async fn wedged_writer_drops_after_the_timeout() {
     );
 }
 
-/// A stalled destination must not serialise a healthy one behind it: with
+/// Fan-out latency should be `max()` across destinations, not `sum()`: with
 /// concurrent fan-out (Task 5), the whole batch should take roughly as long
-/// as the *slower* handler alone (bounded by max), not the sum of both
-/// handlers (bounded by sum). Both handlers here sleep 200ms per record --
-/// if only one handler carried latency, sequential and concurrent fan-out
-/// would take the same total time regardless of which strategy is used,
-/// making the assertion vacuous; two comparably slow handlers are required
-/// to actually distinguish "sum" (400ms/record) from "max" (200ms/record).
-/// `MultiZeekHandler` today (`src/forwarding/zeek_s3.rs:196-198`) fans out
-/// sequentially -- `for handler in &self.0 { handler.handle_record(...).await }`
-/// -- so this assertion is expected to FAIL until Task 5 changes that loop
-/// to a concurrent `join_all`. Left failing deliberately; see the task-4
-/// report.
+/// as one handler alone, not both back to back. Both handlers here sleep
+/// 200ms per record -- if only one carried latency, sequential and
+/// concurrent fan-out would take the same total time regardless of which
+/// strategy is used, making the assertion vacuous; two comparably slow
+/// handlers are required to actually distinguish "sum" (400ms/record) from
+/// "max" (200ms/record). `MultiZeekHandler` today
+/// (`src/forwarding/zeek_s3.rs:196-198`) fans out sequentially --
+/// `for handler in &self.0 { handler.handle_record(...).await }` -- so this
+/// assertion is expected to FAIL until Task 5 changes that loop to a
+/// concurrent `join_all`. Left failing deliberately; see the task-4 report.
 #[tokio::test]
-async fn fan_out_does_not_serialise_a_healthy_destination_behind_a_stalled_one() {
+async fn fan_out_latency_should_be_max_not_sum_across_destinations() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct SlowHandler(Duration);
@@ -286,12 +372,14 @@ async fn fan_out_does_not_serialise_a_healthy_destination_behind_a_stalled_one()
 }
 
 /// A channel sized by the real 100 MiB budget (`capacity_for(ZEEK_RECORD_BYTES)`,
-/// ~102,400 records) must still drain AND flush inside the 10s deadline
-/// `src/main.rs` gives every writer task during shutdown, even when filled
-/// well past any small-channel test size. Uses a fast local-disk sink;
-/// nothing here depends on the sink being slow.
+/// ~102,400 records) is never actually filled here (N=20,000 is well under
+/// capacity, so no send ever waits) -- this test instead measures shutdown
+/// drain+flush: with that many rows buffered in memory at once, the writer
+/// task must still join and flush everything inside the 10s deadline
+/// `src/main.rs` gives every writer task during shutdown. Uses a fast
+/// local-disk sink; nothing here depends on the sink being slow.
 #[tokio::test]
-async fn budget_full_channel_completes_shutdown_within_the_deadline() {
+async fn shutdown_drains_and_flushes_a_deeply_buffered_channel_within_the_deadline() {
     let dir = tempfile::tempdir().expect("tempdir");
     let sink = Arc::new(
         LocalDiskSink::new(dir.path().to_path_buf())
