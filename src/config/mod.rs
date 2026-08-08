@@ -1157,6 +1157,10 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forwarding::channel_budget::{
+        GENERIC_RECORD_BYTES, IPFIX_DATAGRAM_BYTES, SFLOW_RECORD_BYTES, SURICATA_RECORD_BYTES,
+        SYSLOG_MESSAGE_BYTES, WEF_EVENT_BYTES, ZEEK_RECORD_BYTES, capacity_for,
+    };
 
     #[test]
     fn default_config_values_match_expectations() {
@@ -1212,7 +1216,7 @@ secret_key = "SECRET"
         assert_eq!(s3.prefix, "syslog");
         assert_eq!(s3.max_buffer_rows, 10_000);
         assert_eq!(s3.flush_interval_secs, 900);
-        assert_eq!(s3.channel_capacity, crate::forwarding::channel_budget::capacity_for(crate::forwarding::channel_budget::SYSLOG_MESSAGE_BYTES));
+        assert_eq!(s3.channel_capacity, capacity_for(SYSLOG_MESSAGE_BYTES));
     }
 
     #[test]
@@ -1271,7 +1275,7 @@ channel_capacity = 512
         assert_eq!(cfg.prefix, "syslog");
         assert_eq!(cfg.max_buffer_rows, 10_000);
         assert_eq!(cfg.flush_interval_secs, 900);
-        assert_eq!(cfg.channel_capacity, crate::forwarding::channel_budget::capacity_for(crate::forwarding::channel_budget::SYSLOG_MESSAGE_BYTES));
+        assert_eq!(cfg.channel_capacity, capacity_for(SYSLOG_MESSAGE_BYTES));
     }
 
     #[test]
@@ -1339,7 +1343,7 @@ max_buffer_rows = 50000
         assert_eq!(cfg.prefix, "ipfix");
         assert_eq!(cfg.flush_threshold_bytes, 100 * 1024 * 1024);
         assert_eq!(cfg.flush_interval_secs, 900);
-        assert_eq!(cfg.channel_capacity, crate::forwarding::channel_budget::capacity_for(crate::forwarding::channel_budget::IPFIX_DATAGRAM_BYTES));
+        assert_eq!(cfg.channel_capacity, capacity_for(IPFIX_DATAGRAM_BYTES));
         assert_eq!(cfg.max_buffer_rows, 100_000);
     }
 
@@ -1399,7 +1403,7 @@ secret_key = "SECRET"
         assert_eq!(s3.prefix, "zeek");
         assert_eq!(s3.flush_threshold_bytes, 100 * 1024 * 1024);
         assert_eq!(s3.flush_interval_secs, 900);
-        assert_eq!(s3.channel_capacity, crate::forwarding::channel_budget::capacity_for(crate::forwarding::channel_budget::ZEEK_RECORD_BYTES));
+        assert_eq!(s3.channel_capacity, capacity_for(ZEEK_RECORD_BYTES));
         assert_eq!(s3.max_buffer_rows, 100_000);
     }
 
@@ -1448,7 +1452,7 @@ max_buffer_rows = 50000
         assert_eq!(cfg.prefix, "zeek");
         assert_eq!(cfg.flush_threshold_bytes, 100 * 1024 * 1024);
         assert_eq!(cfg.flush_interval_secs, 900);
-        assert_eq!(cfg.channel_capacity, crate::forwarding::channel_budget::capacity_for(crate::forwarding::channel_budget::ZEEK_RECORD_BYTES));
+        assert_eq!(cfg.channel_capacity, capacity_for(ZEEK_RECORD_BYTES));
         assert_eq!(cfg.max_buffer_rows, 100_000);
     }
 
@@ -1512,7 +1516,7 @@ secret_key = "SECRET"
         assert_eq!(s3.prefix, ""); // default: empty prefix preserves old layout
         assert_eq!(s3.flush_threshold_bytes, 100 * 1024 * 1024);
         assert_eq!(s3.flush_interval_secs, 900);
-        assert_eq!(s3.channel_capacity, crate::forwarding::channel_budget::capacity_for(crate::forwarding::channel_budget::WEF_EVENT_BYTES));
+        assert_eq!(s3.channel_capacity, capacity_for(WEF_EVENT_BYTES));
         assert_eq!(s3.max_buffer_rows, 100_000);
     }
 
@@ -1557,7 +1561,7 @@ max_buffer_rows = 50000
         );
         assert_eq!(cfg.flush_threshold_bytes, 100 * 1024 * 1024);
         assert_eq!(cfg.flush_interval_secs, 900);
-        assert_eq!(cfg.channel_capacity, crate::forwarding::channel_budget::capacity_for(crate::forwarding::channel_budget::WEF_EVENT_BYTES));
+        assert_eq!(cfg.channel_capacity, capacity_for(WEF_EVENT_BYTES));
         assert_eq!(cfg.max_buffer_rows, 100_000);
     }
 
@@ -1722,7 +1726,7 @@ secret_key = "SECRET"
         assert_eq!(s3.prefix, "suricata");
         assert_eq!(s3.flush_threshold_bytes, 100 * 1024 * 1024);
         assert_eq!(s3.flush_interval_secs, 900);
-        assert_eq!(s3.channel_capacity, crate::forwarding::channel_budget::capacity_for(crate::forwarding::channel_budget::SURICATA_RECORD_BYTES));
+        assert_eq!(s3.channel_capacity, capacity_for(SURICATA_RECORD_BYTES));
         assert_eq!(s3.max_buffer_rows, 100_000);
     }
 
@@ -1764,7 +1768,7 @@ max_buffer_rows = 50000
         assert_eq!(cfg.prefix, "suricata");
         assert_eq!(cfg.flush_threshold_bytes, 100 * 1024 * 1024);
         assert_eq!(cfg.flush_interval_secs, 900);
-        assert_eq!(cfg.channel_capacity, crate::forwarding::channel_budget::capacity_for(crate::forwarding::channel_budget::SURICATA_RECORD_BYTES));
+        assert_eq!(cfg.channel_capacity, capacity_for(SURICATA_RECORD_BYTES));
         assert_eq!(cfg.max_buffer_rows, 100_000);
     }
 
@@ -1910,7 +1914,7 @@ secret_key = "SSECRET"
         assert_eq!(s3.prefix, "sflow");
         assert_eq!(s3.flush_threshold_bytes, 100 * 1024 * 1024);
         assert_eq!(s3.flush_interval_secs, 900);
-        assert_eq!(s3.channel_capacity, crate::forwarding::channel_budget::capacity_for(crate::forwarding::channel_budget::SFLOW_RECORD_BYTES));
+        assert_eq!(s3.channel_capacity, capacity_for(SFLOW_RECORD_BYTES));
         assert_eq!(s3.max_buffer_rows, 100_000);
     }
 
@@ -1968,7 +1972,7 @@ max_buffer_rows = 50000
         assert_eq!(cfg.prefix, "sflow");
         assert_eq!(cfg.flush_threshold_bytes, 100 * 1024 * 1024);
         assert_eq!(cfg.flush_interval_secs, 900);
-        assert_eq!(cfg.channel_capacity, crate::forwarding::channel_budget::capacity_for(crate::forwarding::channel_budget::SFLOW_RECORD_BYTES));
+        assert_eq!(cfg.channel_capacity, capacity_for(SFLOW_RECORD_BYTES));
         assert_eq!(cfg.max_buffer_rows, 100_000);
     }
 
@@ -2033,7 +2037,7 @@ secret_key = "SECRET"
         assert_eq!(s3.prefix, "hec"); // default prefix
         assert_eq!(s3.flush_threshold_bytes, 100 * 1024 * 1024);
         assert_eq!(s3.flush_interval_secs, 900);
-        assert_eq!(s3.channel_capacity, crate::forwarding::channel_budget::capacity_for(crate::forwarding::channel_budget::GENERIC_RECORD_BYTES));
+        assert_eq!(s3.channel_capacity, capacity_for(GENERIC_RECORD_BYTES));
         assert_eq!(s3.max_buffer_rows, 100_000);
     }
 
@@ -2082,7 +2086,7 @@ max_buffer_rows = 50000
         assert_eq!(cfg.prefix, "hec");
         assert_eq!(cfg.flush_threshold_bytes, 100 * 1024 * 1024);
         assert_eq!(cfg.flush_interval_secs, 900);
-        assert_eq!(cfg.channel_capacity, crate::forwarding::channel_budget::capacity_for(crate::forwarding::channel_budget::GENERIC_RECORD_BYTES));
+        assert_eq!(cfg.channel_capacity, capacity_for(GENERIC_RECORD_BYTES));
         assert_eq!(cfg.max_buffer_rows, 100_000);
     }
 
@@ -2258,14 +2262,34 @@ prefix    = "_iceberg_descriptors"
 
     #[test]
     fn channel_capacity_defaults_derive_from_the_budget() {
-        use crate::forwarding::channel_budget::*;
-        assert_eq!(default_zeek_channel_capacity(), capacity_for(ZEEK_RECORD_BYTES));
-        assert_eq!(default_suricata_channel_capacity(), capacity_for(SURICATA_RECORD_BYTES));
-        assert_eq!(default_hec_channel_capacity(), capacity_for(GENERIC_RECORD_BYTES));
-        assert_eq!(default_syslog_s3_channel_capacity(), capacity_for(SYSLOG_MESSAGE_BYTES));
-        assert_eq!(default_sflow_channel_capacity(), capacity_for(SFLOW_RECORD_BYTES));
-        assert_eq!(default_ipfix_channel_capacity(), capacity_for(IPFIX_DATAGRAM_BYTES));
-        assert_eq!(default_wef_channel_capacity(), capacity_for(WEF_EVENT_BYTES));
+        assert_eq!(
+            default_zeek_channel_capacity(),
+            capacity_for(ZEEK_RECORD_BYTES)
+        );
+        assert_eq!(
+            default_suricata_channel_capacity(),
+            capacity_for(SURICATA_RECORD_BYTES)
+        );
+        assert_eq!(
+            default_hec_channel_capacity(),
+            capacity_for(GENERIC_RECORD_BYTES)
+        );
+        assert_eq!(
+            default_syslog_s3_channel_capacity(),
+            capacity_for(SYSLOG_MESSAGE_BYTES)
+        );
+        assert_eq!(
+            default_sflow_channel_capacity(),
+            capacity_for(SFLOW_RECORD_BYTES)
+        );
+        assert_eq!(
+            default_ipfix_channel_capacity(),
+            capacity_for(IPFIX_DATAGRAM_BYTES)
+        );
+        assert_eq!(
+            default_wef_channel_capacity(),
+            capacity_for(WEF_EVENT_BYTES)
+        );
     }
 
     #[test]
