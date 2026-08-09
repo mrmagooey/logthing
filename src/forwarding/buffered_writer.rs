@@ -2048,15 +2048,44 @@ max_partitions = 128
 
     /// `total_buffered_rows()` starts at zero and sums row counts across
     /// every partition -- used at shutdown to report how much data is at
-    /// stake before the final flush.
+    /// stake before the final flush. Uses a genuinely partitioning sink (two
+    /// distinct partition keys) so the test can't pass by summing only one
+    /// partition's `row_count`.
     #[tokio::test]
     async fn total_buffered_rows_sums_every_partition() {
+        struct TwoPartitionMock;
+        impl ParquetSink for TwoPartitionMock {
+            type Record = (String, String); // (partition, value)
+            fn source(&self) -> &'static str {
+                "test"
+            }
+            fn partition(&self, r: &(String, String)) -> Option<String> {
+                Some(r.0.clone())
+            }
+            fn schema(&self, _p: Option<&str>) -> Arc<Schema> {
+                test_schema()
+            }
+            fn to_record_batch(
+                &self,
+                r: &(String, String),
+                schema: &Arc<Schema>,
+            ) -> anyhow::Result<RecordBatch> {
+                let col = Arc::new(StringArray::from(vec![r.1.as_str()]));
+                Ok(RecordBatch::try_new(schema.clone(), vec![col])?)
+            }
+        }
+
         let s3 = unreachable_s3().await;
         let (cfg, policy) = test_config(usize::MAX); // never flush during the test
-        let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
+        let mut w = PartitionedParquetWriter::new(TwoPartitionMock, s3, cfg, policy);
         assert_eq!(w.total_buffered_rows(), 0);
-        w.push("a".to_string()).await.unwrap();
-        w.push("b".to_string()).await.unwrap();
+        w.push(("p1".to_string(), "a".to_string())).await.unwrap();
+        w.push(("p2".to_string(), "b".to_string())).await.unwrap();
+        assert_eq!(
+            w.buffers.len(),
+            2,
+            "records must land in distinct partitions"
+        );
         assert_eq!(w.total_buffered_rows(), 2);
     }
 
