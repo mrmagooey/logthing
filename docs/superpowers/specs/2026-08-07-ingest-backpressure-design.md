@@ -164,6 +164,19 @@ a documented estimate has drifted by more than ~2×. A memory *ceiling* built
 on an unverified divisor is fiction, and adding a field to a record type would
 otherwise silently inflate the budget.
 
+**The estimator itself is verified too**, which is not the same thing and was
+the gap the final review found. Comparing each constant against
+`json_heap_bytes` only proves the constant agrees with the estimator; if the
+estimator is wrong, every constant is wrong and every test still passes. It
+was wrong: it ignored `BTreeMap` node allocation (`Value::Object` is a
+`BTreeMap<String, Value>`, and a node holds fully-allocated 11-slot key/value
+arrays whatever its occupancy), undercounting real heap by 2.4–3.1×.
+`tests/channel_budget_allocator.rs` therefore measures representative fixtures
+under a counting `#[global_allocator]` — in its own test binary, so the
+allocator perturbs nothing else — and fails if `json_heap_bytes` drifts more
+than 10% from what the process really allocates. It currently matches to the
+byte (2,234 / 4,377 / 696).
+
 "Footprint" means the heap owned by, and reachable from, one channel item —
 following indirection, not `size_of` alone:
 
@@ -181,18 +194,37 @@ following indirection, not `size_of` alone:
 
 ### 4.4 Aggregate memory
 
-Worst case is (enabled sources) × 100 MiB. Two mitigating facts:
+The budget is **per channel**, not per source, and a source has one channel
+*per destination*. `main.rs` builds a separate `ParquetWriterHandle` — hence a
+separate channel — for `.s3` and for `.local`, and `MultiZeekHandler` /
+`MultiSuricataHandler` `record.clone()` into each, so those are two genuinely
+distinct copies of every record.
+
+Channel count with everything enabled and every destination configured: zeek 2,
+suricata 2, syslog 3 (`.s3`, `.local`, plus `structured_s3` when
+`parse_payloads` is on), sflow 2, ipfix 2, HEC/OTLP 2 (OTLP shares HEC's
+handles), WEF 2 — **15 channels, a ~1.46 GiB worst-case ceiling**. One
+correction downward: WEF queues `Arc<WindowsEvent>` and clones the same `Arc`
+into both of its channels, so its two channels share one set of pointees and
+WEF's true worst case is ~100 MiB rather than 200 MiB — call it **~1.37 GiB**.
+
+Two mitigating facts:
 
 - tokio's bounded mpsc allocates its buffer lazily in blocks, so an idle or
   healthy channel costs nearly nothing; the budget is a ceiling, not a
   reservation.
 - Only Zeek and Suricata get backpressure, so only those two are *designed* to
-  dwell near capacity under load — roughly 200 MiB expected steady state. The
-  remaining sources still drop on overflow, so their channels fill only
-  transiently. (This rests on an assumption about those sources' traffic
-  patterns that is not verified in-repo.)
+  dwell near capacity under load — roughly 200 MiB per configured destination
+  pair in expected steady state. The remaining sources still drop on overflow,
+  so their channels fill only transiently. (This rests on an assumption about
+  those sources' traffic patterns that is not verified in-repo.)
 
-Operators should alert on the existing `parquet_s3_channel_available` gauge.
+Operators should alert on `parquet_s3_channel_queued` (records currently
+queued) or `parquet_s3_channel_available` (free slots). Both are refreshed by
+the writer task on a fixed 1-second ticker. They previously rode on the
+writer's flush ticker, whose period is
+`flush_check_interval(flush_interval)` — 900 s at every source's default
+`flush_interval_secs`, which made them useless as an alert signal.
 
 ## 5. Shutdown interaction
 
@@ -221,9 +253,46 @@ Two additions:
 1. A regression test that a budget-full channel completes drain **and** flush
    within the deadline. **If it cannot, the budget comes down** — the delivered
    capacity is whatever passes this test, which may be less than 100 MiB.
+
+   `shutdown_drains_and_flushes_a_budget_full_channel_within_the_deadline`
+   (`tests/ingest_backpressure_integration.rs`) runs at N = the full derived
+   capacity (40,960 Zeek `conn` records). Post-close drain+flush measures
+   **~0.69 s** of the 10 s deadline in a debug build, so the budget stands.
+   Caveat: the channel is not held *literally* full at the instant of
+   shutdown — `ParquetWriterHandle::start` owns both ends of its channel, so a
+   real writer task cannot be handed a pre-filled receiver, and a live writer
+   drains a healthy channel in microseconds. What the test reproduces is the
+   condition that actually threatens the deadline: a full budget's worth of
+   records has reached the writer, none of it has been flushed, and all of it
+   must be encoded and written after the channel closes.
+
 2. Log the residual queued-record count when the deadline expires, so the
    "some data may not have been written" warning says *how much*. The operator
    in this incident had to infer drop volume from a cumulative counter.
+
+   Where this actually fires:
+
+   - The writer's **channel-closed** arm (`buffered_writer.rs`) logs the rows
+     it is about to flush, and on flush failure logs both `rows_before_flush`
+     and `rows_still_buffered` (the pre-flush count alone overstates loss when
+     `flush_all` partially succeeded). This arm runs only when every `Sender`
+     has dropped — which for Zeek and Suricata **does not happen while a sensor
+     holds its TCP connection open**: connection tasks are detached
+     `tokio::spawn`s holding their own handler `Arc`, and `main.rs` aborts only
+     the accept loop. With one persistent sensor connection the channel never
+     closes, the writer never exits, and this log never prints.
+   - The **deadline-expiry** warning in `main.rs` therefore carries the volume
+     itself: it reads the `parquet_s3_channel_queued` gauge back out of the
+     Prometheus recorder (the same trick `profiling::maybe_start` already uses)
+     and reports it as `queued_records`. The timed-out writers are still
+     running and still refreshing that gauge every second, so the figure is
+     near-live; it is `None` when the metrics server is disabled, and it counts
+     records still in channels, not rows already moved into a writer's
+     partition buffers, which no live gauge tracks.
+
+   Giving connection tasks a shutdown signal or tracked `JoinHandle`s — which
+   would make the clean-shutdown path actually run for Zeek/Suricata — is a
+   pre-existing lifetime issue, deliberately out of scope here.
 
 ## 6. Testing
 
