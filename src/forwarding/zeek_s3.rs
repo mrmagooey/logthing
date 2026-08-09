@@ -17,7 +17,7 @@
 //! Metrics:        `parquet_s3_*{source="zeek"}` (generic labels).
 
 use crate::config::ZeekS3Config;
-use crate::forwarding::buffered_writer::{ParquetSink, SEND_TIMEOUT_DEFAULT};
+use crate::forwarding::buffered_writer::ParquetSink;
 use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::zeek::ZeekRecord;
 use crate::zeek::schema::{envelope_schema, get_schema_entry};
@@ -168,11 +168,15 @@ impl crate::zeek::listener::ZeekHandler
             Ok(()) => {}
             Err(e) => {
                 // parquet_s3_dropped{source="zeek"} is already incremented by send_or_drop.
+                // No duration in the message: `SendTimeoutError::Closed`
+                // returns immediately (writer task dead, nothing waited), so
+                // naming the timeout would be a lie on exactly the branch that
+                // matters most. `DropKind` already distinguishes the two in the
+                // throttle key.
                 if let Some(dropped_total) = self.drop_log_due(DropSite::Zeek, DropKind::from(&e)) {
                     tracing::warn!(
                         dropped_total,
-                        "Zeek S3 channel full for {:?}; dropped 1 record from {}",
-                        SEND_TIMEOUT_DEFAULT,
+                        "Zeek S3 channel unavailable; dropped 1 record from {}",
                         source
                     );
                 }

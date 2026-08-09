@@ -18,7 +18,7 @@
 //! Metrics:        `parquet_s3_*{source="suricata"}` (generic labels).
 
 use crate::config::SuricataS3Config;
-use crate::forwarding::buffered_writer::{ParquetSink, SEND_TIMEOUT_DEFAULT};
+use crate::forwarding::buffered_writer::ParquetSink;
 use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::suricata::SuricataRecord;
 use crate::suricata::schema::{envelope_schema, map_envelope};
@@ -118,13 +118,17 @@ impl crate::suricata::listener::SuricataHandler
             Ok(()) => {}
             Err(e) => {
                 // parquet_s3_dropped{source="suricata"} is already incremented by send_or_drop.
+                // No duration in the message: `SendTimeoutError::Closed`
+                // returns immediately (writer task dead, nothing waited), so
+                // naming the timeout would be a lie on exactly the branch that
+                // matters most. `DropKind` already distinguishes the two in the
+                // throttle key.
                 if let Some(dropped_total) =
                     self.drop_log_due(DropSite::Suricata, DropKind::from(&e))
                 {
                     tracing::warn!(
                         dropped_total,
-                        "Suricata S3 channel full for {:?}; dropped 1 record from {}",
-                        SEND_TIMEOUT_DEFAULT,
+                        "Suricata S3 channel unavailable; dropped 1 record from {}",
                         source
                     );
                 }

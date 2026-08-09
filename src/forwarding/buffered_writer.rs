@@ -386,6 +386,14 @@ const MAX_CONCURRENT_FLUSHES_PER_WRITER: usize = 4;
 /// an operator ever needs it per-source.
 pub const SEND_TIMEOUT_DEFAULT: Duration = Duration::from_secs(5);
 
+/// How often the writer task refreshes `parquet_s3_channel_available`.
+///
+/// Fixed and short, independent of `flush_interval`: this gauge is the
+/// recommended queue-depth alert signal, and a channel can fill and drain many
+/// times inside one 900-second flush interval. One timer wakeup per second per
+/// writer, with no per-record cost in the drain loop.
+const CHANNEL_GAUGE_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Row-count threshold at which a partition's live (in-progress) amortized
 /// builder is force-materialized into a real, stored `RecordBatch` entry,
 /// independent of any flush. Bounds two things: the maximum size of a
@@ -1217,6 +1225,16 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                 descriptor_sink,
             );
             let mut ticker = tokio::time::interval(flush_check);
+            // Separate, deliberately short ticker for the channel-depth gauge.
+            // It used to ride on `ticker`, whose period is
+            // `flush_check_interval(flush_interval)` -- 900s at every source's
+            // default `flush_interval_secs`, which makes a queue-depth alert
+            // useless (the spec recommends alerting on this gauge). One
+            // timer wakeup per second per writer is cheap; sampling it on the
+            // `recv` arm instead would be per-record work in the hot loop and
+            // would freeze the gauge at its last value whenever traffic stops,
+            // exactly when a stuck-full channel most needs reporting.
+            let mut gauge_ticker = tokio::time::interval(CHANNEL_GAUGE_INTERVAL);
             loop {
                 tokio::select! {
                     msg = rx.recv() => {
@@ -1246,10 +1264,17 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                                     "parquet_s3 writer shutting down; flushing buffered rows"
                                 );
                                 if let Err(e) = writer.flush_all().await {
+                                    // `at_risk` is the PRE-flush count, so it
+                                    // overstates loss whenever `flush_all`
+                                    // partially succeeded; the count still
+                                    // buffered afterwards is what was actually
+                                    // lost. Both are reported, named for what
+                                    // they are.
                                     tracing::warn!(
                                         source,
                                         target,
-                                        buffered_rows = at_risk,
+                                        rows_before_flush = at_risk,
+                                        rows_still_buffered = writer.total_buffered_rows(),
                                         "parquet_s3 flush_all on shutdown: {e}"
                                     );
                                 }
@@ -1257,9 +1282,17 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                             }
                         }
                     }
-                    _ = ticker.tick() => {
+                    _ = gauge_ticker.tick() => {
                         metrics::gauge!("parquet_s3_channel_available", "source" => source, "target" => target)
                             .set(rx.capacity() as f64);
+                        // Depth, not headroom: `available` alone cannot be read
+                        // as a volume without knowing each channel's configured
+                        // capacity, and shutdown wants exactly that volume (see
+                        // `await_handles_with_deadline`'s caller in main.rs).
+                        metrics::gauge!("parquet_s3_channel_queued", "source" => source, "target" => target)
+                            .set(capacity.saturating_sub(rx.capacity()) as f64);
+                    }
+                    _ = ticker.tick() => {
                         writer.update_buffer_gauges();
                         // flush_all_if_needed() always returns Ok now (flush failures surface
                         // async via apply_flush_outcome) -- kept as Result to avoid churning
@@ -2563,6 +2596,98 @@ max_partitions = 128
         assert_eq!(
             dropped, 1,
             "parquet_s3_dropped{{source=\"test\",target=\"s3\"}} should be incremented by send_or_drop on timeout"
+        );
+    }
+
+    /// The other half of `send_or_drop`'s error path: a **closed** channel.
+    /// It is not a slow variant of the timeout case — `send_timeout` on a
+    /// dead receiver returns `Closed` immediately, waiting zero time, which
+    /// is why the Zeek/Suricata drop warnings must not name a duration. This
+    /// was the one untested branch and it was the one logging the wrong line.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn send_or_drop_returns_closed_immediately_when_the_writer_is_gone() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        // Receiver dropped == writer task dead. Capacity is irrelevant.
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(8);
+        drop(rx);
+        let handle = ParquetWriterHandle::<MockSink> {
+            tx,
+            source: "test",
+            target: "s3",
+            flush_interval: LiveInterval::new(Duration::from_secs(900)),
+            drop_log: Arc::new(DropLogThrottles::new()),
+            send_timeout: SEND_TIMEOUT_DEFAULT, // 5s, and none of it is spent
+        };
+
+        let start = std::time::Instant::now();
+        let err = handle
+            .send_or_drop("orphan".to_string())
+            .await
+            .expect_err("a closed channel must fail");
+        let elapsed = start.elapsed();
+
+        match err {
+            tokio::sync::mpsc::error::SendTimeoutError::Closed(record) => {
+                assert_eq!(
+                    record, "orphan",
+                    "the dropped record must be handed back, not silently swallowed"
+                );
+            }
+            other => panic!("expected Closed, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "Closed must return without waiting out send_timeout; took {elapsed:?}"
+        );
+        let key = CompositeKey::new(
+            MetricKind::Counter,
+            metrics::Key::from_parts(
+                "parquet_s3_dropped",
+                vec![
+                    metrics::Label::new("source", "test"),
+                    metrics::Label::new("target", "s3"),
+                ],
+            ),
+        );
+        let dropped = snapshotter
+            .snapshot()
+            .into_hashmap()
+            .get(&key)
+            .map(|(_, _, v)| {
+                if let DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            dropped, 1,
+            "parquet_s3_dropped must be incremented on the closed branch too"
+        );
+    }
+
+    /// The channel-depth gauges are the recommended queue-depth alert signal,
+    /// so their cadence must stay short and, crucially, independent of
+    /// `flush_check_interval` — which is 900s at every source's default
+    /// `flush_interval_secs`.
+    #[test]
+    fn channel_gauge_interval_is_short_and_independent_of_the_flush_interval() {
+        assert!(CHANNEL_GAUGE_INTERVAL <= Duration::from_secs(5));
+        assert_ne!(
+            CHANNEL_GAUGE_INTERVAL,
+            crate::forwarding::s3_sink::flush_check_interval(Duration::from_secs(
+                default_flush_interval_secs()
+            ))
         );
     }
 

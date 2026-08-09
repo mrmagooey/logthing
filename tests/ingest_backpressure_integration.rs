@@ -312,11 +312,10 @@ async fn wedged_writer_drops_after_the_timeout() {
 /// concurrent fan-out would take the same total time regardless of which
 /// strategy is used, making the assertion vacuous; two comparably slow
 /// handlers are required to actually distinguish "sum" (400ms/record) from
-/// "max" (200ms/record). `MultiZeekHandler` today
-/// (`src/forwarding/zeek_s3.rs:196-198`) fans out sequentially --
-/// `for handler in &self.0 { handler.handle_record(...).await }` -- so this
-/// assertion is expected to FAIL until Task 5 changes that loop to a
-/// concurrent `join_all`. Left failing deliberately; see the task-4 report.
+/// "max" (200ms/record). `MultiZeekHandler` now fans out with
+/// `futures::future::join_all`, so this passes; reverting it to the previous
+/// sequential `for handler in &self.0 { handler.handle_record(...).await }`
+/// is exactly the regression this test exists to catch.
 #[tokio::test]
 async fn fan_out_latency_should_be_max_not_sum_across_destinations() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -371,15 +370,159 @@ async fn fan_out_latency_should_be_max_not_sum_across_destinations() {
     );
 }
 
-/// A channel sized by the real 100 MiB budget (`capacity_for(ZEEK_RECORD_BYTES)`,
-/// ~102,400 records) is never actually filled here (N=20,000 is well under
-/// capacity, so no send ever waits) -- this test instead measures shutdown
-/// drain+flush: with that many rows buffered in memory at once, the writer
-/// task must still join and flush everything inside the 10s deadline
-/// `src/main.rs` gives every writer task during shutdown. Uses a fast
-/// local-disk sink; nothing here depends on the sink being slow.
+/// Counts `set` calls per gauge name. A `DebuggingRecorder` snapshot shows the
+/// current *value*, which cannot distinguish "set once at startup" from "set
+/// every second" — and `tokio::time::interval`'s first tick fires immediately,
+/// so even a 900-second ticker publishes a value at t=0. Update *rate* is the
+/// thing under test, so it has to be counted directly.
+#[derive(Default)]
+struct GaugeSetCounter(
+    std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicUsize>>>,
+);
+
+impl GaugeSetCounter {
+    fn slot(&self, name: &str) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.0
+            .lock()
+            .unwrap()
+            .entry(name.to_string())
+            .or_default()
+            .clone()
+    }
+
+    fn count(&self, name: &str) -> usize {
+        self.slot(name).load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+struct CountingGauge(Arc<std::sync::atomic::AtomicUsize>);
+
+impl metrics::GaugeFn for CountingGauge {
+    fn increment(&self, _value: f64) {}
+    fn decrement(&self, _value: f64) {}
+    fn set(&self, _value: f64) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl metrics::Recorder for GaugeSetCounter {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn register_counter(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        metrics::Counter::noop()
+    }
+    fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::from_arc(Arc::new(CountingGauge(self.slot(key.name()))))
+    }
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+/// The queue-depth gauges must refresh on their own short cadence, NOT on the
+/// writer's flush ticker. They used to ride on `ticker`, whose period is
+/// `flush_check_interval(flush_interval)` — 900s at every source's default
+/// `flush_interval_secs`, which is exactly the config used here. A gauge the
+/// spec tells operators to alert on cannot update once every 15 minutes.
+///
+/// Regression shape: under the old code each channel gauge is set exactly
+/// once (the immediate first tick) and then not again for 900 seconds, so the
+/// counts below stay at 1 while `parquet_s3_buffer_rows` — still on the flush
+/// ticker, deliberately — also stays at 1. That asymmetry is the assertion.
 #[tokio::test]
-async fn shutdown_drains_and_flushes_a_deeply_buffered_channel_within_the_deadline() {
+async fn channel_depth_gauges_refresh_despite_a_900_second_flush_interval() {
+    use metrics::set_default_local_recorder;
+
+    let recorder = GaugeSetCounter::default();
+    let _guard = set_default_local_recorder(&recorder);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = Arc::new(
+        LocalDiskSink::new(dir.path().to_path_buf())
+            .await
+            .expect("LocalDiskSink::new"),
+    );
+    let cfg = logthing::config::ZeekLocalConfig {
+        directory: dir.path().to_path_buf(),
+        prefix: "zeek".to_string(),
+        max_buffer_rows: 100_000,
+        flush_threshold_bytes: 1_000_000_000,
+        flush_interval_secs: 900, // the production default
+        channel_capacity: 64,
+    };
+    let (handler, _writer_task) = zeek_local_start(
+        &cfg,
+        sink,
+        Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+
+    // Long enough for the 1s gauge ticker to fire at least three times
+    // (t=0, 1s, 2s), short enough to keep the suite fast.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    drop(handler);
+
+    let available = recorder.count("parquet_s3_channel_available");
+    let queued = recorder.count("parquet_s3_channel_queued");
+    let buffer_rows = recorder.count("parquet_s3_buffer_rows");
+    assert!(
+        available >= 3 && queued >= 3,
+        "channel gauges must refresh about once a second regardless of \
+         flush_interval_secs=900; saw available={available}, queued={queued} \
+         updates in 2.5s (1 each means they are back on the flush ticker)"
+    );
+    assert_eq!(
+        buffer_rows, 0,
+        "parquet_s3_buffer_rows stays on the flush ticker by design (it walks \
+         every partition); it should not have fired in 2.5s of a 900s interval"
+    );
+}
+
+/// The spec's budget gate (§5): a **budget-full** channel must still complete
+/// drain and flush inside the 10s deadline `src/main.rs:619-624` gives every
+/// writer task, "and if it cannot, the budget comes down".
+///
+/// N is therefore the derived capacity itself -- `capacity_for(ZEEK_RECORD_BYTES)`,
+/// a full 100 MiB of Zeek `conn` records -- not a fraction of it. An earlier
+/// version of this test used N=20,000 (~20% of capacity) and asserted
+/// `capacity >= N`, which tested nothing about the budget.
+///
+/// One honest caveat: the channel is not held *literally* full at the moment
+/// of shutdown. `ParquetWriterHandle::start` owns both ends of its channel, so
+/// there is no way to hand a real writer task a pre-filled receiver, and a live
+/// writer drains a healthy channel in microseconds. What is reproduced instead
+/// is the condition that actually threatens the deadline: a whole budget's
+/// worth of records has reached the writer, none of it has been flushed (the
+/// thresholds below see to that), and all of it must be encoded and written
+/// after the channel closes. The pure-CPU drain the spec bounds separately is
+/// included, just spread across the push phase.
+///
+/// Uses a fast local-disk sink; nothing here depends on the sink being slow.
+#[tokio::test]
+async fn shutdown_drains_and_flushes_a_budget_full_channel_within_the_deadline() {
     let dir = tempfile::tempdir().expect("tempdir");
     let sink = Arc::new(
         LocalDiskSink::new(dir.path().to_path_buf())
@@ -389,19 +532,18 @@ async fn shutdown_drains_and_flushes_a_deeply_buffered_channel_within_the_deadli
     let capacity = logthing::forwarding::channel_budget::capacity_for(
         logthing::forwarding::channel_budget::ZEEK_RECORD_BYTES,
     );
-    const N: usize = 20_000;
-    assert!(
-        capacity >= N,
-        "this test assumes the budgeted capacity ({capacity}) comfortably exceeds N ({N})"
-    );
+    // The gate: a full budget's worth of records, whatever that currently
+    // derives to. Re-deriving the constants must re-run this test, not slip
+    // past a hardcoded N.
+    let n = capacity;
     // High thresholds so nothing flushes mid-burst; the only flush is the
     // shutdown `flush_all`, which must still complete inside the deadline
-    // even with N rows all buffered in memory at once.
+    // even with every row buffered in memory at once.
     let cfg = logthing::config::ZeekLocalConfig {
         directory: dir.path().to_path_buf(),
         prefix: "zeek".to_string(),
-        max_buffer_rows: N * 2,
-        flush_threshold_bytes: 1_000_000_000,
+        max_buffer_rows: n * 2,
+        flush_threshold_bytes: 10_000_000_000,
         flush_interval_secs: 3600,
         channel_capacity: capacity,
     };
@@ -413,25 +555,36 @@ async fn shutdown_drains_and_flushes_a_deeply_buffered_channel_within_the_deadli
     );
 
     let src: std::net::SocketAddr = "127.0.0.1:47760".parse().unwrap();
-    for i in 0..N {
+    for i in 0..n {
         handler
             .handle_record(make_conn_record(&format!("CBudget{i:05}")), src)
             .await;
     }
 
     drop(handler);
+    // Only the post-close drain+flush is timed -- that is what the 10s
+    // deadline actually covers. The push phase above is the sensors' own
+    // steady-state work, not part of shutdown.
     let deadline = Duration::from_secs(10);
+    let start = std::time::Instant::now();
     tokio::time::timeout(deadline, writer_task)
         .await
         .unwrap_or_else(|_| {
-            panic!("writer task must join within the {deadline:?} shutdown deadline")
+            panic!(
+                "a budget-full channel ({n} records) must drain and flush within the \
+                 {deadline:?} shutdown deadline. If this fails, CHANNEL_BUDGET_BYTES is \
+                 too high for the deadline -- that is a deliberate, recorded decision, \
+                 not something to fix by lowering this assertion."
+            )
         })
         .expect("writer task must not panic");
+    let shutdown_took = start.elapsed();
 
     let conn_dir = dir.path().join("zeek/conn");
     assert_eq!(
         count_parquet_rows(&conn_dir),
-        N,
-        "all {N} rows must have reached Parquet before the writer task joined"
+        n,
+        "all {n} rows must have reached Parquet before the writer task joined \
+         (shutdown drain+flush took {shutdown_took:?})"
     );
 }
