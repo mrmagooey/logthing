@@ -56,17 +56,26 @@
 //! The load-bearing assertion is `parquet_s3_dropped{source="zeek"} == 0`
 //! while the client outruns the pipeline -- the one that fails if
 //! `send_or_drop` is reverted to `try_send` (confirmed by mutation, see the
-//! task report).
+//! task report). This is the assertion that actually discriminates the fix
+//! from a regression, and it runs first.
 //!
-//! A secondary assertion checks that at least one client `write()` call took
+//! A second assertion checks that at least one client `write()` call took
 //! materially longer than the others (`max > 10 * median` of per-write
-//! elapsed times), evidence that the stall reaches the client's actual TCP
-//! socket -- the connection's read loop blocking inside `send_or_drop` stops
-//! draining the socket, so the kernel receive buffer (and then the client's
-//! send buffer) fills and a subsequent `write()` genuinely blocks in the
-//! syscall. Empirically this ratio lands in the 10^5-10^6 range across
-//! repeated local runs (see the task report), so the 10x threshold has a
-//! very large margin and does not depend on a lightly-loaded machine.
+//! elapsed times). Under the correct `send_or_drop` implementation this is
+//! genuine corroborating evidence that the stall reaches the client's actual
+//! TCP socket -- empirically the ratio lands in the 10^5-10^6 range across
+//! repeated local runs (see the task report), several orders of magnitude
+//! clear of the 10x threshold and CI-stable.
+//!
+//! It is NOT, by itself, an independent regression detector: a reviewer
+//! confirmed by direct experiment that with the zero-drops assertion
+//! disabled and `try_send` substituted in, this ratio still clears 10x in
+//! 3/3 runs (58x-232x) purely from ordinary scheduler jitter across ~100k
+//! tight-loop writes under 4-worker contention -- no genuine channel-full
+//! blocking involved. So this assertion only means what the paragraph above
+//! says when the zero-drops assertion has already passed; the two are
+//! checked in that order in the function below, and that ordering is
+//! load-bearing for the test's correctness under mutation, not incidental.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -239,13 +248,20 @@ dropping (sent {sent} records)"
     );
 
     // 5. Assert at least one write() call took materially longer than the
-    // others -- the socket's send buffer filled because the server stopped
-    // reading while send_or_drop's bounded wait was blocking the
-    // connection's read loop. That is backpressure reaching the wire, not
-    // just the internal channel. `max > 10 * median` (per the task brief):
-    // a socket that never blocks shows a flat distribution close to 1x.
-    // Empirically (5 local runs) this ratio lands in the 10^5-10^6 range
-    // -- comfortably clear of the 10x threshold even under heavy CI load.
+    // others. Under the correct send_or_drop implementation (i.e. having
+    // already passed assertion 4 above) this is corroborating evidence
+    // that the stall reaches the socket, not just the internal channel --
+    // empirically (5 local runs) this ratio lands in the 10^5-10^6 range,
+    // comfortably clear of the 10x threshold even under heavy CI load.
+    //
+    // This ratio alone does NOT discriminate a try_send regression: a
+    // reviewer confirmed by direct experiment that with assertion 4
+    // disabled and try_send substituted in, max > 10*median still holds in
+    // 3/3 runs (58x-232x) from ordinary scheduler jitter across ~100k
+    // tight-loop writes under 4-worker contention, with no genuine
+    // channel-full blocking. It is only meaningful here because assertion
+    // 4 already ran and passed first -- that ordering is load-bearing for
+    // this test's correctness under mutation, not incidental.
     let mut sorted_write_times = write_times;
     sorted_write_times.sort();
     let median = sorted_write_times[sorted_write_times.len() / 2];
