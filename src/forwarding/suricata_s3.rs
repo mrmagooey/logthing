@@ -674,11 +674,12 @@ mod tests {
         // `suricata_start` writer task can't produce this: `push()` never
         // awaits the actual upload, so a real writer drains a healthy
         // channel in microseconds regardless of how broken the sink is, and
-        // would just as well succeed for every record. Fan-out is still
-        // sequential (Task 5's concurrent join_all lands later), so the
-        // struggling handler's 20ms wait-then-drop happens before the
-        // healthy handler's turn on every iteration — proving isolation,
-        // not concurrency.
+        // would just as well succeed for every record. Fan-out is now
+        // concurrent (via join_all), so the struggling handler's 20ms
+        // wait-then-drop runs alongside the healthy handler's send on every
+        // iteration — this proves a healthy destination still receives
+        // every record even while a sibling destination drops, under
+        // concurrent fan-out.
         let (tx, _rx) = tokio::sync::mpsc::channel::<SuricataRecord>(1);
         tx.try_send(make_alert_record("0.0.0.1")).unwrap();
         let struggling_handler =

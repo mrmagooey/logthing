@@ -887,10 +887,11 @@ mod tests {
         // `zeek_start` writer task can't produce this: `push()` never awaits
         // the actual upload, so a real writer drains a healthy channel in
         // microseconds regardless of how broken the sink is, and would just
-        // as well succeed for every record. Fan-out is still sequential
-        // (Task 5's concurrent join_all lands later), so the struggling
-        // handler's 20ms wait-then-drop happens before the healthy handler's
-        // turn on every iteration — proving isolation, not concurrency.
+        // as well succeed for every record. Fan-out is now concurrent (via
+        // join_all), so the struggling handler's 20ms wait-then-drop runs
+        // alongside the healthy handler's send on every iteration — this
+        // proves a healthy destination still receives every record even
+        // while a sibling destination drops, under concurrent fan-out.
         let (tx, _rx) = tokio::sync::mpsc::channel::<ZeekRecord>(1);
         tx.try_send(make_conn_record("Cfirst")).unwrap();
         let struggling_handler = ParquetWriterHandle::<ZeekSink>::for_test(tx, "zeek", "s3")

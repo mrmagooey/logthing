@@ -816,6 +816,13 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         }
     }
 
+    /// Rows currently buffered across every partition, including any live
+    /// amortized builder. Used to report how much data is at stake when the
+    /// shutdown path begins its final flush.
+    pub(crate) fn total_buffered_rows(&self) -> usize {
+        self.buffers.values().map(|b| b.row_count).sum()
+    }
+
     /// Drain all in-flight background flushes to completion, applying each
     /// outcome as it arrives. Used at graceful shutdown (so the writer's
     /// `JoinHandle` doesn't complete while a flush is still outstanding —
@@ -1231,8 +1238,20 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                                 // merged back for the final flush below to
                                 // pick up), THEN flush whatever remains.
                                 writer.drain_pending_flushes().await;
+                                let at_risk = writer.total_buffered_rows();
+                                tracing::info!(
+                                    source,
+                                    target,
+                                    buffered_rows = at_risk,
+                                    "parquet_s3 writer shutting down; flushing buffered rows"
+                                );
                                 if let Err(e) = writer.flush_all().await {
-                                    tracing::warn!(source, target, "parquet_s3 flush_all on shutdown: {e}");
+                                    tracing::warn!(
+                                        source,
+                                        target,
+                                        buffered_rows = at_risk,
+                                        "parquet_s3 flush_all on shutdown: {e}"
+                                    );
                                 }
                                 break;
                             }
@@ -2025,6 +2044,20 @@ max_partitions = 128
             w.push(format!("r{i}")).await.unwrap();
         }
         assert_eq!(w.buffers.get("").unwrap().row_count, 4);
+    }
+
+    /// `total_buffered_rows()` starts at zero and sums row counts across
+    /// every partition -- used at shutdown to report how much data is at
+    /// stake before the final flush.
+    #[tokio::test]
+    async fn total_buffered_rows_sums_every_partition() {
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(usize::MAX); // never flush during the test
+        let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
+        assert_eq!(w.total_buffered_rows(), 0);
+        w.push("a".to_string()).await.unwrap();
+        w.push("b".to_string()).await.unwrap();
+        assert_eq!(w.total_buffered_rows(), 2);
     }
 
     /// Proves `PartitionedParquetWriter` is destination-agnostic: an in-memory
