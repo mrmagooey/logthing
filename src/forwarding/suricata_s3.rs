@@ -108,16 +108,27 @@ impl crate::suricata::listener::SuricataHandler
     for crate::forwarding::buffered_writer::ParquetWriterHandle<SuricataSink>
 {
     async fn handle_record(&self, record: SuricataRecord, source: std::net::SocketAddr) {
-        match self.try_send(record) {
+        // Bounded wait, not try_send: Suricata arrives over TCP on a dedicated
+        // per-connection task, so blocking here stops reading this one socket,
+        // closes the TCP window, and pushes the queue back to the sensor —
+        // which has its own disk-backed spool. A drop now means the writer was
+        // unavailable for a full SEND_TIMEOUT_DEFAULT, not merely that a burst
+        // arrived.
+        match self.send_or_drop(record).await {
             Ok(()) => {}
             Err(e) => {
-                // parquet_s3_dropped{source="suricata"} is already incremented by try_send.
+                // parquet_s3_dropped{source="suricata"} is already incremented by send_or_drop.
+                // No duration in the message: `SendTimeoutError::Closed`
+                // returns immediately (writer task dead, nothing waited), so
+                // naming the timeout would be a lie on exactly the branch that
+                // matters most. `DropKind` already distinguishes the two in the
+                // throttle key.
                 if let Some(dropped_total) =
                     self.drop_log_due(DropSite::Suricata, DropKind::from(&e))
                 {
                     tracing::warn!(
                         dropped_total,
-                        "Suricata S3 channel full; dropped 1 record from {}",
+                        "Suricata S3 channel unavailable; dropped 1 record from {}",
                         source
                     );
                 }
@@ -141,9 +152,18 @@ pub struct MultiSuricataHandler(
 #[async_trait::async_trait]
 impl crate::suricata::listener::SuricataHandler for MultiSuricataHandler {
     async fn handle_record(&self, record: SuricataRecord, source: std::net::SocketAddr) {
-        for handler in &self.0 {
-            handler.handle_record(record.clone(), source).await;
-        }
+        // Concurrent, not sequential: sends now block for up to
+        // SEND_TIMEOUT_DEFAULT, and awaiting destinations in series would let a
+        // stalled S3 target add that latency to an otherwise-healthy local one.
+        // Each destination owns an independent channel and writer with no
+        // shared mutable state, so concurrent polling is safe and total latency
+        // becomes max() instead of sum().
+        futures::future::join_all(
+            self.0
+                .iter()
+                .map(|handler| handler.handle_record(record.clone(), source)),
+        )
+        .await;
     }
 }
 
@@ -399,7 +419,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::mutable_key_type)]
     async fn handler_overflow_increments_dropped_counter() {
-        use crate::config::SuricataS3Config;
+        use crate::forwarding::buffered_writer::ParquetWriterHandle;
         use crate::suricata::listener::SuricataHandler;
         use metrics::set_default_local_recorder;
         use metrics_util::CompositeKey;
@@ -411,28 +431,18 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         let _guard = set_default_local_recorder(&recorder);
 
-        let sink = unreachable_sink().await;
-        let cfg = SuricataS3Config {
-            connection: S3ConnectionConfig {
-                endpoint: "http://127.0.0.1:1".to_string(),
-                bucket: "test-bucket".to_string(),
-                region: "us-east-1".to_string(),
-                access_key: "AKIATEST".to_string(),
-                secret_key: "SECRETTEST".to_string(),
-            },
-            prefix: "suricata".to_string(),
-            flush_threshold_bytes: 1,
-            flush_interval_secs: 3600,
-            channel_capacity: 1,
-            max_buffer_rows: 1,
-        };
-        let (handler, _writer_handle) = suricata_start(
-            &cfg,
-            sink,
-            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
-            None,
-        );
-        tokio::task::yield_now().await;
+        // Capacity 1, receiver held but never polled: the channel genuinely
+        // stays full for the life of the test (no writer task draining it).
+        // Going through a real `suricata_start` writer task doesn't work
+        // here: since `push()` never awaits the actual upload (flushes are
+        // spawned and decoupled from the channel-draining loop), a real
+        // writer drains a healthy channel in microseconds regardless of how
+        // broken the sink is, so a capacity-1 channel never actually stays
+        // full long enough for `send_or_drop` to time out.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<SuricataRecord>(1);
+        tx.try_send(make_alert_record("0.0.0.1")).unwrap();
+        let handler = ParquetWriterHandle::<SuricataSink>::for_test(tx, "suricata", "s3")
+            .with_send_timeout(std::time::Duration::from_millis(20));
 
         let src: SocketAddr = "127.0.0.1:47761".parse().unwrap();
         for i in 0..50usize {
@@ -650,7 +660,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::mutable_key_type)]
     async fn multi_suricata_handler_survives_one_inner_handler_dropping() {
-        use crate::config::SuricataS3Config;
+        use crate::forwarding::buffered_writer::ParquetWriterHandle;
         use crate::suricata::listener::SuricataHandler;
         use metrics::set_default_local_recorder;
         use metrics_util::CompositeKey;
@@ -662,27 +672,23 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         let _guard = set_default_local_recorder(&recorder);
 
-        let sink = unreachable_sink().await;
-        let cfg = SuricataS3Config {
-            connection: S3ConnectionConfig {
-                endpoint: "http://127.0.0.1:1".to_string(),
-                bucket: "test-bucket".to_string(),
-                region: "us-east-1".to_string(),
-                access_key: "AKIATEST".to_string(),
-                secret_key: "SECRETTEST".to_string(),
-            },
-            prefix: "suricata".to_string(),
-            flush_threshold_bytes: usize::MAX,
-            flush_interval_secs: 3600,
-            channel_capacity: 1,
-            max_buffer_rows: 1,
-        };
-        let (struggling_handler, _jh) = suricata_start(
-            &cfg,
-            sink,
-            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
-            None,
-        );
+        // Capacity 1, receiver held but never polled: the struggling
+        // handler's channel genuinely stays full, so `send_or_drop` (with a
+        // short timeout) reliably times out and drops on every send. A real
+        // `suricata_start` writer task can't produce this: `push()` never
+        // awaits the actual upload, so a real writer drains a healthy
+        // channel in microseconds regardless of how broken the sink is, and
+        // would just as well succeed for every record. Fan-out is now
+        // concurrent (via join_all), so the struggling handler's 20ms
+        // wait-then-drop runs alongside the healthy handler's send on every
+        // iteration — this proves a healthy destination still receives
+        // every record even while a sibling destination drops, under
+        // concurrent fan-out.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<SuricataRecord>(1);
+        tx.try_send(make_alert_record("0.0.0.1")).unwrap();
+        let struggling_handler =
+            ParquetWriterHandle::<SuricataSink>::for_test(tx, "suricata", "s3")
+                .with_send_timeout(std::time::Duration::from_millis(20));
 
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct CountingHandler(Arc<AtomicUsize>);

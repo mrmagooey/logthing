@@ -158,14 +158,25 @@ impl crate::zeek::listener::ZeekHandler
     for crate::forwarding::buffered_writer::ParquetWriterHandle<ZeekSink>
 {
     async fn handle_record(&self, record: ZeekRecord, source: std::net::SocketAddr) {
-        match self.try_send(record) {
+        // Bounded wait, not try_send: Zeek arrives over TCP on a dedicated
+        // per-connection task, so blocking here stops reading this one socket,
+        // closes the TCP window, and pushes the queue back to the sensor —
+        // which has its own disk-backed spool. A drop now means the writer was
+        // unavailable for a full SEND_TIMEOUT_DEFAULT, not merely that a burst
+        // arrived.
+        match self.send_or_drop(record).await {
             Ok(()) => {}
             Err(e) => {
-                // parquet_s3_dropped{source="zeek"} is already incremented by try_send.
+                // parquet_s3_dropped{source="zeek"} is already incremented by send_or_drop.
+                // No duration in the message: `SendTimeoutError::Closed`
+                // returns immediately (writer task dead, nothing waited), so
+                // naming the timeout would be a lie on exactly the branch that
+                // matters most. `DropKind` already distinguishes the two in the
+                // throttle key.
                 if let Some(dropped_total) = self.drop_log_due(DropSite::Zeek, DropKind::from(&e)) {
                     tracing::warn!(
                         dropped_total,
-                        "Zeek S3 channel full; dropped 1 record from {}",
+                        "Zeek S3 channel unavailable; dropped 1 record from {}",
                         source
                     );
                 }
@@ -187,9 +198,18 @@ pub struct MultiZeekHandler(pub Vec<std::sync::Arc<dyn crate::zeek::listener::Ze
 #[async_trait::async_trait]
 impl crate::zeek::listener::ZeekHandler for MultiZeekHandler {
     async fn handle_record(&self, record: ZeekRecord, source: std::net::SocketAddr) {
-        for handler in &self.0 {
-            handler.handle_record(record.clone(), source).await;
-        }
+        // Concurrent, not sequential: sends now block for up to
+        // SEND_TIMEOUT_DEFAULT, and awaiting destinations in series would let a
+        // stalled S3 target add that latency to an otherwise-healthy local one.
+        // Each destination owns an independent channel and writer with no
+        // shared mutable state, so concurrent polling is safe and total latency
+        // becomes max() instead of sum().
+        futures::future::join_all(
+            self.0
+                .iter()
+                .map(|handler| handler.handle_record(record.clone(), source)),
+        )
+        .await;
     }
 }
 
@@ -653,6 +673,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::mutable_key_type)]
     async fn handler_overflow_increments_dropped_counter() {
+        use crate::forwarding::buffered_writer::ParquetWriterHandle;
         use crate::zeek::listener::ZeekHandler;
         use metrics::set_default_local_recorder;
         use metrics_util::CompositeKey;
@@ -664,35 +685,24 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         let _guard = set_default_local_recorder(&recorder);
 
-        let sink = unreachable_sink().await;
-        let cfg = ZeekS3Config {
-            connection: S3ConnectionConfig {
-                endpoint: "http://127.0.0.1:1".to_string(),
-                bucket: "test-bucket".to_string(),
-                region: "us-east-1".to_string(),
-                access_key: "AKIATEST".to_string(),
-                secret_key: "SECRETTEST".to_string(),
-            },
-            prefix: "zeek".to_string(),
-            flush_threshold_bytes: 1,
-            flush_interval_secs: 3600,
-            channel_capacity: 1,
-            max_buffer_rows: 1,
-        };
-        let (handler, _writer_handle) = zeek_start(
-            &cfg,
-            sink,
-            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
-            None,
-        );
-        tokio::task::yield_now().await;
+        // Capacity 1, receiver held but never polled: the channel genuinely
+        // stays full for the life of the test (no writer task draining it).
+        // Going through a real `zeek_start` writer task doesn't work here:
+        // since `push()` never awaits the actual upload (flushes are
+        // spawned and decoupled from the channel-draining loop), a real
+        // writer drains a healthy channel in microseconds regardless of how
+        // broken the sink is, so a capacity-1 channel never actually stays
+        // full long enough for `send_or_drop` to time out.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ZeekRecord>(1);
+        tx.try_send(make_conn_record("Cfirst")).unwrap();
+        let handler = ParquetWriterHandle::<ZeekSink>::for_test(tx, "zeek", "s3")
+            .with_send_timeout(std::time::Duration::from_millis(20));
 
         let src: SocketAddr = "127.0.0.1:47760".parse().unwrap();
         for i in 0..50usize {
             let rec = make_conn_record(&format!("C{i}"));
             handler.handle_record(rec, src).await;
         }
-        tokio::task::yield_now().await;
 
         let snapshot = snapshotter.snapshot();
         let map = snapshot.into_hashmap();
@@ -863,6 +873,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::mutable_key_type)]
     async fn multi_zeek_handler_survives_one_inner_handler_dropping() {
+        use crate::forwarding::buffered_writer::ParquetWriterHandle;
         use crate::zeek::listener::ZeekHandler;
         use metrics::set_default_local_recorder;
         use metrics_util::CompositeKey;
@@ -874,30 +885,21 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         let _guard = set_default_local_recorder(&recorder);
 
-        // A handler backed by a writer with channel_capacity=1 and a slow/unreachable
-        // sink will drop records via try_send rather than blocking — proving that a
-        // struggling destination cannot stall MultiZeekHandler's fan-out to the other.
-        let sink = unreachable_sink().await;
-        let cfg = ZeekS3Config {
-            connection: S3ConnectionConfig {
-                endpoint: "http://127.0.0.1:1".to_string(),
-                bucket: "test-bucket".to_string(),
-                region: "us-east-1".to_string(),
-                access_key: "AKIATEST".to_string(),
-                secret_key: "SECRETTEST".to_string(),
-            },
-            prefix: "zeek".to_string(),
-            flush_threshold_bytes: usize::MAX,
-            flush_interval_secs: 3600,
-            channel_capacity: 1,
-            max_buffer_rows: 1,
-        };
-        let (struggling_handler, _jh) = zeek_start(
-            &cfg,
-            sink,
-            std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
-            None,
-        );
+        // Capacity 1, receiver held but never polled: the struggling
+        // handler's channel genuinely stays full, so `send_or_drop` (with a
+        // short timeout) reliably times out and drops on every send. A real
+        // `zeek_start` writer task can't produce this: `push()` never awaits
+        // the actual upload, so a real writer drains a healthy channel in
+        // microseconds regardless of how broken the sink is, and would just
+        // as well succeed for every record. Fan-out is now concurrent (via
+        // join_all), so the struggling handler's 20ms wait-then-drop runs
+        // alongside the healthy handler's send on every iteration — this
+        // proves a healthy destination still receives every record even
+        // while a sibling destination drops, under concurrent fan-out.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ZeekRecord>(1);
+        tx.try_send(make_conn_record("Cfirst")).unwrap();
+        let struggling_handler = ParquetWriterHandle::<ZeekSink>::for_test(tx, "zeek", "s3")
+            .with_send_timeout(std::time::Duration::from_millis(20));
 
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct CountingHandler(Arc<AtomicUsize>);

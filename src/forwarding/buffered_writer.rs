@@ -374,6 +374,26 @@ pub(crate) fn build_key(
 /// outage from causing many partitions to retry in lockstep.
 const MAX_CONCURRENT_FLUSHES_PER_WRITER: usize = 4;
 
+/// How long a backpressure-aware sender waits for channel capacity before
+/// giving up and dropping the record.
+///
+/// Far longer than any plausible writer hiccup (a `spawn_blocking` zstd encode,
+/// a metrics scrape), far shorter than sensor and TCP timeouts. Deliberately
+/// not a config key — no evidence anyone needs to tune it, and promoting a
+/// const to a config field later is trivial.
+///
+/// ponytail: const + per-handle override; promote to `BufferedWriterConfig` if
+/// an operator ever needs it per-source.
+pub const SEND_TIMEOUT_DEFAULT: Duration = Duration::from_secs(5);
+
+/// How often the writer task refreshes `parquet_s3_channel_available`.
+///
+/// Fixed and short, independent of `flush_interval`: this gauge is the
+/// recommended queue-depth alert signal, and a channel can fill and drain many
+/// times inside one 900-second flush interval. One timer wakeup per second per
+/// writer, with no per-record cost in the drain loop.
+const CHANNEL_GAUGE_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Row-count threshold at which a partition's live (in-progress) amortized
 /// builder is force-materialized into a real, stored `RecordBatch` entry,
 /// independent of any flush. Bounds two things: the maximum size of a
@@ -804,6 +824,13 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         }
     }
 
+    /// Rows currently buffered across every partition, including any live
+    /// amortized builder. Used to report how much data is at stake when the
+    /// shutdown path begins its final flush.
+    pub(crate) fn total_buffered_rows(&self) -> usize {
+        self.buffers.values().map(|b| b.row_count).sum()
+    }
+
     /// Drain all in-flight background flushes to completion, applying each
     /// outcome as it arrives. Used at graceful shutdown (so the writer's
     /// `JoinHandle` doesn't complete while a flush is still outstanding —
@@ -1136,6 +1163,10 @@ pub struct ParquetWriterHandle<S: ParquetSink> {
     /// per-clone throttle state would reset constantly and restore the log
     /// storm.
     drop_log: Arc<DropLogThrottles>,
+    /// Bounded wait applied by `send_or_drop`. A field rather than a bare
+    /// constant so tests can shorten it — otherwise every test that must
+    /// observe the drop-after-timeout path would stall for 5 real seconds.
+    send_timeout: Duration,
 }
 
 impl<S: ParquetSink> ParquetWriterHandle<S> {
@@ -1194,6 +1225,16 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                 descriptor_sink,
             );
             let mut ticker = tokio::time::interval(flush_check);
+            // Separate, deliberately short ticker for the channel-depth gauge.
+            // It used to ride on `ticker`, whose period is
+            // `flush_check_interval(flush_interval)` -- 900s at every source's
+            // default `flush_interval_secs`, which makes a queue-depth alert
+            // useless (the spec recommends alerting on this gauge). One
+            // timer wakeup per second per writer is cheap; sampling it on the
+            // `recv` arm instead would be per-record work in the hot loop and
+            // would freeze the gauge at its last value whenever traffic stops,
+            // exactly when a stuck-full channel most needs reporting.
+            let mut gauge_ticker = tokio::time::interval(CHANNEL_GAUGE_INTERVAL);
             loop {
                 tokio::select! {
                     msg = rx.recv() => {
@@ -1215,16 +1256,43 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                                 // merged back for the final flush below to
                                 // pick up), THEN flush whatever remains.
                                 writer.drain_pending_flushes().await;
+                                let at_risk = writer.total_buffered_rows();
+                                tracing::info!(
+                                    source,
+                                    target,
+                                    buffered_rows = at_risk,
+                                    "parquet_s3 writer shutting down; flushing buffered rows"
+                                );
                                 if let Err(e) = writer.flush_all().await {
-                                    tracing::warn!(source, target, "parquet_s3 flush_all on shutdown: {e}");
+                                    // `at_risk` is the PRE-flush count, so it
+                                    // overstates loss whenever `flush_all`
+                                    // partially succeeded; the count still
+                                    // buffered afterwards is what was actually
+                                    // lost. Both are reported, named for what
+                                    // they are.
+                                    tracing::warn!(
+                                        source,
+                                        target,
+                                        rows_before_flush = at_risk,
+                                        rows_still_buffered = writer.total_buffered_rows(),
+                                        "parquet_s3 flush_all on shutdown: {e}"
+                                    );
                                 }
                                 break;
                             }
                         }
                     }
-                    _ = ticker.tick() => {
+                    _ = gauge_ticker.tick() => {
                         metrics::gauge!("parquet_s3_channel_available", "source" => source, "target" => target)
                             .set(rx.capacity() as f64);
+                        // Depth, not headroom: `available` alone cannot be read
+                        // as a volume without knowing each channel's configured
+                        // capacity, and shutdown wants exactly that volume (see
+                        // `await_handles_with_deadline`'s caller in main.rs).
+                        metrics::gauge!("parquet_s3_channel_queued", "source" => source, "target" => target)
+                            .set(capacity.saturating_sub(rx.capacity()) as f64);
+                    }
+                    _ = ticker.tick() => {
                         writer.update_buffer_gauges();
                         // flush_all_if_needed() always returns Ok now (flush failures surface
                         // async via apply_flush_outcome) -- kept as Result to avoid churning
@@ -1258,6 +1326,7 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                 target,
                 flush_interval: handle_flush_interval,
                 drop_log: Arc::new(DropLogThrottles::new()),
+                send_timeout: SEND_TIMEOUT_DEFAULT,
             },
             handle,
         )
@@ -1280,6 +1349,69 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
         record: S::Record,
     ) -> Result<(), tokio::sync::mpsc::error::TrySendError<S::Record>> {
         match self.tx.try_send(record) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                metrics::counter!("parquet_s3_dropped", "source" => self.source, "target" => self.target)
+                    .increment(1);
+                Err(e)
+            }
+        }
+    }
+
+    /// Override the bounded-wait timeout used by `send_or_drop`. Test seam.
+    #[must_use]
+    pub fn with_send_timeout(mut self, timeout: Duration) -> Self {
+        self.send_timeout = timeout;
+        self
+    }
+
+    /// Test seam (like `with_send_timeout`): build a handle around a
+    /// caller-supplied `Sender` whose receiver the caller controls (and may
+    /// simply never poll). Other modules' overflow tests -- including
+    /// integration tests, which compile against this crate without
+    /// `cfg(test)` and so cannot see `#[cfg(test)]`-gated items -- need
+    /// this to genuinely stall a channel: going through `start()`'s real
+    /// writer task doesn't work for that purpose, because `push()` never
+    /// awaits the upload (flushes are spawned into `flush_tasks`, decoupled
+    /// from the channel-draining loop -- see `try_flush_partition_async`),
+    /// so a real writer drains a healthy channel in microseconds regardless
+    /// of how broken the sink is, and a capacity-1 channel never actually
+    /// stays full long enough to time out.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_test(
+        tx: tokio::sync::mpsc::Sender<S::Record>,
+        source: &'static str,
+        target: &'static str,
+    ) -> Self {
+        Self {
+            tx,
+            source,
+            target,
+            flush_interval: LiveInterval::new(Duration::from_secs(900)),
+            drop_log: Arc::new(DropLogThrottles::new()),
+            send_timeout: SEND_TIMEOUT_DEFAULT,
+        }
+    }
+
+    /// Send one record, waiting up to `send_timeout` for channel capacity.
+    ///
+    /// This is the backpressure-aware counterpart to `try_send`, for sources
+    /// whose transport can absorb the wait: awaiting here stops the caller's
+    /// per-connection task from reading its socket, which closes the TCP
+    /// window and pushes the queue back to the sender. Only use it from a task
+    /// that owns a single connection — never from a task shared across
+    /// connections or transports (see the spec's §3.1 note on syslog).
+    ///
+    /// On timeout or a closed channel the record is dropped and
+    /// `parquet_s3_dropped{source,target}` is incremented, exactly as
+    /// `try_send` does, so the existing safety valve and metrics are unchanged.
+    #[must_use = "callers should log or handle the error to avoid silent record loss"]
+    pub async fn send_or_drop(
+        &self,
+        record: S::Record,
+    ) -> Result<(), tokio::sync::mpsc::error::SendTimeoutError<S::Record>> {
+        match self.tx.send_timeout(record, self.send_timeout).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 metrics::counter!("parquet_s3_dropped", "source" => self.source, "target" => self.target)
@@ -1947,6 +2079,49 @@ max_partitions = 128
         assert_eq!(w.buffers.get("").unwrap().row_count, 4);
     }
 
+    /// `total_buffered_rows()` starts at zero and sums row counts across
+    /// every partition -- used at shutdown to report how much data is at
+    /// stake before the final flush. Uses a genuinely partitioning sink (two
+    /// distinct partition keys) so the test can't pass by summing only one
+    /// partition's `row_count`.
+    #[tokio::test]
+    async fn total_buffered_rows_sums_every_partition() {
+        struct TwoPartitionMock;
+        impl ParquetSink for TwoPartitionMock {
+            type Record = (String, String); // (partition, value)
+            fn source(&self) -> &'static str {
+                "test"
+            }
+            fn partition(&self, r: &(String, String)) -> Option<String> {
+                Some(r.0.clone())
+            }
+            fn schema(&self, _p: Option<&str>) -> Arc<Schema> {
+                test_schema()
+            }
+            fn to_record_batch(
+                &self,
+                r: &(String, String),
+                schema: &Arc<Schema>,
+            ) -> anyhow::Result<RecordBatch> {
+                let col = Arc::new(StringArray::from(vec![r.1.as_str()]));
+                Ok(RecordBatch::try_new(schema.clone(), vec![col])?)
+            }
+        }
+
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(usize::MAX); // never flush during the test
+        let mut w = PartitionedParquetWriter::new(TwoPartitionMock, s3, cfg, policy);
+        assert_eq!(w.total_buffered_rows(), 0);
+        w.push(("p1".to_string(), "a".to_string())).await.unwrap();
+        w.push(("p2".to_string(), "b".to_string())).await.unwrap();
+        assert_eq!(
+            w.buffers.len(),
+            2,
+            "records must land in distinct partitions"
+        );
+        assert_eq!(w.total_buffered_rows(), 2);
+    }
+
     /// Proves `PartitionedParquetWriter` is destination-agnostic: an in-memory
     /// `UploadSink` (not `S3Sink`) receives the flushed bytes.
     struct RecordingSink {
@@ -2328,6 +2503,197 @@ max_partitions = 128
             .await
             .expect("join within timeout")
             .expect("task did not panic");
+    }
+
+    #[tokio::test]
+    async fn send_or_drop_delivers_when_capacity_is_available() {
+        let s3 = unreachable_s3().await;
+        let (mut cfg, policy) = test_config(10_000);
+        cfg.channel_capacity = 4;
+        let (handle, _task) = ParquetWriterHandle::start(MockSink, s3, cfg, policy);
+        assert!(handle.send_or_drop("hello".to_string()).await.is_ok());
+    }
+
+    /// Exercises `ParquetWriterHandle::send_or_drop`'s actual timeout path
+    /// (not a bare `tokio::mpsc::Sender`): a hand-built handle around a
+    /// capacity-1 channel whose receiver is held but never polled, so the
+    /// channel genuinely never drains (no writer task to race against).
+    /// Proves three things the vacuous predecessor test proved none of:
+    /// `send_or_drop` itself times out, the dropped record is handed back
+    /// in the error (no silent swallow), and `parquet_s3_dropped` is
+    /// incremented by the production code. Also exercises `with_send_timeout`,
+    /// which was otherwise dead.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn send_or_drop_times_out_and_reports_full_when_the_writer_never_drains() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        // Capacity 1, receiver bound but never polled: the first send fills
+        // the channel and it stays full for the rest of the test.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
+        tx.try_send("first".to_string()).unwrap();
+        let handle = ParquetWriterHandle::<MockSink> {
+            tx,
+            source: "test",
+            target: "s3",
+            flush_interval: LiveInterval::new(Duration::from_secs(900)),
+            drop_log: Arc::new(DropLogThrottles::new()),
+            send_timeout: SEND_TIMEOUT_DEFAULT,
+        }
+        .with_send_timeout(Duration::from_millis(50));
+
+        let start = std::time::Instant::now();
+        let err = handle
+            .send_or_drop("second".to_string())
+            .await
+            .expect_err("must time out against a full, undrained channel");
+        assert!(start.elapsed() >= Duration::from_millis(50));
+        // Upper bound: proves the shortened per-handle timeout (50ms) was
+        // actually honoured, not `SEND_TIMEOUT_DEFAULT` (5s) hardcoded in
+        // place of `self.send_timeout` -- that mutation would still pass the
+        // lower-bound assertion above, just five seconds slower.
+        assert!(start.elapsed() < Duration::from_millis(500));
+
+        match err {
+            tokio::sync::mpsc::error::SendTimeoutError::Timeout(record) => {
+                assert_eq!(
+                    record, "second",
+                    "the dropped record must be handed back, not silently swallowed"
+                );
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+
+        let key = CompositeKey::new(
+            MetricKind::Counter,
+            metrics::Key::from_parts(
+                "parquet_s3_dropped",
+                vec![
+                    metrics::Label::new("source", "test"),
+                    metrics::Label::new("target", "s3"),
+                ],
+            ),
+        );
+        let dropped = snapshotter
+            .snapshot()
+            .into_hashmap()
+            .get(&key)
+            .map(|(_, _, v)| {
+                if let DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            dropped, 1,
+            "parquet_s3_dropped{{source=\"test\",target=\"s3\"}} should be incremented by send_or_drop on timeout"
+        );
+    }
+
+    /// The other half of `send_or_drop`'s error path: a **closed** channel.
+    /// It is not a slow variant of the timeout case — `send_timeout` on a
+    /// dead receiver returns `Closed` immediately, waiting zero time, which
+    /// is why the Zeek/Suricata drop warnings must not name a duration. This
+    /// was the one untested branch and it was the one logging the wrong line.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn send_or_drop_returns_closed_immediately_when_the_writer_is_gone() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        // Receiver dropped == writer task dead. Capacity is irrelevant.
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(8);
+        drop(rx);
+        let handle = ParquetWriterHandle::<MockSink> {
+            tx,
+            source: "test",
+            target: "s3",
+            flush_interval: LiveInterval::new(Duration::from_secs(900)),
+            drop_log: Arc::new(DropLogThrottles::new()),
+            send_timeout: SEND_TIMEOUT_DEFAULT, // 5s, and none of it is spent
+        };
+
+        let start = std::time::Instant::now();
+        let err = handle
+            .send_or_drop("orphan".to_string())
+            .await
+            .expect_err("a closed channel must fail");
+        let elapsed = start.elapsed();
+
+        match err {
+            tokio::sync::mpsc::error::SendTimeoutError::Closed(record) => {
+                assert_eq!(
+                    record, "orphan",
+                    "the dropped record must be handed back, not silently swallowed"
+                );
+            }
+            other => panic!("expected Closed, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "Closed must return without waiting out send_timeout; took {elapsed:?}"
+        );
+        let key = CompositeKey::new(
+            MetricKind::Counter,
+            metrics::Key::from_parts(
+                "parquet_s3_dropped",
+                vec![
+                    metrics::Label::new("source", "test"),
+                    metrics::Label::new("target", "s3"),
+                ],
+            ),
+        );
+        let dropped = snapshotter
+            .snapshot()
+            .into_hashmap()
+            .get(&key)
+            .map(|(_, _, v)| {
+                if let DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            dropped, 1,
+            "parquet_s3_dropped must be incremented on the closed branch too"
+        );
+    }
+
+    /// The channel-depth gauges are the recommended queue-depth alert signal,
+    /// so their cadence must stay short and, crucially, independent of
+    /// `flush_check_interval` — which is 900s at every source's default
+    /// `flush_interval_secs`.
+    #[test]
+    fn channel_gauge_interval_is_short_and_independent_of_the_flush_interval() {
+        assert!(CHANNEL_GAUGE_INTERVAL <= Duration::from_secs(5));
+        assert_ne!(
+            CHANNEL_GAUGE_INTERVAL,
+            crate::forwarding::s3_sink::flush_check_interval(Duration::from_secs(
+                default_flush_interval_secs()
+            ))
+        );
+    }
+
+    #[test]
+    fn send_timeout_default_is_five_seconds() {
+        assert_eq!(SEND_TIMEOUT_DEFAULT, Duration::from_secs(5));
     }
 
     /// I3: channel-overflow metric is now incremented by the PRODUCTION `try_send` path,

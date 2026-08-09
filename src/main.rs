@@ -580,10 +580,12 @@ async fn async_main() -> anyhow::Result<()> {
         warn!("Failed to send shutdown signal: {e}");
     }
 
-    // 2. Wait briefly for listeners to exit (they hold the last Arc<dyn Handler> clones).
-    //    After listeners exit (or are aborted), the Arc refcount drops to zero,
-    //    the Sender inside each S3 handler is dropped, the channel closes,
-    //    and the writer task flushes then exits.
+    // 2. Wait briefly for listeners to exit. Each listener's accept loop holds
+    //    Arc<dyn Handler> clones, so aborting it releases those — but for Zeek
+    //    and Suricata it does NOT release every clone: each accepted connection
+    //    runs in a detached `tokio::spawn` holding its own clone
+    //    (`zeek/listener.rs:107-117`), and nothing here signals or aborts those
+    //    tasks. See step 3.
     //
     //    R-2: Capture abort_handle() before awaiting so that a timed-out
     //    listener task is truly cancelled (not just detached).
@@ -604,11 +606,21 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
 
-    // 3. The handler Arcs created in this function were moved into the listener tasks.
-    //    With the listener tasks finished (or aborted), the Arc refcounts hit zero,
-    //    the Senders drop, and the writer channels close.
-    //    Now await all writer tasks (plus the optional WEF worker) with a shared
-    //    10s combined timeout via `await_handles_with_deadline`.
+    // 3. Await all writer tasks (plus the optional WEF worker) with a shared 10s
+    //    combined timeout via `await_handles_with_deadline`.
+    //
+    //    A writer task only returns once its channel closes, i.e. once the LAST
+    //    Sender drops. That happens promptly for sources whose handler Arcs live
+    //    solely in the listener task just aborted. It does NOT happen for Zeek or
+    //    Suricata while any sensor holds its TCP connection open: those
+    //    per-connection tasks are detached and keep an Arc<dyn Handler>, so the
+    //    channel stays open, the writer keeps looping, and the 10s deadline below
+    //    expires with the warning rather than a clean flush. The buffered rows are
+    //    then whatever the last periodic flush did not cover.
+    //
+    //    Fixing that means giving connection tasks a shutdown signal or tracked
+    //    JoinHandles — a lifetime change deliberately out of scope here; recorded
+    //    in the final review of `feat/ingest-backpressure`.
     info!("Waiting for S3 writer tasks to flush (up to 10s)...");
 
     // 4. Gap-b: Bundle the WEF→S3 Parquet worker handle (if present) into the
@@ -622,9 +634,21 @@ async fn async_main() -> anyhow::Result<()> {
     let total = all_writer_handles.len();
     let completed = await_handles_with_deadline(all_writer_handles, Duration::from_secs(10)).await;
     if completed < total {
+        // Say *how much*, not just "some". The unfinished writers are still
+        // running and still refreshing `parquet_s3_channel_queued` once a
+        // second, so reading it back out of the recorder (the same trick
+        // `profiling::maybe_start` uses above) gives a near-live figure with no
+        // cross-task plumbing. `None` when the metrics server is disabled, and
+        // it counts records still in the channels — not rows already moved into
+        // a writer's partition buffers, which no live gauge tracks.
+        let queued = logthing::server::METRICS_HANDLE.get().and_then(|h| {
+            logthing::profiling::parse_counter(&h.render(), "parquet_s3_channel_queued")
+        });
         warn!(
+            queued_records = queued,
             "S3 writer flush timed out after 10s; {}/{} tasks finished — some data may not have been written",
-            completed, total,
+            completed,
+            total,
         );
     }
 
