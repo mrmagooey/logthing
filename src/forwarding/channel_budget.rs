@@ -1,4 +1,4 @@
-//! Per-source bounded-channel sizing from a fixed memory budget.
+//! Bounded-channel sizing from a fixed per-channel memory budget.
 //!
 //! `channel_capacity` is expressed in **records**, but the operational
 //! constraint is **bytes**: a Zeek record and an IPFIX datagram's worth of
@@ -8,13 +8,44 @@
 //!
 //! The per-record figures below are **measured**, not guessed — see the tests
 //! at the bottom of this file, which rebuild a representative record for each
-//! type and fail if the constant has drifted by more than 2x. A memory ceiling
-//! computed from an unverified divisor is fiction, and adding a field to a
-//! record type would otherwise silently inflate the real ceiling.
+//! type and fail if the constant has drifted by more than 2x, and
+//! `tests/channel_budget_allocator.rs`, which checks the *estimator* those
+//! tests use against a counting global allocator. A memory ceiling computed
+//! from an unverified divisor is fiction, and adding a field to a record type
+//! would otherwise silently inflate the real ceiling.
+//!
+//! Each constant is the measured figure **rounded up to the next 256 bytes**.
+//! Rounding up is the conservative direction (a bigger divisor means a smaller
+//! capacity means less memory), and 256 B is fine enough not to throw away
+//! most of a channel the way rounding to the next power of two does.
+//!
+//! # The budget is per *channel*, not per source
+//!
+//! `CHANNEL_BUDGET_BYTES` bounds **one** bounded mpsc channel. A source
+//! configured with both `.s3` and `.local` gets two independent
+//! `ParquetWriterHandle`s — two channels — and the `Multi*Handler` fan-out
+//! `record.clone()`s into each, so those really are two distinct copies of
+//! every record, not two references to one. Syslog can reach three (`.s3`,
+//! `.local`, and `structured_s3` when `parse_payloads` is on).
+//!
+//! A deployment with every source enabled and every destination configured
+//! therefore has 15 channels — zeek 2, suricata 2, syslog 3, sflow 2, ipfix 2,
+//! HEC/OTLP 2 (OTLP shares HEC's handles), WEF 2 — for a **~1.46 GiB**
+//! worst-case ceiling, not 100 MiB and not 700 MiB. One exception: WEF queues
+//! `Arc<WindowsEvent>` and clones the same `Arc` into both of its channels, so
+//! its two channels share one set of pointees and the true WEF worst case is
+//! ~100 MiB rather than 200 MiB, putting the realistic ceiling at ~1.37 GiB.
+//!
+//! That is a ceiling, not a reservation (see `CHANNEL_BUDGET_BYTES`): only
+//! Zeek and Suricata apply backpressure and so are the only channels *designed*
+//! to dwell near capacity, ~200 MiB per configured destination pair.
 //!
 //! See `docs/superpowers/specs/2026-08-07-ingest-backpressure-design.md` §4.
 
-/// Memory budget for one source's bounded channel, in bytes.
+/// Memory budget for **one** bounded channel, in bytes.
+///
+/// Per channel, not per source: see this module's header for what a
+/// fully-configured deployment adds up to.
 ///
 /// This is a **ceiling, not a reservation**: tokio's bounded mpsc allocates
 /// its buffer lazily in blocks, so an idle or healthy channel costs nearly
@@ -34,13 +65,58 @@ pub const fn capacity_for(bytes_per_record: usize) -> usize {
     if n == 0 { 1 } else { n }
 }
 
+/// Bytes of `BTreeMap<String, Value>` **node** allocations for `entries` entries.
+///
+/// This crate does not enable serde_json's `preserve_order` feature, so
+/// `Value::Object` is a `BTreeMap`, and a B-tree's dominant allocation is its
+/// nodes, not its entries. std uses `B = 6`, so one node holds up to 11
+/// entries in `[MaybeUninit<String>; 11]` / `[MaybeUninit<Value>; 11]` arrays
+/// that are allocated in full whether or not they are occupied — a 5-key
+/// object therefore costs the same 632 bytes as an 11-key one. The `String`
+/// and `Value` structs themselves live *inside* those arrays, which is why
+/// the per-entry term below counts only `k.capacity()` and the value's own
+/// heap, never `size_of::<String>()` or `size_of::<Value>()`.
+///
+/// Node counts assume packed nodes (`entries / 11`), which is the floor: a map
+/// built by repeated insertion can leave nodes about half full after a split,
+/// so this can understate by up to ~2x for maps large enough to have split.
+/// Accepted — the accuracy contract is 2x, and every fixture measured in
+/// `tests/channel_budget_allocator.rs` lands on the exact byte.
+fn btreemap_node_bytes(entries: usize) -> usize {
+    // An empty `BTreeMap` allocates no root node at all.
+    if entries == 0 {
+        return 0;
+    }
+    const NODE_ENTRIES: usize = 11; // 2 * B - 1, B = 6
+    // `LeafNode`: parent pointer + parent_idx + len, padded to pointer
+    // alignment, then the two fully-allocated arrays.
+    let leaf = std::mem::size_of::<usize>()
+        + std::mem::size_of::<usize>()
+        + NODE_ENTRIES * (std::mem::size_of::<String>() + std::mem::size_of::<serde_json::Value>());
+    // `InternalNode` is a `LeafNode` plus one child pointer per subtree.
+    let internal = leaf + (NODE_ENTRIES + 1) * std::mem::size_of::<usize>();
+
+    let mut nodes = entries.div_ceil(NODE_ENTRIES);
+    let mut total = nodes * leaf;
+    while nodes > 1 {
+        nodes = nodes.div_ceil(NODE_ENTRIES + 1);
+        total += nodes * internal;
+    }
+    total
+}
+
 /// Heap bytes owned by a `serde_json::Value`, following nesting.
 ///
-/// Approximate by design (per-entry map overhead is not modelled exactly) —
-/// the 2x drift tolerance in the tests is the accuracy contract. This crate
-/// does not enable serde_json's `preserve_order` feature, so `Value::Object`
-/// is backed by a `BTreeMap`; we do not attempt to model its per-node
-/// allocation overhead, only the key/value bytes it owns.
+/// Three allocation sources are modelled: a `String`'s buffer, an array's
+/// `Vec` buffer, and an object's `BTreeMap` nodes (see `btreemap_node_bytes`,
+/// which is where most of an object's bytes actually live — omitting it
+/// undercounted real allocation by 2.4-3.1x).
+///
+/// Verified against a counting global allocator in
+/// `tests/channel_budget_allocator.rs`, which fails if this estimate drifts
+/// from real allocation. The 2x drift tolerance in this file's tests is the
+/// accuracy contract for the *constants*; that test is the contract for the
+/// estimator itself.
 pub fn json_heap_bytes(v: &serde_json::Value) -> usize {
     use serde_json::Value;
     match v {
@@ -50,50 +126,60 @@ pub fn json_heap_bytes(v: &serde_json::Value) -> usize {
             a.capacity() * std::mem::size_of::<Value>()
                 + a.iter().map(json_heap_bytes).sum::<usize>()
         }
-        Value::Object(m) => m
-            .iter()
-            .map(|(k, val)| k.capacity() + std::mem::size_of::<Value>() + json_heap_bytes(val))
-            .sum(),
+        Value::Object(m) => {
+            btreemap_node_bytes(m.len())
+                + m.iter()
+                    .map(|(k, val)| k.capacity() + json_heap_bytes(val))
+                    .sum::<usize>()
+        }
     }
 }
 
 /// Measured heap footprint of one `ZeekRecord` carrying a representative
-/// `conn` log line: 990 bytes measured, rounded up to 1024. See
-/// `measured_zeek_record_bytes_matches_constant`.
-pub const ZEEK_RECORD_BYTES: usize = 1024;
+/// `conn` log line: 2310 bytes measured, rounded up to 2560. See
+/// `measured_zeek_record_bytes_matches_constant`. Most of it is the 21-key
+/// `fields` object's BTreeMap nodes (1992 of 2234 JSON bytes), not the field
+/// text.
+pub const ZEEK_RECORD_BYTES: usize = 2560;
 
 /// Measured heap footprint of one `SuricataRecord` carrying a representative
-/// `alert` event: 1590 bytes measured, rounded up to 2048. Same shape as
+/// `alert` event: 4454 bytes measured, rounded up to 4608. Same shape as
 /// `ZeekRecord` (String + Value + DateTime), but larger — EVE `alert` events
 /// carry nested `alert`/`http`/`flow` sub-objects that a Zeek `conn` line does
-/// not.
-pub const SURICATA_RECORD_BYTES: usize = 2048;
+/// not, and each nested object costs a BTreeMap node of its own.
+pub const SURICATA_RECORD_BYTES: usize = 4608;
 
-/// Measured heap footprint of one `GenericRecord` (HEC/NDJSON, OTLP): 353
-/// bytes measured for a representative HEC event, rounded up to 512.
-pub const GENERIC_RECORD_BYTES: usize = 512;
+/// Measured heap footprint of one `GenericRecord` (HEC/NDJSON, OTLP): 825
+/// bytes measured for a representative HEC event, rounded up to 1024.
+pub const GENERIC_RECORD_BYTES: usize = 1024;
 
 /// Measured heap footprint of one `SyslogMessage`: 697 bytes measured for a
-/// representative RFC 5424 message with structured data, rounded up to 1024.
-pub const SYSLOG_MESSAGE_BYTES: usize = 1024;
+/// representative RFC 5424 message with structured data, rounded up to 768.
+/// Unaffected by the BTreeMap correction — `SyslogMessage` carries `HashMap`s,
+/// not `serde_json::Value`.
+pub const SYSLOG_MESSAGE_BYTES: usize = 768;
 
 /// Measured heap footprint of one `SflowRecord` — a flat, fixed-size struct
 /// with no owned heap besides `extra` (empty for curated samples), so this is
-/// `size_of` plus slack: 256 bytes measured, already clean.
+/// `size_of` alone: 256 bytes measured, already a multiple of 256. A sample
+/// that did populate `extra` would cost a BTreeMap node (~632 B) on top;
+/// unmodelled, and the only constant here with no rounding headroom.
 pub const SFLOW_RECORD_BYTES: usize = 256;
 
 /// Measured footprint of one IPFIX channel message, which is a `Vec<FlowRecord>`
-/// holding **all flows from one UDP datagram**: 4184 bytes measured for the
+/// holding **all flows from one UDP datagram**: 8904 bytes measured for the
 /// 10-flow representative datagram used by this repo's IPFIX fixtures — each
 /// flow carrying a handful of non-curated IEs in `extra` (ToS, TTLs,
 /// flow-end reason, biflow direction), as a real export template does —
-/// rounded up to 8192.
+/// rounded up to 9216. Note that a *non-empty* `extra` costs a whole 632-byte
+/// BTreeMap node per flow whatever its key count, which is why five small
+/// integer IEs cost 696 bytes each.
 ///
 /// **Average-case, not a ceiling.** Flows-per-datagram is variable; this uses a
 /// representative count from the repo's IPFIX test fixtures. Datagrams denser
 /// than that average will push this source past `CHANNEL_BUDGET_BYTES`. Known
 /// and accepted limitation — see the spec §4.3.
-pub const IPFIX_DATAGRAM_BYTES: usize = 8192;
+pub const IPFIX_DATAGRAM_BYTES: usize = 9216;
 
 /// Measured footprint of one `Arc<WindowsEvent>` — the **pointee**, not the
 /// 8-byte pointer in the channel slot. Each queued `Arc` is a distinct event;
@@ -103,8 +189,10 @@ pub const IPFIX_DATAGRAM_BYTES: usize = 8192;
 /// plus a populated `ParsedEvent.message` (real events are parsed on receipt,
 /// not left `None` — see `measured_wef_event_bytes_counts_the_pointee_not_the_pointer`):
 /// 12146 bytes measured for a ~5.6KB raw event with a representative parsed
-/// Security-log message, rounded up to 16384.
-pub const WEF_EVENT_BYTES: usize = 16384;
+/// Security-log message, rounded up to 12288. Unaffected by the BTreeMap
+/// correction — the dominant `raw_xml`/`message` are plain `String`s and
+/// `ParsedEvent.data` is always `None` on the real path.
+pub const WEF_EVENT_BYTES: usize = 12288;
 
 #[cfg(test)]
 mod tests {
@@ -130,6 +218,24 @@ mod tests {
         // Two string values (10 + 3) plus key capacities (1 + 1 + 1); the exact
         // total depends on allocator slack, so assert a sane lower bound only.
         assert!(json_heap_bytes(&v) >= 16, "got {}", json_heap_bytes(&v));
+    }
+
+    /// The term the pre-correction estimator missed entirely: an object's
+    /// bytes are dominated by BTreeMap nodes, which are allocated whole.
+    #[test]
+    fn json_heap_bytes_counts_btreemap_nodes_not_just_entries() {
+        assert_eq!(json_heap_bytes(&serde_json::json!({})), 0);
+        let one_key = json_heap_bytes(&serde_json::json!({"a": 1}));
+        assert!(
+            one_key > 600,
+            "a single-key object still pays for a whole node; got {one_key}"
+        );
+        // Eleven keys fit in that same node, so the only growth is key bytes.
+        let eleven_keys = json_heap_bytes(&serde_json::json!({
+            "a": 1, "b": 1, "c": 1, "d": 1, "e": 1, "f": 1,
+            "g": 1, "h": 1, "i": 1, "j": 1, "k": 1
+        }));
+        assert_eq!(eleven_keys, one_key + 10);
     }
 
     #[test]

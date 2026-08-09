@@ -258,7 +258,8 @@ secret_key = "minioadmin"
 prefix     = "syslog"          # slash-free; builder inserts /
 max_buffer_rows = 10000        # flush when this many rows buffered (default 10 000)
 flush_interval_secs = 900      # flush every N seconds regardless of row count (default 900)
-channel_capacity = 4096        # bounded channel between listener and writer (default 4096)
+channel_capacity = 136533      # bounded channel between listener and writer
+                               # (default: 100 MiB budget / 768 B per message)
 ```
 
 **Note — `parse_dns` and `[syslog.s3]` are currently mutually exclusive.**
@@ -321,7 +322,8 @@ secret_key            = "minioadmin"
 prefix                = "ipfix"          # slash-free; builder inserts /
 flush_threshold_bytes = 104857600        # flush when buffer reaches 100 MiB (default)
 flush_interval_secs   = 900             # flush every N seconds regardless of size (default 900)
-channel_capacity      = 256             # bounded channel between listener and writer (default 256)
+channel_capacity      = 11377           # bounded channel between listener and writer
+                                        # (default: 100 MiB budget / 9216 B per datagram)
 max_buffer_rows       = 100000          # hard-cap rows before oldest are dropped (default 100 000)
 ```
 
@@ -371,7 +373,8 @@ secret_key            = "minioadmin"
 prefix                = "zeek"           # slash-free; builder inserts /  (default: "zeek")
 flush_threshold_bytes = 104857600        # flush when buffer reaches 100 MiB (default)
 flush_interval_secs   = 900             # flush every N seconds regardless of size (default 900)
-channel_capacity      = 256             # bounded channel between listener and writer (default 256)
+channel_capacity      = 40960           # bounded channel between listener and writer
+                                        # (default: 100 MiB budget / 2560 B per record)
 max_buffer_rows       = 100000          # hard-cap rows before oldest are dropped (default 100 000)
 ```
 
@@ -414,7 +417,8 @@ secret_key            = "minioadmin"
 # prefix defaults to "" (empty) — preserves event_type=.../year=... layout at root
 flush_threshold_bytes = 104857600        # flush when buffer reaches 100 MiB (default)
 flush_interval_secs   = 900             # flush every N seconds regardless of size (default 900)
-channel_capacity      = 10000           # bounded channel depth (default 10 000)
+channel_capacity      = 22755           # bounded channel depth
+                                        # (default: 100 MiB budget / 4608 B per record)
 max_buffer_rows       = 100000          # hard-cap rows before oldest are dropped (default 100 000)
 ```
 

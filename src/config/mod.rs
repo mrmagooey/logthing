@@ -301,7 +301,7 @@ fn default_zeek_flush_bytes() -> usize {
 fn default_zeek_flush_secs() -> u64 {
     900
 }
-/// Bounded channel depth, derived from the shared 100 MiB per-source budget
+/// Bounded channel depth, derived from the shared 100 MiB per-channel budget
 /// (`channel_budget::CHANNEL_BUDGET_BYTES`) and the measured per-record
 /// footprint. Was a hardcoded 256 — roughly 60-250 ms of burst headroom,
 /// which is what caused the production channel-full drops.
@@ -409,7 +409,7 @@ fn default_suricata_flush_bytes() -> usize {
 fn default_suricata_flush_secs() -> u64 {
     900
 }
-/// Bounded channel depth, derived from the shared 100 MiB per-source budget
+/// Bounded channel depth, derived from the shared 100 MiB per-channel budget
 /// (`channel_budget::CHANNEL_BUDGET_BYTES`) and the measured per-record
 /// footprint. Was a hardcoded 256 — roughly 60-250 ms of burst headroom,
 /// which is what caused the production channel-full drops.
@@ -477,7 +477,7 @@ fn default_wef_flush_bytes() -> usize {
 fn default_wef_flush_secs() -> u64 {
     900
 }
-/// Bounded channel depth, derived from the shared 100 MiB per-source budget
+/// Bounded channel depth, derived from the shared 100 MiB per-channel budget
 /// (`channel_budget::CHANNEL_BUDGET_BYTES`) and the measured per-record
 /// footprint. Was a hardcoded 10_000 — roughly 600ms of burst headroom.
 fn default_wef_channel_capacity() -> usize {
@@ -562,7 +562,7 @@ fn default_hec_flush_bytes() -> usize {
 fn default_hec_flush_secs() -> u64 {
     900
 }
-/// Bounded channel depth, derived from the shared 100 MiB per-source budget
+/// Bounded channel depth, derived from the shared 100 MiB per-channel budget
 /// (`channel_budget::CHANNEL_BUDGET_BYTES`) and the measured per-record
 /// footprint. Was a hardcoded 256 — roughly 60-250 ms of burst headroom,
 /// which is what caused the production channel-full drops.
@@ -765,7 +765,7 @@ fn default_syslog_s3_max_rows() -> usize {
 fn default_syslog_s3_flush_interval_secs() -> u64 {
     900
 }
-/// Bounded channel depth, derived from the shared 100 MiB per-source budget
+/// Bounded channel depth, derived from the shared 100 MiB per-channel budget
 /// (`channel_budget::CHANNEL_BUDGET_BYTES`) and the measured per-message
 /// footprint. Was a hardcoded 4_096 — roughly 4 seconds of burst headroom.
 fn default_syslog_s3_channel_capacity() -> usize {
@@ -831,7 +831,7 @@ fn default_ipfix_flush_bytes() -> usize {
 fn default_ipfix_flush_secs() -> u64 {
     900
 }
-/// Bounded channel depth, derived from the shared 100 MiB per-source budget
+/// Bounded channel depth, derived from the shared 100 MiB per-channel budget
 /// (`channel_budget::CHANNEL_BUDGET_BYTES`) and the measured per-datagram
 /// footprint. Was a hardcoded 256 — roughly 60-250 ms of burst headroom,
 /// which is what caused the production channel-full drops.
@@ -942,7 +942,7 @@ fn default_sflow_flush_bytes() -> usize {
 fn default_sflow_flush_secs() -> u64 {
     900
 }
-/// Bounded channel depth, derived from the shared 100 MiB per-source budget
+/// Bounded channel depth, derived from the shared 100 MiB per-channel budget
 /// (`channel_budget::CHANNEL_BUDGET_BYTES`) and the measured per-record
 /// footprint. Was a hardcoded 256 — roughly 60-250 ms of burst headroom,
 /// which is what caused the production channel-full drops.
