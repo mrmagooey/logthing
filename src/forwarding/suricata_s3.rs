@@ -148,9 +148,18 @@ pub struct MultiSuricataHandler(
 #[async_trait::async_trait]
 impl crate::suricata::listener::SuricataHandler for MultiSuricataHandler {
     async fn handle_record(&self, record: SuricataRecord, source: std::net::SocketAddr) {
-        for handler in &self.0 {
-            handler.handle_record(record.clone(), source).await;
-        }
+        // Concurrent, not sequential: sends now block for up to
+        // SEND_TIMEOUT_DEFAULT, and awaiting destinations in series would let a
+        // stalled S3 target add that latency to an otherwise-healthy local one.
+        // Each destination owns an independent channel and writer with no
+        // shared mutable state, so concurrent polling is safe and total latency
+        // becomes max() instead of sum().
+        futures::future::join_all(
+            self.0
+                .iter()
+                .map(|handler| handler.handle_record(record.clone(), source)),
+        )
+        .await;
     }
 }
 
