@@ -4,6 +4,8 @@ Zeek NDJSON TCP generator for E2E testing.
 
 Connects to logthing's Zeek TCP listener and streams sample NDJSON records:
 - 5 conn records
+- 2 conn records with a rotated `_path` (e.g. "conn.2026-08-14-16-08-44"),
+  simulating a Zeek log-rotation boundary -> must still land under conn/
 - 3 dns records
 - 2 records from an unmodelled stream ("weird") -> routed to unknown/
 - 1 malformed JSON line (must not crash the server)
@@ -43,6 +45,21 @@ def send_records(host, port):
          "orig_pkts": 10 + i, "resp_pkts": 15 + i}
         for i in range(5)
     ]
+    # Rotation-boundary conn records: Zeek shippers emit the rotated archive
+    # filename as `_path` instead of the stable stream name right after a log
+    # rotation. These must still land under the same conn/ prefix as the
+    # records above, not fragment into a separate table.
+    rotated_conn_records = [
+        {"_path": f"conn.2026-08-14-16-{8 + i:02d}-44", "ts": 1700000100.0 + i,
+         "uid": f"CConnRot{i:03d}",
+         "id.orig_h": f"10.1.{i}.1", "id.orig_p": 41000 + i,
+         "id.resp_h": "93.184.216.34", "id.resp_p": 443,
+         "proto": "tcp", "service": "ssl", "duration": 0.2 + i * 0.01,
+         "orig_bytes": 600 + i * 100, "resp_bytes": 5000 + i * 200,
+         "conn_state": "SF", "history": "ShADadFf",
+         "orig_pkts": 12 + i, "resp_pkts": 18 + i}
+        for i in range(2)
+    ]
     dns_records = [
         {"_path": "dns", "ts": 1700001000.0 + i, "uid": f"CDns{i:03d}",
          "id.orig_h": "192.168.1.100", "id.orig_p": 12345 + i,
@@ -58,7 +75,7 @@ def send_records(host, port):
          "name": "data_before_established", "addl": f"extra_data_{i}"}
         for i in range(2)
     ]
-    all_records = conn_records + dns_records + weird_records
+    all_records = conn_records + rotated_conn_records + dns_records + weird_records
 
     with socket.create_connection((host, port)) as sock:
         f = sock.makefile("wb")
