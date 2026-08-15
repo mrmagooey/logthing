@@ -7,6 +7,12 @@ Unmodelled Zeek streams keep their own path (e.g. zeek/weird/); only records
 with a missing _path field (or a log_path that is empty after sanitisation)
 route to zeek/unknown/.
 Downloads each object and validates schema and row count.
+
+The generator also sends a batch of conn records with a rotated `_path`
+(e.g. "conn.2026-08-14-16-08-44"), simulating a Zeek log-rotation boundary.
+Those must be normalized at ingest and land in the same zeek/conn/ prefix as
+the rest -- this verifier asserts no rotation-suffixed sibling prefix (e.g.
+zeek/conn_2026_08_14_16_08_44/) appears alongside it.
 """
 
 import io
@@ -25,7 +31,10 @@ TIMEOUT = int(os.environ.get("E2E_TIMEOUT_SECS", "60"))
 # Expected prefixes and minimum row counts
 EXPECTED_STREAMS = {
     "zeek/conn/": {
-        "min_rows": 5,
+        # 5 conn records + 2 rotation-boundary conn records (rotated `_path`,
+        # e.g. "conn.2026-08-14-16-08-44") that must normalize into this
+        # same prefix rather than fragmenting into their own table.
+        "min_rows": 7,
         "required_columns": ["ts", "uid", "id_orig_h", "id_orig_p",
                               "id_resp_h", "id_resp_p", "proto",
                               "orig_bytes", "conn_state", "_extra"],
@@ -102,10 +111,38 @@ def verify_stream(client, prefix, spec, timeout):
     )
 
 
+def verify_no_conn_rotation_sibling_prefixes(client):
+    """A rotated `_path` (e.g. "conn.2026-08-14-16-08-44") must normalize to
+    the stable "conn" stream at ingest. If normalization regressed, it would
+    sanitize straight through to a distinct S3 prefix like
+    "zeek/conn_2026_08_14_16_08_44/" -- fail loudly if any such sibling
+    prefix exists alongside zeek/conn/."""
+    resp = client.list_objects_v2(Bucket=BUCKET, Prefix="zeek/", Delimiter="/")
+    top_level = [p["Prefix"] for p in resp.get("CommonPrefixes", [])]
+    rotation_siblings = [
+        p for p in top_level if p.startswith("zeek/conn_") or p.startswith("zeek/conn.")
+    ]
+    if rotation_siblings:
+        print(
+            f"ERROR: found rotation-fragmented conn prefixes (log_path "
+            f"normalization regressed): {rotation_siblings}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(f"OK: no rotation-fragmented conn prefixes (saw {sorted(top_level)})")
+
+
 def main():
     client = make_client()
-    for prefix, spec in EXPECTED_STREAMS.items():
-        verify_stream(client, prefix, spec, TIMEOUT)
+    try:
+        for prefix, spec in EXPECTED_STREAMS.items():
+            verify_stream(client, prefix, spec, TIMEOUT)
+    finally:
+        # In `finally` so it still runs when a row-count check exits: on a
+        # normalization regression the rotated records land under their own
+        # prefix, so zeek/conn/ never reaches min_rows and verify_stream exits
+        # first -- this names the actual cause instead of just "too few rows".
+        verify_no_conn_rotation_sibling_prefixes(client)
     print("Zeek S3 verifier succeeded")
     sys.stdout.flush()
     sys.stderr.flush()

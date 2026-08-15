@@ -1,6 +1,6 @@
 //! Zeek TCP NDJSON listener.
 
-use crate::zeek::ZeekRecord;
+use crate::zeek::{ZeekRecord, normalize_log_path};
 use chrono::Utc;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -244,7 +244,7 @@ impl ZeekListener {
                 Ok(value) => {
                     // Extract _path.
                     let log_path = match value.get("_path").and_then(|v| v.as_str()) {
-                        Some(p) => p.to_string(),
+                        Some(p) => normalize_log_path(p).to_string(),
                         None => {
                             metrics::counter!("zeek_missing_path").increment(1);
                             "unknown".to_string()
@@ -394,6 +394,10 @@ mod tests {
             "\n",
             r#"{"_path":"dns","uid":"C2","ts":1700000001.0}"#,
             "\n",
+            // Log-rotation boundary: shippers emit the rotated archive filename
+            // as `_path`. Must normalize back to the stable stream name.
+            r#"{"_path":"conn.2026-08-14-16-08-44","uid":"C3","ts":1700000002.0}"#,
+            "\n",
         );
         stream.write_all(lines.as_bytes()).await.unwrap();
         drop(stream);
@@ -404,12 +408,13 @@ mod tests {
         let records = handler.take_records();
         assert_eq!(
             records.len(),
-            2,
-            "expected 2 records, got {}",
+            3,
+            "expected 3 records, got {}",
             records.len()
         );
         assert_eq!(records[0].log_path, "conn");
         assert_eq!(records[1].log_path, "dns");
+        assert_eq!(records[2].log_path, "conn");
     }
 
     #[tokio::test]

@@ -631,6 +631,66 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Rotation-boundary regression: a rotated `_path` (as the listener now
+    // normalizes it) must land in the typed conn schema/partition, not the
+    // envelope fallback.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn rotated_log_path_accumulates_into_conn_buffer_via_writer() {
+        // End-to-end through PartitionedParquetWriter: a record whose log_path
+        // has already been normalized (as the listener does) must accumulate
+        // into the "conn" buffer using the typed ConnAccumulator, not overflow
+        // into a distinct per-rotation buffer or the envelope fallback.
+        let sink = unreachable_sink().await;
+        let (bwc, policy) = make_zeek_cfg(100_000, usize::MAX, 256);
+        let mut writer = PartitionedParquetWriter::new(ZeekSink, sink, bwc, policy);
+
+        let raw_path = "/logs/conn.2026-08-14-16-08-44.log.gz";
+        let normalized = crate::zeek::normalize_log_path(raw_path).to_string();
+        assert_eq!(normalized, "conn");
+
+        let record = ZeekRecord {
+            log_path: normalized,
+            fields: serde_json::json!({
+                "_path": raw_path,
+                "ts": 1700000000.0,
+                "uid": "CRot2",
+                "id.orig_h": "10.0.0.1",
+                "id.orig_p": 12345,
+                "id.resp_h": "10.0.0.2",
+                "id.resp_p": 80,
+                "proto": "tcp",
+                "conn_state": "SF",
+                "orig_bytes": 512,
+                "resp_bytes": 4096,
+            }),
+            received_at: Utc::now(),
+        };
+        writer.push(record).await.unwrap();
+
+        // Lands in the single stable "conn" buffer — no rotation-suffixed sibling.
+        assert_eq!(
+            writer.buffers.get("conn").map(|b| b.row_count).unwrap_or(0),
+            1,
+            "rotated record must accumulate into the stable 'conn' buffer"
+        );
+        assert_eq!(
+            writer.buffers.len(),
+            1,
+            "no additional per-rotation buffer should have been created"
+        );
+        // Accepted into the typed live builder (ConnAccumulator), not pushed as a
+        // pre-built envelope fallback batch.
+        let buf = writer.buffers.get("conn").unwrap();
+        assert_eq!(
+            buf.live_builder.as_ref().map(|b| b.len()).unwrap_or(0),
+            1,
+            "rotated record must be accepted into the conn live builder (typed path)"
+        );
+    }
+
     #[tokio::test]
     async fn mismatched_raw_log_path_falls_back_to_envelope_not_conn_accumulator() {
         let sink = unreachable_sink().await;
