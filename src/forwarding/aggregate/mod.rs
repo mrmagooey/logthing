@@ -577,6 +577,28 @@ pub fn compile_rules(config: &Config) -> anyhow::Result<Vec<CompiledRule>> {
         if rule.name.trim().is_empty() {
             anyhow::bail!("[[aggregate.rules]] has an empty `name`");
         }
+        // The rule name is spliced verbatim into the output object key
+        // (`AggregateSink::partition` -> `buffered_writer::build_key`), the
+        // same way `ZeekSink` splices a sanitized `_path` — except nothing
+        // sanitizes this one. Restrict it up front rather than sanitizing at
+        // `partition()` time: `AggregateSink::schemas` is keyed by this exact
+        // string, so sanitizing later would need that map re-keyed too.
+        if !rule
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            anyhow::bail!(
+                "[[aggregate.rules]] name '{}' must match [A-Za-z0-9._-]+",
+                rule.name
+            );
+        }
+        if rule.name.chars().all(|c| c == '.') {
+            anyhow::bail!(
+                "[[aggregate.rules]] name '{}' is a dot-only path component",
+                rule.name
+            );
+        }
         if seen.contains(&rule.name.as_str()) {
             anyhow::bail!("duplicate [[aggregate.rules]] name '{}'", rule.name);
         }
@@ -1053,6 +1075,39 @@ mod tests {
             err.contains("sum_n"),
             "error must name the duplicated output column: {err}"
         );
+    }
+
+    #[test]
+    fn compile_rules_rejects_a_path_traversal_rule_name() {
+        let cfg = config_with(vec![raw_rule("../escape", "zeek", &["query"])]);
+        assert!(compile_rules(&cfg).is_err());
+    }
+
+    #[test]
+    fn compile_rules_rejects_a_rule_name_containing_a_slash() {
+        let cfg = config_with(vec![raw_rule("zeek/dns", "zeek", &["query"])]);
+        assert!(compile_rules(&cfg).is_err());
+    }
+
+    #[test]
+    fn compile_rules_rejects_a_dot_only_rule_name() {
+        // No "/" in this name, so it clears the character-class check, but a
+        // rule name of ".." would still splice into the output key as a
+        // literal parent-directory path component.
+        let cfg = config_with(vec![raw_rule("..", "zeek", &["query"])]);
+        assert!(compile_rules(&cfg).is_err());
+    }
+
+    #[test]
+    fn compile_rules_rejects_a_whitespace_only_rule_name() {
+        let cfg = config_with(vec![raw_rule("   ", "zeek", &["query"])]);
+        assert!(compile_rules(&cfg).is_err());
+    }
+
+    #[test]
+    fn compile_rules_accepts_a_rule_name_with_dots_dashes_and_underscores() {
+        let cfg = config_with(vec![raw_rule("dns.by-query_v2", "zeek", &["query"])]);
+        assert!(compile_rules(&cfg).is_ok());
     }
 
     #[test]
