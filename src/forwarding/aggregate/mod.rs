@@ -619,6 +619,34 @@ pub fn compile_rules(config: &Config) -> anyhow::Result<Vec<CompiledRule>> {
             }
         }
 
+        // The Arrow schema is built positionally from this same name list
+        // (`rule_schema`), so a collision doesn't error there — it silently
+        // produces a schema with two identically-named fields. Reading such
+        // a file back by name (`batch.column_by_name`) then returns
+        // whichever field Arrow resolves first, not necessarily the one the
+        // caller meant. Catch it here, at config time, where a message can
+        // name the culprit.
+        let mut output_names: Vec<&str> = Vec::with_capacity(rule.group_by.len() + aggs.len() + 3);
+        output_names.extend(rule.group_by.iter().map(String::as_str));
+        output_names.push("count");
+        output_names.extend(aggs.iter().map(|a| a.column.as_str()));
+        output_names.push("window_start");
+        output_names.push("window_end");
+        let mut seen_names: Vec<&str> = Vec::with_capacity(output_names.len());
+        for name in output_names {
+            if seen_names.contains(&name) {
+                anyhow::bail!(
+                    "[[aggregate.rules]] '{}' produces duplicate output column '{}' \
+                     (check for repeats within `group_by`, and collisions between \
+                     `group_by`/`count`/`window_start`/`window_end` and the \
+                     `sum_`/`min_`/`max_`-prefixed aggregate columns)",
+                    rule.name,
+                    name
+                );
+            }
+            seen_names.push(name);
+        }
+
         let schema = rule_schema(&rule.group_by, &aggs);
         compiled.push(CompiledRule {
             name: Arc::from(rule.name.as_str()),
@@ -991,6 +1019,40 @@ mod tests {
     fn compile_rules_rejects_empty_group_by() {
         let cfg = config_with(vec![raw_rule("r", "zeek", &[])]);
         assert!(compile_rules(&cfg).is_err());
+    }
+
+    #[test]
+    fn compile_rules_rejects_a_group_by_column_named_count() {
+        // group_by = ["count"] collides with the always-present `count`
+        // column: the schema would carry two fields both named "count".
+        let cfg = config_with(vec![raw_rule("r", "zeek", &["count"])]);
+        let err = compile_rules(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("count"),
+            "error must name the colliding column: {err}"
+        );
+    }
+
+    #[test]
+    fn compile_rules_rejects_duplicate_group_by_columns() {
+        let cfg = config_with(vec![raw_rule("r", "zeek", &["query", "query"])]);
+        let err = compile_rules(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("query"),
+            "error must name the duplicated column: {err}"
+        );
+    }
+
+    #[test]
+    fn compile_rules_rejects_duplicate_sum_fields() {
+        let mut rule = raw_rule("r", "zeek", &["proto"]);
+        rule.sum = vec!["n".to_string(), "n".to_string()];
+        let cfg = config_with(vec![rule]);
+        let err = compile_rules(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("sum_n"),
+            "error must name the duplicated output column: {err}"
+        );
     }
 
     #[test]
