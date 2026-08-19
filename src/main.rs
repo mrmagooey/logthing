@@ -85,6 +85,95 @@ async fn async_main() -> anyhow::Result<()> {
             });
 
     // -----------------------------------------------------------------------
+    // Build the aggregator (optional). Rules are validated up front: a bad
+    // rule means a noisy stream would keep flowing unaggregated, so a config
+    // error here is fatal rather than logged-and-skipped.
+    // -----------------------------------------------------------------------
+    let aggregator: Option<Arc<forwarding::aggregate::Aggregator>> = {
+        let rules = forwarding::aggregate::compile_rules(&config)?;
+        if rules.is_empty() {
+            None
+        } else {
+            let agg_cfg = &config.aggregate;
+            let mut handles: Vec<Arc<forwarding::aggregate::AggregateWriterHandle>> = Vec::new();
+
+            if let Some(s3_cfg) = agg_cfg.s3.as_ref() {
+                match forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await {
+                    Ok(sink) => {
+                        let (handle, writer_handle) = forwarding::aggregate::start_aggregate_writer(
+                            &rules,
+                            s3_cfg.prefix.clone(),
+                            agg_cfg.flush_interval_secs,
+                            agg_cfg.channel_capacity,
+                            Arc::new(sink),
+                            source_stats.clone(),
+                            descriptor_sink.clone(),
+                        );
+                        writer_handles.push(writer_handle);
+                        flush_registry.register("aggregate.s3", handle.flush_interval());
+                        handles.push(Arc::new(handle));
+                    }
+                    Err(e) => {
+                        error!("Failed to create S3Sink for aggregation, skipping S3 target: {e}");
+                    }
+                }
+            }
+
+            if let Some(local_cfg) = agg_cfg.local.as_ref() {
+                match forwarding::local_sink::LocalDiskSink::new(local_cfg.directory.clone()).await
+                {
+                    Ok(sink) => {
+                        let (handle, writer_handle) = forwarding::aggregate::start_aggregate_writer(
+                            &rules,
+                            local_cfg.prefix.clone(),
+                            agg_cfg.flush_interval_secs,
+                            agg_cfg.channel_capacity,
+                            Arc::new(sink),
+                            source_stats.clone(),
+                            descriptor_sink.clone(),
+                        );
+                        writer_handles.push(writer_handle);
+                        flush_registry.register("aggregate.local", handle.flush_interval());
+                        handles.push(Arc::new(handle));
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to create LocalDiskSink for aggregation, \
+                             skipping local target: {e}"
+                        );
+                    }
+                }
+            }
+
+            if handles.is_empty() {
+                error!(
+                    "Aggregation is configured with {} rule(s) but no destination could be \
+                     created; aggregation is disabled and raw records will flow normally",
+                    rules.len()
+                );
+                None
+            } else {
+                let agg = Arc::new(forwarding::aggregate::Aggregator::new(
+                    rules,
+                    agg_cfg.max_groups,
+                ));
+                let emit = agg.clone().spawn_emit_task(
+                    handles,
+                    std::time::Duration::from_secs(agg_cfg.flush_interval_secs),
+                    shutdown_rx.clone(),
+                );
+                writer_handles.push(emit);
+                info!(
+                    "Aggregation enabled: {} rule(s), {}s window",
+                    agg.rules().len(),
+                    agg_cfg.flush_interval_secs
+                );
+                Some(agg)
+            }
+        }
+    };
+
+    // -----------------------------------------------------------------------
     // Start syslog listener if enabled
     // -----------------------------------------------------------------------
     if config.syslog.enabled {
@@ -198,6 +287,15 @@ async fn async_main() -> anyhow::Result<()> {
                 structured_handle,
             })
         };
+        // Aggregation wraps the whole chain: matched records are counted here
+        // and never reach the raw writer.
+        let syslog_handler: Arc<dyn syslog::listener::SyslogHandler> = match aggregator.as_ref() {
+            Some(agg) => Arc::new(forwarding::aggregate::handlers::AggregatingSyslogHandler {
+                agg: agg.clone(),
+                inner: syslog_handler,
+            }),
+            None => syslog_handler,
+        };
 
         let syslog_config = syslog::listener::SyslogListenerConfig {
             udp_port: config_clone.syslog.udp_port,
@@ -272,6 +370,15 @@ async fn async_main() -> anyhow::Result<()> {
             1 => ipfix_handlers.into_iter().next().unwrap(),
             _ => Arc::new(forwarding::ipfix_s3::MultiIpfixHandler(ipfix_handlers)),
         };
+        // Aggregation wraps the whole chain: matched records are counted here
+        // and never reach the raw writer.
+        let ipfix_handler: Arc<dyn ipfix::listener::IpfixHandler> = match aggregator.as_ref() {
+            Some(agg) => Arc::new(forwarding::aggregate::handlers::AggregatingIpfixHandler {
+                agg: agg.clone(),
+                inner: ipfix_handler,
+            }),
+            None => ipfix_handler,
+        };
 
         let listener_config = ipfix::listener::IpfixListenerConfig {
             udp_port: ipfix_config_clone.ipfix.udp_port,
@@ -343,6 +450,15 @@ async fn async_main() -> anyhow::Result<()> {
             0 => Arc::new(zeek::listener::DefaultZeekHandler),
             1 => zeek_handlers.into_iter().next().unwrap(),
             _ => Arc::new(forwarding::zeek_s3::MultiZeekHandler(zeek_handlers)),
+        };
+        // Aggregation wraps the whole chain: matched records are counted here
+        // and never reach the raw writer.
+        let zeek_handler: Arc<dyn zeek::listener::ZeekHandler> = match aggregator.as_ref() {
+            Some(agg) => Arc::new(forwarding::aggregate::handlers::AggregatingZeekHandler {
+                agg: agg.clone(),
+                inner: zeek_handler,
+            }),
+            None => zeek_handler,
         };
 
         let listener_config = zeek::listener::ZeekListenerConfig {
@@ -419,6 +535,18 @@ async fn async_main() -> anyhow::Result<()> {
                     suricata_handlers,
                 )),
             };
+        // Aggregation wraps the whole chain: matched records are counted here
+        // and never reach the raw writer.
+        let suricata_handler: Arc<dyn suricata::listener::SuricataHandler> =
+            match aggregator.as_ref() {
+                Some(agg) => Arc::new(
+                    forwarding::aggregate::handlers::AggregatingSuricataHandler {
+                        agg: agg.clone(),
+                        inner: suricata_handler,
+                    },
+                ),
+                None => suricata_handler,
+            };
 
         let listener_config = suricata::listener::SuricataListenerConfig {
             tcp_port: suricata_config_clone.suricata.tcp_port,
@@ -491,6 +619,15 @@ async fn async_main() -> anyhow::Result<()> {
             0 => Arc::new(sflow::listener::DefaultSflowHandler),
             1 => sflow_handlers.into_iter().next().unwrap(),
             _ => Arc::new(forwarding::sflow_s3::MultiSflowHandler(sflow_handlers)),
+        };
+        // Aggregation wraps the whole chain: matched records are counted here
+        // and never reach the raw writer.
+        let sflow_handler: Arc<dyn sflow::listener::SflowHandler> = match aggregator.as_ref() {
+            Some(agg) => Arc::new(forwarding::aggregate::handlers::AggregatingSflowHandler {
+                agg: agg.clone(),
+                inner: sflow_handler,
+            }),
+            None => sflow_handler,
         };
 
         let listener_config = sflow::listener::SflowListenerConfig {
