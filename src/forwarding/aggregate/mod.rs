@@ -354,7 +354,12 @@ impl Aggregator {
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
+            // Belt-and-braces: `compile_rules` already rejects
+            // `flush_interval_secs == 0`, but `tokio::time::interval` panics
+            // on a zero period, so clamp here too — matches the convention at
+            // `s3_sink::flush_check_interval` and
+            // `BufferedWriterConfig::channel_capacity.max(1)`.
+            let mut ticker = tokio::time::interval(interval.max(std::time::Duration::from_secs(1)));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             ticker.tick().await; // the first tick completes immediately
             let mut window_start = Utc::now();
@@ -543,6 +548,12 @@ pub fn compile_rules(config: &Config) -> anyhow::Result<Vec<CompiledRule>> {
         anyhow::bail!(
             "[aggregate] has {} rule(s) but neither [aggregate.s3] nor [aggregate.local] is configured",
             cfg.rules.len()
+        );
+    }
+    if cfg.flush_interval_secs == 0 {
+        anyhow::bail!(
+            "[aggregate] flush_interval_secs must be greater than 0 (tokio::time::interval \
+             panics on a zero period)"
         );
     }
 
@@ -980,6 +991,17 @@ mod tests {
     }
 
     #[test]
+    fn compile_rules_rejects_a_zero_flush_interval() {
+        let mut cfg = config_with(vec![raw_rule("r", "zeek", &["query"])]);
+        cfg.aggregate.flush_interval_secs = 0;
+        let err = compile_rules(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("flush_interval_secs"),
+            "error must name the bad field: {err}"
+        );
+    }
+
+    #[test]
     fn compile_rules_rejects_rules_with_no_destination() {
         let mut cfg = config_with(vec![raw_rule("r", "zeek", &["query"])]);
         cfg.aggregate.local = None;
@@ -1117,10 +1139,14 @@ mod tests {
             AggregateSink,
         >::for_test(tx, "aggregate", "local"));
 
+        // `spawn_emit_task` clamps its interval to a 1s floor (belt-and-braces
+        // against `tokio::time::interval`'s zero-period panic; production
+        // `flush_interval_secs` is whole seconds anyway), so this must
+        // request and wait for at least that much real time.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let task = agg.clone().spawn_emit_task(
             vec![handle],
-            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(1),
             shutdown_rx,
         );
 
@@ -1128,7 +1154,7 @@ mod tests {
             "zeek",
             &zeek("dns", serde_json::json!({"query": "a.example"})),
         );
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
 
         let first = rx.try_recv().expect("the tick must emit the window's row");
         assert_eq!(first.count, 1);
@@ -1147,5 +1173,30 @@ mod tests {
             .try_recv()
             .expect("shutdown must drain the partial window");
         assert_eq!(last.keys, vec![Some("b.example".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn spawn_emit_task_with_a_zero_interval_does_not_panic() {
+        // `compile_rules` rejects flush_interval_secs == 0, but the clamp in
+        // `spawn_emit_task` must independently keep `tokio::time::interval`
+        // (which asserts `period > 0`) from panicking, in case some future
+        // caller constructs an `Aggregator` without going through
+        // `compile_rules`.
+        let mut r = rule("r", "zeek", Some("dns"), &["query"]);
+        r.schema = rule_schema(&r.group_by, &r.aggs);
+        let agg = Arc::new(Aggregator::new(vec![r], 1000));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            agg.clone()
+                .spawn_emit_task(Vec::new(), std::time::Duration::from_secs(0), shutdown_rx);
+
+        // Give the task a moment to run; if it panicked, `is_finished()`
+        // would be true and `task.await` below would return an error.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!task.is_finished(), "the emit task must still be alive");
+
+        shutdown_tx.send(true).expect("signal shutdown");
+        task.await.expect("emit task joins without panicking");
     }
 }
