@@ -124,6 +124,7 @@ async fn ndjson_over_tcp_becomes_an_aggregated_parquet_table() {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut rows: Vec<(String, u64)> = Vec::new();
     for file in &parquet_files {
         let bytes = std::fs::read(file).expect("read parquet");
         let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
@@ -146,6 +147,7 @@ async fn ndjson_over_tcp_becomes_an_aggregated_parquet_table() {
                 .unwrap();
             for i in 0..batch.num_rows() {
                 *counts.entry(q.value(i).to_string()).or_default() += n.value(i);
+                rows.push((q.value(i).to_string(), n.value(i)));
             }
         }
     }
@@ -156,4 +158,21 @@ async fn ndjson_over_tcp_becomes_an_aggregated_parquet_table() {
         "four identical queries must collapse to one row with count=4, got {counts:?}"
     );
     assert_eq!(counts.get("quiet.example").copied(), Some(1));
+
+    // The sums above alone would pass vacuously if grouping were broken and
+    // each identical "noisy.example" record landed in its own row with
+    // count=1 (4 rows summing to 4). Assert the row shape directly: exactly
+    // one row per distinct query, and that row's own count is 4 -- not
+    // merely that four rows' counts sum to 4.
+    rows.sort();
+    assert_eq!(rows.len(), 2, "one row per distinct query, got {rows:?}");
+    assert_eq!(
+        rows.iter().find(|(q, _)| q == "noisy.example").cloned(),
+        Some(("noisy.example".to_string(), 4)),
+        "the four identical queries must collapse into a single row with count=4, got {rows:?}"
+    );
+    assert_eq!(
+        rows.iter().find(|(q, _)| q == "quiet.example").cloned(),
+        Some(("quiet.example".to_string(), 1))
+    );
 }
