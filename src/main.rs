@@ -173,6 +173,27 @@ async fn async_main() -> anyhow::Result<()> {
         }
     };
 
+    // Per-source "does any rule even target this source" checks, so a
+    // deployment with e.g. one Zeek rule does not also pay an extra
+    // async_trait boxed future plus an all-rules consume() scan on every
+    // syslog message and every sFlow/IPFIX sample. A source with no matching
+    // rule is structurally unable to be wrapped, let alone suppressed.
+    let agg_targets_zeek = aggregator
+        .as_ref()
+        .is_some_and(|agg| agg.rules().iter().any(|r| r.source == "zeek"));
+    let agg_targets_suricata = aggregator
+        .as_ref()
+        .is_some_and(|agg| agg.rules().iter().any(|r| r.source == "suricata"));
+    let agg_targets_syslog = aggregator
+        .as_ref()
+        .is_some_and(|agg| agg.rules().iter().any(|r| r.source == "syslog"));
+    let agg_targets_ipfix = aggregator
+        .as_ref()
+        .is_some_and(|agg| agg.rules().iter().any(|r| r.source == "ipfix"));
+    let agg_targets_sflow = aggregator
+        .as_ref()
+        .is_some_and(|agg| agg.rules().iter().any(|r| r.source == "sflow"));
+
     // -----------------------------------------------------------------------
     // Start syslog listener if enabled
     // -----------------------------------------------------------------------
@@ -288,14 +309,19 @@ async fn async_main() -> anyhow::Result<()> {
             })
         };
         // Aggregation wraps the whole chain: matched records are counted here
-        // and never reach the raw writer.
-        let syslog_handler: Arc<dyn syslog::listener::SyslogHandler> = match aggregator.as_ref() {
-            Some(agg) => Arc::new(forwarding::aggregate::handlers::AggregatingSyslogHandler {
-                agg: agg.clone(),
-                inner: syslog_handler,
-            }),
-            None => syslog_handler,
-        };
+        // and never reach the raw writer. Only wrapped when a rule actually
+        // targets syslog — otherwise every message would pay the decorator's
+        // cost for a consume() that can only ever return false.
+        let syslog_handler: Arc<dyn syslog::listener::SyslogHandler> =
+            match (agg_targets_syslog, aggregator.as_ref()) {
+                (true, Some(agg)) => {
+                    Arc::new(forwarding::aggregate::handlers::AggregatingSyslogHandler {
+                        agg: agg.clone(),
+                        inner: syslog_handler,
+                    })
+                }
+                _ => syslog_handler,
+            };
 
         let syslog_config = syslog::listener::SyslogListenerConfig {
             udp_port: config_clone.syslog.udp_port,
@@ -371,14 +397,19 @@ async fn async_main() -> anyhow::Result<()> {
             _ => Arc::new(forwarding::ipfix_s3::MultiIpfixHandler(ipfix_handlers)),
         };
         // Aggregation wraps the whole chain: matched records are counted here
-        // and never reach the raw writer.
-        let ipfix_handler: Arc<dyn ipfix::listener::IpfixHandler> = match aggregator.as_ref() {
-            Some(agg) => Arc::new(forwarding::aggregate::handlers::AggregatingIpfixHandler {
-                agg: agg.clone(),
-                inner: ipfix_handler,
-            }),
-            None => ipfix_handler,
-        };
+        // and never reach the raw writer. Only wrapped when a rule actually
+        // targets ipfix — otherwise every batch would pay the decorator's
+        // cost for a consume() that can only ever return false.
+        let ipfix_handler: Arc<dyn ipfix::listener::IpfixHandler> =
+            match (agg_targets_ipfix, aggregator.as_ref()) {
+                (true, Some(agg)) => {
+                    Arc::new(forwarding::aggregate::handlers::AggregatingIpfixHandler {
+                        agg: agg.clone(),
+                        inner: ipfix_handler,
+                    })
+                }
+                _ => ipfix_handler,
+            };
 
         let listener_config = ipfix::listener::IpfixListenerConfig {
             udp_port: ipfix_config_clone.ipfix.udp_port,
@@ -452,14 +483,19 @@ async fn async_main() -> anyhow::Result<()> {
             _ => Arc::new(forwarding::zeek_s3::MultiZeekHandler(zeek_handlers)),
         };
         // Aggregation wraps the whole chain: matched records are counted here
-        // and never reach the raw writer.
-        let zeek_handler: Arc<dyn zeek::listener::ZeekHandler> = match aggregator.as_ref() {
-            Some(agg) => Arc::new(forwarding::aggregate::handlers::AggregatingZeekHandler {
-                agg: agg.clone(),
-                inner: zeek_handler,
-            }),
-            None => zeek_handler,
-        };
+        // and never reach the raw writer. Only wrapped when a rule actually
+        // targets zeek — otherwise every record would pay the decorator's
+        // cost for a consume() that can only ever return false.
+        let zeek_handler: Arc<dyn zeek::listener::ZeekHandler> =
+            match (agg_targets_zeek, aggregator.as_ref()) {
+                (true, Some(agg)) => {
+                    Arc::new(forwarding::aggregate::handlers::AggregatingZeekHandler {
+                        agg: agg.clone(),
+                        inner: zeek_handler,
+                    })
+                }
+                _ => zeek_handler,
+            };
 
         let listener_config = zeek::listener::ZeekListenerConfig {
             tcp_port: zeek_config_clone.zeek.tcp_port,
@@ -536,16 +572,18 @@ async fn async_main() -> anyhow::Result<()> {
                 )),
             };
         // Aggregation wraps the whole chain: matched records are counted here
-        // and never reach the raw writer.
+        // and never reach the raw writer. Only wrapped when a rule actually
+        // targets suricata — otherwise every record would pay the
+        // decorator's cost for a consume() that can only ever return false.
         let suricata_handler: Arc<dyn suricata::listener::SuricataHandler> =
-            match aggregator.as_ref() {
-                Some(agg) => Arc::new(
+            match (agg_targets_suricata, aggregator.as_ref()) {
+                (true, Some(agg)) => Arc::new(
                     forwarding::aggregate::handlers::AggregatingSuricataHandler {
                         agg: agg.clone(),
                         inner: suricata_handler,
                     },
                 ),
-                None => suricata_handler,
+                _ => suricata_handler,
             };
 
         let listener_config = suricata::listener::SuricataListenerConfig {
@@ -621,14 +659,19 @@ async fn async_main() -> anyhow::Result<()> {
             _ => Arc::new(forwarding::sflow_s3::MultiSflowHandler(sflow_handlers)),
         };
         // Aggregation wraps the whole chain: matched records are counted here
-        // and never reach the raw writer.
-        let sflow_handler: Arc<dyn sflow::listener::SflowHandler> = match aggregator.as_ref() {
-            Some(agg) => Arc::new(forwarding::aggregate::handlers::AggregatingSflowHandler {
-                agg: agg.clone(),
-                inner: sflow_handler,
-            }),
-            None => sflow_handler,
-        };
+        // and never reach the raw writer. Only wrapped when a rule actually
+        // targets sflow — otherwise every sample would pay the decorator's
+        // cost for a consume() that can only ever return false.
+        let sflow_handler: Arc<dyn sflow::listener::SflowHandler> =
+            match (agg_targets_sflow, aggregator.as_ref()) {
+                (true, Some(agg)) => {
+                    Arc::new(forwarding::aggregate::handlers::AggregatingSflowHandler {
+                        agg: agg.clone(),
+                        inner: sflow_handler,
+                    })
+                }
+                _ => sflow_handler,
+            };
 
         let listener_config = sflow::listener::SflowListenerConfig {
             udp_port: sflow_config_clone.sflow.udp_port,
