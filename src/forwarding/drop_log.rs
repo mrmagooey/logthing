@@ -95,17 +95,19 @@ pub enum DropSite {
     /// Shared by `DefaultSyslogHandler` and `PayloadDispatchingHandler`, which
     /// `main.rs` wires up as mutually exclusive.
     StructuredSyslog = 8,
+    /// Aggregated group-by tables (`forwarding/aggregate`).
+    Aggregate = 9,
 }
 
 /// Number of `DropSite` variants; the slot array is `DROP_SITE_COUNT * 2`.
-pub const DROP_SITE_COUNT: usize = 9;
+pub const DROP_SITE_COUNT: usize = 10;
 
 /// Compile-time guard: if a `DropSite` variant is added or removed without
 /// updating `DROP_SITE_COUNT` to match, this fails the build instead of
 /// letting `DropLogThrottles::check_at`'s `slots[site as usize * 2 + kind as
 /// usize]` index out of bounds and panic on the hot path at runtime. Update
 /// this alongside any new `DropSite` variant.
-const _: () = assert!(DropSite::StructuredSyslog as usize + 1 == DROP_SITE_COUNT);
+const _: () = assert!(DropSite::Aggregate as usize + 1 == DROP_SITE_COUNT);
 
 /// One throttle: a monotonic drop count plus the time of the last emitted line.
 ///
@@ -302,6 +304,7 @@ mod tests {
             DropSite::Ipfix,
             DropSite::Syslog,
             DropSite::StructuredSyslog,
+            DropSite::Aggregate,
         ];
         assert_eq!(sites.len(), DROP_SITE_COUNT);
         for s in sites {
@@ -310,6 +313,12 @@ mod tests {
                 assert_eq!(ts.check_at(s, k, 0), Some(1));
             }
         }
+    }
+
+    #[test]
+    fn aggregate_drop_site_has_its_own_throttle_slot() {
+        let ts = DropLogThrottles::new();
+        assert_eq!(ts.check_at(DropSite::Aggregate, DropKind::Full, 0), Some(1));
     }
 
     #[test]

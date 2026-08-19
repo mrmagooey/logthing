@@ -7,6 +7,7 @@
 pub mod fields;
 pub mod handlers;
 
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -295,6 +296,99 @@ impl Aggregator {
     }
 }
 
+/// Arrow schema for one rule. Column order must match `AggregateRow`'s field
+/// order — `to_record_batch` builds columns positionally.
+pub fn rule_schema(group_by: &[String], aggs: &[AggSpec]) -> Arc<Schema> {
+    let mut fields: Vec<Field> = group_by
+        .iter()
+        .map(|name| Field::new(name, DataType::Utf8, true))
+        .collect();
+    fields.push(Field::new("count", DataType::UInt64, false));
+    for spec in aggs {
+        // Nullable: SQL SUM/MIN/MAX over zero observations is NULL.
+        fields.push(Field::new(&spec.column, DataType::Float64, true));
+    }
+    let ts = DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+    fields.push(Field::new("window_start", ts.clone(), false));
+    fields.push(Field::new("window_end", ts, false));
+    Arc::new(Schema::new(fields))
+}
+
+/// `ParquetSink` adapter for aggregated rows. One writer serves every rule:
+/// `AggregateRow` is source-agnostic and the partition is the rule name.
+pub struct AggregateSink {
+    schemas: HashMap<String, Arc<Schema>>,
+}
+
+impl AggregateSink {
+    pub fn new(rules: &[CompiledRule]) -> Self {
+        Self {
+            schemas: rules
+                .iter()
+                .map(|r| (r.name.to_string(), r.schema.clone()))
+                .collect(),
+        }
+    }
+}
+
+impl crate::forwarding::buffered_writer::ParquetSink for AggregateSink {
+    type Record = AggregateRow;
+
+    fn source(&self) -> &'static str {
+        "aggregate"
+    }
+
+    fn partition(&self, record: &AggregateRow) -> Option<String> {
+        Some(record.rule.to_string())
+    }
+
+    fn schema(&self, partition: Option<&str>) -> Arc<Schema> {
+        partition
+            .and_then(|p| self.schemas.get(p))
+            .cloned()
+            // Unreachable in practice: every row carries a compiled rule name.
+            .unwrap_or_else(|| Arc::new(Schema::empty()))
+    }
+
+    fn to_record_batch(
+        &self,
+        record: &AggregateRow,
+        schema: &Arc<Schema>,
+    ) -> anyhow::Result<arrow_array::RecordBatch> {
+        use arrow::array::{
+            ArrayRef, Float64Array, StringArray, TimestampMillisecondArray, UInt64Array,
+        };
+
+        let expected = record.keys.len() + 1 + record.aggs.len() + 2;
+        if schema.fields().len() != expected {
+            anyhow::bail!(
+                "aggregate row for rule '{}' has {} columns but its schema has {}",
+                record.rule,
+                expected,
+                schema.fields().len()
+            );
+        }
+
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(expected);
+        for k in &record.keys {
+            columns.push(Arc::new(StringArray::from(vec![k.as_deref()])));
+        }
+        columns.push(Arc::new(UInt64Array::from(vec![record.count])));
+        for a in &record.aggs {
+            columns.push(Arc::new(Float64Array::from(vec![*a])));
+        }
+        let tz: Arc<str> = Arc::from("UTC");
+        for t in [record.window_start, record.window_end] {
+            columns.push(Arc::new(
+                TimestampMillisecondArray::from(vec![t.timestamp_millis()])
+                    .with_timezone(tz.clone()),
+            ));
+        }
+
+        Ok(arrow_array::RecordBatch::try_new(schema.clone(), columns)?)
+    }
+}
+
 /// Sources an aggregation rule may name.
 const KNOWN_SOURCES: [&str; 5] = ["zeek", "suricata", "syslog", "ipfix", "sflow"];
 
@@ -374,14 +468,14 @@ pub fn compile_rules(config: &Config) -> anyhow::Result<Vec<CompiledRule>> {
             }
         }
 
+        let schema = rule_schema(&rule.group_by, &aggs);
         compiled.push(CompiledRule {
             name: Arc::from(rule.name.as_str()),
             source: rule.source.clone(),
             stream: rule.stream.clone(),
             group_by: rule.group_by.clone(),
             aggs,
-            // Replaced with the real schema in Task 5.
-            schema: Arc::new(arrow_schema::Schema::empty()),
+            schema,
         });
     }
 
@@ -775,5 +869,108 @@ mod tests {
                 .expect("disabled is not an error")
                 .is_empty()
         );
+    }
+
+    // -- Task 5: rule_schema / AggregateSink --
+
+    #[test]
+    fn rule_schema_orders_columns_group_count_aggs_window() {
+        let group_by = vec!["query".to_string(), "id.orig_h".to_string()];
+        let aggs = vec![AggSpec {
+            kind: AggKind::Sum,
+            field: "n".into(),
+            column: "sum_n".into(),
+        }];
+        let schema = rule_schema(&group_by, &aggs);
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "query",
+                "id.orig_h",
+                "count",
+                "sum_n",
+                "window_start",
+                "window_end"
+            ]
+        );
+
+        use arrow_schema::DataType;
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert!(schema.field(0).is_nullable(), "group columns are nullable");
+        assert_eq!(schema.field(2).data_type(), &DataType::UInt64);
+        assert!(!schema.field(2).is_nullable(), "count is never null");
+        assert_eq!(schema.field(3).data_type(), &DataType::Float64);
+        assert!(schema.field(3).is_nullable(), "aggregates may be SQL NULL");
+    }
+
+    #[test]
+    fn aggregate_sink_encodes_a_row_including_nulls() {
+        use crate::forwarding::buffered_writer::ParquetSink;
+
+        let mut r = rule("dns_by_query", "zeek", Some("dns"), &["query", "client"]);
+        r.aggs = vec![AggSpec {
+            kind: AggKind::Sum,
+            field: "n".into(),
+            column: "sum_n".into(),
+        }];
+        r.schema = rule_schema(&r.group_by, &r.aggs);
+        let schema = r.schema.clone();
+        let sink = AggregateSink::new(std::slice::from_ref(&r));
+
+        let now = Utc::now();
+        let row = AggregateRow {
+            rule: Arc::from("dns_by_query"),
+            keys: vec![Some("a.example".to_string()), None],
+            count: 7,
+            aggs: vec![None],
+            window_start: now,
+            window_end: now,
+        };
+
+        assert_eq!(sink.partition(&row).as_deref(), Some("dns_by_query"));
+        assert_eq!(sink.schema(Some("dns_by_query")), schema);
+
+        let batch = sink.to_record_batch(&row, &schema).expect("encodes");
+        assert_eq!(batch.num_rows(), 1);
+
+        use arrow::array::{Array, Float64Array, StringArray, UInt64Array};
+        let query = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(query.value(0), "a.example");
+        let client = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(client.is_null(0), "a missing group value must be NULL");
+        let count = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(count.value(0), 7);
+        let sum = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(sum.is_null(0), "an unobserved aggregate must be NULL");
+    }
+
+    #[test]
+    fn compile_rules_fills_in_the_real_schema() {
+        let cfg = config_with(vec![raw_rule("r", "zeek", &["query"])]);
+        let rules = compile_rules(&cfg).expect("compiles");
+        let names: Vec<&str> = rules[0]
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, vec!["query", "count", "window_start", "window_end"]);
     }
 }
