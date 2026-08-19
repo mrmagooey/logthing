@@ -1,3 +1,4 @@
+pub mod aggregate;
 pub mod buffered_writer;
 pub mod channel_budget;
 pub mod drop_log;

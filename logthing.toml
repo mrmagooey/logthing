@@ -93,3 +93,22 @@ bind_address = "0.0.0.0"   # env: WEF__IPFIX__BIND_ADDRESS
 # access_key = "minioadmin"
 # secret_key = "minioadmin"
 # prefix     = "_iceberg_descriptors"   # env: WEF__ICEBERG__S3__PREFIX
+
+# Optional log aggregation: count records as they arrive, grouped by configured
+# columns, and write the counted table to Parquet instead of the raw rows.
+# Disabled by default.
+# [aggregate]
+# enabled = true
+# flush_interval_secs = 300
+# max_groups = 100000
+# channel_capacity = 4096
+#
+# [aggregate.local]
+# directory = "/data/agg"
+# prefix = "aggregate"
+#
+# [[aggregate.rules]]
+# name = "dns_by_query"
+# source = "zeek"
+# stream = "dns"
+# group_by = ["query", "id.orig_h"]

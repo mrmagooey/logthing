@@ -11,6 +11,7 @@ A high-performance TCP server written in Rust for receiving Windows Event Logs f
 - **DNS Log Parsing**: Automatic parsing of BIND, Unbound, and PowerDNS query logs
 - **Generic Event Parser**: YAML-configurable parsing for specific Windows event codes
 - **Parquet S3 Storage**: Aggregate events into Parquet files and store in S3-compatible storage
+- **Log Aggregation**: Optionally count records as they arrive, grouped by configured columns, writing an SQL `GROUP BY`-style table to Parquet instead of the raw rows — cuts noisy streams down to their useful summary
 - **TLS/SSL Encryption**: Secure connections with certificate support
 - **IP Whitelisting**: Control which hosts can connect
 - **High Performance**: Async I/O with Tokio for handling 100+ hosts
@@ -402,6 +403,60 @@ Each stream produces a separate Parquet file series using its own typed schema (
 - A record with a valid `_path` that would create a new partition beyond the `max_partitions` cap (default 256) is routed to `zeek/_overflow/` by the generic partition-cap machinery.
 
 **Memory safety**: when S3 is unavailable and a stream's buffer exceeds `max_buffer_rows * 4` rows, the oldest batches are dropped and the `parquet_s3_buffer_dropped{source="zeek"}` counter is incremented.
+
+### Log Aggregation
+
+Aggregation counts records as they arrive, grouped by configured columns, and
+writes the counted table to Parquet. A stream covered by a rule **stops
+writing raw rows entirely** — that is the point: the noisy stream is reduced to
+its summary.
+
+```toml
+[aggregate]
+enabled = true
+flush_interval_secs = 300   # window length; each row carries window_start/window_end
+max_groups = 100000         # per rule, per window
+channel_capacity = 4096     # bounded channel between the emit task and the Parquet writer (default: 4096)
+
+[aggregate.local]           # and/or [aggregate.s3], same shape as other sources
+directory = "/data/agg"
+prefix = "aggregate"
+
+[[aggregate.rules]]
+name = "dns_by_query"       # unique; becomes the output partition
+source = "zeek"             # zeek | suricata | syslog | ipfix | sflow
+stream = "dns"              # optional; omitted = every record from that source
+group_by = ["query", "id.orig_h"]
+
+[[aggregate.rules]]
+name = "flow_talkers"
+source = "ipfix"
+group_by = ["src_addr", "dst_addr", "dst_port"]
+sum = ["octet_delta_count", "packet_delta_count"]
+```
+
+Output lands at `<prefix>/<rule>/year=/month=/day=/<uuid>.parquet` with one
+column per `group_by` field, a `count`, one column per `sum`/`min`/`max`, and
+`window_start`/`window_end`.
+
+Notes:
+
+- `stream` matches the Zeek `_path` (normalized to the stable stream name, so rotation
+  suffixes are stripped; e.g., `conn.2026-08-14-16-08-44.log.gz` → `conn`), Suricata
+  `event_type`, syslog `app_name`, sFlow `"flow"`/`"counter"`, or IPFIX `"flows"`.
+- A record matching two rules is counted in both.
+- Aggregates follow SQL semantics: missing and non-numeric values are skipped,
+  the record is still counted, and a group with no numeric observations emits
+  NULL rather than 0.
+- Past `max_groups` distinct groups in a window, further keys fold into a
+  single `_other` row so the window total stays exact.
+- Invalid rules (unknown or disabled source, empty `group_by`, duplicate name,
+  no destination) are fatal at startup rather than silently inert.
+- Do not put `_path` in a Zeek rule's `group_by`: unlike the `stream` filter
+  above, `group_by` reads the field straight off the raw JSON, which still
+  holds the un-normalized value — a new group per rotation suffix.
+- syslog's `protocol` is not an addressable field (falls through to the
+  structured-data lookup and misses); `group_by = ["protocol"]` yields NULL.
 
 ### WEF (Windows Event) S3 Persistence
 

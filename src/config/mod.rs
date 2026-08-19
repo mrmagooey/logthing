@@ -74,6 +74,9 @@ pub struct Config {
 
     #[serde(default)]
     pub iceberg: IcebergConfig,
+
+    #[serde(default)]
+    pub aggregate: AggregateConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -995,6 +998,101 @@ impl Default for SyslogConfig {
     }
 }
 
+/// Optional aggregation: count records as they arrive, grouped by configured
+/// columns, and write the counted table to Parquet instead of the raw rows.
+/// Disabled by default — absent from TOML means nothing changes.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AggregateConfig {
+    #[serde(default = "default_aggregate_enabled")]
+    pub enabled: bool,
+    /// Window length: drives both the emit tick and the writer's flush age.
+    #[serde(default = "default_aggregate_flush_secs")]
+    pub flush_interval_secs: u64,
+    /// Per-rule, per-window distinct-group cap. Beyond this, new keys fold
+    /// into that rule's single `_other` row.
+    #[serde(default = "default_aggregate_max_groups")]
+    pub max_groups: usize,
+    #[serde(default = "default_aggregate_channel_capacity")]
+    pub channel_capacity: usize,
+    #[serde(default)]
+    pub s3: Option<AggregateS3Config>,
+    #[serde(default)]
+    pub local: Option<AggregateLocalConfig>,
+    #[serde(default)]
+    pub rules: Vec<AggregateRule>,
+}
+
+impl Default for AggregateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_aggregate_enabled(),
+            flush_interval_secs: default_aggregate_flush_secs(),
+            max_groups: default_aggregate_max_groups(),
+            channel_capacity: default_aggregate_channel_capacity(),
+            s3: None,
+            local: None,
+            rules: Vec::new(),
+        }
+    }
+}
+
+fn default_aggregate_enabled() -> bool {
+    false
+}
+fn default_aggregate_flush_secs() -> u64 {
+    900
+}
+fn default_aggregate_max_groups() -> usize {
+    100_000
+}
+fn default_aggregate_channel_capacity() -> usize {
+    4096
+}
+fn default_aggregate_prefix() -> String {
+    "aggregate".to_string()
+}
+
+/// S3 destination for aggregated tables. One writer serves every rule
+/// regardless of which source the rule reads from — `AggregateRow` is
+/// source-agnostic.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AggregateS3Config {
+    #[serde(flatten)]
+    pub connection: S3ConnectionConfig,
+    #[serde(default = "default_aggregate_prefix")]
+    pub prefix: String,
+}
+
+/// Local-disk destination for aggregated tables. Independent of `s3` — both
+/// may be set, in which case rows are written to both.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AggregateLocalConfig {
+    pub directory: PathBuf,
+    #[serde(default = "default_aggregate_prefix")]
+    pub prefix: String,
+}
+
+/// One `GROUP BY` rule.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AggregateRule {
+    /// Unique; becomes the output partition segment.
+    pub name: String,
+    /// One of: zeek, suricata, syslog, ipfix, sflow.
+    pub source: String,
+    /// Optional stream filter — zeek `_path`, suricata `event_type`, syslog
+    /// `app_name`, sflow `"flow"`/`"counter"`, ipfix `"flows"`. Omitted means
+    /// every record from that source.
+    #[serde(default)]
+    pub stream: Option<String>,
+    pub group_by: Vec<String>,
+    #[serde(default)]
+    pub sum: Vec<String>,
+    #[serde(default)]
+    pub min: Vec<String>,
+    #[serde(default)]
+    pub max: Vec<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -1012,6 +1110,7 @@ impl Default for Config {
             hec: HecConfig::default(),
             otlp: OtlpConfig::default(),
             iceberg: IcebergConfig::default(),
+            aggregate: AggregateConfig::default(),
         }
     }
 }
@@ -2298,5 +2397,94 @@ prefix    = "_iceberg_descriptors"
         // headroom at realistic sensor rates.
         assert!(default_zeek_channel_capacity() > 10_000);
         assert!(default_suricata_channel_capacity() > 10_000);
+    }
+
+    #[test]
+    fn aggregate_config_defaults_to_disabled_and_inert() {
+        let cfg: AggregateConfig = toml::from_str("").expect("empty aggregate section parses");
+        assert!(!cfg.enabled, "aggregation must default to off");
+        assert_eq!(cfg.flush_interval_secs, 900);
+        assert_eq!(cfg.max_groups, 100_000);
+        assert!(cfg.rules.is_empty());
+        assert!(cfg.s3.is_none());
+        assert!(cfg.local.is_none());
+    }
+
+    #[test]
+    fn aggregate_rule_parses_full_toml_shape() {
+        let toml_src = r#"
+enabled = true
+flush_interval_secs = 300
+max_groups = 5000
+
+[local]
+directory = "/data/agg"
+prefix = "aggregate"
+
+[[rules]]
+name = "dns_by_query"
+source = "zeek"
+stream = "dns"
+group_by = ["query", "id.orig_h"]
+
+[[rules]]
+name = "flow_talkers"
+source = "ipfix"
+group_by = ["src_addr", "dst_addr"]
+sum = ["octet_delta_count"]
+"#;
+        let cfg: AggregateConfig = toml::from_str(toml_src).expect("parses");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.flush_interval_secs, 300);
+        assert_eq!(cfg.max_groups, 5000);
+        assert_eq!(cfg.rules.len(), 2);
+
+        assert_eq!(cfg.rules[0].name, "dns_by_query");
+        assert_eq!(cfg.rules[0].stream.as_deref(), Some("dns"));
+        assert_eq!(cfg.rules[0].group_by, vec!["query", "id.orig_h"]);
+        assert!(
+            cfg.rules[0].sum.is_empty(),
+            "omitted sum must default empty"
+        );
+
+        assert_eq!(cfg.rules[1].source, "ipfix");
+        assert_eq!(
+            cfg.rules[1].stream, None,
+            "omitted stream means all records"
+        );
+        assert_eq!(cfg.rules[1].sum, vec!["octet_delta_count"]);
+
+        let local = cfg.local.expect("local target present");
+        assert_eq!(local.directory, std::path::PathBuf::from("/data/agg"));
+        assert_eq!(local.prefix, "aggregate");
+    }
+
+    #[test]
+    fn aggregate_local_prefix_defaults_to_aggregate() {
+        let cfg: AggregateLocalConfig =
+            toml::from_str(r#"directory = "/tmp/x""#).expect("parses without prefix");
+        assert_eq!(cfg.prefix, "aggregate");
+    }
+
+    #[test]
+    fn aggregate_s3_prefix_defaults_to_aggregate() {
+        let toml_src = r#"
+endpoint = "http://localhost:9000"
+bucket = "agg-bucket"
+region = "us-east-1"
+access_key = "minioadmin"
+secret_key = "minioadmin"
+"#;
+        let cfg: AggregateS3Config =
+            toml::from_str(toml_src).expect("parses s3 config with flattened connection fields");
+        assert_eq!(cfg.connection.endpoint, "http://localhost:9000");
+        assert_eq!(cfg.connection.bucket, "agg-bucket");
+        assert_eq!(cfg.connection.region, "us-east-1");
+        assert_eq!(cfg.connection.access_key, "minioadmin");
+        assert_eq!(cfg.connection.secret_key, "minioadmin");
+        assert_eq!(
+            cfg.prefix, "aggregate",
+            "prefix defaults to aggregate when omitted"
+        );
     }
 }
