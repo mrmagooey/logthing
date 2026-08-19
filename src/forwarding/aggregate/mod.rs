@@ -371,6 +371,19 @@ impl Aggregator {
                     }
                     res = shutdown.changed() => {
                         if res.is_err() || *shutdown.borrow() {
+                            window_start = self.emit(window_start, &handles).await;
+                            // Zeek and Suricata per-connection tasks are
+                            // DETACHED (main.rs) and keep an Arc<dyn Handler>
+                            // — including this aggregator wrapper — for the
+                            // whole listener-drain window documented there
+                            // (2s). Records those connections hand to
+                            // `consume()` after the drain above land in a map
+                            // this task would otherwise never touch again:
+                            // counted, suppressed, then dropped with no
+                            // DropSite log and no counter. Wait out that same
+                            // window and drain once more so they are not
+                            // silently lost.
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                             self.emit(window_start, &handles).await;
                             return;
                         }
@@ -1173,6 +1186,56 @@ mod tests {
             .try_recv()
             .expect("shutdown must drain the partial window");
         assert_eq!(last.keys, vec![Some("b.example".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_record_consumed_after_the_shutdown_signal_is_still_emitted() {
+        use tokio::sync::mpsc;
+
+        // Zeek/Suricata per-connection tasks are detached and keep counting
+        // into the aggregator for ~2s after shutdown fires (main.rs's
+        // documented listener-drain window). The emit task must drain a
+        // second time after that window, not just once immediately on the
+        // shutdown signal, or those records vanish uncounted.
+        let mut r = rule("r", "zeek", Some("dns"), &["query"]);
+        r.schema = rule_schema(&r.group_by, &r.aggs);
+        let agg = Arc::new(Aggregator::new(vec![r], 1000));
+
+        let (tx, mut rx) = mpsc::channel::<AggregateRow>(64);
+        let handle = Arc::new(crate::forwarding::buffered_writer::ParquetWriterHandle::<
+            AggregateSink,
+        >::for_test(tx, "aggregate", "local"));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = agg.clone().spawn_emit_task(
+            vec![handle],
+            std::time::Duration::from_secs(1),
+            shutdown_rx,
+        );
+
+        // Simulate a detached connection: it hands the aggregator a record
+        // partway through the 2s post-shutdown drain window, i.e. strictly
+        // after the immediate first drain the shutdown arm already does.
+        let consumer = {
+            let agg = agg.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                agg.consume(
+                    "zeek",
+                    &zeek("dns", serde_json::json!({"query": "late.example"})),
+                );
+            })
+        };
+
+        shutdown_tx.send(true).expect("signal shutdown");
+        task.await.expect("emit task joins after the second drain");
+        consumer.await.expect("consumer task joins");
+
+        let row = rx
+            .try_recv()
+            .expect("the post-shutdown drain must emit the late record");
+        assert_eq!(row.keys, vec![Some("late.example".to_string())]);
+        assert_eq!(row.count, 1);
     }
 
     #[tokio::test]
