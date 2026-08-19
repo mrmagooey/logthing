@@ -14,6 +14,9 @@ use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex};
 
 use crate::config::Config;
+use crate::forwarding::buffered_writer::{
+    BufferedWriterConfig, FlushPolicy, LiveInterval, ParquetWriterHandle, UploadSink,
+};
 use fields::{AggFields, group_value_string, numeric_value};
 
 /// Group-column value written for the cardinality-overflow row.
@@ -293,6 +296,130 @@ impl Aggregator {
             });
         }
         rows
+    }
+}
+
+pub type AggregateWriterHandle = ParquetWriterHandle<AggregateSink>;
+
+/// Start one writer for aggregated rows. `AggregateSink` is not `Default`
+/// (schemas come from config), so this goes through `start_with_stats` rather
+/// than the `start_writer::<S>()` convenience wrapper.
+#[allow(clippy::too_many_arguments)]
+pub fn start_aggregate_writer(
+    rules: &[CompiledRule],
+    prefix: String,
+    flush_interval_secs: u64,
+    channel_capacity: usize,
+    sink: Arc<dyn UploadSink>,
+    source_stats: Arc<crate::stats::SourceHourlyStats>,
+    descriptor_sink: Option<Arc<dyn UploadSink>>,
+) -> (AggregateWriterHandle, tokio::task::JoinHandle<()>) {
+    // Rows are few (one per group per window) and large flushes are fine, so
+    // the age trigger is what should fire — not rows or bytes.
+    let max_buffer_rows = usize::MAX / 4;
+    let flush_threshold_bytes = 64 * 1024 * 1024;
+
+    let cfg = BufferedWriterConfig {
+        // Vestigial for sink-based writers — same placeholder `start_writer` uses.
+        connection: crate::forwarding::buffered_writer::unused_s3_connection_placeholder(),
+        prefix,
+        max_buffer_rows,
+        flush_threshold_bytes,
+        flush_interval_secs,
+        channel_capacity,
+        max_partitions: rules.len() + 1,
+    };
+    let policy = FlushPolicy {
+        max_rows: max_buffer_rows,
+        max_bytes: flush_threshold_bytes,
+        interval: LiveInterval::new(std::time::Duration::from_secs(flush_interval_secs)),
+    };
+    ParquetWriterHandle::start_with_stats(
+        AggregateSink::new(rules),
+        sink,
+        cfg,
+        policy,
+        source_stats,
+        descriptor_sink,
+    )
+}
+
+impl Aggregator {
+    /// Drain the group map every `interval` into each writer, and once more on
+    /// shutdown so a partial window is not lost.
+    pub fn spawn_emit_task(
+        self: Arc<Self>,
+        handles: Vec<Arc<AggregateWriterHandle>>,
+        interval: std::time::Duration,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // the first tick completes immediately
+            let mut window_start = Utc::now();
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        window_start = self.emit(window_start, &handles).await;
+                    }
+                    res = shutdown.changed() => {
+                        if res.is_err() || *shutdown.borrow() {
+                            self.emit(window_start, &handles).await;
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    /// Drain one window and push it to every destination. Returns the start of
+    /// the next window.
+    async fn emit(
+        &self,
+        window_start: DateTime<Utc>,
+        handles: &[Arc<AggregateWriterHandle>],
+    ) -> DateTime<Utc> {
+        let window_end = Utc::now();
+        let rows = self.drain(window_start, window_end);
+        if rows.is_empty() {
+            return window_end;
+        }
+
+        for rule in &self.rules {
+            let n = rows.iter().filter(|r| r.rule == rule.name).count();
+            metrics::gauge!("aggregate_groups", "rule" => rule.name.to_string()).set(n as f64);
+        }
+
+        for row in rows {
+            for handle in handles {
+                let rule = row.rule.clone();
+                // Bounded wait, not try_send: this task is off the ingest hot
+                // path, so waiting for channel capacity costs nothing that
+                // matters and a whole window's counts are expensive to lose.
+                match handle.send_or_drop(row.clone()).await {
+                    Ok(()) => {
+                        metrics::counter!("aggregate_rows_emitted", "rule" => rule.to_string())
+                            .increment(1);
+                    }
+                    Err(e) => {
+                        if let Some(dropped_total) = handle.drop_log_due(
+                            crate::forwarding::drop_log::DropSite::Aggregate,
+                            crate::forwarding::drop_log::DropKind::from(&e),
+                        ) {
+                            tracing::warn!(
+                                dropped_total,
+                                rule = %rule,
+                                "aggregate writer channel unavailable; dropped 1 aggregated row"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        window_end
     }
 }
 
@@ -972,5 +1099,53 @@ mod tests {
             .map(|f| f.name().as_str())
             .collect();
         assert_eq!(names, vec!["query", "count", "window_start", "window_end"]);
+    }
+
+    // -- Task 6: emit task --
+
+    #[tokio::test]
+    async fn the_emit_task_drains_on_tick_and_again_on_shutdown() {
+        use tokio::sync::mpsc;
+
+        let mut r = rule("r", "zeek", Some("dns"), &["query"]);
+        r.schema = rule_schema(&r.group_by, &r.aggs);
+        let agg = Arc::new(Aggregator::new(vec![r], 1000));
+
+        // A handle whose receiver we own, so we can observe what was emitted.
+        let (tx, mut rx) = mpsc::channel::<AggregateRow>(64);
+        let handle = Arc::new(crate::forwarding::buffered_writer::ParquetWriterHandle::<
+            AggregateSink,
+        >::for_test(tx, "aggregate", "local"));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = agg.clone().spawn_emit_task(
+            vec![handle],
+            std::time::Duration::from_millis(100),
+            shutdown_rx,
+        );
+
+        agg.consume(
+            "zeek",
+            &zeek("dns", serde_json::json!({"query": "a.example"})),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let first = rx.try_recv().expect("the tick must emit the window's row");
+        assert_eq!(first.count, 1);
+        assert_eq!(first.keys, vec![Some("a.example".to_string())]);
+        assert!(first.window_end >= first.window_start);
+
+        // A record arriving after the tick must still be emitted on shutdown.
+        agg.consume(
+            "zeek",
+            &zeek("dns", serde_json::json!({"query": "b.example"})),
+        );
+        shutdown_tx.send(true).expect("signal shutdown");
+        task.await.expect("emit task joins");
+
+        let last = rx
+            .try_recv()
+            .expect("shutdown must drain the partial window");
+        assert_eq!(last.keys, vec![Some("b.example".to_string())]);
     }
 }
