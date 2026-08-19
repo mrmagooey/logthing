@@ -64,6 +64,11 @@ enum GroupKey {
 
 /// One aggregate's running state. `n == 0` means "never observed a usable
 /// number" and emits SQL NULL rather than a fabricated 0.0.
+//
+// ponytail: every numeric aggregate accumulates as f64, exact only up to
+// 2^53. A sum of large counters (e.g. octet_delta_count) over a long window
+// could in principle exceed that. Upgrade path: an `Int(i64) | Float(f64)`
+// enum for `sum`/`min`/`max` if a real deployment's counters get there.
 #[derive(Debug, Clone)]
 struct AggAcc {
     sum: f64,
@@ -141,9 +146,13 @@ pub struct Aggregator {
     rules: Vec<CompiledRule>,
     max_groups: usize,
     metrics: Vec<RuleMetrics>,
-    // ponytail: one mutex over all rules' groups. A hashmap lookup plus a
-    // counter bump is tens of nanoseconds; shard by rule if a profile ever
-    // shows contention here.
+    // ponytail: one mutex over all rules' groups. The hashmap lookup and
+    // counter bump under the lock are cheap, but building the key first is
+    // not: `group_value_string` heap-allocates once per `group_by` field
+    // (twice for typed sources whose `opt_str` already owns a `String`), and
+    // the `Box<[Option<String>]>` key itself allocates and drops on every
+    // call — even when the group already exists. Shard by rule, or cache the
+    // last key per rule, if a profile ever shows this mattering.
     state: Mutex<AggState>,
 }
 
@@ -347,6 +356,14 @@ pub fn start_aggregate_writer(
 impl Aggregator {
     /// Drain the group map every `interval` into each writer, and once more on
     /// shutdown so a partial window is not lost.
+    //
+    // ponytail: windows are bounded by this emit interval, not event time —
+    // a record counts into whichever window happens to be open when it
+    // arrives (spec C2). A late/out-of-order record never gets re-bucketed
+    // into the window its timestamp would suggest. Event-time windowing
+    // (watermarks, out-of-order buffering) is a much bigger feature; add it
+    // if a consumer ever needs windows that line up with wall-clock event
+    // time rather than arrival time.
     pub fn spawn_emit_task(
         self: Arc<Self>,
         handles: Vec<Arc<AggregateWriterHandle>>,
@@ -402,13 +419,18 @@ impl Aggregator {
     ) -> DateTime<Utc> {
         let window_end = Utc::now();
         let rows = self.drain(window_start, window_end);
-        if rows.is_empty() {
-            return window_end;
-        }
 
+        // Set every rule's gauge — including 0 for rules with no rows this
+        // window — BEFORE the early return below. A rule that stops
+        // receiving records must report 0 groups, not silently keep
+        // reporting whatever count its last non-empty window had.
         for rule in &self.rules {
             let n = rows.iter().filter(|r| r.rule == rule.name).count();
             metrics::gauge!("aggregate_groups", "rule" => rule.name.to_string()).set(n as f64);
+        }
+
+        if rows.is_empty() {
+            return window_end;
         }
 
         for row in rows {
@@ -741,6 +763,50 @@ mod tests {
         agg.consume("zeek", &zeek("dns", serde_json::json!({"query": "a"})));
         assert_eq!(drain_sorted(&agg).len(), 1);
         assert!(drain_sorted(&agg).is_empty(), "second drain must be empty");
+    }
+
+    #[tokio::test]
+    async fn a_rule_with_no_rows_this_window_reports_a_zero_gauge_not_a_stale_one() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let mut r = rule("r", "zeek", Some("dns"), &["query"]);
+        r.schema = rule_schema(&r.group_by, &r.aggs);
+        let agg = Aggregator::new(vec![r], 1000);
+
+        // Window 1: one group observed, so the gauge is set to 1.
+        agg.consume("zeek", &zeek("dns", serde_json::json!({"query": "a"})));
+        let now = Utc::now();
+        agg.emit(now, &[]).await;
+
+        // Window 2: nothing consumed. Before this fix, `emit` returned early
+        // on `rows.is_empty()` and never touched the gauge again, so it kept
+        // reporting the window-1 value forever.
+        agg.emit(now, &[]).await;
+
+        let key = CompositeKey::new(
+            MetricKind::Gauge,
+            metrics::Key::from_parts("aggregate_groups", vec![metrics::Label::new("rule", "r")]),
+        );
+        let value = snapshotter
+            .snapshot()
+            .into_hashmap()
+            .get(&key)
+            .map(|(_, _, v)| match v {
+                DebugValue::Gauge(g) => g.into_inner(),
+                _ => f64::NAN,
+            });
+        assert_eq!(
+            value,
+            Some(0.0),
+            "an empty window must report 0 groups, not the stale count from the last non-empty one"
+        );
     }
 
     #[test]

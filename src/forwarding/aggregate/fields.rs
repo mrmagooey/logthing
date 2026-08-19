@@ -44,8 +44,19 @@ pub fn truncate_to_bytes(s: &str, max: usize) -> &str {
 
 /// Render a field value as a group-key component.
 pub fn group_value_string(v: FieldValue<'_>) -> String {
-    let s = match v {
-        FieldValue::Str(s) => return truncate_to_bytes(&s, MAX_GROUP_VALUE_BYTES).to_string(),
+    match v {
+        // A `Cow::Owned` already owns a buffer (typed sources' `opt_str`
+        // conversions), so truncate it in place — `String::truncate` just
+        // shortens the length, no second allocation — instead of slicing
+        // and `.to_string()`-ing into a fresh one.
+        FieldValue::Str(Cow::Owned(mut s)) => {
+            let cut = truncate_to_bytes(&s, MAX_GROUP_VALUE_BYTES).len();
+            s.truncate(cut);
+            s
+        }
+        FieldValue::Str(Cow::Borrowed(s)) => {
+            truncate_to_bytes(s, MAX_GROUP_VALUE_BYTES).to_string()
+        }
         // Whole numbers render as integers: a port grouped as "443", not "443.0".
         FieldValue::Num(n)
             if n.is_finite() && n.fract() == 0.0 && n.abs() < 9.007_199_254_740_992e15 =>
@@ -55,13 +66,14 @@ pub fn group_value_string(v: FieldValue<'_>) -> String {
         // `{n:?}` (not `to_string`): Display drops the decimal point for whole
         // floats beyond the i64-shortcut range (e.g. "9007199254740994"),
         // while Debug always keeps it ("...994.0"), which is what a value
-        // that hit this fallback needs to still look like a float.
-        FieldValue::Num(n) => format!("{n:?}"),
+        // that hit this fallback needs to still look like a float. Numeric
+        // renderings are always short, but truncate uniformly so the memory
+        // bound holds for every branch.
+        FieldValue::Num(n) => {
+            truncate_to_bytes(&format!("{n:?}"), MAX_GROUP_VALUE_BYTES).to_string()
+        }
         FieldValue::Bool(b) => b.to_string(),
-    };
-    // Numeric and boolean renderings are always short, but truncate uniformly
-    // so the memory bound holds for every branch.
-    truncate_to_bytes(&s, MAX_GROUP_VALUE_BYTES).to_string()
+    }
 }
 
 /// Numeric contribution of a field value to a sum/min/max accumulator.
@@ -285,6 +297,29 @@ mod tests {
         let long = "a".repeat(MAX_GROUP_VALUE_BYTES + 50);
         let out = group_value_string(FieldValue::Str(Cow::Owned(long)));
         assert_eq!(out.len(), MAX_GROUP_VALUE_BYTES);
+    }
+
+    #[test]
+    fn a_borrowed_string_within_the_cap_is_returned_unchanged() {
+        let out = group_value_string(FieldValue::Str(Cow::Borrowed("a.example")));
+        assert_eq!(out, "a.example");
+    }
+
+    #[test]
+    fn an_owned_string_is_truncated_in_place_without_splitting_a_multibyte_char() {
+        // 'é' is 2 bytes; an in-place `String::truncate` landing mid-char
+        // would panic, so this must still walk back to a char boundary the
+        // same way the borrowed path does.
+        let long: String = "é".repeat(200); // 400 bytes
+        let out = group_value_string(FieldValue::Str(Cow::Owned(long)));
+        assert!(out.len() <= MAX_GROUP_VALUE_BYTES);
+        assert_eq!(out.len() % 2, 0, "must not split a 2-byte char");
+    }
+
+    #[test]
+    fn an_owned_string_within_the_cap_is_returned_unchanged() {
+        let out = group_value_string(FieldValue::Str(Cow::Owned("short".to_string())));
+        assert_eq!(out, "short");
     }
 
     // -- truncate_to_bytes --
