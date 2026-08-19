@@ -591,6 +591,12 @@ pub fn compile_rules(config: &Config) -> anyhow::Result<Vec<CompiledRule>> {
              panics on a zero period)"
         );
     }
+    if cfg.max_groups == 0 {
+        anyhow::bail!(
+            "[aggregate] max_groups must be greater than 0 (0 silently makes grouping a \
+             no-op — every record folds into `_other`)"
+        );
+    }
 
     let mut seen: Vec<&str> = Vec::new();
     let mut compiled = Vec::with_capacity(cfg.rules.len());
@@ -1193,6 +1199,17 @@ mod tests {
         let err = compile_rules(&cfg).unwrap_err().to_string();
         assert!(
             err.contains("flush_interval_secs"),
+            "error must name the bad field: {err}"
+        );
+    }
+
+    #[test]
+    fn compile_rules_rejects_a_zero_max_groups() {
+        let mut cfg = config_with(vec![raw_rule("r", "zeek", &["query"])]);
+        cfg.aggregate.max_groups = 0;
+        let err = compile_rules(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("max_groups"),
             "error must name the bad field: {err}"
         );
     }
