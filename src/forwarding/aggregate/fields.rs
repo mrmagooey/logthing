@@ -494,6 +494,58 @@ mod tests {
     }
 
     #[test]
+    fn sflow_record_exposes_all_ten_counter_only_fields() {
+        use std::net::{IpAddr, Ipv4Addr};
+        // Every counter-only field set to a distinct value, so a future
+        // field-swap (e.g. two fields' match arms accidentally transposed)
+        // shows up as a wrong number rather than a coincidental pass.
+        let rec = crate::sflow::SflowRecord {
+            sample_type: crate::sflow::SampleType::Counter,
+            exporter: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            received_at: chrono::Utc::now(),
+            src_addr: None,
+            dst_addr: None,
+            src_port: None,
+            dst_port: None,
+            ip_protocol: None,
+            sampling_rate: None,
+            input_ifindex: None,
+            output_ifindex: None,
+            if_index: Some(1),
+            if_type: Some(2),
+            if_speed: Some(3),
+            if_direction: Some(4),
+            if_in_octets: Some(5),
+            if_out_octets: Some(6),
+            if_in_ucast_pkts: Some(7),
+            if_out_ucast_pkts: Some(8),
+            if_in_errors: Some(9),
+            if_out_errors: Some(10),
+            extra: serde_json::json!({}),
+        };
+
+        let cases: [(&str, f64); 10] = [
+            ("if_index", 1.0),
+            ("if_type", 2.0),
+            ("if_speed", 3.0),
+            ("if_direction", 4.0),
+            ("if_in_octets", 5.0),
+            ("if_out_octets", 6.0),
+            ("if_in_ucast_pkts", 7.0),
+            ("if_out_ucast_pkts", 8.0),
+            ("if_in_errors", 9.0),
+            ("if_out_errors", 10.0),
+        ];
+        for (name, expected) in cases {
+            assert!(
+                matches!(rec.field(name), Some(FieldValue::Num(n)) if n == expected),
+                "field {name:?} must report {expected}, got {:?}",
+                rec.field(name)
+            );
+        }
+    }
+
+    #[test]
     fn syslog_message_exposes_app_name_as_stream_and_curated_fields() {
         let msg = crate::syslog::SyslogMessage {
             priority: 34,

@@ -244,4 +244,93 @@ mod tests {
         assert_eq!(total, 3);
         assert_eq!(rows.len(), 2, "two distinct dst_port groups");
     }
+
+    #[tokio::test]
+    async fn sflow_batch_offers_every_record_to_consume_and_forwards_only_the_remainder() {
+        use crate::sflow::SflowRecord;
+        use crate::sflow::listener::SflowHandler;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        fn sample(sample_type: crate::sflow::SampleType, dst_port: u16) -> SflowRecord {
+            SflowRecord {
+                sample_type,
+                exporter: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                received_at: chrono::Utc::now(),
+                src_addr: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))),
+                dst_addr: None,
+                src_port: None,
+                dst_port: Some(dst_port),
+                ip_protocol: None,
+                sampling_rate: None,
+                input_ifindex: None,
+                output_ifindex: None,
+                if_index: None,
+                if_type: None,
+                if_speed: None,
+                if_direction: None,
+                if_in_octets: None,
+                if_out_octets: None,
+                if_in_ucast_pkts: None,
+                if_out_ucast_pkts: None,
+                if_in_errors: None,
+                if_out_errors: None,
+                extra: serde_json::json!({}),
+            }
+        }
+
+        struct CapturingSflow(Mutex<Vec<SflowRecord>>);
+        #[async_trait::async_trait]
+        impl SflowHandler for CapturingSflow {
+            async fn handle_samples(&self, samples: Vec<SflowRecord>, _s: std::net::SocketAddr) {
+                self.0.lock().unwrap().extend(samples);
+            }
+        }
+
+        // The rule targets only "flow" samples, so "counter" samples in the
+        // same batch must be offered to consume() (and not matched), then
+        // still reach the inner handler as the unmatched remainder.
+        let group_by = vec!["dst_port".to_string()];
+        let rule = CompiledRule {
+            name: std::sync::Arc::from("flow_by_port"),
+            source: "sflow".to_string(),
+            stream: Some("flow".to_string()),
+            group_by: group_by.clone(),
+            aggs: Vec::new(),
+            schema: rule_schema(&group_by, &[]),
+        };
+        let agg = Arc::new(Aggregator::new(vec![rule], 1000));
+        let inner = Arc::new(CapturingSflow(Mutex::new(Vec::new())));
+        let h = AggregatingSflowHandler {
+            agg: agg.clone(),
+            inner: inner.clone(),
+        };
+        let src: std::net::SocketAddr = "127.0.0.1:6343".parse().unwrap();
+
+        h.handle_samples(
+            vec![
+                sample(crate::sflow::SampleType::Flow, 443),
+                sample(crate::sflow::SampleType::Flow, 443),
+                sample(crate::sflow::SampleType::Counter, 80),
+            ],
+            src,
+        )
+        .await;
+
+        let forwarded = inner.0.lock().unwrap();
+        assert_eq!(
+            forwarded.len(),
+            1,
+            "only the unmatched counter sample must reach the raw writer"
+        );
+        assert_eq!(forwarded[0].sample_type, crate::sflow::SampleType::Counter);
+        drop(forwarded);
+
+        let now = chrono::Utc::now();
+        let rows = agg.drain(now, now);
+        assert_eq!(rows.len(), 1, "one group: the two matched flow samples");
+        assert_eq!(
+            rows[0].count, 2,
+            "both flow samples were offered to consume() and counted"
+        );
+    }
 }
