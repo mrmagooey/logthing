@@ -131,6 +131,124 @@ impl AggFields for crate::suricata::SuricataRecord {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-source impls: typed records
+// ---------------------------------------------------------------------------
+
+/// Helper: `Option<T: Display>` → `FieldValue::Str`.
+fn opt_str<T: std::fmt::Display>(v: &Option<T>) -> Option<FieldValue<'static>> {
+    v.as_ref()
+        .map(|x| FieldValue::Str(Cow::Owned(x.to_string())))
+}
+
+/// Helper: `Option<T: Into<f64>>` → `FieldValue::Num`.
+fn opt_num<T: Copy + Into<f64>>(v: &Option<T>) -> Option<FieldValue<'static>> {
+    v.map(|x| FieldValue::Num(x.into()))
+}
+
+impl AggFields for crate::ipfix::FlowRecord {
+    fn stream(&self) -> &str {
+        // IPFIX has no stream concept; one bucket keeps rule matching uniform.
+        "flows"
+    }
+    fn field(&self, name: &str) -> Option<FieldValue<'_>> {
+        match name {
+            "observation_domain_id" => Some(FieldValue::Num(self.observation_domain_id as f64)),
+            "template_id" => Some(FieldValue::Num(self.template_id as f64)),
+            "protocol_version" => Some(FieldValue::Num(self.protocol_version as f64)),
+            "exporter" => Some(FieldValue::Str(Cow::Owned(self.exporter.to_string()))),
+            "export_time" => Some(FieldValue::Str(Cow::Owned(self.export_time.to_rfc3339()))),
+            "src_addr" => opt_str(&self.src_addr),
+            "dst_addr" => opt_str(&self.dst_addr),
+            "src_port" => opt_num(&self.src_port),
+            "dst_port" => opt_num(&self.dst_port),
+            "ip_protocol" => opt_num(&self.ip_protocol),
+            "octet_delta_count" => self.octet_delta_count.map(|v| FieldValue::Num(v as f64)),
+            "packet_delta_count" => self.packet_delta_count.map(|v| FieldValue::Num(v as f64)),
+            "flow_start" => opt_str(&self.flow_start.map(|t| t.to_rfc3339())),
+            "flow_end" => opt_str(&self.flow_end.map(|t| t.to_rfc3339())),
+            "tcp_flags" => opt_num(&self.tcp_flags),
+            "input_interface" => opt_num(&self.input_interface),
+            "output_interface" => opt_num(&self.output_interface),
+            // Non-curated IEs land in `extra` keyed by IE name.
+            other => json_field(&self.extra, other),
+        }
+    }
+}
+
+impl AggFields for crate::sflow::SflowRecord {
+    fn stream(&self) -> &str {
+        match self.sample_type {
+            crate::sflow::SampleType::Flow => "flow",
+            crate::sflow::SampleType::Counter => "counter",
+        }
+    }
+    fn field(&self, name: &str) -> Option<FieldValue<'_>> {
+        match name {
+            "exporter" => Some(FieldValue::Str(Cow::Owned(self.exporter.to_string()))),
+            "received_at" => Some(FieldValue::Str(Cow::Owned(self.received_at.to_rfc3339()))),
+            "src_addr" => opt_str(&self.src_addr),
+            "dst_addr" => opt_str(&self.dst_addr),
+            "src_port" => opt_num(&self.src_port),
+            "dst_port" => opt_num(&self.dst_port),
+            "ip_protocol" => opt_num(&self.ip_protocol),
+            "sampling_rate" => opt_num(&self.sampling_rate),
+            "input_ifindex" => opt_num(&self.input_ifindex),
+            "output_ifindex" => opt_num(&self.output_ifindex),
+            "if_index" => opt_num(&self.if_index),
+            "if_type" => opt_num(&self.if_type),
+            "if_speed" => self.if_speed.map(|v| FieldValue::Num(v as f64)),
+            "if_direction" => opt_num(&self.if_direction),
+            "if_in_octets" => self.if_in_octets.map(|v| FieldValue::Num(v as f64)),
+            "if_out_octets" => self.if_out_octets.map(|v| FieldValue::Num(v as f64)),
+            "if_in_ucast_pkts" => self.if_in_ucast_pkts.map(|v| FieldValue::Num(v as f64)),
+            "if_out_ucast_pkts" => self.if_out_ucast_pkts.map(|v| FieldValue::Num(v as f64)),
+            "if_in_errors" => opt_num(&self.if_in_errors),
+            "if_out_errors" => opt_num(&self.if_out_errors),
+            other => json_field(&self.extra, other),
+        }
+    }
+}
+
+impl AggFields for crate::syslog::SyslogMessage {
+    fn stream(&self) -> &str {
+        self.app_name.as_deref().unwrap_or("")
+    }
+    fn field(&self, name: &str) -> Option<FieldValue<'_>> {
+        match name {
+            "priority" => Some(FieldValue::Num(self.priority as f64)),
+            "severity" => Some(FieldValue::Num(self.severity as f64)),
+            "facility" => Some(FieldValue::Num(self.facility as f64)),
+            "timestamp" => opt_str(&self.timestamp.map(|t| t.to_rfc3339())),
+            "hostname" => self
+                .hostname
+                .as_deref()
+                .map(|s| FieldValue::Str(Cow::Borrowed(s))),
+            "app_name" => self
+                .app_name
+                .as_deref()
+                .map(|s| FieldValue::Str(Cow::Borrowed(s))),
+            "proc_id" => self
+                .proc_id
+                .as_deref()
+                .map(|s| FieldValue::Str(Cow::Borrowed(s))),
+            "msg_id" => self
+                .msg_id
+                .as_deref()
+                .map(|s| FieldValue::Str(Cow::Borrowed(s))),
+            "message" => Some(FieldValue::Str(Cow::Borrowed(self.message.as_str()))),
+            // RFC 5424 structured data: "sdid.param" addresses one parameter.
+            other => {
+                let sd = self.structured_data.as_ref()?;
+                let (sdid, param) = other.split_once('.')?;
+                sd.get(sdid)
+                    .and_then(|params| params.get(param))
+                    .map(|s| FieldValue::Str(Cow::Borrowed(s.as_str())))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +387,114 @@ mod tests {
         };
         assert_eq!(rec.stream(), "dns");
         assert!(matches!(rec.field("dns.rrname"), Some(FieldValue::Str(s)) if s == "a.example"));
+    }
+
+    #[test]
+    fn flow_record_exposes_curated_fields_and_extra_fallback() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let rec = crate::ipfix::FlowRecord {
+            observation_domain_id: 1,
+            template_id: 256,
+            protocol_version: 10,
+            exporter: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            export_time: chrono::Utc::now(),
+            src_addr: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5))),
+            dst_addr: Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            src_port: Some(51000),
+            dst_port: Some(443),
+            ip_protocol: Some(6),
+            octet_delta_count: Some(4096),
+            packet_delta_count: Some(8),
+            flow_start: None,
+            flow_end: None,
+            tcp_flags: None,
+            input_interface: None,
+            output_interface: None,
+            extra: serde_json::json!({"vendorField": 12}),
+        };
+        assert_eq!(rec.stream(), "flows");
+        assert!(matches!(rec.field("src_addr"), Some(FieldValue::Str(s)) if s == "192.168.1.5"));
+        assert!(matches!(rec.field("dst_port"), Some(FieldValue::Num(n)) if n == 443.0));
+        assert!(matches!(rec.field("octet_delta_count"), Some(FieldValue::Num(n)) if n == 4096.0));
+        // Absent Option field is a miss, not a zero.
+        assert!(rec.field("tcp_flags").is_none());
+        // Unknown name falls through to `extra`.
+        assert!(matches!(rec.field("vendorField"), Some(FieldValue::Num(n)) if n == 12.0));
+        assert!(rec.field("no_such_field").is_none());
+    }
+
+    #[test]
+    fn sflow_record_stream_distinguishes_flow_from_counter() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let mut rec = crate::sflow::SflowRecord {
+            sample_type: crate::sflow::SampleType::Flow,
+            exporter: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            received_at: chrono::Utc::now(),
+            src_addr: Some(IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1))),
+            dst_addr: None,
+            src_port: None,
+            dst_port: Some(80),
+            ip_protocol: Some(6),
+            sampling_rate: Some(512),
+            input_ifindex: None,
+            output_ifindex: None,
+            if_index: None,
+            if_type: None,
+            if_speed: None,
+            if_direction: None,
+            if_in_octets: None,
+            if_out_octets: None,
+            if_in_ucast_pkts: None,
+            if_out_ucast_pkts: None,
+            if_in_errors: None,
+            if_out_errors: None,
+            extra: serde_json::json!({}),
+        };
+        assert_eq!(rec.stream(), "flow");
+        assert!(matches!(rec.field("src_addr"), Some(FieldValue::Str(s)) if s == "10.1.1.1"));
+        assert!(matches!(rec.field("sampling_rate"), Some(FieldValue::Num(n)) if n == 512.0));
+
+        rec.sample_type = crate::sflow::SampleType::Counter;
+        assert_eq!(rec.stream(), "counter");
+    }
+
+    #[test]
+    fn syslog_message_exposes_app_name_as_stream_and_curated_fields() {
+        let msg = crate::syslog::SyslogMessage {
+            priority: 34,
+            severity: 2,
+            facility: 4,
+            timestamp: None,
+            hostname: Some("host-a".to_string()),
+            app_name: Some("sshd".to_string()),
+            proc_id: None,
+            msg_id: None,
+            message: "Failed password".to_string(),
+            structured_data: None,
+            protocol: crate::syslog::SyslogProtocol::Rfc5424,
+        };
+        assert_eq!(msg.stream(), "sshd");
+        assert!(matches!(msg.field("hostname"), Some(FieldValue::Str(s)) if s == "host-a"));
+        assert!(matches!(msg.field("severity"), Some(FieldValue::Num(n)) if n == 2.0));
+        assert!(matches!(msg.field("message"), Some(FieldValue::Str(s)) if s == "Failed password"));
+        assert!(msg.field("proc_id").is_none());
+    }
+
+    #[test]
+    fn syslog_message_without_app_name_has_an_empty_stream() {
+        let msg = crate::syslog::SyslogMessage {
+            priority: 13,
+            severity: 5,
+            facility: 1,
+            timestamp: None,
+            hostname: None,
+            app_name: None,
+            proc_id: None,
+            msg_id: None,
+            message: "x".to_string(),
+            structured_data: None,
+            protocol: crate::syslog::SyslogProtocol::Rfc3164,
+        };
+        assert_eq!(msg.stream(), "");
     }
 }
