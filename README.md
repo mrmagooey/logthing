@@ -416,7 +416,7 @@ its summary.
 enabled = true
 flush_interval_secs = 300   # window length; each row carries window_start/window_end
 max_groups = 100000         # per rule, per window
-channel_capacity = 4096     # bounded channel between listener and aggregator (default: 4096)
+channel_capacity = 4096     # bounded channel between the emit task and the Parquet writer (default: 4096)
 
 [aggregate.local]           # and/or [aggregate.s3], same shape as other sources
 directory = "/data/agg"
@@ -452,6 +452,11 @@ Notes:
   single `_other` row so the window total stays exact.
 - Invalid rules (unknown or disabled source, empty `group_by`, duplicate name,
   no destination) are fatal at startup rather than silently inert.
+- Do not put `_path` in a Zeek rule's `group_by`: unlike the `stream` filter
+  above, `group_by` reads the field straight off the raw JSON, which still
+  holds the un-normalized value — a new group per rotation suffix.
+- syslog's `protocol` is not an addressable field (falls through to the
+  structured-data lookup and misses); `group_by = ["protocol"]` yields NULL.
 
 ### WEF (Windows Event) S3 Persistence
 

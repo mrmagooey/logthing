@@ -125,9 +125,13 @@ absent yields `Keys([None, …])`, not `Other`.
 **Cardinality cap.** Once a rule holds `max_groups` keys, every new key folds
 into that rule's single `Other` row, which is an ordinary `Acc`: count **and**
 sum/min/max accumulate into it, so window totals stay exact for every
-aggregate. Worst-case memory per rule is
-`max_groups × group_by.len() × 256 B` (~51 MB for a 2-column rule at the
-100 000 default).
+aggregate. Worst-case memory is **per rule**, and nothing caps the number of
+configured rules — total worst-case memory is the sum across every rule.
+`max_groups × group_by.len() × 256 B` is a lower bound, not the real figure:
+it ignores the `String` header (24 B each on a 64-bit target), the
+`Option`/`Box` slice around the keys, the `Acc`/`AggAcc` accumulator itself,
+and `HashMap` slot overhead. Including those, a 2-column rule at the
+100 000-group default is closer to **~67 MB**, not ~51 MB.
 
 ### Aggregate semantics (SQL)
 
@@ -204,15 +208,17 @@ read as a set; the only load-bearing semantics are the explicit
 `FlushPolicy.interval`, so files land window-aligned in practice without
 anything depending on it.
 
-On shutdown the emit task does a final drain before the writer's graceful
-flush, so a partial window is not lost.
+On shutdown the emit task drains immediately, then waits ~2s (matching the
+listener-drain window main.rs documents for detached Zeek/Suricata
+per-connection tasks) and drains once more before returning, so neither a
+partial window nor a record counted during that drain window is lost.
 
 ## Configuration
 
 ```toml
 [aggregate]
 enabled = true
-flush_interval_secs = 300     # = window length
+flush_interval_secs = 300     # = window length (example value; code default is 900)
 max_groups = 100000           # per rule, per window
 
 [aggregate.s3]                # optional; S3ConnectionConfig flattened as elsewhere
