@@ -9,6 +9,7 @@ pub mod handlers;
 
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex};
 
 use crate::config::Config;
@@ -113,22 +114,53 @@ pub struct AggregateRow {
     pub window_end: DateTime<Utc>,
 }
 
+/// Group map plus the per-rule live-group counts that keep the cardinality
+/// cap an O(1) check. Both live under the same mutex so they can never drift
+/// out of sync with each other.
+struct AggState {
+    groups: HashMap<(usize, GroupKey), Acc>,
+    /// Live `Keys` (non-`Other`) group count per rule index, mirroring
+    /// `groups`. Incremented exactly once per genuinely new `Keys` entry;
+    /// reset to zero alongside `groups` in `drain()`.
+    counts: Vec<usize>,
+}
+
+/// Metric handles resolved once per rule at construction, so `consume()`
+/// never allocates a label string on the hot path.
+struct RuleMetrics {
+    consumed: metrics::Counter,
+    overflow: metrics::Counter,
+}
+
 /// In-memory group state for every rule.
 pub struct Aggregator {
     rules: Vec<CompiledRule>,
     max_groups: usize,
+    metrics: Vec<RuleMetrics>,
     // ponytail: one mutex over all rules' groups. A hashmap lookup plus a
     // counter bump is tens of nanoseconds; shard by rule if a profile ever
     // shows contention here.
-    state: Mutex<HashMap<(usize, GroupKey), Acc>>,
+    state: Mutex<AggState>,
 }
 
 impl Aggregator {
     pub fn new(rules: Vec<CompiledRule>, max_groups: usize) -> Self {
+        let metrics = rules
+            .iter()
+            .map(|r| RuleMetrics {
+                consumed: metrics::counter!("aggregate_records_consumed", "rule" => r.name.to_string()),
+                overflow: metrics::counter!("aggregate_overflow_records", "rule" => r.name.to_string()),
+            })
+            .collect();
+        let counts = vec![0; rules.len()];
         Self {
             rules,
             max_groups,
-            state: Mutex::new(HashMap::new()),
+            metrics,
+            state: Mutex::new(AggState {
+                groups: HashMap::new(),
+                counts,
+            }),
         }
     }
 
@@ -168,38 +200,41 @@ impl Aggregator {
                 .map(|spec| rec.field(&spec.field).as_ref().and_then(numeric_value))
                 .collect();
 
-            let mut state = self.state.lock().expect("aggregator state mutex poisoned");
+            let mut guard = self.state.lock().expect("aggregator state mutex poisoned");
+            // Split the guard into disjoint field borrows up front: through
+            // a `MutexGuard`, `state.groups.entry(key)` ties up the *whole*
+            // guard for the borrow checker (it can't see `groups` and
+            // `counts` as independent places across the deref), so checking
+            // `state.counts[idx]` from inside that match's arms does not
+            // borrow-check. Destructuring into two local `&mut` bindings
+            // first makes the two fields provably disjoint again.
+            let AggState { groups, counts } = &mut *guard;
             let key = (idx, GroupKey::Keys(keys));
-            // NOTE ON RESTRUCTURING: the brief's original shape scanned
-            // `state.keys()` for the existing-group count from inside the
-            // `None` arm of a `match state.get_mut(&key)`, which does not
-            // borrow-check (the `get_mut` mutable borrow is still live while
-            // `state.keys()` wants a shared borrow). Restructured to a
-            // `contains_key` probe up front instead: if the key is already
-            // present, cap logic never applies (it is not a *new* group), so
-            // the cap-count scan only needs to run in the not-present case.
-            // Semantics are unchanged: the cap counts only this rule's real
-            // (`Keys`) groups, and overflow increments the overflow counter.
-            let final_key = if state.contains_key(&key) {
-                key
-            } else {
-                let existing = state
-                    .keys()
-                    .filter(|(i, k)| *i == idx && matches!(k, GroupKey::Keys(_)))
-                    .count();
-                if existing >= self.max_groups {
-                    metrics::counter!("aggregate_overflow_records", "rule" => rule.name.to_string())
-                        .increment(1);
-                    (idx, GroupKey::Other)
-                } else {
-                    key
+            // O(1) cap check: `counts[idx]` mirrors the live number of
+            // `Keys` groups for this rule, so no per-record scan of the
+            // (shared, all-rules) map is needed. On a genuinely new key that
+            // would exceed the cap, abandon the vacant entry for `key` and
+            // re-enter under `(idx, GroupKey::Other)` instead — one extra
+            // hash lookup only on the rare overflow path, never on the
+            // common "already tracked" or "room under the cap" paths.
+            let entry = match groups.entry(key) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(e) => {
+                    if counts[idx] >= self.max_groups {
+                        self.metrics[idx].overflow.increment(1);
+                        groups.entry((idx, GroupKey::Other)).or_insert_with(|| Acc {
+                            count: 0,
+                            aggs: rule.aggs.iter().map(|_| AggAcc::new()).collect(),
+                        })
+                    } else {
+                        counts[idx] += 1;
+                        e.insert(Acc {
+                            count: 0,
+                            aggs: rule.aggs.iter().map(|_| AggAcc::new()).collect(),
+                        })
+                    }
                 }
             };
-
-            let entry = state.entry(final_key).or_insert_with(|| Acc {
-                count: 0,
-                aggs: rule.aggs.iter().map(|_| AggAcc::new()).collect(),
-            });
 
             entry.count += 1;
             for (acc, obs) in entry.aggs.iter_mut().zip(observations) {
@@ -207,10 +242,9 @@ impl Aggregator {
                     acc.observe(v);
                 }
             }
-            drop(state);
+            drop(guard);
 
-            metrics::counter!("aggregate_records_consumed", "rule" => rule.name.to_string())
-                .increment(1);
+            self.metrics[idx].consumed.increment(1);
         }
 
         matched
@@ -224,7 +258,10 @@ impl Aggregator {
     ) -> Vec<AggregateRow> {
         let taken = {
             let mut state = self.state.lock().expect("aggregator state mutex poisoned");
-            std::mem::take(&mut *state)
+            // Reset the per-rule counters alongside the map they mirror —
+            // they must never drift out of sync across a window boundary.
+            state.counts.iter_mut().for_each(|c| *c = 0);
+            std::mem::take(&mut state.groups)
         };
 
         let mut rows = Vec::with_capacity(taken.len());
@@ -521,13 +558,27 @@ mod tests {
                 serde_json::json!({"proto": "tcp", "orig_bytes": "7"}),
             ),
         );
+        // Non-finite (JSON itself cannot carry NaN/Infinity, but a numeric
+        // string parses to one, which is exactly what `numeric_value` must
+        // still reject).
+        agg.consume(
+            "zeek",
+            &zeek(
+                "conn",
+                serde_json::json!({"proto": "tcp", "orig_bytes": "NaN"}),
+            ),
+        );
 
         let rows = drain_sorted(&agg);
         assert_eq!(
-            rows[0].count, 4,
+            rows[0].count, 5,
             "every record counts regardless of aggregate usability"
         );
-        assert_eq!(rows[0].aggs, vec![Some(12.0)]);
+        assert_eq!(
+            rows[0].aggs,
+            vec![Some(12.0)],
+            "NaN must not pollute the sum"
+        );
     }
 
     #[test]
@@ -579,6 +630,43 @@ mod tests {
             other.aggs,
             vec![Some(3.0)],
             "aggregates accumulate into _other too"
+        );
+    }
+
+    #[test]
+    fn the_per_rule_group_counter_resets_on_drain_so_a_fresh_window_admits_max_groups_again() {
+        let agg = Aggregator::new(vec![rule("r", "zeek", Some("dns"), &["query"])], 2);
+        // Fill past the cap in window 1: 3 distinct keys against a cap of 2
+        // must fold the 3rd into `_other`.
+        for i in 0..3 {
+            agg.consume(
+                "zeek",
+                &zeek("dns", serde_json::json!({"query": format!("q{i}")})),
+            );
+        }
+        let rows = drain_sorted(&agg);
+        assert_eq!(rows.len(), 3, "2 real groups + 1 overflow row in window 1");
+
+        // If the per-rule live-group counter did not reset alongside the
+        // map on drain, it would still read >= max_groups here and every
+        // key in window 2 — even brand new ones — would immediately
+        // overflow into `_other`.
+        for i in 0..2 {
+            agg.consume(
+                "zeek",
+                &zeek("dns", serde_json::json!({"query": format!("w2-{i}")})),
+            );
+        }
+        let rows = drain_sorted(&agg);
+        assert_eq!(
+            rows.len(),
+            2,
+            "a fresh window must admit max_groups real groups again, not overflow immediately"
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.keys.iter().all(|k| k.as_deref() != Some(OTHER_LABEL))),
+            "neither key should have overflowed: {rows:?}"
         );
     }
 
