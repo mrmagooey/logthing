@@ -101,6 +101,7 @@ bind_address = "0.0.0.0"   # env: WEF__IPFIX__BIND_ADDRESS
 # enabled = true
 # flush_interval_secs = 300
 # max_groups = 100000
+# channel_capacity = 4096
 #
 # [aggregate.local]
 # directory = "/data/agg"

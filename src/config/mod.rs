@@ -2465,4 +2465,26 @@ sum = ["octet_delta_count"]
             toml::from_str(r#"directory = "/tmp/x""#).expect("parses without prefix");
         assert_eq!(cfg.prefix, "aggregate");
     }
+
+    #[test]
+    fn aggregate_s3_prefix_defaults_to_aggregate() {
+        let toml_src = r#"
+endpoint = "http://localhost:9000"
+bucket = "agg-bucket"
+region = "us-east-1"
+access_key = "minioadmin"
+secret_key = "minioadmin"
+"#;
+        let cfg: AggregateS3Config =
+            toml::from_str(toml_src).expect("parses s3 config with flattened connection fields");
+        assert_eq!(cfg.connection.endpoint, "http://localhost:9000");
+        assert_eq!(cfg.connection.bucket, "agg-bucket");
+        assert_eq!(cfg.connection.region, "us-east-1");
+        assert_eq!(cfg.connection.access_key, "minioadmin");
+        assert_eq!(cfg.connection.secret_key, "minioadmin");
+        assert_eq!(
+            cfg.prefix, "aggregate",
+            "prefix defaults to aggregate when omitted"
+        );
+    }
 }

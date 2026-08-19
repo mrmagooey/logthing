@@ -416,6 +416,7 @@ its summary.
 enabled = true
 flush_interval_secs = 300   # window length; each row carries window_start/window_end
 max_groups = 100000         # per rule, per window
+channel_capacity = 4096     # bounded channel between listener and aggregator (default: 4096)
 
 [aggregate.local]           # and/or [aggregate.s3], same shape as other sources
 directory = "/data/agg"
@@ -440,8 +441,9 @@ column per `group_by` field, a `count`, one column per `sum`/`min`/`max`, and
 
 Notes:
 
-- `stream` matches the Zeek `_path`, Suricata `event_type`, syslog `app_name`,
-  sFlow `"flow"`/`"counter"`, or IPFIX `"flows"`.
+- `stream` matches the Zeek `_path` (normalized to the stable stream name, so rotation
+  suffixes are stripped; e.g., `conn.2026-08-14-16-08-44.log.gz` → `conn`), Suricata
+  `event_type`, syslog `app_name`, sFlow `"flow"`/`"counter"`, or IPFIX `"flows"`.
 - A record matching two rules is counted in both.
 - Aggregates follow SQL semantics: missing and non-numeric values are skipped,
   the record is still counted, and a group with no numeric observations emits
