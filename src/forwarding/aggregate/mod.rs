@@ -475,7 +475,7 @@ pub fn rule_schema(group_by: &[String], aggs: &[AggSpec]) -> Arc<Schema> {
         // Nullable: SQL SUM/MIN/MAX over zero observations is NULL.
         fields.push(Field::new(&spec.column, DataType::Float64, true));
     }
-    let ts = DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+    let ts = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
     fields.push(Field::new("window_start", ts.clone(), false));
     fields.push(Field::new("window_end", ts, false));
     Arc::new(Schema::new(fields))
@@ -523,7 +523,7 @@ impl crate::forwarding::buffered_writer::ParquetSink for AggregateSink {
         schema: &Arc<Schema>,
     ) -> anyhow::Result<arrow_array::RecordBatch> {
         use arrow::array::{
-            ArrayRef, Float64Array, StringArray, TimestampMillisecondArray, UInt64Array,
+            ArrayRef, Float64Array, StringArray, TimestampMicrosecondArray, UInt64Array,
         };
 
         let expected = record.keys.len() + 1 + record.aggs.len() + 2;
@@ -547,7 +547,7 @@ impl crate::forwarding::buffered_writer::ParquetSink for AggregateSink {
         let tz: Arc<str> = Arc::from("UTC");
         for t in [record.window_start, record.window_end] {
             columns.push(Arc::new(
-                TimestampMillisecondArray::from(vec![t.timestamp_millis()])
+                TimestampMicrosecondArray::from(vec![t.timestamp_micros()])
                     .with_timezone(tz.clone()),
             ));
         }
@@ -1257,13 +1257,16 @@ mod tests {
             ]
         );
 
-        use arrow_schema::DataType;
+        use arrow_schema::{DataType, TimeUnit};
         assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
         assert!(schema.field(0).is_nullable(), "group columns are nullable");
         assert_eq!(schema.field(2).data_type(), &DataType::UInt64);
         assert!(!schema.field(2).is_nullable(), "count is never null");
         assert_eq!(schema.field(3).data_type(), &DataType::Float64);
         assert!(schema.field(3).is_nullable(), "aggregates may be SQL NULL");
+        let ts = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        assert_eq!(schema.field(4).data_type(), &ts, "window_start");
+        assert_eq!(schema.field(5).data_type(), &ts, "window_end");
     }
 
     #[test]
@@ -1280,7 +1283,9 @@ mod tests {
         let schema = r.schema.clone();
         let sink = AggregateSink::new(std::slice::from_ref(&r));
 
-        let now = Utc::now();
+        // A sub-millisecond component so a regression to millisecond
+        // truncation would fail this test.
+        let now = DateTime::<Utc>::from_timestamp_micros(1_700_000_000_123_456).unwrap();
         let row = AggregateRow {
             rule: Arc::from("dns_by_query"),
             keys: vec![Some("a.example".to_string()), None],
@@ -1321,6 +1326,20 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .unwrap();
         assert!(sum.is_null(0), "an unobserved aggregate must be NULL");
+
+        use arrow::array::TimestampMicrosecondArray;
+        let window_start = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(window_start.value(0), now.timestamp_micros());
+        let window_end = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(window_end.value(0), now.timestamp_micros());
     }
 
     #[test]
