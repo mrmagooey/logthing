@@ -164,6 +164,67 @@ async fn no_pri_cef_datagram_produces_structured_record_with_cef_payload_type() 
 }
 
 #[tokio::test]
+async fn no_pri_cef_datagram_with_trailing_newline_produces_structured_record_with_cef_payload_type()
+ {
+    // Regression test: UDP syslog senders commonly append a trailing '\n' to
+    // the datagram. Unlike the TCP path, the UDP receive arm does not trim
+    // it before calling SyslogMessage::parse. Before the central strip in
+    // parse(), a trailing '\n' made every header regex's `$` anchor fail
+    // (Rust regex `$` has no trailing-newline exception without multi-line
+    // mode), so the message was silently dropped.
+    let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp_port = udp_socket.local_addr().unwrap().port();
+    drop(udp_socket);
+
+    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_port = tcp_listener.local_addr().unwrap().port();
+    drop(tcp_listener);
+
+    let store = CapturingStore::new();
+    let handler = Arc::new(DispatchingTestHandler {
+        store: store.clone(),
+    });
+
+    let cfg = SyslogListenerConfig {
+        udp_port,
+        tcp_port,
+        bind_address: "127.0.0.1".to_string(),
+        parse_dns_logs: false,
+    };
+
+    let listener = SyslogListener::new(cfg, handler);
+    let task = tokio::spawn(async move {
+        listener.start().await.ok();
+    });
+
+    sleep(Duration::from_millis(100)).await;
+
+    // Bare CEF line, no <PRI> envelope, WITH a trailing newline byte.
+    let send_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let cef_line = "CEF:0|Vendor|FW|1.0|SIG001|Firewall Accept|6|src=10.0.0.1 dst=8.8.8.8";
+    send_sock
+        .send_to(
+            format!("{}\n", cef_line).as_bytes(),
+            format!("127.0.0.1:{}", udp_port),
+        )
+        .await
+        .unwrap();
+
+    sleep(Duration::from_millis(200)).await;
+    task.abort();
+
+    let records = store.take();
+    assert_eq!(
+        records.len(),
+        1,
+        "expected 1 structured record, got {}",
+        records.len()
+    );
+    let rec = &records[0];
+    assert_eq!(rec.payload_type, "cef");
+}
+
+#[tokio::test]
 async fn non_matching_datagram_produces_no_structured_record() {
     let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let udp_port = udp_socket.local_addr().unwrap().port();

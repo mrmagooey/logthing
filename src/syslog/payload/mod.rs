@@ -242,6 +242,19 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_no_pri_bare_cef_trailing_newline_returns_cef_variant() {
+        // Regression guard: UDP syslog senders commonly append a trailing
+        // newline to the datagram. Before the central strip in parse(), a
+        // trailing '\n' made the RFC3164_NOPRI_RE `$` anchor fail to match,
+        // so the message was dropped before the CEF sub-parser ever ran.
+        let msg = crate::syslog::SyslogMessage::parse(
+            "CEF:0|Vendor|Product|1.0|100|Login|5|src=10.0.0.1\n",
+        )
+        .expect("no-PRI bare CEF line with trailing newline must parse");
+        assert!(matches!(dispatch(&msg), SyslogPayload::Cef(_)));
+    }
+
+    #[test]
     fn dispatch_unknown_message_returns_none_variant() {
         let msg = bare_msg("this is not any known format");
         assert!(matches!(dispatch(&msg), SyslogPayload::None));
