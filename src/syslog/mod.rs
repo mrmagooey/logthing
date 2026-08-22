@@ -267,7 +267,16 @@ impl SyslogMessage {
             let hostname = Some(caps.get(2)?.as_str().to_string());
 
             let rest = caps.get(3)?.as_str();
-            let (app_name, proc_id, message) = Self::parse_rfc3164_tag(rest);
+            // If the hostname is immediately followed by a bare CEF/LEEF
+            // payload with no separate app-tag (e.g. UDM-style forwarding),
+            // don't let parse_rfc3164_tag's greedy tag regex eat the "CEF"/
+            // "LEEF" prefix off the message.
+            let (app_name, proc_id, message) =
+                if rest.starts_with("CEF:") || rest.starts_with("LEEF:") {
+                    (None, None, rest.to_string())
+                } else {
+                    Self::parse_rfc3164_tag(rest)
+                };
 
             return Some(SyslogMessage {
                 priority,
@@ -836,6 +845,32 @@ mod tests {
         assert_eq!(parsed.facility, 1);
         assert!(matches!(parsed.protocol, SyslogProtocol::Unknown));
         assert!(parsed.message.contains("CEF:0|"));
+    }
+
+    #[test]
+    fn test_parse_no_pri_rfc3164_shaped_cef_no_tag() {
+        // Hostname immediately followed by a bare CEF/LEEF payload, with no
+        // separate app-tag in between (e.g. UDM-Pro style forwarding). The
+        // greedy tag regex must not eat the "CEF:"/"LEEF:" prefix.
+        let cef = "Jan 15 10:30:45 UDM-Pro CEF:0|Ubiquiti|IDS|1.0|100|Alert|5|src=1.2.3.4";
+        let parsed = SyslogMessage::parse(cef).unwrap();
+        assert_eq!(parsed.hostname, Some("UDM-Pro".to_string()));
+        assert_eq!(parsed.app_name, None);
+        assert_eq!(
+            parsed.message,
+            "CEF:0|Ubiquiti|IDS|1.0|100|Alert|5|src=1.2.3.4"
+        );
+        assert!(parsed.message.starts_with("CEF:"));
+
+        let leef = "Jan 15 10:30:45 UDM-Pro LEEF:1.0|Ubiquiti|IDS|1.0|EventID|key=value";
+        let parsed = SyslogMessage::parse(leef).unwrap();
+        assert_eq!(parsed.hostname, Some("UDM-Pro".to_string()));
+        assert_eq!(parsed.app_name, None);
+        assert_eq!(
+            parsed.message,
+            "LEEF:1.0|Ubiquiti|IDS|1.0|EventID|key=value"
+        );
+        assert!(parsed.message.starts_with("LEEF:"));
     }
 
     #[test]
