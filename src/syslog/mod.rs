@@ -20,6 +20,11 @@ static RFC3164_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^<(\d{1,3})>([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+(.*?)$").unwrap()
 });
 
+/// RFC 3164 header with no `<PRI>` prefix (some devices omit it entirely).
+static RFC3164_NOPRI_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+(.*?)$").unwrap()
+});
+
 /// RFC 3164 timestamp: "Mon DD HH:MM:SS"
 static RFC3164_TS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})$").unwrap());
@@ -230,7 +235,76 @@ impl SyslogMessage {
         }
 
         // Fall back to RFC 3164
-        Self::parse_rfc3164(input)
+        if let Some(msg) = Self::parse_rfc3164(input) {
+            return Some(msg);
+        }
+
+        // Some devices (e.g. Ubiquiti UDM CEF/LEEF forwarding) omit <PRI> entirely.
+        Self::parse_no_pri(input)
+    }
+
+    /// Fallback for messages with no `<PRI>` prefix at all.
+    ///
+    /// Tried only after both RFC 5424 and RFC 3164 (with PRI) fail. Targeted,
+    /// not a catch-all: garbage text must still return `None` here so
+    /// `test_parse_invalid_syslog` / `test_parse_empty_message` keep passing.
+    ///
+    /// Tier 1: RFC-3164-shaped line minus `<PRI>`.
+    /// Tier 2: bare recognized payload prefix (CEF/LEEF only — the only two
+    /// payload formats in `payload/` that are unambiguous by prefix alone).
+    fn parse_no_pri(input: &str) -> Option<Self> {
+        // RFC 3164 §4.3.3 default when PRI is missing: facility=user(1), severity=notice(5).
+        const DEFAULT_PRIORITY: u8 = (1 << 3) | 5;
+
+        if let Some(caps) = RFC3164_NOPRI_RE.captures(input) {
+            let priority = DEFAULT_PRIORITY;
+            let severity = priority & 0x07;
+            let facility = (priority >> 3) & 0x1f;
+
+            let timestamp_str = caps.get(1)?.as_str();
+            let timestamp = Self::parse_rfc3164_timestamp(timestamp_str);
+
+            let hostname = Some(caps.get(2)?.as_str().to_string());
+
+            let rest = caps.get(3)?.as_str();
+            let (app_name, proc_id, message) = Self::parse_rfc3164_tag(rest);
+
+            return Some(SyslogMessage {
+                priority,
+                severity,
+                facility,
+                timestamp,
+                hostname,
+                app_name,
+                proc_id,
+                msg_id: None,
+                message,
+                structured_data: None,
+                protocol: SyslogProtocol::Unknown,
+            });
+        }
+
+        if input.starts_with("CEF:") || input.starts_with("LEEF:") {
+            let priority = DEFAULT_PRIORITY;
+            let severity = priority & 0x07;
+            let facility = (priority >> 3) & 0x1f;
+
+            return Some(SyslogMessage {
+                priority,
+                severity,
+                facility,
+                timestamp: None,
+                hostname: None,
+                app_name: None,
+                proc_id: None,
+                msg_id: None,
+                message: input.to_string(),
+                structured_data: None,
+                protocol: SyslogProtocol::Unknown,
+            });
+        }
+
+        None
     }
 
     /// Parse RFC 5424 formatted syslog message
@@ -750,6 +824,38 @@ mod tests {
         assert_eq!(Facility::from_u8(0), Some(Facility::Kernel));
         assert_eq!(Facility::from_u8(4), Some(Facility::Security));
         assert_eq!(Facility::from_u8(16), Some(Facility::Local0));
+    }
+
+    #[test]
+    fn test_parse_no_pri_rfc3164_shaped_cef() {
+        let msg = "Jan 15 10:30:45 fw01 arcsight: CEF:0|Vendor|Product|1.0|100|Login|5|src=1.2.3.4";
+        let parsed = SyslogMessage::parse(msg).unwrap();
+
+        assert_eq!(parsed.priority, 13);
+        assert_eq!(parsed.severity, 5);
+        assert_eq!(parsed.facility, 1);
+        assert!(matches!(parsed.protocol, SyslogProtocol::Unknown));
+        assert!(parsed.message.contains("CEF:0|"));
+    }
+
+    #[test]
+    fn test_parse_no_pri_bare_cef() {
+        let msg = "CEF:0|Vendor|Product|1.0|100|Login|5|src=1.2.3.4";
+        let parsed = SyslogMessage::parse(msg).unwrap();
+
+        assert_eq!(parsed.hostname, None);
+        assert_eq!(parsed.message, msg);
+        assert_eq!(parsed.priority, 13);
+    }
+
+    #[test]
+    fn test_parse_no_pri_bare_leef() {
+        let msg = "LEEF:1.0|Vendor|Product|1.0|EventID|key=value";
+        let parsed = SyslogMessage::parse(msg).unwrap();
+
+        assert_eq!(parsed.hostname, None);
+        assert_eq!(parsed.message, msg);
+        assert_eq!(parsed.priority, 13);
     }
 
     #[test]

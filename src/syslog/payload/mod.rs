@@ -230,6 +230,18 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_no_pri_bare_cef_message_returns_cef_variant() {
+        // Regression guard: before the no-PRI fallback, SyslogMessage::parse
+        // returned None for bare CEF lines with no <PRI> envelope, so the
+        // CEF sub-parser never ran.
+        let msg = crate::syslog::SyslogMessage::parse(
+            "CEF:0|Vendor|Product|1.0|100|Login|5|src=10.0.0.1",
+        )
+        .expect("no-PRI bare CEF line must parse");
+        assert!(matches!(dispatch(&msg), SyslogPayload::Cef(_)));
+    }
+
+    #[test]
     fn dispatch_unknown_message_returns_none_variant() {
         let msg = bare_msg("this is not any known format");
         assert!(matches!(dispatch(&msg), SyslogPayload::None));
