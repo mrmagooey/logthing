@@ -229,6 +229,14 @@ impl SyslogMessage {
     /// }
     /// ```
     pub fn parse(input: &str) -> Option<Self> {
+        // Every header regex below ends in `(.*?)$`. Rust's regex `.` never
+        // crosses `\n`, and unlike some other regex flavors `$` has no
+        // trailing-newline exception (it only matches absolute end-of-haystack
+        // without multi-line mode) — so an untrimmed line terminator silently
+        // fails all three parse attempts. Strip it once, here, for every caller.
+        let input = input.strip_suffix('\n').unwrap_or(input);
+        let input = input.strip_suffix('\r').unwrap_or(input);
+
         // Try RFC 5424 first (starts with version number after priority)
         if let Some(msg) = Self::parse_rfc5424(input) {
             return Some(msg);
@@ -891,6 +899,44 @@ mod tests {
         assert_eq!(parsed.hostname, None);
         assert_eq!(parsed.message, msg);
         assert_eq!(parsed.priority, 13);
+    }
+
+    #[test]
+    fn test_parse_rfc3164_trailing_newline() {
+        let msg = "<134>Jan 15 10:30:45 fw01 arcsight: CEF:0|Vendor|Product|1.0|100|Login|5|src=1.2.3.4\n";
+        let parsed = SyslogMessage::parse(msg).unwrap();
+
+        assert!(matches!(parsed.protocol, SyslogProtocol::Rfc3164));
+        assert!(!parsed.message.ends_with('\n'));
+        assert_eq!(
+            parsed.message,
+            "CEF:0|Vendor|Product|1.0|100|Login|5|src=1.2.3.4"
+        );
+    }
+
+    #[test]
+    fn test_parse_rfc3164_trailing_crlf() {
+        let msg = "<134>Jan 15 10:30:45 fw01 arcsight: CEF:0|Vendor|Product|1.0|100|Login|5|src=1.2.3.4\r\n";
+        let parsed = SyslogMessage::parse(msg).unwrap();
+
+        assert!(matches!(parsed.protocol, SyslogProtocol::Rfc3164));
+        assert!(!parsed.message.ends_with('\r'));
+        assert!(!parsed.message.ends_with('\n'));
+        assert_eq!(
+            parsed.message,
+            "CEF:0|Vendor|Product|1.0|100|Login|5|src=1.2.3.4"
+        );
+    }
+
+    #[test]
+    fn test_parse_no_pri_bare_cef_trailing_newline() {
+        let msg = "CEF:0|Vendor|Product|1.0|100|Login|5|src=1.2.3.4\n";
+        let parsed = SyslogMessage::parse(msg).unwrap();
+
+        assert_eq!(
+            parsed.message,
+            "CEF:0|Vendor|Product|1.0|100|Login|5|src=1.2.3.4"
+        );
     }
 
     #[test]
