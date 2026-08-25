@@ -344,6 +344,81 @@ pub fn admin_start_allowed(bind: SocketAddr, user: &str, pass: &str) -> Result<(
 /// * `require_client_cert` – `WEF_ADMIN_TLS_REQUIRE_CLIENT_CERT` parsed value (default `false`).
 /// * `enable_csrf`         – `WEF_ADMIN_ENABLE_CSRF` parsed value (default `true`).
 /// * `enable_rate_limiting`– `WEF_ADMIN_ENABLE_RATE_LIMIT` parsed value (default `true`).
+/// Raw, unvalidated env-var inputs for trusted reverse-proxy-header auth.
+/// Bundled into one struct so `build_admin_config_from_parts` doesn't grow
+/// past its already-long positional-argument list.
+#[derive(Default)]
+pub struct TrustedHeaderEnvArgs<'a> {
+    pub trust_proxy_headers: bool,
+    pub username_header: Option<&'a str>,
+    pub groups_header: Option<&'a str>,
+    pub secret_header: Option<&'a str>,
+    pub secret: Option<&'a str>,
+    pub allowed_groups: Option<&'a str>,
+}
+
+/// Validates and builds `TrustedHeaderConfig` from raw env-derived inputs.
+///
+/// Fails closed, unconditionally (regardless of bind address): if
+/// `trust_proxy_headers` is true, both a non-empty secret and a non-empty
+/// allowed-groups list are required. A missing secret would let anyone who
+/// reaches this server forge identity headers; a missing groups list would
+/// silently turn "groups gate access" into "any proxied user is admin,"
+/// which defeats the entire point of the feature.
+fn build_trusted_header_config(
+    args: TrustedHeaderEnvArgs,
+) -> anyhow::Result<Option<TrustedHeaderConfig>> {
+    if !args.trust_proxy_headers {
+        return Ok(None);
+    }
+
+    let secret = args.secret.unwrap_or("").to_string();
+    if secret.is_empty() {
+        anyhow::bail!(
+            "WEF_ADMIN_TRUST_PROXY_HEADERS is true but WEF_ADMIN_TRUSTED_HEADER_SECRET is \
+             not set. A shared secret is required whenever trusted-header auth is enabled \
+             (regardless of bind address) — without it, any request that reaches this \
+             server can forge the identity headers."
+        );
+    }
+
+    let allowed_groups: Vec<String> = args
+        .allowed_groups
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if allowed_groups.is_empty() {
+        anyhow::bail!(
+            "WEF_ADMIN_TRUST_PROXY_HEADERS is true but WEF_ADMIN_TRUSTED_GROUPS is empty. \
+             At least one allowed group is required — trusted-header auth must not grant \
+             access to every successfully-proxied user."
+        );
+    }
+
+    let username_header =
+        HeaderName::from_bytes(args.username_header.unwrap_or("X-authentik-username").as_bytes())
+            .map_err(|e| anyhow::anyhow!("invalid WEF_ADMIN_TRUSTED_HEADER value: {e}"))?;
+    let groups_header = HeaderName::from_bytes(
+        args.groups_header.unwrap_or("X-authentik-groups").as_bytes(),
+    )
+    .map_err(|e| anyhow::anyhow!("invalid WEF_ADMIN_TRUSTED_GROUPS_HEADER value: {e}"))?;
+    let secret_header = HeaderName::from_bytes(
+        args.secret_header.unwrap_or("X-Admin-Proxy-Secret").as_bytes(),
+    )
+    .map_err(|e| anyhow::anyhow!("invalid WEF_ADMIN_TRUSTED_SECRET_HEADER value: {e}"))?;
+
+    Ok(Some(TrustedHeaderConfig {
+        username_header,
+        groups_header,
+        secret_header,
+        secret,
+        allowed_groups,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_admin_config_from_parts(
     bind_str: Option<&str>,
@@ -357,6 +432,7 @@ pub fn build_admin_config_from_parts(
     require_client_cert: bool,
     enable_csrf: bool,
     enable_rate_limiting: bool,
+    trusted_header_env: TrustedHeaderEnvArgs,
 ) -> anyhow::Result<AdminServerConfig> {
     // Resolve bind address — warn and fall back to loopback if the value is present but
     // unparseable (mirrors the env-reading path in load_admin_config).
@@ -433,6 +509,8 @@ pub fn build_admin_config_from_parts(
         }
     };
 
+    let trusted_header = build_trusted_header_config(trusted_header_env)?;
+
     Ok(AdminServerConfig {
         bind_address,
         username: username.to_string(),
@@ -441,7 +519,7 @@ pub fn build_admin_config_from_parts(
         tls_config,
         enable_csrf,
         enable_rate_limiting,
-        trusted_header: None,
+        trusted_header,
     })
 }
 
@@ -464,6 +542,14 @@ pub fn load_admin_config() -> anyhow::Result<AdminServerConfig> {
     let enable_rate_limiting = std::env::var("WEF_ADMIN_ENABLE_RATE_LIMIT")
         .map(|s| s == "true" || s == "1")
         .unwrap_or(true);
+    let trust_proxy_headers = std::env::var("WEF_ADMIN_TRUST_PROXY_HEADERS")
+        .map(|s| s == "true" || s == "1")
+        .unwrap_or(false);
+    let trusted_username_header = std::env::var("WEF_ADMIN_TRUSTED_HEADER").ok();
+    let trusted_groups_header = std::env::var("WEF_ADMIN_TRUSTED_GROUPS_HEADER").ok();
+    let trusted_secret_header = std::env::var("WEF_ADMIN_TRUSTED_SECRET_HEADER").ok();
+    let trusted_header_secret = std::env::var("WEF_ADMIN_TRUSTED_HEADER_SECRET").ok();
+    let trusted_groups = std::env::var("WEF_ADMIN_TRUSTED_GROUPS").ok();
 
     build_admin_config_from_parts(
         bind_str.as_deref(),
@@ -477,6 +563,14 @@ pub fn load_admin_config() -> anyhow::Result<AdminServerConfig> {
         require_client_cert,
         enable_csrf,
         enable_rate_limiting,
+        TrustedHeaderEnvArgs {
+            trust_proxy_headers,
+            username_header: trusted_username_header.as_deref(),
+            groups_header: trusted_groups_header.as_deref(),
+            secret_header: trusted_secret_header.as_deref(),
+            secret: trusted_header_secret.as_deref(),
+            allowed_groups: trusted_groups.as_deref(),
+        },
     )
 }
 
@@ -604,6 +698,7 @@ mod tests {
             false,   // require_client_cert
             true,    // enable_csrf
             true,    // enable_rate_limiting
+            TrustedHeaderEnvArgs::default(),
         )
     }
 
@@ -630,6 +725,7 @@ mod tests {
             false,
             true,
             true,
+            TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
         assert_eq!(cfg.bind_address.port(), 9090);
@@ -650,6 +746,7 @@ mod tests {
             false,
             true,
             true,
+            TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
         assert_eq!(
@@ -673,6 +770,7 @@ mod tests {
             false,
             true,
             true,
+            TrustedHeaderEnvArgs::default(),
         );
         assert!(
             result.is_err(),
@@ -699,6 +797,7 @@ mod tests {
             false,
             true,
             true,
+            TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
         assert_eq!(cfg.username, "ops");
@@ -720,6 +819,7 @@ mod tests {
             false,
             true,
             true,
+            TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
         // The stored hash should verify against the original password.
@@ -730,6 +830,7 @@ mod tests {
     fn build_config_custom_user_and_pass() {
         let cfg = build_admin_config_from_parts(
             None, "myuser", "mypass", None, None, None, None, None, false, true, true,
+            TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
         assert_eq!(cfg.username, "myuser");
@@ -750,6 +851,7 @@ mod tests {
             false,
             true,
             true,
+            TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
         assert_eq!(cfg.allowed_ips.len(), 3);
@@ -779,6 +881,7 @@ mod tests {
             false,
             true,
             true,
+            TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
         assert!(cfg.allowed_ips.is_empty());
@@ -799,6 +902,7 @@ mod tests {
             false,
             true,
             true,
+            TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
         assert_eq!(
@@ -829,6 +933,7 @@ mod tests {
             false,
             true,
             true,
+            TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
         let tls = cfg.tls_config.expect("TLS should be configured");
@@ -852,6 +957,7 @@ mod tests {
             true, // require_client_cert
             true,
             true,
+            TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
         let tls = cfg.tls_config.expect("TLS should be configured");
@@ -874,6 +980,7 @@ mod tests {
             false,
             true,
             true,
+            TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
         assert!(
@@ -894,6 +1001,7 @@ mod tests {
             None, "admin", "admin", None, None, None, None, None, false,
             false, // enable_csrf = false
             true,
+            TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
         assert!(!cfg.enable_csrf);
@@ -905,6 +1013,7 @@ mod tests {
             None, "admin", "admin", None, None, None, None, None, false,
             true, // enable_csrf = true
             true,
+            TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
         assert!(cfg.enable_csrf);
@@ -915,6 +1024,7 @@ mod tests {
         let cfg = build_admin_config_from_parts(
             None, "admin", "admin", None, None, None, None, None, false, true,
             false, // enable_rate_limiting = false
+            TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
         assert!(!cfg.enable_rate_limiting);
@@ -924,9 +1034,104 @@ mod tests {
     fn build_config_rate_limiting_enabled() {
         let cfg = build_admin_config_from_parts(
             None, "admin", "admin", None, None, None, None, None, false, true, true,
+            TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
         assert!(cfg.enable_rate_limiting);
+    }
+
+    // ── TrustedHeaderConfig / build_trusted_header_config coverage ────────────
+
+    #[test]
+    fn trusted_header_disabled_by_default() {
+        let cfg = default_parts().unwrap();
+        assert!(cfg.trusted_header.is_none());
+    }
+
+    #[test]
+    fn trusted_header_enabled_without_secret_errs() {
+        let result = build_admin_config_from_parts(
+            None, "admin", "admin", None, None, None, None, None, false, true, true,
+            TrustedHeaderEnvArgs {
+                trust_proxy_headers: true,
+                allowed_groups: Some("admins"),
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err(), "trust mode on with no secret must be refused");
+        let msg = result.err().unwrap().to_string();
+        assert!(msg.contains("WEF_ADMIN_TRUSTED_HEADER_SECRET"), "{msg}");
+    }
+
+    #[test]
+    fn trusted_header_enabled_with_empty_groups_errs() {
+        let result = build_admin_config_from_parts(
+            None, "admin", "admin", None, None, None, None, None, false, true, true,
+            TrustedHeaderEnvArgs {
+                trust_proxy_headers: true,
+                secret: Some("shhh"),
+                allowed_groups: Some("   , ,  "), // parses to zero non-empty entries
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err(), "trust mode on with no usable group must be refused");
+        let msg = result.err().unwrap().to_string();
+        assert!(msg.contains("WEF_ADMIN_TRUSTED_GROUPS"), "{msg}");
+    }
+
+    #[test]
+    fn trusted_header_enabled_valid_inputs_uses_defaults() {
+        let cfg = build_admin_config_from_parts(
+            None, "admin", "admin", None, None, None, None, None, false, true, true,
+            TrustedHeaderEnvArgs {
+                trust_proxy_headers: true,
+                secret: Some("shhh"),
+                allowed_groups: Some("admins, ops"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let th = cfg.trusted_header.expect("trusted_header should be Some");
+        assert_eq!(th.username_header, "x-authentik-username");
+        assert_eq!(th.groups_header, "x-authentik-groups");
+        assert_eq!(th.secret_header, "x-admin-proxy-secret");
+        assert_eq!(th.secret, "shhh");
+        assert_eq!(th.allowed_groups, vec!["admins", "ops"]);
+    }
+
+    #[test]
+    fn trusted_header_custom_header_names_override_defaults() {
+        let cfg = build_admin_config_from_parts(
+            None, "admin", "admin", None, None, None, None, None, false, true, true,
+            TrustedHeaderEnvArgs {
+                trust_proxy_headers: true,
+                username_header: Some("X-Custom-User"),
+                groups_header: Some("X-Custom-Groups"),
+                secret_header: Some("X-Custom-Secret"),
+                secret: Some("shhh"),
+                allowed_groups: Some("admins"),
+            },
+        )
+        .unwrap();
+        let th = cfg.trusted_header.expect("trusted_header should be Some");
+        assert_eq!(th.username_header, "x-custom-user");
+        assert_eq!(th.groups_header, "x-custom-groups");
+        assert_eq!(th.secret_header, "x-custom-secret");
+    }
+
+    #[test]
+    fn trusted_header_invalid_header_name_errs() {
+        let result = build_admin_config_from_parts(
+            None, "admin", "admin", None, None, None, None, None, false, true, true,
+            TrustedHeaderEnvArgs {
+                trust_proxy_headers: true,
+                username_header: Some("not a valid header name!!"),
+                secret: Some("shhh"),
+                allowed_groups: Some("admins"),
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err(), "an invalid header-name string must be refused at build time");
     }
 
     // ── load_admin_config env-driven tests (sequential, single test fn) ───────
