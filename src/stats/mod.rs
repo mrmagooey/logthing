@@ -57,16 +57,22 @@ impl ThroughputStats {
         //
         // Cap the number of distinct keys at MAX_EVENT_TYPES; once full, a
         // never-seen-before key folds into "_other" instead of growing the
-        // map further. `contains_key` then `entry` (mirroring the same
-        // idiom in `forwarding/aggregate/mod.rs` and
-        // `forwarding/buffered_writer.rs`) keeps the extra hash lookup off
-        // the common "already tracked" / "room under the cap" paths.
+        // map further. `contains_key` then `entry` mirrors the same
+        // check-then-insert idiom `forwarding/buffered_writer.rs`'s
+        // partition cap uses, so the extra hash lookup only lands on the
+        // overflow path, not the common "already tracked" / "room under the
+        // cap" ones.
         //
-        // This check-then-act is racy under concurrent callers: two threads
-        // can each observe room under the cap and both insert, overshooting
-        // it by a small, thread-count-bounded amount. That's accepted here,
-        // same as the existing partition cap it mirrors — closing it would
-        // need a lock this DashMap is explicitly avoiding.
+        // ponytail: that idiom is shared, but the race below is not — the
+        // partition cap it's modeled on takes `&mut self` (no concurrent
+        // callers possible) and the aggregate group cap holds a mutex
+        // across its check-and-insert, so neither actually races. This is
+        // genuinely check-then-act over a lock-free DashMap: concurrent
+        // callers can each observe room under the cap and all insert,
+        // overshooting it by up to (concurrent callers - 1) keys. Bounded
+        // by caller concurrency, not by input size, so it's accepted rather
+        // than closed. Wrap the check-and-insert in a `Mutex` if a tighter
+        // bound is ever needed.
         let key = if self.inner.contains_key(&event_type) || self.inner.len() < MAX_EVENT_TYPES {
             event_type
         } else {

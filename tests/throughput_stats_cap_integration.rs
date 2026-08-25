@@ -19,7 +19,7 @@ use std::sync::Arc;
 /// diverged from this value in a way that changed the bounded-growth shape.
 const MAX_EVENT_TYPES: usize = 1024;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cap_holds_under_concurrent_distinct_keys() {
     let stats = Arc::new(ThroughputStats::new());
 
@@ -73,7 +73,7 @@ async fn cap_holds_under_concurrent_distinct_keys() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_stays_bounded_when_one_key_dominates_at_the_cap() {
     let stats = ThroughputStats::new();
 
