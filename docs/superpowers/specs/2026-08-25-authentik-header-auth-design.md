@@ -239,6 +239,22 @@ outside `src/admin/`. `main.rs` and `tests/admin_flush_interval_e2e.rs` only
 go through the stable public `spawn_admin_server(...)` entry point and are
 unaffected (new env vars default off).
 
+**Fourth inventory, found while writing the implementation plan (same
+verification discipline applied prospectively this time, not after a review
+round caught it)**: `build_admin_config_from_parts` itself — the function
+gaining the new `trusted_header_env: TrustedHeaderEnvArgs` parameter — has
+**18** references, verified via `grep -rn "build_admin_config_from_parts("
+src/admin/`: the definition (`state.rs:322`), the one production call inside
+`load_admin_config` (`state.rs:441`), and **16 test call sites**, all
+confined to `state.rs`'s own test module (lines 568, 594, 614, 637, 663, 684,
+704, 714, 743, 763, 793, 816, 838, 866, 877, 888, 898). Adding a required
+positional parameter breaks compilation at all 16 until each passes
+`TrustedHeaderEnvArgs::default()` (trust-mode off) as the new last argument —
+except the handful of tests written specifically to exercise the new
+validation branches, which construct a real `TrustedHeaderEnvArgs` inline.
+Unlike the `AdminServerConfig`/`ensure_authorized` sprawl across 4-5 files,
+this one is entirely contained within `state.rs`.
+
 ## Documentation
 
 New numbered section in `docs/admin-security.md` (matches the file's existing
@@ -302,6 +318,7 @@ inventories above:
 ```
 grep -rn "AdminServerConfig {" src/admin/
 grep -rn "ensure_authorized(" src/admin/
+grep -rn "build_admin_config_from_parts(" src/admin/
 ```
 plus a clean `cargo build` and `cargo test` for the whole `admin` module —
 verified mechanically, not re-enumerated from memory. This closes the actual
