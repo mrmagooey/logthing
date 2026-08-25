@@ -59,9 +59,10 @@ impl ThroughputStats {
         // never-seen-before key folds into "_other" instead of growing the
         // map further. `contains_key` then `entry` mirrors the same
         // check-then-insert idiom `forwarding/buffered_writer.rs`'s
-        // partition cap uses, so the extra hash lookup only lands on the
-        // overflow path, not the common "already tracked" / "room under the
-        // cap" ones.
+        // partition cap uses: the short-circuit spares only the common
+        // "already tracked" path (one lookup); admitting a new key under
+        // the cap and folding one into "_other" both pay the same
+        // lookup-plus-`len()` cost.
         //
         // ponytail: that idiom is shared, but the race below is not — the
         // partition cap it's modeled on takes `&mut self` (no concurrent
