@@ -5,6 +5,7 @@ use std::{
     time::Instant,
 };
 
+use axum::http::HeaderName;
 use chrono::Utc;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -189,6 +190,8 @@ pub struct AdminServerConfig {
     pub tls_config: Option<AdminTlsConfig>,
     pub enable_csrf: bool,
     pub enable_rate_limiting: bool,
+    /// `None` disables trusted reverse-proxy-header auth entirely (default).
+    pub trusted_header: Option<TrustedHeaderConfig>,
 }
 
 /// Admin TLS configuration
@@ -200,6 +203,29 @@ pub struct AdminTlsConfig {
     pub ca_file: Option<PathBuf>,
     #[allow(dead_code)]
     pub require_client_cert: bool,
+}
+
+/// Configuration for trusting reverse-proxy-injected identity headers (e.g.
+/// from an Authentik forward-auth outpost). Headers are only trusted when a
+/// shared secret (verified constant-time) accompanies them and the resolved
+/// group list intersects `allowed_groups` — presence of the identity headers
+/// alone is never sufficient, since a reverse-proxy config error (or a
+/// request that bypasses the proxy entirely) can forge them.
+#[derive(Clone)]
+pub struct TrustedHeaderConfig {
+    pub username_header: HeaderName,
+    pub groups_header: HeaderName,
+    pub secret_header: HeaderName,
+    pub secret: String,
+    pub allowed_groups: Vec<String>,
+}
+
+/// A caller identity resolved from trusted reverse-proxy headers, inserted
+/// into request extensions by `trusted_header_middleware` when verification
+/// succeeds.
+#[derive(Clone)]
+pub struct TrustedIdentity {
+    pub username: String,
 }
 
 /// Hashed password using Argon2
@@ -415,6 +441,7 @@ pub fn build_admin_config_from_parts(
         tls_config,
         enable_csrf,
         enable_rate_limiting,
+        trusted_header: None,
     })
 }
 

@@ -131,6 +131,7 @@ mod tests {
             tls_config: None,
             enable_csrf,
             enable_rate_limiting,
+            trusted_header: None,
         };
 
         AdminState {

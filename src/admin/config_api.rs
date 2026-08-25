@@ -625,6 +625,7 @@ mod tests {
             tls_config: None,
             enable_csrf: false,
             enable_rate_limiting: false,
+            trusted_header: None,
         };
 
         let mut cfg = Config::default();

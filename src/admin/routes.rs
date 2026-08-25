@@ -473,6 +473,7 @@ mod tests {
             tls_config: None,
             enable_csrf: false,
             enable_rate_limiting: false,
+            trusted_header: None,
         };
 
         AdminState {
@@ -813,6 +814,7 @@ mod tests {
             tls_config: None,
             enable_csrf: false,
             enable_rate_limiting: false,
+            trusted_header: None,
         };
         let state = AdminState {
             config: Arc::new(RwLock::new(Config::default())),
@@ -1007,6 +1009,7 @@ mod tests {
             tls_config: None,
             enable_csrf: true,
             enable_rate_limiting: false,
+            trusted_header: None,
         };
 
         let state = AdminState {

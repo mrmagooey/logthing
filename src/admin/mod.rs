@@ -31,6 +31,7 @@ mod tests {
             tls_config: None,
             enable_csrf: false,
             enable_rate_limiting: false,
+            trusted_header: None,
         };
 
         AdminState {
@@ -434,6 +435,7 @@ mod tests {
                 tls_config: None,
                 enable_csrf: true,
                 enable_rate_limiting: true,
+                trusted_header: None,
             };
 
             let _cloned = config.clone();
@@ -644,6 +646,7 @@ port = 9090
             tls_config: None,
             enable_csrf: false,
             enable_rate_limiting: false,
+            trusted_header: None,
         };
 
         let state = AdminState {
