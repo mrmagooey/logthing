@@ -326,24 +326,6 @@ pub fn admin_start_allowed(bind: SocketAddr, user: &str, pass: &str) -> Result<(
     Ok(())
 }
 
-/// Pure, testable core of admin config construction.  All values that would normally be
-/// read from `std::env` are accepted as parameters here; `load_admin_config` is the thin
-/// env-reading wrapper that calls this.
-///
-/// Parameters
-/// ----------
-/// * `bind_str`            – raw `WEF_ADMIN_BIND` value, or `None` if the variable is absent.
-/// * `username`            – `WEF_ADMIN_USER` (or default `"admin"`).
-/// * `plain_pass`          – `WEF_ADMIN_PASS` (or default `"admin"`).  Used only when
-///   `pass_hash` is `None`.
-/// * `pass_hash`           – pre-hashed password from `WEF_ADMIN_PASS_HASH`, if set.
-/// * `allowed_ips_str`     – raw `WEF_ADMIN_ALLOWED_IPS` value, or `None`.
-/// * `tls_cert`            – `WEF_ADMIN_TLS_CERT`, or `None`.
-/// * `tls_key`             – `WEF_ADMIN_TLS_KEY`, or `None`.
-/// * `tls_ca`              – `WEF_ADMIN_TLS_CA`, or `None`.
-/// * `require_client_cert` – `WEF_ADMIN_TLS_REQUIRE_CLIENT_CERT` parsed value (default `false`).
-/// * `enable_csrf`         – `WEF_ADMIN_ENABLE_CSRF` parsed value (default `true`).
-/// * `enable_rate_limiting`– `WEF_ADMIN_ENABLE_RATE_LIMIT` parsed value (default `true`).
 /// Raw, unvalidated env-var inputs for trusted reverse-proxy-header auth.
 /// Bundled into one struct so `build_admin_config_from_parts` doesn't grow
 /// past its already-long positional-argument list.
@@ -419,6 +401,24 @@ fn build_trusted_header_config(
     }))
 }
 
+/// Pure, testable core of admin config construction.  All values that would normally be
+/// read from `std::env` are accepted as parameters here; `load_admin_config` is the thin
+/// env-reading wrapper that calls this.
+///
+/// Parameters
+/// ----------
+/// * `bind_str`            – raw `WEF_ADMIN_BIND` value, or `None` if the variable is absent.
+/// * `username`            – `WEF_ADMIN_USER` (or default `"admin"`).
+/// * `plain_pass`          – `WEF_ADMIN_PASS` (or default `"admin"`).  Used only when
+///   `pass_hash` is `None`.
+/// * `pass_hash`           – pre-hashed password from `WEF_ADMIN_PASS_HASH`, if set.
+/// * `allowed_ips_str`     – raw `WEF_ADMIN_ALLOWED_IPS` value, or `None`.
+/// * `tls_cert`            – `WEF_ADMIN_TLS_CERT`, or `None`.
+/// * `tls_key`             – `WEF_ADMIN_TLS_KEY`, or `None`.
+/// * `tls_ca`              – `WEF_ADMIN_TLS_CA`, or `None`.
+/// * `require_client_cert` – `WEF_ADMIN_TLS_REQUIRE_CLIENT_CERT` parsed value (default `false`).
+/// * `enable_csrf`         – `WEF_ADMIN_ENABLE_CSRF` parsed value (default `true`).
+/// * `enable_rate_limiting`– `WEF_ADMIN_ENABLE_RATE_LIMIT` parsed value (default `true`).
 #[allow(clippy::too_many_arguments)]
 pub fn build_admin_config_from_parts(
     bind_str: Option<&str>,
