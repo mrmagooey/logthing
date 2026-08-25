@@ -394,13 +394,7 @@ impl Server {
         Ok(())
     }
 
-    /// Build the full request router (public + protected routes, merged),
-    /// with the server-wide security layers applied.
-    ///
-    /// `pub` (rather than private) so integration/e2e tests outside this
-    /// module can exercise the exact router production traffic runs
-    /// through, rather than a hand-rolled approximation of it.
-    pub fn create_router(&self, ip_whitelist: IpWhitelist) -> anyhow::Result<Router> {
+    fn create_router(&self, ip_whitelist: IpWhitelist) -> anyhow::Result<Router> {
         // Shared layers for all routes
         let shared_layers =
             middleware::from_fn_with_state(ip_whitelist.clone(), ip_whitelist_middleware);
@@ -2155,6 +2149,161 @@ mod tests {
             handles.is_empty(),
             "hec worker handles must be empty when hec.enabled=false"
         );
+    }
+
+    // ------------------------------------------------------------------ //
+    // security.max_connections / security.connection_timeout_secs wiring: //
+    // GlobalConcurrencyLimitLayer + tower_http TimeoutLayer, applied to    //
+    // the real merged router built by create_router.                      //
+    // ------------------------------------------------------------------ //
+
+    /// `connection_timeout_secs = 0` must reach the real `TimeoutLayer`: a
+    /// request to a real, fast production route (`/health`) still comes
+    /// back `408 Request Timeout`. This is deterministic, not a race —
+    /// verified against the vendored `tower-http-0.5.2` source
+    /// (`src/timeout/service.rs`): `Timeout`'s `ResponseFuture::poll`
+    /// checks `sleep.poll(cx)` *before* polling the inner service future,
+    /// so an already-elapsed deadline (duration 0) always wins on the very
+    /// first poll, even against a handler that resolves synchronously.
+    ///
+    /// A real-clock zero-duration `tokio::time::sleep` is not guaranteed to
+    /// report `Ready` on literally its very first poll (it may need to
+    /// register with the timer driver first), and `/health`'s handler
+    /// chain resolves fast enough that this genuinely races on a live
+    /// clock. Pausing tokio's clock (`start_paused = true`) makes the
+    /// deadline comparison deterministic instead of a wall-clock race.
+    #[tokio::test(start_paused = true)]
+    async fn configured_zero_timeout_reaches_the_layer_via_real_create_router() {
+        use tower::ServiceExt;
+
+        let mut config = Config::default();
+        config.security.connection_timeout_secs = 0;
+        let server = build_server(config).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds");
+
+        let req = with_connect_info(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/health")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::REQUEST_TIMEOUT,
+            "connection_timeout_secs=0 must reach the real TimeoutLayer and time out /health"
+        );
+    }
+
+    /// With the default (non-zero) timeout, the same route still succeeds —
+    /// proving the layer's presence doesn't regress ordinary traffic.
+    #[tokio::test]
+    async fn default_timeout_does_not_break_normal_requests() {
+        use tower::ServiceExt;
+
+        let server = build_server(Config::default()).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds");
+
+        let req = with_connect_info(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/health")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// `max_connections = 0` must reach the real `GlobalConcurrencyLimitLayer`:
+    /// its semaphore starts with zero permits, so `poll_ready` never
+    /// resolves and a request against a real production route never
+    /// completes. Wrapped in a short `tokio::time::timeout` so the test
+    /// itself stays fast; the assertion is that it deterministically does
+    /// NOT resolve (a semaphore with 0 permits never grants
+    /// `poll_acquire`), not a race.
+    #[tokio::test]
+    async fn configured_zero_max_connections_reaches_the_layer_via_real_create_router() {
+        use tower::ServiceExt;
+
+        let mut config = Config::default();
+        config.security.max_connections = 0;
+        let server = build_server(config).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds");
+
+        let req = with_connect_info(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/health")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        );
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), router.oneshot(req)).await;
+        assert!(
+            result.is_err(),
+            "max_connections=0 must reach the real GlobalConcurrencyLimitLayer and block \
+             /health forever (a semaphore with zero permits never grants poll_ready)"
+        );
+    }
+
+    /// The concurrency layer is applied to the MERGED router (after
+    /// `public_router.merge(protected_router)`), so it must also gate a
+    /// protected route, not just a public one.
+    #[tokio::test]
+    async fn zero_max_connections_also_blocks_a_protected_route() {
+        use tower::ServiceExt;
+
+        let mut config = Config::default();
+        config.security.max_connections = 0;
+        let server = build_server(config).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds");
+
+        let req = with_connect_info(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/syslog/examples")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        );
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), router.oneshot(req)).await;
+        assert!(
+            result.is_err(),
+            "max_connections=0 must also block a protected route — the layer covers the merged \
+             router"
+        );
+    }
+
+    /// With the default (non-zero) `max_connections`, ordinary traffic on a
+    /// protected route is unaffected.
+    #[tokio::test]
+    async fn default_max_connections_does_not_break_normal_requests() {
+        use tower::ServiceExt;
+
+        let server = build_server(Config::default()).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds");
+
+        let req = with_connect_info(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/syslog/examples")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     // ------------------------------------------------------------------ //
