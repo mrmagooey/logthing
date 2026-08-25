@@ -30,7 +30,10 @@ use axum::{extract::Request, middleware::Next};
 use futures::stream::{self, StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
+use tower::limit::GlobalConcurrencyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 use tracing::{debug, error, info, warn};
 
 /// Handle onto the installed Prometheus recorder, published so profiling can
@@ -391,7 +394,13 @@ impl Server {
         Ok(())
     }
 
-    fn create_router(&self, ip_whitelist: IpWhitelist) -> anyhow::Result<Router> {
+    /// Build the full request router (public + protected routes, merged),
+    /// with the server-wide security layers applied.
+    ///
+    /// `pub` (rather than private) so integration/e2e tests outside this
+    /// module can exercise the exact router production traffic runs
+    /// through, rather than a hand-rolled approximation of it.
+    pub fn create_router(&self, ip_whitelist: IpWhitelist) -> anyhow::Result<Router> {
         // Shared layers for all routes
         let shared_layers =
             middleware::from_fn_with_state(ip_whitelist.clone(), ip_whitelist_middleware);
@@ -456,6 +465,36 @@ impl Server {
 
         // Merge public and protected routes
         let router = public_router.merge(protected_router);
+
+        // Server-wide security layers (cover both public and protected
+        // routes, on both the plain-HTTP and TLS paths, since both `run`
+        // and `run_tls` share this one `create_router` choke point).
+        //
+        // `GlobalConcurrencyLimitLayer` — NOT `tower::limit::ConcurrencyLimitLayer`.
+        // `Router::layer` applies the given `tower::Layer` independently to
+        // EACH registered route (axum iterates routes and calls
+        // `layer.clone().layer(route)` per route — see
+        // `axum::routing::path_router::PathRouter::layer`). This router has
+        // many routes (`/health`, `/wsman`, `/syslog`, ...), so
+        // `ConcurrencyLimitLayer::layer()` — which builds a brand new
+        // `Arc::new(Semaphore::new(max))` on every call — would silently
+        // hand each route its OWN independent limit of `max`, not one
+        // server-wide cap. `GlobalConcurrencyLimitLayer` holds a single
+        // `Arc<Semaphore>` and its `layer()` always clones that same Arc, so
+        // every route shares the one real semaphore (its doc comment: "Cloning
+        // this layer will not create a new semaphore").
+        //
+        // `tower_http::timeout::TimeoutLayer` — NOT `tower::timeout::TimeoutLayer`.
+        // The tower-http version maps a timeout directly to a `408 Request
+        // Timeout` response; the plain tower version errors with a
+        // `Box<dyn Error>` that doesn't implement `IntoResponse`.
+        let router = router
+            .layer(GlobalConcurrencyLimitLayer::new(
+                self.config.security.max_connections,
+            ))
+            .layer(TimeoutLayer::new(Duration::from_secs(
+                self.config.security.connection_timeout_secs,
+            )));
 
         Ok(router)
     }

@@ -100,9 +100,20 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub allowed_ips: Vec<String>,
 
+    /// Maximum number of requests processed concurrently, server-wide,
+    /// across both public and protected routes (via a shared
+    /// `tower::limit::GlobalConcurrencyLimitLayer` semaphore). This bounds
+    /// concurrent *in-flight requests*, not open TCP connections — a
+    /// connection with no request in flight does not hold a permit. When
+    /// the limit is saturated, requests are queued (via `poll_ready`
+    /// backpressure) rather than rejected with an error.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
 
+    /// Maximum duration, in seconds, a request may take to be handled
+    /// before the server responds with `408 Request Timeout`
+    /// (`tower_http::timeout::TimeoutLayer`). Applies to request processing
+    /// time only, not to time spent queued behind `max_connections`.
     #[serde(default = "default_connection_timeout_secs")]
     pub connection_timeout_secs: u64,
 
@@ -1268,6 +1279,25 @@ mod tests {
         assert!(cfg.tls.enabled);
         assert_eq!(cfg.metrics.port, 9090);
         assert!(cfg.syslog.enabled);
+    }
+
+    #[test]
+    fn security_max_connections_and_timeout_default_when_absent() {
+        let cfg = Config::default();
+        assert_eq!(cfg.security.max_connections, 10_000);
+        assert_eq!(cfg.security.connection_timeout_secs, 300);
+    }
+
+    #[test]
+    fn security_max_connections_and_timeout_parse_from_toml() {
+        let toml_str = r#"
+[security]
+max_connections = 42
+connection_timeout_secs = 7
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse config");
+        assert_eq!(cfg.security.max_connections, 42);
+        assert_eq!(cfg.security.connection_timeout_secs, 7);
     }
 
     #[test]
