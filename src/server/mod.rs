@@ -30,7 +30,10 @@ use axum::{extract::Request, middleware::Next};
 use futures::stream::{self, StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
+use tower::limit::GlobalConcurrencyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 use tracing::{debug, error, info, warn};
 
 /// Handle onto the installed Prometheus recorder, published so profiling can
@@ -392,6 +395,29 @@ impl Server {
     }
 
     fn create_router(&self, ip_whitelist: IpWhitelist) -> anyhow::Result<Router> {
+        // A value of 0 here isn't a smaller limit, it's a broken server: 0
+        // permits means the GlobalConcurrencyLimitLayer semaphore never
+        // grants a single one, so every request queues forever (or until
+        // connection_timeout_secs rejects it with 408) — the process stays
+        // up but serves nothing. Bail loudly at construction rather than
+        // silently accept it, matching the precedent in
+        // `forwarding::aggregate::compile_rules` for other zero-is-broken knobs.
+        if self.config.security.max_connections == 0 {
+            anyhow::bail!(
+                "[security] max_connections must be greater than 0 (0 means the concurrency \
+                 semaphore never grants a permit — every request would queue forever)"
+            );
+        }
+        // A value of 0 here means every request is rejected with 408
+        // immediately, since TimeoutLayer's deadline is already elapsed at
+        // creation time.
+        if self.config.security.connection_timeout_secs == 0 {
+            anyhow::bail!(
+                "[security] connection_timeout_secs must be greater than 0 (0 means every \
+                 request would time out with 408 immediately)"
+            );
+        }
+
         // Shared layers for all routes
         let shared_layers =
             middleware::from_fn_with_state(ip_whitelist.clone(), ip_whitelist_middleware);
@@ -456,6 +482,36 @@ impl Server {
 
         // Merge public and protected routes
         let router = public_router.merge(protected_router);
+
+        // Server-wide security layers (cover both public and protected
+        // routes, on both the plain-HTTP and TLS paths, since both `run`
+        // and `run_tls` share this one `create_router` choke point).
+        //
+        // `GlobalConcurrencyLimitLayer` — NOT `tower::limit::ConcurrencyLimitLayer`.
+        // `Router::layer` applies the given `tower::Layer` independently to
+        // EACH registered route (axum iterates routes and calls
+        // `layer.clone().layer(route)` per route — see
+        // `axum::routing::path_router::PathRouter::layer`). This router has
+        // many routes (`/health`, `/wsman`, `/syslog`, ...), so
+        // `ConcurrencyLimitLayer::layer()` — which builds a brand new
+        // `Arc::new(Semaphore::new(max))` on every call — would silently
+        // hand each route its OWN independent limit of `max`, not one
+        // server-wide cap. `GlobalConcurrencyLimitLayer` holds a single
+        // `Arc<Semaphore>` and its `layer()` always clones that same Arc, so
+        // every route shares the one real semaphore (its doc comment: "Cloning
+        // this layer will not create a new semaphore").
+        //
+        // `tower_http::timeout::TimeoutLayer` — NOT `tower::timeout::TimeoutLayer`.
+        // The tower-http version maps a timeout directly to a `408 Request
+        // Timeout` response; the plain tower version errors with a
+        // `Box<dyn Error>` that doesn't implement `IntoResponse`.
+        let router = router
+            .layer(GlobalConcurrencyLimitLayer::new(
+                self.config.security.max_connections,
+            ))
+            .layer(TimeoutLayer::new(Duration::from_secs(
+                self.config.security.connection_timeout_secs,
+            )));
 
         Ok(router)
     }
@@ -2115,6 +2171,158 @@ mod tests {
         assert!(
             handles.is_empty(),
             "hec worker handles must be empty when hec.enabled=false"
+        );
+    }
+
+    // ------------------------------------------------------------------ //
+    // security.max_connections / security.connection_timeout_secs wiring: //
+    // GlobalConcurrencyLimitLayer + tower_http TimeoutLayer, applied to    //
+    // the real merged router built by create_router.                      //
+    //                                                                      //
+    // Zero-value determinism note: earlier versions of these tests used   //
+    // max_connections=0 / connection_timeout_secs=0 as a determinism      //
+    // trick (0 permits never grants poll_ready; an already-elapsed        //
+    // deadline always wins the first poll). Both are now rejected at      //
+    // construction (see create_router above), so that trick is gone.      //
+    // Reaching for a NONZERO substitute doesn't work through this         //
+    // router's actual fixed routes: every one of them (health_check,      //
+    // handle_syslog_examples, ...) resolves fully synchronously, with no  //
+    // real `.await` suspension point (confirmed: no blocking `.send()`    //
+    // anywhere reachable, only non-blocking `try_send`). Concretely, a    //
+    // `tower::util::Oneshot` future for any of these routes runs          //
+    // poll_ready -> call -> poll(inner) to completion inside ONE poll()   //
+    // call, so a concurrency permit is acquired and released within a    //
+    // single synchronous step, and no real or paused clock ever gets a    //
+    // chance to interleave with it. There is no nonzero value or timing   //
+    // trick that holds a permit, or leaves a nonzero timeout unresolved,  //
+    // across an externally observable window using only these routes.    //
+    // That "genuinely enforced, with a real nonzero value" proof already //
+    // lives in tests/security_limits_e2e.rs, which builds an equivalent  //
+    // router (same real GlobalConcurrencyLimitLayer / TimeoutLayer types) //
+    // around a handler with a real, controllable sleep -- see             //
+    // e2e_concurrency_limit_is_global_across_routes_not_per_route and     //
+    // e2e_slow_handler_past_timeout_returns_408 there. What's left worth   //
+    // asserting here, through the real create_router, is: zero is         //
+    // rejected, and the smallest legal value (1) is accepted and doesn't   //
+    // break real requests on both a public and a protected route.         //
+    // ------------------------------------------------------------------ //
+
+    /// `max_connections = 0` must be rejected at router construction, not
+    /// silently accepted (0 permits would mean the server never admits a
+    /// single request).
+    #[tokio::test]
+    async fn create_router_rejects_zero_max_connections() {
+        let mut config = Config::default();
+        config.security.max_connections = 0;
+        let server = build_server(config).await;
+        let err = server
+            .create_router(IpWhitelist::empty())
+            .expect_err("max_connections=0 must be rejected");
+        assert!(
+            err.to_string().contains("max_connections"),
+            "error must name the offending field, got: {err}"
+        );
+    }
+
+    /// `connection_timeout_secs = 0` must be rejected at router
+    /// construction, not silently accepted (0 would time out every
+    /// request immediately).
+    #[tokio::test]
+    async fn create_router_rejects_zero_connection_timeout_secs() {
+        let mut config = Config::default();
+        config.security.connection_timeout_secs = 0;
+        let server = build_server(config).await;
+        let err = server
+            .create_router(IpWhitelist::empty())
+            .expect_err("connection_timeout_secs=0 must be rejected");
+        assert!(
+            err.to_string().contains("connection_timeout_secs"),
+            "error must name the offending field, got: {err}"
+        );
+    }
+
+    /// With the default (non-zero) timeout, `/health` still succeeds —
+    /// proving the layer's presence doesn't regress ordinary traffic.
+    #[tokio::test]
+    async fn default_timeout_does_not_break_normal_requests() {
+        use tower::ServiceExt;
+
+        let server = build_server(Config::default()).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds");
+
+        let req = with_connect_info(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/health")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// With the default (non-zero) `max_connections`, ordinary traffic on a
+    /// protected route is unaffected.
+    #[tokio::test]
+    async fn default_max_connections_does_not_break_normal_requests() {
+        use tower::ServiceExt;
+
+        let server = build_server(Config::default()).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds");
+
+        let req = with_connect_info(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/syslog/examples")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// The smallest legal (nonzero) value for both knobs is accepted, and
+    /// the router still serves both a public and a protected route
+    /// normally — pins the validation boundary at exactly ">0", not
+    /// something stricter, on both routes the layers wrap.
+    #[tokio::test]
+    async fn minimum_legal_values_are_accepted_and_serve_both_route_kinds() {
+        use tower::ServiceExt;
+
+        let mut config = Config::default();
+        config.security.max_connections = 1;
+        config.security.connection_timeout_secs = 1;
+        let server = build_server(config).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("max_connections=1, connection_timeout_secs=1 must both be accepted");
+
+        let health_req = with_connect_info(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/health")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        );
+        let resp = router.clone().oneshot(health_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "public route /health");
+
+        let protected_req = with_connect_info(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/syslog/examples")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        );
+        let resp = router.oneshot(protected_req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "protected route /syslog/examples"
         );
     }
 

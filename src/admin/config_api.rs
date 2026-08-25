@@ -187,6 +187,17 @@ pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
         }
     }
 
+    // security.max_connections=0 / connection_timeout_secs=0 are rejected
+    // at router construction (Server::create_router) too — catching them
+    // here as well means a bad reload/import is rejected before it ever
+    // reaches that point, with an error surfaced straight to the admin UI.
+    if cfg.security.max_connections == 0 {
+        errors.push("security.max_connections must be greater than 0".to_string());
+    }
+    if cfg.security.connection_timeout_secs == 0 {
+        errors.push("security.connection_timeout_secs must be greater than 0".to_string());
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -752,6 +763,23 @@ mod tests {
             validate_config_invariants(&cfg).is_ok(),
             "TLS with cert+key must be accepted"
         );
+    }
+
+    #[test]
+    fn validate_config_invariants_rejects_zero_max_connections() {
+        let mut cfg = Config::default();
+        cfg.security.max_connections = 0;
+        let msg = validate_config_invariants(&cfg).expect_err("max_connections=0 must be rejected");
+        assert!(msg.contains("max_connections"), "error: {msg}");
+    }
+
+    #[test]
+    fn validate_config_invariants_rejects_zero_connection_timeout_secs() {
+        let mut cfg = Config::default();
+        cfg.security.connection_timeout_secs = 0;
+        let msg = validate_config_invariants(&cfg)
+            .expect_err("connection_timeout_secs=0 must be rejected");
+        assert!(msg.contains("connection_timeout_secs"), "error: {msg}");
     }
 
     // H-7: import_config rejects a config with port 0 (running config unchanged).

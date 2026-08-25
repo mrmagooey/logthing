@@ -100,9 +100,41 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub allowed_ips: Vec<String>,
 
+    /// Maximum number of requests processed concurrently, server-wide,
+    /// across both public and protected routes (via a shared
+    /// `tower::limit::GlobalConcurrencyLimitLayer` semaphore). This bounds
+    /// concurrent *in-flight requests*, not open TCP connections — a
+    /// connection with no request in flight does not hold a permit. When
+    /// the limit is saturated, an excess request is NOT rejected
+    /// immediately: it queues (via `poll_ready` backpressure) waiting for a
+    /// permit, and if one doesn't free up within
+    /// `connection_timeout_secs`, the queued request is then rejected with
+    /// `408 Request Timeout` by the timeout layer — it can time out before
+    /// its handler ever runs. Must be greater than 0 (validated at router
+    /// construction); a value of 0 would mean no request is ever admitted.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
 
+    /// Maximum duration, in seconds, a request may spend in the server —
+    /// from arrival to response — before it is rejected with `408 Request
+    /// Timeout` (`tower_http::timeout::TimeoutLayer`). This covers the
+    /// ENTIRE time in the server, including any time spent queued waiting
+    /// for a `max_connections` permit, not just handler execution time:
+    /// `TimeoutLayer` is applied outermost, wrapping
+    /// `GlobalConcurrencyLimitLayer` (see `Server::create_router`), so its
+    /// clock starts on arrival regardless of when (or whether) a
+    /// concurrency permit is granted. That nesting is deliberate — the
+    /// reverse (concurrency outside timeout) would let a saturated server
+    /// queue requests forever with no timeout ever firing — so don't "fix"
+    /// it by swapping the two `.layer()` calls.
+    ///
+    /// Note this also bounds bulk ingest routes (`/wsman/events`,
+    /// `/syslog`, HEC): at the default 300s against `MAX_BODY_SIZE` (64
+    /// MiB), a request must sustain roughly 218 KB/s or better to avoid
+    /// timing out.
+    ///
+    /// Must be greater than 0 (validated at router construction); a value
+    /// of 0 would make every request time out immediately.
     #[serde(default = "default_connection_timeout_secs")]
     pub connection_timeout_secs: u64,
 
@@ -1268,6 +1300,25 @@ mod tests {
         assert!(cfg.tls.enabled);
         assert_eq!(cfg.metrics.port, 9090);
         assert!(cfg.syslog.enabled);
+    }
+
+    #[test]
+    fn security_max_connections_and_timeout_default_when_absent() {
+        let cfg = Config::default();
+        assert_eq!(cfg.security.max_connections, 10_000);
+        assert_eq!(cfg.security.connection_timeout_secs, 300);
+    }
+
+    #[test]
+    fn security_max_connections_and_timeout_parse_from_toml() {
+        let toml_str = r#"
+[security]
+max_connections = 42
+connection_timeout_secs = 7
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse config");
+        assert_eq!(cfg.security.max_connections, 42);
+        assert_eq!(cfg.security.connection_timeout_secs, 7);
     }
 
     #[test]
