@@ -7,6 +7,12 @@ use std::sync::Arc;
 
 const RETENTION_MINUTES: i64 = 60;
 
+/// Distinct event types tracked before the rest collapse into `_other`.
+/// The key is `"{provider}:{event_id}"` parsed from caller-submitted WEF
+/// XML, so it is caller-controlled and needs a ceiling. Each entry costs
+/// ~1 KB (61 minute buckets plus the key), capping this map at ~1 MB.
+const MAX_EVENT_TYPES: usize = 1024;
+
 #[derive(Clone)]
 pub struct ThroughputStats {
     inner: Arc<DashMap<String, EventStats>>,
@@ -47,9 +53,35 @@ impl ThroughputStats {
     /// ```
     pub async fn record_event(&self, event_type: String) {
         let minute = current_minute();
-        // Use DashMap for lock-free concurrent updates
+        // Use DashMap for lock-free concurrent updates.
+        //
+        // Cap the number of distinct keys at MAX_EVENT_TYPES; once full, a
+        // never-seen-before key folds into "_other" instead of growing the
+        // map further. `contains_key` then `entry` mirrors the same
+        // check-then-insert idiom `forwarding/buffered_writer.rs`'s
+        // partition cap uses: the short-circuit spares only the common
+        // "already tracked" path (one lookup); admitting a new key under
+        // the cap and folding one into "_other" both pay the same
+        // lookup-plus-`len()` cost.
+        //
+        // ponytail: that idiom is shared, but the race below is not — the
+        // partition cap it's modeled on takes `&mut self` (no concurrent
+        // callers possible) and the aggregate group cap holds a mutex
+        // across its check-and-insert, so neither actually races. This is
+        // genuinely check-then-act over a lock-free DashMap: concurrent
+        // callers can each observe room under the cap and all insert,
+        // overshooting it by up to (concurrent callers - 1) keys. Bounded
+        // by caller concurrency, not by input size, so it's accepted rather
+        // than closed. Wrap the check-and-insert in a `Mutex` if a tighter
+        // bound is ever needed.
+        let key = if self.inner.contains_key(&event_type) || self.inner.len() < MAX_EVENT_TYPES {
+            event_type
+        } else {
+            metrics::counter!("throughput_event_types_capped").increment(1);
+            "_other".to_string()
+        };
         self.inner
-            .entry(event_type)
+            .entry(key)
             .or_default()
             .value_mut()
             .record(minute);
@@ -302,6 +334,112 @@ mod tests {
         assert_eq!(map.get("type-a").unwrap().total_events, 2);
         assert_eq!(map.get("type-b").unwrap().total_events, 1);
         assert!(map.get("type-a").unwrap().average_per_second_last_minute > 0.0);
+    }
+
+    #[tokio::test]
+    async fn distinct_keys_below_the_cap_stay_distinct() {
+        let stats = ThroughputStats::new();
+
+        for i in 0..MAX_EVENT_TYPES {
+            stats.record_event(format!("type-{i}")).await;
+        }
+
+        let snapshot = stats.snapshot().await;
+        assert_eq!(
+            snapshot.len(),
+            MAX_EVENT_TYPES,
+            "every key below the cap must get its own row, no \"_other\" folding"
+        );
+        assert!(
+            snapshot.iter().all(|row| row.event_type != "_other"),
+            "no key should have folded into _other below the cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_key_at_the_cap_folds_into_other() {
+        let stats = ThroughputStats::new();
+
+        for i in 0..MAX_EVENT_TYPES {
+            stats.record_event(format!("type-{i}")).await;
+        }
+        // The map is now at MAX_EVENT_TYPES distinct keys. A never-seen key
+        // must fold into "_other" rather than growing the map further.
+        stats.record_event("brand-new-type".into()).await;
+
+        let snapshot = stats.snapshot().await;
+        assert_eq!(
+            snapshot.len(),
+            MAX_EVENT_TYPES + 1,
+            "the map should hold the original keys plus exactly one _other row"
+        );
+        let other = snapshot
+            .iter()
+            .find(|row| row.event_type == "_other")
+            .expect("expected an _other row after exceeding the cap");
+        assert_eq!(other.total_events, 1);
+        assert!(
+            snapshot
+                .iter()
+                .all(|row| row.event_type != "brand-new-type"),
+            "the overflowing key itself must never appear as its own row"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_key_still_records_normally_at_the_cap() {
+        let stats = ThroughputStats::new();
+
+        for i in 0..MAX_EVENT_TYPES {
+            stats.record_event(format!("type-{i}")).await;
+        }
+        // The map is at the cap. Re-recording an ALREADY-tracked key must
+        // still increment that key's own row via the `contains_key`
+        // short-circuit, not get redirected into "_other".
+        stats.record_event("type-0".into()).await;
+
+        let snapshot = stats.snapshot().await;
+        assert_eq!(
+            snapshot.len(),
+            MAX_EVENT_TYPES,
+            "re-recording an existing key at the cap must not grow the map"
+        );
+        let type_0 = snapshot
+            .iter()
+            .find(|row| row.event_type == "type-0")
+            .expect("type-0 must still have its own row");
+        assert_eq!(type_0.total_events, 2);
+        assert!(snapshot.iter().all(|row| row.event_type != "_other"));
+    }
+
+    #[tokio::test]
+    async fn other_bucket_accumulates_counts_from_multiple_overflowing_keys() {
+        let stats = ThroughputStats::new();
+
+        for i in 0..MAX_EVENT_TYPES {
+            stats.record_event(format!("type-{i}")).await;
+        }
+        // Three distinct never-seen keys, all past the cap: they must all
+        // collapse into the SAME "_other" row, and its count must reflect
+        // all of them, not just the last one.
+        stats.record_event("overflow-a".into()).await;
+        stats.record_event("overflow-b".into()).await;
+        stats.record_event("overflow-c".into()).await;
+
+        let snapshot = stats.snapshot().await;
+        let other = snapshot
+            .iter()
+            .find(|row| row.event_type == "_other")
+            .expect("expected a single _other row");
+        assert_eq!(
+            other.total_events, 3,
+            "_other must accumulate counts across every overflowing key"
+        );
+        assert_eq!(
+            snapshot.len(),
+            MAX_EVENT_TYPES + 1,
+            "overflowing keys must never grow the map past cap + 1 (_other)"
+        );
     }
 
     #[test]
