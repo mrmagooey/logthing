@@ -47,10 +47,26 @@
 /// Per channel, not per source: see this module's header for what a
 /// fully-configured deployment adds up to.
 ///
-/// This is a **ceiling, not a reservation**: tokio's bounded mpsc allocates
-/// its buffer lazily in blocks, so an idle or healthy channel costs nearly
-/// nothing. Only Zeek and Suricata apply backpressure, so only those two are
+/// This is a **ceiling, not a reservation**: tokio's bounded mpsc is a linked
+/// list of 32-slot blocks, not a ring buffer sized to capacity, so a channel
+/// starts life holding exactly one block — 32 B of header plus
+/// `32 * size_of::<T>()` — and allocates another only per 32 records actually
+/// queued. All 15 channels of a fully-configured deployment come to ~50 KB at
+/// startup. Only Zeek and Suricata apply backpressure, so only those two are
 /// designed to dwell near capacity under sustained load.
+///
+/// **Lazy on the way up, sticky on the way down.** Drained blocks are recycled
+/// onto the sender's tail for reuse (`Rx::reclaim_blocks`), not freed; the
+/// whole list is released only when the channel itself drops, at shutdown. A
+/// channel's block footprint is therefore a high-water mark held for the
+/// process lifetime: one burst that fills the syslog channel pins ~25 MB of
+/// slots (136 533 records * 184 B) until exit, however idle it goes afterwards.
+/// RSS does not come back down after a spike.
+///
+/// That stickiness applies to the *slots* only. The per-record heap this
+/// budget actually counts — `String`s, `serde_json::Value` BTreeMap nodes — is
+/// owned by the records and freed as they drain, and it dominates the slot
+/// array for every type except `SflowRecord`, which is flat and owns no heap.
 pub const CHANNEL_BUDGET_BYTES: usize = 100 * 1024 * 1024;
 
 /// Records that fit in the budget, given a per-record byte figure.
