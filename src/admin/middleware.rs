@@ -137,6 +137,14 @@ pub async fn trusted_header_middleware(
     mut request: axum::http::Request<Body>,
     next: Next,
 ) -> Response {
+    // Resolved once, up front, so both the extension inserted below AND the
+    // TRUSTED_HEADER_REJECTED audit entry (when verification fails for a
+    // reason other than a bad secret — e.g. missing username or no matching
+    // group) use the same real end-user IP rather than the rejection path
+    // logging the proxy's own peer address.
+    let resolved_ip = resolve_client_ip(&state, addr, request.headers());
+    let client_ip = resolved_ip.to_string();
+
     match verify_trusted_header(&state, request.headers()) {
         Some(identity) => {
             request.extensions_mut().insert(identity);
@@ -152,7 +160,6 @@ pub async fn trusted_header_middleware(
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .unwrap_or("unknown");
-                let client_ip = addr.ip().to_string();
                 state
                     .audit_logger
                     .log("TRUSTED_HEADER_REJECTED", username, &client_ip, None)
@@ -164,7 +171,6 @@ pub async fn trusted_header_middleware(
     // Runs unconditionally, regardless of verification outcome above, so
     // downstream code (security_middleware, handlers) always has a resolved
     // IP to read rather than having to guess whether trust-mode applied.
-    let resolved_ip = resolve_client_ip(&state, addr, request.headers());
     request
         .extensions_mut()
         .insert(crate::admin::state::ResolvedClientIp(resolved_ip));
@@ -672,6 +678,51 @@ mod tests {
                 .find(|e| e.action == "TRUSTED_HEADER_REJECTED")
                 .expect("TRUSTED_HEADER_REJECTED entry should exist");
             assert_eq!(entry.username, "unknown");
+        }
+
+        /// Regression test: when the secret IS valid but verification still
+        /// fails for another reason (here, no matching group), the resulting
+        /// TRUSTED_HEADER_REJECTED entry must record the XFF-resolved IP —
+        /// not the proxy's own ConnectInfo peer address. This is the exact
+        /// bug this follow-up exists to fix; it was previously missed in
+        /// this one logging call even though the ResolvedClientIp extension
+        /// itself was already correct.
+        #[tokio::test]
+        async fn valid_secret_rejected_attempt_logs_xff_resolved_ip() {
+            let state = state_with_trust(Some(trusted_cfg())).await;
+            let app = axum::Router::new()
+                .route("/test", get(echo_trusted))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    trusted_header_middleware,
+                ))
+                .with_state(state.clone());
+
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .header("x-admin-proxy-secret", "shhh")
+                .header("x-authentik-username", "alice")
+                .header("x-authentik-groups", "not-admins")
+                .header("x-forwarded-for", "198.51.100.77")
+                .body(Body::empty())
+                .unwrap();
+            // The proxy's own peer address — must NOT end up in the audit log.
+            inject_connect_info(&mut request, "192.0.2.9:1".parse().unwrap());
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let entries = state.audit_logger.get_entries(10).await;
+            let entry = entries
+                .iter()
+                .find(|e| e.action == "TRUSTED_HEADER_REJECTED")
+                .expect("TRUSTED_HEADER_REJECTED entry should exist");
+            assert_eq!(
+                entry.client_ip, "198.51.100.77",
+                "a valid-secret rejection must log the XFF-resolved IP, not \
+                 the proxy's peer address"
+            );
         }
 
         /// No secret header at all means no trusted-header attempt was made

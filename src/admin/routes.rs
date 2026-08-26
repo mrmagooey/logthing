@@ -125,6 +125,27 @@ async fn run_admin_server(
         // error, no test failure unless the ordering is exercised directly
         // (see `security_middleware_resolved_ip_tests` in `middleware.rs`,
         // which builds this exact two-layer chain and asserts on it).
+        //
+        // Known tradeoff from this ordering (accepted, not a bug): before
+        // this change, `security_middleware`'s IP allowlist and rate limiter
+        // ran before any handler-adjacent code, so a request from a blocked
+        // or already-rate-limited IP was rejected immediately. Now
+        // `trusted_header_middleware` runs first, and its rejection path
+        // writes a `TRUSTED_HEADER_REJECTED` audit entry (disk append +
+        // in-memory ring eviction) for ANY request carrying the secret
+        // header — including ones that `security_middleware` would go on to
+        // block. A disallowed or malicious client can drive repeated audit
+        // writes and evict genuine history from the bounded in-memory ring
+        // purely by resending a request with some (even wrong) secret header
+        // value, before the allowlist/rate-limit check ever runs. This is a
+        // modest DoS-adjacent side effect of putting IP resolution ahead of
+        // the security gate — accepted here because resolving the IP is a
+        // prerequisite for the gate to key on the right address at all.
+        // Revisit only if this is ever observed being exploited in practice;
+        // fixing it properly would mean splitting `trusted_header_middleware`
+        // so verification/logging and IP-extension-insertion run on opposite
+        // sides of `security_middleware`, which is more restructuring than
+        // this tradeoff currently warrants.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             security_middleware,

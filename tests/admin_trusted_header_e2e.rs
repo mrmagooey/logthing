@@ -147,4 +147,52 @@ async fn get_config_over_real_http_succeeds_with_trusted_headers_alone_no_basic_
         "a wrong shared secret must not grant access, even with \
          correct-looking identity headers and no Authorization header"
     );
+
+    // ---------------------------------------------------------------------
+    // 5. Real-router proof that `trusted_header_middleware` runs before
+    //    `security_middleware` in the ACTUAL assembled production router
+    //    (`run_admin_server`'s `.layer(...)` chain), not just in an isolated
+    //    test double. A request with a valid secret and a spoofed
+    //    `X-Forwarded-For` value must have that XFF IP show up as the
+    //    audit log's `client_ip` — the real peer address here is loopback
+    //    (this test client connects over 127.0.0.1), so any regression that
+    //    flips the layer order back (silently falling through to
+    //    `ConnectInfo`) would make this assert on "127.0.0.1" instead and
+    //    fail.
+    // ---------------------------------------------------------------------
+    let spoofed_xff_ip = "203.0.113.77";
+    let response = client
+        .get(format!("{base_url}/config"))
+        .header("X-authentik-username", "xff-tester")
+        .header("X-authentik-groups", "admins")
+        .header("X-Admin-Proxy-Secret", trusted_secret)
+        .header("X-Forwarded-For", spoofed_xff_ip)
+        .send()
+        .await
+        .expect("GET /config request should succeed over the network");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let audit_response = client
+        .get(format!("{base_url}/audit-log"))
+        .basic_auth("admin", Some("admin"))
+        .send()
+        .await
+        .expect("GET /audit-log request should succeed over the network");
+    assert_eq!(audit_response.status(), reqwest::StatusCode::OK);
+
+    let entries: Vec<serde_json::Value> = audit_response
+        .json()
+        .await
+        .expect("audit log response should be valid JSON");
+    let entry = entries
+        .iter()
+        .find(|e| e["action"] == "CONFIG_READ" && e["username"] == "xff-tester")
+        .expect("CONFIG_READ entry for the xff-tester request should exist");
+    assert_eq!(
+        entry["client_ip"], spoofed_xff_ip,
+        "the audit entry for a valid-secret request carrying X-Forwarded-For \
+         must record the XFF-derived IP — this proves trusted_header_middleware \
+         runs before security_middleware in the real production router, not \
+         just in an isolated middleware-chain test double; got entry: {entry:?}"
+    );
 }
