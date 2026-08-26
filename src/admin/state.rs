@@ -354,13 +354,16 @@ fn build_trusted_header_config(
         return Ok(None);
     }
 
-    let secret = args.secret.unwrap_or("").to_string();
-    if secret.is_empty() {
+    const MIN_SECRET_LEN: usize = 16;
+    let secret = args.secret.unwrap_or("").trim().to_string();
+    if secret.len() < MIN_SECRET_LEN {
         anyhow::bail!(
             "WEF_ADMIN_TRUST_PROXY_HEADERS is true but WEF_ADMIN_TRUSTED_HEADER_SECRET is \
-             not set. A shared secret is required whenever trusted-header auth is enabled \
-             (regardless of bind address) — without it, any request that reaches this \
-             server can forge the identity headers."
+             not set or too short (must be at least {MIN_SECRET_LEN} characters after \
+             trimming whitespace). A shared secret is required whenever trusted-header auth \
+             is enabled (regardless of bind address) — without it, any request that reaches \
+             this server can forge the identity headers, and a short or guessable secret \
+             defeats that trust boundary just as surely as no secret at all."
         );
     }
 
@@ -1069,7 +1072,7 @@ mod tests {
             None, "admin", "admin", None, None, None, None, None, false, true, true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
-                secret: Some("shhh"),
+                secret: Some("shhhshhhshhhshhh"),
                 allowed_groups: Some("   , ,  "), // parses to zero non-empty entries
                 ..Default::default()
             },
@@ -1085,7 +1088,7 @@ mod tests {
             None, "admin", "admin", None, None, None, None, None, false, true, true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
-                secret: Some("shhh"),
+                secret: Some("shhhshhhshhhshhh"),
                 allowed_groups: Some("admins, ops"),
                 ..Default::default()
             },
@@ -1095,7 +1098,7 @@ mod tests {
         assert_eq!(th.username_header, "x-authentik-username");
         assert_eq!(th.groups_header, "x-authentik-groups");
         assert_eq!(th.secret_header, "x-admin-proxy-secret");
-        assert_eq!(th.secret, "shhh");
+        assert_eq!(th.secret, "shhhshhhshhhshhh");
         assert_eq!(th.allowed_groups, vec!["admins", "ops"]);
     }
 
@@ -1108,7 +1111,7 @@ mod tests {
                 username_header: Some("X-Custom-User"),
                 groups_header: Some("X-Custom-Groups"),
                 secret_header: Some("X-Custom-Secret"),
-                secret: Some("shhh"),
+                secret: Some("shhhshhhshhhshhh"),
                 allowed_groups: Some("admins"),
             },
         )
@@ -1126,12 +1129,63 @@ mod tests {
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 username_header: Some("not a valid header name!!"),
-                secret: Some("shhh"),
+                secret: Some("shhhshhhshhhshhh"),
                 allowed_groups: Some("admins"),
                 ..Default::default()
             },
         );
         assert!(result.is_err(), "an invalid header-name string must be refused at build time");
+    }
+
+    #[test]
+    fn trusted_header_secret_too_short_errs() {
+        let result = build_admin_config_from_parts(
+            None, "admin", "admin", None, None, None, None, None, false, true, true,
+            TrustedHeaderEnvArgs {
+                trust_proxy_headers: true,
+                secret: Some("short"),
+                allowed_groups: Some("admins"),
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err(), "a secret shorter than 16 chars must be refused");
+        let msg = result.err().unwrap().to_string();
+        assert!(msg.contains("WEF_ADMIN_TRUSTED_HEADER_SECRET"), "{msg}");
+        assert!(msg.contains("16"), "{msg}");
+    }
+
+    #[test]
+    fn trusted_header_secret_exactly_16_chars_ok() {
+        let cfg = build_admin_config_from_parts(
+            None, "admin", "admin", None, None, None, None, None, false, true, true,
+            TrustedHeaderEnvArgs {
+                trust_proxy_headers: true,
+                secret: Some("0123456789abcdef"), // exactly 16 chars
+                allowed_groups: Some("admins"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let th = cfg.trusted_header.expect("trusted_header should be Some");
+        assert_eq!(th.secret, "0123456789abcdef");
+    }
+
+    #[test]
+    fn trusted_header_secret_trimmed_before_length_check() {
+        let cfg = build_admin_config_from_parts(
+            None, "admin", "admin", None, None, None, None, None, false, true, true,
+            TrustedHeaderEnvArgs {
+                trust_proxy_headers: true,
+                // 16 real chars padded with surrounding whitespace: must be
+                // trimmed *before* being length-checked and stored.
+                secret: Some("  0123456789abcdef  "),
+                allowed_groups: Some("admins"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let th = cfg.trusted_header.expect("trusted_header should be Some");
+        assert_eq!(th.secret, "0123456789abcdef");
     }
 
     // ── load_admin_config env-driven tests (sequential, single test fn) ───────
