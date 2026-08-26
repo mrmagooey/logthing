@@ -99,6 +99,10 @@ async fn run_admin_server(
         .route("/stats.json", axum::routing::get(get_stats_json))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            crate::admin::middleware::trusted_header_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             security_middleware,
         ))
         .layer(axum::middleware::from_fn_with_state(
@@ -1382,5 +1386,153 @@ mod tests {
              already-registered live writer handle — this is the actual bug \
              fix, exercised end-to-end through the HTTP path"
         );
+    }
+
+    mod trusted_header_integration_tests {
+        use super::*;
+        use crate::admin::state::TrustedHeaderConfig;
+
+        async fn test_state_with_trust() -> AdminState {
+            let server_config = AdminServerConfig {
+                bind_address: "0.0.0.0:8080".parse().unwrap(),
+                username: "admin".to_string(),
+                password_hash: PasswordHash::hash("admin").unwrap(),
+                allowed_ips: vec![],
+                tls_config: None,
+                enable_csrf: false,
+                enable_rate_limiting: false,
+                trusted_header: Some(TrustedHeaderConfig {
+                    username_header: axum::http::HeaderName::from_static("x-authentik-username"),
+                    groups_header: axum::http::HeaderName::from_static("x-authentik-groups"),
+                    secret_header: axum::http::HeaderName::from_static("x-admin-proxy-secret"),
+                    secret: "shhh".to_string(),
+                    allowed_groups: vec!["admins".to_string()],
+                }),
+            };
+            AdminState {
+                config: Arc::new(RwLock::new(Config::default())),
+                server_config,
+                audit_logger: AuditLogger::new(100).await,
+                csrf_tokens: Arc::new(RwLock::new(Vec::new())),
+                request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+                source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
+                flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
+            }
+        }
+
+        fn trusted_headers_request(method: Method, uri: &str) -> Request<Body> {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("x-admin-proxy-secret", "shhh")
+                .header("x-authentik-username", "alice")
+                .header("x-authentik-groups", "admins")
+                .body(Body::empty())
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn get_config_succeeds_with_trusted_headers_alone_no_basic_auth() {
+            let state = test_state_with_trust().await;
+            let mut request = trusted_headers_request(Method::GET, "/config");
+            inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+            let app = axum::Router::new()
+                .route("/config", axum::routing::get(get_config))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::admin::middleware::trusted_header_middleware,
+                ))
+                .with_state(state);
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn export_config_succeeds_with_trusted_headers_alone_no_basic_auth() {
+            let state = test_state_with_trust().await;
+            let mut request = trusted_headers_request(Method::POST, "/config/export");
+            inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+            let app = axum::Router::new()
+                .route(
+                    "/config/export",
+                    axum::routing::post(crate::admin::config_api::export_config),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::admin::middleware::trusted_header_middleware,
+                ))
+                .with_state(state);
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn get_config_falls_back_to_basic_auth_when_no_trusted_headers_present() {
+            let state = test_state_with_trust().await;
+            let mut request = create_request_with_auth(Method::GET, "/config", "admin", "admin", None);
+            inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+            let app = axum::Router::new()
+                .route("/config", axum::routing::get(get_config))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::admin::middleware::trusted_header_middleware,
+                ))
+                .with_state(state);
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "Basic Auth must still work when no trusted headers are present"
+            );
+        }
+
+        #[tokio::test]
+        async fn get_config_rejects_when_neither_trusted_headers_nor_basic_auth_present() {
+            let state = test_state_with_trust().await;
+            let mut request = create_request_without_auth(Method::GET, "/config");
+            inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+            let app = axum::Router::new()
+                .route("/config", axum::routing::get(get_config))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::admin::middleware::trusted_header_middleware,
+                ))
+                .with_state(state);
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn get_config_records_header_derived_username_in_audit_log() {
+            let state = test_state_with_trust().await;
+            let mut request = trusted_headers_request(Method::GET, "/config");
+            inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+            let app = axum::Router::new()
+                .route("/config", axum::routing::get(get_config))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::admin::middleware::trusted_header_middleware,
+                ))
+                .with_state(state.clone());
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let entries = state.audit_logger.get_entries(10).await;
+            let entry = entries
+                .iter()
+                .find(|e| e.action == "CONFIG_READ")
+                .expect("CONFIG_READ entry should exist");
+            assert_eq!(entry.username, "alice");
+        }
     }
 }

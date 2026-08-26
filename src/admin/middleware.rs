@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::admin::auth::verify_csrf_token;
+use crate::admin::auth::{verify_csrf_token, verify_trusted_header};
 use crate::admin::state::{AdminState, RateLimitError};
 
 /// Security middleware: rate limiting, IP whitelist, and CSRF protection
@@ -103,6 +103,24 @@ pub async fn csrf_middleware(
         })),
     )
         .into_response()
+}
+
+/// Resolves a trusted reverse-proxy identity (if any) and, when present,
+/// inserts it into the request's extensions for downstream handlers to pick
+/// up via `Option<Extension<TrustedIdentity>>`.
+///
+/// Never rejects the request itself — a request with no or invalid trusted
+/// headers must still be able to reach the handler and fall back to Basic
+/// Auth there (`ensure_authorized` handles that fallback).
+pub async fn trusted_header_middleware(
+    State(state): State<AdminState>,
+    mut request: axum::http::Request<Body>,
+    next: Next,
+) -> Response {
+    if let Some(identity) = verify_trusted_header(&state, request.headers()) {
+        request.extensions_mut().insert(identity);
+    }
+    next.run(request).await
 }
 
 #[cfg(test)]
@@ -320,5 +338,166 @@ mod tests {
         let response: axum::http::Response<axum::body::Body> = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    mod trusted_header_middleware_tests {
+        use super::*;
+        use crate::admin::state::TrustedHeaderConfig;
+        use axum::http::HeaderName;
+        use axum::routing::get;
+
+        fn trusted_cfg() -> TrustedHeaderConfig {
+            TrustedHeaderConfig {
+                username_header: HeaderName::from_static("x-authentik-username"),
+                groups_header: HeaderName::from_static("x-authentik-groups"),
+                secret_header: HeaderName::from_static("x-admin-proxy-secret"),
+                secret: "shhh".to_string(),
+                allowed_groups: vec!["admins".to_string()],
+            }
+        }
+
+        async fn state_with_trust(trusted_header: Option<TrustedHeaderConfig>) -> AdminState {
+            let server_config = AdminServerConfig {
+                bind_address: "0.0.0.0:8080".parse().unwrap(),
+                username: "user".to_string(),
+                password_hash: PasswordHash::hash("pass").unwrap(),
+                allowed_ips: vec![],
+                tls_config: None,
+                enable_csrf: false,
+                enable_rate_limiting: false,
+                trusted_header,
+            };
+            AdminState {
+                config: Arc::new(RwLock::new(crate::config::Config::default())),
+                server_config,
+                audit_logger: AuditLogger::new(100).await,
+                csrf_tokens: Arc::new(RwLock::new(Vec::new())),
+                request_counts: Arc::new(RwLock::new(HashMap::new())),
+                source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
+                flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
+            }
+        }
+
+        /// A downstream test handler that reports whether a TrustedIdentity
+        /// extension is present, so the test can observe the middleware's
+        /// effect without needing a real admin handler.
+        async fn echo_trusted(
+            trusted: Option<axum::extract::Extension<crate::admin::state::TrustedIdentity>>,
+        ) -> String {
+            match trusted {
+                Some(axum::extract::Extension(t)) => format!("trusted:{}", t.username),
+                None => "untrusted".to_string(),
+            }
+        }
+
+        #[tokio::test]
+        async fn sets_extension_on_secret_and_group_match() {
+            let state = state_with_trust(Some(trusted_cfg())).await;
+            let app = axum::Router::new()
+                .route("/test", get(echo_trusted))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    trusted_header_middleware,
+                ))
+                .with_state(state);
+
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .header("x-admin-proxy-secret", "shhh")
+                .header("x-authentik-username", "alice")
+                .header("x-authentik-groups", "admins")
+                .body(Body::empty())
+                .unwrap();
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], b"trusted:alice");
+        }
+
+        #[tokio::test]
+        async fn does_not_set_extension_on_wrong_secret() {
+            let state = state_with_trust(Some(trusted_cfg())).await;
+            let app = axum::Router::new()
+                .route("/test", get(echo_trusted))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    trusted_header_middleware,
+                ))
+                .with_state(state);
+
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .header("x-admin-proxy-secret", "wrong")
+                .header("x-authentik-username", "alice")
+                .header("x-authentik-groups", "admins")
+                .body(Body::empty())
+                .unwrap();
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], b"untrusted");
+        }
+
+        #[tokio::test]
+        async fn does_not_set_extension_on_non_matching_group() {
+            let state = state_with_trust(Some(trusted_cfg())).await;
+            let app = axum::Router::new()
+                .route("/test", get(echo_trusted))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    trusted_header_middleware,
+                ))
+                .with_state(state);
+
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .header("x-admin-proxy-secret", "shhh")
+                .header("x-authentik-username", "alice")
+                .header("x-authentik-groups", "guests")
+                .body(Body::empty())
+                .unwrap();
+
+            let response = app.oneshot(request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], b"untrusted");
+        }
+
+        #[tokio::test]
+        async fn disabled_feature_never_sets_extension() {
+            let state = state_with_trust(None).await;
+            let app = axum::Router::new()
+                .route("/test", get(echo_trusted))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    trusted_header_middleware,
+                ))
+                .with_state(state);
+
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .header("x-admin-proxy-secret", "shhh")
+                .header("x-authentik-username", "alice")
+                .header("x-authentik-groups", "admins")
+                .body(Body::empty())
+                .unwrap();
+
+            let response = app.oneshot(request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], b"untrusted");
+        }
     }
 }
