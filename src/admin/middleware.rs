@@ -9,21 +9,32 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::admin::auth::{verify_csrf_token, verify_trusted_header};
-use crate::admin::state::{AdminState, RateLimitError};
+use crate::admin::auth::{resolve_client_ip, verify_csrf_token, verify_trusted_header};
+use crate::admin::state::{AdminState, RateLimitError, ResolvedClientIp};
 
-/// Security middleware: rate limiting, IP whitelist, and CSRF protection
+/// Security middleware: rate limiting, IP whitelist, and CSRF protection.
+///
+/// `resolved_ip` (populated by `trusted_header_middleware`, which must run
+/// BEFORE this middleware — see the ordering note on `run_admin_server` in
+/// `routes.rs`) is preferred over the raw `ConnectInfo` peer address for
+/// both the allowlist check and the rate-limit bucket key, so SSO traffic
+/// behind a reverse proxy is keyed on the real end-user IP rather than the
+/// proxy's single IP. Falls back to `ConnectInfo` when absent (e.g. trust
+/// mode is off, or a test harness that doesn't run `trusted_header_middleware`).
 pub async fn security_middleware(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    resolved_ip: Option<axum::extract::Extension<ResolvedClientIp>>,
     request: axum::http::Request<Body>,
     next: Next,
 ) -> Response {
-    let client_ip = addr.ip().to_string();
+    let ip: IpAddr = resolved_ip
+        .map(|axum::extract::Extension(ResolvedClientIp(ip))| ip)
+        .unwrap_or_else(|| addr.ip());
+    let client_ip = ip.to_string();
 
     // Check IP whitelist
     if !state.server_config.allowed_ips.is_empty() {
-        let ip: IpAddr = addr.ip();
         let allowed = state
             .server_config
             .allowed_ips
@@ -149,6 +160,15 @@ pub async fn trusted_header_middleware(
             }
         }
     }
+
+    // Runs unconditionally, regardless of verification outcome above, so
+    // downstream code (security_middleware, handlers) always has a resolved
+    // IP to read rather than having to guess whether trust-mode applied.
+    let resolved_ip = resolve_client_ip(&state, addr, request.headers());
+    request
+        .extensions_mut()
+        .insert(crate::admin::state::ResolvedClientIp(resolved_ip));
+
     next.run(request).await
 }
 
@@ -755,6 +775,200 @@ mod tests {
                     .iter()
                     .any(|e| e.action == "TRUSTED_HEADER_REJECTED"),
                 "a successful attempt is not a rejection"
+            );
+        }
+    }
+
+    /// Proves `security_middleware` actually consumes the `ResolvedClientIp`
+    /// extension that `trusted_header_middleware` sets — not just that the
+    /// extension exists. Chains both middlewares in the order the real
+    /// router uses (trusted_header_middleware outer/first, security_middleware
+    /// inner/second — see the ordering doc comment on `run_admin_server`),
+    /// then observes `security_middleware`'s rate-limit bucket keys and
+    /// allowlist decisions from outside.
+    mod security_middleware_resolved_ip_tests {
+        use super::*;
+        use crate::admin::state::TrustedHeaderConfig;
+        use axum::http::HeaderName;
+        use axum::routing::get;
+        use ipnet::IpNet;
+
+        fn trusted_cfg() -> TrustedHeaderConfig {
+            TrustedHeaderConfig {
+                username_header: HeaderName::from_static("x-authentik-username"),
+                groups_header: HeaderName::from_static("x-authentik-groups"),
+                secret_header: HeaderName::from_static("x-admin-proxy-secret"),
+                secret: "shhh".to_string(),
+                allowed_groups: vec!["admins".to_string()],
+            }
+        }
+
+        async fn state_with(
+            trusted_header: Option<TrustedHeaderConfig>,
+            allowed_ips: Vec<IpNet>,
+            enable_rate_limiting: bool,
+        ) -> AdminState {
+            let server_config = AdminServerConfig {
+                bind_address: "0.0.0.0:8080".parse().unwrap(),
+                username: "user".to_string(),
+                password_hash: PasswordHash::hash("pass").unwrap(),
+                allowed_ips,
+                tls_config: None,
+                enable_csrf: false,
+                enable_rate_limiting,
+                trusted_header,
+            };
+            AdminState {
+                config: Arc::new(RwLock::new(crate::config::Config::default())),
+                server_config,
+                audit_logger: AuditLogger::new(100).await,
+                csrf_tokens: Arc::new(RwLock::new(Vec::new())),
+                request_counts: Arc::new(RwLock::new(HashMap::new())),
+                source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
+                flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
+            }
+        }
+
+        /// Builds the same two-layer chain `run_admin_server` builds:
+        /// trusted_header_middleware runs first (outer), then
+        /// security_middleware (inner), then the handler.
+        fn app_with_both_middlewares(state: AdminState) -> axum::Router {
+            axum::Router::new()
+                .route("/test", get(|| async { "OK" }))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    security_middleware,
+                ))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    trusted_header_middleware,
+                ))
+                .with_state(state)
+        }
+
+        fn request_with_xff(peer_secret_ok: bool, xff: &str) -> Request<Body> {
+            let secret = if peer_secret_ok { "shhh" } else { "wrong" };
+            Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .header("x-admin-proxy-secret", secret)
+                .header("x-authentik-username", "alice")
+                .header("x-authentik-groups", "admins")
+                .header("x-forwarded-for", xff)
+                .body(Body::empty())
+                .unwrap()
+        }
+
+        /// Two requests share the same `ConnectInfo` peer address but carry
+        /// different (secret-verified) `X-Forwarded-For` values. They must
+        /// land in different rate-limit buckets — i.e. `request_counts` must
+        /// be keyed on the resolved IP, not the shared peer address.
+        #[tokio::test]
+        async fn rate_limit_bucket_keyed_on_resolved_ip_not_peer_addr() {
+            let state = state_with(Some(trusted_cfg()), vec![], true).await;
+            let peer: SocketAddr = "10.1.1.1:55555".parse().unwrap();
+
+            let app = app_with_both_middlewares(state.clone());
+            let mut req1 = request_with_xff(true, "203.0.113.10");
+            req1.extensions_mut().insert(ConnectInfo(peer));
+            let resp1 = app.oneshot(req1).await.unwrap();
+            assert_eq!(resp1.status(), StatusCode::OK);
+
+            let app = app_with_both_middlewares(state.clone());
+            let mut req2 = request_with_xff(true, "203.0.113.20");
+            req2.extensions_mut().insert(ConnectInfo(peer));
+            let resp2 = app.oneshot(req2).await.unwrap();
+            assert_eq!(resp2.status(), StatusCode::OK);
+
+            let counts = state.request_counts.read().await;
+            assert!(
+                counts.contains_key("203.0.113.10"),
+                "expected a bucket for the first XFF-resolved IP; got keys: {:?}",
+                counts.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                counts.contains_key("203.0.113.20"),
+                "expected a bucket for the second XFF-resolved IP; got keys: {:?}",
+                counts.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                !counts.contains_key(&peer.ip().to_string()),
+                "the shared peer address must not itself be used as a bucket key \
+                 when the secret verified and XFF was present; got keys: {:?}",
+                counts.keys().collect::<Vec<_>>()
+            );
+        }
+
+        /// Negative case: when the secret does NOT verify, `X-Forwarded-For`
+        /// must be completely ignored by the whole chain — the rate-limit
+        /// bucket must be keyed on the real peer address, even though a
+        /// (spoofable) XFF header is present.
+        #[tokio::test]
+        async fn wrong_secret_rate_limit_bucket_keyed_on_peer_addr_xff_ignored() {
+            let state = state_with(Some(trusted_cfg()), vec![], true).await;
+            let peer: SocketAddr = "10.2.2.2:12345".parse().unwrap();
+
+            let app = app_with_both_middlewares(state.clone());
+            let mut req = request_with_xff(false, "203.0.113.99");
+            req.extensions_mut().insert(ConnectInfo(peer));
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let counts = state.request_counts.read().await;
+            assert!(
+                counts.contains_key(&peer.ip().to_string()),
+                "expected the peer address to be used as the bucket key when \
+                 the secret was wrong; got keys: {:?}",
+                counts.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                !counts.contains_key("203.0.113.99"),
+                "the spoofed XFF value must never become a bucket key when the \
+                 secret didn't verify; got keys: {:?}",
+                counts.keys().collect::<Vec<_>>()
+            );
+        }
+
+        /// Allowlist variant of the same proof: the allowlist only permits
+        /// the XFF-resolved IP, not the real peer address. A secret-verified
+        /// request with that XFF must pass.
+        #[tokio::test]
+        async fn allowlist_evaluated_against_resolved_ip_when_secret_valid() {
+            let allowed: IpNet = "203.0.113.0/24".parse().unwrap();
+            let state = state_with(Some(trusted_cfg()), vec![allowed], false).await;
+            let peer: SocketAddr = "10.3.3.3:12345".parse().unwrap();
+
+            let app = app_with_both_middlewares(state);
+            let mut req = request_with_xff(true, "203.0.113.55");
+            req.extensions_mut().insert(ConnectInfo(peer));
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "allowlist check must use the XFF-resolved IP, which is in range, \
+                 not the out-of-range peer address"
+            );
+        }
+
+        /// Negative allowlist case: same allowlist, but the secret is wrong —
+        /// the XFF value must be ignored and the (out-of-range) peer address
+        /// used instead, so the request is denied.
+        #[tokio::test]
+        async fn allowlist_falls_back_to_peer_addr_when_secret_invalid() {
+            let allowed: IpNet = "203.0.113.0/24".parse().unwrap();
+            let state = state_with(Some(trusted_cfg()), vec![allowed], false).await;
+            let peer: SocketAddr = "10.4.4.4:12345".parse().unwrap();
+
+            let app = app_with_both_middlewares(state);
+            let mut req = request_with_xff(false, "203.0.113.55");
+            req.extensions_mut().insert(ConnectInfo(peer));
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "with an invalid secret, the out-of-range peer address must be \
+                 used for the allowlist check, denying access despite the \
+                 in-range (spoofed) XFF value"
             );
         }
     }

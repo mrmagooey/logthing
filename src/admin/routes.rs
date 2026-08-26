@@ -16,7 +16,8 @@ use crate::admin::config_api::{
 };
 use crate::admin::middleware::security_middleware;
 use crate::admin::state::{
-    AdminServerConfig, AdminState, AuditLogger, TrustedIdentity, load_admin_config,
+    AdminServerConfig, AdminState, AuditLogger, ResolvedClientIp, TrustedIdentity,
+    load_admin_config,
 };
 use crate::config::Config;
 
@@ -97,13 +98,40 @@ async fn run_admin_server(
         .route("/audit-log", axum::routing::get(get_audit_log))
         .route("/stats", axum::routing::get(get_stats))
         .route("/stats.json", axum::routing::get(get_stats_json))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::admin::middleware::trusted_header_middleware,
-        ))
+        // Layer ordering is deliberate and security-relevant — do not reorder
+        // without re-reading this comment.
+        //
+        // `axum`'s `.layer(A).layer(B)` makes B the OUTER layer: on an
+        // incoming request B runs first, then A, then the handler (layers
+        // added later wrap the ones added earlier). The three `.layer()`
+        // calls below are listed in the order they're ADDED, so read them
+        // bottom-to-top to get request-flow order:
+        //
+        //   csrf_middleware (outermost, runs 1st)
+        //     -> trusted_header_middleware (runs 2nd)
+        //       -> security_middleware (innermost, runs 3rd)
+        //         -> handler
+        //
+        // `trusted_header_middleware` MUST run before `security_middleware`
+        // because it's the one that resolves the real client IP (from
+        // `X-Forwarded-For`, only when the shared secret verifies — see
+        // `auth::resolve_client_ip`) and stashes it in request extensions as
+        // `ResolvedClientIp`. `security_middleware` reads that extension to
+        // key its rate limiter and IP-allowlist check on the real end-user
+        // IP instead of the reverse proxy's single IP. If the order here were
+        // ever flipped, `security_middleware` would run before the
+        // `ResolvedClientIp` extension exists and would silently fall back to
+        // the raw `ConnectInfo` peer address for every request — no compile
+        // error, no test failure unless the ordering is exercised directly
+        // (see `security_middleware_resolved_ip_tests` in `middleware.rs`,
+        // which builds this exact two-layer chain and asserts on it).
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             security_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::admin::middleware::trusted_header_middleware,
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -166,9 +194,12 @@ async fn get_config(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     trusted: Option<Extension<TrustedIdentity>>,
+    resolved_ip: Option<Extension<ResolvedClientIp>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
 ) -> Result<Json<Config>, Response> {
-    let client_ip = addr.ip().to_string();
+    let client_ip = resolved_ip
+        .map(|Extension(ResolvedClientIp(ip))| ip.to_string())
+        .unwrap_or_else(|| addr.ip().to_string());
     let username =
         ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
@@ -187,9 +218,12 @@ async fn admin_page(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     trusted: Option<Extension<TrustedIdentity>>,
+    resolved_ip: Option<Extension<ResolvedClientIp>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
 ) -> Result<Html<String>, Response> {
-    let client_ip = addr.ip().to_string();
+    let client_ip = resolved_ip
+        .map(|Extension(ResolvedClientIp(ip))| ip.to_string())
+        .unwrap_or_else(|| addr.ip().to_string());
     let username =
         ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
@@ -214,10 +248,13 @@ async fn update_config(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     trusted: Option<Extension<TrustedIdentity>>,
+    resolved_ip: Option<Extension<ResolvedClientIp>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
     Json(new_config): Json<Config>,
 ) -> Result<Json<Config>, Response> {
-    let client_ip = addr.ip().to_string();
+    let client_ip = resolved_ip
+        .map(|Extension(ResolvedClientIp(ip))| ip.to_string())
+        .unwrap_or_else(|| addr.ip().to_string());
     let username =
         ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
@@ -279,10 +316,13 @@ async fn patch_config(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     trusted: Option<Extension<TrustedIdentity>>,
+    resolved_ip: Option<Extension<ResolvedClientIp>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
     Json(partial): Json<PartialConfigUpdate>,
 ) -> Result<Json<Config>, Response> {
-    let client_ip = addr.ip().to_string();
+    let client_ip = resolved_ip
+        .map(|Extension(ResolvedClientIp(ip))| ip.to_string())
+        .unwrap_or_else(|| addr.ip().to_string());
     let username =
         ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
@@ -379,9 +419,12 @@ async fn get_audit_log(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     trusted: Option<Extension<TrustedIdentity>>,
+    resolved_ip: Option<Extension<ResolvedClientIp>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
 ) -> Result<Json<Vec<crate::admin::state::AuditEntry>>, Response> {
-    let client_ip = addr.ip().to_string();
+    let client_ip = resolved_ip
+        .map(|Extension(ResolvedClientIp(ip))| ip.to_string())
+        .unwrap_or_else(|| addr.ip().to_string());
     let username =
         ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
@@ -400,9 +443,12 @@ async fn get_stats(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     trusted: Option<Extension<TrustedIdentity>>,
+    resolved_ip: Option<Extension<ResolvedClientIp>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
 ) -> Result<Html<String>, Response> {
-    let client_ip = addr.ip().to_string();
+    let client_ip = resolved_ip
+        .map(|Extension(ResolvedClientIp(ip))| ip.to_string())
+        .unwrap_or_else(|| addr.ip().to_string());
     let username =
         ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
@@ -457,9 +503,12 @@ async fn get_stats_json(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     trusted: Option<Extension<TrustedIdentity>>,
+    resolved_ip: Option<Extension<ResolvedClientIp>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
 ) -> Result<Json<Vec<crate::stats::SourceHourlySnapshot>>, Response> {
-    let client_ip = addr.ip().to_string();
+    let client_ip = resolved_ip
+        .map(|Extension(ResolvedClientIp(ip))| ip.to_string())
+        .unwrap_or_else(|| addr.ip().to_string());
     let username =
         ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
@@ -1615,6 +1664,50 @@ mod tests {
                 .find(|e| e.action == "CONFIG_READ")
                 .expect("CONFIG_READ entry should exist");
             assert_eq!(entry.username, "alice");
+        }
+
+        /// End-to-end proof for the audit-log finding this follow-up fixes:
+        /// with trust-mode + a valid secret + `X-Forwarded-For` all present,
+        /// the `CONFIG_READ` audit entry's `client_ip` must reflect the
+        /// XFF-derived end-user IP, not the reverse proxy's own peer address
+        /// (`ConnectInfo`). Chains `trusted_header_middleware` in front of
+        /// `get_config`, exactly as `run_admin_server` wires it.
+        #[tokio::test]
+        async fn get_config_records_xff_derived_client_ip_in_audit_log() {
+            let state = test_state_with_trust().await;
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri("/config")
+                .header("x-admin-proxy-secret", "shhh")
+                .header("x-authentik-username", "alice")
+                .header("x-authentik-groups", "admins")
+                .header("x-forwarded-for", "198.51.100.23")
+                .body(Body::empty())
+                .unwrap();
+            // The proxy's own peer address — must NOT end up in the audit log.
+            inject_connect_info(&mut request, "10.0.0.1:12345".parse().unwrap());
+
+            let app = axum::Router::new()
+                .route("/config", axum::routing::get(get_config))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::admin::middleware::trusted_header_middleware,
+                ))
+                .with_state(state.clone());
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let entries = state.audit_logger.get_entries(10).await;
+            let entry = entries
+                .iter()
+                .find(|e| e.action == "CONFIG_READ")
+                .expect("CONFIG_READ entry should exist");
+            assert_eq!(
+                entry.client_ip, "198.51.100.23",
+                "audit log must record the XFF-derived end-user IP, not the \
+                 reverse proxy's own peer address"
+            );
         }
     }
 }

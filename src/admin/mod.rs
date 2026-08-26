@@ -278,6 +278,7 @@ mod tests {
                 State(state),
                 ConnectInfo(addr),
                 None,
+                None,
                 auth,
                 Json(invalid_config),
             )
@@ -297,10 +298,16 @@ mod tests {
 
             let config = Config::default();
 
-            let Json(diff) =
-                config_api::diff_config(State(state), ConnectInfo(addr), None, auth, Json(config))
-                    .await
-                    .expect("diff succeeds");
+            let Json(diff) = config_api::diff_config(
+                State(state),
+                ConnectInfo(addr),
+                None,
+                None,
+                auth,
+                Json(config),
+            )
+            .await
+            .expect("diff succeeds");
 
             assert!(diff.changed.is_empty());
             assert!(diff.added.is_empty());
@@ -491,6 +498,7 @@ mod tests {
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
                 None,
+                None,
                 Some(auth),
                 axum::Json(config),
             )
@@ -514,6 +522,7 @@ mod tests {
             let axum::Json(result) = config_api::validate_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 None,
                 Some(auth),
                 axum::Json(config),
@@ -556,6 +565,7 @@ mod tests {
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
                 None,
+                None,
                 Some(auth),
             )
             .await;
@@ -578,6 +588,7 @@ mod tests {
             let result = config_api::import_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 None,
                 Some(auth),
                 invalid_content,
@@ -621,6 +632,7 @@ port = 9090
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
                 None,
+                None,
                 Some(auth),
                 toml_content,
             )
@@ -640,6 +652,7 @@ port = 9090
             let result = config_api::reload_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 None,
                 Some(auth),
             )
@@ -715,6 +728,7 @@ port = 9090
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
                 None,
+                None,
                 Some(auth),
                 axum::Json(config),
             )
@@ -741,6 +755,7 @@ port = 9090
             let Json(result) = config_api::validate_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 None,
                 Some(auth),
                 axum::Json(config),
@@ -774,6 +789,7 @@ port = 9090
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
                 None,
+                None,
                 Some(auth),
                 axum::Json(config),
             )
@@ -803,6 +819,7 @@ port = 9090
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
                 None,
+                None,
                 Some(auth),
                 axum::Json(config),
             )
@@ -831,6 +848,7 @@ port = 9090
             let Json(result) = config_api::validate_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 None,
                 Some(auth),
                 axum::Json(config),
@@ -863,6 +881,7 @@ port = 9090
             let Json(result) = config_api::validate_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 None,
                 Some(auth),
                 axum::Json(config),

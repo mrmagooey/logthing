@@ -19,6 +19,55 @@ fn ct_str_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
+/// Returns `true` iff trusted-header auth is configured AND the request
+/// carries a secret header value that constant-time-matches the configured
+/// secret. This is the single trust boundary shared by `verify_trusted_header`
+/// (full identity + group verification) and `resolve_client_ip` (whether
+/// `X-Forwarded-For` may be believed) — factored out so the two can never
+/// silently diverge on what counts as "this request genuinely came through
+/// our trusted proxy."
+fn secret_header_matches(state: &AdminState, headers: &HeaderMap) -> bool {
+    let Some(cfg) = state.server_config.trusted_header.as_ref() else {
+        return false;
+    };
+    let Some(secret) = headers.get(&cfg.secret_header).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    ct_str_eq(secret, &cfg.secret)
+}
+
+/// Resolve the real client IP for this request.
+///
+/// Only trusts `X-Forwarded-For` when [`secret_header_matches`] returns
+/// `true` — i.e. only on requests proven to have come through the trusted
+/// reverse proxy. This is the critical security boundary: honoring
+/// `X-Forwarded-For` on arbitrary traffic would let any attacker spoof their
+/// logged/rate-limited/allowlisted IP simply by setting the header
+/// themselves. When the secret doesn't match (trust-mode off, header
+/// missing, or wrong), `X-Forwarded-For` is never even inspected — the raw
+/// `ConnectInfo` peer address is returned unconditionally.
+///
+/// When trusted, takes the leftmost (client-facing) hop of `X-Forwarded-For`
+/// — the standard single-proxy convention — trimmed and parsed as an
+/// `IpAddr`. Falls back to the peer address if the header is absent, empty,
+/// or fails to parse.
+pub fn resolve_client_ip(
+    state: &AdminState,
+    addr: std::net::SocketAddr,
+    headers: &HeaderMap,
+) -> std::net::IpAddr {
+    if !secret_header_matches(state, headers) {
+        return addr.ip();
+    }
+
+    let xff = match headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        Some(v) => v,
+        None => return addr.ip(),
+    };
+    let first_hop = xff.split(',').next().unwrap_or("").trim();
+    first_hop.parse::<std::net::IpAddr>().unwrap_or_else(|_| addr.ip())
+}
+
 /// Resolve a caller identity from trusted reverse-proxy headers, or `None`
 /// if trusted-header auth is disabled, the shared secret is missing/wrong,
 /// the username header is missing/empty, or no incoming group matches the
@@ -34,8 +83,7 @@ fn ct_str_eq(a: &str, b: &str) -> bool {
 pub fn verify_trusted_header(state: &AdminState, headers: &HeaderMap) -> Option<TrustedIdentity> {
     let cfg = state.server_config.trusted_header.as_ref()?;
 
-    let secret = headers.get(&cfg.secret_header)?.to_str().ok()?;
-    if !ct_str_eq(secret, &cfg.secret) {
+    if !secret_header_matches(state, headers) {
         return None;
     }
 
@@ -330,6 +378,133 @@ mod tests {
                 HeaderValue::from_bytes(&[0xff, 0xfe, 0xfd]).unwrap(),
             );
             assert!(verify_trusted_header(&state, &h).is_none());
+        }
+    }
+
+    mod resolve_client_ip_tests {
+        use super::super::resolve_client_ip;
+        use crate::admin::state::{
+            AdminServerConfig, AdminState, AuditLogger, PasswordHash, TrustedHeaderConfig,
+        };
+        use axum::http::{HeaderMap, HeaderName, HeaderValue};
+        use std::net::{IpAddr, SocketAddr};
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        fn trusted_cfg() -> TrustedHeaderConfig {
+            TrustedHeaderConfig {
+                username_header: HeaderName::from_static("x-authentik-username"),
+                groups_header: HeaderName::from_static("x-authentik-groups"),
+                secret_header: HeaderName::from_static("x-admin-proxy-secret"),
+                secret: "shhh".to_string(),
+                allowed_groups: vec!["admins".to_string()],
+            }
+        }
+
+        async fn state_with(trusted_header: Option<TrustedHeaderConfig>) -> AdminState {
+            let server_config = AdminServerConfig {
+                bind_address: "127.0.0.1:8080".parse().unwrap(),
+                username: "admin".to_string(),
+                password_hash: PasswordHash::hash("admin").unwrap(),
+                allowed_ips: vec![],
+                tls_config: None,
+                enable_csrf: false,
+                enable_rate_limiting: false,
+                trusted_header,
+            };
+            AdminState {
+                config: Arc::new(RwLock::new(crate::config::Config::default())),
+                server_config,
+                audit_logger: AuditLogger::new(10).await,
+                csrf_tokens: Arc::new(RwLock::new(Vec::new())),
+                request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+                source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
+                flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
+            }
+        }
+
+        fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+            let mut h = HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(
+                    HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            h
+        }
+
+        fn peer_addr() -> SocketAddr {
+            "10.9.9.9:12345".parse().unwrap()
+        }
+
+        #[tokio::test]
+        async fn secret_matches_valid_xff_returns_xff_ip() {
+            let state = state_with(Some(trusted_cfg())).await;
+            let h = headers(&[
+                ("x-admin-proxy-secret", "shhh"),
+                ("x-forwarded-for", "203.0.113.42"),
+            ]);
+            let ip = resolve_client_ip(&state, peer_addr(), &h);
+            assert_eq!(ip, "203.0.113.42".parse::<IpAddr>().unwrap());
+        }
+
+        #[tokio::test]
+        async fn secret_matches_no_xff_header_falls_back_to_peer_addr() {
+            let state = state_with(Some(trusted_cfg())).await;
+            let h = headers(&[("x-admin-proxy-secret", "shhh")]);
+            let ip = resolve_client_ip(&state, peer_addr(), &h);
+            assert_eq!(ip, peer_addr().ip());
+        }
+
+        #[tokio::test]
+        async fn secret_matches_malformed_xff_falls_back_to_peer_addr() {
+            let state = state_with(Some(trusted_cfg())).await;
+            let h = headers(&[
+                ("x-admin-proxy-secret", "shhh"),
+                ("x-forwarded-for", "not-an-ip-address"),
+            ]);
+            let ip = resolve_client_ip(&state, peer_addr(), &h);
+            assert_eq!(ip, peer_addr().ip());
+        }
+
+        #[tokio::test]
+        async fn secret_matches_multi_hop_xff_takes_first_hop() {
+            let state = state_with(Some(trusted_cfg())).await;
+            let h = headers(&[
+                ("x-admin-proxy-secret", "shhh"),
+                ("x-forwarded-for", "198.51.100.7, 10.0.0.1, 10.0.0.2"),
+            ]);
+            let ip = resolve_client_ip(&state, peer_addr(), &h);
+            assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+        }
+
+        /// The security boundary: a wrong/missing secret must mean
+        /// `X-Forwarded-For` is completely ignored, even if it's present
+        /// and points at a plausible-looking IP. Otherwise any attacker
+        /// could spoof their logged/rate-limited IP by just setting the
+        /// header themselves.
+        #[tokio::test]
+        async fn secret_does_not_match_xff_present_still_returns_peer_addr() {
+            let state = state_with(Some(trusted_cfg())).await;
+            let h = headers(&[
+                ("x-admin-proxy-secret", "totally-wrong"),
+                ("x-forwarded-for", "203.0.113.42"),
+            ]);
+            let ip = resolve_client_ip(&state, peer_addr(), &h);
+            assert_eq!(
+                ip,
+                peer_addr().ip(),
+                "XFF must be completely ignored when the secret doesn't match"
+            );
+        }
+
+        #[tokio::test]
+        async fn trust_mode_disabled_xff_present_returns_peer_addr() {
+            let state = state_with(None).await;
+            let h = headers(&[("x-forwarded-for", "203.0.113.42")]);
+            let ip = resolve_client_ip(&state, peer_addr(), &h);
+            assert_eq!(ip, peer_addr().ip());
         }
     }
 }

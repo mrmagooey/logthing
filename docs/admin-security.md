@@ -125,6 +125,24 @@ JWT verification of Authentik's signed `X-authentik-jwt` header is not
 implemented — the shared-secret + loopback-bind + group-check combination is
 the current trust model.
 
+**`X-Forwarded-For` is trusted for audit logging, rate limiting, and the IP
+allowlist — but only on requests where the shared secret verified.** When
+trust mode is enabled, every request is checked against the same shared
+secret used for identity headers; only if that check passes does the server
+read `X-Forwarded-For` (its leftmost hop) to resolve the real end-user IP for
+`AuditEntry.client_ip`, the rate limiter's bucket key, and
+`WEF_ADMIN_ALLOWED_IPS` matching. If the secret is missing or wrong, the
+header is never even inspected and the raw TCP peer address (i.e. the
+proxy's own IP) is used instead — this is what stops a client who lacks the
+secret from spoofing their logged/rate-limited/allowlisted IP by simply
+setting the header themselves. Exactly like the identity headers, **the
+proxy must strip or overwrite any client-supplied `X-Forwarded-For` before
+appending its own hop.** If it does not, a request that also happens to
+guess or obtain a valid shared secret could still forge its logged and
+rate-limited IP — the shared secret is what makes `X-Forwarded-For`
+trustworthy at all, but only if the proxy guarantees the header it forwards
+is proxy-authored, not attacker-authored.
+
 ## API Endpoints
 
 - `GET /` - Admin web interface (requires authentication)

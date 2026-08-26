@@ -228,6 +228,15 @@ pub struct TrustedIdentity {
     pub username: String,
 }
 
+/// The client IP `trusted_header_middleware` resolved for this request,
+/// inserted into request extensions on every request (regardless of whether
+/// trusted-header verification succeeded). This is `X-Forwarded-For`'s
+/// leftmost hop only when the request's shared secret verified; otherwise
+/// it's the raw `ConnectInfo` peer address. See `auth::resolve_client_ip`
+/// for the security boundary this enforces.
+#[derive(Clone)]
+pub struct ResolvedClientIp(pub std::net::IpAddr);
+
 /// Hashed password using Argon2
 #[derive(Clone)]
 pub struct PasswordHash {
