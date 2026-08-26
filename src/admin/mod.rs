@@ -75,20 +75,35 @@ mod tests {
         let bad = Some(TypedHeader(Authorization::basic("user", "nope")));
 
         assert!(
-            auth::ensure_authorized(&state, good, client_ip)
+            auth::ensure_authorized(&state, None, good, client_ip)
                 .await
                 .is_ok()
         );
         assert!(
-            auth::ensure_authorized(&state, bad, client_ip)
+            auth::ensure_authorized(&state, None, bad, client_ip)
                 .await
                 .is_err()
         );
         assert!(
-            auth::ensure_authorized(&state, None, client_ip)
+            auth::ensure_authorized(&state, None, None, client_ip)
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_authorized_trusted_identity_short_circuits_basic_auth() {
+        let state = test_state().await;
+        let client_ip = "127.0.0.1";
+        let trusted = Some(crate::admin::state::TrustedIdentity {
+            username: "proxied-user".to_string(),
+        });
+
+        // No Authorization header at all — must still succeed via the
+        // trusted identity, proving Basic Auth is not consulted when a
+        // trusted identity is already present.
+        let result = auth::ensure_authorized(&state, trusted, None, client_ip).await;
+        assert_eq!(result.unwrap(), "proxied-user");
     }
 
     #[tokio::test]
@@ -262,6 +277,7 @@ mod tests {
             let result = config_api::validate_config(
                 State(state),
                 ConnectInfo(addr),
+                None,
                 auth,
                 Json(invalid_config),
             )
@@ -282,7 +298,7 @@ mod tests {
             let config = Config::default();
 
             let Json(diff) =
-                config_api::diff_config(State(state), ConnectInfo(addr), auth, Json(config))
+                config_api::diff_config(State(state), ConnectInfo(addr), None, auth, Json(config))
                     .await
                     .expect("diff succeeds");
 
@@ -474,6 +490,7 @@ mod tests {
             let result = config_api::validate_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 Some(auth),
                 axum::Json(config),
             )
@@ -497,6 +514,7 @@ mod tests {
             let axum::Json(result) = config_api::validate_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 Some(auth),
                 axum::Json(config),
             )
@@ -537,6 +555,7 @@ mod tests {
             let response = config_api::export_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 Some(auth),
             )
             .await;
@@ -559,6 +578,7 @@ mod tests {
             let result = config_api::import_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 Some(auth),
                 invalid_content,
             )
@@ -600,6 +620,7 @@ port = 9090
             let result = config_api::import_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 Some(auth),
                 toml_content,
             )
@@ -619,6 +640,7 @@ port = 9090
             let result = config_api::reload_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 Some(auth),
             )
             .await;
@@ -692,6 +714,7 @@ port = 9090
             let Json(result) = config_api::diff_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 Some(auth),
                 axum::Json(config),
             )
@@ -718,6 +741,7 @@ port = 9090
             let Json(result) = config_api::validate_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 Some(auth),
                 axum::Json(config),
             )
@@ -749,6 +773,7 @@ port = 9090
             let Json(result) = config_api::validate_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 Some(auth),
                 axum::Json(config),
             )
@@ -777,6 +802,7 @@ port = 9090
             let Json(result) = config_api::validate_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 Some(auth),
                 axum::Json(config),
             )
@@ -805,6 +831,7 @@ port = 9090
             let Json(result) = config_api::validate_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 Some(auth),
                 axum::Json(config),
             )
@@ -836,6 +863,7 @@ port = 9090
             let Json(result) = config_api::validate_config(
                 axum::extract::State(state),
                 axum::extract::ConnectInfo(addr),
+                None,
                 Some(auth),
                 axum::Json(config),
             )

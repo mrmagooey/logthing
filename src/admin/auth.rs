@@ -62,12 +62,22 @@ pub fn verify_trusted_header(state: &AdminState, headers: &HeaderMap) -> Option<
     })
 }
 
-/// Verify authentication and authorize access
+/// Verify authentication and authorize access.
+///
+/// Checks a trusted reverse-proxy identity first (if present — see
+/// `verify_trusted_header`), and only falls back to Basic Auth if none was
+/// resolved. This keeps Basic Auth fully working as a fallback for direct/
+/// local access when the trusted-header proxy isn't in the request path.
 pub async fn ensure_authorized(
     state: &AdminState,
+    trusted: Option<TrustedIdentity>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
     client_ip: &str,
 ) -> Result<String, Response> {
+    if let Some(identity) = trusted {
+        return Ok(identity.username);
+    }
+
     let Some(auth) = auth else {
         return Err(unauthorized());
     };

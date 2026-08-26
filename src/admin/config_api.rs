@@ -1,7 +1,7 @@
 use axum::{
     Json,
     body::Bytes,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Extension, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use tokio::fs;
 
 use crate::admin::auth::ensure_authorized;
-use crate::admin::state::AdminState;
+use crate::admin::state::{AdminState, TrustedIdentity};
 use crate::config::{ADMIN_OVERRIDE_FILE, Config, S3ConnectionConfig};
 
 const REDACTED: &str = "***REDACTED***";
@@ -217,11 +217,13 @@ pub struct ValidationResult {
 pub async fn validate_config(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    trusted: Option<Extension<TrustedIdentity>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
     Json(config_to_validate): Json<Config>,
 ) -> Result<Json<ValidationResult>, Response> {
     let client_ip = addr.ip().to_string();
-    let username = ensure_authorized(&state, auth, &client_ip).await?;
+    let username =
+        ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
@@ -300,11 +302,13 @@ pub struct ConfigDiff {
 pub async fn diff_config(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    trusted: Option<Extension<TrustedIdentity>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
     Json(proposed_config): Json<Config>,
 ) -> Result<Json<ConfigDiff>, Response> {
     let client_ip = addr.ip().to_string();
-    let username = ensure_authorized(&state, auth, &client_ip).await?;
+    let username =
+        ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
     let current = state.config.read().await.clone();
 
@@ -386,10 +390,12 @@ pub async fn diff_config(
 pub async fn export_config(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    trusted: Option<Extension<TrustedIdentity>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
 ) -> Result<Response, Response> {
     let client_ip = addr.ip().to_string();
-    let username = ensure_authorized(&state, auth, &client_ip).await?;
+    let username =
+        ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
     let cfg = redacted_config(&*state.config.read().await);
 
@@ -436,11 +442,13 @@ const IMPORT_MAX_BODY_BYTES: usize = 1024 * 1024;
 pub async fn import_config(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    trusted: Option<Extension<TrustedIdentity>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
     body: Bytes,
 ) -> Result<Json<Config>, Response> {
     let client_ip = addr.ip().to_string();
-    let username = ensure_authorized(&state, auth, &client_ip).await?;
+    let username =
+        ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
     // M-12: reject oversized bodies before any parsing.
     if body.len() > IMPORT_MAX_BODY_BYTES {
@@ -511,10 +519,12 @@ pub async fn import_config(
 pub async fn reload_config(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    trusted: Option<Extension<TrustedIdentity>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
 ) -> Result<Json<Config>, Response> {
     let client_ip = addr.ip().to_string();
-    let username = ensure_authorized(&state, auth, &client_ip).await?;
+    let username =
+        ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
     // Reload config from disk
     let reloaded_config = match Config::load() {
@@ -798,6 +808,7 @@ mod tests {
         let result = import_config(
             axum::extract::State(state.clone()),
             axum::extract::ConnectInfo(addr),
+            None,
             Some(auth),
             axum::body::Bytes::from_static(invalid_toml),
         )
@@ -830,6 +841,7 @@ enabled = true
         let result = import_config(
             axum::extract::State(state),
             axum::extract::ConnectInfo(addr),
+            None,
             Some(auth),
             axum::body::Bytes::from_static(invalid_toml),
         )
@@ -855,6 +867,7 @@ enabled = true
         let result = import_config(
             axum::extract::State(state),
             axum::extract::ConnectInfo(addr),
+            None,
             Some(auth),
             oversized_body,
         )
@@ -901,6 +914,7 @@ enabled = true
         let result = import_config(
             axum::extract::State(state),
             axum::extract::ConnectInfo(addr),
+            None,
             Some(auth),
             body,
         )

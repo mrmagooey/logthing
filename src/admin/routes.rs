@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Extension, State},
     response::{Html, IntoResponse, Response},
 };
 use axum_extra::extract::TypedHeader;
@@ -15,7 +15,9 @@ use crate::admin::config_api::{
     validate_config_invariants,
 };
 use crate::admin::middleware::security_middleware;
-use crate::admin::state::{AdminServerConfig, AdminState, AuditLogger, load_admin_config};
+use crate::admin::state::{
+    AdminServerConfig, AdminState, AuditLogger, TrustedIdentity, load_admin_config,
+};
 use crate::config::Config;
 
 /// Spawn the admin server as a background task
@@ -159,10 +161,12 @@ pub async fn health_check() -> &'static str {
 async fn get_config(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    trusted: Option<Extension<TrustedIdentity>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
 ) -> Result<Json<Config>, Response> {
     let client_ip = addr.ip().to_string();
-    let username = ensure_authorized(&state, auth, &client_ip).await?;
+    let username =
+        ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
     let cfg = state.config.read().await;
 
@@ -178,10 +182,12 @@ async fn get_config(
 async fn admin_page(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    trusted: Option<Extension<TrustedIdentity>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
 ) -> Result<Html<String>, Response> {
     let client_ip = addr.ip().to_string();
-    let username = ensure_authorized(&state, auth, &client_ip).await?;
+    let username =
+        ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
     // Generate CSRF token if enabled
     let csrf_token = if state.server_config.enable_csrf {
@@ -203,11 +209,13 @@ async fn admin_page(
 async fn update_config(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    trusted: Option<Extension<TrustedIdentity>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
     Json(new_config): Json<Config>,
 ) -> Result<Json<Config>, Response> {
     let client_ip = addr.ip().to_string();
-    let username = ensure_authorized(&state, auth, &client_ip).await?;
+    let username =
+        ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
     // H-7: validate before touching shared state.
     if let Err(msg) = validate_config_invariants(&new_config) {
@@ -266,11 +274,13 @@ async fn update_config(
 async fn patch_config(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    trusted: Option<Extension<TrustedIdentity>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
     Json(partial): Json<PartialConfigUpdate>,
 ) -> Result<Json<Config>, Response> {
     let client_ip = addr.ip().to_string();
-    let username = ensure_authorized(&state, auth, &client_ip).await?;
+    let username =
+        ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
     // Build candidate config by applying partial fields to a COPY (do NOT touch
     // shared state yet — we validate first).
@@ -364,10 +374,12 @@ async fn patch_config(
 async fn get_audit_log(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    trusted: Option<Extension<TrustedIdentity>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
 ) -> Result<Json<Vec<crate::admin::state::AuditEntry>>, Response> {
     let client_ip = addr.ip().to_string();
-    let username = ensure_authorized(&state, auth, &client_ip).await?;
+    let username =
+        ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
     let entries = state.audit_logger.get_entries(100).await;
 
@@ -383,10 +395,12 @@ async fn get_audit_log(
 async fn get_stats(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    trusted: Option<Extension<TrustedIdentity>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
 ) -> Result<Html<String>, Response> {
     let client_ip = addr.ip().to_string();
-    let username = ensure_authorized(&state, auth, &client_ip).await?;
+    let username =
+        ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
     let snapshot = state.source_stats.snapshot();
 
@@ -438,10 +452,12 @@ async fn get_stats(
 async fn get_stats_json(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    trusted: Option<Extension<TrustedIdentity>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
 ) -> Result<Json<Vec<crate::stats::SourceHourlySnapshot>>, Response> {
     let client_ip = addr.ip().to_string();
-    let username = ensure_authorized(&state, auth, &client_ip).await?;
+    let username =
+        ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
     let snapshot = state.source_stats.snapshot();
 
