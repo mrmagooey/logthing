@@ -148,6 +148,12 @@ the current trust model.
 | `WEF_ADMIN_TLS_REQUIRE_CLIENT_CERT` | Require client certificates | `false` |
 | `WEF_ADMIN_ENABLE_CSRF` | Enable CSRF protection | `true` |
 | `WEF_ADMIN_ENABLE_RATE_LIMIT` | Enable rate limiting | `true` |
+| `WEF_ADMIN_TRUST_PROXY_HEADERS` | Enable trusted reverse-proxy header auth | `false` |
+| `WEF_ADMIN_TRUSTED_HEADER` | Header carrying the trusted username | `X-authentik-username` |
+| `WEF_ADMIN_TRUSTED_GROUPS_HEADER` | Header carrying the trusted group list | `X-authentik-groups` |
+| `WEF_ADMIN_TRUSTED_SECRET_HEADER` | Header carrying the shared secret | `X-Admin-Proxy-Secret` |
+| `WEF_ADMIN_TRUSTED_HEADER_SECRET` | Shared secret the proxy must send; required when trust mode is enabled | - |
+| `WEF_ADMIN_TRUSTED_GROUPS` | Comma-separated allowed group names; required when trust mode is enabled | - |
 
 ## Security Recommendations
 

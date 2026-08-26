@@ -112,13 +112,42 @@ pub async fn csrf_middleware(
 /// Never rejects the request itself — a request with no or invalid trusted
 /// headers must still be able to reach the handler and fall back to Basic
 /// Auth there (`ensure_authorized` handles that fallback).
+///
+/// When trust-mode is configured and the request actually carries the
+/// shared-secret header but verification fails, records a
+/// `TRUSTED_HEADER_REJECTED` audit entry (best-effort username, never the
+/// secret) so a brute-force attempt against the shared secret isn't
+/// invisible the way a silent `None` would leave it. Requests that don't
+/// attempt trusted-header auth at all (no trust config, or no secret
+/// header present) are not logged.
 pub async fn trusted_header_middleware(
     State(state): State<AdminState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     mut request: axum::http::Request<Body>,
     next: Next,
 ) -> Response {
-    if let Some(identity) = verify_trusted_header(&state, request.headers()) {
-        request.extensions_mut().insert(identity);
+    match verify_trusted_header(&state, request.headers()) {
+        Some(identity) => {
+            request.extensions_mut().insert(identity);
+        }
+        None => {
+            if let Some(cfg) = state.server_config.trusted_header.as_ref()
+                && request.headers().contains_key(&cfg.secret_header)
+            {
+                let username = request
+                    .headers()
+                    .get(&cfg.username_header)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("unknown");
+                let client_ip = addr.ip().to_string();
+                state
+                    .audit_logger
+                    .log("TRUSTED_HEADER_REJECTED", username, &client_ip, None)
+                    .await;
+            }
+        }
     }
     next.run(request).await
 }
@@ -370,12 +399,43 @@ mod tests {
             AdminState {
                 config: Arc::new(RwLock::new(crate::config::Config::default())),
                 server_config,
-                audit_logger: AuditLogger::new(100).await,
+                audit_logger: isolated_audit_logger().await,
                 csrf_tokens: Arc::new(RwLock::new(Vec::new())),
                 request_counts: Arc::new(RwLock::new(HashMap::new())),
                 source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
                 flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
             }
+        }
+
+        /// `AuditLogger::new` defaults to the shared `log/admin-audit.log`
+        /// file (relative to the repo root) unless `WEF_ADMIN_AUDIT_LOG`
+        /// points elsewhere, and loads its prior contents on startup. Tests
+        /// in this module assert on the *absence* of specific audit
+        /// entries, so unlike the sibling tests here (which only assert
+        /// presence and tolerate a shared, accumulating file), they need a
+        /// private log file per call — otherwise a `TRUSTED_HEADER_REJECTED`
+        /// entry written to disk by an earlier test run leaks in via
+        /// `load_entries_from_file` and fails an unrelated "no entry"
+        /// assertion. Mirrors the tempdir + env-var pattern already used in
+        /// `admin::mod::tests` (e.g. `audit_logger_persists_to_json_lines`).
+        async fn isolated_audit_logger() -> AuditLogger {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let log_path = std::env::temp_dir().join(format!(
+                "logthing-test-audit-{}-{n}.log",
+                std::process::id()
+            ));
+            // SAFETY: test-only, single-threaded within this call; mirrors
+            // the existing set/read/remove pattern used elsewhere in this
+            // crate's tests (see `admin::mod::tests`).
+            unsafe {
+                std::env::set_var("WEF_ADMIN_AUDIT_LOG", &log_path);
+            }
+            let logger = AuditLogger::new(100).await;
+            unsafe {
+                std::env::remove_var("WEF_ADMIN_AUDIT_LOG");
+            }
+            logger
         }
 
         /// A downstream test handler that reports whether a TrustedIdentity
@@ -390,6 +450,13 @@ mod tests {
             }
         }
 
+        /// `trusted_header_middleware` now requires `ConnectInfo` (to log
+        /// the client IP on rejection), so every test request needs it
+        /// injected the way the real connect-info service would.
+        fn inject_connect_info(request: &mut Request<Body>, addr: SocketAddr) {
+            request.extensions_mut().insert(ConnectInfo(addr));
+        }
+
         #[tokio::test]
         async fn sets_extension_on_secret_and_group_match() {
             let state = state_with_trust(Some(trusted_cfg())).await;
@@ -401,7 +468,7 @@ mod tests {
                 ))
                 .with_state(state);
 
-            let request = Request::builder()
+            let mut request = Request::builder()
                 .method(Method::GET)
                 .uri("/test")
                 .header("x-admin-proxy-secret", "shhh")
@@ -409,6 +476,7 @@ mod tests {
                 .header("x-authentik-groups", "admins")
                 .body(Body::empty())
                 .unwrap();
+            inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
 
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -429,7 +497,7 @@ mod tests {
                 ))
                 .with_state(state);
 
-            let request = Request::builder()
+            let mut request = Request::builder()
                 .method(Method::GET)
                 .uri("/test")
                 .header("x-admin-proxy-secret", "wrong")
@@ -437,6 +505,7 @@ mod tests {
                 .header("x-authentik-groups", "admins")
                 .body(Body::empty())
                 .unwrap();
+            inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
 
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -457,7 +526,7 @@ mod tests {
                 ))
                 .with_state(state);
 
-            let request = Request::builder()
+            let mut request = Request::builder()
                 .method(Method::GET)
                 .uri("/test")
                 .header("x-admin-proxy-secret", "shhh")
@@ -465,6 +534,7 @@ mod tests {
                 .header("x-authentik-groups", "guests")
                 .body(Body::empty())
                 .unwrap();
+            inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
 
             let response = app.oneshot(request).await.unwrap();
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -484,7 +554,7 @@ mod tests {
                 ))
                 .with_state(state);
 
-            let request = Request::builder()
+            let mut request = Request::builder()
                 .method(Method::GET)
                 .uri("/test")
                 .header("x-admin-proxy-secret", "shhh")
@@ -492,12 +562,200 @@ mod tests {
                 .header("x-authentik-groups", "admins")
                 .body(Body::empty())
                 .unwrap();
+            inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
 
             let response = app.oneshot(request).await.unwrap();
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .unwrap();
             assert_eq!(&body[..], b"untrusted");
+        }
+
+        /// Finding: rejected trusted-header attempts previously left no
+        /// audit trace at all (unlike a failed Basic Auth attempt, which
+        /// logs `AUTH_FAILED`). A wrong-secret attempt — the header the
+        /// feature is gated on is present, just wrong — must now produce a
+        /// `TRUSTED_HEADER_REJECTED` audit entry, and that entry must never
+        /// contain the secret value itself.
+        #[tokio::test]
+        async fn wrong_secret_with_attempt_logs_trusted_header_rejected() {
+            let state = state_with_trust(Some(trusted_cfg())).await;
+            let app = axum::Router::new()
+                .route("/test", get(echo_trusted))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    trusted_header_middleware,
+                ))
+                .with_state(state.clone());
+
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .header("x-admin-proxy-secret", "totally-wrong-secret")
+                .header("x-authentik-username", "alice")
+                .header("x-authentik-groups", "admins")
+                .body(Body::empty())
+                .unwrap();
+            inject_connect_info(&mut request, "192.0.2.7:54321".parse().unwrap());
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let entries = state.audit_logger.get_entries(10).await;
+            let entry = entries
+                .iter()
+                .find(|e| e.action == "TRUSTED_HEADER_REJECTED")
+                .expect("TRUSTED_HEADER_REJECTED entry should exist");
+            assert_eq!(entry.username, "alice");
+            assert_eq!(entry.client_ip, "192.0.2.7");
+
+            // The secret must never appear anywhere in the logged entry.
+            assert!(!entry.action.contains("totally-wrong-secret"));
+            assert!(!entry.username.contains("totally-wrong-secret"));
+            assert!(!entry.client_ip.contains("totally-wrong-secret"));
+            assert!(
+                !entry
+                    .details
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("totally-wrong-secret")
+            );
+        }
+
+        /// Best-effort username: if the username header is missing/blank on
+        /// a rejected attempt, fall back to "unknown" rather than failing.
+        #[tokio::test]
+        async fn wrong_secret_missing_username_logs_unknown_username() {
+            let state = state_with_trust(Some(trusted_cfg())).await;
+            let app = axum::Router::new()
+                .route("/test", get(echo_trusted))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    trusted_header_middleware,
+                ))
+                .with_state(state.clone());
+
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .header("x-admin-proxy-secret", "wrong")
+                .body(Body::empty())
+                .unwrap();
+            inject_connect_info(&mut request, "192.0.2.8:1".parse().unwrap());
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let entries = state.audit_logger.get_entries(10).await;
+            let entry = entries
+                .iter()
+                .find(|e| e.action == "TRUSTED_HEADER_REJECTED")
+                .expect("TRUSTED_HEADER_REJECTED entry should exist");
+            assert_eq!(entry.username, "unknown");
+        }
+
+        /// No secret header at all means no trusted-header attempt was made
+        /// — must stay silent (this is the ordinary Basic-Auth-only path,
+        /// not a rejection).
+        #[tokio::test]
+        async fn no_secret_header_does_not_log_rejection() {
+            let state = state_with_trust(Some(trusted_cfg())).await;
+            let app = axum::Router::new()
+                .route("/test", get(echo_trusted))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    trusted_header_middleware,
+                ))
+                .with_state(state.clone());
+
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .body(Body::empty())
+                .unwrap();
+            inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let entries = state.audit_logger.get_entries(10).await;
+            assert!(
+                !entries
+                    .iter()
+                    .any(|e| e.action == "TRUSTED_HEADER_REJECTED"),
+                "no attempt was made, so nothing should be logged"
+            );
+        }
+
+        /// Trust-mode disabled entirely — even with the secret header
+        /// present, there's no trust config to attempt verification
+        /// against, so nothing should be logged.
+        #[tokio::test]
+        async fn disabled_trust_mode_does_not_log_rejection() {
+            let state = state_with_trust(None).await;
+            let app = axum::Router::new()
+                .route("/test", get(echo_trusted))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    trusted_header_middleware,
+                ))
+                .with_state(state.clone());
+
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .header("x-admin-proxy-secret", "shhh")
+                .header("x-authentik-username", "alice")
+                .header("x-authentik-groups", "admins")
+                .body(Body::empty())
+                .unwrap();
+            inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let entries = state.audit_logger.get_entries(10).await;
+            assert!(
+                !entries
+                    .iter()
+                    .any(|e| e.action == "TRUSTED_HEADER_REJECTED"),
+                "trust-mode is disabled, so nothing should be logged"
+            );
+        }
+
+        /// A matching (accepted) trusted-header request must not also
+        /// produce a rejection entry.
+        #[tokio::test]
+        async fn successful_verification_does_not_log_rejection() {
+            let state = state_with_trust(Some(trusted_cfg())).await;
+            let app = axum::Router::new()
+                .route("/test", get(echo_trusted))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    trusted_header_middleware,
+                ))
+                .with_state(state.clone());
+
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .header("x-admin-proxy-secret", "shhh")
+                .header("x-authentik-username", "alice")
+                .header("x-authentik-groups", "admins")
+                .body(Body::empty())
+                .unwrap();
+            inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let entries = state.audit_logger.get_entries(10).await;
+            assert!(
+                !entries
+                    .iter()
+                    .any(|e| e.action == "TRUSTED_HEADER_REJECTED"),
+                "a successful attempt is not a rejection"
+            );
         }
     }
 }
