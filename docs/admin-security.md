@@ -90,6 +90,41 @@ WEF_ADMIN_ENABLE_CSRF=true
 
 The CSRF token is embedded in the admin page and validated on form submissions.
 
+### 8. Trusted Reverse-Proxy Header Auth (Authentik)
+
+The admin interface can trust identity headers injected by a reverse-proxy
+forward-auth setup (e.g. an Authentik outpost), as an alternative to typing
+Basic Auth credentials. This is opt-in and additive — Basic Auth keeps
+working unchanged as a fallback.
+
+```bash
+WEF_ADMIN_TRUST_PROXY_HEADERS=true
+WEF_ADMIN_TRUSTED_HEADER=X-authentik-username           # default shown
+WEF_ADMIN_TRUSTED_GROUPS_HEADER=X-authentik-groups       # default shown
+WEF_ADMIN_TRUSTED_SECRET_HEADER=X-Admin-Proxy-Secret     # default shown
+WEF_ADMIN_TRUSTED_HEADER_SECRET=<a long random value only the proxy and this server know>
+WEF_ADMIN_TRUSTED_GROUPS=admins,ops                      # comma-separated allowlist
+```
+
+**Both `WEF_ADMIN_TRUSTED_HEADER_SECRET` and `WEF_ADMIN_TRUSTED_GROUPS` are
+required whenever `WEF_ADMIN_TRUST_PROXY_HEADERS=true`** — the admin server
+refuses to start otherwise, regardless of bind address. Presence of the
+identity headers alone is never trusted: Authentik does not itself guarantee
+that a reverse-proxy config strips client-forged copies of these headers —
+that's the proxy's job. **The proxy must overwrite (not merely pass through)
+any client-supplied copy of these headers**, and the shared secret must never
+be reachable by anything other than the proxy and this server.
+
+**Caveat — verify before relying on this in production**: Authentik's exact
+delimiter for `X-authentik-groups` was not confirmed against live Authentik
+documentation at the time this was implemented. This implementation accepts
+both `,` and `|` as a best-effort default. Confirm the actual format against
+your deployed Authentik version before relying on group-based access control.
+
+JWT verification of Authentik's signed `X-authentik-jwt` header is not
+implemented — the shared-secret + loopback-bind + group-check combination is
+the current trust model.
+
 ## API Endpoints
 
 - `GET /` - Admin web interface (requires authentication)

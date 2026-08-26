@@ -881,6 +881,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn e2e_trusted_header_auth_over_real_socket() {
+        use crate::admin::state::TrustedHeaderConfig;
+
+        let server_config = AdminServerConfig {
+            bind_address: "127.0.0.1:0".parse().unwrap(),
+            username: "admin".to_string(),
+            password_hash: PasswordHash::hash("admin").unwrap(),
+            allowed_ips: vec![],
+            tls_config: None,
+            enable_csrf: false,
+            enable_rate_limiting: false,
+            trusted_header: Some(TrustedHeaderConfig {
+                username_header: axum::http::HeaderName::from_static("x-authentik-username"),
+                groups_header: axum::http::HeaderName::from_static("x-authentik-groups"),
+                secret_header: axum::http::HeaderName::from_static("x-admin-proxy-secret"),
+                secret: "shhh".to_string(),
+                allowed_groups: vec!["admins".to_string()],
+            }),
+        };
+        let state = AdminState {
+            config: Arc::new(RwLock::new(Config::default())),
+            server_config,
+            audit_logger: AuditLogger::new(100).await,
+            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
+            request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
+            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
+        };
+
+        let app = axum::Router::new()
+            .route("/config", axum::routing::get(get_config))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::admin::middleware::trusted_header_middleware,
+            ))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let real_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+
+        // Trusted headers alone, no Authorization header at all → 200.
+        let resp = client
+            .get(format!("http://{real_addr}/config"))
+            .header("x-admin-proxy-secret", "shhh")
+            .header("x-authentik-username", "alice")
+            .header("x-authentik-groups", "admins")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "real HTTP request with valid trusted headers and no Basic Auth must succeed"
+        );
+
+        // Wrong secret, no Authorization header → 401 (falls through, no fallback available).
+        let resp = client
+            .get(format!("http://{real_addr}/config"))
+            .header("x-admin-proxy-secret", "wrong-secret")
+            .header("x-authentik-username", "alice")
+            .header("x-authentik-groups", "admins")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "a wrong shared secret must not grant access, even with correct-looking identity headers"
+        );
+    }
+
+    #[tokio::test]
     async fn update_config_with_valid_auth_updates_configuration() {
         let state = test_state().await;
         let new_config = Config::default();
