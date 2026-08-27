@@ -423,8 +423,6 @@ fn build_trusted_header_config(
 /// * `allowed_ips_str`     – raw `LOGTHING_ADMIN_ALLOWED_IPS` value, or `None`.
 /// * `tls_cert`            – `LOGTHING_ADMIN_TLS_CERT`, or `None`.
 /// * `tls_key`             – `LOGTHING_ADMIN_TLS_KEY`, or `None`.
-/// * `tls_ca`              – `LOGTHING_ADMIN_TLS_CA`, or `None`.
-/// * `require_client_cert` – `LOGTHING_ADMIN_TLS_REQUIRE_CLIENT_CERT` parsed value (default `false`).
 /// * `enable_csrf`         – `LOGTHING_ADMIN_ENABLE_CSRF` parsed value (default `true`).
 /// * `enable_rate_limiting`– `LOGTHING_ADMIN_ENABLE_RATE_LIMIT` parsed value (default `true`).
 #[allow(clippy::too_many_arguments)]
@@ -1309,25 +1307,6 @@ true,
             let tls = cfg.tls_config.expect("TLS should be Some");
             assert_eq!(tls.cert_file, PathBuf::from("/etc/ssl/cert.pem"));
             assert_eq!(tls.key_file, PathBuf::from("/etc/ssl/key.pem"));
-        }
-
-        // ── Scenario 11: TLS with CA + require_client_cert ───────────────────────
-        {
-            unsafe {
-                std::env::set_var("LOGTHING_ADMIN_TLS_CERT", "/etc/ssl/cert.pem");
-                std::env::set_var("LOGTHING_ADMIN_TLS_KEY", "/etc/ssl/key.pem");
-                std::env::set_var("LOGTHING_ADMIN_TLS_CA", "/etc/ssl/ca.pem");
-                std::env::set_var("LOGTHING_ADMIN_TLS_REQUIRE_CLIENT_CERT", "true");
-            }
-            let result = load_admin_config();
-            unsafe {
-                std::env::remove_var("LOGTHING_ADMIN_TLS_CERT");
-                std::env::remove_var("LOGTHING_ADMIN_TLS_KEY");
-                std::env::remove_var("LOGTHING_ADMIN_TLS_CA");
-                std::env::remove_var("LOGTHING_ADMIN_TLS_REQUIRE_CLIENT_CERT");
-            }
-            let cfg = result.expect("TLS + CA + require_client_cert should be accepted");
-            let _tls = cfg.tls_config.expect("TLS should be Some");
         }
 
         // ── Scenario 12: LOGTHING_ADMIN_ENABLE_CSRF=false ─────────────────────────────
