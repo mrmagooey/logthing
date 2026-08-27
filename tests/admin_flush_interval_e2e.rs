@@ -97,15 +97,15 @@ async fn put_config_over_real_http_updates_already_running_writers_live_flush_in
     // DO NOT add a second `#[tokio::test]` to this file without introducing
     // the same kind of crate-wide env-var mutex that
     // `src/admin/config_api.rs`'s `test_support::PERSIST_CONFIG_ENV_LOCK`
-    // uses for `WEF_ADMIN_OVERRIDE_FILE` — that module is `pub(crate)` and
+    // uses for `LOGTHING_ADMIN_OVERRIDE_FILE` — that module is `pub(crate)` and
     // not reusable from here, so a from-scratch equivalent would be needed.
     unsafe {
-        std::env::set_var("WEF_ADMIN_BIND", format!("127.0.0.1:{port}"));
-        std::env::set_var("WEF_ADMIN_USER", admin_user);
-        std::env::set_var("WEF_ADMIN_PASS", admin_pass);
-        std::env::set_var("WEF_ADMIN_ENABLE_CSRF", "false");
-        std::env::set_var("WEF_ADMIN_ENABLE_RATE_LIMIT", "false");
-        std::env::set_var("WEF_ADMIN_OVERRIDE_FILE", &override_file);
+        std::env::set_var("LOGTHING_ADMIN_BIND", format!("127.0.0.1:{port}"));
+        std::env::set_var("LOGTHING_ADMIN_USER", admin_user);
+        std::env::set_var("LOGTHING_ADMIN_PASS", admin_pass);
+        std::env::set_var("LOGTHING_ADMIN_ENABLE_CSRF", "false");
+        std::env::set_var("LOGTHING_ADMIN_ENABLE_RATE_LIMIT", "false");
+        std::env::set_var("LOGTHING_ADMIN_OVERRIDE_FILE", &override_file);
     }
 
     let mut initial_config = Config {

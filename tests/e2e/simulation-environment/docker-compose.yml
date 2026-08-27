@@ -5,12 +5,12 @@ services:
     image: logthing:e2e
     environment:
       - RUST_LOG=info
-      - WEF__TLS__ENABLED=false
-      - WEF__SYSLOG__ENABLED=true
-      - WEF__SYSLOG__UDP_PORT=5514
-      - WEF__SYSLOG__TCP_PORT=5601
-      - WEF_ADMIN_USER=e2e
-      - WEF_ADMIN_PASS=e2e
+      - LOGTHING__TLS__ENABLED=false
+      - LOGTHING__SYSLOG__ENABLED=true
+      - LOGTHING__SYSLOG__UDP_PORT=5514
+      - LOGTHING__SYSLOG__TCP_PORT=5601
+      - LOGTHING_ADMIN_USER=e2e
+      - LOGTHING_ADMIN_PASS=e2e
     volumes:
       - ./config/logthing.toml:/etc/logthing/config.toml:ro
       - zeek-local-data:/var/log/zeek-local
@@ -29,10 +29,10 @@ services:
     image: logthing:e2e-kerberos
     environment:
       - RUST_LOG=info
-      - WEF__TLS__ENABLED=false
-      - WEF__SYSLOG__ENABLED=true
-      - WEF__SYSLOG__UDP_PORT=5514
-      - WEF__SYSLOG__TCP_PORT=5601
+      - LOGTHING__TLS__ENABLED=false
+      - LOGTHING__SYSLOG__ENABLED=true
+      - LOGTHING__SYSLOG__UDP_PORT=5514
+      - LOGTHING__SYSLOG__TCP_PORT=5601
     volumes:
       - ./config/logthing-kerberos.toml:/etc/logthing/config.toml:ro
     depends_on:
@@ -163,13 +163,13 @@ services:
     image: logthing:e2e
     environment:
       - RUST_LOG=info
-      - WEF__TLS__ENABLED=true
-      - WEF__TLS__PORT=5986
-      - WEF__SYSLOG__ENABLED=true
-      - WEF__SYSLOG__UDP_PORT=5514
-      - WEF__SYSLOG__TCP_PORT=5601
-      - WEF_ADMIN_USER=e2e
-      - WEF_ADMIN_PASS=e2e
+      - LOGTHING__TLS__ENABLED=true
+      - LOGTHING__TLS__PORT=5986
+      - LOGTHING__SYSLOG__ENABLED=true
+      - LOGTHING__SYSLOG__UDP_PORT=5514
+      - LOGTHING__SYSLOG__TCP_PORT=5601
+      - LOGTHING_ADMIN_USER=e2e
+      - LOGTHING_ADMIN_PASS=e2e
     volumes:
       - ./config/logthing-tls.toml:/etc/logthing/config.toml:ro
       - ./certs/server.crt:/etc/logthing/certs/server.crt:ro
@@ -262,12 +262,12 @@ services:
     image: logthing:e2e
     environment:
       - RUST_LOG=info
-      - WEF__TLS__ENABLED=false
-      - WEF__SYSLOG__ENABLED=true
-      - WEF__SYSLOG__UDP_PORT=5514
-      - WEF__SYSLOG__TCP_PORT=5601
-      - WEF_ADMIN_USER=e2e
-      - WEF_ADMIN_PASS=e2e
+      - LOGTHING__TLS__ENABLED=false
+      - LOGTHING__SYSLOG__ENABLED=true
+      - LOGTHING__SYSLOG__UDP_PORT=5514
+      - LOGTHING__SYSLOG__TCP_PORT=5601
+      - LOGTHING_ADMIN_USER=e2e
+      - LOGTHING_ADMIN_PASS=e2e
     volumes:
       - ./config/logthing-10k-sustained.toml:/etc/logthing/config.toml:ro
     depends_on:

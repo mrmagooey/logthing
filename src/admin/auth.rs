@@ -153,7 +153,7 @@ pub fn unauthorized() -> Response {
         StatusCode::UNAUTHORIZED,
         [(
             header::WWW_AUTHENTICATE,
-            "Basic realm=\"WEF Admin\", charset=\"UTF-8\"",
+            "Basic realm=\"logthing Admin\", charset=\"UTF-8\"",
         )],
         "Unauthorized",
     )

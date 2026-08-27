@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-A high-performance Windows Event Forwarding (WEF) server written in Rust, capable of receiving Windows Event Logs from 100+ external hosts and forwarding them to multiple destinations.
+A high-performance log ingestion server written in Rust, capable of receiving Windows Event Logs via Windows Event Forwarding (WEF) from 100+ external hosts, alongside syslog, IPFIX/NetFlow, Zeek, Suricata, sFlow, HEC, and OTLP, and forwarding them to multiple destinations.
 
 ## Architecture
 
@@ -39,7 +39,7 @@ A high-performance Windows Event Forwarding (WEF) server written in Rust, capabl
 
 ### 1. Configuration System (`src/config/mod.rs`)
 - **TOML-based**: File-based configuration with hot-reload support
-- **Environment Variables**: Prefix `WEF__` for containerized deployments
+- **Environment Variables**: Prefix `LOGTHING__` for containerized deployments
 - **Hierarchical Loading**: Defaults → Config file → Environment vars
 - **Features**:
   - Network binding (address/port)
@@ -271,14 +271,17 @@ export WEF_SECURITY_ALLOWED_IPS="192.168.1.0/24,10.0.0.0/8"
 
 ### Prometheus Queries
 ```promql
-# Events per second
-rate(wef_events_received_total[5m])
+# Syslog messages per second
+rate(syslog_messages_received_total[5m])
 
-# Active connections
-wef_connections_total
+# Parquet rows written per second, by source
+sum by (source) (rate(parquet_s3_records_written_total[5m]))
 
-# Forwarding success rate
-rate(wef_events_forwarded_total[5m]) / rate(wef_events_received_total[5m])
+# Backpressure drop rate, by source
+sum by (source) (rate(parquet_s3_dropped_total[5m]))
+
+# Upload failure rate
+rate(parquet_s3_upload_errors_total[5m]) / rate(parquet_s3_uploads_total[5m])
 ```
 
 ### Alerting Rules

@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or(num_cpus);
 
     info!(
-        "Starting WEF Server with {} worker threads ({} CPUs available)",
+        "Starting logthing with {} worker threads ({} CPUs available)",
         worker_threads, num_cpus
     );
 
@@ -46,7 +46,7 @@ async fn async_main() -> anyhow::Result<()> {
         config::LogFormat::Pretty => subscriber.pretty().init(),
     };
 
-    info!("Starting WEF Server v{}", env!("CARGO_PKG_VERSION"));
+    info!("Starting logthing v{}", env!("CARGO_PKG_VERSION"));
     info!("Configuration loaded successfully");
 
     // Start CPU profiling if requested. No-op unless LOGTHING_PROFILE_SECS is

@@ -2,8 +2,8 @@
 //! *real* admin HTTP path.
 //!
 //! Spins up the actual admin server (`logthing::admin::spawn_admin_server`)
-//! as a real TCP listener with `WEF_ADMIN_TRUST_PROXY_HEADERS=true` and the
-//! rest of the `WEF_ADMIN_TRUSTED_*` env vars set, then fires genuine HTTP
+//! as a real TCP listener with `LOGTHING_ADMIN_TRUST_PROXY_HEADERS=true` and the
+//! rest of the `LOGTHING_ADMIN_TRUSTED_*` env vars set, then fires genuine HTTP
 //! `GET /config` requests at it via `reqwest` carrying only the trusted
 //! identity headers (no `Authorization` header at all). This exercises the
 //! full path — real HTTP request → `trusted_header_middleware` → header
@@ -15,10 +15,10 @@
 //! variant) and with no Basic Auth involved anywhere.
 //!
 //! `spawn_admin_server` internally calls `load_admin_config()`, which reads
-//! all `WEF_ADMIN_*` env vars including the six trust-mode ones, so no code
+//! all `LOGTHING_ADMIN_*` env vars including the six trust-mode ones, so no code
 //! changes are needed to test trust mode through this entry point — just
 //! setting the right env vars first, exactly like the existing
-//! `admin_flush_interval_e2e.rs` sets `WEF_ADMIN_BIND`/`WEF_ADMIN_USER`/etc.
+//! `admin_flush_interval_e2e.rs` sets `LOGTHING_ADMIN_BIND`/`LOGTHING_ADMIN_USER`/etc.
 
 use logthing::admin::spawn_admin_server;
 use logthing::config::{Config, TlsConfig};
@@ -58,17 +58,17 @@ async fn get_config_over_real_http_succeeds_with_trusted_headers_alone_no_basic_
     // DO NOT add a second `#[tokio::test]` to this file without introducing
     // the same kind of crate-wide env-var mutex that
     // `src/admin/config_api.rs`'s `test_support::PERSIST_CONFIG_ENV_LOCK`
-    // uses for `WEF_ADMIN_OVERRIDE_FILE` — that module is `pub(crate)` and
+    // uses for `LOGTHING_ADMIN_OVERRIDE_FILE` — that module is `pub(crate)` and
     // not reusable from here, so a from-scratch equivalent would be needed.
     unsafe {
-        std::env::set_var("WEF_ADMIN_BIND", format!("127.0.0.1:{port}"));
-        std::env::set_var("WEF_ADMIN_ENABLE_CSRF", "false");
-        std::env::set_var("WEF_ADMIN_ENABLE_RATE_LIMIT", "false");
-        std::env::set_var("WEF_ADMIN_TRUST_PROXY_HEADERS", "true");
-        std::env::set_var("WEF_ADMIN_TRUSTED_HEADER_SECRET", trusted_secret);
-        std::env::set_var("WEF_ADMIN_TRUSTED_GROUPS", "admins");
-        // WEF_ADMIN_TRUSTED_HEADER / WEF_ADMIN_TRUSTED_GROUPS_HEADER /
-        // WEF_ADMIN_TRUSTED_SECRET_HEADER are deliberately left unset so
+        std::env::set_var("LOGTHING_ADMIN_BIND", format!("127.0.0.1:{port}"));
+        std::env::set_var("LOGTHING_ADMIN_ENABLE_CSRF", "false");
+        std::env::set_var("LOGTHING_ADMIN_ENABLE_RATE_LIMIT", "false");
+        std::env::set_var("LOGTHING_ADMIN_TRUST_PROXY_HEADERS", "true");
+        std::env::set_var("LOGTHING_ADMIN_TRUSTED_HEADER_SECRET", trusted_secret);
+        std::env::set_var("LOGTHING_ADMIN_TRUSTED_GROUPS", "admins");
+        // LOGTHING_ADMIN_TRUSTED_HEADER / LOGTHING_ADMIN_TRUSTED_GROUPS_HEADER /
+        // LOGTHING_ADMIN_TRUSTED_SECRET_HEADER are deliberately left unset so
         // this test exercises the real defaults: X-authentik-username,
         // X-authentik-groups, X-Admin-Proxy-Secret (see
         // `build_trusted_header_config` in `src/admin/state.rs`).

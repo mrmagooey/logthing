@@ -1250,7 +1250,7 @@ impl Config {
     /// 2. `logthing.toml` file (optional)
     /// 3. Admin override file (`logthing.admin.toml`, optional)
     /// 4. `/etc/logthing/config.toml` (optional)
-    /// 5. Environment variables with `WEF__` prefix
+    /// 5. Environment variables with `LOGTHING__` prefix
     ///
     /// # Examples
     ///
@@ -1275,8 +1275,8 @@ impl Config {
         builder =
             builder.add_source(config::File::with_name("/etc/logthing/config").required(false));
 
-        // Add environment variables with prefix WEF_
-        builder = builder.add_source(config::Environment::with_prefix("WEF").separator("__"));
+        // Add environment variables with prefix LOGTHING_
+        builder = builder.add_source(config::Environment::with_prefix("LOGTHING").separator("__"));
 
         let config = builder.build()?;
         let config: Config = config.try_deserialize()?;
@@ -1743,29 +1743,29 @@ max_buffer_rows = 50000
 
     #[test]
     fn env_vars_override_bind_ports_for_all_log_types() {
-        // `WEF__<SECTION>__<FIELD>` env vars are process-global, and cargo
+        // `LOGTHING__<SECTION>__<FIELD>` env vars are process-global, and cargo
         // runs unit tests in this file's binary on multiple threads by
         // default. No other test in this file (or reachable from this test
         // binary) reads these particular fields, so no cross-test lock is
         // needed — but we still wrap set/load/assert in catch_unwind and
         // guarantee cleanup runs even on a failed assertion, so a panic here
-        // can never leak `WEF__*` state into a test added later. This
+        // can never leak `LOGTHING__*` state into a test added later. This
         // mirrors the `load_reads_configuration_file` test's rename/restore
         // safety pattern above.
         let vars: &[(&str, &str)] = &[
-            ("WEF__BIND_ADDRESS", "127.0.0.1:15985"),
-            ("WEF__TLS__PORT", "15986"),
-            ("WEF__METRICS__PORT", "19090"),
-            ("WEF__SYSLOG__UDP_PORT", "15140"),
-            ("WEF__SYSLOG__TCP_PORT", "16010"),
-            ("WEF__IPFIX__UDP_PORT", "14739"),
-            ("WEF__IPFIX__BIND_ADDRESS", "127.0.0.2"),
-            ("WEF__ZEEK__TCP_PORT", "14776"),
-            ("WEF__ZEEK__BIND_ADDRESS", "127.0.0.3"),
-            ("WEF__SURICATA__TCP_PORT", "14777"),
-            ("WEF__SURICATA__BIND_ADDRESS", "127.0.0.4"),
-            ("WEF__SFLOW__UDP_PORT", "16343"),
-            ("WEF__SFLOW__BIND_ADDRESS", "127.0.0.5"),
+            ("LOGTHING__BIND_ADDRESS", "127.0.0.1:15985"),
+            ("LOGTHING__TLS__PORT", "15986"),
+            ("LOGTHING__METRICS__PORT", "19090"),
+            ("LOGTHING__SYSLOG__UDP_PORT", "15140"),
+            ("LOGTHING__SYSLOG__TCP_PORT", "16010"),
+            ("LOGTHING__IPFIX__UDP_PORT", "14739"),
+            ("LOGTHING__IPFIX__BIND_ADDRESS", "127.0.0.2"),
+            ("LOGTHING__ZEEK__TCP_PORT", "14776"),
+            ("LOGTHING__ZEEK__BIND_ADDRESS", "127.0.0.3"),
+            ("LOGTHING__SURICATA__TCP_PORT", "14777"),
+            ("LOGTHING__SURICATA__BIND_ADDRESS", "127.0.0.4"),
+            ("LOGTHING__SFLOW__UDP_PORT", "16343"),
+            ("LOGTHING__SFLOW__BIND_ADDRESS", "127.0.0.5"),
         ];
 
         for (k, v) in vars {
@@ -2381,12 +2381,12 @@ prefix    = "_iceberg_descriptors"
     #[test]
     fn env_vars_override_iceberg_s3_config() {
         let vars: &[(&str, &str)] = &[
-            ("WEF__ICEBERG__S3__ENDPOINT", "http://minio-test:9000"),
-            ("WEF__ICEBERG__S3__BUCKET", "env-override-bucket"),
-            ("WEF__ICEBERG__S3__REGION", "eu-west-1"),
-            ("WEF__ICEBERG__S3__ACCESS_KEY", "envkey"),
-            ("WEF__ICEBERG__S3__SECRET_KEY", "envsecret"),
-            ("WEF__ICEBERG__S3__PREFIX", "env-prefix"),
+            ("LOGTHING__ICEBERG__S3__ENDPOINT", "http://minio-test:9000"),
+            ("LOGTHING__ICEBERG__S3__BUCKET", "env-override-bucket"),
+            ("LOGTHING__ICEBERG__S3__REGION", "eu-west-1"),
+            ("LOGTHING__ICEBERG__S3__ACCESS_KEY", "envkey"),
+            ("LOGTHING__ICEBERG__S3__SECRET_KEY", "envsecret"),
+            ("LOGTHING__ICEBERG__S3__PREFIX", "env-prefix"),
         ];
         for (k, v) in vars {
             unsafe { std::env::set_var(k, v) };

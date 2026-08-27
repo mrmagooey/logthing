@@ -18,13 +18,13 @@ enabled = true
 port = 9090
 
 # Bind ports below can be overridden without editing this file, via
-# WEF__SYSLOG__UDP_PORT / WEF__SYSLOG__TCP_PORT env vars. Unlike the other
+# LOGTHING__SYSLOG__UDP_PORT / LOGTHING__SYSLOG__TCP_PORT env vars. Unlike the other
 # listeners below, syslog's bind address is fixed at 0.0.0.0 — there is no
-# WEF__SYSLOG__BIND_ADDRESS.
+# LOGTHING__SYSLOG__BIND_ADDRESS.
 [syslog]
 enabled = true
-udp_port = 514      # Standard syslog UDP port (env: WEF__SYSLOG__UDP_PORT)
-tcp_port = 601      # Standard syslog TCP port (RFC 6587) (env: WEF__SYSLOG__TCP_PORT)
+udp_port = 514      # Standard syslog UDP port (env: LOGTHING__SYSLOG__UDP_PORT)
+tcp_port = 601      # Standard syslog TCP port (RFC 6587) (env: LOGTHING__SYSLOG__TCP_PORT)
 parse_dns = true    # Enable DNS log parsing
 
 # Optional: persist syslog messages to S3 as Parquet files.
@@ -44,8 +44,8 @@ parse_dns = true    # Enable DNS log parsing
 # Disabled by default — set enabled = true to activate.
 [zeek]
 enabled      = false
-tcp_port     = 47760       # default Zeek NDJSON listener port (env: WEF__ZEEK__TCP_PORT)
-bind_address = "0.0.0.0"   # env: WEF__ZEEK__BIND_ADDRESS
+tcp_port     = 47760       # default Zeek NDJSON listener port (env: LOGTHING__ZEEK__TCP_PORT)
+bind_address = "0.0.0.0"   # env: LOGTHING__ZEEK__BIND_ADDRESS
 
 # Optional: persist Zeek logs to S3 as per-stream Parquet files.
 # Remove or comment out this block to disable Zeek S3 persistence.
@@ -65,8 +65,8 @@ bind_address = "0.0.0.0"   # env: WEF__ZEEK__BIND_ADDRESS
 # Disabled by default — set enabled = true to activate.
 [ipfix]
 enabled      = false
-udp_port     = 4739        # IANA-standard IPFIX port (env: WEF__IPFIX__UDP_PORT)
-bind_address = "0.0.0.0"   # env: WEF__IPFIX__BIND_ADDRESS
+udp_port     = 4739        # IANA-standard IPFIX port (env: LOGTHING__IPFIX__UDP_PORT)
+bind_address = "0.0.0.0"   # env: LOGTHING__IPFIX__BIND_ADDRESS
 
 # Optional: persist IPFIX/NetFlow flows to S3 as Parquet files.
 # Remove or comment out this block to disable IPFIX S3 persistence.
@@ -92,7 +92,7 @@ bind_address = "0.0.0.0"   # env: WEF__IPFIX__BIND_ADDRESS
 # region     = "us-east-1"
 # access_key = "minioadmin"
 # secret_key = "minioadmin"
-# prefix     = "_iceberg_descriptors"   # env: WEF__ICEBERG__S3__PREFIX
+# prefix     = "_iceberg_descriptors"   # env: LOGTHING__ICEBERG__S3__PREFIX
 
 # Optional log aggregation: count records as they arrive, grouped by configured
 # columns, and write the counted table to Parquet instead of the raw rows.

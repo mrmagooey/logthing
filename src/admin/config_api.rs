@@ -78,7 +78,7 @@ pub(crate) fn apply_flush_intervals(
 
 /// Test-only helpers for sandboxing `persist_config()`'s write path.
 ///
-/// `WEF_ADMIN_OVERRIDE_FILE` is a process-global env var, but cargo runs
+/// `LOGTHING_ADMIN_OVERRIDE_FILE` is a process-global env var, but cargo runs
 /// `#[tokio::test]` functions concurrently within one process. Every test
 /// (in this module or `admin::routes`) that points the var at a temp path
 /// must serialize against every other such test crate-wide, or one test's
@@ -98,11 +98,11 @@ pub(crate) mod test_support {
     impl Drop for PersistConfigSandbox {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.tmp);
-            unsafe { std::env::remove_var("WEF_ADMIN_OVERRIDE_FILE") };
+            unsafe { std::env::remove_var("LOGTHING_ADMIN_OVERRIDE_FILE") };
         }
     }
 
-    /// Locks the shared mutex and points `WEF_ADMIN_OVERRIDE_FILE` at a fresh
+    /// Locks the shared mutex and points `LOGTHING_ADMIN_OVERRIDE_FILE` at a fresh
     /// temp path. The override (and the lock) is released when the returned
     /// guard drops, so a panicking assertion mid-test can't leak it into
     /// later tests.
@@ -117,7 +117,7 @@ pub(crate) mod test_support {
         ));
         std::fs::create_dir_all(&tmp).unwrap();
         let override_path = tmp.join("logthing.admin.toml");
-        unsafe { std::env::set_var("WEF_ADMIN_OVERRIDE_FILE", &override_path) };
+        unsafe { std::env::set_var("LOGTHING_ADMIN_OVERRIDE_FILE", &override_path) };
         PersistConfigSandbox { tmp, _lock: lock }
     }
 
@@ -599,18 +599,18 @@ pub struct PartialConfigUpdate {
 
 /// Persist configuration to file
 pub async fn persist_config(config: &Config) -> anyhow::Result<()> {
-    // SECURITY (M-11): WEF_ADMIN_OVERRIDE_FILE is an operator-controlled env var
+    // SECURITY (M-11): LOGTHING_ADMIN_OVERRIDE_FILE is an operator-controlled env var
     // that determines the write path for the persisted config.  An attacker who
     // can set this env var already has the ability to run arbitrary code in the
     // process environment, so the privilege escalation risk is low.  We emit a
     // tracing::warn the first time a non-default path is used so that the
     // operator is aware it has been overridden (visible in structured logs).
-    let path = match std::env::var("WEF_ADMIN_OVERRIDE_FILE") {
+    let path = match std::env::var("LOGTHING_ADMIN_OVERRIDE_FILE") {
         Ok(v) => {
             let p = PathBuf::from(&v);
             tracing::warn!(
                 path = %v,
-                "WEF_ADMIN_OVERRIDE_FILE is set; config will be written to a \
+                "LOGTHING_ADMIN_OVERRIDE_FILE is set; config will be written to a \
                  non-default path — verify this is intentional"
             );
             p

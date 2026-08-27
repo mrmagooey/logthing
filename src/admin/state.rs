@@ -35,7 +35,7 @@ pub struct AuditLogger {
 impl AuditLogger {
     pub async fn new(max_entries: usize) -> Self {
         // Get log file path from env or use default
-        let log_file = std::env::var("WEF_ADMIN_AUDIT_LOG")
+        let log_file = std::env::var("LOGTHING_ADMIN_AUDIT_LOG")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("log/admin-audit.log"));
 
@@ -325,7 +325,7 @@ pub fn admin_start_allowed(bind: SocketAddr, user: &str, pass: &str) -> Result<(
     if !is_loopback && user == "admin" && pass == "admin" {
         return Err(format!(
             "Admin server refused to start: bind address {} is non-loopback but default \
-             credentials (admin/admin) are in use. Set WEF_ADMIN_USER and WEF_ADMIN_PASS \
+             credentials (admin/admin) are in use. Set LOGTHING_ADMIN_USER and LOGTHING_ADMIN_PASS \
              to non-default values, or bind to a loopback address (127.0.0.1) instead. \
              The data-plane server continues running.",
             bind
@@ -367,7 +367,7 @@ fn build_trusted_header_config(
     let secret = args.secret.unwrap_or("").trim().to_string();
     if secret.len() < MIN_SECRET_LEN {
         anyhow::bail!(
-            "WEF_ADMIN_TRUST_PROXY_HEADERS is true but WEF_ADMIN_TRUSTED_HEADER_SECRET is \
+            "LOGTHING_ADMIN_TRUST_PROXY_HEADERS is true but LOGTHING_ADMIN_TRUSTED_HEADER_SECRET is \
              not set or too short (must be at least {MIN_SECRET_LEN} characters after \
              trimming whitespace). A shared secret is required whenever trusted-header auth \
              is enabled (regardless of bind address) — without it, any request that reaches \
@@ -386,7 +386,7 @@ fn build_trusted_header_config(
         .collect();
     if allowed_groups.is_empty() {
         anyhow::bail!(
-            "WEF_ADMIN_TRUST_PROXY_HEADERS is true but WEF_ADMIN_TRUSTED_GROUPS is empty. \
+            "LOGTHING_ADMIN_TRUST_PROXY_HEADERS is true but LOGTHING_ADMIN_TRUSTED_GROUPS is empty. \
              At least one allowed group is required — trusted-header auth must not grant \
              access to every successfully-proxied user."
         );
@@ -394,15 +394,15 @@ fn build_trusted_header_config(
 
     let username_header =
         HeaderName::from_bytes(args.username_header.unwrap_or("X-authentik-username").as_bytes())
-            .map_err(|e| anyhow::anyhow!("invalid WEF_ADMIN_TRUSTED_HEADER value: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("invalid LOGTHING_ADMIN_TRUSTED_HEADER value: {e}"))?;
     let groups_header = HeaderName::from_bytes(
         args.groups_header.unwrap_or("X-authentik-groups").as_bytes(),
     )
-    .map_err(|e| anyhow::anyhow!("invalid WEF_ADMIN_TRUSTED_GROUPS_HEADER value: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("invalid LOGTHING_ADMIN_TRUSTED_GROUPS_HEADER value: {e}"))?;
     let secret_header = HeaderName::from_bytes(
         args.secret_header.unwrap_or("X-Admin-Proxy-Secret").as_bytes(),
     )
-    .map_err(|e| anyhow::anyhow!("invalid WEF_ADMIN_TRUSTED_SECRET_HEADER value: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("invalid LOGTHING_ADMIN_TRUSTED_SECRET_HEADER value: {e}"))?;
 
     Ok(Some(TrustedHeaderConfig {
         username_header,
@@ -419,18 +419,18 @@ fn build_trusted_header_config(
 ///
 /// Parameters
 /// ----------
-/// * `bind_str`            – raw `WEF_ADMIN_BIND` value, or `None` if the variable is absent.
-/// * `username`            – `WEF_ADMIN_USER` (or default `"admin"`).
-/// * `plain_pass`          – `WEF_ADMIN_PASS` (or default `"admin"`).  Used only when
+/// * `bind_str`            – raw `LOGTHING_ADMIN_BIND` value, or `None` if the variable is absent.
+/// * `username`            – `LOGTHING_ADMIN_USER` (or default `"admin"`).
+/// * `plain_pass`          – `LOGTHING_ADMIN_PASS` (or default `"admin"`).  Used only when
 ///   `pass_hash` is `None`.
-/// * `pass_hash`           – pre-hashed password from `WEF_ADMIN_PASS_HASH`, if set.
-/// * `allowed_ips_str`     – raw `WEF_ADMIN_ALLOWED_IPS` value, or `None`.
-/// * `tls_cert`            – `WEF_ADMIN_TLS_CERT`, or `None`.
-/// * `tls_key`             – `WEF_ADMIN_TLS_KEY`, or `None`.
-/// * `tls_ca`              – `WEF_ADMIN_TLS_CA`, or `None`.
-/// * `require_client_cert` – `WEF_ADMIN_TLS_REQUIRE_CLIENT_CERT` parsed value (default `false`).
-/// * `enable_csrf`         – `WEF_ADMIN_ENABLE_CSRF` parsed value (default `true`).
-/// * `enable_rate_limiting`– `WEF_ADMIN_ENABLE_RATE_LIMIT` parsed value (default `true`).
+/// * `pass_hash`           – pre-hashed password from `LOGTHING_ADMIN_PASS_HASH`, if set.
+/// * `allowed_ips_str`     – raw `LOGTHING_ADMIN_ALLOWED_IPS` value, or `None`.
+/// * `tls_cert`            – `LOGTHING_ADMIN_TLS_CERT`, or `None`.
+/// * `tls_key`             – `LOGTHING_ADMIN_TLS_KEY`, or `None`.
+/// * `tls_ca`              – `LOGTHING_ADMIN_TLS_CA`, or `None`.
+/// * `require_client_cert` – `LOGTHING_ADMIN_TLS_REQUIRE_CLIENT_CERT` parsed value (default `false`).
+/// * `enable_csrf`         – `LOGTHING_ADMIN_ENABLE_CSRF` parsed value (default `true`).
+/// * `enable_rate_limiting`– `LOGTHING_ADMIN_ENABLE_RATE_LIMIT` parsed value (default `true`).
 #[allow(clippy::too_many_arguments)]
 pub fn build_admin_config_from_parts(
     bind_str: Option<&str>,
@@ -451,7 +451,7 @@ pub fn build_admin_config_from_parts(
     let bind_address: SocketAddr = match bind_str {
         Some(s) => s.parse().unwrap_or_else(|_| {
             tracing::warn!(
-                "WEF_ADMIN_BIND value {:?} failed to parse as a socket address; \
+                "LOGTHING_ADMIN_BIND value {:?} failed to parse as a socket address; \
                  falling back to 127.0.0.1:8080 (loopback only). \
                  Fix the value to bind the admin interface as intended.",
                 s
@@ -480,8 +480,8 @@ pub fn build_admin_config_from_parts(
         if username == "admin" && plain_pass == "admin" {
             tracing::warn!(
                 "Admin interface is using default credentials. \
-                 Set WEF_ADMIN_USER/WEF_ADMIN_PASS environment variables \
-                 or WEF_ADMIN_PASS_HASH for a pre-hashed password."
+                 Set LOGTHING_ADMIN_USER/LOGTHING_ADMIN_PASS environment variables \
+                 or LOGTHING_ADMIN_PASS_HASH for a pre-hashed password."
             );
         }
 
@@ -500,7 +500,7 @@ pub fn build_admin_config_from_parts(
     if allowed_ips.is_empty() {
         tracing::warn!(
             "Admin interface has no IP whitelist configured. \
-             Consider setting WEF_ADMIN_ALLOWED_IPS for security."
+             Consider setting LOGTHING_ADMIN_ALLOWED_IPS for security."
         );
     }
 
@@ -515,7 +515,7 @@ pub fn build_admin_config_from_parts(
         _ => {
             tracing::warn!(
                 "Admin interface is running without TLS. \
-                 Set WEF_ADMIN_TLS_CERT and WEF_ADMIN_TLS_KEY for HTTPS."
+                 Set LOGTHING_ADMIN_TLS_CERT and LOGTHING_ADMIN_TLS_KEY for HTTPS."
             );
             None
         }
@@ -537,31 +537,31 @@ pub fn build_admin_config_from_parts(
 
 /// Load admin server configuration from environment variables
 pub fn load_admin_config() -> anyhow::Result<AdminServerConfig> {
-    let bind_str = std::env::var("WEF_ADMIN_BIND").ok();
-    let username = std::env::var("WEF_ADMIN_USER").unwrap_or_else(|_| "admin".to_string());
-    let plain_pass = std::env::var("WEF_ADMIN_PASS").unwrap_or_else(|_| "admin".to_string());
-    let pass_hash = std::env::var("WEF_ADMIN_PASS_HASH").ok();
-    let allowed_ips_str = std::env::var("WEF_ADMIN_ALLOWED_IPS").ok();
-    let tls_cert = std::env::var("WEF_ADMIN_TLS_CERT").ok();
-    let tls_key = std::env::var("WEF_ADMIN_TLS_KEY").ok();
-    let tls_ca = std::env::var("WEF_ADMIN_TLS_CA").ok();
-    let require_client_cert = std::env::var("WEF_ADMIN_TLS_REQUIRE_CLIENT_CERT")
+    let bind_str = std::env::var("LOGTHING_ADMIN_BIND").ok();
+    let username = std::env::var("LOGTHING_ADMIN_USER").unwrap_or_else(|_| "admin".to_string());
+    let plain_pass = std::env::var("LOGTHING_ADMIN_PASS").unwrap_or_else(|_| "admin".to_string());
+    let pass_hash = std::env::var("LOGTHING_ADMIN_PASS_HASH").ok();
+    let allowed_ips_str = std::env::var("LOGTHING_ADMIN_ALLOWED_IPS").ok();
+    let tls_cert = std::env::var("LOGTHING_ADMIN_TLS_CERT").ok();
+    let tls_key = std::env::var("LOGTHING_ADMIN_TLS_KEY").ok();
+    let tls_ca = std::env::var("LOGTHING_ADMIN_TLS_CA").ok();
+    let require_client_cert = std::env::var("LOGTHING_ADMIN_TLS_REQUIRE_CLIENT_CERT")
         .map(|s| s == "true" || s == "1")
         .unwrap_or(false);
-    let enable_csrf = std::env::var("WEF_ADMIN_ENABLE_CSRF")
+    let enable_csrf = std::env::var("LOGTHING_ADMIN_ENABLE_CSRF")
         .map(|s| s == "true" || s == "1")
         .unwrap_or(true);
-    let enable_rate_limiting = std::env::var("WEF_ADMIN_ENABLE_RATE_LIMIT")
+    let enable_rate_limiting = std::env::var("LOGTHING_ADMIN_ENABLE_RATE_LIMIT")
         .map(|s| s == "true" || s == "1")
         .unwrap_or(true);
-    let trust_proxy_headers = std::env::var("WEF_ADMIN_TRUST_PROXY_HEADERS")
+    let trust_proxy_headers = std::env::var("LOGTHING_ADMIN_TRUST_PROXY_HEADERS")
         .map(|s| s == "true" || s == "1")
         .unwrap_or(false);
-    let trusted_username_header = std::env::var("WEF_ADMIN_TRUSTED_HEADER").ok();
-    let trusted_groups_header = std::env::var("WEF_ADMIN_TRUSTED_GROUPS_HEADER").ok();
-    let trusted_secret_header = std::env::var("WEF_ADMIN_TRUSTED_SECRET_HEADER").ok();
-    let trusted_header_secret = std::env::var("WEF_ADMIN_TRUSTED_HEADER_SECRET").ok();
-    let trusted_groups = std::env::var("WEF_ADMIN_TRUSTED_GROUPS").ok();
+    let trusted_username_header = std::env::var("LOGTHING_ADMIN_TRUSTED_HEADER").ok();
+    let trusted_groups_header = std::env::var("LOGTHING_ADMIN_TRUSTED_GROUPS_HEADER").ok();
+    let trusted_secret_header = std::env::var("LOGTHING_ADMIN_TRUSTED_SECRET_HEADER").ok();
+    let trusted_header_secret = std::env::var("LOGTHING_ADMIN_TRUSTED_HEADER_SECRET").ok();
+    let trusted_groups = std::env::var("LOGTHING_ADMIN_TRUSTED_GROUPS").ok();
 
     build_admin_config_from_parts(
         bind_str.as_deref(),
@@ -1072,7 +1072,7 @@ mod tests {
         );
         assert!(result.is_err(), "trust mode on with no secret must be refused");
         let msg = result.err().unwrap().to_string();
-        assert!(msg.contains("WEF_ADMIN_TRUSTED_HEADER_SECRET"), "{msg}");
+        assert!(msg.contains("LOGTHING_ADMIN_TRUSTED_HEADER_SECRET"), "{msg}");
     }
 
     #[test]
@@ -1088,7 +1088,7 @@ mod tests {
         );
         assert!(result.is_err(), "trust mode on with no usable group must be refused");
         let msg = result.err().unwrap().to_string();
-        assert!(msg.contains("WEF_ADMIN_TRUSTED_GROUPS"), "{msg}");
+        assert!(msg.contains("LOGTHING_ADMIN_TRUSTED_GROUPS"), "{msg}");
     }
 
     #[test]
@@ -1159,7 +1159,7 @@ mod tests {
         );
         assert!(result.is_err(), "a secret shorter than 16 chars must be refused");
         let msg = result.err().unwrap().to_string();
-        assert!(msg.contains("WEF_ADMIN_TRUSTED_HEADER_SECRET"), "{msg}");
+        assert!(msg.contains("LOGTHING_ADMIN_TRUSTED_HEADER_SECRET"), "{msg}");
         assert!(msg.contains("16"), "{msg}");
     }
 
@@ -1263,12 +1263,12 @@ mod tests {
             assert!(cfg.enable_rate_limiting);
         }
 
-        // ── Scenario 2: WEF_ADMIN_USER + WEF_ADMIN_PASS custom values ────────────
+        // ── Scenario 2: LOGTHING_ADMIN_USER + LOGTHING_ADMIN_PASS custom values ────────────
         {
             let cfg = with_two_env(
-                "WEF_ADMIN_USER",
+                "LOGTHING_ADMIN_USER",
                 "myuser",
-                "WEF_ADMIN_PASS",
+                "LOGTHING_ADMIN_PASS",
                 "mypass",
                 || load_admin_config().expect("custom user/pass should succeed"),
             );
@@ -1276,30 +1276,30 @@ mod tests {
             assert!(cfg.password_hash.verify("mypass"));
         }
 
-        // ── Scenario 3: WEF_ADMIN_PASS_HASH branch ───────────────────────────────
+        // ── Scenario 3: LOGTHING_ADMIN_PASS_HASH branch ───────────────────────────────
         {
             let pre_hash = PasswordHash::hash("pre-hashed-secret").unwrap().hash;
-            let cfg = with_env("WEF_ADMIN_PASS_HASH", &pre_hash, || {
+            let cfg = with_env("LOGTHING_ADMIN_PASS_HASH", &pre_hash, || {
                 load_admin_config().expect("pre-hashed pass should succeed")
             });
             assert!(cfg.password_hash.verify("pre-hashed-secret"));
         }
 
-        // ── Scenario 4: WEF_ADMIN_BIND valid → used ───────────────────────────────
+        // ── Scenario 4: LOGTHING_ADMIN_BIND valid → used ───────────────────────────────
         {
             let cfg = with_two_env(
-                "WEF_ADMIN_BIND",
+                "LOGTHING_ADMIN_BIND",
                 "127.0.0.1:9090",
-                "WEF_ADMIN_USER",
+                "LOGTHING_ADMIN_USER",
                 "secure-user", // keep creds non-default if bind is public
                 || load_admin_config().expect("valid bind should succeed"),
             );
             assert_eq!(cfg.bind_address.port(), 9090);
         }
 
-        // ── Scenario 5: WEF_ADMIN_BIND invalid → falls back to 127.0.0.1:8080 ────
+        // ── Scenario 5: LOGTHING_ADMIN_BIND invalid → falls back to 127.0.0.1:8080 ────
         {
-            let cfg = with_env("WEF_ADMIN_BIND", "GARBAGE-NOT-A-SOCKET", || {
+            let cfg = with_env("LOGTHING_ADMIN_BIND", "GARBAGE-NOT-A-SOCKET", || {
                 load_admin_config().expect("invalid bind should fall back to loopback")
             });
             assert_eq!(
@@ -1310,7 +1310,7 @@ mod tests {
 
         // ── Scenario 6: non-loopback bind + default creds → Err ──────────────────
         {
-            let result = with_env("WEF_ADMIN_BIND", "0.0.0.0:8080", load_admin_config);
+            let result = with_env("LOGTHING_ADMIN_BIND", "0.0.0.0:8080", load_admin_config);
             assert!(
                 result.is_err(),
                 "non-loopback bind with default creds must be refused"
@@ -1320,15 +1320,15 @@ mod tests {
         // ── Scenario 7: non-loopback bind + custom creds → Ok ───────────────────
         {
             unsafe {
-                std::env::set_var("WEF_ADMIN_BIND", "0.0.0.0:8080");
-                std::env::set_var("WEF_ADMIN_USER", "ops");
-                std::env::set_var("WEF_ADMIN_PASS", "str0ng");
+                std::env::set_var("LOGTHING_ADMIN_BIND", "0.0.0.0:8080");
+                std::env::set_var("LOGTHING_ADMIN_USER", "ops");
+                std::env::set_var("LOGTHING_ADMIN_PASS", "str0ng");
             }
             let result = load_admin_config();
             unsafe {
-                std::env::remove_var("WEF_ADMIN_BIND");
-                std::env::remove_var("WEF_ADMIN_USER");
-                std::env::remove_var("WEF_ADMIN_PASS");
+                std::env::remove_var("LOGTHING_ADMIN_BIND");
+                std::env::remove_var("LOGTHING_ADMIN_USER");
+                std::env::remove_var("LOGTHING_ADMIN_PASS");
             }
             let cfg = result.expect("non-loopback + custom creds should be allowed");
             assert_eq!(
@@ -1337,30 +1337,32 @@ mod tests {
             );
         }
 
-        // ── Scenario 8: WEF_ADMIN_ALLOWED_IPS valid CIDRs ────────────────────────
+        // ── Scenario 8: LOGTHING_ADMIN_ALLOWED_IPS valid CIDRs ────────────────────────
         {
-            let cfg = with_env("WEF_ADMIN_ALLOWED_IPS", "10.0.0.0/8,192.168.0.0/16", || {
-                load_admin_config().expect("allowed IPs should parse")
-            });
+            let cfg = with_env(
+                "LOGTHING_ADMIN_ALLOWED_IPS",
+                "10.0.0.0/8,192.168.0.0/16",
+                || load_admin_config().expect("allowed IPs should parse"),
+            );
             assert_eq!(cfg.allowed_ips.len(), 2);
         }
 
-        // ── Scenario 9: WEF_ADMIN_ALLOWED_IPS with invalid entry (skipped) ────────
+        // ── Scenario 9: LOGTHING_ADMIN_ALLOWED_IPS with invalid entry (skipped) ────────
         {
             let cfg = with_env(
-                "WEF_ADMIN_ALLOWED_IPS",
+                "LOGTHING_ADMIN_ALLOWED_IPS",
                 "10.0.0.0/8,bad-entry,192.168.0.0/16",
                 || load_admin_config().expect("should succeed ignoring invalid entry"),
             );
             assert_eq!(cfg.allowed_ips.len(), 2);
         }
 
-        // ── Scenario 10: WEF_ADMIN_TLS_CERT + WEF_ADMIN_TLS_KEY ─────────────────
+        // ── Scenario 10: LOGTHING_ADMIN_TLS_CERT + LOGTHING_ADMIN_TLS_KEY ─────────────────
         {
             let cfg = with_two_env(
-                "WEF_ADMIN_TLS_CERT",
+                "LOGTHING_ADMIN_TLS_CERT",
                 "/etc/ssl/cert.pem",
-                "WEF_ADMIN_TLS_KEY",
+                "LOGTHING_ADMIN_TLS_KEY",
                 "/etc/ssl/key.pem",
                 || load_admin_config().expect("TLS config should be accepted"),
             );
@@ -1374,17 +1376,17 @@ mod tests {
         // ── Scenario 11: TLS with CA + require_client_cert ───────────────────────
         {
             unsafe {
-                std::env::set_var("WEF_ADMIN_TLS_CERT", "/etc/ssl/cert.pem");
-                std::env::set_var("WEF_ADMIN_TLS_KEY", "/etc/ssl/key.pem");
-                std::env::set_var("WEF_ADMIN_TLS_CA", "/etc/ssl/ca.pem");
-                std::env::set_var("WEF_ADMIN_TLS_REQUIRE_CLIENT_CERT", "true");
+                std::env::set_var("LOGTHING_ADMIN_TLS_CERT", "/etc/ssl/cert.pem");
+                std::env::set_var("LOGTHING_ADMIN_TLS_KEY", "/etc/ssl/key.pem");
+                std::env::set_var("LOGTHING_ADMIN_TLS_CA", "/etc/ssl/ca.pem");
+                std::env::set_var("LOGTHING_ADMIN_TLS_REQUIRE_CLIENT_CERT", "true");
             }
             let result = load_admin_config();
             unsafe {
-                std::env::remove_var("WEF_ADMIN_TLS_CERT");
-                std::env::remove_var("WEF_ADMIN_TLS_KEY");
-                std::env::remove_var("WEF_ADMIN_TLS_CA");
-                std::env::remove_var("WEF_ADMIN_TLS_REQUIRE_CLIENT_CERT");
+                std::env::remove_var("LOGTHING_ADMIN_TLS_CERT");
+                std::env::remove_var("LOGTHING_ADMIN_TLS_KEY");
+                std::env::remove_var("LOGTHING_ADMIN_TLS_CA");
+                std::env::remove_var("LOGTHING_ADMIN_TLS_REQUIRE_CLIENT_CERT");
             }
             let cfg = result.expect("TLS + CA + require_client_cert should be accepted");
             let tls = cfg.tls_config.expect("TLS should be Some");
@@ -1392,25 +1394,25 @@ mod tests {
             assert!(tls.require_client_cert);
         }
 
-        // ── Scenario 12: WEF_ADMIN_ENABLE_CSRF=false ─────────────────────────────
+        // ── Scenario 12: LOGTHING_ADMIN_ENABLE_CSRF=false ─────────────────────────────
         {
-            let cfg = with_env("WEF_ADMIN_ENABLE_CSRF", "false", || {
+            let cfg = with_env("LOGTHING_ADMIN_ENABLE_CSRF", "false", || {
                 load_admin_config().expect("CSRF disabled should succeed")
             });
             assert!(!cfg.enable_csrf);
         }
 
-        // ── Scenario 13: WEF_ADMIN_ENABLE_RATE_LIMIT=0 ───────────────────────────
+        // ── Scenario 13: LOGTHING_ADMIN_ENABLE_RATE_LIMIT=0 ───────────────────────────
         {
-            let cfg = with_env("WEF_ADMIN_ENABLE_RATE_LIMIT", "0", || {
+            let cfg = with_env("LOGTHING_ADMIN_ENABLE_RATE_LIMIT", "0", || {
                 load_admin_config().expect("rate limit disabled should succeed")
             });
             assert!(!cfg.enable_rate_limiting);
         }
 
-        // ── Scenario 14: WEF_ADMIN_ENABLE_CSRF=1 ─────────────────────────────────
+        // ── Scenario 14: LOGTHING_ADMIN_ENABLE_CSRF=1 ─────────────────────────────────
         {
-            let cfg = with_env("WEF_ADMIN_ENABLE_CSRF", "1", || {
+            let cfg = with_env("LOGTHING_ADMIN_ENABLE_CSRF", "1", || {
                 load_admin_config().expect("CSRF with '1' should succeed")
             });
             assert!(cfg.enable_csrf);

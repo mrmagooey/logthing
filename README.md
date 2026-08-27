@@ -1,6 +1,6 @@
-# Windows Event Forwarding (WEF) Server
+# logthing
 
-A high-performance TCP server written in Rust for receiving Windows Event Logs from multiple external hosts via Windows Event Forwarding (WEF) protocol.
+A high-performance log ingestion server written in Rust. Receives Windows Event Logs via Windows Event Forwarding (WEF), plus syslog, IPFIX/NetFlow, Zeek, Suricata, sFlow, HEC, and OTLP, and persists them as Parquet to S3 or local disk.
 
 ## Features
 
@@ -74,15 +74,15 @@ Configuration is loaded from multiple sources (in order of precedence):
 2. `logthing.toml` file (optional)
 3. **Admin override file** (`logthing.admin.toml`, optional) - takes precedence over main config
 4. `/etc/logthing/config.toml` (optional)
-5. Environment variables with `WEF__` prefix (double underscore for nesting)
+5. Environment variables with `LOGTHING__` prefix (double underscore for nesting)
 
 The admin override file is useful for runtime configuration changes without modifying the main config file.
 
 Every config field is reachable this way, including each listener's bind
-port: `WEF__SYSLOG__UDP_PORT`, `WEF__SYSLOG__TCP_PORT`,
-`WEF__IPFIX__UDP_PORT`, `WEF__ZEEK__TCP_PORT`, `WEF__SURICATA__TCP_PORT`,
-`WEF__SFLOW__UDP_PORT`. Ipfix, Zeek, Suricata, and sFlow additionally accept
-`WEF__<SECTION>__BIND_ADDRESS` to change which interface they listen on;
+port: `LOGTHING__SYSLOG__UDP_PORT`, `LOGTHING__SYSLOG__TCP_PORT`,
+`LOGTHING__IPFIX__UDP_PORT`, `LOGTHING__ZEEK__TCP_PORT`, `LOGTHING__SURICATA__TCP_PORT`,
+`LOGTHING__SFLOW__UDP_PORT`. Ipfix, Zeek, Suricata, and sFlow additionally accept
+`LOGTHING__<SECTION>__BIND_ADDRESS` to change which interface they listen on;
 syslog's bind address is fixed at `0.0.0.0` and has no such override.
 
 ### Iceberg descriptor output
@@ -93,7 +93,7 @@ partition, per-column stats, fully-qualified location) for an external
 Apache Iceberg committer process — logthing itself has no Iceberg
 dependency and never talks to a catalog. Enable it with `[iceberg.s3]` or
 `[iceberg.local]` in `logthing.toml` (mirroring every other source's
-`.s3`/`.local` shape), or via `WEF__ICEBERG__S3__BUCKET` etc. Configuring
+`.s3`/`.local` shape), or via `LOGTHING__ICEBERG__S3__BUCKET` etc. Configuring
 both `iceberg.s3` and `iceberg.local` simultaneously is a startup error —
 unlike other sources, the descriptor sink supports exactly one
 destination.
@@ -156,36 +156,36 @@ Require inbound clients (e.g., Windows Event Forwarding collectors) to authentic
 [security.kerberos]
 enabled = true
 spn = "HTTP/wef.contoso.com@CONTOSO.COM"
-keytab = "/etc/wef/krb5.keytab"
+keytab = "/etc/logthing/krb5.keytab"
 ```
 
 - Build the binary or container with `--features kerberos-auth` so the Kerberos middleware is compiled in. (Without the feature the server will log a warning and continue without enforcing Negotiate.)
 - When `enabled = true`, every HTTP endpoint (`/wsman`, `/syslog`, admin API, etc.) enforces Kerberos authentication before any route logic runs.
 - `spn` must match the service principal registered in Active Directory (format `HTTP/hostname@REALM`).
-- `keytab` (optional) points to the keytab that contains the service principal’s keys. If provided, WEF sets `KRB5_KTNAME` automatically so `libgssapi` can decrypt tickets.
+- `keytab` (optional) points to the keytab that contains the service principal’s keys. If provided, logthing sets `KRB5_KTNAME` automatically so `libgssapi` can decrypt tickets.
 - Handlers can read the authenticated user principal via the `axum_negotiate::Upn` extractor if you need per-user auditing.
 
-#### Active Directory Setup (Kerberos clients → WEF)
+#### Active Directory Setup (Kerberos clients → logthing)
 
-1. **Create a service account** that represents the WEF server itself, e.g., `CONTOSO\wef-appliance`.
+1. **Create a service account** that represents the logthing server itself, e.g., `CONTOSO\logthing-appliance`.
 2. **Register the HTTP SPN** so KDCs know which account owns the hostname clients connect to:
    ```powershell
-   setspn -S HTTP/wef.contoso.com CONTOSO\wef-appliance
+   setspn -S HTTP/wef.contoso.com CONTOSO\logthing-appliance
    ```
 3. **Generate a keytab** for that account (Domain Admin privilege required):
    ```powershell
    ktpass /princ HTTP/wef.contoso.com@CONTOSO.COM ^
-          /mapuser CONTOSO\wef-appliance ^
+          /mapuser CONTOSO\logthing-appliance ^
           /pass * ^
           /ptype KRB5_NT_PRINCIPAL ^
           /crypto AES256-SHA1 ^
-          /out C:\temp\wef.keytab
+          /out C:\temp\logthing.keytab
    ```
-   Copy the resulting keytab to the Linux host/container that runs WEF and guard it (`chmod 600`).
+   Copy the resulting keytab to the Linux host/container that runs logthing and guard it (`chmod 600`).
 4. **Configure `/etc/krb5.conf`** with your AD realm and KDCs.
 5. **Sanity check Kerberos locally** before enabling the server:
    ```bash
-   export KRB5_KTNAME=/etc/wef/krb5.keytab
+   export KRB5_KTNAME=/etc/logthing/krb5.keytab
    kinit -k -t "$KRB5_KTNAME" HTTP/wef.contoso.com@CONTOSO.COM
    curl --negotiate -u : https://wef.contoso.com/wsman -d '' -k
    ```
@@ -557,7 +557,7 @@ The runtime listeners (syslog UDP 514/TCP 601, IPFIX UDP 4739) must be published
 
 ## End-to-End Test Harness
 
-Spin up a self-contained validation stack (WEF server, generators, MinIO) to exercise the full data path.
+Spin up a self-contained validation stack (logthing, generators, MinIO) to exercise the full data path.
 
 Requirements: Docker with Compose v2.
 
@@ -710,21 +710,21 @@ The repository ships example parsers for 50 high-value Windows Security events. 
 ./logthing
 
 # Or with environment variables (note the double underscore)
-WEF__BIND_ADDRESS=0.0.0.0:5985 WEF__TLS__ENABLED=true ./logthing
+LOGTHING__BIND_ADDRESS=0.0.0.0:5985 LOGTHING__TLS__ENABLED=true ./logthing
 
 # For nested configuration values
-WEF__SECURITY__MAX_CONNECTIONS=5000 WEF__METRICS__PORT=8080 ./logthing
+LOGTHING__SECURITY__MAX_CONNECTIONS=5000 LOGTHING__METRICS__PORT=8080 ./logthing
 
 # Every listener's bind port (and, except for syslog, its bind address) can
 # be overridden the same way — no code or config-file changes needed:
-WEF__SYSLOG__UDP_PORT=5514 WEF__SYSLOG__TCP_PORT=5601 ./logthing
-WEF__IPFIX__UDP_PORT=14739 WEF__IPFIX__BIND_ADDRESS=127.0.0.1 ./logthing
-WEF__ZEEK__TCP_PORT=47760 WEF__ZEEK__BIND_ADDRESS=127.0.0.1 ./logthing
-WEF__SURICATA__TCP_PORT=47761 WEF__SURICATA__BIND_ADDRESS=127.0.0.1 ./logthing
-WEF__SFLOW__UDP_PORT=6343 WEF__SFLOW__BIND_ADDRESS=127.0.0.1 ./logthing
+LOGTHING__SYSLOG__UDP_PORT=5514 LOGTHING__SYSLOG__TCP_PORT=5601 ./logthing
+LOGTHING__IPFIX__UDP_PORT=14739 LOGTHING__IPFIX__BIND_ADDRESS=127.0.0.1 ./logthing
+LOGTHING__ZEEK__TCP_PORT=47760 LOGTHING__ZEEK__BIND_ADDRESS=127.0.0.1 ./logthing
+LOGTHING__SURICATA__TCP_PORT=47761 LOGTHING__SURICATA__BIND_ADDRESS=127.0.0.1 ./logthing
+LOGTHING__SFLOW__UDP_PORT=6343 LOGTHING__SFLOW__BIND_ADDRESS=127.0.0.1 ./logthing
 ```
 
-Note: syslog has no `WEF__SYSLOG__BIND_ADDRESS` — its listener always binds
+Note: syslog has no `LOGTHING__SYSLOG__BIND_ADDRESS` — its listener always binds
 `0.0.0.0` (not configurable), unlike ipfix/zeek/suricata/sflow above.
 
 ## Windows Client Configuration
@@ -805,16 +805,30 @@ winrm set winrm/config/client '@{TrustedHosts="your-logthing-ip"}'
 
 The server exposes Prometheus metrics on port 9090:
 
-- `wef_connections_total` - Total connections
-- `wef_events_received_total` - Total events received
-- `wef_events_forwarded_total` - Total events forwarded
-- `wef_active_subscriptions` - Active subscription count
+Per-source ingest counters:
+
+- `syslog_messages_received`, `ipfix_datagrams_received`, `ipfix_flows_decoded`,
+  `sflow_datagrams_received`, `suricata_records_received`, `hec_events_received`,
+  `otlp_logs_received`
+- Decode/parse failures: `ipfix_decode_errors`, `sflow_decode_errors`,
+  `suricata_parse_errors`, `hec_parse_errors`
+
+Parquet persistence (labelled `source="wef"|"syslog"|"ipfix"|"zeek"|"suricata"|"sflow"|"hec"|"otlp"`):
+
+- `parquet_s3_records_written`, `parquet_s3_uploads`, `parquet_s3_upload_errors`
+- `parquet_s3_dropped`, `parquet_s3_buffer_dropped` - backpressure drops
+- `parquet_s3_buffer_rows`, `parquet_s3_channel_queued`, `parquet_s3_channel_available`
+
+Aggregation: `aggregate_records_consumed`, `aggregate_rows_emitted`, `aggregate_groups`,
+`aggregate_overflow_records`.
+
+Counters are exported with a `_total` suffix by the Prometheus exporter.
 
 ## Architecture
 
 ```
                     ┌─────────────────────────────────────┐
-                    │           WEF Server                │
+                    │            logthing                 │
   Windows Hosts →   │  ┌─────────┐  ┌─────────────────┐  │   → S3 (Parquet)
       (HTTPS)       │  │  WEF    │  │  Syslog Parser  │  │
                     │  │Handler  │  │  (RFC 3164/5424)│  │

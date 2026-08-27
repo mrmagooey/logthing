@@ -434,7 +434,7 @@ mod tests {
         }
 
         /// `AuditLogger::new` defaults to the shared `log/admin-audit.log`
-        /// file (relative to the repo root) unless `WEF_ADMIN_AUDIT_LOG`
+        /// file (relative to the repo root) unless `LOGTHING_ADMIN_AUDIT_LOG`
         /// points elsewhere, and loads its prior contents on startup. Tests
         /// in this module assert on the *absence* of specific audit
         /// entries, so unlike the sibling tests here (which only assert
@@ -455,11 +455,11 @@ mod tests {
             // the existing set/read/remove pattern used elsewhere in this
             // crate's tests (see `admin::mod::tests`).
             unsafe {
-                std::env::set_var("WEF_ADMIN_AUDIT_LOG", &log_path);
+                std::env::set_var("LOGTHING_ADMIN_AUDIT_LOG", &log_path);
             }
             let logger = AuditLogger::new(100).await;
             unsafe {
-                std::env::remove_var("WEF_ADMIN_AUDIT_LOG");
+                std::env::remove_var("LOGTHING_ADMIN_AUDIT_LOG");
             }
             logger
         }

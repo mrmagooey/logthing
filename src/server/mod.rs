@@ -87,7 +87,7 @@ pub struct Server {
 }
 
 impl Server {
-    /// Create a new WEF server instance.
+    /// Create a new logthing server instance.
     ///
     /// Initializes all components including the parser and optional
     /// Parquet S3 forwarder.
@@ -346,7 +346,7 @@ impl Server {
         std::mem::take(&mut self.hec_worker_handles)
     }
 
-    /// Run the WEF server without TLS (HTTP only).
+    /// Run the logthing server without TLS (HTTP only).
     ///
     /// Starts the HTTP server on the configured bind address and port.
     /// Also starts the metrics server if enabled.  Exits when `shutdown_rx`
@@ -366,7 +366,7 @@ impl Server {
 
         // Start HTTP server
         let addr = self.config.bind_address;
-        info!("Starting WEF server on http://{}", addr);
+        info!("Starting logthing server on http://{}", addr);
 
         let listener = tokio::net::TcpListener::bind(&addr).await?;
 
@@ -516,7 +516,7 @@ impl Server {
         Ok(router)
     }
 
-    /// Run the WEF server with TLS enabled.
+    /// Run the logthing server with TLS enabled.
     ///
     /// If TLS is not enabled in the configuration, falls back to running without TLS.
     /// Otherwise, starts an HTTPS server on the configured TLS port.  Exits on
@@ -540,7 +540,7 @@ impl Server {
         let tls_config = build_tls_config(&self.config.tls)?;
         let tls_addr: SocketAddr = format!("0.0.0.0:{}", self.config.tls.port).parse()?;
 
-        info!("Starting WEF server with TLS on https://{}", tls_addr);
+        info!("Starting logthing server with TLS on https://{}", tls_addr);
 
         // Gap-b: use axum_server::Handle to trigger graceful shutdown when the
         // watch fires.  The handle is cloned into a task that waits for the signal

@@ -1,4 +1,4 @@
-//! Admin HTTP interface for WEF server configuration management
+//! Admin HTTP interface for logthing server configuration management
 //!
 //! This module provides a secure web interface for managing server configuration,
 //! viewing audit logs, and monitoring system status.
@@ -125,7 +125,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("test-audit.log");
         unsafe {
-            std::env::set_var("WEF_ADMIN_AUDIT_LOG", &log_path);
+            std::env::set_var("LOGTHING_ADMIN_AUDIT_LOG", &log_path);
         }
 
         let logger = AuditLogger::new(10).await;
@@ -142,7 +142,7 @@ mod tests {
         assert_eq!(entries[0].details, Some("test details".to_string()));
 
         unsafe {
-            std::env::remove_var("WEF_ADMIN_AUDIT_LOG");
+            std::env::remove_var("LOGTHING_ADMIN_AUDIT_LOG");
         }
     }
 
@@ -152,7 +152,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("test-audit.log");
         unsafe {
-            std::env::set_var("WEF_ADMIN_AUDIT_LOG", &log_path);
+            std::env::set_var("LOGTHING_ADMIN_AUDIT_LOG", &log_path);
         }
 
         let logger = AuditLogger::new(2).await;
@@ -167,7 +167,7 @@ mod tests {
         assert_eq!(entries[1].action, "ACTION2");
 
         unsafe {
-            std::env::remove_var("WEF_ADMIN_AUDIT_LOG");
+            std::env::remove_var("LOGTHING_ADMIN_AUDIT_LOG");
         }
     }
 
@@ -235,14 +235,14 @@ mod tests {
 
         #[tokio::test]
         async fn persist_config_writes_to_file() {
-            // WEF_ADMIN_OVERRIDE_FILE is process-global; serialize against every
+            // LOGTHING_ADMIN_OVERRIDE_FILE is process-global; serialize against every
             // other test that touches it crate-wide (see config_api::test_support).
             let _lock = config_api::test_support::lock_persist_config_env().await;
 
             let dir = tempdir().unwrap();
             let path = dir.path().join("test-admin.toml");
             unsafe {
-                std::env::set_var("WEF_ADMIN_OVERRIDE_FILE", &path);
+                std::env::set_var("LOGTHING_ADMIN_OVERRIDE_FILE", &path);
             }
 
             let cfg = Config::default();
@@ -255,7 +255,7 @@ mod tests {
             assert!(contents.contains("bind_address"));
 
             unsafe {
-                std::env::remove_var("WEF_ADMIN_OVERRIDE_FILE");
+                std::env::remove_var("LOGTHING_ADMIN_OVERRIDE_FILE");
             }
         }
 
@@ -387,7 +387,7 @@ mod tests {
             let dir = tempdir().unwrap();
             let log_path = dir.path().join("test-persist.log");
             unsafe {
-                std::env::set_var("WEF_ADMIN_AUDIT_LOG", &log_path);
+                std::env::set_var("LOGTHING_ADMIN_AUDIT_LOG", &log_path);
             }
 
             let logger = AuditLogger::new(10).await;
@@ -405,7 +405,7 @@ mod tests {
             assert!(contents.contains("user"));
 
             unsafe {
-                std::env::remove_var("WEF_ADMIN_AUDIT_LOG");
+                std::env::remove_var("LOGTHING_ADMIN_AUDIT_LOG");
             }
         }
 
@@ -427,7 +427,7 @@ mod tests {
             std::fs::write(&log_path, json + "\n").unwrap();
 
             unsafe {
-                std::env::set_var("WEF_ADMIN_AUDIT_LOG", &log_path);
+                std::env::set_var("LOGTHING_ADMIN_AUDIT_LOG", &log_path);
             }
 
             let logger = AuditLogger::new(10).await;
@@ -437,7 +437,7 @@ mod tests {
             assert!(entries.iter().any(|e| e.action == "PRELOADED"));
 
             unsafe {
-                std::env::remove_var("WEF_ADMIN_AUDIT_LOG");
+                std::env::remove_var("LOGTHING_ADMIN_AUDIT_LOG");
             }
         }
 
@@ -907,14 +907,14 @@ port = 9090
 
         #[tokio::test]
         async fn update_config_persists_changes() {
-            // WEF_ADMIN_OVERRIDE_FILE is process-global; serialize against every
+            // LOGTHING_ADMIN_OVERRIDE_FILE is process-global; serialize against every
             // other test that touches it crate-wide (see config_api::test_support).
             let _lock = config_api::test_support::lock_persist_config_env().await;
 
             let dir = tempdir().unwrap();
             let path = dir.path().join("test-config.toml");
             unsafe {
-                std::env::set_var("WEF_ADMIN_OVERRIDE_FILE", &path);
+                std::env::set_var("LOGTHING_ADMIN_OVERRIDE_FILE", &path);
             }
 
             let _state = test_state().await;
@@ -934,7 +934,7 @@ port = 9090
             }
 
             unsafe {
-                std::env::remove_var("WEF_ADMIN_OVERRIDE_FILE");
+                std::env::remove_var("LOGTHING_ADMIN_OVERRIDE_FILE");
             }
         }
     }

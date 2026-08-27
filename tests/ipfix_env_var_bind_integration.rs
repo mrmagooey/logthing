@@ -24,14 +24,27 @@ async fn env_var_override_binds_ipfix_listener_on_overridden_address_and_port() 
     drop(probe);
 
     unsafe {
-        std::env::set_var("WEF__IPFIX__UDP_PORT", port.to_string());
-        std::env::set_var("WEF__IPFIX__BIND_ADDRESS", "127.0.0.1");
+        std::env::set_var("LOGTHING__IPFIX__UDP_PORT", port.to_string());
+        std::env::set_var("LOGTHING__IPFIX__BIND_ADDRESS", "127.0.0.1");
+        // Regression guard for the WEF -> logthing rename: the legacy `WEF__`
+        // prefix was dropped outright with no fallback, so this must be
+        // ignored. Set in the same process as the live override above rather
+        // than in its own #[test] — env vars are process-global and the two
+        // would race under the parallel test harness.
+        std::env::set_var("WEF__ZEEK__TCP_PORT", "14776");
     }
     let cfg = Config::load().expect("config loads with env overrides");
     unsafe {
-        std::env::remove_var("WEF__IPFIX__UDP_PORT");
-        std::env::remove_var("WEF__IPFIX__BIND_ADDRESS");
+        std::env::remove_var("LOGTHING__IPFIX__UDP_PORT");
+        std::env::remove_var("LOGTHING__IPFIX__BIND_ADDRESS");
+        std::env::remove_var("WEF__ZEEK__TCP_PORT");
     }
+
+    assert_eq!(
+        cfg.zeek.tcp_port, 47760,
+        "legacy WEF__ prefix must no longer override config; it was removed \
+         without a compatibility fallback in the logthing rename"
+    );
 
     assert_eq!(
         cfg.ipfix.udp_port, port,
