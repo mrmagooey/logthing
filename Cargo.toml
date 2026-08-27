@@ -2,6 +2,7 @@
 name = "logthing"
 version = "0.13.3"
 edition = "2024"
+license = "MIT"
 
 [workspace]
 members = ["tools/loadgen"]
