@@ -28,9 +28,8 @@ axum = { version = "0.7", features = ["macros"] }
 axum-extra = { version = "0.9", features = ["typed-header"] }
 axum-negotiate = { version = "0.1.1", optional = true }
 headers = "0.4"
-tower = { version = "0.4", features = ["full"] }
+tower = { version = "0.4", features = ["limit", "util"] }
 tower-http = { version = "0.5", features = ["trace", "cors", "timeout"] }
-hyper = { version = "1.0", features = ["full"] }
 
 # TLS/SSL
 rustls = "0.23"
@@ -125,7 +124,6 @@ pprof = { version = "0.14", default-features = false, features = [
 ], optional = true }
 
 [dev-dependencies]
-tokio-test = "0.4"
 tempfile = "3.9"
 metrics-util = { version = "0.16", features = ["debugging"] }
 criterion = "0.5"
