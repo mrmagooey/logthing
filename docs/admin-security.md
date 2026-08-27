@@ -20,8 +20,6 @@ The admin interface now supports TLS for encrypted connections:
 ```bash
 LOGTHING_ADMIN_TLS_CERT=/path/to/cert.pem
 LOGTHING_ADMIN_TLS_KEY=/path/to/key.pem
-LOGTHING_ADMIN_TLS_CA=/path/to/ca.pem              # Optional
-LOGTHING_ADMIN_TLS_REQUIRE_CLIENT_CERT=true        # Require client certificates
 ```
 
 When TLS is enabled, the admin interface runs on HTTPS and all traffic is encrypted.
@@ -162,8 +160,6 @@ is proxy-authored, not attacker-authored.
 | `LOGTHING_ADMIN_ALLOWED_IPS` | Comma-separated allowed IPs/CIDRs | - |
 | `LOGTHING_ADMIN_TLS_CERT` | TLS certificate file path | - |
 | `LOGTHING_ADMIN_TLS_KEY` | TLS private key file path | - |
-| `LOGTHING_ADMIN_TLS_CA` | TLS CA certificate file path | - |
-| `LOGTHING_ADMIN_TLS_REQUIRE_CLIENT_CERT` | Require client certificates | `false` |
 | `LOGTHING_ADMIN_ENABLE_CSRF` | Enable CSRF protection | `true` |
 | `LOGTHING_ADMIN_ENABLE_RATE_LIMIT` | Enable rate limiting | `true` |
 | `LOGTHING_ADMIN_TRUST_PROXY_HEADERS` | Enable trusted reverse-proxy header auth | `false` |

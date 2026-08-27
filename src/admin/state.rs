@@ -388,15 +388,22 @@ fn build_trusted_header_config(
         );
     }
 
-    let username_header =
-        HeaderName::from_bytes(args.username_header.unwrap_or("X-authentik-username").as_bytes())
-            .map_err(|e| anyhow::anyhow!("invalid LOGTHING_ADMIN_TRUSTED_HEADER value: {e}"))?;
+    let username_header = HeaderName::from_bytes(
+        args.username_header
+            .unwrap_or("X-authentik-username")
+            .as_bytes(),
+    )
+    .map_err(|e| anyhow::anyhow!("invalid LOGTHING_ADMIN_TRUSTED_HEADER value: {e}"))?;
     let groups_header = HeaderName::from_bytes(
-        args.groups_header.unwrap_or("X-authentik-groups").as_bytes(),
+        args.groups_header
+            .unwrap_or("X-authentik-groups")
+            .as_bytes(),
     )
     .map_err(|e| anyhow::anyhow!("invalid LOGTHING_ADMIN_TRUSTED_GROUPS_HEADER value: {e}"))?;
     let secret_header = HeaderName::from_bytes(
-        args.secret_header.unwrap_or("X-Admin-Proxy-Secret").as_bytes(),
+        args.secret_header
+            .unwrap_or("X-Admin-Proxy-Secret")
+            .as_bytes(),
     )
     .map_err(|e| anyhow::anyhow!("invalid LOGTHING_ADMIN_TRUSTED_SECRET_HEADER value: {e}"))?;
 
@@ -715,7 +722,7 @@ mod tests {
             None,
             None,
             None,
-true,
+            true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -734,7 +741,7 @@ true,
             None,
             None,
             None,
-true,
+            true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -756,7 +763,7 @@ true,
             None,
             None,
             None,
-true,
+            true,
             true,
             TrustedHeaderEnvArgs::default(),
         );
@@ -781,7 +788,7 @@ true,
             None,
             None,
             None,
-true,
+            true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -813,7 +820,15 @@ true,
     #[test]
     fn build_config_custom_user_and_pass() {
         let cfg = build_admin_config_from_parts(
-            None, "myuser", "mypass", None, None, None, None, true, true,
+            None,
+            "myuser",
+            "mypass",
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
             TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
@@ -831,7 +846,7 @@ true,
             Some("10.0.0.0/8, 192.168.1.0/24, 203.0.113.5/32"),
             None,
             None,
-true,
+            true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -859,7 +874,7 @@ true,
             Some(""),
             None,
             None,
-true,
+            true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -878,7 +893,7 @@ true,
             Some("10.0.0.0/8, not-a-valid-cidr, 192.168.0.0/16"),
             None,
             None,
-true,
+            true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -907,7 +922,7 @@ true,
             None,
             Some("/etc/ssl/cert.pem"),
             Some("/etc/ssl/key.pem"),
-true,
+            true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -928,7 +943,7 @@ true,
             None,
             Some("/etc/ssl/cert.pem"),
             None, // no key
-true,
+            true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -948,7 +963,13 @@ true,
     #[test]
     fn build_config_csrf_disabled() {
         let cfg = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None,
+            None,
+            "admin",
+            "admin",
+            None,
+            None,
+            None,
+            None,
             false, // enable_csrf = false
             true,
             TrustedHeaderEnvArgs::default(),
@@ -960,7 +981,13 @@ true,
     #[test]
     fn build_config_csrf_enabled() {
         let cfg = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None,
+            None,
+            "admin",
+            "admin",
+            None,
+            None,
+            None,
+            None,
             true, // enable_csrf = true
             true,
             TrustedHeaderEnvArgs::default(),
@@ -972,7 +999,14 @@ true,
     #[test]
     fn build_config_rate_limiting_disabled() {
         let cfg = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, true,
+            None,
+            "admin",
+            "admin",
+            None,
+            None,
+            None,
+            None,
+            true,
             false, // enable_rate_limiting = false
             TrustedHeaderEnvArgs::default(),
         )
@@ -983,7 +1017,15 @@ true,
     #[test]
     fn build_config_rate_limiting_enabled() {
         let cfg = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, true, true,
+            None,
+            "admin",
+            "admin",
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
             TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
@@ -1001,22 +1043,44 @@ true,
     #[test]
     fn trusted_header_enabled_without_secret_errs() {
         let result = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, true, true,
+            None,
+            "admin",
+            "admin",
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 allowed_groups: Some("admins"),
                 ..Default::default()
             },
         );
-        assert!(result.is_err(), "trust mode on with no secret must be refused");
+        assert!(
+            result.is_err(),
+            "trust mode on with no secret must be refused"
+        );
         let msg = result.err().unwrap().to_string();
-        assert!(msg.contains("LOGTHING_ADMIN_TRUSTED_HEADER_SECRET"), "{msg}");
+        assert!(
+            msg.contains("LOGTHING_ADMIN_TRUSTED_HEADER_SECRET"),
+            "{msg}"
+        );
     }
 
     #[test]
     fn trusted_header_enabled_with_empty_groups_errs() {
         let result = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, true, true,
+            None,
+            "admin",
+            "admin",
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 secret: Some("shhhshhhshhhshhh"),
@@ -1024,7 +1088,10 @@ true,
                 ..Default::default()
             },
         );
-        assert!(result.is_err(), "trust mode on with no usable group must be refused");
+        assert!(
+            result.is_err(),
+            "trust mode on with no usable group must be refused"
+        );
         let msg = result.err().unwrap().to_string();
         assert!(msg.contains("LOGTHING_ADMIN_TRUSTED_GROUPS"), "{msg}");
     }
@@ -1032,7 +1099,15 @@ true,
     #[test]
     fn trusted_header_enabled_valid_inputs_uses_defaults() {
         let cfg = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, true, true,
+            None,
+            "admin",
+            "admin",
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 secret: Some("shhhshhhshhhshhh"),
@@ -1052,7 +1127,15 @@ true,
     #[test]
     fn trusted_header_custom_header_names_override_defaults() {
         let cfg = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, true, true,
+            None,
+            "admin",
+            "admin",
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 username_header: Some("X-Custom-User"),
@@ -1072,7 +1155,15 @@ true,
     #[test]
     fn trusted_header_invalid_header_name_errs() {
         let result = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, true, true,
+            None,
+            "admin",
+            "admin",
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 username_header: Some("not a valid header name!!"),
@@ -1081,13 +1172,24 @@ true,
                 ..Default::default()
             },
         );
-        assert!(result.is_err(), "an invalid header-name string must be refused at build time");
+        assert!(
+            result.is_err(),
+            "an invalid header-name string must be refused at build time"
+        );
     }
 
     #[test]
     fn trusted_header_secret_too_short_errs() {
         let result = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, true, true,
+            None,
+            "admin",
+            "admin",
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 secret: Some("short"),
@@ -1095,16 +1197,30 @@ true,
                 ..Default::default()
             },
         );
-        assert!(result.is_err(), "a secret shorter than 16 chars must be refused");
+        assert!(
+            result.is_err(),
+            "a secret shorter than 16 chars must be refused"
+        );
         let msg = result.err().unwrap().to_string();
-        assert!(msg.contains("LOGTHING_ADMIN_TRUSTED_HEADER_SECRET"), "{msg}");
+        assert!(
+            msg.contains("LOGTHING_ADMIN_TRUSTED_HEADER_SECRET"),
+            "{msg}"
+        );
         assert!(msg.contains("16"), "{msg}");
     }
 
     #[test]
     fn trusted_header_secret_exactly_16_chars_ok() {
         let cfg = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, true, true,
+            None,
+            "admin",
+            "admin",
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 secret: Some("0123456789abcdef"), // exactly 16 chars
@@ -1120,7 +1236,15 @@ true,
     #[test]
     fn trusted_header_secret_trimmed_before_length_check() {
         let cfg = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, true, true,
+            None,
+            "admin",
+            "admin",
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 // 16 real chars padded with surrounding whitespace: must be
