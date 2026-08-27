@@ -30,7 +30,10 @@ fn secret_header_matches(state: &AdminState, headers: &HeaderMap) -> bool {
     let Some(cfg) = state.server_config.trusted_header.as_ref() else {
         return false;
     };
-    let Some(secret) = headers.get(&cfg.secret_header).and_then(|v| v.to_str().ok()) else {
+    let Some(secret) = headers
+        .get(&cfg.secret_header)
+        .and_then(|v| v.to_str().ok())
+    else {
         return false;
     };
     ct_str_eq(secret, &cfg.secret)
@@ -65,7 +68,9 @@ pub fn resolve_client_ip(
         None => return addr.ip(),
     };
     let first_hop = xff.split(',').next().unwrap_or("").trim();
-    first_hop.parse::<std::net::IpAddr>().unwrap_or_else(|_| addr.ip())
+    first_hop
+        .parse::<std::net::IpAddr>()
+        .unwrap_or_else(|_| addr.ip())
 }
 
 /// Resolve a caller identity from trusted reverse-proxy headers, or `None`

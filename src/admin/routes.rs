@@ -1625,7 +1625,8 @@ mod tests {
         #[tokio::test]
         async fn get_config_falls_back_to_basic_auth_when_no_trusted_headers_present() {
             let state = test_state_with_trust().await;
-            let mut request = create_request_with_auth(Method::GET, "/config", "admin", "admin", None);
+            let mut request =
+                create_request_with_auth(Method::GET, "/config", "admin", "admin", None);
             inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
 
             let app = axum::Router::new()
