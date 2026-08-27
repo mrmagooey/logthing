@@ -670,35 +670,6 @@ port = 9090
         }
     }
 
-    // Test helper to create a real HTTP request
-    #[allow(dead_code)] // helper retained for future route tests
-    async fn create_test_app() -> axum::Router {
-        let server_config = AdminServerConfig {
-            bind_address: "0.0.0.0:8080".parse().unwrap(),
-            username: "user".to_string(),
-            password_hash: PasswordHash::hash("pass").unwrap(),
-            allowed_ips: vec![],
-            tls_config: None,
-            enable_csrf: false,
-            enable_rate_limiting: false,
-            trusted_header: None,
-        };
-
-        let state = AdminState {
-            config: Arc::new(RwLock::new(Config::default())),
-            server_config,
-            audit_logger: AuditLogger::new(100).await,
-            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
-            request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
-            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-        };
-
-        axum::Router::new()
-            .route("/health", axum::routing::get(routes::health_check))
-            .with_state(state)
-    }
-
     // Integration tests for routes
     mod route_integration_tests {
         use super::*;

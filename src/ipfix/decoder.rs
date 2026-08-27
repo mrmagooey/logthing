@@ -154,15 +154,6 @@ impl Default for IpfixDecoder {
 
 // ---- Bounds-checked read helpers ----------------------------------------
 
-#[allow(dead_code)]
-fn read_u8(buf: &[u8], offset: usize) -> Result<u8, DecodeError> {
-    buf.get(offset).copied().ok_or(DecodeError::Truncated {
-        offset,
-        need: 1,
-        have: buf.len().saturating_sub(offset),
-    })
-}
-
 fn read_u16_be(buf: &[u8], offset: usize) -> Result<u16, DecodeError> {
     let end = offset
         .checked_add(2)
@@ -198,23 +189,6 @@ fn read_u32_be(buf: &[u8], offset: usize) -> Result<u32, DecodeError> {
         buf[offset + 2],
         buf[offset + 3],
     ]))
-}
-
-#[allow(dead_code)]
-fn read_u64_be(buf: &[u8], offset: usize) -> Result<u64, DecodeError> {
-    let end = offset
-        .checked_add(8)
-        .ok_or_else(|| DecodeError::Malformed {
-            reason: "offset overflow".into(),
-        })?;
-    if end > buf.len() {
-        return Err(DecodeError::Truncated {
-            offset,
-            need: 8,
-            have: buf.len().saturating_sub(offset),
-        });
-    }
-    Ok(u64::from_be_bytes(buf[offset..end].try_into().unwrap()))
 }
 
 fn read_bytes(buf: &[u8], offset: usize, len: usize) -> Result<&[u8], DecodeError> {
@@ -1470,39 +1444,6 @@ mod tests {
     }
 
     // =================== NEW TARGETED COVERAGE TESTS ======================
-
-    // ---- read_u8 helper tests ----
-
-    #[test]
-    fn read_u8_ok_and_error() {
-        let buf = [0xAB_u8, 0xCD];
-        assert_eq!(read_u8(&buf, 0).unwrap(), 0xAB);
-        assert_eq!(read_u8(&buf, 1).unwrap(), 0xCD);
-        // Past end → Truncated
-        let err = read_u8(&buf, 2).unwrap_err();
-        assert!(matches!(
-            err,
-            DecodeError::Truncated {
-                offset: 2,
-                need: 1,
-                ..
-            }
-        ));
-        // Empty buffer
-        assert!(read_u8(&[], 0).is_err());
-    }
-
-    // ---- read_u64_be helper tests ----
-
-    #[test]
-    fn read_u64_be_ok_and_error() {
-        let buf: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xE8];
-        assert_eq!(read_u64_be(&buf, 0).unwrap(), 1000u64);
-        // Only 7 bytes available at offset 1 → Truncated
-        assert!(read_u64_be(&buf, 1).is_err());
-        // Empty buffer
-        assert!(read_u64_be(&[], 0).is_err());
-    }
 
     // ---- IpfixDecoder::default() ----
 

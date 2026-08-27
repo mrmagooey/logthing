@@ -199,10 +199,6 @@ pub struct AdminServerConfig {
 pub struct AdminTlsConfig {
     pub cert_file: PathBuf,
     pub key_file: PathBuf,
-    #[allow(dead_code)]
-    pub ca_file: Option<PathBuf>,
-    #[allow(dead_code)]
-    pub require_client_cert: bool,
 }
 
 /// Configuration for trusting reverse-proxy-injected identity headers (e.g.
@@ -440,8 +436,6 @@ pub fn build_admin_config_from_parts(
     allowed_ips_str: Option<&str>,
     tls_cert: Option<&str>,
     tls_key: Option<&str>,
-    tls_ca: Option<&str>,
-    require_client_cert: bool,
     enable_csrf: bool,
     enable_rate_limiting: bool,
     trusted_header_env: TrustedHeaderEnvArgs,
@@ -509,8 +503,6 @@ pub fn build_admin_config_from_parts(
         (Some(cert), Some(key)) => Some(AdminTlsConfig {
             cert_file: cert.into(),
             key_file: key.into(),
-            ca_file: tls_ca.map(|s| s.into()),
-            require_client_cert,
         }),
         _ => {
             tracing::warn!(
@@ -544,10 +536,6 @@ pub fn load_admin_config() -> anyhow::Result<AdminServerConfig> {
     let allowed_ips_str = std::env::var("LOGTHING_ADMIN_ALLOWED_IPS").ok();
     let tls_cert = std::env::var("LOGTHING_ADMIN_TLS_CERT").ok();
     let tls_key = std::env::var("LOGTHING_ADMIN_TLS_KEY").ok();
-    let tls_ca = std::env::var("LOGTHING_ADMIN_TLS_CA").ok();
-    let require_client_cert = std::env::var("LOGTHING_ADMIN_TLS_REQUIRE_CLIENT_CERT")
-        .map(|s| s == "true" || s == "1")
-        .unwrap_or(false);
     let enable_csrf = std::env::var("LOGTHING_ADMIN_ENABLE_CSRF")
         .map(|s| s == "true" || s == "1")
         .unwrap_or(true);
@@ -571,8 +559,6 @@ pub fn load_admin_config() -> anyhow::Result<AdminServerConfig> {
         allowed_ips_str.as_deref(),
         tls_cert.as_deref(),
         tls_key.as_deref(),
-        tls_ca.as_deref(),
-        require_client_cert,
         enable_csrf,
         enable_rate_limiting,
         TrustedHeaderEnvArgs {
@@ -706,8 +692,6 @@ mod tests {
             None,    // allowed_ips_str
             None,    // tls_cert
             None,    // tls_key
-            None,    // tls_ca
-            false,   // require_client_cert
             true,    // enable_csrf
             true,    // enable_rate_limiting
             TrustedHeaderEnvArgs::default(),
@@ -733,9 +717,7 @@ mod tests {
             None,
             None,
             None,
-            None,
-            false,
-            true,
+true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -754,9 +736,7 @@ mod tests {
             None,
             None,
             None,
-            None,
-            false,
-            true,
+true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -778,9 +758,7 @@ mod tests {
             None,
             None,
             None,
-            None,
-            false,
-            true,
+true,
             true,
             TrustedHeaderEnvArgs::default(),
         );
@@ -805,9 +783,7 @@ mod tests {
             None,
             None,
             None,
-            None,
-            false,
-            true,
+true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -827,8 +803,6 @@ mod tests {
             None,
             None,
             None,
-            None,
-            false,
             true,
             true,
             TrustedHeaderEnvArgs::default(),
@@ -841,7 +815,7 @@ mod tests {
     #[test]
     fn build_config_custom_user_and_pass() {
         let cfg = build_admin_config_from_parts(
-            None, "myuser", "mypass", None, None, None, None, None, false, true, true,
+            None, "myuser", "mypass", None, None, None, None, true, true,
             TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
@@ -859,9 +833,7 @@ mod tests {
             Some("10.0.0.0/8, 192.168.1.0/24, 203.0.113.5/32"),
             None,
             None,
-            None,
-            false,
-            true,
+true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -889,9 +861,7 @@ mod tests {
             Some(""),
             None,
             None,
-            None,
-            false,
-            true,
+true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -910,9 +880,7 @@ mod tests {
             Some("10.0.0.0/8, not-a-valid-cidr, 192.168.0.0/16"),
             None,
             None,
-            None,
-            false,
-            true,
+true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -941,9 +909,7 @@ mod tests {
             None,
             Some("/etc/ssl/cert.pem"),
             Some("/etc/ssl/key.pem"),
-            None,
-            false,
-            true,
+true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -951,30 +917,6 @@ mod tests {
         let tls = cfg.tls_config.expect("TLS should be configured");
         assert_eq!(tls.cert_file, PathBuf::from("/etc/ssl/cert.pem"));
         assert_eq!(tls.key_file, PathBuf::from("/etc/ssl/key.pem"));
-        assert!(tls.ca_file.is_none());
-        assert!(!tls.require_client_cert);
-    }
-
-    #[test]
-    fn build_config_tls_with_ca_and_require_client_cert() {
-        let cfg = build_admin_config_from_parts(
-            None,
-            "admin",
-            "admin",
-            None,
-            None,
-            Some("/etc/ssl/cert.pem"),
-            Some("/etc/ssl/key.pem"),
-            Some("/etc/ssl/ca.pem"),
-            true, // require_client_cert
-            true,
-            true,
-            TrustedHeaderEnvArgs::default(),
-        )
-        .unwrap();
-        let tls = cfg.tls_config.expect("TLS should be configured");
-        assert_eq!(tls.ca_file, Some(PathBuf::from("/etc/ssl/ca.pem")));
-        assert!(tls.require_client_cert);
     }
 
     #[test]
@@ -988,9 +930,7 @@ mod tests {
             None,
             Some("/etc/ssl/cert.pem"),
             None, // no key
-            None,
-            false,
-            true,
+true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -1010,7 +950,7 @@ mod tests {
     #[test]
     fn build_config_csrf_disabled() {
         let cfg = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, None, false,
+            None, "admin", "admin", None, None, None, None,
             false, // enable_csrf = false
             true,
             TrustedHeaderEnvArgs::default(),
@@ -1022,7 +962,7 @@ mod tests {
     #[test]
     fn build_config_csrf_enabled() {
         let cfg = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, None, false,
+            None, "admin", "admin", None, None, None, None,
             true, // enable_csrf = true
             true,
             TrustedHeaderEnvArgs::default(),
@@ -1034,7 +974,7 @@ mod tests {
     #[test]
     fn build_config_rate_limiting_disabled() {
         let cfg = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, None, false, true,
+            None, "admin", "admin", None, None, None, None, true,
             false, // enable_rate_limiting = false
             TrustedHeaderEnvArgs::default(),
         )
@@ -1045,7 +985,7 @@ mod tests {
     #[test]
     fn build_config_rate_limiting_enabled() {
         let cfg = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, None, false, true, true,
+            None, "admin", "admin", None, None, None, None, true, true,
             TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
@@ -1063,7 +1003,7 @@ mod tests {
     #[test]
     fn trusted_header_enabled_without_secret_errs() {
         let result = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, None, false, true, true,
+            None, "admin", "admin", None, None, None, None, true, true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 allowed_groups: Some("admins"),
@@ -1078,7 +1018,7 @@ mod tests {
     #[test]
     fn trusted_header_enabled_with_empty_groups_errs() {
         let result = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, None, false, true, true,
+            None, "admin", "admin", None, None, None, None, true, true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 secret: Some("shhhshhhshhhshhh"),
@@ -1094,7 +1034,7 @@ mod tests {
     #[test]
     fn trusted_header_enabled_valid_inputs_uses_defaults() {
         let cfg = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, None, false, true, true,
+            None, "admin", "admin", None, None, None, None, true, true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 secret: Some("shhhshhhshhhshhh"),
@@ -1114,7 +1054,7 @@ mod tests {
     #[test]
     fn trusted_header_custom_header_names_override_defaults() {
         let cfg = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, None, false, true, true,
+            None, "admin", "admin", None, None, None, None, true, true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 username_header: Some("X-Custom-User"),
@@ -1134,7 +1074,7 @@ mod tests {
     #[test]
     fn trusted_header_invalid_header_name_errs() {
         let result = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, None, false, true, true,
+            None, "admin", "admin", None, None, None, None, true, true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 username_header: Some("not a valid header name!!"),
@@ -1149,7 +1089,7 @@ mod tests {
     #[test]
     fn trusted_header_secret_too_short_errs() {
         let result = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, None, false, true, true,
+            None, "admin", "admin", None, None, None, None, true, true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 secret: Some("short"),
@@ -1166,7 +1106,7 @@ mod tests {
     #[test]
     fn trusted_header_secret_exactly_16_chars_ok() {
         let cfg = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, None, false, true, true,
+            None, "admin", "admin", None, None, None, None, true, true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 secret: Some("0123456789abcdef"), // exactly 16 chars
@@ -1182,7 +1122,7 @@ mod tests {
     #[test]
     fn trusted_header_secret_trimmed_before_length_check() {
         let cfg = build_admin_config_from_parts(
-            None, "admin", "admin", None, None, None, None, None, false, true, true,
+            None, "admin", "admin", None, None, None, None, true, true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 // 16 real chars padded with surrounding whitespace: must be
@@ -1369,8 +1309,6 @@ mod tests {
             let tls = cfg.tls_config.expect("TLS should be Some");
             assert_eq!(tls.cert_file, PathBuf::from("/etc/ssl/cert.pem"));
             assert_eq!(tls.key_file, PathBuf::from("/etc/ssl/key.pem"));
-            assert!(tls.ca_file.is_none());
-            assert!(!tls.require_client_cert);
         }
 
         // ── Scenario 11: TLS with CA + require_client_cert ───────────────────────
@@ -1389,9 +1327,7 @@ mod tests {
                 std::env::remove_var("LOGTHING_ADMIN_TLS_REQUIRE_CLIENT_CERT");
             }
             let cfg = result.expect("TLS + CA + require_client_cert should be accepted");
-            let tls = cfg.tls_config.expect("TLS should be Some");
-            assert_eq!(tls.ca_file, Some(PathBuf::from("/etc/ssl/ca.pem")));
-            assert!(tls.require_client_cert);
+            let _tls = cfg.tls_config.expect("TLS should be Some");
         }
 
         // ── Scenario 12: LOGTHING_ADMIN_ENABLE_CSRF=false ─────────────────────────────
