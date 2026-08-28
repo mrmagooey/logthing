@@ -1,6 +1,10 @@
 // Library target — single authoritative module home for all crate modules.
 // The binary target (main.rs) uses `logthing::` instead of re-declaring modules.
 
+// result_large_err misfires on idiomatic axum `Result<T, Response>` handlers
+// (clippy 1.98 counts the >=128-byte Response as an oversized Err variant);
+// these are cold admin endpoints, boxing would be noise for no benefit.
+#[allow(clippy::result_large_err)]
 pub mod admin;
 pub mod config;
 pub mod forwarding;
