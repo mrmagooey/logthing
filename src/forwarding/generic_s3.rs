@@ -10,7 +10,7 @@
 use crate::config::HecS3Config;
 use crate::forwarding::buffered_writer::ParquetSink;
 use crate::ingest::GenericRecord;
-use arrow_array::{RecordBatch, StringArray, TimestampMillisecondArray};
+use arrow_array::{RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use std::sync::Arc;
 
@@ -28,12 +28,12 @@ fn generic_schema() -> Arc<Schema> {
         Field::new("host", DataType::Utf8, true),
         Field::new(
             "time",
-            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             true,
         ),
         Field::new(
             "received_at",
-            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
         ),
         Field::new("fields", DataType::Utf8, false),
@@ -70,18 +70,18 @@ impl ParquetSink for GenericSink {
         // col 1: host (Utf8, nullable)
         let host: StringArray = StringArray::from(vec![record.host.as_deref()]);
 
-        // col 2: time (Timestamp(Millisecond, UTC), nullable)
+        // col 2: time (Timestamp(Microsecond, UTC), nullable)
         // IMPORTANT: must call .with_timezone("UTC") so the array's DataType
-        // matches the schema field's Timestamp(Millisecond, Some("UTC")).
+        // matches the schema field's Timestamp(Microsecond, Some("UTC")).
         let time_col = match &record.time {
-            Some(dt) => TimestampMillisecondArray::from(vec![Some(dt.timestamp_millis())]),
-            None => TimestampMillisecondArray::from(vec![None::<i64>]),
+            Some(dt) => TimestampMicrosecondArray::from(vec![Some(dt.timestamp_micros())]),
+            None => TimestampMicrosecondArray::from(vec![None::<i64>]),
         }
         .with_timezone("UTC");
 
-        // col 3: received_at (Timestamp(Millisecond, UTC), non-null)
+        // col 3: received_at (Timestamp(Microsecond, UTC), non-null)
         let received_col =
-            TimestampMillisecondArray::from(vec![Some(record.received_at.timestamp_millis())])
+            TimestampMicrosecondArray::from(vec![Some(record.received_at.timestamp_micros())])
                 .with_timezone("UTC");
 
         // col 4: fields (Utf8, non-null) — JSON-serialized
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn generic_sink_null_host_produces_null_in_batch() {
-        use arrow::array::{Array, StringArray, TimestampMillisecondArray};
+        use arrow::array::{Array, StringArray, TimestampMicrosecondArray};
         let mut rec = make_record("mytype");
         rec.host = None;
         rec.time = None;
@@ -278,9 +278,26 @@ mod tests {
             .column_by_name("time")
             .unwrap()
             .as_any()
-            .downcast_ref::<TimestampMillisecondArray>()
+            .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
         assert!(time_col.is_null(0), "null time must produce Arrow null");
+    }
+
+    #[test]
+    fn schema_time_and_received_at_are_microsecond_timestamps() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        let schema = generic_schema();
+        let expected = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        assert_eq!(
+            schema.field_with_name("time").unwrap().data_type(),
+            &expected
+        );
+        assert!(schema.field_with_name("time").unwrap().is_nullable());
+        assert_eq!(
+            schema.field_with_name("received_at").unwrap().data_type(),
+            &expected
+        );
+        assert!(!schema.field_with_name("received_at").unwrap().is_nullable());
     }
 
     #[tokio::test]
