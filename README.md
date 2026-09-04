@@ -340,7 +340,7 @@ The `[ipfix.s3]` block is optional; when absent, flows are handled by the defaul
 | template_id | UInt16 | no |
 | protocol_version | UInt8 | no |
 | exporter | String | no |
-| export_time | String (RFC 3339) | no |
+| export_time | Timestamp(µs, UTC) | no |
 | src_addr | String | yes |
 | dst_addr | String | yes |
 | src_port | UInt16 | yes |
@@ -348,8 +348,8 @@ The `[ipfix.s3]` block is optional; when absent, flows are handled by the defaul
 | ip_protocol | UInt8 | yes |
 | octet_delta_count | UInt64 | yes |
 | packet_delta_count | UInt64 | yes |
-| flow_start | String (RFC 3339) | yes |
-| flow_end | String (RFC 3339) | yes |
+| flow_start | Timestamp(µs, UTC) | yes |
+| flow_end | Timestamp(µs, UTC) | yes |
 | tcp_flags | UInt8 | yes |
 | input_interface | UInt32 | yes |
 | output_interface | UInt32 | yes |
