@@ -104,7 +104,7 @@ This is a best-effort, total mapping: no information is silently discarded.
 
 | Arrow column | Arrow type | Nullable | Source JSON key |
 |---|---|---|---|
-| `ts` | Float64 | yes | `ts` |
+| `ts` | Timestamp(µs, UTC) | yes | `ts` |
 | `uid` | Utf8 | yes | `uid` |
 | `id_orig_h` | Utf8 | yes | `id.orig_h` |
 | `id_orig_p` | UInt16 | yes | `id.orig_p` |
@@ -125,7 +125,7 @@ This is a best-effort, total mapping: no information is silently discarded.
 
 | Arrow column | Arrow type | Nullable | Source JSON key |
 |---|---|---|---|
-| `ts` | Float64 | yes | `ts` |
+| `ts` | Timestamp(µs, UTC) | yes | `ts` |
 | `uid` | Utf8 | yes | `uid` |
 | `id_orig_h` | Utf8 | yes | `id.orig_h` |
 | `id_orig_p` | UInt16 | yes | `id.orig_p` |
@@ -162,17 +162,17 @@ For stream names not in the registry (including `"unknown"`):
 
 | Arrow column | Arrow type | Nullable |
 |---|---|---|
-| `ts` | Float64 | yes |
+| `ts` | Timestamp(µs, UTC) | yes |
 | `uid` | Utf8 | yes |
 | `id_orig_h` | Utf8 | yes |
 | `id_orig_p` | UInt16 | yes |
 | `id_resp_h` | Utf8 | yes |
 | `id_resp_p` | UInt16 | yes |
 | `log_path` | Utf8 | **no** |
-| `ingest_time` | Utf8 | **no** |
+| `ingest_time` | Timestamp(µs, UTC) | **no** |
 | `payload` | Utf8 | **no** |
 
-The full JSON object is stored verbatim in `payload`. `log_path` holds the actual (sanitised) path; `ingest_time` is RFC 3339.
+The full JSON object is stored verbatim in `payload`. `log_path` holds the actual (sanitised) path; `ingest_time` is a microsecond-precision UTC timestamp.
 
 ## 5. S3 Persistence (`src/forwarding/zeek_s3.rs`)
 

@@ -297,6 +297,8 @@ Each incoming JSON record is identified by its `_path` field (e.g. `"conn"`, `"d
 
 Note: Zeek JSON uses dot-notation for connection-id fields (`id.orig_h`, etc.); the Arrow column names use underscores (`id_orig_h`). All typed schemas include a non-null `_extra` JSON column that captures every field not listed above, as well as any field whose runtime type does not match the expected Arrow type (best-effort, type-mismatch-safe mapping).
 
+`ts` is written as a microsecond-precision UTC timestamp (Arrow `Timestamp(Microsecond, UTC)`), suitable as an Iceberg day/month/year/hour partition-transform source.
+
 **Envelope fallback**:
 Records with a `_path` value that does not match one of the six curated stream names (including `"unknown"`) are routed to a generic envelope schema with columns: `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `log_path`, `ingest_time`, `payload`. The full JSON object is stored verbatim in `payload`.
 
