@@ -189,6 +189,25 @@ fn json_f64(v: &serde_json::Value, key: &str) -> Option<f64> {
     v.get(key).and_then(|f| f.as_f64())
 }
 
+/// Extract an epoch-seconds float and convert it to microseconds.
+///
+/// Returns `None` if the key is absent, is not a number, or is outside the
+/// range representable as `i64` microseconds. JSON is a trust boundary: a
+/// legal-but-absurd value like `1e300` would saturate a bare `as i64` cast
+/// to `i64::MAX`, presenting a nonsense timestamp as real data. Callers
+/// treat `None` exactly as they already treat a type mismatch.
+fn json_ts_micros(v: &serde_json::Value, key: &str) -> Option<i64> {
+    let secs = v.get(key).and_then(|f| f.as_f64())?;
+    let micros = (secs * 1e6).round();
+    // NaN/Infinity cannot arrive from JSON, but the range check below also
+    // rejects them, so the guard holds regardless of the source.
+    if micros >= (i64::MIN as f64) && micros <= (i64::MAX as f64) {
+        Some(micros as i64)
+    } else {
+        None
+    }
+}
+
 /// Extract a u64 value from JSON (accepts non-negative integer).
 fn json_u64(v: &serde_json::Value, key: &str) -> Option<u64> {
     v.get(key).and_then(|f| f.as_u64())
@@ -1635,6 +1654,45 @@ mod tests {
             "type-mismatched uid must appear in _extra"
         );
         assert_eq!(extra_val["uid"], 42, "uid value preserved in _extra");
+    }
+
+    // --- json_ts_micros helper ---
+
+    #[test]
+    fn json_ts_micros_converts_epoch_seconds() {
+        let v = serde_json::json!({ "ts": 1700000000.0 });
+        assert_eq!(json_ts_micros(&v, "ts"), Some(1_700_000_000_000_000));
+    }
+
+    #[test]
+    fn json_ts_micros_preserves_sub_second_precision() {
+        let v = serde_json::json!({ "ts": 1717171717.123456 });
+        // f64 resolves to ~0.21us at this magnitude, so rounding to whole
+        // microseconds is lossless relative to what the source can represent.
+        assert_eq!(json_ts_micros(&v, "ts"), Some(1_717_171_717_123_456));
+    }
+
+    #[test]
+    fn json_ts_micros_returns_none_for_absent_key() {
+        let v = serde_json::json!({ "uid": "C1" });
+        assert_eq!(json_ts_micros(&v, "ts"), None);
+    }
+
+    #[test]
+    fn json_ts_micros_returns_none_for_non_numeric() {
+        let v = serde_json::json!({ "ts": "not a number" });
+        assert_eq!(json_ts_micros(&v, "ts"), None);
+    }
+
+    #[test]
+    fn json_ts_micros_rejects_out_of_range() {
+        // 1e300 is legal JSON. A bare `as i64` cast would saturate to
+        // i64::MAX and present a nonsense timestamp as real data.
+        let v = serde_json::json!({ "ts": 1e300 });
+        assert_eq!(json_ts_micros(&v, "ts"), None);
+
+        let v = serde_json::json!({ "ts": -1e300 });
+        assert_eq!(json_ts_micros(&v, "ts"), None);
     }
 
     #[test]
