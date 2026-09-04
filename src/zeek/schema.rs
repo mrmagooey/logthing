@@ -186,14 +186,22 @@ pub fn notice_schema() -> Arc<Schema> {
 pub fn envelope_schema() -> Arc<Schema> {
     static S: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         Arc::new(Schema::new(vec![
-            Field::new("ts", DataType::Float64, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
             Field::new("uid", DataType::Utf8, true),
             Field::new("id_orig_h", DataType::Utf8, true),
             Field::new("id_orig_p", DataType::UInt16, true),
             Field::new("id_resp_h", DataType::Utf8, true),
             Field::new("id_resp_p", DataType::UInt16, true),
             Field::new("log_path", DataType::Utf8, false),
-            Field::new("ingest_time", DataType::Utf8, false),
+            Field::new(
+                "ingest_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
             Field::new("payload", DataType::Utf8, false),
         ]))
     });
@@ -1045,23 +1053,24 @@ fn map_notice(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
 fn map_envelope(value: &serde_json::Value, log_path: &str) -> anyhow::Result<RecordBatch> {
     let schema = envelope_schema();
 
-    let ts = json_f64(value, "ts");
+    let ts = json_ts_micros(value, "ts");
     let uid = json_str(value, "uid");
     let id_orig_h = json_str(value, "id.orig_h");
     let id_orig_p = json_u16(value, "id.orig_p");
     let id_resp_h = json_str(value, "id.resp_h");
     let id_resp_p = json_u16(value, "id.resp_p");
-    let ingest_time = chrono::Utc::now().to_rfc3339();
+    let ingest_time = chrono::Utc::now().timestamp_micros();
     let payload = value.to_string();
 
-    let mut b_ts = Float64Builder::new();
+    let ts_type = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+    let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(ts_type.clone());
     let mut b_uid = StringBuilder::new();
     let mut b_id_orig_h = StringBuilder::new();
     let mut b_id_orig_p = UInt16Builder::new();
     let mut b_id_resp_h = StringBuilder::new();
     let mut b_id_resp_p = UInt16Builder::new();
     let mut b_log_path = StringBuilder::new();
-    let mut b_ingest_time = StringBuilder::new();
+    let mut b_ingest_time = TimestampMicrosecondBuilder::new().with_data_type(ts_type);
     let mut b_payload = StringBuilder::new();
 
     b_ts.append_option(ts);
@@ -1071,7 +1080,7 @@ fn map_envelope(value: &serde_json::Value, log_path: &str) -> anyhow::Result<Rec
     b_id_resp_h.append_option(id_resp_h.as_deref());
     b_id_resp_p.append_option(id_resp_p);
     b_log_path.append_value(log_path);
-    b_ingest_time.append_value(&ingest_time);
+    b_ingest_time.append_value(ingest_time);
     b_payload.append_value(&payload);
 
     let columns: Vec<ArrayRef> = vec![
@@ -1809,5 +1818,52 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(log_path.value(0), "weird");
+    }
+
+    #[test]
+    fn envelope_schema_ts_and_ingest_time_are_microsecond_timestamps() {
+        let s = envelope_schema();
+        let expected = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+
+        let f = s.field_with_name("ts").unwrap();
+        assert_eq!(*f.data_type(), expected);
+        assert!(f.is_nullable());
+
+        let f = s.field_with_name("ingest_time").unwrap();
+        assert_eq!(*f.data_type(), expected);
+        assert!(!f.is_nullable()); // ingest_time is server-generated, never null
+    }
+
+    #[test]
+    fn envelope_out_of_range_ts_is_null_and_preserved_in_payload() {
+        let v = serde_json::json!({ "ts": 1e300, "uid": "C1" });
+        let batch = map_envelope(&v, "weird").unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        let ts = batch
+            .column_by_name("ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert!(ts.is_null(0));
+
+        // map_envelope has no `mismatches` mechanism; it stores the entire raw
+        // record in `payload` unconditionally, which preserves the value.
+        let payload = batch
+            .column_by_name("payload")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        // serde_json renders 1e300 as "1e+300", so parse and compare the
+        // value rather than substring-matching the literal "1e300".
+        let payload_json: serde_json::Value = serde_json::from_str(payload.value(0)).unwrap();
+        assert_eq!(
+            payload_json.get("ts"),
+            Some(&serde_json::json!(1e300)),
+            "the raw ts value must be preserved in payload, got: {}",
+            payload.value(0)
+        );
     }
 }
