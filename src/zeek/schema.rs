@@ -2,9 +2,10 @@
 //! plus a generic envelope fallback for unmodelled stream types.
 
 use arrow::array::{
-    ArrayRef, Float64Builder, StringBuilder, UInt16Builder, UInt32Builder, UInt64Builder,
+    ArrayRef, Float64Builder, StringBuilder, TimestampMicrosecondBuilder, UInt16Builder,
+    UInt32Builder, UInt64Builder,
 };
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -31,7 +32,11 @@ pub struct SchemaEntry {
 pub fn conn_schema() -> Arc<Schema> {
     static S: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         Arc::new(Schema::new(vec![
-            Field::new("ts", DataType::Float64, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
             Field::new("uid", DataType::Utf8, true),
             Field::new("id_orig_h", DataType::Utf8, true),
             Field::new("id_orig_p", DataType::UInt16, true),
@@ -56,7 +61,11 @@ pub fn conn_schema() -> Arc<Schema> {
 pub fn dns_schema() -> Arc<Schema> {
     static S: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         Arc::new(Schema::new(vec![
-            Field::new("ts", DataType::Float64, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
             Field::new("uid", DataType::Utf8, true),
             Field::new("id_orig_h", DataType::Utf8, true),
             Field::new("id_orig_p", DataType::UInt16, true),
@@ -79,7 +88,11 @@ pub fn dns_schema() -> Arc<Schema> {
 pub fn http_schema() -> Arc<Schema> {
     static S: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         Arc::new(Schema::new(vec![
-            Field::new("ts", DataType::Float64, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
             Field::new("uid", DataType::Utf8, true),
             Field::new("id_orig_h", DataType::Utf8, true),
             Field::new("id_orig_p", DataType::UInt16, true),
@@ -102,7 +115,11 @@ pub fn http_schema() -> Arc<Schema> {
 pub fn ssl_schema() -> Arc<Schema> {
     static S: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         Arc::new(Schema::new(vec![
-            Field::new("ts", DataType::Float64, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
             Field::new("uid", DataType::Utf8, true),
             Field::new("id_orig_h", DataType::Utf8, true),
             Field::new("id_orig_p", DataType::UInt16, true),
@@ -123,7 +140,11 @@ pub fn ssl_schema() -> Arc<Schema> {
 pub fn files_schema() -> Arc<Schema> {
     static S: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         Arc::new(Schema::new(vec![
-            Field::new("ts", DataType::Float64, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
             Field::new("fuid", DataType::Utf8, true),
             Field::new("tx_hosts", DataType::Utf8, true),
             Field::new("rx_hosts", DataType::Utf8, true),
@@ -141,7 +162,11 @@ pub fn files_schema() -> Arc<Schema> {
 pub fn notice_schema() -> Arc<Schema> {
     static S: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         Arc::new(Schema::new(vec![
-            Field::new("ts", DataType::Float64, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
             Field::new("uid", DataType::Utf8, true),
             Field::new("id_orig_h", DataType::Utf8, true),
             Field::new("id_orig_p", DataType::UInt16, true),
@@ -261,7 +286,7 @@ fn build_extra(value: &serde_json::Value, promoted: &[&str], mismatch_keys: &[&s
 /// fields, so they can be reused across many records via `finish(&mut
 /// self)` instead of reallocated per record or per batch.
 pub(crate) struct ConnAccumulator {
-    b_ts: Float64Builder,
+    b_ts: TimestampMicrosecondBuilder,
     b_uid: StringBuilder,
     b_id_orig_h: StringBuilder,
     b_id_orig_p: UInt16Builder,
@@ -283,7 +308,10 @@ pub(crate) struct ConnAccumulator {
 impl ConnAccumulator {
     pub(crate) fn new() -> Self {
         Self {
-            b_ts: Float64Builder::new(),
+            b_ts: TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            )),
             b_uid: StringBuilder::new(),
             b_id_orig_h: StringBuilder::new(),
             b_id_orig_p: UInt16Builder::new(),
@@ -327,7 +355,7 @@ impl ConnAccumulator {
         ];
         let mut mismatches: Vec<&str> = Vec::new();
 
-        let ts = json_f64(value, "ts");
+        let ts = json_ts_micros(value, "ts");
         if value.get("ts").is_some() && ts.is_none() {
             mismatches.push("ts");
         }
@@ -493,7 +521,7 @@ fn map_dns(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     ];
     let mut mismatches: Vec<&str> = Vec::new();
 
-    let ts = json_f64(value, "ts");
+    let ts = json_ts_micros(value, "ts");
     if value.get("ts").is_some() && ts.is_none() {
         mismatches.push("ts");
     }
@@ -548,7 +576,8 @@ fn map_dns(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
 
     let extra = build_extra(value, promoted, &mismatches);
 
-    let mut b_ts = Float64Builder::new();
+    let mut b_ts = TimestampMicrosecondBuilder::new()
+        .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
     let mut b_uid = StringBuilder::new();
     let mut b_id_orig_h = StringBuilder::new();
     let mut b_id_orig_p = UInt16Builder::new();
@@ -616,7 +645,7 @@ fn map_http(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     ];
     let mut mismatches: Vec<&str> = Vec::new();
 
-    let ts = json_f64(value, "ts");
+    let ts = json_ts_micros(value, "ts");
     if value.get("ts").is_some() && ts.is_none() {
         mismatches.push("ts");
     }
@@ -671,7 +700,8 @@ fn map_http(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
 
     let extra = build_extra(value, promoted, &mismatches);
 
-    let mut b_ts = Float64Builder::new();
+    let mut b_ts = TimestampMicrosecondBuilder::new()
+        .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
     let mut b_uid = StringBuilder::new();
     let mut b_id_orig_h = StringBuilder::new();
     let mut b_id_orig_p = UInt16Builder::new();
@@ -737,7 +767,7 @@ fn map_ssl(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     ];
     let mut mismatches: Vec<&str> = Vec::new();
 
-    let ts = json_f64(value, "ts");
+    let ts = json_ts_micros(value, "ts");
     if value.get("ts").is_some() && ts.is_none() {
         mismatches.push("ts");
     }
@@ -784,7 +814,8 @@ fn map_ssl(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
 
     let extra = build_extra(value, promoted, &mismatches);
 
-    let mut b_ts = Float64Builder::new();
+    let mut b_ts = TimestampMicrosecondBuilder::new()
+        .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
     let mut b_uid = StringBuilder::new();
     let mut b_id_orig_h = StringBuilder::new();
     let mut b_id_orig_p = UInt16Builder::new();
@@ -841,7 +872,7 @@ fn map_files(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     ];
     let mut mismatches: Vec<&str> = Vec::new();
 
-    let ts = json_f64(value, "ts");
+    let ts = json_ts_micros(value, "ts");
     if value.get("ts").is_some() && ts.is_none() {
         mismatches.push("ts");
     }
@@ -876,7 +907,8 @@ fn map_files(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
 
     let extra = build_extra(value, promoted, &mismatches);
 
-    let mut b_ts = Float64Builder::new();
+    let mut b_ts = TimestampMicrosecondBuilder::new()
+        .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
     let mut b_fuid = StringBuilder::new();
     let mut b_tx_hosts = StringBuilder::new();
     let mut b_rx_hosts = StringBuilder::new();
@@ -926,7 +958,7 @@ fn map_notice(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     ];
     let mut mismatches: Vec<&str> = Vec::new();
 
-    let ts = json_f64(value, "ts");
+    let ts = json_ts_micros(value, "ts");
     if value.get("ts").is_some() && ts.is_none() {
         mismatches.push("ts");
     }
@@ -969,7 +1001,8 @@ fn map_notice(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
 
     let extra = build_extra(value, promoted, &mismatches);
 
-    let mut b_ts = Float64Builder::new();
+    let mut b_ts = TimestampMicrosecondBuilder::new()
+        .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
     let mut b_uid = StringBuilder::new();
     let mut b_id_orig_h = StringBuilder::new();
     let mut b_id_orig_p = UInt16Builder::new();
@@ -1129,7 +1162,7 @@ pub fn get_schema_entry(log_path: &str) -> Arc<SchemaEntry> {
 mod tests {
     use super::*;
     use crate::forwarding::buffered_writer::RecordBatchAccumulator;
-    use arrow::array::{Array, Float64Array, StringArray, UInt16Array, UInt64Array};
+    use arrow::array::{Array, StringArray, TimestampMicrosecondArray, UInt16Array, UInt64Array};
 
     // --- conn schema tests ---
 
@@ -1191,7 +1224,10 @@ mod tests {
         let s = conn_schema();
         assert_eq!(s.fields().len(), 16);
         let f = s.field_with_name("ts").unwrap();
-        assert_eq!(*f.data_type(), DataType::Float64);
+        assert_eq!(
+            *f.data_type(),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
         assert!(f.is_nullable());
         let f = s.field_with_name("_extra").unwrap();
         assert_eq!(*f.data_type(), DataType::Utf8);
@@ -1238,9 +1274,9 @@ mod tests {
             .column_by_name("ts")
             .unwrap()
             .as_any()
-            .downcast_ref::<Float64Array>()
+            .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
-        assert!((ts.value(0) - 1700000000.123).abs() < 0.001);
+        assert_eq!(ts.value(0), 1_700_000_000_123_000);
 
         let orig_p = batch
             .column_by_name("id_orig_p")
@@ -1281,7 +1317,7 @@ mod tests {
             .column_by_name("ts")
             .unwrap()
             .as_any()
-            .downcast_ref::<Float64Array>()
+            .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
         assert!(ts.is_null(0), "absent ts should be null");
         let orig_bytes = batch
@@ -1291,6 +1327,49 @@ mod tests {
             .downcast_ref::<UInt64Array>()
             .unwrap();
         assert!(orig_bytes.is_null(0), "absent orig_bytes should be null");
+    }
+
+    #[test]
+    fn conn_ts_is_written_as_microseconds() {
+        let v = serde_json::json!({ "ts": 1700000000.0, "uid": "C1" });
+        let batch = map_conn(&v).unwrap();
+        let col = batch
+            .column_by_name("ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("ts column should be TimestampMicrosecondArray");
+        assert_eq!(col.value(0), 1_700_000_000_000_000);
+    }
+
+    #[test]
+    fn conn_out_of_range_ts_is_null_and_preserved_in_extra() {
+        let v = serde_json::json!({ "ts": 1e300, "uid": "C1" });
+        let batch = map_conn(&v).unwrap();
+        // The record is still written...
+        assert_eq!(batch.num_rows(), 1);
+        // ...the ts column is null...
+        let col = batch
+            .column_by_name("ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert!(col.is_null(0));
+        // ...and the raw value survives in _extra via the existing
+        // mismatches/build_extra path.
+        let extra = batch
+            .column_by_name("_extra")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let extra_json: serde_json::Value = serde_json::from_str(extra.value(0)).unwrap();
+        assert!(
+            extra_json.get("ts").is_some(),
+            "the rejected raw ts value must be preserved in _extra, got: {}",
+            extra.value(0)
+        );
     }
 
     #[test]
