@@ -62,8 +62,7 @@ pub fn structured_syslog_record_to_batch(
     let hostname = Arc::new(StringArray::from(vec![rec.hostname.clone()])) as ArrayRef;
     let app_name = Arc::new(StringArray::from(vec![rec.app_name.clone()])) as ArrayRef;
     let received_at = Arc::new(
-        TimestampMicrosecondArray::from(vec![rec.received_at.timestamp_micros()])
-            .with_timezone(tz.clone()),
+        TimestampMicrosecondArray::from(vec![rec.received_at.timestamp_micros()]).with_timezone(tz),
     ) as ArrayRef;
     let payload_type = Arc::new(StringArray::from(vec![rec.payload_type])) as ArrayRef;
     let parsed = Arc::new(StringArray::from(vec![
