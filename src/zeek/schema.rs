@@ -1440,6 +1440,12 @@ mod tests {
         s.field_with_name("answers").expect("answers must exist");
         let f = s.field_with_name("trans_id").unwrap();
         assert_eq!(*f.data_type(), DataType::UInt32);
+        let f = s.field_with_name("ts").unwrap();
+        assert_eq!(
+            *f.data_type(),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(f.is_nullable());
     }
 
     #[test]
@@ -1489,6 +1495,17 @@ mod tests {
     // --- http schema tests ---
 
     #[test]
+    fn http_schema_ts_is_nullable_microsecond_timestamp() {
+        let s = http_schema();
+        let f = s.field_with_name("ts").unwrap();
+        assert_eq!(
+            *f.data_type(),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(f.is_nullable());
+    }
+
+    #[test]
     fn http_mapper_extracts_status_code_and_uri() {
         let json = serde_json::json!({
             "_path": "http",
@@ -1526,6 +1543,17 @@ mod tests {
     // --- ssl schema tests ---
 
     #[test]
+    fn ssl_schema_ts_is_nullable_microsecond_timestamp() {
+        let s = ssl_schema();
+        let f = s.field_with_name("ts").unwrap();
+        assert_eq!(
+            *f.data_type(),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(f.is_nullable());
+    }
+
+    #[test]
     fn ssl_mapper_extracts_server_name_and_cipher() {
         let json = serde_json::json!({
             "_path": "ssl",
@@ -1561,6 +1589,17 @@ mod tests {
     // --- files schema tests ---
 
     #[test]
+    fn files_schema_ts_is_nullable_microsecond_timestamp() {
+        let s = files_schema();
+        let f = s.field_with_name("ts").unwrap();
+        assert_eq!(
+            *f.data_type(),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(f.is_nullable());
+    }
+
+    #[test]
     fn files_mapper_extracts_mime_type_and_total_bytes() {
         let json = serde_json::json!({
             "_path": "files",
@@ -1591,6 +1630,17 @@ mod tests {
     }
 
     // --- notice schema tests ---
+
+    #[test]
+    fn notice_schema_ts_is_nullable_microsecond_timestamp() {
+        let s = notice_schema();
+        let f = s.field_with_name("ts").unwrap();
+        assert_eq!(
+            *f.data_type(),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(f.is_nullable());
+    }
 
     #[test]
     fn notice_mapper_extracts_note_and_msg() {

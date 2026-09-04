@@ -110,6 +110,14 @@ async fn syslog_messages_appear_as_parquet_on_local_disk() {
     let builder = ParquetRecordBatchReaderBuilder::try_new(buf).unwrap();
     let schema = builder.schema().clone();
     assert_eq!(schema.fields().len(), 11);
+    assert_eq!(
+        schema.field_with_name("timestamp").unwrap().data_type(),
+        &arrow::datatypes::DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            Some("UTC".into())
+        ),
+        "on-disk Parquet timestamp column must be a microsecond UTC timestamp"
+    );
 
     let mut reader = builder.build().unwrap();
     let rb = reader

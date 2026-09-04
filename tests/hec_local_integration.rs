@@ -97,6 +97,16 @@ async fn hec_records_appear_as_parquet_on_local_disk() {
     let builder = ParquetRecordBatchReaderBuilder::try_new(buf).unwrap();
     let schema = builder.schema().clone();
     assert_eq!(schema.fields().len(), 5);
+    for col in ["time", "received_at"] {
+        assert_eq!(
+            schema.field_with_name(col).unwrap().data_type(),
+            &arrow::datatypes::DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into())
+            ),
+            "on-disk Parquet '{col}' column must be a microsecond UTC timestamp"
+        );
+    }
 
     let mut reader = builder.build().unwrap();
     let rb = reader
