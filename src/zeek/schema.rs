@@ -590,8 +590,10 @@ fn map_dns(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
 
     let extra = build_extra(value, promoted, &mismatches);
 
-    let mut b_ts = TimestampMicrosecondBuilder::new()
-        .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
+    let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+        TimeUnit::Microsecond,
+        Some("UTC".into()),
+    ));
     let mut b_uid = StringBuilder::new();
     let mut b_id_orig_h = StringBuilder::new();
     let mut b_id_orig_p = UInt16Builder::new();
@@ -714,8 +716,10 @@ fn map_http(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
 
     let extra = build_extra(value, promoted, &mismatches);
 
-    let mut b_ts = TimestampMicrosecondBuilder::new()
-        .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
+    let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+        TimeUnit::Microsecond,
+        Some("UTC".into()),
+    ));
     let mut b_uid = StringBuilder::new();
     let mut b_id_orig_h = StringBuilder::new();
     let mut b_id_orig_p = UInt16Builder::new();
@@ -828,8 +832,10 @@ fn map_ssl(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
 
     let extra = build_extra(value, promoted, &mismatches);
 
-    let mut b_ts = TimestampMicrosecondBuilder::new()
-        .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
+    let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+        TimeUnit::Microsecond,
+        Some("UTC".into()),
+    ));
     let mut b_uid = StringBuilder::new();
     let mut b_id_orig_h = StringBuilder::new();
     let mut b_id_orig_p = UInt16Builder::new();
@@ -921,8 +927,10 @@ fn map_files(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
 
     let extra = build_extra(value, promoted, &mismatches);
 
-    let mut b_ts = TimestampMicrosecondBuilder::new()
-        .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
+    let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+        TimeUnit::Microsecond,
+        Some("UTC".into()),
+    ));
     let mut b_fuid = StringBuilder::new();
     let mut b_tx_hosts = StringBuilder::new();
     let mut b_rx_hosts = StringBuilder::new();
@@ -1015,8 +1023,10 @@ fn map_notice(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
 
     let extra = build_extra(value, promoted, &mismatches);
 
-    let mut b_ts = TimestampMicrosecondBuilder::new()
-        .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
+    let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+        TimeUnit::Microsecond,
+        Some("UTC".into()),
+    ));
     let mut b_uid = StringBuilder::new();
     let mut b_id_orig_h = StringBuilder::new();
     let mut b_id_orig_p = UInt16Builder::new();
