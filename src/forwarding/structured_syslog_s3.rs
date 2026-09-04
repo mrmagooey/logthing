@@ -232,6 +232,47 @@ mod tests {
     }
 
     #[test]
+    fn absent_timestamp_is_null() {
+        use arrow::array::{Array, TimestampMicrosecondArray};
+        let mut rec = sample_record("cef");
+        rec.timestamp = None;
+        let batch = structured_syslog_record_to_batch(&rec).unwrap();
+        let col = batch
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert!(col.is_null(0));
+    }
+
+    #[test]
+    fn timestamp_and_received_at_are_written_as_microseconds() {
+        use arrow::array::TimestampMicrosecondArray;
+        use chrono::TimeZone;
+        let mut rec = sample_record("cef");
+        rec.timestamp = Some(chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+        rec.received_at = chrono::Utc.timestamp_opt(1_700_000_001, 0).unwrap();
+        let batch = structured_syslog_record_to_batch(&rec).unwrap();
+
+        let ts = batch
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ts.value(0), 1_700_000_000_000_000);
+
+        let received = batch
+            .column_by_name("received_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(received.value(0), 1_700_000_001_000_000);
+    }
+
+    #[test]
     fn sink_partition_returns_payload_type() {
         let sink = StructuredSyslogSink;
         let rec = sample_record("cef");

@@ -300,6 +300,38 @@ mod tests {
         assert!(!schema.field_with_name("received_at").unwrap().is_nullable());
     }
 
+    #[test]
+    fn time_and_received_at_are_written_as_microseconds() {
+        use arrow::array::TimestampMicrosecondArray;
+        use chrono::TimeZone;
+        // 123_456 microseconds past the second — unmistakable from a
+        // millisecond-truncated value (which would read 1_700_000_000_123).
+        let dt = chrono::Utc
+            .timestamp_opt(1_700_000_000, 123_456_000)
+            .unwrap();
+        let mut rec = make_record("access_log");
+        rec.time = Some(dt);
+        rec.received_at = dt;
+        let schema = GenericSink.schema(Some("access_log"));
+        let batch = GenericSink.to_record_batch(&rec, &schema).unwrap();
+
+        let time_col = batch
+            .column_by_name("time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(time_col.value(0), 1_700_000_000_123_456);
+
+        let received_col = batch
+            .column_by_name("received_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(received_col.value(0), 1_700_000_000_123_456);
+    }
+
     #[tokio::test]
     async fn writer_partitions_by_sourcetype() {
         let sink = unreachable_sink().await;
