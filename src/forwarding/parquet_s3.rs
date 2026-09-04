@@ -10,8 +10,8 @@
 use crate::config::WefS3Config;
 use crate::forwarding::buffered_writer::ParquetSink;
 use crate::models::WindowsEvent;
-use arrow::array::{ArrayRef, StringArray, UInt32Array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
@@ -53,7 +53,11 @@ impl ParquetSink for WefSink {
     fn schema(&self, _partition: Option<&str>) -> Arc<arrow_schema::Schema> {
         Arc::new(Schema::new(vec![
             Field::new("event_id", DataType::UInt32, false),
-            Field::new("timestamp", DataType::Utf8, false),
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
             Field::new("source_host", DataType::Utf8, false),
             Field::new("subscription_id", DataType::Utf8, true),
             Field::new("event_data", DataType::Utf8, false),
@@ -79,7 +83,10 @@ impl ParquetSink for WefSink {
             schema.clone(),
             vec![
                 Arc::new(UInt32Array::from(vec![parsed.event_id])) as ArrayRef,
-                Arc::new(StringArray::from(vec![record.received_at.to_rfc3339()])) as ArrayRef,
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![record.received_at.timestamp_micros()])
+                        .with_timezone(Arc::<str>::from("UTC")),
+                ) as ArrayRef,
                 Arc::new(StringArray::from(vec![record.source_host.as_str()])) as ArrayRef,
                 Arc::new(StringArray::from(vec![record.subscription_id.as_deref()])) as ArrayRef,
                 Arc::new(StringArray::from(vec![event_data.as_str()])) as ArrayRef,
@@ -209,6 +216,18 @@ mod tests {
     }
 
     #[test]
+    fn schema_timestamp_is_microsecond_timestamp() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        let schema = WefSink.schema(None);
+        let f = schema.field_with_name("timestamp").unwrap();
+        assert_eq!(
+            f.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(!f.is_nullable());
+    }
+
+    #[test]
     fn wef_sink_partition_uses_event_id() {
         let event = make_parsed_event(4624);
         assert_eq!(
@@ -247,6 +266,14 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(host_col.value(0), "host");
+
+        let ts_col = batch
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("timestamp column should be TimestampMicrosecondArray");
+        assert_eq!(ts_col.value(0), event.received_at.timestamp_micros());
     }
 
     #[test]
