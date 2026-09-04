@@ -234,7 +234,13 @@ fn json_ts_micros(v: &serde_json::Value, key: &str) -> Option<i64> {
     let micros = (secs * 1e6).round();
     // NaN/Infinity cannot arrive from JSON, but the range check below also
     // rejects them, so the guard holds regardless of the source.
-    if micros >= (i64::MIN as f64) && micros <= (i64::MAX as f64) {
+    //
+    // Upper bound is a strict `<`, not `<=`: i64::MAX (2^63 - 1) is not
+    // exactly representable as f64 (ULP is 1024 at that magnitude), so
+    // `i64::MAX as f64` rounds up to 2^63. A `micros` value of exactly
+    // 2^63 would pass `<=` but is already out of i64 range, so `as i64`
+    // would saturate it to i64::MAX instead of being rejected here.
+    if micros >= (i64::MIN as f64) && micros < (i64::MAX as f64) {
         Some(micros as i64)
     } else {
         None
@@ -1781,6 +1787,22 @@ mod tests {
 
         let v = serde_json::json!({ "ts": -1e300 });
         assert_eq!(json_ts_micros(&v, "ts"), None);
+    }
+
+    #[test]
+    fn json_ts_micros_rejects_value_at_i64_max_boundary() {
+        // i64::MAX (2^63 - 1) is not exactly representable as f64 -- the
+        // ULP at that magnitude is 1024, so `i64::MAX as f64` rounds up to
+        // 2^63. A ts of 9223372036854.775 seconds rounds to exactly
+        // 2^63 microseconds, which is one past the largest valid i64 and
+        // must be rejected, not saturated to i64::MAX by `as i64`.
+        let v = serde_json::json!({ "ts": 9223372036854.775 });
+        assert_eq!(json_ts_micros(&v, "ts"), None);
+
+        // A large but genuinely representable value just under the
+        // boundary must still convert -- the fix must not over-reject.
+        let v = serde_json::json!({ "ts": 9223372036.854773 });
+        assert_eq!(json_ts_micros(&v, "ts"), Some(9_223_372_036_854_772));
     }
 
     #[test]
