@@ -5,9 +5,10 @@ use crate::forwarding::buffered_writer::ParquetSink;
 use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::sflow::{SampleType, SflowRecord};
 use arrow::array::{
-    ArrayRef, StringBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
+    ArrayRef, StringBuilder, TimestampMicrosecondBuilder, UInt8Builder, UInt16Builder,
+    UInt32Builder, UInt64Builder,
 };
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use std::sync::{Arc, LazyLock};
 
@@ -17,7 +18,11 @@ static FLOW_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("sample_type", DataType::Utf8, false),
         Field::new("exporter", DataType::Utf8, false),
-        Field::new("received_at", DataType::Utf8, false),
+        Field::new(
+            "received_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
         Field::new("src_addr", DataType::Utf8, true),
         Field::new("dst_addr", DataType::Utf8, true),
         Field::new("src_port", DataType::UInt16, true),
@@ -34,7 +39,11 @@ static COUNTER_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("sample_type", DataType::Utf8, false),
         Field::new("exporter", DataType::Utf8, false),
-        Field::new("received_at", DataType::Utf8, false),
+        Field::new(
+            "received_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
         Field::new("if_index", DataType::UInt32, true),
         Field::new("if_type", DataType::UInt32, true),
         Field::new("if_speed", DataType::UInt64, true),
@@ -104,8 +113,11 @@ fn flow_to_record_batch(r: &SflowRecord, schema: &Arc<Schema>) -> anyhow::Result
             b.finish()
         }),
         Arc::new({
-            let mut b = StringBuilder::new();
-            b.append_value(r.received_at.to_rfc3339());
+            let mut b = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ));
+            b.append_value(r.received_at.timestamp_micros());
             b.finish()
         }),
         Arc::new({
@@ -171,8 +183,11 @@ fn counter_to_record_batch(r: &SflowRecord, schema: &Arc<Schema>) -> anyhow::Res
             b.finish()
         }),
         Arc::new({
-            let mut b = StringBuilder::new();
-            b.append_value(r.received_at.to_rfc3339());
+            let mut b = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ));
+            b.append_value(r.received_at.timestamp_micros());
             b.finish()
         }),
         Arc::new({
@@ -422,6 +437,12 @@ mod tests {
                 "flow schema missing column '{col}'"
             );
         }
+        let f = schema.field_with_name("received_at").unwrap();
+        assert_eq!(
+            f.data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(!f.is_nullable());
     }
 
     #[test]
@@ -449,6 +470,12 @@ mod tests {
                 "counter schema missing column '{col}'"
             );
         }
+        let f = schema.field_with_name("received_at").unwrap();
+        assert_eq!(
+            f.data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(!f.is_nullable());
     }
 
     #[test]
@@ -474,6 +501,14 @@ mod tests {
             .downcast_ref::<UInt32Array>()
             .unwrap();
         assert_eq!(sr.value(0), 512);
+
+        let received_at = batch
+            .column_by_name("received_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .expect("received_at column should be TimestampMicrosecondArray");
+        assert_eq!(received_at.value(0), r.received_at.timestamp_micros());
     }
 
     #[test]
@@ -499,6 +534,14 @@ mod tests {
             .downcast_ref::<UInt64Array>()
             .unwrap();
         assert_eq!(if_in_oct.value(0), 1_000_000u64);
+
+        let received_at = batch
+            .column_by_name("received_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .expect("received_at column should be TimestampMicrosecondArray");
+        assert_eq!(received_at.value(0), r.received_at.timestamp_micros());
     }
 
     #[tokio::test]

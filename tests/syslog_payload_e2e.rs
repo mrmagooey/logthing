@@ -106,6 +106,38 @@ async fn cef_datagram_produces_structured_record_with_cef_payload_type() {
     let v = &rec.parsed;
     assert_eq!(v["device_vendor"].as_str().unwrap_or(""), "Vendor");
     assert_eq!(v["severity"].as_str().unwrap_or(""), "6");
+
+    // End-to-end assertion: run this same record through the real
+    // production mapper (`structured_syslog_record_to_batch`, the exact
+    // function `StructuredSyslogSink::to_record_batch` delegates to) and a
+    // real `ArrowWriter`, then read the resulting on-disk-format Parquet
+    // bytes back through a real Parquet reader -- the schema a downstream
+    // Iceberg/lakehouse consumer actually sees -- and assert `timestamp` is
+    // a microsecond UTC timestamp, not just checked against the in-memory
+    // schema definition.
+    use logthing::forwarding::structured_syslog_s3::structured_syslog_record_to_batch;
+    let batch = structured_syslog_record_to_batch(rec).expect("record maps to a RecordBatch");
+    let mut buf = Vec::new();
+    {
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        bytes::Bytes::from(buf),
+    )
+    .expect("parquet builder for on-disk bytes");
+    let field = builder.schema().field_with_name("timestamp").unwrap();
+    assert_eq!(
+        *field.data_type(),
+        arrow::datatypes::DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            Some("UTC".into())
+        ),
+        "on-disk Parquet timestamp column must be a microsecond UTC timestamp so that \
+         Iceberg day/month/year partition transforms can use it"
+    );
 }
 
 #[tokio::test]

@@ -130,7 +130,7 @@ The Parquet files use a fixed 18-column schema (in order):
 | template_id | UInt16 | no |
 | protocol_version | UInt8 | no |
 | exporter | Utf8 | no |
-| export_time | Utf8 | no |
+| export_time | Timestamp(µs, UTC) | no |
 | src_addr | Utf8 | yes |
 | dst_addr | Utf8 | yes |
 | src_port | UInt16 | yes |
@@ -138,14 +138,14 @@ The Parquet files use a fixed 18-column schema (in order):
 | ip_protocol | UInt8 | yes |
 | octet_delta_count | UInt64 | yes |
 | packet_delta_count | UInt64 | yes |
-| flow_start | Utf8 | yes |
-| flow_end | Utf8 | yes |
+| flow_start | Timestamp(µs, UTC) | yes |
+| flow_end | Timestamp(µs, UTC) | yes |
 | tcp_flags | UInt8 | yes |
 | input_interface | UInt32 | yes |
 | output_interface | UInt32 | yes |
 | extra | Utf8 | no |
 
-IP addresses and timestamps are stored as UTF-8 strings. Timestamps use RFC 3339 format.
+IP addresses are stored as UTF-8 strings. Timestamps are microsecond-precision UTC timestamps, usable directly as Iceberg partition-transform sources.
 
 ### 6. Configuration
 

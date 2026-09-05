@@ -416,7 +416,23 @@ impl SyslogMessage {
         })
     }
 
-    /// Parse RFC 3164 timestamp (assumes current year)
+    /// Parse an RFC 3164 (BSD syslog) timestamp such as `"Oct 11 22:14:15"`.
+    ///
+    /// The wire format carries neither a year nor a timezone, so both are
+    /// inferred:
+    ///
+    /// - **Year** — taken from `Utc::now()` at parse time. Parsing happens
+    ///   inline as the message is received, so this is effectively receipt
+    ///   time. Known limitation: a message parsed after a long buffering
+    ///   delay that straddles a year boundary can take the wrong year. Fixing
+    ///   that means threading the record's own `received_at` through this
+    ///   function and its callers.
+    /// - **Timezone** — assumed UTC. There is no sender-timezone handling
+    ///   anywhere in this codebase; a sender in another zone will have its
+    ///   timestamps offset accordingly.
+    ///
+    /// RFC 5424 messages are unaffected: they carry a full date and explicit
+    /// offset and are parsed unambiguously by `parse_rfc5424`.
     fn parse_rfc3164_timestamp(ts_str: &str) -> Option<DateTime<Utc>> {
         // RFC 3164 uses: "Oct 11 22:14:15" format (no year)
         let caps = RFC3164_TS_RE.captures(ts_str)?;

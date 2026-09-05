@@ -123,6 +123,14 @@ async fn sflow_samples_appear_as_parquet_on_local_disk() {
                 "expected column '{col}' in flow schema"
             );
         }
+        assert_eq!(
+            schema.field_with_name("received_at").unwrap().data_type(),
+            &arrow::datatypes::DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into())
+            ),
+            "on-disk Parquet received_at column must be a microsecond UTC timestamp"
+        );
 
         let mut reader = builder.build().expect("parquet reader for flow");
         let rb = reader
@@ -165,6 +173,14 @@ async fn sflow_samples_appear_as_parquet_on_local_disk() {
                 "expected column '{col}' in counter schema"
             );
         }
+        assert_eq!(
+            schema.field_with_name("received_at").unwrap().data_type(),
+            &arrow::datatypes::DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into())
+            ),
+            "on-disk Parquet received_at column must be a microsecond UTC timestamp"
+        );
 
         let mut reader = builder.build().expect("parquet reader for counter");
         let rb = reader

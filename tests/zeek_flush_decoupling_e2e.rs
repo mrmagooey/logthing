@@ -58,12 +58,24 @@ struct SlowUploadSink {
     /// `notify_waiters`) stores a wakeup permit even if no one is awaiting
     /// yet, so there's no missed-wakeup race regardless of call order.
     started: Arc<tokio::sync::Notify>,
+    /// Captures the raw bytes of the first real Parquet file this sink is
+    /// asked to persist -- this test substitutes out the actual S3/disk
+    /// backend (see the module doc comment), so this is the only way to get
+    /// the on-disk-format bytes back out for a real Parquet-reader
+    /// assertion on the written schema.
+    captured: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
 }
 
 #[async_trait::async_trait]
 impl UploadSink for SlowUploadSink {
-    async fn upload(&self, _key: &str, _body: Vec<u8>) -> anyhow::Result<()> {
+    async fn upload(&self, _key: &str, body: Vec<u8>) -> anyhow::Result<()> {
         self.started.notify_one();
+        {
+            let mut captured = self.captured.lock().unwrap();
+            if captured.is_none() {
+                *captured = Some(body);
+            }
+        }
         tokio::time::sleep(self.delay).await;
         Ok(())
     }
@@ -87,6 +99,8 @@ async fn zeek_tcp_ingest_does_not_drop_records_at_the_channel_during_a_slow_flus
     let _guard = set_default_local_recorder(&recorder);
 
     let flush_started = Arc::new(tokio::sync::Notify::new());
+    let captured_bytes: Arc<std::sync::Mutex<Option<Vec<u8>>>> =
+        Arc::new(std::sync::Mutex::new(None));
     let cfg = BufferedWriterConfig {
         connection: logthing::config::S3ConnectionConfig {
             endpoint: String::new(),
@@ -110,6 +124,7 @@ async fn zeek_tcp_ingest_does_not_drop_records_at_the_channel_during_a_slow_flus
     let slow_sink: Arc<dyn UploadSink> = Arc::new(SlowUploadSink {
         delay: Duration::from_millis(200),
         started: flush_started.clone(),
+        captured: captured_bytes.clone(),
     });
     let (handler, _join_handle) = ParquetWriterHandle::<ZeekSink>::start_with_stats(
         ZeekSink,
@@ -218,5 +233,36 @@ async fn zeek_tcp_ingest_does_not_drop_records_at_the_channel_during_a_slow_flus
     assert!(
         has_buffer_rows_gauge,
         "expected at least one parquet_s3_buffer_rows series through the real TCP ingest path"
+    );
+
+    // Verify the on-disk-format Parquet bytes this sink actually persisted
+    // (captured from the real `UploadSink::upload` call, which is exactly
+    // what a real S3/local-disk backend would have written to disk) carry
+    // `ts` as a real timestamp column, read back through a real Parquet
+    // reader -- not just checked against an in-memory RecordBatch built by
+    // the mapper.
+    let body = captured_bytes
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("at least one flush must have captured Parquet bytes via upload()");
+    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        bytes::Bytes::from(body),
+    )
+    .expect("parquet builder for captured bytes");
+    let mut reader = builder.build().expect("parquet reader for captured bytes");
+    let batch = reader
+        .next()
+        .expect("at least one batch in captured Parquet bytes")
+        .expect("batch ok");
+    let field = batch.schema().field_with_name("ts").unwrap().clone();
+    assert_eq!(
+        *field.data_type(),
+        arrow::datatypes::DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            Some("UTC".into())
+        ),
+        "on-disk Parquet ts column must be a microsecond UTC timestamp so that \
+         Iceberg day/month/year partition transforms can use it"
     );
 }

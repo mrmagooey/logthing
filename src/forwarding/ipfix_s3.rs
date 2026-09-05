@@ -13,9 +13,10 @@ use crate::forwarding::buffered_writer::ParquetSink;
 use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::ipfix::FlowRecord;
 use arrow::array::{
-    ArrayRef, StringBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
+    ArrayRef, StringBuilder, TimestampMicrosecondBuilder, UInt8Builder, UInt16Builder,
+    UInt32Builder, UInt64Builder,
 };
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use std::sync::{Arc, LazyLock};
 
@@ -29,7 +30,11 @@ static FLOW_RECORD_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         Field::new("template_id", DataType::UInt16, false),
         Field::new("protocol_version", DataType::UInt8, false),
         Field::new("exporter", DataType::Utf8, false),
-        Field::new("export_time", DataType::Utf8, false),
+        Field::new(
+            "export_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
         Field::new("src_addr", DataType::Utf8, true),
         Field::new("dst_addr", DataType::Utf8, true),
         Field::new("src_port", DataType::UInt16, true),
@@ -37,8 +42,16 @@ static FLOW_RECORD_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         Field::new("ip_protocol", DataType::UInt8, true),
         Field::new("octet_delta_count", DataType::UInt64, true),
         Field::new("packet_delta_count", DataType::UInt64, true),
-        Field::new("flow_start", DataType::Utf8, true),
-        Field::new("flow_end", DataType::Utf8, true),
+        Field::new(
+            "flow_start",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        ),
+        Field::new(
+            "flow_end",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        ),
         Field::new("tcp_flags", DataType::UInt8, true),
         Field::new("input_interface", DataType::UInt32, true),
         Field::new("output_interface", DataType::UInt32, true),
@@ -62,7 +75,7 @@ pub struct FlowRecordBuilders {
     template_id: UInt16Builder,
     protocol_version: UInt8Builder,
     exporter: StringBuilder,
-    export_time: StringBuilder,
+    export_time: TimestampMicrosecondBuilder,
     src_addr: StringBuilder,
     dst_addr: StringBuilder,
     src_port: UInt16Builder,
@@ -70,8 +83,8 @@ pub struct FlowRecordBuilders {
     ip_protocol: UInt8Builder,
     octet_delta_count: UInt64Builder,
     packet_delta_count: UInt64Builder,
-    flow_start: StringBuilder,
-    flow_end: StringBuilder,
+    flow_start: TimestampMicrosecondBuilder,
+    flow_end: TimestampMicrosecondBuilder,
     tcp_flags: UInt8Builder,
     input_interface: UInt32Builder,
     output_interface: UInt32Builder,
@@ -86,7 +99,10 @@ impl FlowRecordBuilders {
             template_id: UInt16Builder::new(),
             protocol_version: UInt8Builder::new(),
             exporter: StringBuilder::new(),
-            export_time: StringBuilder::new(),
+            export_time: TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            )),
             src_addr: StringBuilder::new(),
             dst_addr: StringBuilder::new(),
             src_port: UInt16Builder::new(),
@@ -94,8 +110,14 @@ impl FlowRecordBuilders {
             ip_protocol: UInt8Builder::new(),
             octet_delta_count: UInt64Builder::new(),
             packet_delta_count: UInt64Builder::new(),
-            flow_start: StringBuilder::new(),
-            flow_end: StringBuilder::new(),
+            flow_start: TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            )),
+            flow_end: TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            )),
             tcp_flags: UInt8Builder::new(),
             input_interface: UInt32Builder::new(),
             output_interface: UInt32Builder::new(),
@@ -126,7 +148,7 @@ pub fn append_flow_record(
     builders.exporter.append_value(record.exporter.to_string());
     builders
         .export_time
-        .append_value(record.export_time.to_rfc3339());
+        .append_value(record.export_time.timestamp_micros());
 
     builders
         .src_addr
@@ -145,10 +167,10 @@ pub fn append_flow_record(
         .append_option(record.packet_delta_count);
     builders
         .flow_start
-        .append_option(record.flow_start.as_ref().map(|t| t.to_rfc3339()));
+        .append_option(record.flow_start.map(|t| t.timestamp_micros()));
     builders
         .flow_end
-        .append_option(record.flow_end.as_ref().map(|t| t.to_rfc3339()));
+        .append_option(record.flow_end.map(|t| t.timestamp_micros()));
     builders.tcp_flags.append_option(record.tcp_flags);
     builders
         .input_interface
@@ -395,12 +417,14 @@ mod tests {
         let schema = flow_record_schema();
         assert_eq!(schema.fields().len(), 18, "expected 18 columns");
 
+        use arrow::datatypes::TimeUnit;
+        let ts_type = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
         let cases: &[(&str, DataType, bool)] = &[
             ("observation_domain_id", DataType::UInt32, false),
             ("template_id", DataType::UInt16, false),
             ("protocol_version", DataType::UInt8, false),
             ("exporter", DataType::Utf8, false),
-            ("export_time", DataType::Utf8, false),
+            ("export_time", ts_type.clone(), false),
             ("src_addr", DataType::Utf8, true),
             ("dst_addr", DataType::Utf8, true),
             ("src_port", DataType::UInt16, true),
@@ -408,8 +432,8 @@ mod tests {
             ("ip_protocol", DataType::UInt8, true),
             ("octet_delta_count", DataType::UInt64, true),
             ("packet_delta_count", DataType::UInt64, true),
-            ("flow_start", DataType::Utf8, true),
-            ("flow_end", DataType::Utf8, true),
+            ("flow_start", ts_type.clone(), true),
+            ("flow_end", ts_type.clone(), true),
             ("tcp_flags", DataType::UInt8, true),
             ("input_interface", DataType::UInt32, true),
             ("output_interface", DataType::UInt32, true),
@@ -483,6 +507,67 @@ mod tests {
         assert!(
             extra_col.value(0).contains("ie200"),
             "extra column at row 0 must contain ie200"
+        );
+    }
+
+    #[test]
+    fn export_time_flow_start_flow_end_produce_exact_microseconds_and_nulls() {
+        use arrow::array::TimestampMicrosecondArray;
+
+        let mut r0 = make_flow_record(Some("10.0.0.1"), Some(1), serde_json::json!({}));
+        r0.flow_start = Some(
+            chrono::Utc
+                .with_ymd_and_hms(2026, 1, 15, 11, 59, 0)
+                .unwrap(),
+        );
+        r0.flow_end = Some(
+            chrono::Utc
+                .with_ymd_and_hms(2026, 1, 15, 12, 0, 30)
+                .unwrap(),
+        );
+        let r1 = make_flow_record(None, None, serde_json::json!({})); // flow_start/flow_end: None
+
+        let mut builders = FlowRecordBuilders::new();
+        append_flow_record(&mut builders, &r0).unwrap();
+        append_flow_record(&mut builders, &r1).unwrap();
+        let batch = finish_batch(builders, flow_record_schema()).unwrap();
+
+        let export_time_col = batch
+            .column_by_name("export_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("export_time column should be TimestampMicrosecondArray");
+        assert_eq!(export_time_col.value(0), r0.export_time.timestamp_micros());
+
+        let flow_start_col = batch
+            .column_by_name("flow_start")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("flow_start column should be TimestampMicrosecondArray");
+        assert_eq!(
+            flow_start_col.value(0),
+            r0.flow_start.unwrap().timestamp_micros()
+        );
+        assert!(
+            flow_start_col.is_null(1),
+            "row 1 flow_start (None) must be a real NULL, not an epoch value"
+        );
+
+        let flow_end_col = batch
+            .column_by_name("flow_end")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("flow_end column should be TimestampMicrosecondArray");
+        assert_eq!(
+            flow_end_col.value(0),
+            r0.flow_end.unwrap().timestamp_micros()
+        );
+        assert!(
+            flow_end_col.is_null(1),
+            "row 1 flow_end (None) must be a real NULL, not an epoch value"
         );
     }
 

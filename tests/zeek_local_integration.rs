@@ -117,6 +117,14 @@ async fn zeek_records_appear_as_parquet_on_local_disk() {
                 "expected column '{col}' in conn schema"
             );
         }
+        assert_eq!(
+            schema.field_with_name("ts").unwrap().data_type(),
+            &arrow::datatypes::DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into())
+            ),
+            "on-disk Parquet ts column must be a microsecond UTC timestamp"
+        );
 
         let mut reader = builder.build().expect("parquet reader for conn");
         let rb = reader

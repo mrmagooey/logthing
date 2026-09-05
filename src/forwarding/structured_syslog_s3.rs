@@ -8,8 +8,8 @@
 use crate::config::SyslogS3Config;
 use crate::forwarding::buffered_writer::ParquetSink;
 use crate::syslog::payload::StructuredSyslogRecord;
-use arrow::array::{ArrayRef, StringArray, UInt8Array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt8Array};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use std::sync::{Arc, LazyLock};
 
@@ -22,10 +22,18 @@ static STRUCTURED_SYSLOG_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         Field::new("priority", DataType::UInt8, false),
         Field::new("severity", DataType::UInt8, false),
         Field::new("facility", DataType::UInt8, false),
-        Field::new("timestamp", DataType::Utf8, true),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        ),
         Field::new("hostname", DataType::Utf8, true),
         Field::new("app_name", DataType::Utf8, true),
-        Field::new("received_at", DataType::Utf8, false),
+        Field::new(
+            "received_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
         Field::new("payload_type", DataType::Utf8, false),
         Field::new("parsed", DataType::Utf8, false),
     ]))
@@ -46,13 +54,16 @@ pub fn structured_syslog_record_to_batch(
     let priority = Arc::new(UInt8Array::from(vec![rec.priority])) as ArrayRef;
     let severity = Arc::new(UInt8Array::from(vec![rec.severity])) as ArrayRef;
     let facility = Arc::new(UInt8Array::from(vec![rec.facility])) as ArrayRef;
-    let timestamp = Arc::new(StringArray::from(vec![
-        rec.timestamp.as_ref().map(|t| t.to_rfc3339()),
-    ])) as ArrayRef;
+    let tz: Arc<str> = Arc::from("UTC");
+    let timestamp = Arc::new(
+        TimestampMicrosecondArray::from(vec![rec.timestamp.map(|t| t.timestamp_micros())])
+            .with_timezone(tz.clone()),
+    ) as ArrayRef;
     let hostname = Arc::new(StringArray::from(vec![rec.hostname.clone()])) as ArrayRef;
     let app_name = Arc::new(StringArray::from(vec![rec.app_name.clone()])) as ArrayRef;
-    let received_at =
-        Arc::new(StringArray::from(vec![Some(rec.received_at.to_rfc3339())])) as ArrayRef;
+    let received_at = Arc::new(
+        TimestampMicrosecondArray::from(vec![rec.received_at.timestamp_micros()]).with_timezone(tz),
+    ) as ArrayRef;
     let payload_type = Arc::new(StringArray::from(vec![rec.payload_type])) as ArrayRef;
     let parsed = Arc::new(StringArray::from(vec![
         serde_json::to_string(&rec.parsed).unwrap_or_else(|_| "null".to_string()),
@@ -202,6 +213,62 @@ mod tests {
         let f = schema.field_with_name("parsed").unwrap();
         assert_eq!(f.data_type(), &DataType::Utf8);
         assert!(!f.is_nullable());
+    }
+
+    #[test]
+    fn schema_timestamp_and_received_at_are_microsecond_timestamps() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        let schema = structured_syslog_schema();
+        let expected = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+
+        let f = schema.field_with_name("timestamp").unwrap();
+        assert_eq!(f.data_type(), &expected);
+        assert!(f.is_nullable());
+
+        let f = schema.field_with_name("received_at").unwrap();
+        assert_eq!(f.data_type(), &expected);
+        assert!(!f.is_nullable()); // received_at is always set
+    }
+
+    #[test]
+    fn absent_timestamp_is_null() {
+        use arrow::array::{Array, TimestampMicrosecondArray};
+        let mut rec = sample_record("cef");
+        rec.timestamp = None;
+        let batch = structured_syslog_record_to_batch(&rec).unwrap();
+        let col = batch
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert!(col.is_null(0));
+    }
+
+    #[test]
+    fn timestamp_and_received_at_are_written_as_microseconds() {
+        use arrow::array::TimestampMicrosecondArray;
+        use chrono::TimeZone;
+        let mut rec = sample_record("cef");
+        rec.timestamp = Some(chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+        rec.received_at = chrono::Utc.timestamp_opt(1_700_000_001, 0).unwrap();
+        let batch = structured_syslog_record_to_batch(&rec).unwrap();
+
+        let ts = batch
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ts.value(0), 1_700_000_000_000_000);
+
+        let received = batch
+            .column_by_name("received_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(received.value(0), 1_700_000_001_000_000);
     }
 
     #[test]

@@ -13,8 +13,8 @@ use crate::config::SyslogS3Config;
 use crate::forwarding::buffered_writer::ParquetSink;
 use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::syslog::SyslogMessage;
-use arrow::array::{ArrayRef, StringArray, UInt8Array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt8Array};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use std::sync::{Arc, LazyLock};
 
@@ -27,7 +27,11 @@ static SYSLOG_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         Field::new("priority", DataType::UInt8, false),
         Field::new("severity", DataType::UInt8, false),
         Field::new("facility", DataType::UInt8, false),
-        Field::new("timestamp", DataType::Utf8, true),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        ),
         Field::new("hostname", DataType::Utf8, true),
         Field::new("app_name", DataType::Utf8, true),
         Field::new("proc_id", DataType::Utf8, true),
@@ -54,9 +58,11 @@ pub fn syslog_message_to_batch(msg: &SyslogMessage) -> anyhow::Result<RecordBatc
     let priority = Arc::new(UInt8Array::from(vec![msg.priority])) as ArrayRef;
     let severity = Arc::new(UInt8Array::from(vec![msg.severity])) as ArrayRef;
     let facility = Arc::new(UInt8Array::from(vec![msg.facility])) as ArrayRef;
-    let timestamp = Arc::new(StringArray::from(vec![
-        msg.timestamp.as_ref().map(|t| t.to_rfc3339()),
-    ])) as ArrayRef;
+    let tz: Arc<str> = Arc::from("UTC");
+    let timestamp = Arc::new(
+        TimestampMicrosecondArray::from(vec![msg.timestamp.map(|t| t.timestamp_micros())])
+            .with_timezone(tz),
+    ) as ArrayRef;
     let hostname = Arc::new(StringArray::from(vec![msg.hostname.clone()])) as ArrayRef;
     let app_name = Arc::new(StringArray::from(vec![msg.app_name.clone()])) as ArrayRef;
     let proc_id = Arc::new(StringArray::from(vec![msg.proc_id.clone()])) as ArrayRef;
@@ -316,7 +322,7 @@ mod tests {
 
     #[test]
     fn schema_has_correct_columns_and_types() {
-        use arrow::datatypes::DataType;
+        use arrow::datatypes::{DataType, TimeUnit};
         let schema = syslog_schema();
         assert_eq!(schema.fields().len(), 11);
         assert_eq!(
@@ -326,7 +332,7 @@ mod tests {
         assert!(!schema.field_with_name("priority").unwrap().is_nullable());
         assert_eq!(
             schema.field_with_name("timestamp").unwrap().data_type(),
-            &DataType::Utf8
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
         );
         assert!(schema.field_with_name("timestamp").unwrap().is_nullable());
         assert_eq!(
@@ -343,6 +349,35 @@ mod tests {
                 .is_nullable()
         );
         assert!(!schema.field_with_name("protocol").unwrap().is_nullable());
+    }
+
+    #[test]
+    fn timestamp_is_written_as_microseconds() {
+        use chrono::TimeZone;
+        let mut msg = sample_rfc5424();
+        msg.timestamp = Some(chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+        let batch = syslog_message_to_batch(&msg).unwrap();
+        let col = batch
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("timestamp should be TimestampMicrosecondArray");
+        assert_eq!(col.value(0), 1_700_000_000_000_000);
+    }
+
+    #[test]
+    fn absent_timestamp_is_null() {
+        let mut msg = sample_rfc5424();
+        msg.timestamp = None;
+        let batch = syslog_message_to_batch(&msg).unwrap();
+        let col = batch
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert!(col.is_null(0));
     }
 
     // -- Task 1: row mapping --
@@ -413,7 +448,7 @@ mod tests {
         let ts = batch
             .column(3)
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
         assert!(ts.is_null(0));
         let sd = batch

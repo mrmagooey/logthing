@@ -5,8 +5,8 @@
 //! and avoids the need to maintain a growing registry as Suricata event types evolve.
 
 use crate::suricata::SuricataRecord;
-use arrow::array::{ArrayRef, StringBuilder};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{ArrayRef, StringBuilder, TimestampMicrosecondBuilder};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use std::sync::{Arc, LazyLock};
 
@@ -14,14 +14,18 @@ use std::sync::{Arc, LazyLock};
 ///
 /// Columns:
 /// - `event_type`  — Utf8, non-null  (from SuricataRecord.event_type)
-/// - `received_at` — Utf8, non-null  (RFC-3339 wall-clock ingest time)
+/// - `received_at` — Timestamp(µs, UTC), non-null  (wall-clock ingest time)
 /// - `src_ip`      — Utf8, nullable  (opportunistic fast path; null when absent)
 /// - `payload`     — Utf8, non-null  (full JSON object as string)
 pub fn envelope_schema() -> Arc<Schema> {
     static S: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         Arc::new(Schema::new(vec![
             Field::new("event_type", DataType::Utf8, false),
-            Field::new("received_at", DataType::Utf8, false),
+            Field::new(
+                "received_at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
             Field::new("src_ip", DataType::Utf8, true),
             Field::new("payload", DataType::Utf8, false),
         ]))
@@ -38,16 +42,19 @@ pub fn map_envelope(record: &SuricataRecord) -> anyhow::Result<RecordBatch> {
         .get("src_ip")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let received_at = record.received_at.to_rfc3339();
+    let received_at = record.received_at.timestamp_micros();
     let payload = record.fields.to_string();
 
     let mut b_event_type = StringBuilder::new();
-    let mut b_received_at = StringBuilder::new();
+    let mut b_received_at = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+        TimeUnit::Microsecond,
+        Some("UTC".into()),
+    ));
     let mut b_src_ip = StringBuilder::new();
     let mut b_payload = StringBuilder::new();
 
     b_event_type.append_value(&record.event_type);
-    b_received_at.append_value(&received_at);
+    b_received_at.append_value(received_at);
     b_src_ip.append_option(src_ip.as_deref());
     b_payload.append_value(&payload);
 
@@ -105,6 +112,18 @@ mod tests {
     }
 
     #[test]
+    fn schema_received_at_is_microsecond_timestamp() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        let s = envelope_schema();
+        let f = s.field_with_name("received_at").unwrap();
+        assert_eq!(
+            f.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(!f.is_nullable());
+    }
+
+    #[test]
     fn map_envelope_extracts_event_type_and_payload() {
         let rec = make_alert_record();
         let batch = map_envelope(&rec).unwrap();
@@ -126,6 +145,23 @@ mod tests {
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(payload_col.value(0)).unwrap();
         assert_eq!(parsed["src_ip"], "192.168.1.100");
+    }
+
+    #[test]
+    fn map_envelope_received_at_is_exact_microseconds() {
+        use arrow::array::TimestampMicrosecondArray;
+        let mut rec = make_alert_record();
+        rec.received_at = chrono::DateTime::parse_from_rfc3339("2024-01-15T10:30:00.123456Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let batch = map_envelope(&rec).unwrap();
+        let col = batch
+            .column_by_name("received_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("received_at column should be TimestampMicrosecondArray");
+        assert_eq!(col.value(0), rec.received_at.timestamp_micros());
     }
 
     #[test]
