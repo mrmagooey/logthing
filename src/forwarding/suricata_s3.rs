@@ -85,6 +85,8 @@ impl ParquetSink for SuricataSink {
         envelope_schema()
     }
 
+    /// Time column for day bucketing. Suricata records do not carry an event
+    /// timestamp in the payload; use the non-null `received_at` (server receipt time).
     fn time_column(&self) -> Option<&'static str> {
         Some("received_at")
     }
@@ -369,8 +371,17 @@ mod tests {
     }
 
     #[test]
-    fn suricata_sink_time_column_is_received_at() {
-        assert_eq!(SuricataSink.time_column(), Some("received_at"));
+    fn suricata_sink_time_column_received_at_exists_in_schema() {
+        let sink = SuricataSink;
+        let col = sink
+            .time_column()
+            .expect("suricata_sink must opt in to day partitioning");
+        let schema = sink.schema(None);
+        assert!(
+            schema.field_with_name(col).is_ok(),
+            "time_column() returned {:?}, which is not a field in the schema",
+            col
+        );
     }
 
     // -- PartitionedParquetWriter accumulation --

@@ -64,6 +64,8 @@ impl ParquetSink for WefSink {
         ]))
     }
 
+    /// Event time column for day bucketing. WEF `timestamp` is the event
+    /// occurrence time from the Windows Event Log (non-null).
     fn time_column(&self) -> Option<&'static str> {
         Some("timestamp")
     }
@@ -316,8 +318,18 @@ mod tests {
     }
 
     #[test]
-    fn wef_sink_time_column_is_timestamp() {
-        assert_eq!(WefSink.time_column(), Some("timestamp"));
+    fn wef_sink_time_column_timestamp_exists_in_schema() {
+        let sink = WefSink;
+        let col = sink
+            .time_column()
+            .expect("wef_sink must opt in to day partitioning");
+        // Use a valid partition format (event_type=4624)
+        let schema = sink.schema(Some("event_type=4624"));
+        assert!(
+            schema.field_with_name(col).is_ok(),
+            "time_column() returned {:?}, which is not a field in the schema",
+            col
+        );
     }
 
     #[tokio::test]

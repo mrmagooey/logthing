@@ -84,6 +84,9 @@ impl ParquetSink for SflowSink {
         }
     }
 
+    /// Time column for day bucketing. sFlow samples carry a sample timestamp
+    /// but it is offset-based, not absolute; use the non-null `received_at`
+    /// (collector receipt time) for reliable partitioning across clock skews.
     fn time_column(&self) -> Option<&'static str> {
         Some("received_at")
     }
@@ -549,8 +552,21 @@ mod tests {
     }
 
     #[test]
-    fn sflow_sink_time_column_is_received_at() {
-        assert_eq!(SflowSink.time_column(), Some("received_at"));
+    fn sflow_sink_time_column_received_at_exists_in_both_schemas() {
+        let sink = SflowSink;
+        let col = sink
+            .time_column()
+            .expect("sflow_sink must opt in to day partitioning");
+        // Check both flow and counter schemas
+        for partition in &[Some("flow"), Some("counter")] {
+            let schema = sink.schema(*partition);
+            assert!(
+                schema.field_with_name(col).is_ok(),
+                "time_column() returned {:?}, which is not a field in schema for partition {:?}",
+                col,
+                partition
+            );
+        }
     }
 
     #[tokio::test]

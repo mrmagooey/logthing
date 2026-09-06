@@ -517,6 +517,9 @@ impl crate::forwarding::buffered_writer::ParquetSink for AggregateSink {
             .unwrap_or_else(|| Arc::new(Schema::empty()))
     }
 
+    /// Time column for day bucketing. Aggregate rows' `window_start` is the
+    /// inclusive start of the aggregation window, computed from the rule's
+    /// flush interval. It is always non-null.
     fn time_column(&self) -> Option<&'static str> {
         Some("window_start")
     }
@@ -1488,8 +1491,19 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_sink_time_column_is_window_start() {
-        let sink = AggregateSink::new(&[]);
-        assert_eq!(sink.time_column(), Some("window_start"));
+    fn aggregate_sink_time_column_window_start_exists_in_schema() {
+        // Construct a sink with at least one rule so the schema is populated.
+        let mut r = rule("r", "zeek", Some("dns"), &["query"]);
+        r.schema = rule_schema(&r.group_by, &r.aggs);
+        let sink = AggregateSink::new(&[r]);
+        let col = sink
+            .time_column()
+            .expect("aggregate_sink must opt in to day partitioning");
+        let schema = sink.schema(Some("r"));
+        assert!(
+            schema.field_with_name(col).is_ok(),
+            "time_column() returned {:?}, which is not a field in the schema",
+            col
+        );
     }
 }

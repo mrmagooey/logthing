@@ -106,6 +106,9 @@ impl ParquetSink for StructuredSyslogSink {
         structured_syslog_schema()
     }
 
+    /// Event time column for day bucketing. Structured syslog's `timestamp` is
+    /// parsed from the message and represents when the event occurred.
+    /// Falls back to `received_at` if timestamp is missing (nullable).
     fn time_column(&self) -> Option<&'static str> {
         Some("timestamp")
     }
@@ -327,8 +330,17 @@ mod tests {
     }
 
     #[test]
-    fn structured_syslog_sink_time_column_is_timestamp() {
-        assert_eq!(StructuredSyslogSink.time_column(), Some("timestamp"));
+    fn structured_syslog_sink_time_column_timestamp_exists_in_schema() {
+        let sink = StructuredSyslogSink;
+        let col = sink
+            .time_column()
+            .expect("structured_syslog_sink must opt in to day partitioning");
+        let schema = sink.schema(None);
+        assert!(
+            schema.field_with_name(col).is_ok(),
+            "time_column() returned {:?}, which is not a field in the schema",
+            col
+        );
     }
 
     #[tokio::test]

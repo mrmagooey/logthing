@@ -96,6 +96,9 @@ impl ParquetSink for ZeekSink {
         }
     }
 
+    /// Event time column for day bucketing. Zeek's `ts` field carries the
+    /// original event time from the network traffic (connection start, DNS query, etc.),
+    /// which is more accurate for partitioning than the receipt time.
     fn time_column(&self) -> Option<&'static str> {
         Some("ts")
     }
@@ -532,8 +535,29 @@ mod tests {
     }
 
     #[test]
-    fn zeek_sink_time_column_is_ts() {
-        assert_eq!(ZeekSink.time_column(), Some("ts"));
+    fn zeek_sink_time_column_ts_exists_in_all_schemas() {
+        let sink = ZeekSink;
+        let col = sink
+            .time_column()
+            .expect("zeek_sink must opt in to day partitioning");
+        // Check that ts exists in all 6 typed schemas plus the envelope fallback.
+        for partition in &[
+            Some("conn"),
+            Some("dns"),
+            Some("http"),
+            Some("ssl"),
+            Some("files"),
+            Some("notice"),
+            None, // envelope fallback for unknown paths
+        ] {
+            let schema = sink.schema(*partition);
+            assert!(
+                schema.field_with_name(col).is_ok(),
+                "time_column() returned {:?}, which is not a field in schema for partition {:?}",
+                col,
+                partition
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

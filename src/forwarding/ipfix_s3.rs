@@ -239,6 +239,9 @@ impl ParquetSink for IpfixSink {
         flow_record_schema()
     }
 
+    /// Event time column for day bucketing. IPFIX `export_time` is the absolute
+    /// flow export time from the exporter (non-null), representing when the flow
+    /// ended and was exported, which is more accurate for partitioning.
     fn time_column(&self) -> Option<&'static str> {
         Some("export_time")
     }
@@ -618,8 +621,17 @@ mod tests {
     }
 
     #[test]
-    fn ipfix_sink_time_column_is_export_time() {
-        assert_eq!(IpfixSink.time_column(), Some("export_time"));
+    fn ipfix_sink_time_column_export_time_exists_in_schema() {
+        let sink = IpfixSink;
+        let col = sink
+            .time_column()
+            .expect("ipfix_sink must opt in to day partitioning");
+        let schema = sink.schema(None);
+        assert!(
+            schema.field_with_name(col).is_ok(),
+            "time_column() returned {:?}, which is not a field in the schema",
+            col
+        );
     }
 
     // -- Task 2: writer push accumulation and bounded buffer under S3 outage --

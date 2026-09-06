@@ -59,6 +59,8 @@ impl ParquetSink for GenericSink {
         generic_schema()
     }
 
+    /// Event time column for day bucketing. Generic records' `time` field is
+    /// the application-supplied event time. Falls back to `received_at` if missing (nullable).
     fn time_column(&self) -> Option<&'static str> {
         Some("time")
     }
@@ -337,8 +339,17 @@ mod tests {
     }
 
     #[test]
-    fn generic_sink_time_column_is_time() {
-        assert_eq!(GenericSink.time_column(), Some("time"));
+    fn generic_sink_time_column_time_exists_in_schema() {
+        let sink = GenericSink;
+        let col = sink
+            .time_column()
+            .expect("generic_sink must opt in to day partitioning");
+        let schema = sink.schema(None);
+        assert!(
+            schema.field_with_name(col).is_ok(),
+            "time_column() returned {:?}, which is not a field in the schema",
+            col
+        );
     }
 
     #[tokio::test]
