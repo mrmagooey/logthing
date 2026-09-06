@@ -16,10 +16,15 @@
 //! is used anyway (the protocol tag is the more realistic choice, since its
 //! wire format is the one that actually carries an explicit year).
 //!
-//! Two fixed past days (2023-11-14 and 2023-11-15) are used for the
-//! straddling pair -- not "today"/"tomorrow" -- so that a total failure of
-//! day derivation (e.g. everything silently falling back to `Utc::now()`)
-//! cannot coincidentally produce a passing result.
+//! The straddling pair is anchored 2 days before the real `Utc::now()` at
+//! test-run time (not a hardcoded calendar date, and not "today"/"tomorrow")
+//! so it lands inside `partition_time`'s `[received_at - 30d, received_at +
+//! 1d]` clamp window (see `buffered_writer::partition_time`) -- outside that
+//! window, an event instant is *supposed* to collapse onto `received_at` by
+//! design, which would make a hardcoded far-past date coincidentally pass
+//! even with a broken derivation. Anchoring 2 days back, rather than at
+//! "today", also means a test run starting right at a real UTC midnight
+//! cannot put both instants on the same side of the boundary.
 
 use logthing::config::SyslogLocalConfig;
 use logthing::forwarding::local_sink::LocalDiskSink;
@@ -136,11 +141,19 @@ async fn syslog_ingest_spanning_midnight_is_day_clean() {
     );
 
     let src: std::net::SocketAddr = "127.0.0.1:47762".parse().unwrap();
-    use chrono::TimeZone;
-    let day1_ts = chrono::Utc
-        .with_ymd_and_hms(2023, 11, 14, 23, 59, 0)
-        .unwrap();
-    let day2_ts = chrono::Utc.with_ymd_and_hms(2023, 11, 15, 0, 1, 0).unwrap();
+    // Anchor 2 days before the real "now" so both instants sit safely
+    // inside the clamp window relative to the REAL `received_at` the mapper
+    // stamps at push time (which is close to `now`), while still landing on
+    // two different UTC calendar days determined by the real clock rather
+    // than a hardcoded date -- see the module doc comment above.
+    let now = chrono::Utc::now();
+    let anchor_midnight = (now - chrono::TimeDelta::days(2))
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+    let day1_ts = anchor_midnight - chrono::TimeDelta::minutes(1); // 23:59:00 the day before
+    let day2_ts = anchor_midnight + chrono::TimeDelta::minutes(1); // 00:01:00 the anchor day
     let expected_day1 = day1_ts.date_naive();
     let expected_day2 = day2_ts.date_naive();
 
@@ -205,36 +218,38 @@ async fn syslog_ingest_spanning_midnight_is_day_clean() {
     }
     assert_eq!(by_day.len(), 3, "expected 3 distinct day directories");
 
-    // Property: the "before midnight" message's file lives under
-    // 2023-11-14, and its `timestamp` column -- read back from the actual
-    // on-disk Parquet bytes -- itself decodes to that same day.
+    // Property: the "before midnight" message's file lives under the
+    // anchor day minus one, and its `partition_time` column -- read back
+    // from the actual on-disk Parquet bytes, the column the external
+    // Iceberg committer's day() transform is declared against -- itself
+    // decodes to that same day.
     let day1_path = by_day
         .get(&expected_day1)
         .unwrap_or_else(|| panic!("no file under {expected_day1}; found {by_day:?}"));
     assert_eq!(
-        read_day_column(day1_path, "timestamp"),
+        read_day_column(day1_path, "partition_time"),
         expected_day1,
-        "day1 file's on-disk timestamp column must decode to its own directory's day"
+        "day1 file's on-disk partition_time column must decode to its own directory's day"
     );
 
-    // Property: the "after midnight" message's file lives under
-    // 2023-11-15, one day later, not merged into the same file as day1.
+    // Property: the "after midnight" message's file lives under the anchor
+    // day, one day later, not merged into the same file as day1.
     let day2_path = by_day
         .get(&expected_day2)
         .unwrap_or_else(|| panic!("no file under {expected_day2}; found {by_day:?}"));
     assert_eq!(
-        read_day_column(day2_path, "timestamp"),
+        read_day_column(day2_path, "partition_time"),
         expected_day2,
-        "day2 file's on-disk timestamp column must decode to its own directory's day"
+        "day2 file's on-disk partition_time column must decode to its own directory's day"
     );
 
     // Property: the message with NO parseable timestamp must NOT have
     // landed under day1 or day2 (which would mean it silently inherited
     // whichever day the buffer/process happened to be in), and its file's
-    // `received_at` column -- not `timestamp`, which is null for this row
-    // -- must itself decode to that same fallback day, landing within the
-    // [before_fallback, after_fallback] wall-clock bracket taken around the
-    // push.
+    // `partition_time` column -- non-null by construction even though
+    // `timestamp` is null for this row -- must itself decode to that same
+    // fallback day, landing within the [before_fallback, after_fallback]
+    // wall-clock bracket taken around the push.
     let fallback_day = *by_day
         .keys()
         .find(|d| **d != expected_day1 && **d != expected_day2)
@@ -246,9 +261,9 @@ async fn syslog_ingest_spanning_midnight_is_day_clean() {
     );
     let fallback_path = &by_day[&fallback_day];
     assert_eq!(
-        read_day_column(fallback_path, "received_at"),
+        read_day_column(fallback_path, "partition_time"),
         fallback_day,
-        "no-timestamp file's on-disk received_at column must decode to its own \
+        "no-timestamp file's on-disk partition_time column must decode to its own \
          directory's day (the fallback source day_from_batch actually used)"
     );
 
@@ -258,5 +273,150 @@ async fn syslog_ingest_spanning_midnight_is_day_clean() {
             .iter()
             .any(|p| p.file_name().unwrap().to_string_lossy().contains(".tmp-")),
         "no leftover .tmp- files should remain after flush: {all_files:?}"
+    );
+}
+
+/// Regression test for the bug this addendum exists to close: a buffer that
+/// mixes messages WITH a parseable `timestamp` and messages WITHOUT one
+/// (`timestamp: None` -- what a CEF/LEEF payload yields, see
+/// `src/syslog/mod.rs:313`) whose receipt instants land on the same UTC day.
+///
+/// Before `partition_time` existed, the day-clean guarantee (and the
+/// Iceberg partition column) was derived straight from the nullable
+/// `timestamp` column: a file holding one row with a real `timestamp` and
+/// one row with `timestamp: null` would make Iceberg's `day(timestamp)`
+/// transform see TWO distinct values -- a real date and `null` -- in one
+/// file, which Iceberg refuses to register. `partition_time` is non-null by
+/// construction (see `syslog_message_to_batch`), so every row in a buffer
+/// that shares one receipt day gets the SAME `partition_time` day
+/// regardless of whether its own `timestamp` was present.
+#[tokio::test]
+async fn mixed_timestamped_and_timestampless_messages_share_one_partition_time_day() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = Arc::new(
+        LocalDiskSink::new(dir.path().to_path_buf())
+            .await
+            .expect("LocalDiskSink::new"),
+    );
+    let cfg = SyslogLocalConfig {
+        directory: dir.path().to_path_buf(),
+        prefix: "syslog".to_string(),
+        max_buffer_rows: 10_000, // do NOT flush between the two pushes below
+        flush_interval_secs: 3600,
+        channel_capacity: 256,
+    };
+
+    let (handler, writer_task) = syslog_local_start(
+        &cfg,
+        sink,
+        Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+
+    let src: std::net::SocketAddr = "127.0.0.1:47763".parse().unwrap();
+
+    // A CEF/LEEF-shaped message: the parser produced no `timestamp` at all,
+    // so this row's `timestamp` column is null; its `partition_time` falls
+    // back to `received_at`, stamped internally as `Utc::now()` at push
+    // time.
+    handler
+        .handle_message(msg("no parseable timestamp", None), src)
+        .await;
+    // An ordinary message WITH a parseable timestamp, read immediately
+    // before this push. `handle_message` has no `.await` suspension point
+    // and this is a current-thread `#[tokio::test]` (same reasoning as the
+    // module doc comment above), so this message's `received_at` -- read a
+    // moment later, inside the mapper -- and the row above's `received_at`
+    // land within microseconds of each other: the same real UTC calendar
+    // day in every realistic run.
+    handler
+        .handle_message(msg("has a timestamp", Some(chrono::Utc::now())), src)
+        .await;
+
+    drop(handler);
+    tokio::time::timeout(std::time::Duration::from_secs(5), writer_task)
+        .await
+        .expect("writer task must exit within 5s")
+        .expect("writer task must not panic");
+
+    let mut all_files = Vec::new();
+    walk_all_files(dir.path(), &mut all_files);
+    let parquet_files: Vec<_> = all_files
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+        .collect();
+    assert_eq!(
+        parquet_files.len(),
+        1,
+        "both messages share the same receipt day, so they must land in a \
+         single day-clean file; found {parquet_files:?}"
+    );
+
+    let raw = std::fs::read(parquet_files[0]).unwrap();
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(raw)).expect("parquet builder");
+    let reader = builder.build().expect("build parquet reader");
+
+    use arrow::array::{Array, TimestampMicrosecondArray};
+    let mut timestamp_null_count = 0;
+    let mut timestamp_non_null_count = 0;
+    let mut partition_time_days = std::collections::HashSet::new();
+    let mut total_rows = 0;
+    for batch in reader {
+        let batch = batch.expect("record batch reads without error");
+        total_rows += batch.num_rows();
+
+        let ts_col = batch
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        for i in 0..ts_col.len() {
+            if ts_col.is_null(i) {
+                timestamp_null_count += 1;
+            } else {
+                timestamp_non_null_count += 1;
+            }
+        }
+
+        let pt_col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        for i in 0..pt_col.len() {
+            assert!(
+                !pt_col.is_null(i),
+                "partition_time must never be null (row {i})"
+            );
+            partition_time_days.insert(
+                chrono::DateTime::from_timestamp_micros(pt_col.value(i))
+                    .expect("valid micros")
+                    .date_naive(),
+            );
+        }
+    }
+
+    assert_eq!(total_rows, 2, "expected exactly 2 rows in the single file");
+    // Confirm this really is the mixed scenario the addendum describes:
+    // one row with a real `timestamp` and one with a null.
+    assert_eq!(
+        timestamp_null_count, 1,
+        "expected exactly one row with a null timestamp column"
+    );
+    assert_eq!(
+        timestamp_non_null_count, 1,
+        "expected exactly one row with a non-null timestamp column"
+    );
+    // The property the fix establishes: despite that null/non-null mix in
+    // `timestamp`, `partition_time` holds exactly ONE distinct UTC day
+    // across every row in the file.
+    assert_eq!(
+        partition_time_days.len(),
+        1,
+        "partition_time must hold exactly one distinct UTC day across all \
+         rows in the file; got {partition_time_days:?}"
     );
 }
