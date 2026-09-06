@@ -1119,8 +1119,8 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
 
     /// Test-only mutable counterpart to `buffer_by_partition`, for the
     /// handful of tests that need to hand-backdate a buffer's
-    /// `last_flush` to simulate an age-triggered flush. Same
-    /// same-UTC-day assumption applies -- see `buffer_by_partition`.
+    /// `last_flush` to simulate an age-triggered flush. The same
+    /// single-UTC-day assumption applies -- see `buffer_by_partition`.
     #[cfg(test)]
     pub(crate) fn buffer_by_partition_mut(
         &mut self,
