@@ -409,13 +409,10 @@ mod tests {
     }
 
     #[test]
-    fn syslog_message_to_batch_null_timestamp_falls_back_to_received_at_for_day() {
-        // Regression test for the gap this task closes: a message whose
-        // header timestamp failed to parse must still resolve to *today's*
-        // UTC day via `received_at`, not silently produce a dayless row.
-        // `day_from_batch` is private to buffered_writer.rs, so this
-        // exercises the same fallback chain it implements directly against
-        // the batch this sink produces.
+    fn syslog_message_to_batch_null_timestamp_day_column_is_todays_utc_date() {
+        // Narrower than the trait-level test below: just checks the raw
+        // `received_at` column value the mapper wrote, independent of
+        // whether anything downstream actually reads it for day bucketing.
         let msg = dummy_msg("no timestamp in this message");
         let batch = syslog_message_to_batch(&msg).unwrap();
 
@@ -444,11 +441,10 @@ mod tests {
     }
 
     #[test]
-    fn syslog_message_to_batch_valid_timestamp_still_used_over_received_at() {
-        // When timestamp IS present, it remains the authoritative event
-        // day (day_from_batch tries time_column() first); received_at is
-        // only a fallback, and this message's timestamp is deliberately a
-        // different UTC day than "now" to prove the two never get mixed up.
+    fn syslog_message_to_batch_valid_timestamp_day_column_matches_timestamp() {
+        // Narrower than the trait-level test below: just checks the raw
+        // `timestamp` column value the mapper wrote, independent of whether
+        // `time_column()`/`day_and_batch` actually reads it.
         let mut msg = sample_rfc5424();
         msg.timestamp = Some(
             chrono::DateTime::parse_from_rfc3339("2003-10-11T22:14:15Z")
@@ -475,6 +471,64 @@ mod tests {
             ts_day,
             chrono::Utc::now().date_naive(),
             "test is only meaningful if timestamp's day differs from received_at's day"
+        );
+    }
+
+    // -- Trait-level fallback-chain wiring: these are the tests that
+    // actually guard the feature. They go through `SyslogSink::day_and_batch`
+    // (the real call path `PartitionedParquetWriter::push` uses), not just
+    // the raw column values `syslog_message_to_batch` wrote. Each passes a
+    // `now` far in the future (2099) so that if the wiring silently
+    // degenerates to the wall-clock fallback -- e.g. `time_column()`
+    // returning a column name that doesn't exist, or `received_at` being
+    // ignored -- the returned day is unmistakably wrong (2099-01-01)
+    // instead of coincidentally right.
+
+    #[test]
+    fn day_and_batch_uses_timestamp_column_when_present() {
+        use chrono::TimeZone;
+        let sink = SyslogSink;
+        let schema = sink.schema(None);
+        let mut msg = sample_rfc5424();
+        msg.timestamp = Some(
+            chrono::DateTime::parse_from_rfc3339("2003-10-11T22:14:15Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        let distant_now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+
+        let (day, _batch) = sink.day_and_batch(&msg, &schema, distant_now).unwrap();
+
+        assert_ne!(
+            day,
+            distant_now.date_naive(),
+            "day must not come from the wall-clock fallback"
+        );
+        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2003, 10, 11).unwrap());
+    }
+
+    #[test]
+    fn day_and_batch_falls_back_to_received_at_when_timestamp_is_null() {
+        use chrono::TimeZone;
+        let sink = SyslogSink;
+        let schema = sink.schema(None);
+        let msg = dummy_msg("no timestamp in this message");
+        let distant_now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+
+        let (day, _batch) = sink.day_and_batch(&msg, &schema, distant_now).unwrap();
+
+        // The load-bearing assertion: without it, this test would still
+        // pass if the fallback chain silently degraded all the way to the
+        // wall-clock `now` argument instead of reading `received_at`.
+        assert_ne!(
+            day,
+            distant_now.date_naive(),
+            "day must not come from the wall-clock fallback"
+        );
+        assert_eq!(
+            day,
+            chrono::Utc::now().date_naive(),
+            "day must come from the received_at stamp, which is today's real UTC date"
         );
     }
 
