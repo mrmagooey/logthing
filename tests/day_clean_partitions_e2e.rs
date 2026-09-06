@@ -144,10 +144,18 @@ async fn syslog_ingest_spanning_midnight_is_day_clean() {
     let expected_day1 = day1_ts.date_naive();
     let expected_day2 = day2_ts.date_naive();
 
-    // Bracket the no-timestamp push with wall-clock reads so the test can
-    // confirm the fallback lands near "now" without hardcoding an exact
-    // date -- avoiding flakiness if the test happens to straddle a real
-    // midnight itself.
+    // Accept either of the two adjacent UTC dates for the no-timestamp
+    // fallback rather than hardcoding one, so a run that straddles a real
+    // midnight cannot flake.
+    //
+    // Note these two reads do NOT literally bracket the push's own clock
+    // read. `handle_message` has no `.await` suspension point and this is a
+    // current-thread `#[tokio::test]`, so the writer task -- where `push()`
+    // actually reads `Utc::now()` -- is not scheduled until the final
+    // `drop(handler)` / `timeout(..).await` below. All three pushes' real
+    // clock reads therefore happen just AFTER `after_fallback`, within a
+    // few milliseconds of it. The assertion holds because that gap is far
+    // smaller than a day, not because of any ordering guarantee.
     handler
         .handle_message(msg("before midnight", Some(day1_ts)), src)
         .await;
