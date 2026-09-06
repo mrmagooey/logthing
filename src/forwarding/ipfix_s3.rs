@@ -57,6 +57,11 @@ static FLOW_RECORD_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         Field::new("output_interface", DataType::UInt32, true),
         // extra: JSON object of non-curated fields; always present (non-null)
         Field::new("extra", DataType::Utf8, false),
+        Field::new(
+            "partition_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
     ]))
 });
 
@@ -89,6 +94,7 @@ pub struct FlowRecordBuilders {
     input_interface: UInt32Builder,
     output_interface: UInt32Builder,
     extra: StringBuilder,
+    partition_time: TimestampMicrosecondBuilder,
     row_count: usize,
 }
 
@@ -122,6 +128,10 @@ impl FlowRecordBuilders {
             input_interface: UInt32Builder::new(),
             output_interface: UInt32Builder::new(),
             extra: StringBuilder::new(),
+            partition_time: TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            )),
             row_count: 0,
         }
     }
@@ -182,6 +192,18 @@ pub fn append_flow_record(
     let extra_str = serde_json::to_string(&record.extra).unwrap_or_else(|_| "{}".to_string());
     builders.extra.append_value(extra_str);
 
+    // IPFIX's `export_time` is the exporter's own non-null absolute
+    // timestamp, so it is both the event and the receipt instant here.
+    // Routed through the shared helper (rather than assigned directly) so
+    // every sink derives `partition_time` via one code path.
+    let partition_time = crate::forwarding::buffered_writer::partition_time(
+        Some(record.export_time),
+        record.export_time,
+    );
+    builders
+        .partition_time
+        .append_value(partition_time.timestamp_micros());
+
     builders.row_count += 1;
     Ok(())
 }
@@ -210,6 +232,7 @@ pub fn finish_batch(
         Arc::new(builders.input_interface.finish()) as ArrayRef,
         Arc::new(builders.output_interface.finish()) as ArrayRef,
         Arc::new(builders.extra.finish()) as ArrayRef,
+        Arc::new(builders.partition_time.finish()) as ArrayRef,
     ];
     Ok(RecordBatch::try_new(schema, columns)?)
 }
@@ -239,11 +262,12 @@ impl ParquetSink for IpfixSink {
         flow_record_schema()
     }
 
-    /// Event time column for day bucketing. IPFIX `export_time` is the absolute
-    /// flow export time from the exporter (non-null), representing when the flow
-    /// ended and was exported, which is more accurate for partitioning.
+    /// Event time column for day bucketing. `partition_time` is derived from
+    /// IPFIX `export_time`, the absolute flow export time from the exporter
+    /// (non-null), representing when the flow ended and was exported, which
+    /// is more accurate for partitioning.
     fn time_column(&self) -> Option<&'static str> {
-        Some("export_time")
+        Some("partition_time")
     }
 
     fn to_record_batch(
@@ -422,7 +446,7 @@ mod tests {
     fn schema_has_correct_fields_and_types() {
         use arrow::datatypes::DataType;
         let schema = flow_record_schema();
-        assert_eq!(schema.fields().len(), 18, "expected 18 columns");
+        assert_eq!(schema.fields().len(), 19, "expected 19 columns");
 
         use arrow::datatypes::TimeUnit;
         let ts_type = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
@@ -445,6 +469,7 @@ mod tests {
             ("input_interface", DataType::UInt32, true),
             ("output_interface", DataType::UInt32, true),
             ("extra", DataType::Utf8, false),
+            ("partition_time", ts_type.clone(), false),
         ];
 
         for (name, expected_type, expected_nullable) in cases {
@@ -597,6 +622,55 @@ mod tests {
         assert_eq!(parsed, original);
     }
 
+    #[test]
+    fn schema_partition_time_is_non_null_microsecond_timestamp() {
+        use arrow::datatypes::TimeUnit;
+        let schema = flow_record_schema();
+        let f = schema
+            .field_with_name("partition_time")
+            .expect("partition_time column missing");
+        assert_eq!(
+            f.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(!f.is_nullable(), "partition_time must be non-nullable");
+    }
+
+    #[test]
+    fn partition_time_equals_export_time_for_every_row() {
+        use arrow::array::TimestampMicrosecondArray;
+
+        // Two records with distinct, distinctive (non-"now") export_time
+        // values, so a mapper that fell back to a shared/constant/epoch
+        // value would visibly fail this.
+        let mut r0 = make_flow_record(Some("10.0.0.1"), Some(1), serde_json::json!({}));
+        r0.export_time = chrono::Utc.with_ymd_and_hms(2026, 4, 2, 9, 17, 5).unwrap();
+        let mut r1 = make_flow_record(None, None, serde_json::json!({}));
+        r1.export_time = chrono::Utc
+            .with_ymd_and_hms(2025, 11, 30, 23, 4, 12)
+            .unwrap();
+
+        let mut builders = FlowRecordBuilders::new();
+        append_flow_record(&mut builders, &r0).unwrap();
+        append_flow_record(&mut builders, &r1).unwrap();
+        let batch = finish_batch(builders, flow_record_schema()).unwrap();
+
+        let partition_time_col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("partition_time column should be TimestampMicrosecondArray");
+        assert_eq!(
+            partition_time_col.value(0),
+            r0.export_time.timestamp_micros()
+        );
+        assert_eq!(
+            partition_time_col.value(1),
+            r1.export_time.timestamp_micros()
+        );
+    }
+
     // -- IpfixSink unit tests (Task 2.1) --
 
     #[test]
@@ -604,7 +678,7 @@ mod tests {
         use crate::forwarding::buffered_writer::ParquetSink;
         let sink = IpfixSink;
         let schema = sink.schema(None);
-        assert_eq!(schema.fields().len(), 18);
+        assert_eq!(schema.fields().len(), 19);
         assert!(sink.partition(&vec![]).is_none());
 
         let r = make_flow_record(Some("10.0.0.1"), Some(999), serde_json::json!({"k":"v"}));

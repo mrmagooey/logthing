@@ -17,6 +17,8 @@ use std::sync::{Arc, LazyLock};
 /// - `received_at` — Timestamp(µs, UTC), non-null  (wall-clock ingest time)
 /// - `src_ip`      — Utf8, nullable  (opportunistic fast path; null when absent)
 /// - `payload`     — Utf8, non-null  (full JSON object as string)
+/// - `partition_time` — Timestamp(µs, UTC), non-null  (the instant the buffer's
+///   day was derived from; see `map_envelope`)
 pub fn envelope_schema() -> Arc<Schema> {
     static S: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         Arc::new(Schema::new(vec![
@@ -28,6 +30,11 @@ pub fn envelope_schema() -> Arc<Schema> {
             ),
             Field::new("src_ip", DataType::Utf8, true),
             Field::new("payload", DataType::Utf8, false),
+            Field::new(
+                "partition_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
         ]))
     });
     S.clone()
@@ -44,6 +51,14 @@ pub fn map_envelope(record: &SuricataRecord) -> anyhow::Result<RecordBatch> {
         .map(|s| s.to_string());
     let received_at = record.received_at.timestamp_micros();
     let payload = record.fields.to_string();
+    // Suricata has no event-carried timestamp, so `received_at` is both the
+    // event and the receipt instant. Routed through the shared helper (rather
+    // than assigned directly) so every sink derives `partition_time` via one
+    // code path.
+    let partition_time = crate::forwarding::buffered_writer::partition_time(
+        Some(record.received_at),
+        record.received_at,
+    );
 
     let mut b_event_type = StringBuilder::new();
     let mut b_received_at = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
@@ -52,17 +67,22 @@ pub fn map_envelope(record: &SuricataRecord) -> anyhow::Result<RecordBatch> {
     ));
     let mut b_src_ip = StringBuilder::new();
     let mut b_payload = StringBuilder::new();
+    let mut b_partition_time = TimestampMicrosecondBuilder::new().with_data_type(
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+    );
 
     b_event_type.append_value(&record.event_type);
     b_received_at.append_value(received_at);
     b_src_ip.append_option(src_ip.as_deref());
     b_payload.append_value(&payload);
+    b_partition_time.append_value(partition_time.timestamp_micros());
 
     let columns: Vec<ArrayRef> = vec![
         Arc::new(b_event_type.finish()),
         Arc::new(b_received_at.finish()),
         Arc::new(b_src_ip.finish()),
         Arc::new(b_payload.finish()),
+        Arc::new(b_partition_time.finish()),
     ];
     Ok(RecordBatch::try_new(schema, columns)?)
 }
@@ -161,6 +181,38 @@ mod tests {
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
             .expect("received_at column should be TimestampMicrosecondArray");
+        assert_eq!(col.value(0), rec.received_at.timestamp_micros());
+    }
+
+    #[test]
+    fn schema_has_non_null_microsecond_partition_time() {
+        let s = envelope_schema();
+        let f = s
+            .field_with_name("partition_time")
+            .expect("partition_time column");
+        assert_eq!(
+            f.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(!f.is_nullable(), "partition_time must be non-nullable");
+    }
+
+    #[test]
+    fn map_envelope_partition_time_equals_received_at() {
+        use arrow::array::TimestampMicrosecondArray;
+        // A distinctive, far-from-"now" instant: a broken mapper that fell
+        // back to Utc::now() or to the epoch would visibly fail this.
+        let mut rec = make_alert_record();
+        rec.received_at = chrono::DateTime::parse_from_rfc3339("2024-01-15T10:30:00.123456Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let batch = map_envelope(&rec).unwrap();
+        let col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("partition_time column should be TimestampMicrosecondArray");
         assert_eq!(col.value(0), rec.received_at.timestamp_micros());
     }
 

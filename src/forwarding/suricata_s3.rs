@@ -86,9 +86,10 @@ impl ParquetSink for SuricataSink {
     }
 
     /// Time column for day bucketing. Suricata records do not carry an event
-    /// timestamp in the payload; use the non-null `received_at` (server receipt time).
+    /// timestamp in the payload; `partition_time` is derived from the
+    /// non-null `received_at` (server receipt time).
     fn time_column(&self) -> Option<&'static str> {
-        Some("received_at")
+        Some("partition_time")
     }
 
     /// Convert one `SuricataRecord` to a single-row `RecordBatch`.

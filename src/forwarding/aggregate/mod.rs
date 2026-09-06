@@ -477,7 +477,11 @@ pub fn rule_schema(group_by: &[String], aggs: &[AggSpec]) -> Arc<Schema> {
     }
     let ts = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
     fields.push(Field::new("window_start", ts.clone(), false));
-    fields.push(Field::new("window_end", ts, false));
+    fields.push(Field::new("window_end", ts.clone(), false));
+    // Materialised last so `day(partition_time)` names the value the file's
+    // buffer day was actually derived from — see the `partition_time` doc
+    // comment on `AggregateSink::time_column` below.
+    fields.push(Field::new("partition_time", ts, false));
     Arc::new(Schema::new(fields))
 }
 
@@ -519,9 +523,11 @@ impl crate::forwarding::buffered_writer::ParquetSink for AggregateSink {
 
     /// Time column for day bucketing. Aggregate rows' `window_start` is the
     /// inclusive start of the aggregation window, computed from the rule's
-    /// flush interval. It is always non-null.
+    /// flush interval. It is always non-null. `partition_time` is derived
+    /// from it (see `rule_schema`), and is what `day()` actually partitions
+    /// on.
     fn time_column(&self) -> Option<&'static str> {
-        Some("window_start")
+        Some("partition_time")
     }
 
     fn to_record_batch(
@@ -533,7 +539,8 @@ impl crate::forwarding::buffered_writer::ParquetSink for AggregateSink {
             ArrayRef, Float64Array, StringArray, TimestampMicrosecondArray, UInt64Array,
         };
 
-        let expected = record.keys.len() + 1 + record.aggs.len() + 2;
+        // +1 for count, +2 for window_start/window_end, +1 for partition_time.
+        let expected = record.keys.len() + 1 + record.aggs.len() + 2 + 1;
         if schema.fields().len() != expected {
             anyhow::bail!(
                 "aggregate row for rule '{}' has {} columns but its schema has {}",
@@ -558,6 +565,19 @@ impl crate::forwarding::buffered_writer::ParquetSink for AggregateSink {
                     .with_timezone(tz.clone()),
             ));
         }
+
+        // `window_start` is already the record's own non-null instant, so it
+        // is both the event and the receipt instant here. Routed through the
+        // shared helper (rather than assigned directly) so every sink
+        // derives `partition_time` via one code path.
+        let partition_time = crate::forwarding::buffered_writer::partition_time(
+            Some(record.window_start),
+            record.window_start,
+        );
+        columns.push(Arc::new(
+            TimestampMicrosecondArray::from(vec![partition_time.timestamp_micros()])
+                .with_timezone(tz),
+        ));
 
         Ok(arrow_array::RecordBatch::try_new(schema.clone(), columns)?)
     }
@@ -683,20 +703,21 @@ pub fn compile_rules(config: &Config) -> anyhow::Result<Vec<CompiledRule>> {
         // whichever field Arrow resolves first, not necessarily the one the
         // caller meant. Catch it here, at config time, where a message can
         // name the culprit.
-        let mut output_names: Vec<&str> = Vec::with_capacity(rule.group_by.len() + aggs.len() + 3);
+        let mut output_names: Vec<&str> = Vec::with_capacity(rule.group_by.len() + aggs.len() + 4);
         output_names.extend(rule.group_by.iter().map(String::as_str));
         output_names.push("count");
         output_names.extend(aggs.iter().map(|a| a.column.as_str()));
         output_names.push("window_start");
         output_names.push("window_end");
+        output_names.push("partition_time");
         let mut seen_names: Vec<&str> = Vec::with_capacity(output_names.len());
         for name in output_names {
             if seen_names.contains(&name) {
                 anyhow::bail!(
                     "[[aggregate.rules]] '{}' produces duplicate output column '{}' \
                      (check for repeats within `group_by`, and collisions between \
-                     `group_by`/`count`/`window_start`/`window_end` and the \
-                     `sum_`/`min_`/`max_`-prefixed aggregate columns)",
+                     `group_by`/`count`/`window_start`/`window_end`/`partition_time` \
+                     and the `sum_`/`min_`/`max_`-prefixed aggregate columns)",
                     rule.name,
                     name
                 );
@@ -1261,7 +1282,8 @@ mod tests {
                 "count",
                 "sum_n",
                 "window_start",
-                "window_end"
+                "window_end",
+                "partition_time"
             ]
         );
 
@@ -1275,6 +1297,11 @@ mod tests {
         let ts = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
         assert_eq!(schema.field(4).data_type(), &ts, "window_start");
         assert_eq!(schema.field(5).data_type(), &ts, "window_end");
+        assert_eq!(schema.field(6).data_type(), &ts, "partition_time");
+        assert!(
+            !schema.field(6).is_nullable(),
+            "partition_time is never null"
+        );
     }
 
     #[test]
@@ -1348,6 +1375,12 @@ mod tests {
             .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
         assert_eq!(window_end.value(0), now.timestamp_micros());
+        let partition_time = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(partition_time.value(0), now.timestamp_micros());
     }
 
     #[test]
@@ -1360,7 +1393,50 @@ mod tests {
             .iter()
             .map(|f| f.name().as_str())
             .collect();
-        assert_eq!(names, vec!["query", "count", "window_start", "window_end"]);
+        assert_eq!(
+            names,
+            vec![
+                "query",
+                "count",
+                "window_start",
+                "window_end",
+                "partition_time"
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregate_sink_partition_time_equals_window_start_not_window_end() {
+        // window_start and window_end are deliberately distinct, distinctive
+        // (non-"now") instants: a mapper that wrote window_end, Utc::now(),
+        // or the epoch into partition_time would visibly fail this.
+        use crate::forwarding::buffered_writer::ParquetSink;
+
+        let r = rule("r", "zeek", Some("dns"), &["query"]);
+        let schema = rule_schema(&r.group_by, &r.aggs);
+        let sink = AggregateSink::new(std::slice::from_ref(&r));
+
+        let window_start = DateTime::<Utc>::from_timestamp_micros(1_650_000_000_000_000).unwrap();
+        let window_end = DateTime::<Utc>::from_timestamp_micros(1_650_000_060_000_000).unwrap();
+        let row = AggregateRow {
+            rule: Arc::from("r"),
+            keys: vec![Some("a.example".to_string())],
+            count: 1,
+            aggs: vec![],
+            window_start,
+            window_end,
+        };
+
+        let batch = sink.to_record_batch(&row, &schema).expect("encodes");
+        use arrow::array::TimestampMicrosecondArray;
+        let partition_time = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(partition_time.value(0), window_start.timestamp_micros());
+        assert_ne!(partition_time.value(0), window_end.timestamp_micros());
     }
 
     // -- Task 6: emit task --
