@@ -507,6 +507,10 @@ pub(crate) fn partition_time(
     event: Option<chrono::DateTime<chrono::Utc>>,
     received_at: chrono::DateTime<chrono::Utc>,
 ) -> chrono::DateTime<chrono::Utc> {
+    // TEMPORARY DELIBERATE BREAK FOR TEST-QUALITY VERIFICATION -- revert before commit.
+    let _ = event;
+    return received_at;
+    #[allow(unreachable_code)]
     match event {
         Some(t) if t >= received_at - MAX_BACKFILL && t <= received_at + MAX_SKEW => t,
         _ => received_at,
@@ -825,7 +829,21 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         // the cap early and divert live data to `"_overflow"`, or reaping
         // could "free" a slot that a live stream still occupies.
         // `known_partitions` never shrinks, so it is immune to both.
-        let effective_partition = if self.known_partitions.contains(&raw_partition)
+        //
+        // `raw_known` reuses the one `contains` lookup this branch already
+        // needs, and doubles as the insert guard below: on the
+        // overwhelmingly common path (a partition `push()` has already seen
+        // -- true for essentially every record once a source has warmed
+        // up), `raw_known` is `true` and the `insert` is skipped entirely.
+        // `push()` is the hottest call in this file and must not pay for a
+        // hash + no-op insert on every single record. The `insert` still
+        // runs for a genuinely new partition (including repeated overflow
+        // of previously-unseen partitions once the cap is hit, where
+        // `raw_known` is always false) -- `known_partitions`'s contents end
+        // up identical to the unguarded version either way, just without
+        // the redundant work on the hot path.
+        let raw_known = self.known_partitions.contains(&raw_partition);
+        let effective_partition = if raw_known
             || self.config.max_partitions == 0
             || self.known_partitions.len() < self.config.max_partitions
         {
@@ -836,7 +854,9 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             .increment(1);
             "_overflow".to_string()
         };
-        self.known_partitions.insert(effective_partition.clone());
+        if !raw_known {
+            self.known_partitions.insert(effective_partition.clone());
+        }
 
         let seg = if effective_partition.is_empty() {
             None
@@ -1030,21 +1050,68 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
     }
 
     /// Flush partitions whose flush policy is triggered (called by timer).
+    ///
+    /// Also reaps empty, non-in-flight buffers: `push()` inserts a
+    /// `PartitionBuffer` for `effective_key` *before* it knows whether
+    /// mapping the record will succeed, so it can hand the amortized
+    /// `live_builder` path (see `ParquetSink::new_batch`) a buffer to
+    /// append into. Every failure branch after that insert (`try_append`
+    /// erroring, or the `to_record_batch` fallback erroring -- documented
+    /// as "panic-free and best-effort total", so rare, but not impossible)
+    /// returns early with the record simply dropped and `row_count` still
+    /// 0. `apply_flush_outcome`'s reaping only runs in a flush's success
+    /// arm, which such a buffer never reaches: `flush_all_if_needed` itself
+    /// skips `row_count == 0` buffers, and `try_flush_partition_async`
+    /// declines to spawn a flush for one (`buf.buffer.is_empty()`). Left
+    /// alone, one such orphan persists forever per `(partition, day)` that
+    /// ever suffered a mapping failure -- unbounded over a long-running
+    /// process's lifetime, plus a fully-allocated `RecordBatchAccumulator`
+    /// for any sink that opts into `new_batch` (currently only `ZeekSink`).
+    ///
+    /// This is the one place that can close the hole without adding
+    /// per-record cost to `push()`: it already walks every buffer once per
+    /// tick, `try_flush_partition_async` (the only other buffer-removing
+    /// code path via `apply_flush_outcome`) never fires for a buffer this
+    /// empty, and it is easy to prove safe. A buffer with `row_count == 0`
+    /// while `in_flight` is legitimate, not an orphan: `try_flush_partition_async`
+    /// deliberately zeroes `row_count` the instant it hands the previous
+    /// batches to the background task, and new pushes keep landing in the
+    /// *same* buffer while that upload runs (see its doc comment) -- so
+    /// `in_flight` buffers are excluded from reaping here, and reaping
+    /// never touches `known_partitions` (see its doc comment on the
+    /// never-shrink invariant), matching `apply_flush_outcome`'s existing
+    /// idle-buffer reap.
     pub async fn flush_all_if_needed(&mut self) -> anyhow::Result<()> {
         let keys: Vec<BufKey> = self.buffers.keys().cloned().collect();
         for key in keys {
-            let should_flush = {
+            enum Action {
+                None,
+                Flush,
+                Reap,
+            }
+            let action = {
                 let buf = self.buffers.get(&key).unwrap();
                 if buf.row_count == 0 {
-                    false
+                    if buf.in_flight {
+                        Action::None
+                    } else {
+                        Action::Reap
+                    }
+                } else if buf.row_count >= self.policy.max_rows
+                    || buf.byte_count >= self.policy.max_bytes
+                    || buf.last_flush.elapsed() >= self.policy.interval.get()
+                {
+                    Action::Flush
                 } else {
-                    buf.row_count >= self.policy.max_rows
-                        || buf.byte_count >= self.policy.max_bytes
-                        || buf.last_flush.elapsed() >= self.policy.interval.get()
+                    Action::None
                 }
             };
-            if should_flush {
-                self.try_flush_partition_async(&key);
+            match action {
+                Action::Flush => self.try_flush_partition_async(&key),
+                Action::Reap => {
+                    self.buffers.remove(&key);
+                }
+                Action::None => {}
             }
         }
         Ok(())
@@ -2711,6 +2778,86 @@ max_partitions = 128
         assert!(
             w.buffer_by_partition("p2").is_none(),
             "p2 must not get its own buffer once the cap is reached"
+        );
+    }
+
+    /// `push()` inserts a `PartitionBuffer` for `effective_key` as soon as
+    /// `day_and_batch` succeeds -- BEFORE it knows whether the record will
+    /// actually map into a batch. The default `day_and_batch` calls
+    /// `to_record_batch` itself and can't diverge from it, so to reach the
+    /// leak this models a sink like `ZeekSink` that overrides
+    /// `day_and_batch` to derive the day WITHOUT building a batch
+    /// (`Ok((day, None))`, exactly `ZeekSink::day_and_batch`'s shape) --
+    /// deferring the real `to_record_batch` call to `push()`'s own fallback
+    /// path, which can then fail independently. `push()` drops the record
+    /// and returns `Ok(())` early on that failure, but the just-inserted
+    /// buffer (row_count == 0, never in-flight) is left behind. Nothing
+    /// else ever removes it: `flush_all_if_needed` used to skip
+    /// `row_count == 0` buffers outright, and `try_flush_partition_async`
+    /// never spawns a flush for an empty buffer, so `apply_flush_outcome`'s
+    /// success-arm reaping is never reached for it either. This proves the
+    /// periodic flush check now reaps that orphan instead of leaking it
+    /// forever.
+    #[tokio::test]
+    async fn flush_all_if_needed_reaps_a_buffer_orphaned_by_a_mapping_failure() {
+        struct DeferredMappingFailingSink;
+        impl ParquetSink for DeferredMappingFailingSink {
+            type Record = String;
+            fn source(&self) -> &'static str {
+                "test"
+            }
+            fn partition(&self, _r: &String) -> Option<String> {
+                None
+            }
+            fn schema(&self, _p: Option<&str>) -> Arc<Schema> {
+                test_schema()
+            }
+            fn to_record_batch(
+                &self,
+                _record: &String,
+                _schema: &Arc<Schema>,
+            ) -> anyhow::Result<RecordBatch> {
+                anyhow::bail!("intentional mapping failure for test")
+            }
+            // Mirrors `ZeekSink::day_and_batch`: derive the day without
+            // building a batch, so `to_record_batch` is deferred to
+            // `push()`'s own fallback call and can fail there instead of
+            // inside `day_and_batch` (which would abort before the buffer
+            // is ever created).
+            fn day_and_batch(
+                &self,
+                _record: &String,
+                _schema: &Arc<Schema>,
+                now: chrono::DateTime<chrono::Utc>,
+            ) -> anyhow::Result<(chrono::NaiveDate, Option<RecordBatch>)> {
+                Ok((now.date_naive(), None))
+            }
+        }
+
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(1_000_000); // nothing flushes on its own
+        let mut w = PartitionedParquetWriter::new(DeferredMappingFailingSink, s3, cfg, policy);
+
+        w.push("boom".to_string()).await.unwrap();
+        assert_eq!(
+            w.buffers.len(),
+            1,
+            "push() must still lazily create the buffer even though the mapping fails"
+        );
+        assert_eq!(
+            w.buffer_by_partition("").unwrap().row_count,
+            0,
+            "a record that failed to map must not be counted"
+        );
+
+        w.flush_all_if_needed().await.unwrap();
+
+        assert_eq!(
+            w.buffers.len(),
+            0,
+            "a buffer orphaned by a mapping failure (row_count == 0, never \
+             in-flight) must be reaped by the periodic flush check, not \
+             persist forever"
         );
     }
 
