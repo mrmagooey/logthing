@@ -507,10 +507,6 @@ pub(crate) fn partition_time(
     event: Option<chrono::DateTime<chrono::Utc>>,
     received_at: chrono::DateTime<chrono::Utc>,
 ) -> chrono::DateTime<chrono::Utc> {
-    // TEMPORARY DELIBERATE BREAK FOR TEST-QUALITY VERIFICATION -- revert before commit.
-    let _ = event;
-    return received_at;
-    #[allow(unreachable_code)]
     match event {
         Some(t) if t >= received_at - MAX_BACKFILL && t <= received_at + MAX_SKEW => t,
         _ => received_at,
