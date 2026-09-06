@@ -99,6 +99,54 @@ pub trait ParquetSink: Send + Sync + 'static {
         let _ = schema;
         None
     }
+
+    /// Name of the Arrow column whose value determines a record's UTC
+    /// event day -- the column `day_and_batch`'s default implementation
+    /// reads to bucket buffers (and therefore Parquet files) so each one
+    /// is "day-clean": every row decodes to the same Iceberg `day()`
+    /// partition tuple. See
+    /// docs/superpowers/specs/2026-09-05-day-clean-parquet-partitions-design.md.
+    ///
+    /// `None` means this sink has not opted in, so `day_and_batch`'s
+    /// default falls straight through to the generic `received_at` / `now`
+    /// fallback chain in `day_from_batch`. That is intentionally fine for
+    /// every sink that doesn't override it -- in particular this crate's
+    /// own test-only `ParquetSink` mocks, none of which need accurate
+    /// day partitioning and all of which get correct (if day-agnostic)
+    /// bucketing for free.
+    fn time_column(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Map one record to its batch AND the UTC day its `time_column()`
+    /// value falls on, in a single pass.
+    ///
+    /// Default: calls `to_record_batch` exactly once, then reads the day
+    /// back off the very batch it just built (`day_from_batch`). This is
+    /// deliberate, not just an optimization: it is the only way a sink
+    /// that stamps a fresh `Utc::now()` value into the row it returns
+    /// (e.g. syslog's `received_at` -- see `syslog_s3.rs`) can guarantee
+    /// the buffer-key day and the persisted value never disagree. Calling
+    /// `to_record_batch` a second time, or reading the clock a second
+    /// time, would each independently reopen that race.
+    ///
+    /// Returns `(day, None)` instead of `(day, Some(batch))` only when a
+    /// sink overrides this method to compute the day WITHOUT building a
+    /// batch -- exclusively relevant to a sink that also implements
+    /// `new_batch` (an amortized fast path whose entire purpose is
+    /// avoiding a per-record `to_record_batch` call; see `ZeekSink`'s
+    /// override). The caller (`PartitionedParquetWriter::push`) treats
+    /// `None` as "map it later, only if actually needed."
+    fn day_and_batch(
+        &self,
+        record: &Self::Record,
+        schema: &Arc<arrow_schema::Schema>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<(chrono::NaiveDate, Option<arrow_array::RecordBatch>)> {
+        let batch = self.to_record_batch(record, schema)?;
+        let day = day_from_batch(&batch, self.time_column(), now);
+        Ok((day, Some(batch)))
+    }
 }
 
 /// Amortized builder state for one in-progress, possibly-multi-row
@@ -292,6 +340,124 @@ pub(crate) fn unused_s3_connection_placeholder() -> crate::config::S3ConnectionC
         region: String::new(),
         access_key: String::new(),
         secret_key: String::new(),
+    }
+}
+
+/// Extract the UTC calendar day a just-mapped batch's designated
+/// `time_col` falls on, reading row 0 only.
+///
+/// Row 0 is correct for every sink's batch except `IpfixSink`'s, which
+/// maps a whole `Vec<FlowRecord>` (already batched at the listener) into
+/// one multi-row `RecordBatch` per push -- but IPFIX's `export_time` is
+/// decoded once per message and copied onto every `FlowRecord` produced
+/// from it (see `src/ipfix/decoder.rs`), so row 0 can never disagree with
+/// any other row in that same batch.
+///
+/// Fallback chain: `time_col` -> a column literally named `"received_at"`
+/// -> `now`. The middle step is what lets syslog/structured_syslog/generic
+/// (each of whose primary time column is nullable) fall back to their own
+/// `received_at` column without any sink-specific code here; it is a
+/// harmless no-op for sinks whose primary column has no such column to
+/// find (e.g. Zeek's typed schemas, which fall straight to `now`).
+fn day_from_batch(
+    batch: &arrow_array::RecordBatch,
+    time_col: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::NaiveDate {
+    use arrow_array::Array as _;
+
+    let day_of = |name: &str| -> Option<chrono::NaiveDate> {
+        let col = batch.column_by_name(name)?;
+        let ts = col
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()?;
+        if ts.is_empty() || ts.is_null(0) {
+            return None;
+        }
+        chrono::DateTime::from_timestamp_micros(ts.value(0)).map(|dt| dt.date_naive())
+    };
+
+    time_col
+        .and_then(day_of)
+        .or_else(|| day_of("received_at"))
+        .unwrap_or_else(|| now.date_naive())
+}
+
+#[cfg(test)]
+mod day_from_batch_tests {
+    use super::*;
+    use arrow::array::TimestampMicrosecondArray;
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::record_batch::RecordBatch;
+    use chrono::TimeZone;
+
+    fn ts_schema(cols: &[&str]) -> Arc<Schema> {
+        Arc::new(Schema::new(
+            cols.iter()
+                .map(|name| {
+                    Field::new(
+                        *name,
+                        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn ts_batch(schema: &Arc<Schema>, values: &[Option<i64>]) -> RecordBatch {
+        let cols: Vec<arrow_array::ArrayRef> = values
+            .iter()
+            .map(|v| {
+                Arc::new(TimestampMicrosecondArray::from(vec![*v]).with_timezone("UTC"))
+                    as arrow_array::ArrayRef
+            })
+            .collect();
+        RecordBatch::try_new(schema.clone(), cols).unwrap()
+    }
+
+    fn micros(y: i32, m: u32, d: u32) -> i64 {
+        chrono::Utc
+            .with_ymd_and_hms(y, m, d, 12, 0, 0)
+            .unwrap()
+            .timestamp_micros()
+    }
+
+    #[test]
+    fn reads_the_primary_column_when_non_null() {
+        let schema = ts_schema(&["ts"]);
+        let batch = ts_batch(&schema, &[Some(micros(2026, 3, 7))]);
+        let now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+        let day = day_from_batch(&batch, Some("ts"), now);
+        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2026, 3, 7).unwrap());
+    }
+
+    #[test]
+    fn falls_back_to_received_at_when_primary_is_null() {
+        let schema = ts_schema(&["timestamp", "received_at"]);
+        let batch = ts_batch(&schema, &[None, Some(micros(2026, 5, 1))]);
+        let now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+        let day = day_from_batch(&batch, Some("timestamp"), now);
+        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2026, 5, 1).unwrap());
+    }
+
+    #[test]
+    fn falls_back_to_now_when_nothing_else_applies() {
+        let schema = ts_schema(&["ts"]);
+        let batch = ts_batch(&schema, &[None]);
+        let now = chrono::Utc.with_ymd_and_hms(2030, 12, 25, 0, 0, 0).unwrap();
+        let day = day_from_batch(&batch, Some("ts"), now);
+        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2030, 12, 25).unwrap());
+    }
+
+    #[test]
+    fn none_time_column_skips_straight_to_fallback_chain() {
+        let schema = ts_schema(&["received_at"]);
+        let batch = ts_batch(&schema, &[Some(micros(2027, 2, 2))]);
+        let now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+        // time_column() defaults to None for sinks that don't opt in.
+        let day = day_from_batch(&batch, None, now);
+        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2027, 2, 2).unwrap());
     }
 }
 
