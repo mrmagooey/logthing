@@ -264,8 +264,8 @@ async fn zeek_records_appear_as_parquet_in_s3() {
         ];
         assert_eq!(
             schema.fields().len(),
-            9,
-            "Envelope (weird) schema must have 9 columns"
+            10,
+            "Envelope (weird) schema must have 10 columns"
         );
         for col in envelope_expected_cols {
             assert!(

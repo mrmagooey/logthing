@@ -173,8 +173,8 @@ async fn ipfix_flow_record_appears_as_parquet_in_s3() {
     ];
     assert_eq!(
         schema.fields().len(),
-        18,
-        "IPFIX schema must have 18 columns"
+        19,
+        "IPFIX schema must have 19 columns"
     );
     for col in expected_columns {
         assert!(
