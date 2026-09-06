@@ -1278,7 +1278,7 @@ In `src/forwarding/aggregate/mod.rs` (`AggregateSink::new` needs a `Vec<Compiled
 
 - [ ] **Step 2: Run it, verify it fails**
 
-Run: `cargo test time_column` — Expected: FAIL, every one of the 9 new tests gets `""` (the Task 2 default) instead of the expected column name.
+Run: `cargo test time_column` — Expected: FAIL, every one of the 9 new tests gets `None` (the Task 2 default) instead of the expected column name.
 
 - [ ] **Step 3: Implement**
 
