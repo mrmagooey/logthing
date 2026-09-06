@@ -251,12 +251,12 @@ EOF
 **Interfaces:**
 - Consumes: none new (uses existing `ParquetSink::to_record_batch`).
 - Produces:
-  - `fn day_from_batch(batch: &arrow_array::RecordBatch, time_col: &str, now: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDate` (free function, `buffered_writer.rs`)
-  - `ParquetSink::time_column(&self) -> &'static str` (default `""`)
+  - `fn day_from_batch(batch: &arrow_array::RecordBatch, time_col: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDate` (free function, `buffered_writer.rs`)
+  - `ParquetSink::time_column(&self) -> Option<&'static str>` (default `None`)
   - `ParquetSink::day_and_batch(&self, record: &Self::Record, schema: &Arc<arrow_schema::Schema>, now: chrono::DateTime<chrono::Utc>) -> anyhow::Result<(chrono::NaiveDate, Option<arrow_array::RecordBatch>)>` (default impl)
   - Task 3 consumes `day_and_batch` from `push()`; Task 4 overrides `time_column()` per sink; Task 5 overrides `day_and_batch()` for `ZeekSink`.
 
-This task is a pure addition — no existing call site changes, so the tree keeps compiling and every existing test stays green. `time_column()` defaults to `""` (never matches a real schema column) specifically so the ~12 test-only `ParquetSink` mocks scattered across this crate (`MockSink`, `AmortizingMockSink`, `TwoPartitionMock`, etc. — none of which care about accurate day partitioning) need no changes at all: they fall straight through to the `now`-based fallback in `day_from_batch`, which buckets every record from one short-lived test run onto the same single day.
+This task is a pure addition — no existing call site changes, so the tree keeps compiling and every existing test stays green. `time_column()` defaults to `None` specifically so the ~12 test-only `ParquetSink` mocks scattered across this crate (`MockSink`, `AmortizingMockSink`, `TwoPartitionMock`, etc. — none of which care about accurate day partitioning) need no changes at all: they fall straight through to the `now`-based fallback in `day_from_batch`, which buckets every record from one short-lived test run onto the same single day.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -355,15 +355,15 @@ In `src/forwarding/buffered_writer.rs`, extend the `ParquetSink` trait (after th
     /// partition tuple. See
     /// docs/superpowers/specs/2026-09-05-day-clean-parquet-partitions-design.md.
     ///
-    /// Default `""` never matches a real column, so `day_and_batch`'s
+    /// `None` means this sink has not opted in, so `day_and_batch`'s
     /// default falls straight through to the generic `received_at` / `now`
     /// fallback chain in `day_from_batch`. That is intentionally fine for
     /// every sink that doesn't override it -- in particular this crate's
     /// own test-only `ParquetSink` mocks, none of which need accurate
     /// day partitioning and all of which get correct (if day-agnostic)
     /// bucketing for free.
-    fn time_column(&self) -> &'static str {
-        ""
+    fn time_column(&self) -> Option<&'static str> {
+        None
     }
 
     /// Map one record to its batch AND the UTC day its `time_column()`
@@ -418,7 +418,7 @@ Then, just before the `PartitionBuffer` section (i.e. right before the `// Parti
 /// find (e.g. Zeek's typed schemas, which fall straight to `now`).
 fn day_from_batch(
     batch: &arrow_array::RecordBatch,
-    time_col: &str,
+    time_col: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> chrono::NaiveDate {
     use arrow_array::Array as _;
@@ -510,8 +510,8 @@ Add a new mock and three tests (placed near `RecordingSink`, ~line 2127):
                 true,
             )]))
         }
-        fn time_column(&self) -> &'static str {
-            "ts"
+        fn time_column(&self) -> Option<&'static str> {
+            Some("ts")
         }
         fn to_record_batch(
             &self,
@@ -1286,64 +1286,64 @@ Add to each `impl ParquetSink for X` block (placed after `schema()`, before `to_
 
 `src/forwarding/zeek_s3.rs`:
 ```rust
-    fn time_column(&self) -> &'static str {
-        "ts"
+    fn time_column(&self) -> Option<&'static str> {
+        Some("ts")
     }
 ```
 
 `src/forwarding/syslog_s3.rs`:
 ```rust
-    fn time_column(&self) -> &'static str {
-        "timestamp"
+    fn time_column(&self) -> Option<&'static str> {
+        Some("timestamp")
     }
 ```
 
 `src/forwarding/structured_syslog_s3.rs`:
 ```rust
-    fn time_column(&self) -> &'static str {
-        "timestamp"
+    fn time_column(&self) -> Option<&'static str> {
+        Some("timestamp")
     }
 ```
 
 `src/forwarding/generic_s3.rs`:
 ```rust
-    fn time_column(&self) -> &'static str {
-        "time"
+    fn time_column(&self) -> Option<&'static str> {
+        Some("time")
     }
 ```
 
 `src/forwarding/suricata_s3.rs`:
 ```rust
-    fn time_column(&self) -> &'static str {
-        "received_at"
+    fn time_column(&self) -> Option<&'static str> {
+        Some("received_at")
     }
 ```
 
 `src/forwarding/sflow_s3.rs`:
 ```rust
-    fn time_column(&self) -> &'static str {
-        "received_at"
+    fn time_column(&self) -> Option<&'static str> {
+        Some("received_at")
     }
 ```
 
 `src/forwarding/ipfix_s3.rs`:
 ```rust
-    fn time_column(&self) -> &'static str {
-        "export_time"
+    fn time_column(&self) -> Option<&'static str> {
+        Some("export_time")
     }
 ```
 
 `src/forwarding/parquet_s3.rs`:
 ```rust
-    fn time_column(&self) -> &'static str {
-        "timestamp"
+    fn time_column(&self) -> Option<&'static str> {
+        Some("timestamp")
     }
 ```
 
 `src/forwarding/aggregate/mod.rs`:
 ```rust
-    fn time_column(&self) -> &'static str {
-        "window_start"
+    fn time_column(&self) -> Option<&'static str> {
+        Some("window_start")
     }
 ```
 
@@ -1675,7 +1675,7 @@ pub fn syslog_message_to_batch(msg: &SyslogMessage) -> anyhow::Result<RecordBatc
 }
 ```
 
-Add `fn time_column(&self) -> &'static str { "timestamp" }` if not already present from Task 4 (it is — no duplicate needed here).
+Add `fn time_column(&self) -> Option<&'static str> { "timestamp" }` if not already present from Task 4 (it is — no duplicate needed here).
 
 - [ ] **Step 4: Verify pass**
 
@@ -2065,7 +2065,7 @@ EOF
 **Type/signature consistency check:**
 - `build_key(prefix: &str, partition: Option<&str>, day: chrono::NaiveDate) -> String` — introduced Task 1, consumed identically in Task 3's `encode_and_upload`.
 - `BufKey { partition: String, day: chrono::NaiveDate }` — introduced Task 3, field names (`partition`, `day`) used identically in Tasks 3, 5 (via `push`'s routing, not directly), 7/8 (indirectly, via directory layout).
-- `ParquetSink::time_column(&self) -> &'static str` — default in Task 2, overridden with matching signature in Task 4 (9 sinks) with no drift.
+- `ParquetSink::time_column(&self) -> Option<&'static str>` — default `None` in Task 2, overridden with matching signature in Task 4 (9 sinks) with no drift.
 - `ParquetSink::day_and_batch(&self, record: &Self::Record, schema: &Arc<arrow_schema::Schema>, now: chrono::DateTime<chrono::Utc>) -> anyhow::Result<(chrono::NaiveDate, Option<arrow_array::RecordBatch>)>` — default in Task 2, overridden with an identical signature in Task 5 for `ZeekSink`.
-- `day_from_batch(batch: &arrow_array::RecordBatch, time_col: &str, now: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDate` — introduced and only consumed in Task 2's default `day_and_batch`.
+- `day_from_batch(batch: &arrow_array::RecordBatch, time_col: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDate` — introduced and only consumed in Task 2's default `day_and_batch`.
 - `buffer_by_partition(&self, partition: &str) -> Option<&PartitionBuffer<S::Record>>` — introduced Task 3, consumed with identical call shape in Task 3's own migrated tests (no other task calls it, since it is `#[cfg(test)]`-only).
