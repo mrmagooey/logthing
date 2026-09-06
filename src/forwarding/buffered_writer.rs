@@ -340,18 +340,20 @@ impl<R> PartitionBuffer<R> {
 /// Pattern: `{prefix}/[{partition}/]year={Y}/month={MM}/day={DD}/{uuid}.parquet`
 /// The partition segment is omitted when `partition` is `None` (syslog, ipfix).
 /// When `prefix` is empty the prefix segment is omitted entirely (no leading slash).
-pub(crate) fn build_key(
-    prefix: &str,
-    partition: Option<&str>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> String {
+///
+/// Takes the buffer's own UTC day directly, never `chrono::Utc::now()` --
+/// the buffer key (`BufKey`) is what makes each file day-clean; reading
+/// any other clock here would silently reintroduce the bug this design
+/// fixes for a flush that crosses midnight mid-encode (see the design
+/// doc's "Rejected approach" section, point 1).
+pub(crate) fn build_key(prefix: &str, partition: Option<&str>, day: chrono::NaiveDate) -> String {
     use chrono::Datelike as _;
     let id = uuid::Uuid::new_v4();
     let date = format!(
         "year={}/month={:02}/day={:02}",
-        now.year(),
-        now.month(),
-        now.day()
+        day.year(),
+        day.month(),
+        day.day()
     );
     match (prefix.is_empty(), partition) {
         (true, Some(seg)) => format!("{}/{}/{}.parquet", seg, date, id),
@@ -989,7 +991,9 @@ async fn encode_and_upload(
     } else {
         Some(key.as_str())
     };
-    let s3_key = build_key(&prefix, partition_seg, chrono::Utc::now());
+    // TODO(Task 3): use the flushed buffer's own day (`key.day`) once
+    // `BufKey` exists, instead of re-reading the clock here.
+    let s3_key = build_key(&prefix, partition_seg, chrono::Utc::now().date_naive());
     let target = s3.target_label();
     let body_len = merged.len();
 
@@ -1599,9 +1603,8 @@ max_partitions = 128
 
     #[test]
     fn build_key_no_partition() {
-        use chrono::TimeZone;
-        let now = chrono::Utc.with_ymd_and_hms(2026, 3, 7, 0, 0, 0).unwrap();
-        let key = build_key("syslog", None, now);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 3, 7).unwrap();
+        let key = build_key("syslog", None, day);
         assert!(
             key.starts_with("syslog/year=2026/month=03/day=07/"),
             "got: {key}"
@@ -1612,9 +1615,8 @@ max_partitions = 128
 
     #[test]
     fn build_key_with_partition() {
-        use chrono::TimeZone;
-        let now = chrono::Utc.with_ymd_and_hms(2026, 3, 7, 0, 0, 0).unwrap();
-        let key = build_key("zeek", Some("conn"), now);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 3, 7).unwrap();
+        let key = build_key("zeek", Some("conn"), day);
         assert!(
             key.starts_with("zeek/conn/year=2026/month=03/day=07/"),
             "got: {key}"
@@ -1624,9 +1626,8 @@ max_partitions = 128
 
     #[test]
     fn build_key_wef_partition_segment() {
-        use chrono::TimeZone;
-        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
-        let key = build_key("wef", Some("event_type=4624"), now);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let key = build_key("wef", Some("event_type=4624"), day);
         assert!(
             key.starts_with("wef/event_type=4624/year=2026/"),
             "got: {key}"
@@ -1635,11 +1636,10 @@ max_partitions = 128
 
     #[test]
     fn build_key_empty_prefix_with_partition() {
-        use chrono::TimeZone;
-        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 21, 0, 0, 0).unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 6, 21).unwrap();
 
         // empty prefix + partition → no leading slash, no double-slash
-        let key = build_key("", Some("event_type=4624"), now);
+        let key = build_key("", Some("event_type=4624"), day);
         assert!(
             key.starts_with("event_type=4624/year=2026/"),
             "empty prefix with partition must not have leading slash: {key}"
@@ -1649,7 +1649,7 @@ max_partitions = 128
         assert!(key.ends_with(".parquet"), "must end with .parquet: {key}");
 
         // empty prefix + no partition → no leading slash
-        let key2 = build_key("", None, now);
+        let key2 = build_key("", None, day);
         assert!(
             key2.starts_with("year=2026/"),
             "empty prefix without partition must start with year=: {key2}"

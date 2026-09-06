@@ -509,22 +509,21 @@ mod tests {
     #[test]
     fn build_key_produces_zeek_log_path_layout() {
         use crate::forwarding::buffered_writer::build_key;
-        use chrono::TimeZone;
 
-        let now = chrono::Utc.with_ymd_and_hms(2026, 3, 7, 0, 0, 0).unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 3, 7).unwrap();
 
         // zeek/<log_path>/year=…/month=…/day=…/<uuid>.parquet
-        let key = build_key("zeek", Some("conn"), now);
+        let key = build_key("zeek", Some("conn"), day);
         assert!(
             key.starts_with("zeek/conn/year=2026/month=03/day=07/"),
             "key: {key}"
         );
         assert!(key.ends_with(".parquet"), "key: {key}");
 
-        let key = build_key("zeek", Some("dns"), now);
+        let key = build_key("zeek", Some("dns"), day);
         assert!(key.starts_with("zeek/dns/year="), "key: {key}");
 
-        let key = build_key("zeek", Some("_overflow"), now);
+        let key = build_key("zeek", Some("_overflow"), day);
         assert!(key.starts_with("zeek/_overflow/year="), "key: {key}");
     }
 

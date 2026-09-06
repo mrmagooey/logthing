@@ -300,9 +300,8 @@ mod tests {
     #[test]
     fn s3_key_layout_empty_prefix_produces_correct_path() {
         use crate::forwarding::buffered_writer::build_key;
-        use chrono::TimeZone;
-        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 21, 0, 0, 0).unwrap();
-        let key = build_key("", Some("event_type=4624"), now);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 6, 21).unwrap();
+        let key = build_key("", Some("event_type=4624"), day);
         assert!(
             key.starts_with("event_type=4624/year=2026/month=06/day=21/"),
             "WEF S3 key must match legacy layout: {key}"

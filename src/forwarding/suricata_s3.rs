@@ -354,10 +354,9 @@ mod tests {
     #[test]
     fn build_key_produces_suricata_event_type_layout() {
         use crate::forwarding::buffered_writer::build_key;
-        use chrono::TimeZone;
 
-        let now = chrono::Utc.with_ymd_and_hms(2026, 3, 7, 0, 0, 0).unwrap();
-        let key = build_key("suricata", Some("alert"), now);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 3, 7).unwrap();
+        let key = build_key("suricata", Some("alert"), day);
         assert!(
             key.starts_with("suricata/alert/year=2026/month=03/day=07/"),
             "key: {key}"
