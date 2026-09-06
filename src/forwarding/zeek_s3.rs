@@ -96,11 +96,17 @@ impl ParquetSink for ZeekSink {
         }
     }
 
-    /// Event time column for day bucketing. Zeek's `ts` field carries the
-    /// original event time from the network traffic (connection start, DNS query, etc.),
-    /// which is more accurate for partitioning than the receipt time.
+    /// Event time column for day bucketing. `ts` (Zeek's own event time --
+    /// connection start, DNS query time, etc.) is nullable in all 7 Zeek
+    /// schemas, and 6 of those 7 have no other non-null receipt column of
+    /// their own -- so a `ts`-mixed log path could otherwise split one
+    /// Parquet file's rows across two `day(ts)` Iceberg partition values.
+    /// `partition_time` is the non-null, per-row-materialised column every
+    /// schema carries specifically to close that gap: `ts` when present and
+    /// within the shared backfill/skew window, `received_at` otherwise (see
+    /// `zeek_partition_time`).
     fn time_column(&self) -> Option<&'static str> {
-        Some("ts")
+        Some("partition_time")
     }
 
     /// Convert one `ZeekRecord` to a single-row `RecordBatch`.
@@ -123,7 +129,7 @@ impl ParquetSink for ZeekSink {
         // use the entry's mapper directly; otherwise fall back to re-running with the
         // schema we actually hold (avoids RecordBatch schema mismatch panics).
         if entry.schema == *schema {
-            (entry.mapper)(&record.fields).map_err(|e| {
+            (entry.mapper)(&record.fields, record.received_at).map_err(|e| {
                 anyhow::anyhow!("ZeekSink mapper error for '{}': {e}", record.log_path)
             })
         } else {
@@ -131,7 +137,7 @@ impl ParquetSink for ZeekSink {
             // the raw path).  Use the envelope mapper for the schema we were given.
             let overflow_entry = get_schema_entry("_overflow_nonexistent_");
             // get_schema_entry for unknown path always returns envelope — use that mapper.
-            (overflow_entry.mapper)(&record.fields).map_err(|e| {
+            (overflow_entry.mapper)(&record.fields, record.received_at).map_err(|e| {
                 anyhow::anyhow!(
                     "ZeekSink overflow mapper error for '{}': {e}",
                     record.log_path
@@ -152,20 +158,34 @@ impl ParquetSink for ZeekSink {
         }
     }
 
-    /// Overrides the default `day_and_batch`: reads `record.fields["ts"]`
-    /// directly instead of building a batch first. Applies uniformly to
-    /// every Zeek log path, not just `conn` -- cheaper than the default
-    /// for all 7 schemas, and the only correct option for `conn`
-    /// specifically, whose amortized `ConnAccumulator` must never pay for
-    /// a `to_record_batch` call it doesn't need (see the design doc's
-    /// amortized-builder-path note).
+    /// Overrides the default `day_and_batch`: derives the day from
+    /// `zeek_partition_time(&record.fields, record.received_at)` directly
+    /// instead of building a batch first. Applies uniformly to every Zeek
+    /// log path, not just `conn` -- cheaper than the default for all 7
+    /// schemas, and the only correct option for `conn` specifically, whose
+    /// amortized `ConnAccumulator` must never pay for a `to_record_batch`
+    /// call it doesn't need (see the design doc's amortized-builder-path
+    /// note).
+    ///
+    /// Returning `(day, None)` -- not `(day, Some(batch))` -- is load
+    /// bearing: `push()` calls this before it knows whether a record goes
+    /// to the amortized live builder, so building a batch here just to
+    /// learn the day would make every Zeek record pay for a throwaway
+    /// `RecordBatch`, defeating the entire point of `ConnAccumulator`.
+    ///
+    /// `zeek_partition_time` is a pure function of `(fields, received_at)`
+    /// -- no `Utc::now()` read anywhere in it -- so calling it here and
+    /// again from a row mapper for the very same record always agrees on
+    /// the same instant; the `now` parameter this trait method receives is
+    /// unused precisely because of that.
     fn day_and_batch(
         &self,
         record: &ZeekRecord,
         _schema: &Arc<arrow_schema::Schema>,
-        now: chrono::DateTime<chrono::Utc>,
+        _now: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<(chrono::NaiveDate, Option<arrow_array::RecordBatch>)> {
-        let day = crate::zeek::schema::zeek_event_day(&record.fields, now);
+        let day = crate::zeek::schema::zeek_partition_time(&record.fields, record.received_at)
+            .date_naive();
         Ok((day, None))
     }
 }
@@ -436,18 +456,28 @@ mod tests {
     }
 
     #[test]
-    fn zeek_sink_day_and_batch_splits_conn_records_by_day() {
+    fn zeek_sink_day_and_batch_uses_partition_time_and_never_builds_a_batch() {
         use chrono::TimeZone;
 
         let schema = crate::zeek::schema::conn_schema();
-        let day1 = ZeekRecord {
+        // received_at is a distinctly different day from ts (6 days later,
+        // still inside the 30-day backfill window), so a test that
+        // accidentally asserted the received_at fallback day instead of the
+        // real ts-derived day would fail loudly rather than passing by
+        // coincidence.
+        let received_at = chrono::Utc.with_ymd_and_hms(2023, 11, 20, 8, 0, 0).unwrap();
+        let record = ZeekRecord {
             log_path: "conn".to_string(),
             fields: serde_json::json!({"_path": "conn", "ts": 1700000000.0, "uid": "C1"}),
-            received_at: chrono::Utc::now(),
+            received_at,
         };
+        // `now` is passed but must be ignored entirely: day_and_batch derives
+        // the day from `zeek_partition_time(fields, received_at)`, which
+        // never reads the clock. A far-future `now` that the implementation
+        // wrongly used would produce 2099-01-01, not 2023-11-14.
         let now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
 
-        let (day, batch) = ZeekSink.day_and_batch(&day1, &schema, now).unwrap();
+        let (day, batch) = ZeekSink.day_and_batch(&record, &schema, now).unwrap();
         assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2023, 11, 14).unwrap());
         assert!(
             batch.is_none(),
@@ -572,12 +602,12 @@ mod tests {
     }
 
     #[test]
-    fn zeek_sink_time_column_ts_exists_in_all_schemas() {
+    fn zeek_sink_time_column_partition_time_exists_in_all_schemas() {
         let sink = ZeekSink;
         let col = sink
             .time_column()
             .expect("zeek_sink must opt in to day partitioning");
-        // Check that ts exists in all 6 typed schemas plus the envelope fallback.
+        // Check that partition_time exists in all 6 typed schemas plus the envelope fallback.
         for partition in &[
             Some("conn"),
             Some("dns"),

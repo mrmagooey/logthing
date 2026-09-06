@@ -14,8 +14,14 @@ use std::sync::{Arc, LazyLock};
 // Public types
 // ---------------------------------------------------------------------------
 
-/// A function that maps one JSON record to a one-row RecordBatch.
-pub type RowMapper = Arc<dyn Fn(&serde_json::Value) -> anyhow::Result<RecordBatch> + Send + Sync>;
+/// A function that maps one JSON record (plus the record's `received_at`
+/// receipt instant, needed to derive `partition_time`) to a one-row
+/// RecordBatch.
+pub type RowMapper = Arc<
+    dyn Fn(&serde_json::Value, chrono::DateTime<chrono::Utc>) -> anyhow::Result<RecordBatch>
+        + Send
+        + Sync,
+>;
 
 /// A schema paired with its row mapper.
 pub struct SchemaEntry {
@@ -52,6 +58,11 @@ pub fn conn_schema() -> Arc<Schema> {
             Field::new("orig_pkts", DataType::UInt64, true),
             Field::new("resp_pkts", DataType::UInt64, true),
             Field::new("_extra", DataType::Utf8, false),
+            Field::new(
+                "partition_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
         ]))
     });
     S.clone()
@@ -79,6 +90,11 @@ pub fn dns_schema() -> Arc<Schema> {
             Field::new("rcode_name", DataType::Utf8, true),
             Field::new("answers", DataType::Utf8, true),
             Field::new("_extra", DataType::Utf8, false),
+            Field::new(
+                "partition_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
         ]))
     });
     S.clone()
@@ -106,6 +122,11 @@ pub fn http_schema() -> Arc<Schema> {
             Field::new("request_body_len", DataType::UInt64, true),
             Field::new("response_body_len", DataType::UInt64, true),
             Field::new("_extra", DataType::Utf8, false),
+            Field::new(
+                "partition_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
         ]))
     });
     S.clone()
@@ -131,6 +152,11 @@ pub fn ssl_schema() -> Arc<Schema> {
             Field::new("server_name", DataType::Utf8, true),
             Field::new("validation_status", DataType::Utf8, true),
             Field::new("_extra", DataType::Utf8, false),
+            Field::new(
+                "partition_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
         ]))
     });
     S.clone()
@@ -153,6 +179,11 @@ pub fn files_schema() -> Arc<Schema> {
             Field::new("filename", DataType::Utf8, true),
             Field::new("total_bytes", DataType::UInt64, true),
             Field::new("_extra", DataType::Utf8, false),
+            Field::new(
+                "partition_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
         ]))
     });
     S.clone()
@@ -177,6 +208,11 @@ pub fn notice_schema() -> Arc<Schema> {
             Field::new("sub", DataType::Utf8, true),
             Field::new("actions", DataType::Utf8, true),
             Field::new("_extra", DataType::Utf8, false),
+            Field::new(
+                "partition_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
         ]))
     });
     S.clone()
@@ -203,6 +239,11 @@ pub fn envelope_schema() -> Arc<Schema> {
                 false,
             ),
             Field::new("payload", DataType::Utf8, false),
+            Field::new(
+                "partition_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
         ]))
     });
     S.clone()
@@ -247,26 +288,37 @@ fn json_ts_micros(v: &serde_json::Value, key: &str) -> Option<i64> {
     }
 }
 
-/// Cheap UTC-day peek for one `conn`-shaped JSON record, used by
-/// `ZeekSink::day_and_batch` to route records to the correct
-/// `(partition, day)` buffer WITHOUT building a `RecordBatch` -- the
-/// entire point of `ConnAccumulator` is avoiding exactly that per-record
-/// cost. Reuses `json_ts_micros`, the same parser `append_conn_value`
-/// itself calls a moment later, so the bucketed day and the persisted
-/// `ts` value (when present) can never disagree.
+/// Derive the instant a Zeek record's `partition_time` column (and hence its
+/// day-clean buffer bucket) is computed from.
 ///
-/// Falls back to `now` when `ts` is absent or fails to parse -- `conn`,
-/// like every other typed Zeek schema, has no `received_at`-equivalent
-/// column to fall back to first; only the envelope schema's
-/// `ingest_time` plays that role, for unmodelled log paths.
-pub(crate) fn zeek_event_day(
+/// `ts` is nullable in all 7 Zeek schemas -- a log path that sometimes omits
+/// it would otherwise mix null and non-null `ts` values in one Parquet file,
+/// which yields two `day(ts)` partition values for a single file and
+/// Iceberg rejects the write. Materialising a non-null `partition_time`
+/// column, always derived from this one clock-free function, closes that
+/// gap: every row in a file agrees on the same instant.
+///
+/// Reads the raw JSON `ts` via `json_ts_micros` -- the same parser
+/// `append_conn_value` (and every other row mapper) calls a moment later --
+/// so the bucketed day and the persisted `ts` column (when present) can
+/// never disagree about what the record's own timestamp was. The resulting
+/// `Option<DateTime<Utc>>` is handed to `partition_time`, which applies the
+/// shared backfill/skew clamp and falls back to `received_at` for a missing,
+/// malformed, or out-of-window `ts` -- exactly the fallback the 6 typed
+/// schemas need since none of them expose a `received_at`-equivalent column
+/// of their own (only the envelope schema's `ingest_time` plays that role,
+/// for unmodelled log paths).
+///
+/// Pure and clock-free: no `Utc::now()` read anywhere in this call chain, so
+/// calling it twice on the same `(fields, received_at)` pair -- once from
+/// `ZeekSink::day_and_batch` to pick the buffer, once from a row mapper to
+/// stamp the column -- always agrees.
+pub(crate) fn zeek_partition_time(
     fields: &serde_json::Value,
-    now: chrono::DateTime<chrono::Utc>,
-) -> chrono::NaiveDate {
-    json_ts_micros(fields, "ts")
-        .and_then(chrono::DateTime::from_timestamp_micros)
-        .map(|dt| dt.date_naive())
-        .unwrap_or_else(|| now.date_naive())
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    let event = json_ts_micros(fields, "ts").and_then(chrono::DateTime::from_timestamp_micros);
+    crate::forwarding::buffered_writer::partition_time(event, received_at)
 }
 
 /// Extract a u64 value from JSON (accepts non-negative integer).
@@ -338,6 +390,7 @@ pub(crate) struct ConnAccumulator {
     b_orig_pkts: UInt64Builder,
     b_resp_pkts: UInt64Builder,
     b_extra: StringBuilder,
+    b_partition_time: TimestampMicrosecondBuilder,
     rows: usize,
 }
 
@@ -363,15 +416,23 @@ impl ConnAccumulator {
             b_orig_pkts: UInt64Builder::new(),
             b_resp_pkts: UInt64Builder::new(),
             b_extra: StringBuilder::new(),
+            b_partition_time: TimestampMicrosecondBuilder::new().with_data_type(
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
             rows: 0,
         }
     }
 
-    /// Append one already-parsed JSON `value` (the `conn` fields object).
+    /// Append one already-parsed JSON `value` (the `conn` fields object) plus
+    /// the record's `received_at`, needed to derive `partition_time`.
     /// Shared by both the amortized path (`RecordBatchAccumulator::try_append`)
     /// and `map_conn`'s single-record fallback wrapper below -- identical
     /// extraction/mismatch-detection/`_extra`-building logic either way.
-    fn append_conn_value(&mut self, value: &serde_json::Value) {
+    fn append_conn_value(
+        &mut self,
+        value: &serde_json::Value,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) {
         let promoted = &[
             "ts",
             "uid",
@@ -453,6 +514,7 @@ impl ConnAccumulator {
         }
 
         let extra = build_extra(value, promoted, &mismatches);
+        let partition_time = zeek_partition_time(value, received_at);
 
         self.b_ts.append_option(ts);
         self.b_uid.append_option(uid.as_deref());
@@ -470,6 +532,8 @@ impl ConnAccumulator {
         self.b_orig_pkts.append_option(orig_pkts);
         self.b_resp_pkts.append_option(resp_pkts);
         self.b_extra.append_value(&extra);
+        self.b_partition_time
+            .append_value(partition_time.timestamp_micros());
         self.rows += 1;
     }
 
@@ -477,8 +541,12 @@ impl ConnAccumulator {
     /// `ZeekRecord`-level schema-match check `try_append` performs), for
     /// unit tests that construct raw JSON fixtures.
     #[cfg(test)]
-    fn try_append_value(&mut self, value: &serde_json::Value) -> anyhow::Result<bool> {
-        self.append_conn_value(value);
+    fn try_append_value(
+        &mut self,
+        value: &serde_json::Value,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        self.append_conn_value(value, received_at);
         Ok(true)
     }
 
@@ -500,6 +568,7 @@ impl ConnAccumulator {
             Arc::new(self.b_orig_pkts.finish()),
             Arc::new(self.b_resp_pkts.finish()),
             Arc::new(self.b_extra.finish()),
+            Arc::new(self.b_partition_time.finish()),
         ];
         self.rows = 0;
         Ok(RecordBatch::try_new(conn_schema(), columns)?)
@@ -519,7 +588,7 @@ impl crate::forwarding::buffered_writer::RecordBatchAccumulator<crate::zeek::Zee
         if !Arc::ptr_eq(&entry.schema, &conn_schema()) {
             return Ok(false);
         }
-        self.append_conn_value(&record.fields);
+        self.append_conn_value(&record.fields, record.received_at);
         Ok(true)
     }
 
@@ -532,13 +601,19 @@ impl crate::forwarding::buffered_writer::RecordBatchAccumulator<crate::zeek::Zee
     }
 }
 
-fn map_conn(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
+fn map_conn(
+    value: &serde_json::Value,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<RecordBatch> {
     let mut acc = ConnAccumulator::new();
-    acc.append_conn_value(value);
+    acc.append_conn_value(value, received_at);
     acc.finish_batch()
 }
 
-fn map_dns(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
+fn map_dns(
+    value: &serde_json::Value,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<RecordBatch> {
     let schema = dns_schema();
     let promoted = &[
         "ts",
@@ -611,6 +686,7 @@ fn map_dns(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     }
 
     let extra = build_extra(value, promoted, &mismatches);
+    let partition_time = zeek_partition_time(value, received_at);
 
     let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
         TimeUnit::Microsecond,
@@ -629,6 +705,9 @@ fn map_dns(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     let mut b_rcode_name = StringBuilder::new();
     let mut b_answers = StringBuilder::new();
     let mut b_extra = StringBuilder::new();
+    let mut b_partition_time = TimestampMicrosecondBuilder::new().with_data_type(
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+    );
 
     b_ts.append_option(ts);
     b_uid.append_option(uid.as_deref());
@@ -644,6 +723,7 @@ fn map_dns(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     b_rcode_name.append_option(rcode_name.as_deref());
     b_answers.append_option(answers.as_deref());
     b_extra.append_value(&extra);
+    b_partition_time.append_value(partition_time.timestamp_micros());
 
     let columns: Vec<ArrayRef> = vec![
         Arc::new(b_ts.finish()),
@@ -660,11 +740,15 @@ fn map_dns(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
         Arc::new(b_rcode_name.finish()),
         Arc::new(b_answers.finish()),
         Arc::new(b_extra.finish()),
+        Arc::new(b_partition_time.finish()),
     ];
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-fn map_http(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
+fn map_http(
+    value: &serde_json::Value,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<RecordBatch> {
     let schema = http_schema();
     let promoted = &[
         "ts",
@@ -737,6 +821,7 @@ fn map_http(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     }
 
     let extra = build_extra(value, promoted, &mismatches);
+    let partition_time = zeek_partition_time(value, received_at);
 
     let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
         TimeUnit::Microsecond,
@@ -755,6 +840,9 @@ fn map_http(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     let mut b_request_body_len = UInt64Builder::new();
     let mut b_response_body_len = UInt64Builder::new();
     let mut b_extra = StringBuilder::new();
+    let mut b_partition_time = TimestampMicrosecondBuilder::new().with_data_type(
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+    );
 
     b_ts.append_option(ts);
     b_uid.append_option(uid.as_deref());
@@ -770,6 +858,7 @@ fn map_http(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     b_request_body_len.append_option(request_body_len);
     b_response_body_len.append_option(response_body_len);
     b_extra.append_value(&extra);
+    b_partition_time.append_value(partition_time.timestamp_micros());
 
     let columns: Vec<ArrayRef> = vec![
         Arc::new(b_ts.finish()),
@@ -786,11 +875,15 @@ fn map_http(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
         Arc::new(b_request_body_len.finish()),
         Arc::new(b_response_body_len.finish()),
         Arc::new(b_extra.finish()),
+        Arc::new(b_partition_time.finish()),
     ];
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-fn map_ssl(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
+fn map_ssl(
+    value: &serde_json::Value,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<RecordBatch> {
     let schema = ssl_schema();
     let promoted = &[
         "ts",
@@ -853,6 +946,7 @@ fn map_ssl(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     }
 
     let extra = build_extra(value, promoted, &mismatches);
+    let partition_time = zeek_partition_time(value, received_at);
 
     let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
         TimeUnit::Microsecond,
@@ -869,6 +963,9 @@ fn map_ssl(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     let mut b_server_name = StringBuilder::new();
     let mut b_validation_status = StringBuilder::new();
     let mut b_extra = StringBuilder::new();
+    let mut b_partition_time = TimestampMicrosecondBuilder::new().with_data_type(
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+    );
 
     b_ts.append_option(ts);
     b_uid.append_option(uid.as_deref());
@@ -882,6 +979,7 @@ fn map_ssl(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     b_server_name.append_option(server_name.as_deref());
     b_validation_status.append_option(validation_status.as_deref());
     b_extra.append_value(&extra);
+    b_partition_time.append_value(partition_time.timestamp_micros());
 
     let columns: Vec<ArrayRef> = vec![
         Arc::new(b_ts.finish()),
@@ -896,11 +994,15 @@ fn map_ssl(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
         Arc::new(b_server_name.finish()),
         Arc::new(b_validation_status.finish()),
         Arc::new(b_extra.finish()),
+        Arc::new(b_partition_time.finish()),
     ];
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-fn map_files(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
+fn map_files(
+    value: &serde_json::Value,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<RecordBatch> {
     let schema = files_schema();
     let promoted = &[
         "ts",
@@ -948,6 +1050,7 @@ fn map_files(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     }
 
     let extra = build_extra(value, promoted, &mismatches);
+    let partition_time = zeek_partition_time(value, received_at);
 
     let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
         TimeUnit::Microsecond,
@@ -961,6 +1064,9 @@ fn map_files(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     let mut b_filename = StringBuilder::new();
     let mut b_total_bytes = UInt64Builder::new();
     let mut b_extra = StringBuilder::new();
+    let mut b_partition_time = TimestampMicrosecondBuilder::new().with_data_type(
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+    );
 
     b_ts.append_option(ts);
     b_fuid.append_option(fuid.as_deref());
@@ -971,6 +1077,7 @@ fn map_files(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     b_filename.append_option(filename.as_deref());
     b_total_bytes.append_option(total_bytes);
     b_extra.append_value(&extra);
+    b_partition_time.append_value(partition_time.timestamp_micros());
 
     let columns: Vec<ArrayRef> = vec![
         Arc::new(b_ts.finish()),
@@ -982,11 +1089,15 @@ fn map_files(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
         Arc::new(b_filename.finish()),
         Arc::new(b_total_bytes.finish()),
         Arc::new(b_extra.finish()),
+        Arc::new(b_partition_time.finish()),
     ];
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-fn map_notice(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
+fn map_notice(
+    value: &serde_json::Value,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<RecordBatch> {
     let schema = notice_schema();
     let promoted = &[
         "ts",
@@ -1044,6 +1155,7 @@ fn map_notice(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     }
 
     let extra = build_extra(value, promoted, &mismatches);
+    let partition_time = zeek_partition_time(value, received_at);
 
     let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
         TimeUnit::Microsecond,
@@ -1059,6 +1171,9 @@ fn map_notice(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     let mut b_sub = StringBuilder::new();
     let mut b_actions = StringBuilder::new();
     let mut b_extra = StringBuilder::new();
+    let mut b_partition_time = TimestampMicrosecondBuilder::new().with_data_type(
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+    );
 
     b_ts.append_option(ts);
     b_uid.append_option(uid.as_deref());
@@ -1071,6 +1186,7 @@ fn map_notice(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
     b_sub.append_option(sub.as_deref());
     b_actions.append_option(actions.as_deref());
     b_extra.append_value(&extra);
+    b_partition_time.append_value(partition_time.timestamp_micros());
 
     let columns: Vec<ArrayRef> = vec![
         Arc::new(b_ts.finish()),
@@ -1084,11 +1200,16 @@ fn map_notice(value: &serde_json::Value) -> anyhow::Result<RecordBatch> {
         Arc::new(b_sub.finish()),
         Arc::new(b_actions.finish()),
         Arc::new(b_extra.finish()),
+        Arc::new(b_partition_time.finish()),
     ];
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-fn map_envelope(value: &serde_json::Value, log_path: &str) -> anyhow::Result<RecordBatch> {
+fn map_envelope(
+    value: &serde_json::Value,
+    log_path: &str,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<RecordBatch> {
     let schema = envelope_schema();
 
     let ts = json_ts_micros(value, "ts");
@@ -1099,6 +1220,7 @@ fn map_envelope(value: &serde_json::Value, log_path: &str) -> anyhow::Result<Rec
     let id_resp_p = json_u16(value, "id.resp_p");
     let ingest_time = chrono::Utc::now().timestamp_micros();
     let payload = value.to_string();
+    let partition_time = zeek_partition_time(value, received_at);
 
     let ts_type = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
     let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(ts_type.clone());
@@ -1108,8 +1230,9 @@ fn map_envelope(value: &serde_json::Value, log_path: &str) -> anyhow::Result<Rec
     let mut b_id_resp_h = StringBuilder::new();
     let mut b_id_resp_p = UInt16Builder::new();
     let mut b_log_path = StringBuilder::new();
-    let mut b_ingest_time = TimestampMicrosecondBuilder::new().with_data_type(ts_type);
+    let mut b_ingest_time = TimestampMicrosecondBuilder::new().with_data_type(ts_type.clone());
     let mut b_payload = StringBuilder::new();
+    let mut b_partition_time = TimestampMicrosecondBuilder::new().with_data_type(ts_type);
 
     b_ts.append_option(ts);
     b_uid.append_option(uid.as_deref());
@@ -1120,6 +1243,7 @@ fn map_envelope(value: &serde_json::Value, log_path: &str) -> anyhow::Result<Rec
     b_log_path.append_value(log_path);
     b_ingest_time.append_value(ingest_time);
     b_payload.append_value(&payload);
+    b_partition_time.append_value(partition_time.timestamp_micros());
 
     let columns: Vec<ArrayRef> = vec![
         Arc::new(b_ts.finish()),
@@ -1131,6 +1255,7 @@ fn map_envelope(value: &serde_json::Value, log_path: &str) -> anyhow::Result<Rec
         Arc::new(b_log_path.finish()),
         Arc::new(b_ingest_time.finish()),
         Arc::new(b_payload.finish()),
+        Arc::new(b_partition_time.finish()),
     ];
     Ok(RecordBatch::try_new(schema, columns)?)
 }
@@ -1197,7 +1322,7 @@ pub fn get_schema_entry(log_path: &str) -> Arc<SchemaEntry> {
     let path = log_path.to_string();
     Arc::new(SchemaEntry {
         schema: envelope_schema(),
-        mapper: Arc::new(move |v| map_envelope(v, &path)),
+        mapper: Arc::new(move |v, received_at| map_envelope(v, &path, received_at)),
     })
 }
 
@@ -1210,6 +1335,16 @@ mod tests {
     use super::*;
     use crate::forwarding::buffered_writer::RecordBatchAccumulator;
     use arrow::array::{Array, StringArray, TimestampMicrosecondArray, UInt16Array, UInt64Array};
+    use chrono::TimeZone;
+
+    /// A fixed, distinctive `received_at` for tests that don't care about its
+    /// exact value -- deliberately far from any epoch-second `ts` fixture
+    /// used elsewhere in this module (e.g. `1700000000.0` -> 2023-11-14), so
+    /// a test that silently started asserting against the fallback instead
+    /// of the real one would visibly fail rather than passing by accident.
+    fn rx() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(2024, 3, 15, 12, 0, 0).unwrap()
+    }
 
     // --- conn schema tests ---
 
@@ -1237,13 +1372,13 @@ mod tests {
 
         // Baseline: today's exact per-record path, N single-row batches concatenated.
         let single_row_batches: Vec<RecordBatch> =
-            records.iter().map(|v| map_conn(v).unwrap()).collect();
+            records.iter().map(|v| map_conn(v, rx()).unwrap()).collect();
         let expected = arrow::compute::concat_batches(&conn_schema(), &single_row_batches).unwrap();
 
         // Amortized path: one accumulator, N appends, one finish.
         let mut acc = ConnAccumulator::new();
         for v in &records {
-            assert!(acc.try_append_value(v).unwrap());
+            assert!(acc.try_append_value(v, rx()).unwrap());
         }
         let actual = acc.finish().unwrap();
 
@@ -1261,7 +1396,7 @@ mod tests {
     #[test]
     fn map_conn_still_produces_a_single_row_batch() {
         let v = serde_json::json!({"ts": 1700000000.0, "uid": "C1", "proto": "tcp"});
-        let batch = map_conn(&v).unwrap();
+        let batch = map_conn(&v, rx()).unwrap();
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.schema(), conn_schema());
     }
@@ -1269,7 +1404,7 @@ mod tests {
     #[test]
     fn conn_schema_has_correct_fields() {
         let s = conn_schema();
-        assert_eq!(s.fields().len(), 16);
+        assert_eq!(s.fields().len(), 17);
         let f = s.field_with_name("ts").unwrap();
         assert_eq!(
             *f.data_type(),
@@ -1305,9 +1440,9 @@ mod tests {
             "orig_pkts": 10,
             "resp_pkts": 15
         });
-        let batch = map_conn(&json).unwrap();
+        let batch = map_conn(&json, rx()).unwrap();
         assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.num_columns(), 16);
+        assert_eq!(batch.num_columns(), 17);
 
         let uid = batch
             .column_by_name("uid")
@@ -1359,7 +1494,7 @@ mod tests {
     #[test]
     fn conn_mapper_null_for_absent_fields() {
         let json = serde_json::json!({"_path": "conn", "uid": "CMinimal"});
-        let batch = map_conn(&json).unwrap();
+        let batch = map_conn(&json, rx()).unwrap();
         let ts = batch
             .column_by_name("ts")
             .unwrap()
@@ -1379,7 +1514,7 @@ mod tests {
     #[test]
     fn conn_ts_is_written_as_microseconds() {
         let v = serde_json::json!({ "ts": 1700000000.0, "uid": "C1" });
-        let batch = map_conn(&v).unwrap();
+        let batch = map_conn(&v, rx()).unwrap();
         let col = batch
             .column_by_name("ts")
             .unwrap()
@@ -1392,7 +1527,7 @@ mod tests {
     #[test]
     fn conn_out_of_range_ts_is_null_and_preserved_in_extra() {
         let v = serde_json::json!({ "ts": 1e300, "uid": "C1" });
-        let batch = map_conn(&v).unwrap();
+        let batch = map_conn(&v, rx()).unwrap();
         // The record is still written...
         assert_eq!(batch.num_rows(), 1);
         // ...the ts column is null...
@@ -1428,7 +1563,7 @@ mod tests {
             "ts": 1700000000.0,
             "orig_bytes": "not-a-number"
         });
-        let batch = map_conn(&json).unwrap();
+        let batch = map_conn(&json, rx()).unwrap();
         let orig_bytes = batch
             .column_by_name("orig_bytes")
             .unwrap()
@@ -1457,7 +1592,7 @@ mod tests {
     #[test]
     fn dns_schema_has_correct_fields() {
         let s = dns_schema();
-        assert_eq!(s.fields().len(), 14);
+        assert_eq!(s.fields().len(), 15);
         s.field_with_name("trans_id").expect("trans_id must exist");
         s.field_with_name("answers").expect("answers must exist");
         let f = s.field_with_name("trans_id").unwrap();
@@ -1488,7 +1623,7 @@ mod tests {
             "rcode_name": "NOERROR",
             "answers": ["93.184.216.34"]
         });
-        let batch = map_dns(&json).unwrap();
+        let batch = map_dns(&json, rx()).unwrap();
         assert_eq!(batch.num_rows(), 1);
         let query = batch
             .column_by_name("query")
@@ -1545,7 +1680,7 @@ mod tests {
             "request_body_len": 0,
             "response_body_len": 4096
         });
-        let batch = map_http(&json).unwrap();
+        let batch = map_http(&json, rx()).unwrap();
         let status = batch
             .column_by_name("status_code")
             .unwrap()
@@ -1591,7 +1726,7 @@ mod tests {
             "server_name": "secure.example.com",
             "validation_status": "ok"
         });
-        let batch = map_ssl(&json).unwrap();
+        let batch = map_ssl(&json, rx()).unwrap();
         let sn = batch
             .column_by_name("server_name")
             .unwrap()
@@ -1634,7 +1769,7 @@ mod tests {
             "filename": "report.pdf",
             "total_bytes": 102400
         });
-        let batch = map_files(&json).unwrap();
+        let batch = map_files(&json, rx()).unwrap();
         let mime = batch
             .column_by_name("mime_type")
             .unwrap()
@@ -1679,7 +1814,7 @@ mod tests {
             "sub": "Sampled 1 of 30 attempts",
             "actions": ["Notice::ACTION_LOG"]
         });
-        let batch = map_notice(&json).unwrap();
+        let batch = map_notice(&json, rx()).unwrap();
         let note = batch
             .column_by_name("note")
             .unwrap()
@@ -1708,7 +1843,7 @@ mod tests {
             "name": "data_before_established",
             "addl": "extra data"
         });
-        let batch = (entry.mapper)(&json).unwrap();
+        let batch = (entry.mapper)(&json, rx()).unwrap();
         assert_eq!(batch.num_rows(), 1);
         let payload = batch
             .column_by_name("payload")
@@ -1747,6 +1882,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn all_seven_schemas_have_a_non_nullable_microsecond_partition_time_column() {
+        // All 7 Zeek schemas (6 typed + envelope) must carry a non-null
+        // `partition_time` column of the same type, as the LAST field --
+        // this is what lets every Zeek Parquet file stay day-clean even
+        // though `ts` is nullable in every typed schema and 6 of the 7
+        // schemas have no other non-null receipt column of their own.
+        let expected_type = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        let schemas: Vec<(&str, Arc<Schema>)> = vec![
+            ("conn", conn_schema()),
+            ("dns", dns_schema()),
+            ("http", http_schema()),
+            ("ssl", ssl_schema()),
+            ("files", files_schema()),
+            ("notice", notice_schema()),
+            ("envelope", envelope_schema()),
+        ];
+        for (name, schema) in &schemas {
+            let f = schema
+                .field_with_name("partition_time")
+                .unwrap_or_else(|_| panic!("{name} schema must have a partition_time column"));
+            assert_eq!(
+                *f.data_type(),
+                expected_type,
+                "{name} schema's partition_time must be Timestamp(Microsecond, Some(UTC))"
+            );
+            assert!(
+                !f.is_nullable(),
+                "{name} schema's partition_time must be non-nullable"
+            );
+            assert_eq!(
+                schema.fields().last().unwrap().name(),
+                "partition_time",
+                "{name} schema's partition_time must be the last field"
+            );
+        }
+    }
+
     // --- Parquet round-trip ---
 
     #[test]
@@ -1770,7 +1943,7 @@ mod tests {
             "orig_bytes": 1024,
             "resp_bytes": 8192,
         });
-        let batch = map_conn(&json).unwrap();
+        let batch = map_conn(&json, rx()).unwrap();
         let schema = conn_schema();
 
         let props = WriterProperties::builder()
@@ -1807,7 +1980,7 @@ mod tests {
             "uid": 42,  // number, not string
             "orig_bytes": 512
         });
-        let batch = map_conn(&json).unwrap();
+        let batch = map_conn(&json, rx()).unwrap();
         let uid_col = batch
             .column_by_name("uid")
             .unwrap()
@@ -1887,33 +2060,73 @@ mod tests {
         assert_eq!(json_ts_micros(&v, "ts"), Some(9_223_372_036_854_772));
     }
 
-    // --- zeek_event_day helper ---
+    // --- zeek_partition_time helper ---
 
     #[test]
-    fn zeek_event_day_reads_ts_when_present() {
-        let fields = serde_json::json!({"ts": 1700000000.0});
-        let now = chrono::Utc::now();
-        let day = zeek_event_day(&fields, now);
-        // 1700000000 (UTC) is 2023-11-14.
-        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2023, 11, 14).unwrap());
+    fn zeek_partition_time_uses_ts_when_present_and_within_window() {
+        // ts is a valid, in-window event timestamp on a distinctly different
+        // day from received_at -- a test that accidentally asserted the
+        // received_at fallback instead would fail loudly rather than
+        // passing by coincidence.
+        let fields = serde_json::json!({"ts": 1700000000.0}); // 2023-11-14T22:13:20Z
+        let received_at = chrono::Utc.with_ymd_and_hms(2023, 11, 20, 8, 0, 0).unwrap();
+        let expected = chrono::DateTime::from_timestamp_micros(1_700_000_000_000_000).unwrap();
+        assert_eq!(zeek_partition_time(&fields, received_at), expected);
     }
 
     #[test]
-    fn zeek_event_day_falls_back_to_now_when_ts_missing() {
-        use chrono::TimeZone;
+    fn zeek_partition_time_falls_back_to_received_at_when_ts_missing() {
         let fields = serde_json::json!({"uid": "C1"});
-        let now = chrono::Utc.with_ymd_and_hms(2030, 6, 15, 0, 0, 0).unwrap();
-        let day = zeek_event_day(&fields, now);
-        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2030, 6, 15).unwrap());
+        let received_at = chrono::Utc.with_ymd_and_hms(2030, 6, 15, 0, 0, 0).unwrap();
+        assert_eq!(zeek_partition_time(&fields, received_at), received_at);
     }
 
     #[test]
-    fn zeek_event_day_falls_back_to_now_when_ts_malformed() {
-        use chrono::TimeZone;
+    fn zeek_partition_time_falls_back_to_received_at_when_ts_malformed() {
         let fields = serde_json::json!({"ts": "not-a-number"});
-        let now = chrono::Utc.with_ymd_and_hms(2030, 6, 15, 0, 0, 0).unwrap();
-        let day = zeek_event_day(&fields, now);
-        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2030, 6, 15).unwrap());
+        let received_at = chrono::Utc.with_ymd_and_hms(2030, 6, 15, 0, 0, 0).unwrap();
+        assert_eq!(zeek_partition_time(&fields, received_at), received_at);
+    }
+
+    #[test]
+    fn zeek_partition_time_falls_back_to_received_at_when_ts_far_outside_clamp_window() {
+        // ts claims an event 90 days before received_at -- well past the
+        // shared 30-day backfill clamp `partition_time` applies -- so this
+        // must collapse onto received_at rather than mint a distant buffer.
+        let received_at = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let far_past = received_at - chrono::TimeDelta::days(90);
+        let fields = serde_json::json!({"ts": far_past.timestamp() as f64});
+        assert_eq!(zeek_partition_time(&fields, received_at), received_at);
+    }
+
+    #[test]
+    fn zeek_partition_time_agrees_for_missing_and_present_ts_received_same_day() {
+        // Regression test for the day-clean-partitions addendum: `ts` is
+        // nullable in every typed Zeek schema, so a log path that sometimes
+        // omits it could previously mix a real event instant and a
+        // `now()`-derived fallback within one buffered file, yielding two
+        // `day(ts)` partition values for a single Parquet file -- which
+        // Iceberg rejects. Both records below are received on the same UTC
+        // day; one carries a valid `ts`, the other omits it entirely. Both
+        // must resolve to `partition_time` values on that same day, so a
+        // file built from both rows stays day-clean.
+        let received_at_1 = chrono::Utc.with_ymd_and_hms(2026, 4, 2, 1, 0, 0).unwrap();
+        let received_at_2 = chrono::Utc.with_ymd_and_hms(2026, 4, 2, 23, 0, 0).unwrap();
+
+        // Within the backfill window of both received_at values, same day.
+        let ts_same_day = chrono::Utc.with_ymd_and_hms(2026, 4, 2, 0, 30, 0).unwrap();
+        let with_ts = serde_json::json!({"ts": ts_same_day.timestamp() as f64});
+        let without_ts = serde_json::json!({"uid": "no-ts-here"});
+
+        let pt_1 = zeek_partition_time(&with_ts, received_at_1);
+        let pt_2 = zeek_partition_time(&without_ts, received_at_2);
+
+        assert_eq!(
+            pt_1.date_naive(),
+            pt_2.date_naive(),
+            "a record with ts and one without, received the same day, must \
+             partition onto the same day"
+        );
     }
 
     #[test]
@@ -1928,7 +2141,7 @@ mod tests {
             "uid": "CEnvRT",
             "weird_field": "some_value"
         });
-        let batch = map_envelope(&json, "weird").unwrap();
+        let batch = map_envelope(&json, "weird", rx()).unwrap();
         let schema = envelope_schema();
 
         let mut buf = Vec::new();
@@ -1970,7 +2183,7 @@ mod tests {
     #[test]
     fn envelope_out_of_range_ts_is_null_and_preserved_in_payload() {
         let v = serde_json::json!({ "ts": 1e300, "uid": "C1" });
-        let batch = map_envelope(&v, "weird").unwrap();
+        let batch = map_envelope(&v, "weird", rx()).unwrap();
         assert_eq!(batch.num_rows(), 1);
 
         let ts = batch
