@@ -305,7 +305,7 @@ mod day_from_batch_tests {
         let schema = ts_schema(&["ts"]);
         let batch = ts_batch(&schema, &[Some(micros(2026, 3, 7))]);
         let now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
-        let day = day_from_batch(&batch, "ts", now);
+        let day = day_from_batch(&batch, Some("ts"), now);
         assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2026, 3, 7).unwrap());
     }
 
@@ -314,7 +314,7 @@ mod day_from_batch_tests {
         let schema = ts_schema(&["timestamp", "received_at"]);
         let batch = ts_batch(&schema, &[None, Some(micros(2026, 5, 1))]);
         let now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
-        let day = day_from_batch(&batch, "timestamp", now);
+        let day = day_from_batch(&batch, Some("timestamp"), now);
         assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2026, 5, 1).unwrap());
     }
 
@@ -323,7 +323,7 @@ mod day_from_batch_tests {
         let schema = ts_schema(&["ts"]);
         let batch = ts_batch(&schema, &[None]);
         let now = chrono::Utc.with_ymd_and_hms(2030, 12, 25, 0, 0, 0).unwrap();
-        let day = day_from_batch(&batch, "ts", now);
+        let day = day_from_batch(&batch, Some("ts"), now);
         assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2030, 12, 25).unwrap());
     }
 
@@ -333,7 +333,7 @@ mod day_from_batch_tests {
         let batch = ts_batch(&schema, &[Some(micros(2027, 2, 2))]);
         let now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
         // time_column() defaults to "" for sinks that don't opt in.
-        let day = day_from_batch(&batch, "", now);
+        let day = day_from_batch(&batch, None, now);
         assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2027, 2, 2).unwrap());
     }
 }
