@@ -1,9 +1,11 @@
 //! Generic JSON / HEC → S3 Parquet persistence.
 //!
 //! `GenericSink` is a `ParquetSink` that partitions `GenericRecord`s by
-//! `sourcetype`.  All partitions share a single fixed schema (5 columns):
+//! `sourcetype`.  All partitions share a single fixed schema (6 columns):
 //! `sourcetype`, `host` (nullable), `time` (nullable timestamp), `received_at`,
-//! and `fields` (JSON string).  The `_overflow` partition uses the same schema.
+//! `fields` (JSON string), and `partition_time` (non-null; derived from `time`,
+//! clamped and falling back to `received_at` -- see `ParquetSink::time_column`).
+//! The `_overflow` partition uses the same schema.
 //!
 //! S3 key layout: `hec/<sourcetype>/year={Y}/month={MM}/day={DD}/{uuid}.parquet`
 
@@ -21,7 +23,7 @@ use std::sync::Arc;
 #[derive(Clone, Default)]
 pub struct GenericSink;
 
-/// Build the fixed 5-column schema used for all HEC partitions.
+/// Build the fixed 6-column schema used for all HEC partitions.
 fn generic_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("sourcetype", DataType::Utf8, false),
@@ -37,6 +39,11 @@ fn generic_schema() -> Arc<Schema> {
             false,
         ),
         Field::new("fields", DataType::Utf8, false),
+        Field::new(
+            "partition_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
     ]))
 }
 
@@ -59,10 +66,13 @@ impl ParquetSink for GenericSink {
         generic_schema()
     }
 
-    /// Event time column for day bucketing. Generic records' `time` field is
-    /// the application-supplied event time. Falls back to `received_at` if missing (nullable).
+    /// Event time column for day bucketing. `partition_time` is non-null by
+    /// construction (derived from the application-supplied, nullable `time`,
+    /// clamped and falling back to `received_at`), so a buffer keyed on its
+    /// day is day-clean for every row even when events with and without a
+    /// `time` field land in the same sourcetype partition.
     fn time_column(&self) -> Option<&'static str> {
-        Some("time")
+        Some("partition_time")
     }
 
     fn to_record_batch(
@@ -95,6 +105,16 @@ impl ParquetSink for GenericSink {
             serde_json::to_string(&record.fields).unwrap_or_else(|_| "{}".to_string());
         let fields_col = StringArray::from(vec![fields_json.as_str()]);
 
+        // col 5: partition_time (Timestamp(Microsecond, UTC), non-null) —
+        // derived from the nullable `time` (HEC's application-supplied event
+        // time), clamped against and falling back to `received_at`. See
+        // `crate::forwarding::buffered_writer::partition_time`.
+        let partition_time_value =
+            crate::forwarding::buffered_writer::partition_time(record.time, record.received_at);
+        let partition_time_col =
+            TimestampMicrosecondArray::from(vec![Some(partition_time_value.timestamp_micros())])
+                .with_timezone("UTC");
+
         RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -103,6 +123,7 @@ impl ParquetSink for GenericSink {
                 Arc::new(time_col),
                 Arc::new(received_col),
                 Arc::new(fields_col),
+                Arc::new(partition_time_col),
             ],
         )
         .map_err(|e| anyhow::anyhow!("GenericSink RecordBatch error: {e}"))
@@ -216,15 +237,36 @@ mod tests {
     }
 
     #[test]
-    fn generic_sink_schema_has_five_columns() {
+    fn generic_sink_schema_has_six_columns() {
         let schema = GenericSink.schema(Some("access_log"));
-        assert_eq!(schema.fields().len(), 5);
-        for col in &["sourcetype", "host", "time", "received_at", "fields"] {
+        assert_eq!(schema.fields().len(), 6);
+        for col in &[
+            "sourcetype",
+            "host",
+            "time",
+            "received_at",
+            "fields",
+            "partition_time",
+        ] {
             assert!(
                 schema.field_with_name(col).is_ok(),
                 "schema must have column '{col}'"
             );
         }
+    }
+
+    #[test]
+    fn schema_partition_time_is_non_null_microsecond_timestamp() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        let schema = generic_schema();
+        let f = schema
+            .field_with_name("partition_time")
+            .expect("partition_time column");
+        assert_eq!(
+            f.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(!f.is_nullable(), "partition_time must be non-nullable");
     }
 
     #[test]
@@ -339,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_sink_time_column_time_exists_in_schema() {
+    fn generic_sink_time_column_partition_time_exists_in_schema() {
         let sink = GenericSink;
         let col = sink
             .time_column()
@@ -349,6 +391,108 @@ mod tests {
             schema.field_with_name(col).is_ok(),
             "time_column() returned {:?}, which is not a field in the schema",
             col
+        );
+    }
+
+    #[test]
+    fn partition_time_equals_time_on_distinctly_different_day() {
+        use arrow::array::TimestampMicrosecondArray;
+        use chrono::TimeZone;
+        let mut rec = make_record("access_log");
+        rec.received_at = chrono::Utc.with_ymd_and_hms(2024, 6, 2, 8, 0, 0).unwrap();
+        let event = chrono::Utc.with_ymd_and_hms(2024, 6, 1, 3, 0, 0).unwrap();
+        rec.time = Some(event);
+
+        let schema = GenericSink.schema(Some("access_log"));
+        let batch = GenericSink.to_record_batch(&rec, &schema).unwrap();
+        let col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(col.value(0), event.timestamp_micros());
+    }
+
+    #[test]
+    fn partition_time_falls_back_to_received_at_when_time_is_null() {
+        use arrow::array::TimestampMicrosecondArray;
+        use chrono::TimeZone;
+        let mut rec = make_record("access_log");
+        rec.time = None;
+        rec.received_at = chrono::Utc.with_ymd_and_hms(2024, 6, 2, 8, 0, 0).unwrap();
+
+        let schema = GenericSink.schema(Some("access_log"));
+        let batch = GenericSink.to_record_batch(&rec, &schema).unwrap();
+        let col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(col.value(0), rec.received_at.timestamp_micros());
+    }
+
+    #[test]
+    fn partition_time_falls_back_to_received_at_when_time_outside_clamp() {
+        use arrow::array::TimestampMicrosecondArray;
+        use chrono::TimeZone;
+        let mut rec = make_record("access_log");
+        rec.received_at = chrono::Utc.with_ymd_and_hms(2024, 6, 2, 8, 0, 0).unwrap();
+        // 60 days before receipt -- well past the 30-day backfill clamp.
+        rec.time = Some(rec.received_at - chrono::TimeDelta::days(60));
+
+        let schema = GenericSink.schema(Some("access_log"));
+        let batch = GenericSink.to_record_batch(&rec, &schema).unwrap();
+        let col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(col.value(0), rec.received_at.timestamp_micros());
+    }
+
+    #[test]
+    fn partition_time_mixed_null_and_valid_time_same_receipt_day_agree_regression() {
+        // The regression case for this addendum: a null-`time` HEC event and
+        // a valid-`time` HEC event received the same real day must derive
+        // the buffer day from the SAME non-null column, never from
+        // coalesce(time, received_at) (which is not itself a column).
+        use arrow::array::TimestampMicrosecondArray;
+        use chrono::TimeZone;
+        let receipt_day_a = chrono::Utc.with_ymd_and_hms(2024, 6, 2, 8, 0, 0).unwrap();
+        let receipt_day_b = chrono::Utc.with_ymd_and_hms(2024, 6, 2, 20, 0, 0).unwrap();
+
+        let mut rec_a = make_record("access_log");
+        rec_a.time = None;
+        rec_a.received_at = receipt_day_a;
+
+        let mut rec_b = make_record("access_log");
+        rec_b.time = Some(receipt_day_b - chrono::TimeDelta::hours(1));
+        rec_b.received_at = receipt_day_b;
+
+        let schema = GenericSink.schema(Some("access_log"));
+        let batch_a = GenericSink.to_record_batch(&rec_a, &schema).unwrap();
+        let batch_b = GenericSink.to_record_batch(&rec_b, &schema).unwrap();
+
+        let day_of = |batch: &RecordBatch| {
+            let col = batch
+                .column_by_name("partition_time")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            chrono::DateTime::from_timestamp_micros(col.value(0))
+                .unwrap()
+                .date_naive()
+        };
+
+        assert_eq!(
+            day_of(&batch_a),
+            day_of(&batch_b),
+            "a null-time row and a valid-time row received the same day must \
+             land in the same partition_time day"
         );
     }
 

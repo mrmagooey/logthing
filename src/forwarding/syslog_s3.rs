@@ -44,6 +44,11 @@ static SYSLOG_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
         ),
+        Field::new(
+            "partition_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
     ]))
 });
 
@@ -64,13 +69,23 @@ pub fn syslog_schema() -> Arc<Schema> {
 /// deliberately NOT a field on `SyslogMessage` itself: that struct is
 /// `Serialize`/`Deserialize` (a new field would change JSON forwarding
 /// output) and is consumed by `aggregate/fields.rs` and `channel_budget.rs`.
-/// Because `day_and_batch`'s default calls this function exactly once and
-/// then reads the day back off the very batch it returns, this single
-/// `Utc::now()` call is also the one the day-bucketing fallback chain
-/// reads -- there is no second clock read to disagree with it across a
-/// midnight boundary.
+///
+/// That single stamp is bound to a local ONCE (`now` below) and reused for
+/// BOTH `received_at` and the derivation of `partition_time`. Two separate
+/// `Utc::now()` calls either side of midnight would put different days in
+/// the two columns -- `partition_time` is what the buffer's day key and the
+/// eventual Iceberg partition are derived from, so if it disagreed with
+/// `received_at` (the fallback `day_from_batch` would otherwise read) a
+/// flush could still land in a file declared for a different day than the
+/// value actually stamped into `received_at`. Because `day_and_batch`'s
+/// default calls this function exactly once and then reads the day back off
+/// the very batch it returns, this is also the only clock read the
+/// day-bucketing fallback chain sees -- there is no second read to disagree
+/// with it.
 pub fn syslog_message_to_batch(msg: &SyslogMessage) -> anyhow::Result<RecordBatch> {
     let schema = syslog_schema();
+
+    let now = chrono::Utc::now();
 
     let priority = Arc::new(UInt8Array::from(vec![msg.priority])) as ArrayRef;
     let severity = Arc::new(UInt8Array::from(vec![msg.severity])) as ArrayRef;
@@ -92,7 +107,12 @@ pub fn syslog_message_to_batch(msg: &SyslogMessage) -> anyhow::Result<RecordBatc
     ])) as ArrayRef;
     let protocol = Arc::new(StringArray::from(vec![format!("{:?}", msg.protocol)])) as ArrayRef;
     let received_at = Arc::new(
-        TimestampMicrosecondArray::from(vec![chrono::Utc::now().timestamp_micros()])
+        TimestampMicrosecondArray::from(vec![now.timestamp_micros()]).with_timezone(tz.clone()),
+    ) as ArrayRef;
+    let partition_time_value =
+        crate::forwarding::buffered_writer::partition_time(msg.timestamp, now);
+    let partition_time = Arc::new(
+        TimestampMicrosecondArray::from(vec![partition_time_value.timestamp_micros()])
             .with_timezone(tz),
     ) as ArrayRef;
 
@@ -111,6 +131,7 @@ pub fn syslog_message_to_batch(msg: &SyslogMessage) -> anyhow::Result<RecordBatc
             structured_data,
             protocol,
             received_at,
+            partition_time,
         ],
     )?)
 }
@@ -165,14 +186,14 @@ impl ParquetSink for SyslogSink {
         syslog_schema()
     }
 
-    /// Event time column for day bucketing. Syslog's `timestamp` is parsed
-    /// from the syslog message header and represents when the event occurred.
-    /// It is nullable: a message whose header timestamp failed to parse falls
-    /// through `day_from_batch`'s chain to the non-null `received_at` column
-    /// (stamped in `syslog_message_to_batch`) before ever reaching the wall
-    /// clock.
+    /// Event time column for day bucketing. `partition_time` (see
+    /// `syslog_message_to_batch`) is non-null by construction, so a buffer
+    /// keyed on its day is genuinely day-clean for every row -- including a
+    /// mix of RFC 5424 messages (nullable `timestamp` parsed) and CEF/LEEF
+    /// payloads (`timestamp: None`), which is the ordinary case for SIEM
+    /// traffic on this listener.
     fn time_column(&self) -> Option<&'static str> {
-        Some("timestamp")
+        Some("partition_time")
     }
 
     fn to_record_batch(
@@ -356,7 +377,7 @@ mod tests {
     fn schema_has_correct_columns_and_types() {
         use arrow::datatypes::{DataType, TimeUnit};
         let schema = syslog_schema();
-        assert_eq!(schema.fields().len(), 12);
+        assert_eq!(schema.fields().len(), 13);
         assert_eq!(
             schema.field_with_name("priority").unwrap().data_type(),
             &DataType::UInt8
@@ -390,6 +411,21 @@ mod tests {
              when timestamp fails to parse"
         );
         assert!(!schema.field_with_name("protocol").unwrap().is_nullable());
+        assert_eq!(
+            schema
+                .field_with_name("partition_time")
+                .unwrap()
+                .data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(
+            !schema
+                .field_with_name("partition_time")
+                .unwrap()
+                .is_nullable(),
+            "partition_time must always be set -- it is the single non-null \
+             column the buffer day and the Iceberg partition are derived from"
+        );
     }
 
     #[test]
@@ -474,6 +510,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn syslog_message_to_batch_partition_time_equals_timestamp_on_different_day() {
+        // Different UTC day from receipt time so a bug that silently fell
+        // back to received_at could not pass by accident.
+        let mut msg = sample_rfc5424();
+        let event = chrono::Utc::now() - chrono::TimeDelta::hours(30);
+        msg.timestamp = Some(event);
+        let batch = syslog_message_to_batch(&msg).unwrap();
+
+        let partition_time_col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(partition_time_col.value(0), event.timestamp_micros());
+
+        let received_at_col = batch
+            .column_by_name("received_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_ne!(
+            partition_time_col.value(0),
+            received_at_col.value(0),
+            "test is only meaningful if partition_time actually differs from received_at"
+        );
+    }
+
+    #[test]
+    fn syslog_message_to_batch_partition_time_equals_received_at_when_timestamp_null() {
+        // The single-stamp requirement this addendum exists to guarantee:
+        // when `timestamp` fails to parse (e.g. a CEF/LEEF payload),
+        // `received_at` and `partition_time` must be the EXACT same value,
+        // not two independent `Utc::now()` reads that could straddle
+        // midnight and disagree about which day the row belongs to.
+        let msg = dummy_msg("no timestamp in this message");
+        let batch = syslog_message_to_batch(&msg).unwrap();
+
+        let received_at_col = batch
+            .column_by_name("received_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let partition_time_col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(
+            received_at_col.value(0),
+            partition_time_col.value(0),
+            "received_at and partition_time must be stamped from the same \
+             Utc::now() call when timestamp is null"
+        );
+    }
+
+    #[test]
+    fn syslog_message_to_batch_partition_time_falls_back_when_timestamp_outside_clamp() {
+        let mut msg = sample_rfc5424();
+        // 60 days back is well past the 30-day backfill clamp.
+        msg.timestamp = Some(chrono::Utc::now() - chrono::TimeDelta::days(60));
+        let before = chrono::Utc::now();
+        let batch = syslog_message_to_batch(&msg).unwrap();
+        let after = chrono::Utc::now();
+
+        let partition_time_col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let value = partition_time_col.value(0);
+        assert!(
+            value >= before.timestamp_micros() && value <= after.timestamp_micros(),
+            "partition_time must fall back to received_at (receipt time) once \
+             the event timestamp is outside the clamp window"
+        );
+    }
+
     // -- Trait-level fallback-chain wiring: these are the tests that
     // actually guard the feature. They go through `SyslogSink::day_and_batch`
     // (the real call path `PartitionedParquetWriter::push` uses), not just
@@ -490,11 +609,12 @@ mod tests {
         let sink = SyslogSink;
         let schema = sink.schema(None);
         let mut msg = sample_rfc5424();
-        msg.timestamp = Some(
-            chrono::DateTime::parse_from_rfc3339("2003-10-11T22:14:15Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
-        );
+        // 30 hours back is inside the partition_time clamp window (30-day
+        // backfill) but guaranteed to land on a different UTC calendar day
+        // than "now" -- unlike a fixed historical date, which the clamp
+        // would now reject and collapse onto received_at.
+        let event = chrono::Utc::now() - chrono::TimeDelta::hours(30);
+        msg.timestamp = Some(event);
         let distant_now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
 
         let (day, _batch) = sink.day_and_batch(&msg, &schema, distant_now).unwrap();
@@ -504,7 +624,71 @@ mod tests {
             distant_now.date_naive(),
             "day must not come from the wall-clock fallback"
         );
-        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2003, 10, 11).unwrap());
+        assert_eq!(day, event.date_naive());
+        assert_ne!(
+            day,
+            chrono::Utc::now().date_naive(),
+            "test is only meaningful if the event's day differs from receipt's day"
+        );
+    }
+
+    #[test]
+    fn day_and_batch_timestamp_outside_clamp_falls_back_to_received_at() {
+        use chrono::TimeZone;
+        let sink = SyslogSink;
+        let schema = sink.schema(None);
+        let mut msg = sample_rfc5424();
+        msg.timestamp = Some(chrono::Utc::now() - chrono::TimeDelta::days(60));
+        let distant_now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+
+        let (day, _batch) = sink.day_and_batch(&msg, &schema, distant_now).unwrap();
+
+        assert_ne!(
+            day,
+            distant_now.date_naive(),
+            "day must not come from the wall-clock fallback"
+        );
+        assert_eq!(
+            day,
+            chrono::Utc::now().date_naive(),
+            "an event timestamp outside the clamp window must bucket by receipt day"
+        );
+    }
+
+    #[test]
+    fn day_and_batch_mixed_null_and_valid_timestamp_same_receipt_day_agree_regression() {
+        // The regression case for this addendum: previously the buffer day
+        // came from coalesce(timestamp, received_at), a quantity with no
+        // matching column. A null-timestamp row (e.g. CEF/LEEF) and a
+        // valid-timestamp row received on the same real day could reach the
+        // SAME buffer day via DIFFERENT source columns, producing a file
+        // whose declared day did not match a single non-null Iceberg
+        // partition column. With partition_time, both rows must derive the
+        // buffer day from the very same column.
+        use chrono::TimeZone;
+        let sink = SyslogSink;
+        let schema = sink.schema(None);
+        let distant_now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+
+        // Record A: no parseable header timestamp -- falls back to received_at.
+        let msg_a = dummy_msg("cef-like, no header timestamp");
+        let (day_a, _) = sink.day_and_batch(&msg_a, &schema, distant_now).unwrap();
+
+        // Record B: a valid timestamp a couple of seconds before "now" --
+        // inside the clamp window and, barring a test run landing in the
+        // last couple of seconds before UTC midnight, on the same calendar
+        // day as record A's receipt time.
+        let mut msg_b = sample_rfc5424();
+        msg_b.timestamp = Some(chrono::Utc::now() - chrono::TimeDelta::seconds(2));
+        let (day_b, _) = sink.day_and_batch(&msg_b, &schema, distant_now).unwrap();
+
+        assert_ne!(day_a, distant_now.date_naive());
+        assert_ne!(day_b, distant_now.date_naive());
+        assert_eq!(
+            day_a, day_b,
+            "a null-timestamp row and a valid-timestamp row received on the \
+             same day must land in the same partition_time day"
+        );
     }
 
     #[test]
@@ -533,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn syslog_sink_time_column_timestamp_exists_in_schema() {
+    fn syslog_sink_time_column_partition_time_exists_in_schema() {
         let sink = SyslogSink;
         let col = sink
             .time_column()
@@ -583,7 +767,7 @@ mod tests {
         let msg = sample_rfc5424();
         let batch = syslog_message_to_batch(&msg).expect("batch");
         assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.num_columns(), 12);
+        assert_eq!(batch.num_columns(), 13);
 
         let priority = batch
             .column(0)
@@ -686,7 +870,7 @@ mod tests {
         let mut reader = builder.build().unwrap();
         let rb = reader.next().unwrap().unwrap();
         assert_eq!(rb.num_rows(), 1);
-        assert_eq!(schema.fields().len(), 12);
+        assert_eq!(schema.fields().len(), 13);
 
         use arrow::array::StringArray;
         let hostname = rb.column(4).as_any().downcast_ref::<StringArray>().unwrap();
@@ -739,7 +923,7 @@ mod tests {
 
         let sink = SyslogSink;
         let schema = sink.schema(None);
-        assert_eq!(schema.fields().len(), 12);
+        assert_eq!(schema.fields().len(), 13);
 
         let msg = sample_rfc5424();
         let batch = sink.to_record_batch(&msg, &schema).unwrap();
