@@ -143,9 +143,11 @@ impl ParquetSink for SyslogSink {
         syslog_schema()
     }
 
-    /// Event time column for day bucketing. Syslog's `timestamp` is parsed from
-    /// the syslog message header and represents when the event occurred.
-    /// Falls back to `received_at` if timestamp is missing (nullable).
+    /// Event time column for day bucketing. Syslog's `timestamp` is parsed
+    /// from the syslog message header and represents when the event occurred.
+    /// It is nullable: a message whose header timestamp failed to parse falls
+    /// through `day_from_batch`'s chain to the wall clock today, and to the
+    /// non-null `received_at` column once Task 6 of this change adds it.
     fn time_column(&self) -> Option<&'static str> {
         Some("timestamp")
     }

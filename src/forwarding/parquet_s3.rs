@@ -64,8 +64,11 @@ impl ParquetSink for WefSink {
         ]))
     }
 
-    /// Event time column for day bucketing. WEF `timestamp` is the event
-    /// occurrence time from the Windows Event Log (non-null).
+    /// Time column for day bucketing. Despite its name, the `timestamp`
+    /// column is written from `record.received_at` (server receipt time),
+    /// NOT the event's own `time_created` from the Windows Event Log --
+    /// see `to_record_batch` below. WEF files therefore partition by when
+    /// logthing received an event, not when Windows recorded it.
     fn time_column(&self) -> Option<&'static str> {
         Some("timestamp")
     }
