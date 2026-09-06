@@ -31,7 +31,7 @@ use std::sync::Arc;
 ///
 /// **S3 KEY LAYOUT (choice a — behavior-preserving):**
 /// `event_type=<id>/year=Y/month=MM/day=DD/<uuid>.parquet`
-/// Achieved by using an empty prefix (`""`), so `build_key("", Some("event_type=4624"), now)`
+/// Achieved by using an empty prefix (`""`), so `build_key("", Some("event_type=4624"), day)`
 /// → `event_type=4624/year=…`. No leading slash (verified in generic unit test).
 #[derive(Default)]
 pub struct WefSink;
