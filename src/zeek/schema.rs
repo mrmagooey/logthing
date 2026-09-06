@@ -247,6 +247,28 @@ fn json_ts_micros(v: &serde_json::Value, key: &str) -> Option<i64> {
     }
 }
 
+/// Cheap UTC-day peek for one `conn`-shaped JSON record, used by
+/// `ZeekSink::day_and_batch` to route records to the correct
+/// `(partition, day)` buffer WITHOUT building a `RecordBatch` -- the
+/// entire point of `ConnAccumulator` is avoiding exactly that per-record
+/// cost. Reuses `json_ts_micros`, the same parser `append_conn_value`
+/// itself calls a moment later, so the bucketed day and the persisted
+/// `ts` value (when present) can never disagree.
+///
+/// Falls back to `now` when `ts` is absent or fails to parse -- `conn`,
+/// like every other typed Zeek schema, has no `received_at`-equivalent
+/// column to fall back to first; only the envelope schema's
+/// `ingest_time` plays that role, for unmodelled log paths.
+pub(crate) fn zeek_event_day(
+    fields: &serde_json::Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::NaiveDate {
+    json_ts_micros(fields, "ts")
+        .and_then(chrono::DateTime::from_timestamp_micros)
+        .map(|dt| dt.date_naive())
+        .unwrap_or_else(|| now.date_naive())
+}
+
 /// Extract a u64 value from JSON (accepts non-negative integer).
 fn json_u64(v: &serde_json::Value, key: &str) -> Option<u64> {
     v.get(key).and_then(|f| f.as_u64())
@@ -1863,6 +1885,35 @@ mod tests {
         // boundary must still convert -- the fix must not over-reject.
         let v = serde_json::json!({ "ts": 9223372036.854773 });
         assert_eq!(json_ts_micros(&v, "ts"), Some(9_223_372_036_854_772));
+    }
+
+    // --- zeek_event_day helper ---
+
+    #[test]
+    fn zeek_event_day_reads_ts_when_present() {
+        let fields = serde_json::json!({"ts": 1700000000.0});
+        let now = chrono::Utc::now();
+        let day = zeek_event_day(&fields, now);
+        // 1700000000 (UTC) is 2023-11-14.
+        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2023, 11, 14).unwrap());
+    }
+
+    #[test]
+    fn zeek_event_day_falls_back_to_now_when_ts_missing() {
+        use chrono::TimeZone;
+        let fields = serde_json::json!({"uid": "C1"});
+        let now = chrono::Utc.with_ymd_and_hms(2030, 6, 15, 0, 0, 0).unwrap();
+        let day = zeek_event_day(&fields, now);
+        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2030, 6, 15).unwrap());
+    }
+
+    #[test]
+    fn zeek_event_day_falls_back_to_now_when_ts_malformed() {
+        use chrono::TimeZone;
+        let fields = serde_json::json!({"ts": "not-a-number"});
+        let now = chrono::Utc.with_ymd_and_hms(2030, 6, 15, 0, 0, 0).unwrap();
+        let day = zeek_event_day(&fields, now);
+        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2030, 6, 15).unwrap());
     }
 
     #[test]

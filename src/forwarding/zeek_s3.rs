@@ -151,6 +151,23 @@ impl ParquetSink for ZeekSink {
             None
         }
     }
+
+    /// Overrides the default `day_and_batch`: reads `record.fields["ts"]`
+    /// directly instead of building a batch first. Applies uniformly to
+    /// every Zeek log path, not just `conn` -- cheaper than the default
+    /// for all 7 schemas, and the only correct option for `conn`
+    /// specifically, whose amortized `ConnAccumulator` must never pay for
+    /// a `to_record_batch` call it doesn't need (see the design doc's
+    /// amortized-builder-path note).
+    fn day_and_batch(
+        &self,
+        record: &ZeekRecord,
+        _schema: &Arc<arrow_schema::Schema>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<(chrono::NaiveDate, Option<arrow_array::RecordBatch>)> {
+        let day = crate::zeek::schema::zeek_event_day(&record.fields, now);
+        Ok((day, None))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +433,26 @@ mod tests {
     #[test]
     fn zeek_sink_source_returns_zeek() {
         assert_eq!(ZeekSink.source(), "zeek");
+    }
+
+    #[test]
+    fn zeek_sink_day_and_batch_splits_conn_records_by_day() {
+        use chrono::TimeZone;
+
+        let schema = crate::zeek::schema::conn_schema();
+        let day1 = ZeekRecord {
+            log_path: "conn".to_string(),
+            fields: serde_json::json!({"_path": "conn", "ts": 1700000000.0, "uid": "C1"}),
+            received_at: chrono::Utc::now(),
+        };
+        let now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+
+        let (day, batch) = ZeekSink.day_and_batch(&day1, &schema, now).unwrap();
+        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2023, 11, 14).unwrap());
+        assert!(
+            batch.is_none(),
+            "the amortized path must not pre-build a batch just to learn the day"
+        );
     }
 
     #[test]
