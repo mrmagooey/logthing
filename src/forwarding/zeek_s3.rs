@@ -544,19 +544,24 @@ mod tests {
 
         // conn → "conn" partition, dns → "dns" partition, weird → "weird" partition
         assert_eq!(
-            writer.buffers.get("conn").map(|b| b.row_count).unwrap_or(0),
+            writer
+                .buffer_by_partition("conn")
+                .map(|b| b.row_count)
+                .unwrap_or(0),
             2,
             "conn buffer should have 2 rows"
         );
         assert_eq!(
-            writer.buffers.get("dns").map(|b| b.row_count).unwrap_or(0),
+            writer
+                .buffer_by_partition("dns")
+                .map(|b| b.row_count)
+                .unwrap_or(0),
             1,
             "dns buffer should have 1 row"
         );
         assert_eq!(
             writer
-                .buffers
-                .get("weird")
+                .buffer_by_partition("weird")
                 .map(|b| b.row_count)
                 .unwrap_or(0),
             1,
@@ -579,7 +584,11 @@ mod tests {
             writer.drain_pending_flushes().await;
         }
         assert!(
-            writer.buffers.get("conn").map(|b| b.row_count).unwrap_or(0) <= hard_cap,
+            writer
+                .buffer_by_partition("conn")
+                .map(|b| b.row_count)
+                .unwrap_or(0)
+                <= hard_cap,
             "conn buffer must stay at or below hard cap ({hard_cap})"
         );
     }
@@ -618,11 +627,11 @@ mod tests {
         );
         // The "_overflow" buffer must exist.
         assert!(
-            writer.buffers.contains_key("_overflow"),
+            writer.buffer_by_partition("_overflow").is_some(),
             "_overflow buffer must exist after cap exceeded"
         );
         // The "_overflow" buffer must have rows and a valid (non-empty) schema.
-        let ov = writer.buffers.get("_overflow").unwrap();
+        let ov = writer.buffer_by_partition("_overflow").unwrap();
         assert!(ov.row_count > 0, "_overflow must contain records");
         assert!(
             !ov.schema.fields().is_empty(),
@@ -671,7 +680,10 @@ mod tests {
 
         // Lands in the single stable "conn" buffer — no rotation-suffixed sibling.
         assert_eq!(
-            writer.buffers.get("conn").map(|b| b.row_count).unwrap_or(0),
+            writer
+                .buffer_by_partition("conn")
+                .map(|b| b.row_count)
+                .unwrap_or(0),
             1,
             "rotated record must accumulate into the stable 'conn' buffer"
         );
@@ -682,7 +694,7 @@ mod tests {
         );
         // Accepted into the typed live builder (ConnAccumulator), not pushed as a
         // pre-built envelope fallback batch.
-        let buf = writer.buffers.get("conn").unwrap();
+        let buf = writer.buffer_by_partition("conn").unwrap();
         assert_eq!(
             buf.live_builder.as_ref().map(|b| b.len()).unwrap_or(0),
             1,
@@ -709,7 +721,7 @@ mod tests {
         };
         writer.push(rec).await.unwrap();
 
-        let buf = writer.buffers.get("conn").unwrap();
+        let buf = writer.buffer_by_partition("conn").unwrap();
         assert_eq!(
             buf.row_count, 1,
             "the record must still be counted, just via the fallback path"

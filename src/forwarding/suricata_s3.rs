@@ -399,15 +399,17 @@ mod tests {
 
         assert_eq!(
             writer
-                .buffers
-                .get("alert")
+                .buffer_by_partition("alert")
                 .map(|b| b.row_count)
                 .unwrap_or(0),
             2,
             "alert buffer should have 2 rows"
         );
         assert_eq!(
-            writer.buffers.get("flow").map(|b| b.row_count).unwrap_or(0),
+            writer
+                .buffer_by_partition("flow")
+                .map(|b| b.row_count)
+                .unwrap_or(0),
             1,
             "flow buffer should have 1 row"
         );

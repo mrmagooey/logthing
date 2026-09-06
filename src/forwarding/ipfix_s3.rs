@@ -658,7 +658,7 @@ mod tests {
             writer.drain_pending_flushes().await;
         }
 
-        let buf = writer.buffers.get("").unwrap();
+        let buf = writer.buffer_by_partition("").unwrap();
         assert!(
             buf.row_count <= hard_cap,
             "buffer must stay at or below hard cap ({hard_cap}), got {}",

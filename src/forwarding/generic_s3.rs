@@ -365,16 +365,14 @@ mod tests {
 
         assert_eq!(
             writer
-                .buffers
-                .get("access_log")
+                .buffer_by_partition("access_log")
                 .map(|b| b.row_count)
                 .unwrap_or(0),
             2
         );
         assert_eq!(
             writer
-                .buffers
-                .get("audit_log")
+                .buffer_by_partition("audit_log")
                 .map(|b| b.row_count)
                 .unwrap_or(0),
             1
@@ -419,7 +417,7 @@ mod tests {
             "buffers map must be bounded (cap={cap} + 1 overflow)"
         );
         assert!(
-            writer.buffers.contains_key("_overflow"),
+            writer.buffer_by_partition("_overflow").is_some(),
             "_overflow partition must exist after cap exceeded"
         );
     }
