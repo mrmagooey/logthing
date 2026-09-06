@@ -96,6 +96,10 @@ impl ParquetSink for ZeekSink {
         }
     }
 
+    fn time_column(&self) -> Option<&'static str> {
+        Some("ts")
+    }
+
     /// Convert one `ZeekRecord` to a single-row `RecordBatch`.
     ///
     /// Uses `get_schema_entry(&record.log_path)` to select the row mapper for the
@@ -525,6 +529,11 @@ mod tests {
 
         let key = build_key("zeek", Some("_overflow"), day);
         assert!(key.starts_with("zeek/_overflow/year="), "key: {key}");
+    }
+
+    #[test]
+    fn zeek_sink_time_column_is_ts() {
+        assert_eq!(ZeekSink.time_column(), Some("ts"));
     }
 
     // -----------------------------------------------------------------------

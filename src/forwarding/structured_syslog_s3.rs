@@ -106,6 +106,10 @@ impl ParquetSink for StructuredSyslogSink {
         structured_syslog_schema()
     }
 
+    fn time_column(&self) -> Option<&'static str> {
+        Some("timestamp")
+    }
+
     fn to_record_batch(
         &self,
         record: &StructuredSyslogRecord,
@@ -320,6 +324,11 @@ mod tests {
         let hostname = batch.column_by_name("hostname").unwrap();
         let arr = hostname.as_any().downcast_ref::<StringArray>().unwrap();
         assert!(arr.is_null(0));
+    }
+
+    #[test]
+    fn structured_syslog_sink_time_column_is_timestamp() {
+        assert_eq!(StructuredSyslogSink.time_column(), Some("timestamp"));
     }
 
     #[tokio::test]

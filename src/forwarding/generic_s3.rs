@@ -59,6 +59,10 @@ impl ParquetSink for GenericSink {
         generic_schema()
     }
 
+    fn time_column(&self) -> Option<&'static str> {
+        Some("time")
+    }
+
     fn to_record_batch(
         &self,
         record: &GenericRecord,
@@ -330,6 +334,11 @@ mod tests {
             .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
         assert_eq!(received_col.value(0), 1_700_000_000_123_456);
+    }
+
+    #[test]
+    fn generic_sink_time_column_is_time() {
+        assert_eq!(GenericSink.time_column(), Some("time"));
     }
 
     #[tokio::test]

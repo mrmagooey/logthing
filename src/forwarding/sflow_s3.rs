@@ -84,6 +84,10 @@ impl ParquetSink for SflowSink {
         }
     }
 
+    fn time_column(&self) -> Option<&'static str> {
+        Some("received_at")
+    }
+
     fn to_record_batch(
         &self,
         record: &SflowRecord,
@@ -542,6 +546,11 @@ mod tests {
             .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
             .expect("received_at column should be TimestampMicrosecondArray");
         assert_eq!(received_at.value(0), r.received_at.timestamp_micros());
+    }
+
+    #[test]
+    fn sflow_sink_time_column_is_received_at() {
+        assert_eq!(SflowSink.time_column(), Some("received_at"));
     }
 
     #[tokio::test]

@@ -517,6 +517,10 @@ impl crate::forwarding::buffered_writer::ParquetSink for AggregateSink {
             .unwrap_or_else(|| Arc::new(Schema::empty()))
     }
 
+    fn time_column(&self) -> Option<&'static str> {
+        Some("window_start")
+    }
+
     fn to_record_batch(
         &self,
         record: &AggregateRow,
@@ -714,6 +718,7 @@ pub fn compile_rules(config: &Config) -> anyhow::Result<Vec<CompiledRule>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forwarding::buffered_writer::ParquetSink;
     use chrono::Utc;
 
     fn rule(name: &str, source: &str, stream: Option<&str>, group_by: &[&str]) -> CompiledRule {
@@ -1480,5 +1485,11 @@ mod tests {
 
         shutdown_tx.send(true).expect("signal shutdown");
         task.await.expect("emit task joins without panicking");
+    }
+
+    #[test]
+    fn aggregate_sink_time_column_is_window_start() {
+        let sink = AggregateSink::new(&[]);
+        assert_eq!(sink.time_column(), Some("window_start"));
     }
 }

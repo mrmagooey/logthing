@@ -239,6 +239,10 @@ impl ParquetSink for IpfixSink {
         flow_record_schema()
     }
 
+    fn time_column(&self) -> Option<&'static str> {
+        Some("export_time")
+    }
+
     fn to_record_batch(
         &self,
         records: &Vec<FlowRecord>,
@@ -611,6 +615,11 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(src.value(0), "10.0.0.1");
+    }
+
+    #[test]
+    fn ipfix_sink_time_column_is_export_time() {
+        assert_eq!(IpfixSink.time_column(), Some("export_time"));
     }
 
     // -- Task 2: writer push accumulation and bounded buffer under S3 outage --

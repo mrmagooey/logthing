@@ -143,6 +143,10 @@ impl ParquetSink for SyslogSink {
         syslog_schema()
     }
 
+    fn time_column(&self) -> Option<&'static str> {
+        Some("timestamp")
+    }
+
     fn to_record_batch(
         &self,
         record: &SyslogMessage,
@@ -349,6 +353,11 @@ mod tests {
                 .is_nullable()
         );
         assert!(!schema.field_with_name("protocol").unwrap().is_nullable());
+    }
+
+    #[test]
+    fn syslog_sink_time_column_is_timestamp() {
+        assert_eq!(SyslogSink.time_column(), Some("timestamp"));
     }
 
     #[test]

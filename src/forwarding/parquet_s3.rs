@@ -64,6 +64,10 @@ impl ParquetSink for WefSink {
         ]))
     }
 
+    fn time_column(&self) -> Option<&'static str> {
+        Some("timestamp")
+    }
+
     fn to_record_batch(
         &self,
         record: &Arc<WindowsEvent>,
@@ -309,6 +313,11 @@ mod tests {
         assert!(!key.starts_with('/'), "must not start with /");
         assert!(!key.contains("//"), "must not have double-slash");
         assert!(key.ends_with(".parquet"));
+    }
+
+    #[test]
+    fn wef_sink_time_column_is_timestamp() {
+        assert_eq!(WefSink.time_column(), Some("timestamp"));
     }
 
     #[tokio::test]

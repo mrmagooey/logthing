@@ -85,6 +85,10 @@ impl ParquetSink for SuricataSink {
         envelope_schema()
     }
 
+    fn time_column(&self) -> Option<&'static str> {
+        Some("received_at")
+    }
+
     /// Convert one `SuricataRecord` to a single-row `RecordBatch`.
     /// Uses `map_envelope` which always produces a row matching `envelope_schema()`.
     fn to_record_batch(
@@ -362,6 +366,11 @@ mod tests {
             "key: {key}"
         );
         assert!(key.ends_with(".parquet"), "key: {key}");
+    }
+
+    #[test]
+    fn suricata_sink_time_column_is_received_at() {
+        assert_eq!(SuricataSink.time_column(), Some("received_at"));
     }
 
     // -- PartitionedParquetWriter accumulation --
