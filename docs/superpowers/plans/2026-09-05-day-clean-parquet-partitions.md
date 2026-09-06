@@ -332,7 +332,7 @@ mod day_from_batch_tests {
         let schema = ts_schema(&["received_at"]);
         let batch = ts_batch(&schema, &[Some(micros(2027, 2, 2))]);
         let now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
-        // time_column() defaults to "" for sinks that don't opt in.
+        // time_column() returns None for sinks that don't opt in.
         let day = day_from_batch(&batch, None, now);
         assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2027, 2, 2).unwrap());
     }
