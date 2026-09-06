@@ -51,33 +51,47 @@ Bucket rows by UTC day from the data itself, at the point of flush. Exact by
 construction, and immune to all four objections above — none of them concern the
 data's own timestamps.
 
-### Mechanism
+### Mechanism: day as part of the buffer key
 
-In the flush function (`buffered_writer.rs:~950`), which today concatenates all
-buffered batches and encodes once:
+Records are mapped to a single-row `RecordBatch` **at push time** (`ParquetSink::
+to_record_batch`), and the writer holds buffers in a map keyed by partition
+segment. So the event day is knowable at push, from the just-mapped batch.
 
-1. Concatenate as today.
-2. Derive each row's UTC day from the sink's designated time column.
-3. **Single bucket** (steady state): take today's path unchanged — one file.
-4. **Multiple buckets:** `arrow::compute::take` per bucket, then encode and
-   upload each independently, one `IcebergDescriptor` per file.
+Therefore: **make the UTC day part of the buffer key**, rather than splitting a
+mixed batch at flush time.
 
-`build_descriptor_key` already derives the descriptor key from the Parquet key,
-so N files yield N correctly-paired descriptors with no new correlation logic.
-
-### Seam
-
-`ParquetSink` (`buffered_writer.rs:65`) gains:
-
-```rust
-/// Column whose UTC day determines this sink's Parquet file partitioning.
-/// `None` (the default) preserves the pre-existing single-file-per-flush
-/// behaviour exactly.
-fn time_column(&self) -> Option<&'static str> { None }
+```
+buffers: HashMap<String, Buf>   ->   buffers: HashMap<BufKey, Buf>
+                                     BufKey { partition: Option<String>, day: NaiveDate }
 ```
 
-Defaulting to `None` makes the change opt-in per sink: unopted sinks are
-byte-identical to today, so rollout carries no regression risk.
+Each buffer is then day-clean by construction, and everything downstream is
+untouched: one buffer -> one file -> one descriptor -> one `FlushOutcome`.
+
+This was chosen over splitting the concatenated batch inside `encode_and_upload`
+for one decisive reason: **partial failure**. A flush-time split producing N
+files has no correct `FlushOutcome` when file 3 of 5 fails to upload — returning
+`Failure` with all batches re-uploads the four that succeeded (duplicate rows
+visible in the Iceberg table), and returning only the failed subset means
+reconstructing `batches`/`row_count`/`byte_count` from buckets and rewriting the
+retry accounting in `apply_flush_outcome`. Keying the buffer sidesteps the
+problem entirely: `encode_and_upload` still handles exactly one file and its
+existing retry semantics stay correct with no change.
+
+### Deriving the day
+
+`ParquetSink` gains a `time_column()` seam (below). At push, the writer reads
+that column from the freshly-mapped single-row batch to compute the day.
+
+Because the mapped batch is the single source of the day, syslog's `Utc::now()`
+`received_at` stamp and the buffer key can never disagree — the key is derived
+from the stamped value itself, not from a second clock read.
+
+**Amortized-builder path.** `ParquetSink::new_batch` (`buffered_writer.rs:95`)
+returns a `RecordBatchAccumulator` producing *multi-row* batches, which could
+straddle a day. The implementer must handle this: check each record's day before
+appending and finish the accumulator when the day changes, so an accumulator
+never spans two days. Sinks that opt out of `new_batch` are unaffected.
 
 ### Key stamping
 
@@ -87,12 +101,16 @@ with the data. Cosmetic for a real catalog writer (Iceberg tracks files by
 explicit manifest path, never by directory name), but free given the day is
 already in hand, and it removes a standing source of confusion.
 
-### Concurrency and memory
+### Memory
 
-The split loop performs its uploads **serially under the single existing
-`MAX_CONCURRENT_FLUSHES_PER_WRITER` permit** already held by the flush call.
-Acquiring a permit per bucket would multiply the worst-case memory and network
-footprint the semaphore exists to bound.
+Buffer count becomes partition x active-days. In steady state active days is 1,
+briefly 2 around midnight. `max_buffer_rows` is per-buffer, so the worst-case
+memory bound scales with the number of concurrently-live days — acceptable in
+steady state, and the same fan-out a flush-time split would produce anyway, just
+held slightly longer.
+
+**Empty day-buffers must be reaped** once flushed, or a long-running process
+accumulates one dead buffer per partition per day elapsed.
 
 ## Syslog `received_at`
 
@@ -138,8 +156,9 @@ when null.
 - **Backfill fan-out.** A bulk replay spanning many days splits one flush into
   many small files. Bounded by the data, and unavoidable: a file spanning 365
   days is unregisterable regardless.
-- **Per-flush bucketing scan.** One min/max pass over a timestamp column,
-  vectorised, negligible against zstd encoding. The split path itself is rare.
+- **Per-push day extraction.** Reading one timestamp value from a single-row
+  batch, negligible against mapping and encoding.
+- **More live buffers.** See Memory above.
 
 ## Out of scope
 
