@@ -461,6 +461,125 @@ mod day_from_batch_tests {
     }
 }
 
+/// Widest backfill accepted from a record's own timestamp before
+/// `partition_time` falls back to receipt time instead. This is the knob
+/// that bounds live-buffer fan-out: an untrusted sender can claim any event
+/// timestamp it likes (syslog, IPFIX `export_time`, HEC `time`), and without
+/// a ceiling each distinct claimed day mints its own buffer, its own small
+/// Parquet PUT, and its own descriptor PUT. Clamping to 30 days means a
+/// sender can mint at most ~31 buffers per partition (30 backfill days plus
+/// today) no matter how many distinct dates it claims.
+///
+/// The tradeoff: a *genuine* backfill deeper than 30 days is bucketed by
+/// receipt time rather than event time. It is not dropped and not
+/// mis-typed -- the real event timestamp is still queryable in its own
+/// column -- but the file it lands in partitions by when it was ingested,
+/// not by when it happened. Widen this if deep replay matters more than the
+/// fan-out bound.
+#[allow(dead_code)] // wired up by the follow-on task that adds the `partition_time` sink column
+const MAX_BACKFILL: chrono::TimeDelta = chrono::TimeDelta::days(30);
+
+/// Tolerance for a sender's clock running ahead of ours. A small forward
+/// skew is normal clock drift; anything past this is treated the same as an
+/// out-of-range backfill and bucketed by receipt time instead.
+#[allow(dead_code)] // wired up by the follow-on task that adds the `partition_time` sink column
+const MAX_SKEW: chrono::TimeDelta = chrono::TimeDelta::days(1);
+
+/// Derive the instant a record's partition day is computed from.
+///
+/// This is the single source of truth for the `partition_time` column: a
+/// pure, clock-free function of the record's own event timestamp (if any)
+/// and the receipt instant logthing stamped on ingest. It never reads
+/// `Utc::now()`, which closes the last path where two clock reads either
+/// side of midnight could disagree about which day a buffer belongs to --
+/// the same record, evaluated twice, always derives the same instant.
+///
+/// - `event` is `None` (the record carries no usable timestamp of its own,
+///   e.g. a CEF payload) -> `received_at`.
+/// - `event` is `Some(t)` but falls outside `[received_at - MAX_BACKFILL,
+///   received_at + MAX_SKEW]` -> `received_at`. This is the untrusted-input
+///   clamp: a sender cannot mint unbounded live buffers by claiming
+///   arbitrary event dates, because anything too far from receipt time
+///   collapses onto `received_at`.
+/// - otherwise -> `t`, the record's own event timestamp.
+#[allow(dead_code)] // wired up by the follow-on task that adds the `partition_time` sink column
+pub(crate) fn partition_time(
+    event: Option<chrono::DateTime<chrono::Utc>>,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    match event {
+        Some(t) if t >= received_at - MAX_BACKFILL && t <= received_at + MAX_SKEW => t,
+        _ => received_at,
+    }
+}
+
+#[cfg(test)]
+mod partition_time_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn at(y: i32, m: u32, d: u32, h: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(y, m, d, h, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn none_event_falls_back_to_received_at() {
+        let received_at = at(2026, 6, 15, 12);
+        assert_eq!(partition_time(None, received_at), received_at);
+    }
+
+    #[test]
+    fn event_a_few_hours_before_received_at_is_used_verbatim() {
+        // Different UTC day from received_at, so returning received_at
+        // instead would be visibly wrong -- this can't pass by accident.
+        let received_at = at(2026, 6, 15, 1);
+        let event = at(2026, 6, 14, 20);
+        assert_eq!(partition_time(Some(event), received_at), event);
+    }
+
+    #[test]
+    fn event_31_days_before_received_at_falls_back() {
+        let received_at = at(2026, 6, 15, 12);
+        let event = received_at - chrono::TimeDelta::days(31);
+        assert_eq!(partition_time(Some(event), received_at), received_at);
+    }
+
+    #[test]
+    fn event_2_days_after_received_at_falls_back() {
+        let received_at = at(2026, 6, 15, 12);
+        let event = received_at + chrono::TimeDelta::days(2);
+        assert_eq!(partition_time(Some(event), received_at), received_at);
+    }
+
+    #[test]
+    fn exactly_30_days_backfill_is_accepted() {
+        let received_at = at(2026, 6, 15, 12);
+        let event = received_at - MAX_BACKFILL;
+        assert_eq!(partition_time(Some(event), received_at), event);
+    }
+
+    #[test]
+    fn one_microsecond_beyond_backfill_bound_is_rejected() {
+        let received_at = at(2026, 6, 15, 12);
+        let event = received_at - MAX_BACKFILL - chrono::TimeDelta::microseconds(1);
+        assert_eq!(partition_time(Some(event), received_at), received_at);
+    }
+
+    #[test]
+    fn exactly_1_day_skew_is_accepted() {
+        let received_at = at(2026, 6, 15, 12);
+        let event = received_at + MAX_SKEW;
+        assert_eq!(partition_time(Some(event), received_at), event);
+    }
+
+    #[test]
+    fn one_microsecond_beyond_skew_bound_is_rejected() {
+        let received_at = at(2026, 6, 15, 12);
+        let event = received_at + MAX_SKEW + chrono::TimeDelta::microseconds(1);
+        assert_eq!(partition_time(Some(event), received_at), received_at);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BufKey — buffer-map key
 // ---------------------------------------------------------------------------
