@@ -96,8 +96,8 @@ async fn hec_records_appear_as_parquet_on_local_disk() {
     let buf = Bytes::from(raw);
     let builder = ParquetRecordBatchReaderBuilder::try_new(buf).unwrap();
     let schema = builder.schema().clone();
-    assert_eq!(schema.fields().len(), 5);
-    for col in ["time", "received_at"] {
+    assert_eq!(schema.fields().len(), 6);
+    for col in ["time", "received_at", "partition_time"] {
         assert_eq!(
             schema.field_with_name(col).unwrap().data_type(),
             &arrow::datatypes::DataType::Timestamp(
