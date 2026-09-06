@@ -39,6 +39,11 @@ static SYSLOG_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         Field::new("message", DataType::Utf8, false),
         Field::new("structured_data", DataType::Utf8, true),
         Field::new("protocol", DataType::Utf8, false),
+        Field::new(
+            "received_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
     ]))
 });
 
@@ -52,6 +57,18 @@ pub fn syslog_schema() -> Arc<Schema> {
 // ---------------------------------------------------------------------------
 
 /// Map one `SyslogMessage` to a single-row `RecordBatch`.
+///
+/// Stamps `received_at` with `Utc::now()` here -- the row-mapping
+/// boundary, called exactly once per push from `SyslogSink::to_record_batch`
+/// -- mirroring `StructuredSyslogRecord::from`'s identical stamp. This is
+/// deliberately NOT a field on `SyslogMessage` itself: that struct is
+/// `Serialize`/`Deserialize` (a new field would change JSON forwarding
+/// output) and is consumed by `aggregate/fields.rs` and `channel_budget.rs`.
+/// Because `day_and_batch`'s default calls this function exactly once and
+/// then reads the day back off the very batch it returns, this single
+/// `Utc::now()` call is also the one the day-bucketing fallback chain
+/// reads -- there is no second clock read to disagree with it across a
+/// midnight boundary.
 pub fn syslog_message_to_batch(msg: &SyslogMessage) -> anyhow::Result<RecordBatch> {
     let schema = syslog_schema();
 
@@ -61,7 +78,7 @@ pub fn syslog_message_to_batch(msg: &SyslogMessage) -> anyhow::Result<RecordBatc
     let tz: Arc<str> = Arc::from("UTC");
     let timestamp = Arc::new(
         TimestampMicrosecondArray::from(vec![msg.timestamp.map(|t| t.timestamp_micros())])
-            .with_timezone(tz),
+            .with_timezone(tz.clone()),
     ) as ArrayRef;
     let hostname = Arc::new(StringArray::from(vec![msg.hostname.clone()])) as ArrayRef;
     let app_name = Arc::new(StringArray::from(vec![msg.app_name.clone()])) as ArrayRef;
@@ -74,6 +91,10 @@ pub fn syslog_message_to_batch(msg: &SyslogMessage) -> anyhow::Result<RecordBatc
             .and_then(|sd| serde_json::to_string(sd).ok()),
     ])) as ArrayRef;
     let protocol = Arc::new(StringArray::from(vec![format!("{:?}", msg.protocol)])) as ArrayRef;
+    let received_at = Arc::new(
+        TimestampMicrosecondArray::from(vec![chrono::Utc::now().timestamp_micros()])
+            .with_timezone(tz),
+    ) as ArrayRef;
 
     Ok(RecordBatch::try_new(
         schema,
@@ -89,6 +110,7 @@ pub fn syslog_message_to_batch(msg: &SyslogMessage) -> anyhow::Result<RecordBatc
             message,
             structured_data,
             protocol,
+            received_at,
         ],
     )?)
 }
@@ -146,8 +168,9 @@ impl ParquetSink for SyslogSink {
     /// Event time column for day bucketing. Syslog's `timestamp` is parsed
     /// from the syslog message header and represents when the event occurred.
     /// It is nullable: a message whose header timestamp failed to parse falls
-    /// through `day_from_batch`'s chain to the wall clock today, and to the
-    /// non-null `received_at` column once Task 6 of this change adds it.
+    /// through `day_from_batch`'s chain to the non-null `received_at` column
+    /// (stamped in `syslog_message_to_batch`) before ever reaching the wall
+    /// clock.
     fn time_column(&self) -> Option<&'static str> {
         Some("timestamp")
     }
@@ -333,7 +356,7 @@ mod tests {
     fn schema_has_correct_columns_and_types() {
         use arrow::datatypes::{DataType, TimeUnit};
         let schema = syslog_schema();
-        assert_eq!(schema.fields().len(), 11);
+        assert_eq!(schema.fields().len(), 12);
         assert_eq!(
             schema.field_with_name("priority").unwrap().data_type(),
             &DataType::UInt8
@@ -357,7 +380,102 @@ mod tests {
                 .unwrap()
                 .is_nullable()
         );
+        assert_eq!(
+            schema.field_with_name("received_at").unwrap().data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(
+            !schema.field_with_name("received_at").unwrap().is_nullable(),
+            "received_at must always be set -- it is the fallback day source \
+             when timestamp fails to parse"
+        );
         assert!(!schema.field_with_name("protocol").unwrap().is_nullable());
+    }
+
+    #[test]
+    fn syslog_message_to_batch_stamps_received_at_non_null() {
+        let msg = dummy_msg("no timestamp in this message");
+        let batch = syslog_message_to_batch(&msg).unwrap();
+        let col = batch
+            .column_by_name("received_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .unwrap();
+        assert!(
+            !col.is_null(0),
+            "received_at must be stamped even when timestamp is None"
+        );
+    }
+
+    #[test]
+    fn syslog_message_to_batch_null_timestamp_falls_back_to_received_at_for_day() {
+        // Regression test for the gap this task closes: a message whose
+        // header timestamp failed to parse must still resolve to *today's*
+        // UTC day via `received_at`, not silently produce a dayless row.
+        // `day_from_batch` is private to buffered_writer.rs, so this
+        // exercises the same fallback chain it implements directly against
+        // the batch this sink produces.
+        let msg = dummy_msg("no timestamp in this message");
+        let batch = syslog_message_to_batch(&msg).unwrap();
+
+        let ts_col = batch
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert!(ts_col.is_null(0), "precondition: timestamp must be null");
+
+        let received_at_col = batch
+            .column_by_name("received_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let day = chrono::DateTime::from_timestamp_micros(received_at_col.value(0))
+            .unwrap()
+            .date_naive();
+        assert_eq!(
+            day,
+            chrono::Utc::now().date_naive(),
+            "received_at must resolve to today's UTC day when timestamp is null"
+        );
+    }
+
+    #[test]
+    fn syslog_message_to_batch_valid_timestamp_still_used_over_received_at() {
+        // When timestamp IS present, it remains the authoritative event
+        // day (day_from_batch tries time_column() first); received_at is
+        // only a fallback, and this message's timestamp is deliberately a
+        // different UTC day than "now" to prove the two never get mixed up.
+        let mut msg = sample_rfc5424();
+        msg.timestamp = Some(
+            chrono::DateTime::parse_from_rfc3339("2003-10-11T22:14:15Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        let batch = syslog_message_to_batch(&msg).unwrap();
+
+        let ts_col = batch
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert!(!ts_col.is_null(0));
+        let ts_day = chrono::DateTime::from_timestamp_micros(ts_col.value(0))
+            .unwrap()
+            .date_naive();
+        assert_eq!(
+            ts_day,
+            chrono::NaiveDate::from_ymd_opt(2003, 10, 11).unwrap()
+        );
+        assert_ne!(
+            ts_day,
+            chrono::Utc::now().date_naive(),
+            "test is only meaningful if timestamp's day differs from received_at's day"
+        );
     }
 
     #[test]
@@ -411,7 +529,7 @@ mod tests {
         let msg = sample_rfc5424();
         let batch = syslog_message_to_batch(&msg).expect("batch");
         assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.num_columns(), 11);
+        assert_eq!(batch.num_columns(), 12);
 
         let priority = batch
             .column(0)
@@ -514,7 +632,7 @@ mod tests {
         let mut reader = builder.build().unwrap();
         let rb = reader.next().unwrap().unwrap();
         assert_eq!(rb.num_rows(), 1);
-        assert_eq!(schema.fields().len(), 11);
+        assert_eq!(schema.fields().len(), 12);
 
         use arrow::array::StringArray;
         let hostname = rb.column(4).as_any().downcast_ref::<StringArray>().unwrap();
@@ -567,7 +685,7 @@ mod tests {
 
         let sink = SyslogSink;
         let schema = sink.schema(None);
-        assert_eq!(schema.fields().len(), 11);
+        assert_eq!(schema.fields().len(), 12);
 
         let msg = sample_rfc5424();
         let batch = sink.to_record_batch(&msg, &schema).unwrap();
