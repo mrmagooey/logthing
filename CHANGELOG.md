@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file, newest
 first, loosely following [Keep a Changelog](https://keepachangelog.com/).
 This file starts at 0.15.0; earlier releases are not backfilled.
 
+## [Unreleased]
+
+### Changed
+
+- `security.allowed_ips` now also filters the syslog (UDP + TCP), IPFIX,
+  sFlow, Zeek, and Suricata socket listeners — previously it only gated the
+  HTTP endpoints. **This is a behaviour change for any deployment that
+  already sets `allowed_ips`**: traffic from sources outside the list that
+  was previously accepted on those five listeners is now silently dropped.
+  Deployments that leave `allowed_ips` at its default (empty = allow all)
+  see no change.
+- A rejected source now increments the `listener_source_rejected` counter,
+  labeled `protocol` with one of `syslog_udp`, `syslog_tcp`, `ipfix`,
+  `sflow`, `zeek`, or `suricata`, so a misconfigured allowlist is visible in
+  metrics rather than only in debug/warn logs.
+
+### Added
+
+- A startup warning is now logged when `hec.enabled = true` and `hec.token`
+  is left empty — that combination accepts any (or no) `Authorization`
+  header on the HEC ingest routes, which is only intended for local dev.
+
 ## [0.16.0] - 2026-09-06
 
 ### BREAKING

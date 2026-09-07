@@ -52,6 +52,10 @@ ca_file = "/path/to/ca.pem"           # Optional: for client certificate verific
 require_client_cert = false           # Set to true to enforce mTLS
 
 [security]
+# Restricts both the HTTP endpoints (WEF, syslog-over-HTTP, HEC, OTLP, ...)
+# and the wire-protocol socket listeners (syslog UDP/TCP, IPFIX, sFlow,
+# Zeek, Suricata) to these sources. Empty (the default) allows all sources
+# on every listener.
 allowed_ips = ["192.168.1.0/24", "10.0.0.0/8"]
 max_connections = 10000
 connection_timeout_secs = 300

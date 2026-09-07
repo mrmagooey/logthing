@@ -37,9 +37,10 @@ async fn async_main() -> anyhow::Result<()> {
     // Load configuration
     let config = config::Config::load()?;
 
-    // Build the listener-source IP whitelist once, shared by the axum router
-    // (via Server) and all five wire-protocol socket listeners below. An
-    // invalid CIDR/IP fails fast here rather than silently allowing all
+    // Build the IP whitelist once and share it across all five
+    // wire-protocol socket listeners below. `Server` builds its own,
+    // separate `IpWhitelist` from the same config for the axum HTTP router.
+    // An invalid CIDR/IP fails fast here rather than silently allowing all
     // sources once a listener is up.
     let ip_whitelist = if config.security.allowed_ips.is_empty() {
         IpWhitelist::empty()
