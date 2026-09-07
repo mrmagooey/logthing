@@ -662,6 +662,8 @@ mod tests {
         let col = sink
             .time_column()
             .expect("sflow_sink must opt in to day partitioning");
+        // Pin the exact column name, not just that SOME name resolves.
+        assert_eq!(col, "partition_time");
         // Check both flow and counter schemas
         for partition in &[Some("flow"), Some("counter")] {
             let schema = sink.schema(*partition);

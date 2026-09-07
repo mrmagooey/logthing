@@ -393,6 +393,8 @@ mod tests {
         let col = sink
             .time_column()
             .expect("wef_sink must opt in to day partitioning");
+        // Pin the exact column name, not just that SOME name resolves.
+        assert_eq!(col, "partition_time");
         // Use a valid partition format (event_type=4624)
         let schema = sink.schema(Some("event_type=4624"));
         assert!(

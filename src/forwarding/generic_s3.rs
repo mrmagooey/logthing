@@ -386,6 +386,11 @@ mod tests {
         let col = sink
             .time_column()
             .expect("generic_sink must opt in to day partitioning");
+        // Pin the exact column name, not just that SOME name resolves --
+        // e.g. `Some("received_at")` would also resolve against this
+        // schema but would reinstate the pre-`partition_time` straddling
+        // bug for HEC.
+        assert_eq!(col, "partition_time");
         let schema = sink.schema(None);
         assert!(
             schema.field_with_name(col).is_ok(),

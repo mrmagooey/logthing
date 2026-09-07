@@ -1575,6 +1575,8 @@ mod tests {
         let col = sink
             .time_column()
             .expect("aggregate_sink must opt in to day partitioning");
+        // Pin the exact column name, not just that SOME name resolves.
+        assert_eq!(col, "partition_time");
         let schema = sink.schema(Some("r"));
         assert!(
             schema.field_with_name(col).is_ok(),

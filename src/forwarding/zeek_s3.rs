@@ -607,6 +607,8 @@ mod tests {
         let col = sink
             .time_column()
             .expect("zeek_sink must opt in to day partitioning");
+        // Pin the exact column name, not just that SOME name resolves.
+        assert_eq!(col, "partition_time");
         // Check that partition_time exists in all 6 typed schemas plus the envelope fallback.
         for partition in &[
             Some("conn"),

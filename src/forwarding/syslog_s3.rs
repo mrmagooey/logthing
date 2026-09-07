@@ -722,6 +722,8 @@ mod tests {
         let col = sink
             .time_column()
             .expect("syslog_sink must opt in to day partitioning");
+        // Pin the exact column name, not just that SOME name resolves.
+        assert_eq!(col, "partition_time");
         let schema = sink.schema(None);
         assert!(
             schema.field_with_name(col).is_ok(),
