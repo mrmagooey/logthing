@@ -776,14 +776,23 @@ pub fn validate_iceberg_config(cfg: &IcebergConfig) -> anyhow::Result<()> {
 /// (see `ingest::handlers::handle_hec_event` et al.), so this only surfaces
 /// the footgun rather than refusing to start.
 ///
-/// ponytail: only covers the HEC empty-token case named in this change. The
-/// analogous OTLP `bearer_token` footgun is real but out of scope here.
+/// Also covers the analogous OTLP `bearer_token` footgun: `otlp.bearer_token`
+/// is always compiled into `Config` (present even when the `otlp` feature is
+/// off), so no feature gate is needed here — an unauthenticated route only
+/// exists when `otlp.enabled` is also true.
 pub fn insecure_config_warnings(cfg: &Config) -> Vec<String> {
     let mut warnings = Vec::new();
     if cfg.hec.enabled && cfg.hec.token.is_empty() {
         warnings.push(
             "hec.enabled = true but hec.token is empty: HEC ingest is reachable without \
              authentication; set hec.token to require a shared secret"
+                .to_string(),
+        );
+    }
+    if cfg.otlp.enabled && cfg.otlp.bearer_token.as_deref().unwrap_or("").is_empty() {
+        warnings.push(
+            "otlp.enabled = true but otlp.bearer_token is empty: OTLP ingest is reachable \
+             without authentication; set otlp.bearer_token to require a shared secret"
                 .to_string(),
         );
     }
@@ -2590,5 +2599,67 @@ secret_key = "minioadmin"
         cfg.hec.token = String::new();
 
         assert!(insecure_config_warnings(&cfg).is_empty());
+    }
+
+    #[test]
+    fn insecure_warns_when_otlp_enabled_with_no_token() {
+        let mut cfg = Config::default();
+        cfg.otlp.enabled = true;
+        cfg.otlp.bearer_token = None;
+
+        let warnings = insecure_config_warnings(&cfg);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning; got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn insecure_warns_when_otlp_enabled_with_empty_token() {
+        let mut cfg = Config::default();
+        cfg.otlp.enabled = true;
+        cfg.otlp.bearer_token = Some(String::new());
+
+        let warnings = insecure_config_warnings(&cfg);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning; got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn insecure_silent_when_otlp_enabled_with_token_set() {
+        let mut cfg = Config::default();
+        cfg.otlp.enabled = true;
+        cfg.otlp.bearer_token = Some("super-secret-token".to_string());
+
+        assert!(insecure_config_warnings(&cfg).is_empty());
+    }
+
+    #[test]
+    fn insecure_silent_when_otlp_disabled() {
+        let mut cfg = Config::default();
+        cfg.otlp.enabled = false;
+        cfg.otlp.bearer_token = None;
+
+        assert!(insecure_config_warnings(&cfg).is_empty());
+    }
+
+    #[test]
+    fn insecure_warns_twice_when_both_hec_and_otlp_misconfigured() {
+        let mut cfg = Config::default();
+        cfg.hec.enabled = true;
+        cfg.hec.token = String::new();
+        cfg.otlp.enabled = true;
+        cfg.otlp.bearer_token = None;
+
+        let warnings = insecure_config_warnings(&cfg);
+        assert_eq!(
+            warnings.len(),
+            2,
+            "expected exactly two warnings; got {warnings:?}"
+        );
     }
 }
