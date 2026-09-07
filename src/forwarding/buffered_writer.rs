@@ -476,13 +476,11 @@ mod day_from_batch_tests {
 /// column -- but the file it lands in partitions by when it was ingested,
 /// not by when it happened. Widen this if deep replay matters more than the
 /// fan-out bound.
-#[allow(dead_code)] // wired up by the follow-on task that adds the `partition_time` sink column
 const MAX_BACKFILL: chrono::TimeDelta = chrono::TimeDelta::days(30);
 
 /// Tolerance for a sender's clock running ahead of ours. A small forward
 /// skew is normal clock drift; anything past this is treated the same as an
 /// out-of-range backfill and bucketed by receipt time instead.
-#[allow(dead_code)] // wired up by the follow-on task that adds the `partition_time` sink column
 const MAX_SKEW: chrono::TimeDelta = chrono::TimeDelta::days(1);
 
 /// Derive the instant a record's partition day is computed from.
@@ -502,7 +500,6 @@ const MAX_SKEW: chrono::TimeDelta = chrono::TimeDelta::days(1);
 ///   arbitrary event dates, because anything too far from receipt time
 ///   collapses onto `received_at`.
 /// - otherwise -> `t`, the record's own event timestamp.
-#[allow(dead_code)] // wired up by the follow-on task that adds the `partition_time` sink column
 pub(crate) fn partition_time(
     event: Option<chrono::DateTime<chrono::Utc>>,
     received_at: chrono::DateTime<chrono::Utc>,

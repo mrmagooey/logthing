@@ -17,8 +17,8 @@ use std::sync::{Arc, LazyLock};
 
 /// Fixed WEF schema. `LazyLock`, not a fresh `Arc::new(Schema::new(...))` per
 /// call: `push()` calls `schema()` once per record, and before this each call
-/// allocated a new `Schema` (5 `Field`s plus the `Vec`/`Arc` wrappers) —
-/// ~7 heap allocations per Windows event that every other sink in this file
+/// allocated a new `Schema` (6 `Field`s plus the `Vec`/`Arc` wrappers) —
+/// ~8 heap allocations per Windows event that every other sink in this file
 /// tree avoids by caching its schema statically.
 static WEF_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
@@ -49,7 +49,8 @@ static WEF_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
 /// - `partition()` = `Some("event_type=<event_id>")` from the parsed EventID.
 ///   If the event has no parsed data, returns `Some("event_type=0")` as a safe
 ///   sentinel — but `to_record_batch` will return `Err` to skip unparsed events.
-/// - `schema()` = fixed 5-column WEF schema (unchanged from legacy writer).
+/// - `schema()` = fixed 6-column WEF schema (5 legacy columns plus
+///   `partition_time`).
 /// - `to_record_batch()` = returns `Err` for events with no parsed data (generic
 ///   writer logs + skips, matching legacy "silently skipped" behavior).
 ///

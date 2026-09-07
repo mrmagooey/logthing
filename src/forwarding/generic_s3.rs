@@ -61,7 +61,7 @@ impl ParquetSink for GenericSink {
     }
 
     /// All partitions — including `_overflow` and `None` — use the same fixed
-    /// 5-column schema.  There is no per-sourcetype typed schema.
+    /// 6-column schema.  There is no per-sourcetype typed schema.
     fn schema(&self, _partition: Option<&str>) -> Arc<Schema> {
         generic_schema()
     }
