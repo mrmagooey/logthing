@@ -1,5 +1,6 @@
 //! Suricata TCP EVE JSON listener.
 
+use crate::middleware::IpWhitelist;
 use crate::suricata::SuricataRecord;
 use chrono::Utc;
 use std::net::SocketAddr;
@@ -68,11 +69,23 @@ impl SuricataHandler for DefaultSuricataHandler {
 pub struct SuricataListener {
     config: SuricataListenerConfig,
     handler: Arc<dyn SuricataHandler>,
+    allowed_ips: IpWhitelist,
 }
 
 impl SuricataListener {
     pub fn new(config: SuricataListenerConfig, handler: Arc<dyn SuricataHandler>) -> Self {
-        Self { config, handler }
+        Self {
+            config,
+            handler,
+            allowed_ips: IpWhitelist::empty(),
+        }
+    }
+
+    /// Restrict this listener to sources in `allowed_ips`. Defaults to
+    /// [`IpWhitelist::empty()`] (allow all) via `new()`.
+    pub fn with_allowed_ips(mut self, allowed_ips: IpWhitelist) -> Self {
+        self.allowed_ips = allowed_ips;
+        self
     }
 
     /// Bind the TCP listener and run the accept loop (no shutdown signal — runs until aborted).
@@ -104,6 +117,12 @@ impl SuricataListener {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, src)) => {
+                            // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                            if !self.allowed_ips.is_allowed(&src) {
+                                metrics::counter!("listener_source_rejected", "protocol" => "suricata").increment(1);
+                                warn!("Rejected suricata connection from {} — not in allowed_ips", src);
+                                continue;
+                            }
                             match semaphore.clone().try_acquire_owned() {
                                 Ok(permit) => {
                                     let handler = self.handler.clone();
@@ -151,6 +170,15 @@ impl SuricataListener {
         loop {
             match listener.accept().await {
                 Ok((stream, src)) => {
+                    if !self.allowed_ips.is_allowed(&src) {
+                        metrics::counter!("listener_source_rejected", "protocol" => "suricata")
+                            .increment(1);
+                        warn!(
+                            "Rejected suricata connection from {} — not in allowed_ips",
+                            src
+                        );
+                        continue;
+                    }
                     match semaphore.clone().try_acquire_owned() {
                         Ok(permit) => {
                             let handler = self.handler.clone();
@@ -615,6 +643,70 @@ mod tests {
         assert_eq!(
             count, 1,
             "suricata_oversized_lines counter must be 1; got {count}"
+        );
+    }
+
+    /// A source outside `allowed_ips` never reaches the handler.
+    #[tokio::test]
+    async fn with_allowed_ips_blocks_disallowed_source() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+
+        let handler = CapturingHandler::new();
+        let listener = SuricataListener::new(SuricataListenerConfig::default(), handler.clone())
+            .with_allowed_ips(IpWhitelist::new(vec!["10.99.99.0/24".into()]).unwrap());
+        let task = tokio::spawn(async move {
+            listener.run_with_listener(tcp_listener).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _ = stream
+            .write_all(b"{\"event_type\":\"alert\",\"src_ip\":\"1.2.3.4\"}\n")
+            .await;
+        drop(stream);
+
+        sleep(Duration::from_millis(150)).await;
+        task.abort();
+
+        let records = handler.take_records();
+        assert!(
+            records.is_empty(),
+            "blocked source must not reach the handler; got {}",
+            records.len()
+        );
+    }
+
+    /// A source inside `allowed_ips` reaches the handler as normal.
+    #[tokio::test]
+    async fn with_allowed_ips_allows_whitelisted_source() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+
+        let handler = CapturingHandler::new();
+        let listener = SuricataListener::new(SuricataListenerConfig::default(), handler.clone())
+            .with_allowed_ips(IpWhitelist::new(vec!["127.0.0.1".into()]).unwrap());
+        let task = tokio::spawn(async move {
+            listener.run_with_listener(tcp_listener).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"{\"event_type\":\"alert\",\"src_ip\":\"1.2.3.4\"}\n")
+            .await
+            .unwrap();
+        drop(stream);
+
+        sleep(Duration::from_millis(150)).await;
+        task.abort();
+
+        let records = handler.take_records();
+        assert_eq!(
+            records.len(),
+            1,
+            "allowed source must reach the handler; got {}",
+            records.len()
         );
     }
 }

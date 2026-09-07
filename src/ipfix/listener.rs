@@ -2,6 +2,7 @@
 
 use crate::ipfix::FlowRecord;
 use crate::ipfix::decoder::{IpfixDecoder, decode_datagram};
+use crate::middleware::IpWhitelist;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -52,11 +53,23 @@ impl IpfixHandler for DefaultIpfixHandler {
 pub struct IpfixListener {
     config: IpfixListenerConfig,
     handler: Arc<dyn IpfixHandler>,
+    allowed_ips: IpWhitelist,
 }
 
 impl IpfixListener {
     pub fn new(config: IpfixListenerConfig, handler: Arc<dyn IpfixHandler>) -> Self {
-        Self { config, handler }
+        Self {
+            config,
+            handler,
+            allowed_ips: IpWhitelist::empty(),
+        }
+    }
+
+    /// Restrict this listener to sources in `allowed_ips`. Defaults to
+    /// [`IpWhitelist::empty()`] (allow all) via `new()`.
+    pub fn with_allowed_ips(mut self, allowed_ips: IpWhitelist) -> Self {
+        self.allowed_ips = allowed_ips;
+        self
     }
 
     /// Bind the UDP socket and run the receive loop until error (no shutdown signal).
@@ -89,6 +102,12 @@ impl IpfixListener {
                 result = socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, src)) => {
+                            // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                            if !self.allowed_ips.is_allowed(&src) {
+                                metrics::counter!("listener_source_rejected", "protocol" => "ipfix").increment(1);
+                                debug!("Rejected ipfix datagram from {} — not in allowed_ips", src);
+                                continue;
+                            }
                             debug!("IPFIX datagram from {}: {} bytes", src, len);
                             match decode_datagram(&mut decoder, &buf[..len], src.ip()) {
                                 Ok(flows) if flows.is_empty() => {
@@ -138,6 +157,12 @@ impl IpfixListener {
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((len, src)) => {
+                    if !self.allowed_ips.is_allowed(&src) {
+                        metrics::counter!("listener_source_rejected", "protocol" => "ipfix")
+                            .increment(1);
+                        debug!("Rejected ipfix datagram from {} — not in allowed_ips", src);
+                        continue;
+                    }
                     debug!("IPFIX datagram from {}: {} bytes", src, len);
                     match decode_datagram(&mut decoder, &buf[..len], src.ip()) {
                         Ok(flows) if flows.is_empty() => {
@@ -321,6 +346,73 @@ mod tests {
             batches.len(),
             1,
             "valid datagram must still be handled after malformed one"
+        );
+    }
+
+    /// A source outside `allowed_ips` never reaches the handler.
+    #[tokio::test]
+    async fn with_allowed_ips_blocks_disallowed_source() {
+        let listener_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener_socket.local_addr().unwrap();
+
+        let handler = CapturingHandler::new();
+        let handler_clone = handler.clone();
+        let listener = IpfixListener::new(IpfixListenerConfig::default(), handler_clone)
+            .with_allowed_ips(IpWhitelist::new(vec!["10.99.99.0/24".into()]).unwrap());
+
+        let task = tokio::spawn(async move {
+            listener.run_with_socket(listener_socket).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(FIXTURE_NFV5_ONE_RECORD, listener_addr)
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+
+        task.abort();
+
+        let batches = handler.batches();
+        assert!(
+            batches.is_empty(),
+            "blocked source must not reach the handler; got {} batches",
+            batches.len()
+        );
+    }
+
+    /// A source inside `allowed_ips` reaches the handler as normal.
+    #[tokio::test]
+    async fn with_allowed_ips_allows_whitelisted_source() {
+        let listener_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener_socket.local_addr().unwrap();
+
+        let handler = CapturingHandler::new();
+        let handler_clone = handler.clone();
+        let listener = IpfixListener::new(IpfixListenerConfig::default(), handler_clone)
+            .with_allowed_ips(IpWhitelist::new(vec!["127.0.0.1".into()]).unwrap());
+
+        let task = tokio::spawn(async move {
+            listener.run_with_socket(listener_socket).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(FIXTURE_NFV5_ONE_RECORD, listener_addr)
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+
+        task.abort();
+
+        let batches = handler.batches();
+        assert_eq!(
+            batches.len(),
+            1,
+            "allowed source must reach the handler; got {}",
+            batches.len()
         );
     }
 }

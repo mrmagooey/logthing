@@ -1,6 +1,7 @@
 //! sFlow v5 UDP listener — mirrors src/ipfix/listener.rs; sFlow is stateless
 //! (no template cache), so decode_datagram takes only the buffer + exporter IP.
 
+use crate::middleware::IpWhitelist;
 use crate::sflow::SflowRecord;
 use crate::sflow::decoder::decode_datagram;
 use std::net::SocketAddr;
@@ -44,11 +45,23 @@ impl SflowHandler for DefaultSflowHandler {
 pub struct SflowListener {
     config: SflowListenerConfig,
     handler: Arc<dyn SflowHandler>,
+    allowed_ips: IpWhitelist,
 }
 
 impl SflowListener {
     pub fn new(config: SflowListenerConfig, handler: Arc<dyn SflowHandler>) -> Self {
-        Self { config, handler }
+        Self {
+            config,
+            handler,
+            allowed_ips: IpWhitelist::empty(),
+        }
+    }
+
+    /// Restrict this listener to sources in `allowed_ips`. Defaults to
+    /// [`IpWhitelist::empty()`] (allow all) via `new()`.
+    pub fn with_allowed_ips(mut self, allowed_ips: IpWhitelist) -> Self {
+        self.allowed_ips = allowed_ips;
+        self
     }
 
     /// Bind the UDP socket and run the receive loop until error (no shutdown signal).
@@ -80,6 +93,12 @@ impl SflowListener {
                 result = socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, src)) => {
+                            // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                            if !self.allowed_ips.is_allowed(&src) {
+                                metrics::counter!("listener_source_rejected", "protocol" => "sflow").increment(1);
+                                debug!("Rejected sflow datagram from {} — not in allowed_ips", src);
+                                continue;
+                            }
                             debug!("sFlow datagram from {}: {} bytes", src, len);
                             match decode_datagram(&buf[..len], src.ip()) {
                                 Ok(samples) if samples.is_empty() => {
@@ -125,6 +144,12 @@ impl SflowListener {
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((len, src)) => {
+                    if !self.allowed_ips.is_allowed(&src) {
+                        metrics::counter!("listener_source_rejected", "protocol" => "sflow")
+                            .increment(1);
+                        debug!("Rejected sflow datagram from {} — not in allowed_ips", src);
+                        continue;
+                    }
                     debug!("sFlow datagram from {}: {} bytes", src, len);
                     match decode_datagram(&buf[..len], src.ip()) {
                         Ok(samples) if samples.is_empty() => {
@@ -283,5 +308,70 @@ mod tests {
             "valid datagram must still produce one batch after malformed one"
         );
         assert_eq!(batches[0][0].sample_type, crate::sflow::SampleType::Counter);
+    }
+
+    // ── allowed_ips: blocked source never reaches the handler ──
+    #[tokio::test]
+    async fn with_allowed_ips_blocks_disallowed_source() {
+        let listener_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener_socket.local_addr().unwrap();
+
+        let handler = CapturingHandler::new();
+        let handler_clone = handler.clone();
+        let listener = SflowListener::new(SflowListenerConfig::default(), handler_clone)
+            .with_allowed_ips(IpWhitelist::new(vec!["10.99.99.0/24".into()]).unwrap());
+
+        let task = tokio::spawn(async move {
+            listener.run_with_socket(listener_socket).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(FIXTURE_SFLOW_FLOW_RAW_HEADER, listener_addr)
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        task.abort();
+
+        let batches = handler.batches();
+        assert!(
+            batches.is_empty(),
+            "blocked source must not reach the handler; got {} batches",
+            batches.len()
+        );
+    }
+
+    // ── allowed_ips: whitelisted source reaches the handler as normal ──
+    #[tokio::test]
+    async fn with_allowed_ips_allows_whitelisted_source() {
+        let listener_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener_socket.local_addr().unwrap();
+
+        let handler = CapturingHandler::new();
+        let handler_clone = handler.clone();
+        let listener = SflowListener::new(SflowListenerConfig::default(), handler_clone)
+            .with_allowed_ips(IpWhitelist::new(vec!["127.0.0.1".into()]).unwrap());
+
+        let task = tokio::spawn(async move {
+            listener.run_with_socket(listener_socket).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(FIXTURE_SFLOW_FLOW_RAW_HEADER, listener_addr)
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        task.abort();
+
+        let batches = handler.batches();
+        assert_eq!(
+            batches.len(),
+            1,
+            "allowed source must reach the handler; got {}",
+            batches.len()
+        );
     }
 }

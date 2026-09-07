@@ -9,6 +9,8 @@ enabled = false
 port = 5986
 
 [security]
+# Applies to both the HTTP endpoints and the syslog/IPFIX/sFlow/Zeek/Suricata
+# socket listeners. Empty allows all sources.
 allowed_ips = []
 max_connections = 10000
 connection_timeout_secs = 300
