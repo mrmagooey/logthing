@@ -217,6 +217,15 @@ parse_dns = true    # Enable DNS log parsing
 - `GET /syslog/udp` - Get UDP listener info
 - `GET /syslog/examples` - Get example DNS syslog records
 
+`POST /syslog` is mounted unconditionally (it doesn't depend on `syslog.enabled`), so by
+default it accepts requests with no authentication. Set `syslog.http_token` to require
+`Authorization: Bearer <token>` on that route:
+
+```toml
+[syslog]
+http_token = "shared-secret"   # optional; empty (default) = no auth required
+```
+
 **DNS Log Parsing**:
 The server automatically parses DNS query logs from:
 - BIND/named: `client 192.168.1.100#12345: query: example.com IN A + (93.184.216.34)`

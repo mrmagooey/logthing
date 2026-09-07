@@ -988,29 +988,46 @@ mod tests {
 
     #[tokio::test]
     async fn handle_syslog_http_parses_message() {
+        let state = default_state().await;
         let addr: SocketAddr = "192.0.2.10:5514".parse().unwrap();
         let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: client 192.168.1.100#12345: query: example.com IN A + (93.184.216.34)";
 
-        let ok_response = handle_syslog_http(ConnectInfo(addr), Bytes::from(msg))
-            .await
-            .into_response();
+        let ok_response = handle_syslog_http(
+            State(state.clone()),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+            Bytes::from(msg),
+        )
+        .await
+        .into_response();
         assert_eq!(ok_response.status(), StatusCode::OK);
 
-        let bad_response = handle_syslog_http(ConnectInfo(addr), Bytes::from("not syslog"))
-            .await
-            .into_response();
+        let bad_response = handle_syslog_http(
+            State(state),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+            Bytes::from("not syslog"),
+        )
+        .await
+        .into_response();
         assert_eq!(bad_response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn handle_syslog_http_with_rfc5424_message() {
+        let state = default_state().await;
         let addr: SocketAddr = "192.0.2.10:5514".parse().unwrap();
         // RFC 5424 format
         let msg = r#"<165>1 2024-01-15T10:33:45.000Z dns-server named 1234 - [dns@12345 query="example.com"] DNS query"#;
 
-        let response = handle_syslog_http(ConnectInfo(addr), Bytes::from(msg))
-            .await
-            .into_response();
+        let response = handle_syslog_http(
+            State(state),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+            Bytes::from(msg),
+        )
+        .await
+        .into_response();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -1224,13 +1241,19 @@ mod tests {
 
     #[tokio::test]
     async fn handle_syslog_http_with_dns_log() {
+        let state = default_state().await;
         let addr: SocketAddr = "192.0.2.10:5514".parse().unwrap();
         // BIND DNS query format
         let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: client 192.168.1.100#12345: query: example.com IN A + (93.184.216.34)";
 
-        let response = handle_syslog_http(ConnectInfo(addr), Bytes::from(msg))
-            .await
-            .into_response();
+        let response = handle_syslog_http(
+            State(state),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+            Bytes::from(msg),
+        )
+        .await
+        .into_response();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -1421,18 +1444,114 @@ mod tests {
     /// 400 for one that is structurally invalid (missing priority bracket).
     #[tokio::test]
     async fn handle_syslog_http_rejects_structurally_invalid_message() {
+        let state = default_state().await;
         let addr: SocketAddr = "10.0.0.2:514".parse().unwrap();
         // Missing the leading '<' so the PRI field is absent — not a valid syslog frame.
         let bad_msg = "134>Jun 22 09:00:00 host app[99]: message without pri bracket";
 
-        let response = handle_syslog_http(ConnectInfo(addr), Bytes::from(bad_msg))
-            .await
-            .into_response();
+        let response = handle_syslog_http(
+            State(state),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+            Bytes::from(bad_msg),
+        )
+        .await
+        .into_response();
         assert_eq!(
             response.status(),
             StatusCode::BAD_REQUEST,
             "structurally invalid syslog message must be rejected with 400"
         );
+    }
+
+    /// Helper: build state with `syslog.http_token` set to `token`.
+    async fn state_with_syslog_token(token: &str) -> Arc<AppState> {
+        let mut cfg = Config::default();
+        cfg.syslog.http_token = token.to_string();
+        build_state_with_config(cfg).await
+    }
+
+    #[tokio::test]
+    async fn handle_syslog_http_with_token_configured_rejects_missing_header() {
+        let state = state_with_syslog_token("s3cr3t").await;
+        let addr: SocketAddr = "10.0.0.3:514".parse().unwrap();
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: hello";
+
+        let response = handle_syslog_http(
+            State(state),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+            Bytes::from(msg),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn handle_syslog_http_with_token_configured_rejects_wrong_token() {
+        let state = state_with_syslog_token("s3cr3t").await;
+        let addr: SocketAddr = "10.0.0.3:514".parse().unwrap();
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: hello";
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong-token".parse().unwrap());
+
+        let response =
+            handle_syslog_http(State(state), ConnectInfo(addr), headers, Bytes::from(msg))
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn handle_syslog_http_with_token_configured_rejects_malformed_header() {
+        let state = state_with_syslog_token("s3cr3t").await;
+        let addr: SocketAddr = "10.0.0.3:514".parse().unwrap();
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: hello";
+        let mut headers = HeaderMap::new();
+        // Missing the "Bearer " prefix.
+        headers.insert("authorization", "s3cr3t".parse().unwrap());
+
+        let response =
+            handle_syslog_http(State(state), ConnectInfo(addr), headers, Bytes::from(msg))
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn handle_syslog_http_with_token_configured_accepts_correct_token() {
+        let state = state_with_syslog_token("s3cr3t").await;
+        let addr: SocketAddr = "10.0.0.3:514".parse().unwrap();
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: hello";
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer s3cr3t".parse().unwrap());
+
+        let response =
+            handle_syslog_http(State(state), ConnectInfo(addr), headers, Bytes::from(msg))
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Back-compat case: empty configured token (the default) must skip auth
+    /// entirely, even with no `Authorization` header — every existing
+    /// deployment must see zero behavior change.
+    #[tokio::test]
+    async fn handle_syslog_http_with_empty_token_and_no_header_returns_200() {
+        let state = default_state().await;
+        let addr: SocketAddr = "10.0.0.3:514".parse().unwrap();
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: hello";
+
+        let response = handle_syslog_http(
+            State(state),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+            Bytes::from(msg),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// CR-1 regression: kerberos_auth_middleware must fail CLOSED.
@@ -2156,6 +2275,93 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------ //
+    // syslog.http_token: opt-in bearer auth on the unconditionally-mounted //
+    // /syslog route, exercised through the REAL create_router path.       //
+    // ------------------------------------------------------------------ //
+
+    /// Default config (empty `syslog.http_token`) must accept a request with
+    /// no `Authorization` header at all — the back-compat case that matters
+    /// most, since `/syslog` is mounted unconditionally for every deployment.
+    #[tokio::test]
+    async fn syslog_route_with_empty_token_accepts_request_without_header() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let config = Config::default(); // syslog.http_token defaults to ""
+        let server = build_server(config).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds");
+
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: hello";
+        let req = with_connect_info(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/syslog")
+                .body(Body::from(msg))
+                .unwrap(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// With `syslog.http_token` configured, a request with no `Authorization`
+    /// header is rejected with 401 through the real router.
+    #[tokio::test]
+    async fn syslog_route_with_token_configured_rejects_missing_header() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let mut config = Config::default();
+        config.syslog.http_token = "s3cr3t".to_string();
+        let server = build_server(config).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds");
+
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: hello";
+        let req = with_connect_info(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/syslog")
+                .body(Body::from(msg))
+                .unwrap(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// With `syslog.http_token` configured, the correct bearer token is
+    /// accepted through the real router.
+    #[tokio::test]
+    async fn syslog_route_with_token_configured_accepts_correct_bearer() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let mut config = Config::default();
+        config.syslog.http_token = "s3cr3t".to_string();
+        let server = build_server(config).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds");
+
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: hello";
+        let req = with_connect_info(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/syslog")
+                .header("Authorization", "Bearer s3cr3t")
+                .body(Body::from(msg))
+                .unwrap(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn server_take_hec_worker_handles_returns_empty_when_hec_disabled() {
         let mut server = Server::new(
@@ -2783,10 +2989,39 @@ async fn start_metrics_server(addr: SocketAddr) {
 }
 
 /// Handle syslog messages via HTTP POST
-async fn handle_syslog_http(
+///
+/// Auth: if `config.syslog.http_token` is non-empty, the request must carry
+/// `Authorization: Bearer <token>`. An empty (default) token skips the check
+/// entirely — the route is mounted unconditionally, so this preserves the
+/// pre-existing no-auth behaviour for every default deployment. Comparison
+/// mirrors `handle_otlp_logs`: constant-time on the equal-length path, with
+/// an early length-mismatch branch (token length is low-sensitivity).
+pub async fn handle_syslog_http(
+    State(app_state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    use subtle::ConstantTimeEq;
+
+    {
+        let cfg = app_state.config.read().await;
+        let expected_token = &cfg.syslog.http_token;
+        if !expected_token.is_empty() {
+            let provided = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "))
+                .unwrap_or("");
+            let a = expected_token.as_bytes();
+            let b = provided.as_bytes();
+            let ok: bool = a.len() == b.len() && a.ct_eq(b).into();
+            if !ok {
+                return (StatusCode::UNAUTHORIZED, "Unauthorized");
+            }
+        }
+    }
+
     let msg = String::from_utf8_lossy(&body);
 
     match SyslogMessage::parse(&msg) {

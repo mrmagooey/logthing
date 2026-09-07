@@ -211,6 +211,13 @@ pub struct SyslogConfig {
     /// case messages are written to both.
     #[serde(default)]
     pub local: Option<SyslogLocalConfig>,
+
+    /// Optional bearer token for `POST /syslog` (`Authorization: Bearer <token>`).
+    /// Empty (the default) means auth is disabled — the route is mounted
+    /// unconditionally, so this preserves today's behaviour for every
+    /// existing deployment.
+    #[serde(default)]
+    pub http_token: String,
 }
 
 /// Configuration for the IPFIX / NetFlow UDP listener.
@@ -1056,6 +1063,7 @@ impl Default for SyslogConfig {
             s3: None,
             structured_s3: None,
             local: None,
+            http_token: String::new(),
         }
     }
 }
