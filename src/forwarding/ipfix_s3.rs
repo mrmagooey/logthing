@@ -18,6 +18,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use chrono::{DateTime, Utc};
 use std::sync::{Arc, LazyLock};
 
 // ---------------------------------------------------------------------------
@@ -144,9 +145,15 @@ impl Default for FlowRecordBuilders {
 }
 
 /// Append one `FlowRecord` to the provided mutable column builders.
+///
+/// `received_at` is the receipt instant `partition_time` is clamped
+/// against -- see the doc comment on `IpfixSink::to_record_batch` for why
+/// it is a caller-supplied parameter here rather than `record.export_time`
+/// itself.
 pub fn append_flow_record(
     builders: &mut FlowRecordBuilders,
     record: &FlowRecord,
+    received_at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     builders
         .observation_domain_id
@@ -192,14 +199,14 @@ pub fn append_flow_record(
     let extra_str = serde_json::to_string(&record.extra).unwrap_or_else(|_| "{}".to_string());
     builders.extra.append_value(extra_str);
 
-    // IPFIX's `export_time` is the exporter's own non-null absolute
-    // timestamp, so it is both the event and the receipt instant here.
-    // Routed through the shared helper (rather than assigned directly) so
-    // every sink derives `partition_time` via one code path.
-    let partition_time = crate::forwarding::buffered_writer::partition_time(
-        Some(record.export_time),
-        record.export_time,
-    );
+    // `record.export_time` is the untrusted event instant (read verbatim
+    // off the wire, see `decoder.rs`); `received_at` is the one clock
+    // read `to_record_batch` bound for this whole batch. Passing them as
+    // two DISTINCT values here (rather than `export_time` for both, which
+    // made the clamp in `partition_time` tautologically true for every
+    // input) is what makes the untrusted-day-fan-out clamp actually bind.
+    let partition_time =
+        crate::forwarding::buffered_writer::partition_time(Some(record.export_time), received_at);
     builders
         .partition_time
         .append_value(partition_time.timestamp_micros());
@@ -270,14 +277,37 @@ impl ParquetSink for IpfixSink {
         Some("partition_time")
     }
 
+    /// `FlowRecord` carries no logthing-stamped receipt instant -- unlike
+    /// every other sink in this file tree, IPFIX has nothing trustworthy to
+    /// use as `received_at` except `export_time` itself, and `export_time`
+    /// is read verbatim off unauthenticated, source-spoofable UDP (see
+    /// `decoder.rs`). Passing it as BOTH the event and the receipt instant
+    /// to `partition_time` would make its untrusted-day-fan-out clamp
+    /// `t >= t - MAX_BACKFILL && t <= t + MAX_SKEW` trivially true for
+    /// every input -- a spoofed `export_time` sweeping the u32 wire range
+    /// could then mint one live day-buffer per distinct claimed date
+    /// (~49,710 of them), each eventually its own single-row Parquet PUT.
+    ///
+    /// So this mapper binds exactly ONE `Utc::now()` here, for the whole
+    /// batch, and threads it through `append_flow_record` as `received_at`
+    /// -- unlike the other eight sinks' `to_record_batch`, which are pure
+    /// and clock-free. This is safe for the same reason syslog's single
+    /// `Utc::now()` read is (see `syslog_message_to_batch`): the one bound
+    /// value is written into the `partition_time` column of the SAME batch
+    /// that `day_and_batch`'s default reads the buffer-key day back from,
+    /// so the buffer key and the persisted column can never disagree, even
+    /// though the value itself is a wall-clock read. Do NOT "fix" this back
+    /// to `export_time` for both arguments -- that reinstates the inert
+    /// clamp above.
     fn to_record_batch(
         &self,
         records: &Vec<FlowRecord>,
         schema: &Arc<arrow_schema::Schema>,
     ) -> anyhow::Result<arrow_array::RecordBatch> {
         let mut builders = FlowRecordBuilders::new();
+        let received_at = chrono::Utc::now();
         for r in records {
-            append_flow_record(&mut builders, r)?;
+            append_flow_record(&mut builders, r, received_at)?;
         }
         finish_batch(builders, schema.clone())
     }
@@ -503,8 +533,8 @@ mod tests {
         let r1 = make_flow_record(None, None, serde_json::json!({}));
 
         let mut builders = FlowRecordBuilders::new();
-        append_flow_record(&mut builders, &r0).unwrap();
-        append_flow_record(&mut builders, &r1).unwrap();
+        append_flow_record(&mut builders, &r0, r0.export_time).unwrap();
+        append_flow_record(&mut builders, &r1, r1.export_time).unwrap();
 
         let batch = finish_batch(builders, flow_record_schema()).unwrap();
         assert_eq!(batch.num_rows(), 2);
@@ -560,8 +590,8 @@ mod tests {
         let r1 = make_flow_record(None, None, serde_json::json!({})); // flow_start/flow_end: None
 
         let mut builders = FlowRecordBuilders::new();
-        append_flow_record(&mut builders, &r0).unwrap();
-        append_flow_record(&mut builders, &r1).unwrap();
+        append_flow_record(&mut builders, &r0, r0.export_time).unwrap();
+        append_flow_record(&mut builders, &r1, r1.export_time).unwrap();
         let batch = finish_batch(builders, flow_record_schema()).unwrap();
 
         let export_time_col = batch
@@ -608,7 +638,7 @@ mod tests {
         let original = serde_json::json!({"ie300": "0xabcd", "nested": {"k": 1}});
         let r = make_flow_record(Some("10.1.2.3"), Some(42), original.clone());
         let mut builders = FlowRecordBuilders::new();
-        append_flow_record(&mut builders, &r).unwrap();
+        append_flow_record(&mut builders, &r, r.export_time).unwrap();
         let batch = finish_batch(builders, flow_record_schema()).unwrap();
 
         let extra_col = batch
@@ -637,22 +667,28 @@ mod tests {
     }
 
     #[test]
-    fn partition_time_equals_export_time_for_every_row() {
+    fn partition_time_equals_export_time_when_within_clamp_of_received_at() {
         use arrow::array::TimestampMicrosecondArray;
 
-        // Two records with distinct, distinctive (non-"now") export_time
-        // values, so a mapper that fell back to a shared/constant/epoch
+        // A fixed, arbitrary receipt instant, deliberately NOT derived from
+        // either record's export_time -- so this test cannot degenerate
+        // into the tautological "event == received_at" check the old
+        // version of this test performed (every `append_flow_record` call
+        // used to pass `record.export_time` for both arguments).
+        let received_at = chrono::Utc.with_ymd_and_hms(2026, 4, 10, 0, 0, 0).unwrap();
+
+        // Two records with distinct, distinctive export_time values inside
+        // `[received_at - MAX_BACKFILL, received_at + MAX_SKEW]`, so a
+        // mapper that fell back to a shared/constant/epoch/received_at
         // value would visibly fail this.
         let mut r0 = make_flow_record(Some("10.0.0.1"), Some(1), serde_json::json!({}));
-        r0.export_time = chrono::Utc.with_ymd_and_hms(2026, 4, 2, 9, 17, 5).unwrap();
+        r0.export_time = chrono::Utc.with_ymd_and_hms(2026, 4, 2, 9, 17, 5).unwrap(); // 8 days back
         let mut r1 = make_flow_record(None, None, serde_json::json!({}));
-        r1.export_time = chrono::Utc
-            .with_ymd_and_hms(2025, 11, 30, 23, 4, 12)
-            .unwrap();
+        r1.export_time = chrono::Utc.with_ymd_and_hms(2026, 4, 10, 18, 0, 0).unwrap(); // hours forward
 
         let mut builders = FlowRecordBuilders::new();
-        append_flow_record(&mut builders, &r0).unwrap();
-        append_flow_record(&mut builders, &r1).unwrap();
+        append_flow_record(&mut builders, &r0, received_at).unwrap();
+        append_flow_record(&mut builders, &r1, received_at).unwrap();
         let batch = finish_batch(builders, flow_record_schema()).unwrap();
 
         let partition_time_col = batch
@@ -669,6 +705,64 @@ mod tests {
             partition_time_col.value(1),
             r1.export_time.timestamp_micros()
         );
+    }
+
+    #[test]
+    fn ipfix_sink_buckets_spoofed_far_future_and_far_past_export_time_by_receipt_day() {
+        // Regression test for the finding that IPFIX's `partition_time`
+        // clamp used to be inert: `to_record_batch` passed
+        // `record.export_time` as BOTH the event and the `received_at`
+        // argument to `partition_time`, making the untrusted-day-fan-out
+        // guard `t >= t - MAX_BACKFILL && t <= t + MAX_SKEW` trivially true
+        // for every input. `export_time` is read verbatim off
+        // unauthenticated, source-spoofable UDP, so an exporter sweeping it
+        // across the u32 wire range could mint one live day-buffer per
+        // claimed date. `to_record_batch` now binds a real `Utc::now()` as
+        // `received_at`, so a spoofed export_time decades in the future OR
+        // decades in the past must each bucket by the real receipt day
+        // instead.
+        use arrow::array::TimestampMicrosecondArray;
+
+        let far_future = chrono::Utc.with_ymd_and_hms(2090, 3, 1, 0, 0, 0).unwrap();
+        let far_past = chrono::Utc.with_ymd_and_hms(1975, 6, 1, 0, 0, 0).unwrap();
+
+        let mut r_future = make_flow_record(Some("10.0.0.1"), Some(1), serde_json::json!({}));
+        r_future.export_time = far_future;
+        let mut r_past = make_flow_record(None, None, serde_json::json!({}));
+        r_past.export_time = far_past;
+
+        let sink = IpfixSink;
+        let schema = sink.schema(None);
+        let before = chrono::Utc::now();
+        let batch = sink
+            .to_record_batch(&vec![r_future, r_past], &schema)
+            .unwrap();
+        let after = chrono::Utc::now();
+
+        let partition_time_col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("partition_time column should be TimestampMicrosecondArray");
+
+        for (i, spoofed) in [far_future, far_past].into_iter().enumerate() {
+            let value =
+                chrono::DateTime::<chrono::Utc>::from_timestamp_micros(partition_time_col.value(i))
+                    .expect("valid micros");
+            assert!(
+                value >= before - chrono::TimeDelta::seconds(1)
+                    && value <= after + chrono::TimeDelta::seconds(1),
+                "row {i} partition_time must bucket by the real receipt time, \
+                 not the spoofed export_time; got {value}, expected within \
+                 [{before}, {after}]"
+            );
+            assert_ne!(
+                value.date_naive(),
+                spoofed.date_naive(),
+                "row {i} partition_time must not land on the spoofed export_time's day"
+            );
+        }
     }
 
     // -- IpfixSink unit tests (Task 2.1) --
