@@ -276,10 +276,12 @@ async fn syslog_ingest_spanning_midnight_is_day_clean() {
     );
 }
 
-/// Regression test for the bug this addendum exists to close: a buffer that
-/// mixes messages WITH a parseable `timestamp` and messages WITHOUT one
+/// Regression test for the bug this addendum exists to close: a
+/// `timestamp`-bearing message and a `timestamp: None` message
 /// (`timestamp: None` -- what a CEF/LEEF payload yields, see
-/// `src/syslog/mod.rs:313`) whose receipt instants land on the same UTC day.
+/// `src/syslog/mod.rs:313`) must each get `partition_time` derived from
+/// their OWN day, not silently collapsed onto whichever day the process
+/// happened to be in.
 ///
 /// Before `partition_time` existed, the day-clean guarantee (and the
 /// Iceberg partition column) was derived straight from the nullable
@@ -287,11 +289,23 @@ async fn syslog_ingest_spanning_midnight_is_day_clean() {
 /// one row with `timestamp: null` would make Iceberg's `day(timestamp)`
 /// transform see TWO distinct values -- a real date and `null` -- in one
 /// file, which Iceberg refuses to register. `partition_time` is non-null by
-/// construction (see `syslog_message_to_batch`), so every row in a buffer
-/// that shares one receipt day gets the SAME `partition_time` day
-/// regardless of whether its own `timestamp` was present.
+/// construction (see `syslog_message_to_batch`) and buffers are keyed on
+/// `(partition, day)`, so a null `timestamp` and a real one that fall on
+/// DIFFERENT days must land in two separate day-clean files rather than
+/// one file mixing two `day()` values.
+///
+/// The timestamped message is deliberately anchored 2 days before the real
+/// `Utc::now()` (inside `partition_time`'s 30-day backfill clamp, but a
+/// different UTC calendar day from receipt) rather than at "now" itself.
+/// An earlier version of this test used `Some(chrono::Utc::now())` for the
+/// timestamped message, which put both rows' EXPECTED `partition_time` day
+/// on the receipt day -- so a `partition_time` implementation that always
+/// returned `received_at` (i.e. `partition_time` was never wired up at
+/// all) would still pass every assertion. Anchoring 2 days back means a
+/// broken derivation merges both messages into the SAME (receipt-day)
+/// file, which the file-count assertion below catches.
 #[tokio::test]
-async fn mixed_timestamped_and_timestampless_messages_share_one_partition_time_day() {
+async fn mixed_timestamped_and_timestampless_messages_land_in_distinct_day_files() {
     let dir = tempfile::tempdir().expect("tempdir");
     let sink = Arc::new(
         LocalDiskSink::new(dir.path().to_path_buf())
@@ -318,19 +332,23 @@ async fn mixed_timestamped_and_timestampless_messages_share_one_partition_time_d
     // A CEF/LEEF-shaped message: the parser produced no `timestamp` at all,
     // so this row's `timestamp` column is null; its `partition_time` falls
     // back to `received_at`, stamped internally as `Utc::now()` at push
-    // time.
+    // time. Bracket the push with wall-clock reads (rather than asserting
+    // one hardcoded day) so a run straddling a real UTC midnight cannot
+    // flake -- same technique as `syslog_ingest_spanning_midnight_is_day_clean`.
+    let before_fallback = chrono::Utc::now().date_naive();
     handler
         .handle_message(msg("no parseable timestamp", None), src)
         .await;
-    // An ordinary message WITH a parseable timestamp, read immediately
-    // before this push. `handle_message` has no `.await` suspension point
-    // and this is a current-thread `#[tokio::test]` (same reasoning as the
-    // module doc comment above), so this message's `received_at` -- read a
-    // moment later, inside the mapper -- and the row above's `received_at`
-    // land within microseconds of each other: the same real UTC calendar
-    // day in every realistic run.
+    let after_fallback = chrono::Utc::now().date_naive();
+
+    // An ordinary message WITH a parseable timestamp, 2 days before the
+    // real "now" -- inside the clamp, but a different UTC day from receipt
+    // in every realistic run (including one starting right at midnight,
+    // since the two instants are 2 whole days apart).
+    let event_ts = chrono::Utc::now() - chrono::TimeDelta::days(2);
+    let expected_event_day = event_ts.date_naive();
     handler
-        .handle_message(msg("has a timestamp", Some(chrono::Utc::now())), src)
+        .handle_message(msg("has a timestamp", Some(event_ts)), src)
         .await;
 
     drop(handler);
@@ -344,79 +362,78 @@ async fn mixed_timestamped_and_timestampless_messages_share_one_partition_time_d
     let parquet_files: Vec<_> = all_files
         .iter()
         .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+        .cloned()
         .collect();
     assert_eq!(
         parquet_files.len(),
-        1,
-        "both messages share the same receipt day, so they must land in a \
-         single day-clean file; found {parquet_files:?}"
+        2,
+        "the timestamped message's event day differs from the no-timestamp \
+         message's receipt day, so they must land in two separate day-clean \
+         files, not merged into one; found {parquet_files:?}"
     );
 
-    let raw = std::fs::read(parquet_files[0]).unwrap();
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(raw)).expect("parquet builder");
-    let reader = builder.build().expect("build parquet reader");
-
     use arrow::array::{Array, TimestampMicrosecondArray};
-    let mut timestamp_null_count = 0;
-    let mut timestamp_non_null_count = 0;
-    let mut partition_time_days = std::collections::HashSet::new();
-    let mut total_rows = 0;
-    for batch in reader {
-        let batch = batch.expect("record batch reads without error");
-        total_rows += batch.num_rows();
 
-        let ts_col = batch
-            .column_by_name("timestamp")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .unwrap();
-        for i in 0..ts_col.len() {
-            if ts_col.is_null(i) {
-                timestamp_null_count += 1;
-            } else {
-                timestamp_non_null_count += 1;
+    // Every file must be internally day-clean (exactly one distinct
+    // `partition_time` day), and the two files' days must differ from each
+    // other -- the property this addendum establishes.
+    let mut days_seen = std::collections::HashSet::new();
+    for path in &parquet_files {
+        let raw = std::fs::read(path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(raw))
+            .expect("parquet builder");
+        let reader = builder.build().expect("build parquet reader");
+
+        let mut partition_time_days = std::collections::HashSet::new();
+        let mut total_rows = 0;
+        for batch in reader {
+            let batch = batch.expect("record batch reads without error");
+            total_rows += batch.num_rows();
+
+            let pt_col = batch
+                .column_by_name("partition_time")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            for i in 0..pt_col.len() {
+                assert!(
+                    !pt_col.is_null(i),
+                    "partition_time must never be null (row {i}) in {path:?}"
+                );
+                partition_time_days.insert(
+                    chrono::DateTime::from_timestamp_micros(pt_col.value(i))
+                        .expect("valid micros")
+                        .date_naive(),
+                );
             }
         }
 
-        let pt_col = batch
-            .column_by_name("partition_time")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .unwrap();
-        for i in 0..pt_col.len() {
-            assert!(
-                !pt_col.is_null(i),
-                "partition_time must never be null (row {i})"
-            );
-            partition_time_days.insert(
-                chrono::DateTime::from_timestamp_micros(pt_col.value(i))
-                    .expect("valid micros")
-                    .date_naive(),
-            );
-        }
+        assert_eq!(total_rows, 1, "expected exactly 1 row per file in {path:?}");
+        assert_eq!(
+            partition_time_days.len(),
+            1,
+            "partition_time must hold exactly one distinct UTC day within a \
+             single file; got {partition_time_days:?} in {path:?}"
+        );
+        days_seen.extend(partition_time_days);
     }
 
-    assert_eq!(total_rows, 2, "expected exactly 2 rows in the single file");
-    // Confirm this really is the mixed scenario the addendum describes:
-    // one row with a real `timestamp` and one with a null.
     assert_eq!(
-        timestamp_null_count, 1,
-        "expected exactly one row with a null timestamp column"
+        days_seen.len(),
+        2,
+        "the two files must hold two DISTINCT partition_time days, not the \
+         same day twice; got {days_seen:?}"
     );
-    assert_eq!(
-        timestamp_non_null_count, 1,
-        "expected exactly one row with a non-null timestamp column"
+    assert!(
+        days_seen.contains(&expected_event_day),
+        "one file's partition_time day must equal the timestamped message's \
+         own event day ({expected_event_day}); got {days_seen:?}"
     );
-    // The property the fix establishes: despite that null/non-null mix in
-    // `timestamp`, `partition_time` holds exactly ONE distinct UTC day
-    // across every row in the file.
-    assert_eq!(
-        partition_time_days.len(),
-        1,
-        "partition_time must hold exactly one distinct UTC day across all \
-         rows in the file; got {partition_time_days:?}"
+    assert!(
+        days_seen.contains(&before_fallback) || days_seen.contains(&after_fallback),
+        "the no-timestamp message's file's partition_time day must fall within \
+         the wall-clock bracket [{before_fallback}, {after_fallback}] taken \
+         around its push; got {days_seen:?}"
     );
 }
