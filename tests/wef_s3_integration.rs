@@ -168,7 +168,7 @@ async fn wef_event_appears_as_parquet_in_s3() {
         "subscription_id",
         "event_data",
     ];
-    assert_eq!(schema.fields().len(), 5, "WEF schema must have 5 columns");
+    assert_eq!(schema.fields().len(), 6, "WEF schema must have 6 columns");
     for col in expected_columns {
         assert!(
             schema.field_with_name(col).is_ok(),

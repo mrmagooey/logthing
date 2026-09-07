@@ -13,7 +13,31 @@ use crate::models::WindowsEvent;
 use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+/// Fixed WEF schema. `LazyLock`, not a fresh `Arc::new(Schema::new(...))` per
+/// call: `push()` calls `schema()` once per record, and before this each call
+/// allocated a new `Schema` (6 `Field`s plus the `Vec`/`Arc` wrappers) —
+/// ~8 heap allocations per Windows event that every other sink in this file
+/// tree avoids by caching its schema statically.
+static WEF_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("event_id", DataType::UInt32, false),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new("source_host", DataType::Utf8, false),
+        Field::new("subscription_id", DataType::Utf8, true),
+        Field::new("event_data", DataType::Utf8, false),
+        Field::new(
+            "partition_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+    ]))
+});
 
 // ---------------------------------------------------------------------------
 // WefSink — ParquetSink adapter
@@ -25,13 +49,14 @@ use std::sync::Arc;
 /// - `partition()` = `Some("event_type=<event_id>")` from the parsed EventID.
 ///   If the event has no parsed data, returns `Some("event_type=0")` as a safe
 ///   sentinel — but `to_record_batch` will return `Err` to skip unparsed events.
-/// - `schema()` = fixed 5-column WEF schema (unchanged from legacy writer).
+/// - `schema()` = fixed 6-column WEF schema (5 legacy columns plus
+///   `partition_time`).
 /// - `to_record_batch()` = returns `Err` for events with no parsed data (generic
 ///   writer logs + skips, matching legacy "silently skipped" behavior).
 ///
 /// **S3 KEY LAYOUT (choice a — behavior-preserving):**
 /// `event_type=<id>/year=Y/month=MM/day=DD/<uuid>.parquet`
-/// Achieved by using an empty prefix (`""`), so `build_key("", Some("event_type=4624"), now)`
+/// Achieved by using an empty prefix (`""`), so `build_key("", Some("event_type=4624"), day)`
 /// → `event_type=4624/year=…`. No leading slash (verified in generic unit test).
 #[derive(Default)]
 pub struct WefSink;
@@ -51,17 +76,17 @@ impl ParquetSink for WefSink {
     }
 
     fn schema(&self, _partition: Option<&str>) -> Arc<arrow_schema::Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("event_id", DataType::UInt32, false),
-            Field::new(
-                "timestamp",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                false,
-            ),
-            Field::new("source_host", DataType::Utf8, false),
-            Field::new("subscription_id", DataType::Utf8, true),
-            Field::new("event_data", DataType::Utf8, false),
-        ]))
+        WEF_SCHEMA.clone()
+    }
+
+    /// Time column for day bucketing. Despite its name, the `timestamp`
+    /// column is written from `record.received_at` (server receipt time),
+    /// NOT the event's own `time_created` from the Windows Event Log --
+    /// see `to_record_batch` below. `partition_time` is derived from that
+    /// same `received_at` value, so WEF files partition by when logthing
+    /// received an event, not when Windows recorded it.
+    fn time_column(&self) -> Option<&'static str> {
+        Some("partition_time")
     }
 
     fn to_record_batch(
@@ -79,6 +104,16 @@ impl ParquetSink for WefSink {
         let event_data = serde_json::to_string(record.as_ref())
             .map_err(|e| anyhow::anyhow!("WEF event JSON serialization failed: {e}"))?;
 
+        // `timestamp` is already `record.received_at` (server receipt time),
+        // not an event-carried timestamp, so it is both the event and the
+        // receipt instant here. Routed through the shared helper (rather
+        // than assigned directly) so every sink derives `partition_time` via
+        // one code path.
+        let partition_time = crate::forwarding::buffered_writer::partition_time(
+            Some(record.received_at),
+            record.received_at,
+        );
+
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -90,6 +125,10 @@ impl ParquetSink for WefSink {
                 Arc::new(StringArray::from(vec![record.source_host.as_str()])) as ArrayRef,
                 Arc::new(StringArray::from(vec![record.subscription_id.as_deref()])) as ArrayRef,
                 Arc::new(StringArray::from(vec![event_data.as_str()])) as ArrayRef,
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![partition_time.timestamp_micros()])
+                        .with_timezone(Arc::<str>::from("UTC")),
+                ) as ArrayRef,
             ],
         )?;
         Ok(batch)
@@ -205,14 +244,27 @@ mod tests {
     }
 
     #[test]
-    fn wef_sink_schema_has_five_columns() {
+    fn wef_sink_schema_has_six_columns() {
         let schema = WefSink.schema(None);
-        assert_eq!(schema.fields().len(), 5);
+        assert_eq!(schema.fields().len(), 6);
         assert!(schema.field_with_name("event_id").is_ok());
         assert!(schema.field_with_name("timestamp").is_ok());
         assert!(schema.field_with_name("source_host").is_ok());
         assert!(schema.field_with_name("subscription_id").is_ok());
         assert!(schema.field_with_name("event_data").is_ok());
+        assert!(schema.field_with_name("partition_time").is_ok());
+    }
+
+    #[test]
+    fn schema_partition_time_is_non_null_microsecond_timestamp() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        let schema = WefSink.schema(None);
+        let f = schema.field_with_name("partition_time").unwrap();
+        assert_eq!(
+            f.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(!f.is_nullable(), "partition_time must be non-nullable");
     }
 
     #[test]
@@ -277,6 +329,31 @@ mod tests {
     }
 
     #[test]
+    fn wef_sink_to_record_batch_partition_time_equals_received_at() {
+        // A distinctive, non-"now" instant: a broken mapper that fell back
+        // to Utc::now() or the epoch would visibly fail this.
+        let mut event = WindowsEvent::new("host".into(), "<Event/>".into())
+            .with_parsed(sample_parsed_event(4624));
+        event.received_at = chrono::DateTime::parse_from_rfc3339("2024-07-19T02:41:09.987654Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let event = Arc::new(event);
+        let schema = WefSink.schema(Some("event_type=4624"));
+        let batch = WefSink.to_record_batch(&event, &schema).expect("ok");
+
+        let partition_time_col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("partition_time column should be TimestampMicrosecondArray");
+        assert_eq!(
+            partition_time_col.value(0),
+            event.received_at.timestamp_micros()
+        );
+    }
+
+    #[test]
     fn wef_sink_to_record_batch_unparsed_returns_err() {
         let event = make_unparsed_event();
         let schema = WefSink.schema(None);
@@ -300,9 +377,8 @@ mod tests {
     #[test]
     fn s3_key_layout_empty_prefix_produces_correct_path() {
         use crate::forwarding::buffered_writer::build_key;
-        use chrono::TimeZone;
-        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 21, 0, 0, 0).unwrap();
-        let key = build_key("", Some("event_type=4624"), now);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 6, 21).unwrap();
+        let key = build_key("", Some("event_type=4624"), day);
         assert!(
             key.starts_with("event_type=4624/year=2026/month=06/day=21/"),
             "WEF S3 key must match legacy layout: {key}"
@@ -310,6 +386,23 @@ mod tests {
         assert!(!key.starts_with('/'), "must not start with /");
         assert!(!key.contains("//"), "must not have double-slash");
         assert!(key.ends_with(".parquet"));
+    }
+
+    #[test]
+    fn wef_sink_time_column_timestamp_exists_in_schema() {
+        let sink = WefSink;
+        let col = sink
+            .time_column()
+            .expect("wef_sink must opt in to day partitioning");
+        // Pin the exact column name, not just that SOME name resolves.
+        assert_eq!(col, "partition_time");
+        // Use a valid partition format (event_type=4624)
+        let schema = sink.schema(Some("event_type=4624"));
+        assert!(
+            schema.field_with_name(col).is_ok(),
+            "time_column() returned {:?}, which is not a field in the schema",
+            col
+        );
     }
 
     #[tokio::test]

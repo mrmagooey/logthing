@@ -85,6 +85,13 @@ impl ParquetSink for SuricataSink {
         envelope_schema()
     }
 
+    /// Time column for day bucketing. Suricata records do not carry an event
+    /// timestamp in the payload; `partition_time` is derived from the
+    /// non-null `received_at` (server receipt time).
+    fn time_column(&self) -> Option<&'static str> {
+        Some("partition_time")
+    }
+
     /// Convert one `SuricataRecord` to a single-row `RecordBatch`.
     /// Uses `map_envelope` which always produces a row matching `envelope_schema()`.
     fn to_record_batch(
@@ -354,15 +361,30 @@ mod tests {
     #[test]
     fn build_key_produces_suricata_event_type_layout() {
         use crate::forwarding::buffered_writer::build_key;
-        use chrono::TimeZone;
 
-        let now = chrono::Utc.with_ymd_and_hms(2026, 3, 7, 0, 0, 0).unwrap();
-        let key = build_key("suricata", Some("alert"), now);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 3, 7).unwrap();
+        let key = build_key("suricata", Some("alert"), day);
         assert!(
             key.starts_with("suricata/alert/year=2026/month=03/day=07/"),
             "key: {key}"
         );
         assert!(key.ends_with(".parquet"), "key: {key}");
+    }
+
+    #[test]
+    fn suricata_sink_time_column_received_at_exists_in_schema() {
+        let sink = SuricataSink;
+        let col = sink
+            .time_column()
+            .expect("suricata_sink must opt in to day partitioning");
+        // Pin the exact column name, not just that SOME name resolves.
+        assert_eq!(col, "partition_time");
+        let schema = sink.schema(None);
+        assert!(
+            schema.field_with_name(col).is_ok(),
+            "time_column() returned {:?}, which is not a field in the schema",
+            col
+        );
     }
 
     // -- PartitionedParquetWriter accumulation --
@@ -400,15 +422,17 @@ mod tests {
 
         assert_eq!(
             writer
-                .buffers
-                .get("alert")
+                .buffer_by_partition("alert")
                 .map(|b| b.row_count)
                 .unwrap_or(0),
             2,
             "alert buffer should have 2 rows"
         );
         assert_eq!(
-            writer.buffers.get("flow").map(|b| b.row_count).unwrap_or(0),
+            writer
+                .buffer_by_partition("flow")
+                .map(|b| b.row_count)
+                .unwrap_or(0),
             1,
             "flow buffer should have 1 row"
         );

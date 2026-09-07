@@ -32,6 +32,11 @@ static FLOW_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         Field::new("input_ifindex", DataType::UInt32, true),
         Field::new("output_ifindex", DataType::UInt32, true),
         Field::new("extra", DataType::Utf8, false),
+        Field::new(
+            "partition_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
     ]))
 });
 
@@ -55,6 +60,11 @@ static COUNTER_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         Field::new("if_in_errors", DataType::UInt32, true),
         Field::new("if_out_errors", DataType::UInt32, true),
         Field::new("extra", DataType::Utf8, false),
+        Field::new(
+            "partition_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
     ]))
 });
 
@@ -84,6 +94,14 @@ impl ParquetSink for SflowSink {
         }
     }
 
+    /// Time column for day bucketing. sFlow samples carry a sample timestamp
+    /// but it is offset-based, not absolute; `partition_time` is derived from
+    /// the non-null `received_at` (collector receipt time) for reliable
+    /// partitioning across clock skews.
+    fn time_column(&self) -> Option<&'static str> {
+        Some("partition_time")
+    }
+
     fn to_record_batch(
         &self,
         record: &SflowRecord,
@@ -98,6 +116,12 @@ impl ParquetSink for SflowSink {
 
 fn flow_to_record_batch(r: &SflowRecord, schema: &Arc<Schema>) -> anyhow::Result<RecordBatch> {
     let extra_str = serde_json::to_string(&r.extra).unwrap_or_else(|_| "[]".to_string());
+    // sFlow has no absolute event timestamp (sample timestamps are
+    // offset-based), so `received_at` is both the event and the receipt
+    // instant. Routed through the shared helper (rather than assigned
+    // directly) so every sink derives `partition_time` via one code path.
+    let partition_time =
+        crate::forwarding::buffered_writer::partition_time(Some(r.received_at), r.received_at);
     let columns: Vec<ArrayRef> = vec![
         Arc::new({
             let mut b = StringBuilder::new();
@@ -165,12 +189,24 @@ fn flow_to_record_batch(r: &SflowRecord, schema: &Arc<Schema>) -> anyhow::Result
             b.append_value(&extra_str);
             b.finish()
         }),
+        Arc::new({
+            let mut b = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ));
+            b.append_value(partition_time.timestamp_micros());
+            b.finish()
+        }),
     ];
     Ok(RecordBatch::try_new(schema.clone(), columns)?)
 }
 
 fn counter_to_record_batch(r: &SflowRecord, schema: &Arc<Schema>) -> anyhow::Result<RecordBatch> {
     let extra_str = serde_json::to_string(&r.extra).unwrap_or_else(|_| "[]".to_string());
+    // See flow_to_record_batch: counter samples likewise have no absolute
+    // event timestamp, so `received_at` stands in for both helper arguments.
+    let partition_time =
+        crate::forwarding::buffered_writer::partition_time(Some(r.received_at), r.received_at);
     let columns: Vec<ArrayRef> = vec![
         Arc::new({
             let mut b = StringBuilder::new();
@@ -243,6 +279,14 @@ fn counter_to_record_batch(r: &SflowRecord, schema: &Arc<Schema>) -> anyhow::Res
         Arc::new({
             let mut b = StringBuilder::new();
             b.append_value(&extra_str);
+            b.finish()
+        }),
+        Arc::new({
+            let mut b = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ));
+            b.append_value(partition_time.timestamp_micros());
             b.finish()
         }),
     ];
@@ -542,6 +586,94 @@ mod tests {
             .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
             .expect("received_at column should be TimestampMicrosecondArray");
         assert_eq!(received_at.value(0), r.received_at.timestamp_micros());
+    }
+
+    #[test]
+    fn flow_schema_has_non_null_microsecond_partition_time() {
+        let sink = SflowSink;
+        let schema = sink.schema(Some("flow"));
+        let f = schema
+            .field_with_name("partition_time")
+            .expect("flow schema missing partition_time");
+        assert_eq!(
+            f.data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(!f.is_nullable(), "partition_time must be non-nullable");
+    }
+
+    #[test]
+    fn counter_schema_has_non_null_microsecond_partition_time() {
+        let sink = SflowSink;
+        let schema = sink.schema(Some("counter"));
+        let f = schema
+            .field_with_name("partition_time")
+            .expect("counter schema missing partition_time");
+        assert_eq!(
+            f.data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(!f.is_nullable(), "partition_time must be non-nullable");
+    }
+
+    #[test]
+    fn to_record_batch_flow_partition_time_equals_received_at() {
+        // A distinctive, non-"now" instant: a broken mapper that fell back to
+        // Utc::now() or the epoch would visibly fail this.
+        let mut r = make_flow_record();
+        r.received_at = chrono::DateTime::parse_from_rfc3339("2024-03-11T08:15:30.654321Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let sink = SflowSink;
+        let schema = sink.schema(Some("flow"));
+        let batch = sink.to_record_batch(&r, &schema).unwrap();
+
+        let partition_time = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .expect("partition_time column should be TimestampMicrosecondArray");
+        assert_eq!(partition_time.value(0), r.received_at.timestamp_micros());
+    }
+
+    #[test]
+    fn to_record_batch_counter_partition_time_equals_received_at() {
+        let mut r = make_counter_record();
+        r.received_at = chrono::DateTime::parse_from_rfc3339("2024-03-11T08:15:30.654321Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let sink = SflowSink;
+        let schema = sink.schema(Some("counter"));
+        let batch = sink.to_record_batch(&r, &schema).unwrap();
+
+        let partition_time = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .expect("partition_time column should be TimestampMicrosecondArray");
+        assert_eq!(partition_time.value(0), r.received_at.timestamp_micros());
+    }
+
+    #[test]
+    fn sflow_sink_time_column_received_at_exists_in_both_schemas() {
+        let sink = SflowSink;
+        let col = sink
+            .time_column()
+            .expect("sflow_sink must opt in to day partitioning");
+        // Pin the exact column name, not just that SOME name resolves.
+        assert_eq!(col, "partition_time");
+        // Check both flow and counter schemas
+        for partition in &[Some("flow"), Some("counter")] {
+            let schema = sink.schema(*partition);
+            assert!(
+                schema.field_with_name(col).is_ok(),
+                "time_column() returned {:?}, which is not a field in schema for partition {:?}",
+                col,
+                partition
+            );
+        }
     }
 
     #[tokio::test]

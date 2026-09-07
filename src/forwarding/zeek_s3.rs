@@ -96,6 +96,19 @@ impl ParquetSink for ZeekSink {
         }
     }
 
+    /// Event time column for day bucketing. `ts` (Zeek's own event time --
+    /// connection start, DNS query time, etc.) is nullable in all 7 Zeek
+    /// schemas, and 6 of those 7 have no other non-null receipt column of
+    /// their own -- so a `ts`-mixed log path could otherwise split one
+    /// Parquet file's rows across two `day(ts)` Iceberg partition values.
+    /// `partition_time` is the non-null, per-row-materialised column every
+    /// schema carries specifically to close that gap: `ts` when present and
+    /// within the shared backfill/skew window, `received_at` otherwise (see
+    /// `zeek_partition_time`).
+    fn time_column(&self) -> Option<&'static str> {
+        Some("partition_time")
+    }
+
     /// Convert one `ZeekRecord` to a single-row `RecordBatch`.
     ///
     /// Uses `get_schema_entry(&record.log_path)` to select the row mapper for the
@@ -116,7 +129,7 @@ impl ParquetSink for ZeekSink {
         // use the entry's mapper directly; otherwise fall back to re-running with the
         // schema we actually hold (avoids RecordBatch schema mismatch panics).
         if entry.schema == *schema {
-            (entry.mapper)(&record.fields).map_err(|e| {
+            (entry.mapper)(&record.fields, record.received_at).map_err(|e| {
                 anyhow::anyhow!("ZeekSink mapper error for '{}': {e}", record.log_path)
             })
         } else {
@@ -124,7 +137,7 @@ impl ParquetSink for ZeekSink {
             // the raw path).  Use the envelope mapper for the schema we were given.
             let overflow_entry = get_schema_entry("_overflow_nonexistent_");
             // get_schema_entry for unknown path always returns envelope — use that mapper.
-            (overflow_entry.mapper)(&record.fields).map_err(|e| {
+            (overflow_entry.mapper)(&record.fields, record.received_at).map_err(|e| {
                 anyhow::anyhow!(
                     "ZeekSink overflow mapper error for '{}': {e}",
                     record.log_path
@@ -143,6 +156,37 @@ impl ParquetSink for ZeekSink {
         } else {
             None
         }
+    }
+
+    /// Overrides the default `day_and_batch`: derives the day from
+    /// `zeek_partition_time(&record.fields, record.received_at)` directly
+    /// instead of building a batch first. Applies uniformly to every Zeek
+    /// log path, not just `conn` -- cheaper than the default for all 7
+    /// schemas, and the only correct option for `conn` specifically, whose
+    /// amortized `ConnAccumulator` must never pay for a `to_record_batch`
+    /// call it doesn't need (see the design doc's amortized-builder-path
+    /// note).
+    ///
+    /// Returning `(day, None)` -- not `(day, Some(batch))` -- is load
+    /// bearing: `push()` calls this before it knows whether a record goes
+    /// to the amortized live builder, so building a batch here just to
+    /// learn the day would make every Zeek record pay for a throwaway
+    /// `RecordBatch`, defeating the entire point of `ConnAccumulator`.
+    ///
+    /// `zeek_partition_time` is a pure function of `(fields, received_at)`
+    /// -- no `Utc::now()` read anywhere in it -- so calling it here and
+    /// again from a row mapper for the very same record always agrees on
+    /// the same instant; the `now` parameter this trait method receives is
+    /// unused precisely because of that.
+    fn day_and_batch(
+        &self,
+        record: &ZeekRecord,
+        _schema: &Arc<arrow_schema::Schema>,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<(chrono::NaiveDate, Option<arrow_array::RecordBatch>)> {
+        let day = crate::zeek::schema::zeek_partition_time(&record.fields, record.received_at)
+            .date_naive();
+        Ok((day, None))
     }
 }
 
@@ -412,6 +456,36 @@ mod tests {
     }
 
     #[test]
+    fn zeek_sink_day_and_batch_uses_partition_time_and_never_builds_a_batch() {
+        use chrono::TimeZone;
+
+        let schema = crate::zeek::schema::conn_schema();
+        // received_at is a distinctly different day from ts (6 days later,
+        // still inside the 30-day backfill window), so a test that
+        // accidentally asserted the received_at fallback day instead of the
+        // real ts-derived day would fail loudly rather than passing by
+        // coincidence.
+        let received_at = chrono::Utc.with_ymd_and_hms(2023, 11, 20, 8, 0, 0).unwrap();
+        let record = ZeekRecord {
+            log_path: "conn".to_string(),
+            fields: serde_json::json!({"_path": "conn", "ts": 1700000000.0, "uid": "C1"}),
+            received_at,
+        };
+        // `now` is passed but must be ignored entirely: day_and_batch derives
+        // the day from `zeek_partition_time(fields, received_at)`, which
+        // never reads the clock. A far-future `now` that the implementation
+        // wrongly used would produce 2099-01-01, not 2023-11-14.
+        let now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+
+        let (day, batch) = ZeekSink.day_and_batch(&record, &schema, now).unwrap();
+        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2023, 11, 14).unwrap());
+        assert!(
+            batch.is_none(),
+            "the amortized path must not pre-build a batch just to learn the day"
+        );
+    }
+
+    #[test]
     fn zeek_sink_partition_sanitizes_log_path() {
         let record = make_conn_record("C1");
         assert_eq!(ZeekSink.partition(&record), Some("conn".to_string()));
@@ -509,23 +583,50 @@ mod tests {
     #[test]
     fn build_key_produces_zeek_log_path_layout() {
         use crate::forwarding::buffered_writer::build_key;
-        use chrono::TimeZone;
 
-        let now = chrono::Utc.with_ymd_and_hms(2026, 3, 7, 0, 0, 0).unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 3, 7).unwrap();
 
         // zeek/<log_path>/year=…/month=…/day=…/<uuid>.parquet
-        let key = build_key("zeek", Some("conn"), now);
+        let key = build_key("zeek", Some("conn"), day);
         assert!(
             key.starts_with("zeek/conn/year=2026/month=03/day=07/"),
             "key: {key}"
         );
         assert!(key.ends_with(".parquet"), "key: {key}");
 
-        let key = build_key("zeek", Some("dns"), now);
+        let key = build_key("zeek", Some("dns"), day);
         assert!(key.starts_with("zeek/dns/year="), "key: {key}");
 
-        let key = build_key("zeek", Some("_overflow"), now);
+        let key = build_key("zeek", Some("_overflow"), day);
         assert!(key.starts_with("zeek/_overflow/year="), "key: {key}");
+    }
+
+    #[test]
+    fn zeek_sink_time_column_partition_time_exists_in_all_schemas() {
+        let sink = ZeekSink;
+        let col = sink
+            .time_column()
+            .expect("zeek_sink must opt in to day partitioning");
+        // Pin the exact column name, not just that SOME name resolves.
+        assert_eq!(col, "partition_time");
+        // Check that partition_time exists in all 6 typed schemas plus the envelope fallback.
+        for partition in &[
+            Some("conn"),
+            Some("dns"),
+            Some("http"),
+            Some("ssl"),
+            Some("files"),
+            Some("notice"),
+            None, // envelope fallback for unknown paths
+        ] {
+            let schema = sink.schema(*partition);
+            assert!(
+                schema.field_with_name(col).is_ok(),
+                "time_column() returned {:?}, which is not a field in schema for partition {:?}",
+                col,
+                partition
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -545,19 +646,24 @@ mod tests {
 
         // conn → "conn" partition, dns → "dns" partition, weird → "weird" partition
         assert_eq!(
-            writer.buffers.get("conn").map(|b| b.row_count).unwrap_or(0),
+            writer
+                .buffer_by_partition("conn")
+                .map(|b| b.row_count)
+                .unwrap_or(0),
             2,
             "conn buffer should have 2 rows"
         );
         assert_eq!(
-            writer.buffers.get("dns").map(|b| b.row_count).unwrap_or(0),
+            writer
+                .buffer_by_partition("dns")
+                .map(|b| b.row_count)
+                .unwrap_or(0),
             1,
             "dns buffer should have 1 row"
         );
         assert_eq!(
             writer
-                .buffers
-                .get("weird")
+                .buffer_by_partition("weird")
                 .map(|b| b.row_count)
                 .unwrap_or(0),
             1,
@@ -580,7 +686,11 @@ mod tests {
             writer.drain_pending_flushes().await;
         }
         assert!(
-            writer.buffers.get("conn").map(|b| b.row_count).unwrap_or(0) <= hard_cap,
+            writer
+                .buffer_by_partition("conn")
+                .map(|b| b.row_count)
+                .unwrap_or(0)
+                <= hard_cap,
             "conn buffer must stay at or below hard cap ({hard_cap})"
         );
     }
@@ -619,11 +729,11 @@ mod tests {
         );
         // The "_overflow" buffer must exist.
         assert!(
-            writer.buffers.contains_key("_overflow"),
+            writer.buffer_by_partition("_overflow").is_some(),
             "_overflow buffer must exist after cap exceeded"
         );
         // The "_overflow" buffer must have rows and a valid (non-empty) schema.
-        let ov = writer.buffers.get("_overflow").unwrap();
+        let ov = writer.buffer_by_partition("_overflow").unwrap();
         assert!(ov.row_count > 0, "_overflow must contain records");
         assert!(
             !ov.schema.fields().is_empty(),
@@ -672,7 +782,10 @@ mod tests {
 
         // Lands in the single stable "conn" buffer — no rotation-suffixed sibling.
         assert_eq!(
-            writer.buffers.get("conn").map(|b| b.row_count).unwrap_or(0),
+            writer
+                .buffer_by_partition("conn")
+                .map(|b| b.row_count)
+                .unwrap_or(0),
             1,
             "rotated record must accumulate into the stable 'conn' buffer"
         );
@@ -683,7 +796,7 @@ mod tests {
         );
         // Accepted into the typed live builder (ConnAccumulator), not pushed as a
         // pre-built envelope fallback batch.
-        let buf = writer.buffers.get("conn").unwrap();
+        let buf = writer.buffer_by_partition("conn").unwrap();
         assert_eq!(
             buf.live_builder.as_ref().map(|b| b.len()).unwrap_or(0),
             1,
@@ -710,7 +823,7 @@ mod tests {
         };
         writer.push(rec).await.unwrap();
 
-        let buf = writer.buffers.get("conn").unwrap();
+        let buf = writer.buffer_by_partition("conn").unwrap();
         assert_eq!(
             buf.row_count, 1,
             "the record must still be counted, just via the fallback path"

@@ -1,6 +1,8 @@
 //! StructuredSyslog → S3 Parquet persistence (partitioned by payload_type).
 //!
-//! Schema: 9 columns — syslog envelope + payload_type + parsed (JSON string).
+//! Schema: 10 columns — syslog envelope, payload_type, parsed (JSON string),
+//! and partition_time (non-null; derived from timestamp, clamped and
+//! falling back to received_at -- see `ParquetSink::time_column`).
 //! Partition key: payload_type string ("cef", "leef", "auditd", "dhcp",
 //!                "radius", "web_access", "dns").
 //! The sink reuses SyslogS3Config (identical connection/flush parameters).
@@ -36,6 +38,11 @@ static STRUCTURED_SYSLOG_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
         ),
         Field::new("payload_type", DataType::Utf8, false),
         Field::new("parsed", DataType::Utf8, false),
+        Field::new(
+            "partition_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
     ]))
 });
 
@@ -62,12 +69,23 @@ pub fn structured_syslog_record_to_batch(
     let hostname = Arc::new(StringArray::from(vec![rec.hostname.clone()])) as ArrayRef;
     let app_name = Arc::new(StringArray::from(vec![rec.app_name.clone()])) as ArrayRef;
     let received_at = Arc::new(
-        TimestampMicrosecondArray::from(vec![rec.received_at.timestamp_micros()]).with_timezone(tz),
+        TimestampMicrosecondArray::from(vec![rec.received_at.timestamp_micros()])
+            .with_timezone(tz.clone()),
     ) as ArrayRef;
     let payload_type = Arc::new(StringArray::from(vec![rec.payload_type])) as ArrayRef;
     let parsed = Arc::new(StringArray::from(vec![
         serde_json::to_string(&rec.parsed).unwrap_or_else(|_| "null".to_string()),
     ])) as ArrayRef;
+    // `timestamp` is the syslog header's event time (nullable -- absent for
+    // e.g. some CEF/LEEF payloads); `partition_time` derives the buffer's
+    // day-clean column from it, clamped against and falling back to the
+    // non-null `received_at`. See `crate::forwarding::buffered_writer::partition_time`.
+    let partition_time_value =
+        crate::forwarding::buffered_writer::partition_time(rec.timestamp, rec.received_at);
+    let partition_time = Arc::new(
+        TimestampMicrosecondArray::from(vec![partition_time_value.timestamp_micros()])
+            .with_timezone(tz),
+    ) as ArrayRef;
 
     Ok(RecordBatch::try_new(
         schema,
@@ -81,6 +99,7 @@ pub fn structured_syslog_record_to_batch(
             received_at,
             payload_type,
             parsed,
+            partition_time,
         ],
     )?)
 }
@@ -104,6 +123,15 @@ impl ParquetSink for StructuredSyslogSink {
 
     fn schema(&self, _partition: Option<&str>) -> Arc<arrow_schema::Schema> {
         structured_syslog_schema()
+    }
+
+    /// Event time column for day bucketing. `partition_time` is non-null by
+    /// construction (derived from the nullable `timestamp`, clamped and
+    /// falling back to `received_at`), so a buffer keyed on its day is
+    /// day-clean for every row even when parsed and unparsed-timestamp
+    /// payloads land in the same partition. See `structured_syslog_record_to_batch`.
+    fn time_column(&self) -> Option<&'static str> {
+        Some("partition_time")
     }
 
     fn to_record_batch(
@@ -187,14 +215,28 @@ mod tests {
     }
 
     #[test]
-    fn schema_has_nine_columns() {
+    fn schema_has_ten_columns() {
         let schema = structured_syslog_schema();
         assert_eq!(
             schema.fields().len(),
-            9,
-            "expected 9 fields, got {}",
+            10,
+            "expected 10 fields, got {}",
             schema.fields().len()
         );
+    }
+
+    #[test]
+    fn schema_partition_time_is_non_null_microsecond_timestamp() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        let schema = structured_syslog_schema();
+        let f = schema
+            .field_with_name("partition_time")
+            .expect("partition_time column");
+        assert_eq!(
+            f.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert!(!f.is_nullable(), "partition_time must be non-nullable");
     }
 
     #[test]
@@ -320,6 +362,131 @@ mod tests {
         let hostname = batch.column_by_name("hostname").unwrap();
         let arr = hostname.as_any().downcast_ref::<StringArray>().unwrap();
         assert!(arr.is_null(0));
+    }
+
+    #[test]
+    fn structured_syslog_sink_time_column_partition_time_exists_in_schema() {
+        let sink = StructuredSyslogSink;
+        let col = sink
+            .time_column()
+            .expect("structured_syslog_sink must opt in to day partitioning");
+        // Pin the exact column name, not just that SOME name resolves.
+        assert_eq!(col, "partition_time");
+        let schema = sink.schema(None);
+        assert!(
+            schema.field_with_name(col).is_ok(),
+            "time_column() returned {:?}, which is not a field in the schema",
+            col
+        );
+    }
+
+    #[test]
+    fn partition_time_equals_timestamp_on_distinctly_different_day() {
+        use arrow::array::TimestampMicrosecondArray;
+        let mut rec = sample_record("cef");
+        // Event a full day before receipt -- an unmistakably different UTC
+        // calendar day, so a bug that fell back to received_at could not
+        // pass by accident.
+        rec.received_at = chrono::DateTime::parse_from_rfc3339("2024-06-02T08:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let event = chrono::DateTime::parse_from_rfc3339("2024-06-01T03:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        rec.timestamp = Some(event);
+
+        let batch = structured_syslog_record_to_batch(&rec).unwrap();
+        let col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(col.value(0), event.timestamp_micros());
+    }
+
+    #[test]
+    fn partition_time_falls_back_to_received_at_when_timestamp_is_null() {
+        use arrow::array::TimestampMicrosecondArray;
+        let mut rec = sample_record("cef");
+        rec.timestamp = None;
+        rec.received_at = chrono::DateTime::parse_from_rfc3339("2024-06-02T08:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let batch = structured_syslog_record_to_batch(&rec).unwrap();
+        let col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(col.value(0), rec.received_at.timestamp_micros());
+    }
+
+    #[test]
+    fn partition_time_falls_back_to_received_at_when_timestamp_outside_clamp() {
+        use arrow::array::TimestampMicrosecondArray;
+        let mut rec = sample_record("cef");
+        rec.received_at = chrono::DateTime::parse_from_rfc3339("2024-06-02T08:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // 60 days before receipt -- well past the 30-day backfill clamp.
+        rec.timestamp = Some(rec.received_at - chrono::TimeDelta::days(60));
+
+        let batch = structured_syslog_record_to_batch(&rec).unwrap();
+        let col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(col.value(0), rec.received_at.timestamp_micros());
+    }
+
+    #[test]
+    fn partition_time_mixed_null_and_valid_timestamp_same_receipt_day_agree_regression() {
+        // The regression case for this addendum: a null-timestamp row and a
+        // valid-timestamp row received on the same real day must derive the
+        // buffer day from the SAME non-null column, never from
+        // coalesce(timestamp, received_at) (which is not itself a column).
+        use arrow::array::TimestampMicrosecondArray;
+        let receipt_day_a = chrono::DateTime::parse_from_rfc3339("2024-06-02T08:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let receipt_day_b = chrono::DateTime::parse_from_rfc3339("2024-06-02T20:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let mut rec_a = sample_record("cef");
+        rec_a.timestamp = None;
+        rec_a.received_at = receipt_day_a;
+
+        let mut rec_b = sample_record("leef");
+        rec_b.timestamp = Some(receipt_day_b - chrono::TimeDelta::hours(1));
+        rec_b.received_at = receipt_day_b;
+
+        let batch_a = structured_syslog_record_to_batch(&rec_a).unwrap();
+        let batch_b = structured_syslog_record_to_batch(&rec_b).unwrap();
+
+        let day_of = |batch: &RecordBatch| {
+            let col = batch
+                .column_by_name("partition_time")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            chrono::DateTime::from_timestamp_micros(col.value(0))
+                .unwrap()
+                .date_naive()
+        };
+
+        assert_eq!(
+            day_of(&batch_a),
+            day_of(&batch_b),
+            "a null-timestamp row and a valid-timestamp row received the same \
+             day must land in the same partition_time day"
+        );
     }
 
     #[tokio::test]

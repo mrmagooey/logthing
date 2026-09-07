@@ -109,7 +109,7 @@ async fn syslog_messages_appear_as_parquet_on_local_disk() {
     let buf = Bytes::from(raw);
     let builder = ParquetRecordBatchReaderBuilder::try_new(buf).unwrap();
     let schema = builder.schema().clone();
-    assert_eq!(schema.fields().len(), 11);
+    assert_eq!(schema.fields().len(), 13);
     assert_eq!(
         schema.field_with_name("timestamp").unwrap().data_type(),
         &arrow::datatypes::DataType::Timestamp(

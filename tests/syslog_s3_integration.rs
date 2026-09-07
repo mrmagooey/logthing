@@ -140,8 +140,8 @@ async fn syslog_message_appears_as_parquet_in_s3() {
     let schema = builder.schema().clone();
     assert_eq!(
         schema.fields().len(),
-        11,
-        "Syslog schema must have 11 columns"
+        13,
+        "Syslog schema must have 13 columns"
     );
 
     let mut reader = builder.build().expect("parquet reader");

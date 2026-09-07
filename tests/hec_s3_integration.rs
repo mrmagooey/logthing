@@ -153,8 +153,8 @@ async fn hec_records_appear_as_parquet_in_s3() {
         }
         assert_eq!(
             schema.fields().len(),
-            5,
-            "HEC schema must have exactly 5 columns"
+            6,
+            "HEC schema must have exactly 6 columns"
         );
 
         let mut reader = builder.build().expect("parquet reader");

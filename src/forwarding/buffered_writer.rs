@@ -99,6 +99,54 @@ pub trait ParquetSink: Send + Sync + 'static {
         let _ = schema;
         None
     }
+
+    /// Name of the Arrow column whose value determines a record's UTC
+    /// event day -- the column `day_and_batch`'s default implementation
+    /// reads to bucket buffers (and therefore Parquet files) so each one
+    /// is "day-clean": every row decodes to the same Iceberg `day()`
+    /// partition tuple. See
+    /// docs/superpowers/specs/2026-09-05-day-clean-parquet-partitions-design.md.
+    ///
+    /// `None` means this sink has not opted in, so `day_and_batch`'s
+    /// default falls straight through to the generic `received_at` / `now`
+    /// fallback chain in `day_from_batch`. That is intentionally fine for
+    /// every sink that doesn't override it -- in particular this crate's
+    /// own test-only `ParquetSink` mocks, none of which need accurate
+    /// day partitioning and all of which get correct (if day-agnostic)
+    /// bucketing for free.
+    fn time_column(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Map one record to its batch AND the UTC day its `time_column()`
+    /// value falls on, in a single pass.
+    ///
+    /// Default: calls `to_record_batch` exactly once, then reads the day
+    /// back off the very batch it just built (`day_from_batch`). This is
+    /// deliberate, not just an optimization: it is the only way a sink
+    /// that stamps a fresh `Utc::now()` value into the row it returns
+    /// (e.g. syslog's `received_at` -- see `syslog_s3.rs`) can guarantee
+    /// the buffer-key day and the persisted value never disagree. Calling
+    /// `to_record_batch` a second time, or reading the clock a second
+    /// time, would each independently reopen that race.
+    ///
+    /// Returns `(day, None)` instead of `(day, Some(batch))` only when a
+    /// sink overrides this method to compute the day WITHOUT building a
+    /// batch -- exclusively relevant to a sink that also implements
+    /// `new_batch` (an amortized fast path whose entire purpose is
+    /// avoiding a per-record `to_record_batch` call; see `ZeekSink`'s
+    /// override). The caller (`PartitionedParquetWriter::push`) treats
+    /// `None` as "map it later, only if actually needed."
+    fn day_and_batch(
+        &self,
+        record: &Self::Record,
+        schema: &Arc<arrow_schema::Schema>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<(chrono::NaiveDate, Option<arrow_array::RecordBatch>)> {
+        let batch = self.to_record_batch(record, schema)?;
+        let day = day_from_batch(&batch, self.time_column(), now);
+        Ok((day, Some(batch)))
+    }
 }
 
 /// Amortized builder state for one in-progress, possibly-multi-row
@@ -295,6 +343,258 @@ pub(crate) fn unused_s3_connection_placeholder() -> crate::config::S3ConnectionC
     }
 }
 
+/// Extract the UTC calendar day a just-mapped batch's designated
+/// `time_col` falls on, reading row 0 only.
+///
+/// Row 0 is correct for every sink's batch except `IpfixSink`'s, which
+/// maps a whole `Vec<FlowRecord>` (already batched at the listener) into
+/// one multi-row `RecordBatch` per push -- but IPFIX's `export_time` is
+/// decoded once per message and copied onto every `FlowRecord` produced
+/// from it (see `src/ipfix/decoder.rs`), so row 0 can never disagree with
+/// any other row in that same batch.
+///
+/// Fallback chain: `time_col` -> a column literally named `"received_at"`
+/// -> `now`. The middle step is what lets syslog/structured_syslog/generic
+/// (each of whose primary time column is nullable) fall back to their own
+/// `received_at` column without any sink-specific code here; it is a
+/// harmless no-op for sinks whose primary column has no such column to
+/// find (e.g. Zeek's typed schemas, which fall straight to `now`).
+fn day_from_batch(
+    batch: &arrow_array::RecordBatch,
+    time_col: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::NaiveDate {
+    use arrow_array::Array as _;
+
+    let day_of = |name: &str| -> Option<chrono::NaiveDate> {
+        let col = batch.column_by_name(name)?;
+        let ts = col
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()?;
+        if ts.is_empty() || ts.is_null(0) {
+            return None;
+        }
+        chrono::DateTime::from_timestamp_micros(ts.value(0)).map(|dt| dt.date_naive())
+    };
+
+    time_col
+        .and_then(day_of)
+        .or_else(|| day_of("received_at"))
+        .unwrap_or_else(|| now.date_naive())
+}
+
+#[cfg(test)]
+mod day_from_batch_tests {
+    use super::*;
+    use arrow::array::TimestampMicrosecondArray;
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::record_batch::RecordBatch;
+    use chrono::TimeZone;
+
+    fn ts_schema(cols: &[&str]) -> Arc<Schema> {
+        Arc::new(Schema::new(
+            cols.iter()
+                .map(|name| {
+                    Field::new(
+                        *name,
+                        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn ts_batch(schema: &Arc<Schema>, values: &[Option<i64>]) -> RecordBatch {
+        let cols: Vec<arrow_array::ArrayRef> = values
+            .iter()
+            .map(|v| {
+                Arc::new(TimestampMicrosecondArray::from(vec![*v]).with_timezone("UTC"))
+                    as arrow_array::ArrayRef
+            })
+            .collect();
+        RecordBatch::try_new(schema.clone(), cols).unwrap()
+    }
+
+    fn micros(y: i32, m: u32, d: u32) -> i64 {
+        chrono::Utc
+            .with_ymd_and_hms(y, m, d, 12, 0, 0)
+            .unwrap()
+            .timestamp_micros()
+    }
+
+    #[test]
+    fn reads_the_primary_column_when_non_null() {
+        let schema = ts_schema(&["ts"]);
+        let batch = ts_batch(&schema, &[Some(micros(2026, 3, 7))]);
+        let now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+        let day = day_from_batch(&batch, Some("ts"), now);
+        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2026, 3, 7).unwrap());
+    }
+
+    #[test]
+    fn falls_back_to_received_at_when_primary_is_null() {
+        let schema = ts_schema(&["timestamp", "received_at"]);
+        let batch = ts_batch(&schema, &[None, Some(micros(2026, 5, 1))]);
+        let now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+        let day = day_from_batch(&batch, Some("timestamp"), now);
+        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2026, 5, 1).unwrap());
+    }
+
+    #[test]
+    fn falls_back_to_now_when_nothing_else_applies() {
+        let schema = ts_schema(&["ts"]);
+        let batch = ts_batch(&schema, &[None]);
+        let now = chrono::Utc.with_ymd_and_hms(2030, 12, 25, 0, 0, 0).unwrap();
+        let day = day_from_batch(&batch, Some("ts"), now);
+        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2030, 12, 25).unwrap());
+    }
+
+    #[test]
+    fn none_time_column_skips_straight_to_fallback_chain() {
+        let schema = ts_schema(&["received_at"]);
+        let batch = ts_batch(&schema, &[Some(micros(2027, 2, 2))]);
+        let now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+        // time_column() defaults to None for sinks that don't opt in.
+        let day = day_from_batch(&batch, None, now);
+        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2027, 2, 2).unwrap());
+    }
+}
+
+/// Widest backfill accepted from a record's own timestamp before
+/// `partition_time` falls back to receipt time instead. This is the knob
+/// that bounds live-buffer fan-out: an untrusted sender can claim any event
+/// timestamp it likes (syslog, IPFIX `export_time`, HEC `time`), and without
+/// a ceiling each distinct claimed day mints its own buffer, its own small
+/// Parquet PUT, and its own descriptor PUT. Clamping to 30 days means a
+/// sender can mint at most ~31 buffers per partition (30 backfill days plus
+/// today) no matter how many distinct dates it claims.
+///
+/// The tradeoff: a *genuine* backfill deeper than 30 days is bucketed by
+/// receipt time rather than event time. It is not dropped and not
+/// mis-typed -- the real event timestamp is still queryable in its own
+/// column -- but the file it lands in partitions by when it was ingested,
+/// not by when it happened. Widen this if deep replay matters more than the
+/// fan-out bound.
+const MAX_BACKFILL: chrono::TimeDelta = chrono::TimeDelta::days(30);
+
+/// Tolerance for a sender's clock running ahead of ours. A small forward
+/// skew is normal clock drift; anything past this is treated the same as an
+/// out-of-range backfill and bucketed by receipt time instead.
+const MAX_SKEW: chrono::TimeDelta = chrono::TimeDelta::days(1);
+
+/// Derive the instant a record's partition day is computed from.
+///
+/// This is the single source of truth for the `partition_time` column: a
+/// pure, clock-free function of the record's own event timestamp (if any)
+/// and the receipt instant logthing stamped on ingest. It never reads
+/// `Utc::now()`, which closes the last path where two clock reads either
+/// side of midnight could disagree about which day a buffer belongs to --
+/// the same record, evaluated twice, always derives the same instant.
+///
+/// - `event` is `None` (the record carries no usable timestamp of its own,
+///   e.g. a CEF payload) -> `received_at`.
+/// - `event` is `Some(t)` but falls outside `[received_at - MAX_BACKFILL,
+///   received_at + MAX_SKEW]` -> `received_at`. This is the untrusted-input
+///   clamp: a sender cannot mint unbounded live buffers by claiming
+///   arbitrary event dates, because anything too far from receipt time
+///   collapses onto `received_at`.
+/// - otherwise -> `t`, the record's own event timestamp.
+pub(crate) fn partition_time(
+    event: Option<chrono::DateTime<chrono::Utc>>,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    match event {
+        Some(t) if t >= received_at - MAX_BACKFILL && t <= received_at + MAX_SKEW => t,
+        _ => received_at,
+    }
+}
+
+#[cfg(test)]
+mod partition_time_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn at(y: i32, m: u32, d: u32, h: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(y, m, d, h, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn none_event_falls_back_to_received_at() {
+        let received_at = at(2026, 6, 15, 12);
+        assert_eq!(partition_time(None, received_at), received_at);
+    }
+
+    #[test]
+    fn event_a_few_hours_before_received_at_is_used_verbatim() {
+        // Different UTC day from received_at, so returning received_at
+        // instead would be visibly wrong -- this can't pass by accident.
+        let received_at = at(2026, 6, 15, 1);
+        let event = at(2026, 6, 14, 20);
+        assert_eq!(partition_time(Some(event), received_at), event);
+    }
+
+    #[test]
+    fn event_31_days_before_received_at_falls_back() {
+        let received_at = at(2026, 6, 15, 12);
+        let event = received_at - chrono::TimeDelta::days(31);
+        assert_eq!(partition_time(Some(event), received_at), received_at);
+    }
+
+    #[test]
+    fn event_2_days_after_received_at_falls_back() {
+        let received_at = at(2026, 6, 15, 12);
+        let event = received_at + chrono::TimeDelta::days(2);
+        assert_eq!(partition_time(Some(event), received_at), received_at);
+    }
+
+    #[test]
+    fn exactly_30_days_backfill_is_accepted() {
+        let received_at = at(2026, 6, 15, 12);
+        let event = received_at - MAX_BACKFILL;
+        assert_eq!(partition_time(Some(event), received_at), event);
+    }
+
+    #[test]
+    fn one_microsecond_beyond_backfill_bound_is_rejected() {
+        let received_at = at(2026, 6, 15, 12);
+        let event = received_at - MAX_BACKFILL - chrono::TimeDelta::microseconds(1);
+        assert_eq!(partition_time(Some(event), received_at), received_at);
+    }
+
+    #[test]
+    fn exactly_1_day_skew_is_accepted() {
+        let received_at = at(2026, 6, 15, 12);
+        let event = received_at + MAX_SKEW;
+        assert_eq!(partition_time(Some(event), received_at), event);
+    }
+
+    #[test]
+    fn one_microsecond_beyond_skew_bound_is_rejected() {
+        let received_at = at(2026, 6, 15, 12);
+        let event = received_at + MAX_SKEW + chrono::TimeDelta::microseconds(1);
+        assert_eq!(partition_time(Some(event), received_at), received_at);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BufKey — buffer-map key
+// ---------------------------------------------------------------------------
+
+/// Buffer-map key: partition segment (`""` = no partition, mirroring the
+/// historical `String`-keyed map used by syslog/ipfix) plus the UTC
+/// calendar day of the records it holds. Splitting by day is the entire
+/// mechanism behind "day-clean" Parquet files -- see
+/// `ParquetSink::time_column`'s doc comment. Each `BufKey` maps to
+/// exactly one `PartitionBuffer`, so one buffer -> one flush -> one file
+/// -> one descriptor -> one `day()` Iceberg partition tuple, by
+/// construction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct BufKey {
+    pub(crate) partition: String,
+    pub(crate) day: chrono::NaiveDate,
+}
+
 // ---------------------------------------------------------------------------
 // PartitionBuffer — internal per-partition state
 // ---------------------------------------------------------------------------
@@ -340,18 +640,20 @@ impl<R> PartitionBuffer<R> {
 /// Pattern: `{prefix}/[{partition}/]year={Y}/month={MM}/day={DD}/{uuid}.parquet`
 /// The partition segment is omitted when `partition` is `None` (syslog, ipfix).
 /// When `prefix` is empty the prefix segment is omitted entirely (no leading slash).
-pub(crate) fn build_key(
-    prefix: &str,
-    partition: Option<&str>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> String {
+///
+/// Takes the buffer's own UTC day directly, never `chrono::Utc::now()` --
+/// the buffer key (`BufKey`) is what makes each file day-clean; reading
+/// any other clock here would silently reintroduce the bug this design
+/// fixes for a flush that crosses midnight mid-encode (see the design
+/// doc's "Rejected approach" section, point 1).
+pub(crate) fn build_key(prefix: &str, partition: Option<&str>, day: chrono::NaiveDate) -> String {
     use chrono::Datelike as _;
     let id = uuid::Uuid::new_v4();
     let date = format!(
         "year={}/month={:02}/day={:02}",
-        now.year(),
-        now.month(),
-        now.day()
+        day.year(),
+        day.month(),
+        day.day()
     );
     match (prefix.is_empty(), partition) {
         (true, Some(seg)) => format!("{}/{}/{}.parquet", seg, date, id),
@@ -411,10 +713,10 @@ const BUILDER_BATCH_ROWS: usize = 1000;
 /// back everything needed to retry.
 enum FlushOutcome {
     Success {
-        key: String,
+        key: BufKey,
     },
     Failure {
-        key: String,
+        key: BufKey,
         batches: VecDeque<(arrow_array::RecordBatch, usize)>,
         row_count: usize,
         byte_count: usize,
@@ -427,8 +729,19 @@ pub struct PartitionedParquetWriter<S: ParquetSink> {
     s3: Arc<dyn UploadSink>,
     config: BufferedWriterConfig,
     policy: FlushPolicy,
-    /// `""` key for None-partition sources; sanitized-path / `"event_type=<id>"` for multi-partition.
-    pub(crate) buffers: HashMap<String, PartitionBuffer<S::Record>>,
+    /// One entry per `(partition, day)` currently live. `partition` is
+    /// `""` for None-partition sources; sanitized-path / `"event_type=<id>"`
+    /// for multi-partition; `"_overflow"` past the partition cap.
+    pub(crate) buffers: HashMap<BufKey, PartitionBuffer<S::Record>>,
+    /// Every distinct partition string ever admitted as a real buffer
+    /// (never `"_overflow"`'s inputs, only the sentinel itself once
+    /// created), independent of day and NEVER shrunk -- including by the
+    /// empty-buffer reaping in `apply_flush_outcome`. `max_partitions`
+    /// must cap the number of distinct log streams (e.g. Zeek's up to
+    /// 256 stream types), not the number of `(partition, day)` buffer
+    /// entries, and must not "forget" a partition that goes briefly idle
+    /// across midnight and gets reaped.
+    known_partitions: std::collections::HashSet<String>,
     source_stats: Arc<crate::stats::SourceHourlyStats>,
     /// Optional destination for the Iceberg "descriptor" JSON emitted
     /// alongside each successful Parquet flush. `None` (the default via
@@ -477,6 +790,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             config,
             policy,
             buffers: HashMap::new(),
+            known_partitions: std::collections::HashSet::new(),
             source_stats,
             descriptor_sink,
             flush_tasks: JoinSet::new(),
@@ -491,42 +805,88 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
     /// call `try_flush_partition_async` (spawns a background flush) or
     /// `drop_oldest_to_cap` (if one is already in-flight for this partition).
     pub async fn push(&mut self, record: S::Record) -> anyhow::Result<()> {
-        let raw_key = self.sink.partition(&record).unwrap_or_default();
+        // Read the clock exactly once per push and thread it through
+        // day_and_batch/day_from_batch. Two reads either side of midnight
+        // would produce exactly the non-day-clean file this whole feature
+        // exists to prevent.
+        let now = chrono::Utc::now();
+        let raw_partition = self.sink.partition(&record).unwrap_or_default();
 
-        // Partition-count cap: if we've hit max_partitions and this is a new key, overflow.
-        let effective_key = if self.buffers.contains_key(&raw_key)
+        // Partition-count cap: based on distinct partitions ever admitted
+        // (`known_partitions`), NOT on `self.buffers.len()`. Buffers are
+        // now keyed by (partition, day), so `buffers.len()` can be
+        // transiently inflated by day multiplicity (e.g. two buffers open
+        // around midnight for the same partition) or deflated by the
+        // empty-buffer reaping in `apply_flush_outcome` -- either would
+        // destabilize a cap based directly on it: a doubling could trip
+        // the cap early and divert live data to `"_overflow"`, or reaping
+        // could "free" a slot that a live stream still occupies.
+        // `known_partitions` never shrinks, so it is immune to both.
+        //
+        // `raw_known` reuses the one `contains` lookup this branch already
+        // needs, and doubles as the insert guard below: on the
+        // overwhelmingly common path (a partition `push()` has already seen
+        // -- true for essentially every record once a source has warmed
+        // up), `raw_known` is `true` and the `insert` is skipped entirely.
+        // `push()` is the hottest call in this file and must not pay for a
+        // hash + no-op insert on every single record. The `insert` still
+        // runs for a genuinely new partition (including repeated overflow
+        // of previously-unseen partitions once the cap is hit, where
+        // `raw_known` is always false) -- `known_partitions`'s contents end
+        // up identical to the unguarded version either way, just without
+        // the redundant work on the hot path.
+        let raw_known = self.known_partitions.contains(&raw_partition);
+        let effective_partition = if raw_known
             || self.config.max_partitions == 0
-            || self.buffers.len() < self.config.max_partitions
+            || self.known_partitions.len() < self.config.max_partitions
         {
-            raw_key
+            raw_partition
         } else {
             metrics::counter!("parquet_s3_partitions_capped",
                 "source" => self.sink.source(), "target" => self.s3.target_label())
             .increment(1);
             "_overflow".to_string()
         };
+        if !raw_known {
+            self.known_partitions.insert(effective_partition.clone());
+        }
 
-        // Lazily create the buffer for this partition.
-        let schema = if !self.buffers.contains_key(&effective_key) {
-            let seg = if effective_key.is_empty() {
-                None
-            } else {
-                Some(effective_key.as_str())
-            };
-            Some(self.sink.schema(seg))
-        } else {
+        let seg = if effective_partition.is_empty() {
             None
+        } else {
+            Some(effective_partition.as_str())
         };
-        if let Some(s) = schema {
+        let schema = self.sink.schema(seg);
+
+        // Map once, and read the record's own UTC day back off the
+        // result -- see `ParquetSink::day_and_batch` for why this must
+        // not run `to_record_batch` (or read the clock) a second time.
+        let (day, pre_mapped) = match self.sink.day_and_batch(&record, &schema, now) {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(
+                    source = self.sink.source(),
+                    "day_and_batch failed, skipping record: {e}"
+                );
+                return Ok(());
+            }
+        };
+
+        let effective_key = BufKey {
+            partition: effective_partition,
+            day,
+        };
+
+        // Lazily create the buffer for this (partition, day).
+        if !self.buffers.contains_key(&effective_key) {
             self.buffers
-                .insert(effective_key.clone(), PartitionBuffer::new(s));
+                .insert(effective_key.clone(), PartitionBuffer::new(schema.clone()));
         }
 
         // Convert record → RecordBatch, using the amortized live-builder
         // path if the sink opted in for this partition's schema, else the
         // unchanged one-call-per-record fallback.
         let buf = self.buffers.get_mut(&effective_key).unwrap();
-        let schema = buf.schema.clone();
 
         if buf.live_builder.is_none() {
             buf.live_builder = self.sink.new_batch(&schema);
@@ -545,7 +905,11 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                     // schema (e.g. Zeek's raw/sanitized log_path mismatch
                     // case). Fall back to today's exact per-record path for
                     // just this one record.
-                    match self.sink.to_record_batch(&record, &schema) {
+                    let mapped = match pre_mapped {
+                        Some(b) => Ok(b),
+                        None => self.sink.to_record_batch(&record, &schema),
+                    };
+                    match mapped {
                         Ok(b) => {
                             let est_bytes = b.get_array_memory_size();
                             let n = b.num_rows();
@@ -570,8 +934,14 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 }
             }
         } else {
-            // Adapter never opted in for this schema: unchanged behavior.
-            match self.sink.to_record_batch(&record, &schema) {
+            // Adapter never opted in for this schema: unchanged behavior,
+            // except reusing the batch `day_and_batch` already built
+            // instead of mapping the record a second time.
+            let mapped = match pre_mapped {
+                Some(b) => Ok(b),
+                None => self.sink.to_record_batch(&record, &schema),
+            };
+            match mapped {
                 Ok(b) => {
                     let est_bytes = b.get_array_memory_size();
                     let n = b.num_rows();
@@ -617,7 +987,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
     /// channel left to keep draining, so there is no benefit to spawning,
     /// only a need for a single definitive attempt per partition.
     pub async fn flush_all(&mut self) -> anyhow::Result<()> {
-        let keys: Vec<String> = self.buffers.keys().cloned().collect();
+        let keys: Vec<BufKey> = self.buffers.keys().cloned().collect();
         let mut last_err: Option<anyhow::Error> = None;
         for key in keys {
             let taken = {
@@ -673,21 +1043,69 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
     }
 
     /// Flush partitions whose flush policy is triggered (called by timer).
+    ///
+    /// Also reaps empty, non-in-flight buffers: `push()` inserts a
+    /// `PartitionBuffer` for `effective_key` *before* it knows whether
+    /// mapping the record will succeed, so it can hand the amortized
+    /// `live_builder` path (see `ParquetSink::new_batch`) a buffer to
+    /// append into. Every failure branch after that insert (`try_append`
+    /// erroring, or the `to_record_batch` fallback erroring -- documented
+    /// as "panic-free and best-effort total", so rare, but not impossible)
+    /// returns early with the record simply dropped and `row_count` still
+    /// 0. `apply_flush_outcome`'s reaping only runs in a flush's success
+    /// arm, which such a buffer never reaches: `flush_all_if_needed` itself
+    /// skips `row_count == 0` buffers, and `try_flush_partition_async`
+    /// declines to spawn a flush for one (`buf.buffer.is_empty()`). Left
+    /// alone, one such orphan persists forever per `(partition, day)` that
+    /// ever suffered a mapping failure -- unbounded over a long-running
+    /// process's lifetime, plus a fully-allocated `RecordBatchAccumulator`
+    /// for any sink that opts into `new_batch` (currently only `ZeekSink`).
+    ///
+    /// This is the one place that can close the hole without adding
+    /// per-record cost to `push()`: it already walks every buffer once per
+    /// tick, `try_flush_partition_async` (the only other buffer-removing
+    /// code path via `apply_flush_outcome`) never fires for a buffer this
+    /// empty, and it is easy to prove safe. A buffer with `row_count == 0`
+    /// while `in_flight` is legitimate, not an orphan: `try_flush_partition_async`
+    /// deliberately zeroes `row_count` the instant it hands the previous
+    /// batches to the background task, and new pushes keep landing in the
+    /// *same* buffer while that upload runs (see its doc comment) -- so
+    /// `in_flight` buffers are excluded from reaping here, and reaping
+    /// never touches `known_partitions` (see its doc comment on the
+    /// never-shrink invariant), matching `apply_flush_outcome`'s existing
+    /// idle-buffer reap.
     pub async fn flush_all_if_needed(&mut self) -> anyhow::Result<()> {
-        let keys: Vec<String> = self.buffers.keys().cloned().collect();
+        let keys: Vec<BufKey> = self.buffers.keys().cloned().collect();
         for key in keys {
-            let should_flush = {
+            enum Action {
+                None,
+                Flush,
+                Reap,
+            }
+            let action = {
                 let buf = self.buffers.get(&key).unwrap();
                 if buf.row_count == 0 {
-                    false
+                    if buf.in_flight {
+                        Action::None
+                    } else {
+                        Action::Reap
+                    }
+                } else if buf.row_count >= self.policy.max_rows
+                    || buf.byte_count >= self.policy.max_bytes
+                    || buf.last_flush.elapsed() >= self.policy.interval.get()
+                {
+                    Action::Flush
                 } else {
-                    buf.row_count >= self.policy.max_rows
-                        || buf.byte_count >= self.policy.max_bytes
-                        || buf.last_flush.elapsed() >= self.policy.interval.get()
+                    Action::None
                 }
             };
-            if should_flush {
-                self.try_flush_partition_async(&key);
+            match action {
+                Action::Flush => self.try_flush_partition_async(&key),
+                Action::Reap => {
+                    self.buffers.remove(&key);
+                    self.refresh_partition_gauge(&key.partition);
+                }
+                Action::None => {}
             }
         }
         Ok(())
@@ -701,7 +1119,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
     /// the existing `drop_oldest_to_cap` to the live (still-growing) buffer
     /// instead, exactly as today's flush-failure path already does, just
     /// from a second call site.
-    fn try_flush_partition_async(&mut self, key: &str) {
+    fn try_flush_partition_async(&mut self, key: &BufKey) {
         if let Some(buf) = self.buffers.get_mut(key) {
             Self::materialize_live_builder(buf);
         }
@@ -740,7 +1158,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             .increment(1.0);
 
         self.flush_tasks.spawn(encode_and_upload(
-            key.to_string(),
+            key.clone(),
             taken_batches,
             row_count,
             byte_count,
@@ -774,6 +1192,28 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             FlushOutcome::Success { key } => {
                 if let Some(buf) = self.buffers.get_mut(&key) {
                     buf.in_flight = false;
+                }
+                // A flush that lands with nothing accumulated since it was
+                // kicked off (no pushes arrived while the upload was
+                // in-flight) means this buffer is genuinely idle. Remove
+                // it outright: with the day now part of the key, a
+                // long-running process would otherwise accumulate one
+                // dead buffer per partition per UTC day that ever saw
+                // traffic -- an unbounded leak. The next record for this
+                // (partition, day) recreates it lazily in `push`, exactly
+                // like a brand-new partition. This must NOT touch
+                // `known_partitions` (see its doc comment): removing the
+                // partition from the cap's accounting here would let a
+                // later stream steal a live partition's slot the moment
+                // its buffer goes briefly idle.
+                if self
+                    .buffers
+                    .get(&key)
+                    .map(|b| b.row_count == 0)
+                    .unwrap_or(false)
+                {
+                    self.buffers.remove(&key);
+                    self.refresh_partition_gauge(&key.partition);
                 }
             }
             FlushOutcome::Failure {
@@ -809,6 +1249,40 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         }
     }
 
+    /// Recompute and republish the aggregate `parquet_s3_buffer_rows` gauge
+    /// for a single partition, immediately after one of its day-buffers is
+    /// reaped (see the two `self.buffers.remove(&key)` call sites in
+    /// `flush_all_if_needed` and `apply_flush_outcome`).
+    ///
+    /// `update_buffer_gauges` only walks `self.buffers` and republishes a
+    /// value for partitions that still have at least one live buffer --
+    /// with day now part of `BufKey`, reaping the LAST day-buffer for a
+    /// partition drops it out of that map entirely, so nothing ever visits
+    /// that label again to correct it. Without this, a partition whose
+    /// buffer got reaped keeps reporting its last non-zero row count on
+    /// `parquet_s3_buffer_rows` forever -- a permanently stuck false alarm
+    /// on the gauge this file's `update_buffer_gauges` doc comment calls
+    /// the leading backpressure indicator.
+    ///
+    /// Recomputes from the remaining buffers (rather than unconditionally
+    /// setting 0.0) because a partition can legitimately hold more than one
+    /// live day-buffer at once (e.g. one flushing out while a new day's
+    /// buffer is already accumulating) -- reaping one of them must not
+    /// zero out a gauge that should still reflect the other's rows.
+    fn refresh_partition_gauge(&self, partition: &str) {
+        let source = self.sink.source();
+        let target = self.s3.target_label();
+        let row_count: usize = self
+            .buffers
+            .iter()
+            .filter(|(key, _)| key.partition == partition)
+            .map(|(_, buf)| buf.row_count)
+            .sum();
+        metrics::gauge!("parquet_s3_buffer_rows",
+            "source" => source, "target" => target, "partition" => partition.to_string())
+        .set(row_count as f64);
+    }
+
     /// Report each partition's live buffered row count as a leading
     /// indicator of backpressure. Called only from the writer's periodic
     /// ticker (see `ParquetWriterHandle::start_with_stats`), never from
@@ -817,10 +1291,19 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
     pub(crate) fn update_buffer_gauges(&self) {
         let source = self.sink.source();
         let target = self.s3.target_label();
-        for (partition, buf) in &self.buffers {
+        // Aggregate across days per partition: this preserves today's
+        // metric meaning ("rows buffered for partition X") rather than
+        // fragmenting one gauge series into one-per-day, which would make
+        // the metric harder to alert on and would multiply cardinality by
+        // however many distinct days currently have a live buffer.
+        let mut per_partition: HashMap<&str, usize> = HashMap::new();
+        for (key, buf) in &self.buffers {
+            *per_partition.entry(key.partition.as_str()).or_insert(0) += buf.row_count;
+        }
+        for (partition, row_count) in per_partition {
             metrics::gauge!("parquet_s3_buffer_rows",
-                "source" => source, "target" => target, "partition" => partition.clone())
-            .set(buf.row_count as f64);
+                "source" => source, "target" => target, "partition" => partition.to_string())
+            .set(row_count as f64);
         }
     }
 
@@ -829,6 +1312,39 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
     /// shutdown path begins its final flush.
     pub(crate) fn total_buffered_rows(&self) -> usize {
         self.buffers.values().map(|b| b.row_count).sum()
+    }
+
+    /// Test-only convenience: look up a buffer by partition alone,
+    /// ignoring day. Correct wherever a test's records all map to the
+    /// same UTC day -- every test in this crate does, since they run in
+    /// milliseconds -- so "the buffer for this partition" is
+    /// unambiguous. Production code must never use this: a real
+    /// long-running writer legitimately holds one buffer per
+    /// `(partition, day)`.
+    #[cfg(test)]
+    pub(crate) fn buffer_by_partition(
+        &self,
+        partition: &str,
+    ) -> Option<&PartitionBuffer<S::Record>> {
+        self.buffers
+            .iter()
+            .find(|(k, _)| k.partition == partition)
+            .map(|(_, v)| v)
+    }
+
+    /// Test-only mutable counterpart to `buffer_by_partition`, for the
+    /// handful of tests that need to hand-backdate a buffer's
+    /// `last_flush` to simulate an age-triggered flush. The same
+    /// single-UTC-day assumption applies -- see `buffer_by_partition`.
+    #[cfg(test)]
+    pub(crate) fn buffer_by_partition_mut(
+        &mut self,
+        partition: &str,
+    ) -> Option<&mut PartitionBuffer<S::Record>> {
+        self.buffers
+            .iter_mut()
+            .find(|(k, _)| k.partition == partition)
+            .map(|(_, v)| v)
     }
 
     /// Drain all in-flight background flushes to completion, applying each
@@ -932,7 +1448,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
 /// exact bug this change fixes.
 #[allow(clippy::too_many_arguments)]
 async fn encode_and_upload(
-    key: String,
+    key: BufKey,
     batches: VecDeque<(arrow_array::RecordBatch, usize)>,
     row_count: usize,
     byte_count: usize,
@@ -984,12 +1500,17 @@ async fn encode_and_upload(
         }
     };
 
-    let partition_seg = if key.is_empty() {
+    // `partition_seg` carries ONLY the partition segment -- never the day.
+    // `IcebergDescriptor::partition` (see build_descriptor below) is a
+    // documented contract with the external committer and must not gain
+    // an extra, undocumented day component; the day belongs solely in the
+    // S3 key path segments built by `build_key`.
+    let partition_seg = if key.partition.is_empty() {
         None
     } else {
-        Some(key.as_str())
+        Some(key.partition.as_str())
     };
-    let s3_key = build_key(&prefix, partition_seg, chrono::Utc::now());
+    let s3_key = build_key(&prefix, partition_seg, key.day);
     let target = s3.target_label();
     let body_len = merged.len();
 
@@ -1548,8 +2069,8 @@ fn wrap_with_prefix(inner: Arc<dyn UploadSink>, prefix: &str) -> Arc<dyn UploadS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{StringArray, StringBuilder};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{StringArray, StringBuilder, TimestampMicrosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
 
     // -----------------------------------------------------------------------
@@ -1599,9 +2120,8 @@ max_partitions = 128
 
     #[test]
     fn build_key_no_partition() {
-        use chrono::TimeZone;
-        let now = chrono::Utc.with_ymd_and_hms(2026, 3, 7, 0, 0, 0).unwrap();
-        let key = build_key("syslog", None, now);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 3, 7).unwrap();
+        let key = build_key("syslog", None, day);
         assert!(
             key.starts_with("syslog/year=2026/month=03/day=07/"),
             "got: {key}"
@@ -1612,9 +2132,8 @@ max_partitions = 128
 
     #[test]
     fn build_key_with_partition() {
-        use chrono::TimeZone;
-        let now = chrono::Utc.with_ymd_and_hms(2026, 3, 7, 0, 0, 0).unwrap();
-        let key = build_key("zeek", Some("conn"), now);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 3, 7).unwrap();
+        let key = build_key("zeek", Some("conn"), day);
         assert!(
             key.starts_with("zeek/conn/year=2026/month=03/day=07/"),
             "got: {key}"
@@ -1624,9 +2143,8 @@ max_partitions = 128
 
     #[test]
     fn build_key_wef_partition_segment() {
-        use chrono::TimeZone;
-        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
-        let key = build_key("wef", Some("event_type=4624"), now);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let key = build_key("wef", Some("event_type=4624"), day);
         assert!(
             key.starts_with("wef/event_type=4624/year=2026/"),
             "got: {key}"
@@ -1635,11 +2153,10 @@ max_partitions = 128
 
     #[test]
     fn build_key_empty_prefix_with_partition() {
-        use chrono::TimeZone;
-        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 21, 0, 0, 0).unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 6, 21).unwrap();
 
         // empty prefix + partition → no leading slash, no double-slash
-        let key = build_key("", Some("event_type=4624"), now);
+        let key = build_key("", Some("event_type=4624"), day);
         assert!(
             key.starts_with("event_type=4624/year=2026/"),
             "empty prefix with partition must not have leading slash: {key}"
@@ -1649,7 +2166,7 @@ max_partitions = 128
         assert!(key.ends_with(".parquet"), "must end with .parquet: {key}");
 
         // empty prefix + no partition → no leading slash
-        let key2 = build_key("", None, now);
+        let key2 = build_key("", None, day);
         assert!(
             key2.starts_with("year=2026/"),
             "empty prefix without partition must start with year=: {key2}"
@@ -1854,7 +2371,7 @@ max_partitions = 128
             w.push(format!("r{i}")).await.unwrap();
         }
 
-        let buf = w.buffers.get("").unwrap();
+        let buf = w.buffer_by_partition("").unwrap();
         assert_eq!(
             buf.row_count, 5,
             "row_count must reflect all 5 accepted records"
@@ -1881,7 +2398,7 @@ max_partitions = 128
             w.push(format!("r{i}")).await.unwrap();
         }
 
-        let buf = w.buffers.get("").unwrap();
+        let buf = w.buffer_by_partition("").unwrap();
         assert_eq!(
             buf.row_count,
             BUILDER_BATCH_ROWS + 1,
@@ -2076,7 +2593,7 @@ max_partitions = 128
         for i in 0..4 {
             w.push(format!("r{i}")).await.unwrap();
         }
-        assert_eq!(w.buffers.get("").unwrap().row_count, 4);
+        assert_eq!(w.buffer_by_partition("").unwrap().row_count, 4);
     }
 
     /// `total_buffered_rows()` starts at zero and sums row counts across
@@ -2143,6 +2660,234 @@ max_partitions = 128
         fn location_hint(&self) -> String {
             "recording://test".to_string()
         }
+    }
+
+    /// A `ParquetSink` whose records carry a real UTC timestamp and that
+    /// opts into `time_column()`, used to prove buffers actually split by
+    /// UTC day rather than always falling back to `now`.
+    #[derive(Clone)]
+    struct TimestampedMock;
+    impl ParquetSink for TimestampedMock {
+        type Record = chrono::DateTime<chrono::Utc>;
+        fn source(&self) -> &'static str {
+            "test"
+        }
+        fn partition(&self, _: &chrono::DateTime<chrono::Utc>) -> Option<String> {
+            None
+        }
+        fn schema(&self, _: Option<&str>) -> Arc<Schema> {
+            Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            )]))
+        }
+        fn time_column(&self) -> Option<&'static str> {
+            Some("ts")
+        }
+        fn to_record_batch(
+            &self,
+            record: &chrono::DateTime<chrono::Utc>,
+            schema: &Arc<Schema>,
+        ) -> anyhow::Result<RecordBatch> {
+            let col = TimestampMicrosecondArray::from(vec![Some(record.timestamp_micros())])
+                .with_timezone("UTC");
+            Ok(RecordBatch::try_new(schema.clone(), vec![Arc::new(col)])?)
+        }
+    }
+
+    #[tokio::test]
+    async fn buffers_split_by_utc_day_produce_separate_flushes() {
+        use chrono::TimeZone;
+
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s3: Arc<dyn UploadSink> = Arc::new(RecordingSink {
+            uploads: uploads.clone(),
+        });
+        let (cfg, policy) = test_config(usize::MAX);
+        let mut w = PartitionedParquetWriter::new(TimestampedMock, s3, cfg, policy);
+
+        let day1 = chrono::Utc.with_ymd_and_hms(2026, 3, 7, 23, 59, 0).unwrap();
+        let day2 = chrono::Utc.with_ymd_and_hms(2026, 3, 8, 0, 1, 0).unwrap();
+
+        w.push(day1).await.unwrap();
+        w.push(day2).await.unwrap();
+
+        assert_eq!(
+            w.buffers.len(),
+            2,
+            "records on different UTC days must land in separate buffers, even with no partition"
+        );
+
+        w.flush_all().await.unwrap();
+        w.drain_pending_flushes().await;
+
+        let keys: Vec<String> = uploads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(
+            keys.len(),
+            2,
+            "each day-bucket must produce its own file: {keys:?}"
+        );
+        assert!(
+            keys.iter()
+                .any(|k| k.contains("year=2026/month=03/day=07/")),
+            "{keys:?}"
+        );
+        assert!(
+            keys.iter()
+                .any(|k| k.contains("year=2026/month=03/day=08/")),
+            "{keys:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_flush_reaps_an_idle_buffer() {
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s3: Arc<dyn UploadSink> = Arc::new(RecordingSink { uploads });
+        let (cfg, policy) = test_config(1);
+        let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
+
+        w.push("hello".to_string()).await.unwrap();
+        assert_eq!(w.buffers.len(), 1, "buffer created lazily on first push");
+
+        w.drain_pending_flushes().await;
+
+        assert_eq!(
+            w.buffers.len(),
+            0,
+            "a buffer that received no new pushes while its flush was in flight must be reaped"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_partitions_cap_survives_empty_buffer_reaping() {
+        struct TwoPartitionMock2;
+        impl ParquetSink for TwoPartitionMock2 {
+            type Record = (String, String);
+            fn source(&self) -> &'static str {
+                "test"
+            }
+            fn partition(&self, r: &(String, String)) -> Option<String> {
+                Some(r.0.clone())
+            }
+            fn schema(&self, _: Option<&str>) -> Arc<Schema> {
+                test_schema()
+            }
+            fn to_record_batch(
+                &self,
+                r: &(String, String),
+                schema: &Arc<Schema>,
+            ) -> anyhow::Result<RecordBatch> {
+                let col = Arc::new(StringArray::from(vec![r.1.as_str()]));
+                Ok(RecordBatch::try_new(schema.clone(), vec![col])?)
+            }
+        }
+
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s3: Arc<dyn UploadSink> = Arc::new(RecordingSink { uploads });
+        let (mut cfg, policy) = test_config(1);
+        cfg.max_partitions = 1;
+        let mut w = PartitionedParquetWriter::new(TwoPartitionMock2, s3, cfg, policy);
+
+        w.push(("p1".to_string(), "a".to_string())).await.unwrap();
+        w.drain_pending_flushes().await;
+        assert_eq!(w.buffers.len(), 0, "p1's buffer was flushed and reaped");
+
+        w.push(("p2".to_string(), "b".to_string())).await.unwrap();
+        assert!(
+            w.buffer_by_partition("_overflow").is_some(),
+            "p2 must overflow: p1 already holds the one available partition slot, \
+             even though its buffer was reaped"
+        );
+        assert!(
+            w.buffer_by_partition("p2").is_none(),
+            "p2 must not get its own buffer once the cap is reached"
+        );
+    }
+
+    /// `push()` inserts a `PartitionBuffer` for `effective_key` as soon as
+    /// `day_and_batch` succeeds -- BEFORE it knows whether the record will
+    /// actually map into a batch. The default `day_and_batch` calls
+    /// `to_record_batch` itself and can't diverge from it, so to reach the
+    /// leak this models a sink like `ZeekSink` that overrides
+    /// `day_and_batch` to derive the day WITHOUT building a batch
+    /// (`Ok((day, None))`, exactly `ZeekSink::day_and_batch`'s shape) --
+    /// deferring the real `to_record_batch` call to `push()`'s own fallback
+    /// path, which can then fail independently. `push()` drops the record
+    /// and returns `Ok(())` early on that failure, but the just-inserted
+    /// buffer (row_count == 0, never in-flight) is left behind. Nothing
+    /// else ever removes it: `flush_all_if_needed` used to skip
+    /// `row_count == 0` buffers outright, and `try_flush_partition_async`
+    /// never spawns a flush for an empty buffer, so `apply_flush_outcome`'s
+    /// success-arm reaping is never reached for it either. This proves the
+    /// periodic flush check now reaps that orphan instead of leaking it
+    /// forever.
+    #[tokio::test]
+    async fn flush_all_if_needed_reaps_a_buffer_orphaned_by_a_mapping_failure() {
+        struct DeferredMappingFailingSink;
+        impl ParquetSink for DeferredMappingFailingSink {
+            type Record = String;
+            fn source(&self) -> &'static str {
+                "test"
+            }
+            fn partition(&self, _r: &String) -> Option<String> {
+                None
+            }
+            fn schema(&self, _p: Option<&str>) -> Arc<Schema> {
+                test_schema()
+            }
+            fn to_record_batch(
+                &self,
+                _record: &String,
+                _schema: &Arc<Schema>,
+            ) -> anyhow::Result<RecordBatch> {
+                anyhow::bail!("intentional mapping failure for test")
+            }
+            // Mirrors `ZeekSink::day_and_batch`: derive the day without
+            // building a batch, so `to_record_batch` is deferred to
+            // `push()`'s own fallback call and can fail there instead of
+            // inside `day_and_batch` (which would abort before the buffer
+            // is ever created).
+            fn day_and_batch(
+                &self,
+                _record: &String,
+                _schema: &Arc<Schema>,
+                now: chrono::DateTime<chrono::Utc>,
+            ) -> anyhow::Result<(chrono::NaiveDate, Option<RecordBatch>)> {
+                Ok((now.date_naive(), None))
+            }
+        }
+
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(1_000_000); // nothing flushes on its own
+        let mut w = PartitionedParquetWriter::new(DeferredMappingFailingSink, s3, cfg, policy);
+
+        w.push("boom".to_string()).await.unwrap();
+        assert_eq!(
+            w.buffers.len(),
+            1,
+            "push() must still lazily create the buffer even though the mapping fails"
+        );
+        assert_eq!(
+            w.buffer_by_partition("").unwrap().row_count,
+            0,
+            "a record that failed to map must not be counted"
+        );
+
+        w.flush_all_if_needed().await.unwrap();
+
+        assert_eq!(
+            w.buffers.len(),
+            0,
+            "a buffer orphaned by a mapping failure (row_count == 0, never \
+             in-flight) must be reaped by the periodic flush check, not \
+             persist forever"
+        );
     }
 
     #[tokio::test]
@@ -2334,6 +3079,93 @@ max_partitions = 128
         );
     }
 
+    /// Regression test: a partition's `parquet_s3_buffer_rows` gauge must
+    /// NOT keep reporting its last non-zero value forever once its buffer
+    /// is reaped. Before `apply_flush_outcome`'s `Success` branch called
+    /// `refresh_partition_gauge`, removing the last live day-buffer for a
+    /// partition dropped it out of `update_buffer_gauges`'s `per_partition`
+    /// map entirely -- nothing ever visited that label again to correct
+    /// it, so the gauge stuck at its last published value even though the
+    /// partition had gone idle.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn reaping_the_last_buffer_for_a_partition_zeroes_its_stale_gauge() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(1_000); // high threshold: nothing flushes on its own
+        let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
+
+        for i in 0..5 {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+        w.update_buffer_gauges();
+
+        let gauge_key = CompositeKey::new(
+            MetricKind::Gauge,
+            metrics::Key::from_parts(
+                "parquet_s3_buffer_rows",
+                vec![
+                    metrics::Label::new("source", "test"),
+                    metrics::Label::new("target", "s3"),
+                    metrics::Label::new("partition", ""),
+                ],
+            ),
+        );
+        let read_gauge = |snapshotter: &metrics_util::debugging::Snapshotter| -> f64 {
+            snapshotter
+                .snapshot()
+                .into_hashmap()
+                .get(&gauge_key)
+                .map(|(_, _, v)| {
+                    if let DebugValue::Gauge(g) = v {
+                        g.into_inner()
+                    } else {
+                        0.0
+                    }
+                })
+                .unwrap_or(0.0)
+        };
+        assert_eq!(
+            read_gauge(&snapshotter),
+            5.0,
+            "sanity: gauge must reflect the 5 buffered rows before the reap"
+        );
+
+        // Simulate the flush landing with nothing accumulated meanwhile:
+        // the production path (`try_flush_partition_async`) zeroes
+        // `row_count` the instant it hands batches to the background task,
+        // and no new pushes arrive before this `Success` outcome is
+        // applied -- exactly the "buffer went idle mid-flush" case
+        // `apply_flush_outcome`'s doc comment describes.
+        w.buffer_by_partition_mut("").unwrap().row_count = 0;
+        let key = BufKey {
+            partition: String::new(),
+            day: chrono::Utc::now().date_naive(),
+        };
+        w.apply_flush_outcome(FlushOutcome::Success { key });
+
+        assert_eq!(
+            w.buffers.len(),
+            0,
+            "an idle buffer with row_count == 0 after a successful flush must be reaped"
+        );
+        assert_eq!(
+            read_gauge(&snapshotter),
+            0.0,
+            "parquet_s3_buffer_rows must be republished as 0 the instant the \
+             partition's last live buffer is reaped, not left at its stale \
+             pre-reap value"
+        );
+    }
+
     /// Line 649 (`apply_flush_outcome`'s failure branch) must log both
     /// `source` and `target` as structured fields, not just interpolate
     /// them into the message.
@@ -2346,7 +3178,10 @@ max_partitions = 128
 
         let capture = TestTracingCapture::install();
         w.apply_flush_outcome(FlushOutcome::Failure {
-            key: "".to_string(),
+            key: BufKey {
+                partition: String::new(),
+                day: chrono::Utc::now().date_naive(),
+            },
             batches: std::collections::VecDeque::new(),
             row_count: 0,
             byte_count: 0,
@@ -2432,7 +3267,7 @@ max_partitions = 128
             w.push(format!("r{i}")).await.unwrap(); // push() itself no longer fails -- flush failures surface asynchronously
             w.drain_pending_flushes().await; // deterministically wait for the just-triggered flush attempt (and its merge-back) to finish before pushing more
         }
-        let buf = w.buffers.get("").unwrap();
+        let buf = w.buffer_by_partition("").unwrap();
         assert!(
             buf.row_count <= hard_cap,
             "row_count {} must be <= hard_cap {}",
@@ -2481,7 +3316,7 @@ max_partitions = 128
         // At most max_partitions + 1 (_overflow) buffers exist
         assert!(w.buffers.len() <= 4, "got {} buffers", w.buffers.len());
         assert!(
-            w.buffers.contains_key("_overflow"),
+            w.buffer_by_partition("_overflow").is_some(),
             "overflow key must exist after cap breach"
         );
     }
@@ -2808,7 +3643,7 @@ max_partitions = 128
         // push returns Err (unreachable S3) but must not panic
         let _ = w.push("r1".to_string()).await;
         // After failed flush, buffer is either retained or capped — must not exceed hard cap
-        let buf = w.buffers.get("").unwrap();
+        let buf = w.buffer_by_partition("").unwrap();
         assert!(buf.row_count <= 10_000usize.saturating_mul(4));
     }
 
@@ -2820,7 +3655,7 @@ max_partitions = 128
         let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
         w.push("r1".to_string()).await.unwrap();
         // Age out the buffer by backdating last_flush.
-        if let Some(buf) = w.buffers.get_mut("") {
+        if let Some(buf) = w.buffer_by_partition_mut("") {
             buf.last_flush = Instant::now() - std::time::Duration::from_secs(3601);
         }
         // flush_all_if_needed should attempt flush (will fail on unreachable S3).
@@ -2862,8 +3697,8 @@ max_partitions = 128
         for _ in 0..2 {
             w.push(("b".to_string(), "v".to_string())).await.unwrap();
         }
-        assert_eq!(w.buffers.get("a").unwrap().row_count, 3);
-        assert_eq!(w.buffers.get("b").unwrap().row_count, 2);
+        assert_eq!(w.buffer_by_partition("a").unwrap().row_count, 3);
+        assert_eq!(w.buffer_by_partition("b").unwrap().row_count, 2);
     }
 
     // -----------------------------------------------------------------------
@@ -2913,7 +3748,7 @@ secret_key  = "SECRET"
         for i in 0..(hard_cap * 5) {
             let _ = w.push(format!("r{i}")).await;
         }
-        let buf = w.buffers.get("").unwrap();
+        let buf = w.buffer_by_partition("").unwrap();
         assert!(
             buf.row_count <= hard_cap,
             "row_count {} exceeds hard_cap {}",
@@ -2999,11 +3834,11 @@ secret_key  = "SECRET"
         }
 
         assert!(
-            w.buffers.contains_key("_overflow"),
+            w.buffer_by_partition("_overflow").is_some(),
             "_overflow buffer must exist after partition cap exceeded"
         );
         // The _overflow buffer must have rows (records were actually written to it).
-        let ov = w.buffers.get("_overflow").unwrap();
+        let ov = w.buffer_by_partition("_overflow").unwrap();
         assert!(ov.row_count > 0, "_overflow buffer must contain records");
         // The schema must be valid (non-empty field list from sink.schema(Some("_overflow"))).
         assert!(
@@ -3033,7 +3868,7 @@ secret_key  = "SECRET"
         w.push("r1".to_string()).await.unwrap(); // push() no longer fails synchronously when a flush fails
         w.drain_pending_flushes().await; // deterministically wait for the triggered flush attempt (and its merge-back) to finish
         // After failed flush the hard cap kicks in; row_count must be <= cap.
-        let buf = w.buffers.get("").unwrap();
+        let buf = w.buffer_by_partition("").unwrap();
         let hard_cap = 10_000usize * 4;
         assert!(
             buf.row_count <= hard_cap,
@@ -3067,7 +3902,7 @@ secret_key  = "SECRET"
 
         // Backdate last_flush so the age trigger fires.
         let backdated = Instant::now() - std::time::Duration::from_secs(3601);
-        if let Some(buf) = w.buffers.get_mut("") {
+        if let Some(buf) = w.buffer_by_partition_mut("") {
             buf.last_flush = backdated;
         }
 
@@ -3108,7 +3943,7 @@ secret_key  = "SECRET"
         // The flush path was entered and failed (unreachable S3): the merge-back-on-failure
         // logic must have put the record back, proving the data wasn't lost.
         assert_eq!(
-            w.buffers.get("").unwrap().row_count,
+            w.buffer_by_partition("").unwrap().row_count,
             1,
             "the record must still be present -- a failed flush merges its data back rather than losing it"
         );
@@ -3523,7 +4358,7 @@ secret_key  = "SECRET"
         // First push triggers a flush that will block forever until `gate` fires.
         w.push("r0".to_string()).await.unwrap();
         assert!(
-            w.buffers.get("").unwrap().in_flight,
+            w.buffer_by_partition("").unwrap().in_flight,
             "first push must mark the partition in-flight"
         );
 
@@ -3532,7 +4367,7 @@ secret_key  = "SECRET"
             w.push(format!("r{i}")).await.unwrap();
         }
 
-        let buf = w.buffers.get("").unwrap();
+        let buf = w.buffer_by_partition("").unwrap();
         assert!(
             buf.row_count <= hard_cap,
             "row_count {} must be capped at {} even while a flush is stuck in-flight",
@@ -3566,7 +4401,7 @@ secret_key  = "SECRET"
 
         // First push triggers a flush that blocks forever until `gate` fires.
         w.push("r0".to_string()).await.unwrap();
-        assert!(w.buffers.get("").unwrap().in_flight);
+        assert!(w.buffer_by_partition("").unwrap().in_flight);
 
         // Push far more than hard_cap while the first flush is stuck
         // in-flight, WITHOUT draining -- every one of these accumulates in
@@ -3577,7 +4412,7 @@ secret_key  = "SECRET"
             w.push(format!("r{i}")).await.unwrap();
         }
 
-        let buf = w.buffers.get("").unwrap();
+        let buf = w.buffer_by_partition("").unwrap();
         assert!(
             buf.row_count <= hard_cap,
             "row_count {} must be capped at {} even while rows are accumulating \
@@ -3615,7 +4450,7 @@ secret_key  = "SECRET"
 
         // Force the age trigger by backdating last_flush before the buffer exists.
         w.push("r0".to_string()).await.unwrap();
-        w.buffers.get_mut("").unwrap().last_flush =
+        w.buffer_by_partition_mut("").unwrap().last_flush =
             Instant::now() - std::time::Duration::from_secs(901);
 
         // This push crosses the age threshold and triggers (and fails) a flush.
@@ -3652,7 +4487,7 @@ secret_key  = "SECRET"
              proving the age-triggered flush was actually attempted and failed"
         );
 
-        let buf = w.buffers.get("").unwrap();
+        let buf = w.buffer_by_partition("").unwrap();
         assert_eq!(
             buf.row_count, 2,
             "both records must still be present after the failed flush merges back"
@@ -3683,7 +4518,7 @@ secret_key  = "SECRET"
         w.drain_pending_flushes().await;
 
         assert_eq!(
-            w.buffers.get("").unwrap().row_count,
+            w.buffer_by_partition("").unwrap().row_count,
             1,
             "the record must still be present after the (non-panicking) failed flush"
         );

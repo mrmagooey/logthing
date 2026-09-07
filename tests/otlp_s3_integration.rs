@@ -197,8 +197,8 @@ mod tests {
         }
         assert_eq!(
             schema.fields().len(),
-            5,
-            "HEC schema must have exactly 5 columns"
+            6,
+            "HEC schema must have exactly 6 columns"
         );
 
         let mut reader = builder.build().expect("parquet reader");
