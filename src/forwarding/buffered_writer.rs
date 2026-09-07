@@ -1106,6 +1106,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 Action::Flush => self.try_flush_partition_async(&key),
                 Action::Reap => {
                     self.buffers.remove(&key);
+                    self.refresh_partition_gauge(&key.partition);
                 }
                 Action::None => {}
             }
@@ -1215,6 +1216,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                     .unwrap_or(false)
                 {
                     self.buffers.remove(&key);
+                    self.refresh_partition_gauge(&key.partition);
                 }
             }
             FlushOutcome::Failure {
@@ -1248,6 +1250,40 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 }
             }
         }
+    }
+
+    /// Recompute and republish the aggregate `parquet_s3_buffer_rows` gauge
+    /// for a single partition, immediately after one of its day-buffers is
+    /// reaped (see the two `self.buffers.remove(&key)` call sites in
+    /// `flush_all_if_needed` and `apply_flush_outcome`).
+    ///
+    /// `update_buffer_gauges` only walks `self.buffers` and republishes a
+    /// value for partitions that still have at least one live buffer --
+    /// with day now part of `BufKey`, reaping the LAST day-buffer for a
+    /// partition drops it out of that map entirely, so nothing ever visits
+    /// that label again to correct it. Without this, a partition whose
+    /// buffer got reaped keeps reporting its last non-zero row count on
+    /// `parquet_s3_buffer_rows` forever -- a permanently stuck false alarm
+    /// on the gauge this file's `update_buffer_gauges` doc comment calls
+    /// the leading backpressure indicator.
+    ///
+    /// Recomputes from the remaining buffers (rather than unconditionally
+    /// setting 0.0) because a partition can legitimately hold more than one
+    /// live day-buffer at once (e.g. one flushing out while a new day's
+    /// buffer is already accumulating) -- reaping one of them must not
+    /// zero out a gauge that should still reflect the other's rows.
+    fn refresh_partition_gauge(&self, partition: &str) {
+        let source = self.sink.source();
+        let target = self.s3.target_label();
+        let row_count: usize = self
+            .buffers
+            .iter()
+            .filter(|(key, _)| key.partition == partition)
+            .map(|(_, buf)| buf.row_count)
+            .sum();
+        metrics::gauge!("parquet_s3_buffer_rows",
+            "source" => source, "target" => target, "partition" => partition.to_string())
+        .set(row_count as f64);
     }
 
     /// Report each partition's live buffered row count as a leading
@@ -3043,6 +3079,93 @@ max_partitions = 128
         assert_eq!(
             value, 7.0,
             "expected parquet_s3_buffer_rows{{source=\"test\",target=\"s3\",partition=\"\"}} == 7.0"
+        );
+    }
+
+    /// Regression test: a partition's `parquet_s3_buffer_rows` gauge must
+    /// NOT keep reporting its last non-zero value forever once its buffer
+    /// is reaped. Before `apply_flush_outcome`'s `Success` branch called
+    /// `refresh_partition_gauge`, removing the last live day-buffer for a
+    /// partition dropped it out of `update_buffer_gauges`'s `per_partition`
+    /// map entirely -- nothing ever visited that label again to correct
+    /// it, so the gauge stuck at its last published value even though the
+    /// partition had gone idle.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn reaping_the_last_buffer_for_a_partition_zeroes_its_stale_gauge() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::CompositeKey;
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(1_000); // high threshold: nothing flushes on its own
+        let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
+
+        for i in 0..5 {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+        w.update_buffer_gauges();
+
+        let gauge_key = CompositeKey::new(
+            MetricKind::Gauge,
+            metrics::Key::from_parts(
+                "parquet_s3_buffer_rows",
+                vec![
+                    metrics::Label::new("source", "test"),
+                    metrics::Label::new("target", "s3"),
+                    metrics::Label::new("partition", ""),
+                ],
+            ),
+        );
+        let read_gauge = |snapshotter: &metrics_util::debugging::Snapshotter| -> f64 {
+            snapshotter
+                .snapshot()
+                .into_hashmap()
+                .get(&gauge_key)
+                .map(|(_, _, v)| {
+                    if let DebugValue::Gauge(g) = v {
+                        g.into_inner()
+                    } else {
+                        0.0
+                    }
+                })
+                .unwrap_or(0.0)
+        };
+        assert_eq!(
+            read_gauge(&snapshotter),
+            5.0,
+            "sanity: gauge must reflect the 5 buffered rows before the reap"
+        );
+
+        // Simulate the flush landing with nothing accumulated meanwhile:
+        // the production path (`try_flush_partition_async`) zeroes
+        // `row_count` the instant it hands batches to the background task,
+        // and no new pushes arrive before this `Success` outcome is
+        // applied -- exactly the "buffer went idle mid-flush" case
+        // `apply_flush_outcome`'s doc comment describes.
+        w.buffer_by_partition_mut("").unwrap().row_count = 0;
+        let key = BufKey {
+            partition: String::new(),
+            day: chrono::Utc::now().date_naive(),
+        };
+        w.apply_flush_outcome(FlushOutcome::Success { key });
+
+        assert_eq!(
+            w.buffers.len(),
+            0,
+            "an idle buffer with row_count == 0 after a successful flush must be reaped"
+        );
+        assert_eq!(
+            read_gauge(&snapshotter),
+            0.0,
+            "parquet_s3_buffer_rows must be republished as 0 the instant the \
+             partition's last live buffer is reaped, not left at its stale \
+             pre-reap value"
         );
     }
 
