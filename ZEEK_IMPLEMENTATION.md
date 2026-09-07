@@ -100,6 +100,16 @@ All six typed schemas include a non-null `_extra` column (Arrow `Utf8`). The `_e
 
 This is a best-effort, total mapping: no information is silently discarded.
 
+Every typed schema (and the envelope fallback, below) also ends with a
+non-null `partition_time` column (Arrow `Timestamp(µs, UTC)`): the record's
+own `ts` when present and within a bounded backfill/skew window of receipt,
+otherwise the receipt instant. `ts` itself stays nullable in every one of
+these schemas, so `ts` is not a safe Iceberg partition-transform source — a
+file with even one null `ts` yields two partition values and Iceberg
+refuses the write. `partition_time` is the column to declare the
+transform on: it is guaranteed non-null and single-valued per file, by
+construction (see `zeek_partition_time` in `src/zeek/schema.rs`).
+
 #### `conn` (15 promoted columns + `_extra`)
 
 | Arrow column | Arrow type | Nullable | Source JSON key |
@@ -120,6 +130,7 @@ This is a best-effort, total mapping: no information is silently discarded.
 | `orig_pkts` | UInt64 | yes | `orig_pkts` |
 | `resp_pkts` | UInt64 | yes | `resp_pkts` |
 | `_extra` | Utf8 | **no** | (all remaining fields) |
+| `partition_time` | Timestamp(µs, UTC) | **no** | (derived; see above) |
 
 #### `dns` (13 promoted columns + `_extra`)
 
@@ -139,22 +150,23 @@ This is a best-effort, total mapping: no information is silently discarded.
 | `rcode_name` | Utf8 | yes | `rcode_name` |
 | `answers` | Utf8 | yes | `answers` (array serialised as JSON string) |
 | `_extra` | Utf8 | **no** | (all remaining fields) |
+| `partition_time` | Timestamp(µs, UTC) | **no** | (derived; see above) |
 
 #### `http` (13 promoted columns + `_extra`)
 
-Promoted: `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `method`, `host`, `uri`, `status_code` (UInt16), `user_agent`, `request_body_len` (UInt64), `response_body_len` (UInt64), `_extra`.
+Promoted: `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `method`, `host`, `uri`, `status_code` (UInt16), `user_agent`, `request_body_len` (UInt64), `response_body_len` (UInt64), `_extra`. Plus the non-null derived `partition_time` column, appended last.
 
 #### `ssl` (11 promoted columns + `_extra`)
 
-Promoted: `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `version`, `cipher`, `curve`, `server_name`, `validation_status`, `_extra`.
+Promoted: `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `version`, `cipher`, `curve`, `server_name`, `validation_status`, `_extra`. Plus the non-null derived `partition_time` column, appended last.
 
 #### `files` (8 promoted columns + `_extra`)
 
-Promoted: `ts`, `fuid`, `tx_hosts` (JSON string), `rx_hosts` (JSON string), `source`, `mime_type`, `filename`, `total_bytes` (UInt64), `_extra`.
+Promoted: `ts`, `fuid`, `tx_hosts` (JSON string), `rx_hosts` (JSON string), `source`, `mime_type`, `filename`, `total_bytes` (UInt64), `_extra`. Plus the non-null derived `partition_time` column, appended last.
 
 #### `notice` (10 promoted columns + `_extra`)
 
-Promoted: `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `note`, `msg`, `sub`, `actions` (JSON string), `_extra`.
+Promoted: `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `note`, `msg`, `sub`, `actions` (JSON string), `_extra`. Plus the non-null derived `partition_time` column, appended last.
 
 ### 4.2 Envelope Fallback Schema
 
@@ -171,8 +183,9 @@ For stream names not in the registry (including `"unknown"`):
 | `log_path` | Utf8 | **no** |
 | `ingest_time` | Timestamp(µs, UTC) | **no** |
 | `payload` | Utf8 | **no** |
+| `partition_time` | Timestamp(µs, UTC) | **no** |
 
-The full JSON object is stored verbatim in `payload`. `log_path` holds the actual (sanitised) path; `ingest_time` is a microsecond-precision UTC timestamp.
+The full JSON object is stored verbatim in `payload`. `log_path` holds the actual (sanitised) path; `ingest_time` is a microsecond-precision UTC timestamp. `partition_time` is derived the same way as the six typed schemas — the record's own `ts` when present and within a bounded backfill/skew window of receipt, otherwise the receipt instant — and is the correct Iceberg partition-transform source, since `ts` remains nullable here too.
 
 ## 5. S3 Persistence (`src/forwarding/zeek_s3.rs`)
 
