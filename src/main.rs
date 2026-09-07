@@ -1,3 +1,4 @@
+use logthing::middleware::IpWhitelist;
 use logthing::server::Server;
 use logthing::shutdown::await_handles_with_deadline;
 use logthing::{admin, config, forwarding, ipfix, sflow, stats, suricata, syslog, zeek};
@@ -36,6 +37,16 @@ async fn async_main() -> anyhow::Result<()> {
     // Load configuration
     let config = config::Config::load()?;
 
+    // Build the listener-source IP whitelist once, shared by the axum router
+    // (via Server) and all five wire-protocol socket listeners below. An
+    // invalid CIDR/IP fails fast here rather than silently allowing all
+    // sources once a listener is up.
+    let ip_whitelist = if config.security.allowed_ips.is_empty() {
+        IpWhitelist::empty()
+    } else {
+        IpWhitelist::new(config.security.allowed_ips.clone())?
+    };
+
     // Initialize logging
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(&config.logging.level)
@@ -48,6 +59,13 @@ async fn async_main() -> anyhow::Result<()> {
 
     info!("Starting logthing v{}", env!("CARGO_PKG_VERSION"));
     info!("Configuration loaded successfully");
+
+    // Startup signal for configurations that are valid but insecure (e.g. HEC
+    // enabled with an empty token). Must run after the tracing subscriber is
+    // initialized above, or these warnings are silently discarded.
+    for warning in config::insecure_config_warnings(&config) {
+        warn!("{warning}");
+    }
 
     // Start CPU profiling if requested. No-op unless LOGTHING_PROFILE_SECS is
     // set; warns if set on a binary built without the `pprof` feature.
@@ -329,8 +347,10 @@ async fn async_main() -> anyhow::Result<()> {
             bind_address: "0.0.0.0".to_string(),
             parse_dns_logs: config_clone.syslog.parse_dns,
         };
+        let syslog_ip_whitelist = ip_whitelist.clone();
         let handle = tokio::spawn(async move {
-            let listener = syslog::listener::SyslogListener::new(syslog_config, syslog_handler);
+            let listener = syslog::listener::SyslogListener::new(syslog_config, syslog_handler)
+                .with_allowed_ips(syslog_ip_whitelist);
             if let Err(e) = listener.start_with_shutdown(syslog_shutdown_rx).await {
                 error!("Syslog listener error: {}", e);
             }
@@ -415,8 +435,10 @@ async fn async_main() -> anyhow::Result<()> {
             udp_port: ipfix_config_clone.ipfix.udp_port,
             bind_address: ipfix_config_clone.ipfix.bind_address.clone(),
         };
+        let ipfix_ip_whitelist = ip_whitelist.clone();
         let handle = tokio::spawn(async move {
-            let listener = ipfix::listener::IpfixListener::new(listener_config, ipfix_handler);
+            let listener = ipfix::listener::IpfixListener::new(listener_config, ipfix_handler)
+                .with_allowed_ips(ipfix_ip_whitelist);
             if let Err(e) = listener.start_with_shutdown(ipfix_shutdown_rx).await {
                 error!("IPFIX listener error: {}", e);
             }
@@ -501,8 +523,10 @@ async fn async_main() -> anyhow::Result<()> {
             tcp_port: zeek_config_clone.zeek.tcp_port,
             bind_address: zeek_config_clone.zeek.bind_address.clone(),
         };
+        let zeek_ip_whitelist = ip_whitelist.clone();
         let handle = tokio::spawn(async move {
-            let listener = zeek::listener::ZeekListener::new(listener_config, zeek_handler);
+            let listener = zeek::listener::ZeekListener::new(listener_config, zeek_handler)
+                .with_allowed_ips(zeek_ip_whitelist);
             if let Err(e) = listener.start_with_shutdown(zeek_shutdown_rx).await {
                 error!("Zeek listener error: {}", e);
             }
@@ -590,9 +614,11 @@ async fn async_main() -> anyhow::Result<()> {
             tcp_port: suricata_config_clone.suricata.tcp_port,
             bind_address: suricata_config_clone.suricata.bind_address.clone(),
         };
+        let suricata_ip_whitelist = ip_whitelist.clone();
         let handle = tokio::spawn(async move {
             let listener =
-                suricata::listener::SuricataListener::new(listener_config, suricata_handler);
+                suricata::listener::SuricataListener::new(listener_config, suricata_handler)
+                    .with_allowed_ips(suricata_ip_whitelist);
             if let Err(e) = listener.start_with_shutdown(suricata_shutdown_rx).await {
                 error!("Suricata listener error: {}", e);
             }
@@ -677,8 +703,10 @@ async fn async_main() -> anyhow::Result<()> {
             udp_port: sflow_config_clone.sflow.udp_port,
             bind_address: sflow_config_clone.sflow.bind_address.clone(),
         };
+        let sflow_ip_whitelist = ip_whitelist.clone();
         let handle = tokio::spawn(async move {
-            let listener = sflow::listener::SflowListener::new(listener_config, sflow_handler);
+            let listener = sflow::listener::SflowListener::new(listener_config, sflow_handler)
+                .with_allowed_ips(sflow_ip_whitelist);
             if let Err(e) = listener.start_with_shutdown(sflow_shutdown_rx).await {
                 error!("sFlow listener error: {}", e);
             }

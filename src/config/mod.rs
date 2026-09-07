@@ -769,6 +769,27 @@ pub fn validate_iceberg_config(cfg: &IcebergConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Startup warnings for configurations that are valid but insecure.
+///
+/// Unlike `validate_iceberg_config`, these are not fatal — an empty
+/// `hec.token` is a deliberately supported "accept any token" dev mode
+/// (see `ingest::handlers::handle_hec_event` et al.), so this only surfaces
+/// the footgun rather than refusing to start.
+///
+/// ponytail: only covers the HEC empty-token case named in this change. The
+/// analogous OTLP `bearer_token` footgun is real but out of scope here.
+pub fn insecure_config_warnings(cfg: &Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if cfg.hec.enabled && cfg.hec.token.is_empty() {
+        warnings.push(
+            "hec.enabled = true but hec.token is empty: HEC ingest is reachable without \
+             authentication; set hec.token to require a shared secret"
+                .to_string(),
+        );
+    }
+    warnings
+}
+
 /// Per-source S3 persistence config for the syslog listener.
 /// Absent from TOML → `None` → no S3 persistence (backward compatible).
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -2537,5 +2558,37 @@ secret_key = "minioadmin"
             cfg.prefix, "aggregate",
             "prefix defaults to aggregate when omitted"
         );
+    }
+
+    #[test]
+    fn insecure_warns_when_hec_enabled_with_empty_token() {
+        let mut cfg = Config::default();
+        cfg.hec.enabled = true;
+        cfg.hec.token = String::new();
+
+        let warnings = insecure_config_warnings(&cfg);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning; got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn insecure_silent_when_hec_enabled_with_token_set() {
+        let mut cfg = Config::default();
+        cfg.hec.enabled = true;
+        cfg.hec.token = "super-secret-token".to_string();
+
+        assert!(insecure_config_warnings(&cfg).is_empty());
+    }
+
+    #[test]
+    fn insecure_silent_when_hec_disabled() {
+        let mut cfg = Config::default();
+        cfg.hec.enabled = false;
+        cfg.hec.token = String::new();
+
+        assert!(insecure_config_warnings(&cfg).is_empty());
     }
 }
