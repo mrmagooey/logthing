@@ -286,21 +286,21 @@ Each incoming JSON record is identified by its `_path` field (e.g. `"conn"`, `"d
 
 **Typed schemas — 6 curated streams**:
 
-| Stream | Arrow columns (promoted) | `_extra` |
-|--------|--------------------------|----------|
-| `conn` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `proto`, `service`, `duration`, `orig_bytes`, `resp_bytes`, `conn_state`, `history`, `orig_pkts`, `resp_pkts` | yes |
-| `dns` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `proto`, `trans_id`, `query`, `qtype_name`, `qclass_name`, `rcode_name`, `answers` | yes |
-| `http` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `method`, `host`, `uri`, `status_code`, `user_agent`, `request_body_len`, `response_body_len` | yes |
-| `ssl` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `version`, `cipher`, `curve`, `server_name`, `validation_status` | yes |
-| `files` | `ts`, `fuid`, `tx_hosts`, `rx_hosts`, `source`, `mime_type`, `filename`, `total_bytes` | yes |
-| `notice` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `note`, `msg`, `sub`, `actions` | yes |
+| Stream | Arrow columns (promoted) | `_extra` | `partition_time` |
+|--------|--------------------------|----------|------------------|
+| `conn` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `proto`, `service`, `duration`, `orig_bytes`, `resp_bytes`, `conn_state`, `history`, `orig_pkts`, `resp_pkts` | yes | yes |
+| `dns` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `proto`, `trans_id`, `query`, `qtype_name`, `qclass_name`, `rcode_name`, `answers` | yes | yes |
+| `http` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `method`, `host`, `uri`, `status_code`, `user_agent`, `request_body_len`, `response_body_len` | yes | yes |
+| `ssl` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `version`, `cipher`, `curve`, `server_name`, `validation_status` | yes | yes |
+| `files` | `ts`, `fuid`, `tx_hosts`, `rx_hosts`, `source`, `mime_type`, `filename`, `total_bytes` | yes | yes |
+| `notice` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `note`, `msg`, `sub`, `actions` | yes | yes |
 
-Note: Zeek JSON uses dot-notation for connection-id fields (`id.orig_h`, etc.); the Arrow column names use underscores (`id_orig_h`). All typed schemas include a non-null `_extra` JSON column that captures every field not listed above, as well as any field whose runtime type does not match the expected Arrow type (best-effort, type-mismatch-safe mapping).
+Note: Zeek JSON uses dot-notation for connection-id fields (`id.orig_h`, etc.); the Arrow column names use underscores (`id_orig_h`). All typed schemas include a non-null `_extra` JSON column that captures every field not listed above, as well as any field whose runtime type does not match the expected Arrow type (best-effort, type-mismatch-safe mapping). Every typed schema also ends with a non-null `partition_time` column (Arrow `Timestamp(Microsecond, UTC)`) — see below.
 
-`ts` is written as a microsecond-precision UTC timestamp (Arrow `Timestamp(Microsecond, UTC)`), suitable as an Iceberg day/month/year/hour partition-transform source.
+`ts` is written as a microsecond-precision UTC timestamp (Arrow `Timestamp(Microsecond, UTC)`), but it is **nullable** in all seven Zeek schemas (six typed plus the envelope), so it is not a safe Iceberg partition-transform source: a file with even one row missing `ts` would yield two partition values (`{date, null}`) and Iceberg refuses the write. Use the non-null `partition_time` column instead — it holds the instant (the record's own `ts` when present and within a bounded backfill/skew window of receipt, otherwise the receipt time) that the file's buffer day was actually derived from, and is guaranteed non-null and single-valued per file.
 
 **Envelope fallback**:
-Records with a `_path` value that does not match one of the six curated stream names (including `"unknown"`) are routed to a generic envelope schema with columns: `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `log_path`, `ingest_time`, `payload`. The full JSON object is stored verbatim in `payload`.
+Records with a `_path` value that does not match one of the six curated stream names (including `"unknown"`) are routed to a generic envelope schema with columns: `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `log_path`, `ingest_time`, `payload`, `partition_time`. The full JSON object is stored verbatim in `payload`.
 
 **Robustness**:
 - Lines longer than 16 MiB are rejected and the connection is closed; the `zeek_oversized_lines` counter is incremented.
@@ -332,7 +332,7 @@ max_buffer_rows       = 100000          # hard-cap rows before oldest are droppe
 
 The `[ipfix.s3]` block is optional; when absent, flows are handled by the default handler (logged only) and no S3 writes occur.
 
-**Parquet Schema** (fixed, 18 columns):
+**Parquet Schema** (fixed, 19 columns):
 
 | Column | Type | Nullable |
 |--------|------|----------|
@@ -354,8 +354,11 @@ The `[ipfix.s3]` block is optional; when absent, flows are handled by the defaul
 | input_interface | UInt32 | yes |
 | output_interface | UInt32 | yes |
 | extra | String (JSON) | no |
+| partition_time | Timestamp(µs, UTC) | no |
 
 Objects are stored at `ipfix/year=YYYY/month=MM/day=DD/<uuid>.parquet`, distinct from syslog's `syslog/` prefix. Files are ZSTD-compressed.
+
+`flow_start` and `flow_end` are nullable, so neither is a safe Iceberg partition-transform source on its own — a file with a null in either would yield two partition values and Iceberg refuses the write. `partition_time` is the correct source: it is non-null, derived from `export_time` (clamped to a bounded backfill/skew window around receipt time and otherwise falling back to receipt time), and holds the instant the file's buffer day was actually derived from.
 
 **Memory safety**: when S3 is unavailable and the buffer exceeds `max_buffer_rows * 4` rows, the oldest batches are dropped and the `parquet_s3_buffer_dropped{source="ipfix"}` counter is incremented.
 
@@ -438,8 +441,8 @@ sum = ["octet_delta_count", "packet_delta_count"]
 ```
 
 Output lands at `<prefix>/<rule>/year=/month=/day=/<uuid>.parquet` with one
-column per `group_by` field, a `count`, one column per `sum`/`min`/`max`, and
-`window_start`/`window_end`.
+column per `group_by` field, a `count`, one column per `sum`/`min`/`max`,
+`window_start`/`window_end`, and `partition_time`.
 
 Column names in the output schema:
 
@@ -451,12 +454,19 @@ Column names in the output schema:
 | each `min` field | `min_<field>` |
 | each `max` field | `max_<field>` |
 | — | `window_start`, `window_end` (always present) |
+| — | `partition_time` (always present, non-null; see below) |
 
 For the `flow_talkers` rule above, the schema is: `src_addr, dst_addr,
 dst_port, count, sum_octet_delta_count, sum_packet_delta_count, window_start,
-window_end`. A `group_by` entry can't be named `count`, and no two output
+window_end, partition_time`. A `group_by` entry can't be named `count`, and no two output
 columns may collide (e.g. `group_by = ["sum_x"]` with `sum = ["x"]`) — both
 are rejected at startup.
+
+`partition_time` is materialised last and always equals `window_start` for
+aggregate output (both were already non-null), but it is the column to
+declare an Iceberg partition transform against — it is the one name every
+sink's schema agrees on, so the same committer logic works unmodified
+across all nine.
 
 Notes:
 

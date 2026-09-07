@@ -122,7 +122,7 @@ A flush encodes all buffered batches into a single Parquet file (ZSTD compressio
 
 **Arrow schema**
 
-The Parquet files use a fixed 18-column schema (in order):
+The Parquet files use a fixed 19-column schema (in order):
 
 | Column | Arrow type | Nullable |
 |--------|-----------|---------|
@@ -144,8 +144,9 @@ The Parquet files use a fixed 18-column schema (in order):
 | input_interface | UInt32 | yes |
 | output_interface | UInt32 | yes |
 | extra | Utf8 | no |
+| partition_time | Timestamp(µs, UTC) | no |
 
-IP addresses are stored as UTF-8 strings. Timestamps are microsecond-precision UTC timestamps, usable directly as Iceberg partition-transform sources.
+IP addresses are stored as UTF-8 strings. Timestamps are microsecond-precision UTC timestamps. `flow_start` and `flow_end` are nullable, so neither is safe to declare an Iceberg partition transform on directly — a file with a null in either yields two partition values and Iceberg refuses the write. `partition_time` is the column to use: it is non-null, derived from `export_time` (clamped to a bounded backfill/skew window around receipt time and falling back to receipt time outside it), and equals the instant the file's buffer day was actually derived from.
 
 ### 6. Configuration
 
