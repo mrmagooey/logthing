@@ -204,26 +204,31 @@ mod tests {
     #[tokio::test]
     async fn slow_handle_is_aborted_on_timeout() {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
-        let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel::<()>();
 
         let handle = tokio::spawn(async move {
             let _ = started_tx.send(());
             tokio::time::sleep(Duration::from_secs(30)).await;
-            // If the abort didn't happen, this would eventually run and
-            // signal completion — the test asserts it never does.
-            let _ = finished_tx.send(());
         });
+        let probe = handle.abort_handle();
 
         started_rx.await.expect("task should have started");
 
         drain_listener_handles(vec![handle], Duration::from_millis(100)).await;
 
-        // The task was aborted before it could reach the `sleep`'s end and
-        // signal completion — a dropped sender closes the channel instead.
-        assert!(
-            finished_rx.try_recv().is_err(),
-            "aborted task must not have run to completion"
-        );
+        // `AbortHandle::is_finished()` can lag `abort()`: per tokio's own
+        // docs, "the cancellation process may take some time, and this
+        // method does not return `true` until it has completed" — so poll
+        // briefly rather than asserting immediately. It sleeps 30s, so it
+        // cannot have finished on its own inside a 100ms timeout, meaning
+        // this loop only ends in success if the task was truly aborted.
+        let poll_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !probe.is_finished() {
+            assert!(
+                std::time::Instant::now() < poll_deadline,
+                "handle that overran its timeout must have been aborted, not just abandoned"
+            );
+            tokio::task::yield_now().await;
+        }
     }
 
     /// A normally-running handle that finishes within the timeout is awaited
