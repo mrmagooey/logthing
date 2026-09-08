@@ -167,7 +167,8 @@ keytab = "/etc/logthing/krb5.keytab"
 - When `enabled = true`, every HTTP endpoint (`/wsman`, `/syslog`, admin API, etc.) enforces Kerberos authentication before any route logic runs.
 - `spn` must match the service principal registered in Active Directory (format `HTTP/hostname@REALM`).
 - `keytab` (optional) points to the keytab that contains the service principal’s keys. If provided, logthing sets `KRB5_KTNAME` automatically so `libgssapi` can decrypt tickets.
-- Handlers can read the authenticated user principal via the `axum_negotiate::Upn` extractor if you need per-user auditing.
+- The middleware logs the authenticated client principal at `debug` level; there is no extractor exposing it to handlers.
+- Only two-pass SPNEGO is supported: the client is expected to already hold a Kerberos ticket and send a single, complete `Negotiate` token, as real Kerberos-over-HTTP normally works. Multi-leg negotiation (as an NTLM fallback would need) is not implemented — a token that comes back "continue needed" is rejected with `401` rather than tracked across requests.
 
 #### Active Directory Setup (Kerberos clients → logthing)
 

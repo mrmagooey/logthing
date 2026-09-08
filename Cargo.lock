@@ -959,24 +959,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "axum-negotiate"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be40d3baa9564caa74122e7a5b0e2d8ec215b09abc85543588f145c525d13b84"
-dependencies = [
- "async-trait",
- "axum-core",
- "base64 0.22.1",
- "futures-util",
- "http 1.4.0",
- "libgssapi",
- "log",
- "thiserror 1.0.69",
- "tower-layer",
- "tower-service",
-]
-
-[[package]]
 name = "axum-server"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1056,7 +1038,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -1441,7 +1423,7 @@ dependencies = [
  "clap",
  "criterion-plot",
  "is-terminal",
- "itertools 0.10.5",
+ "itertools",
  "num-traits",
  "once_cell",
  "oorandom",
@@ -1462,7 +1444,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b50826342786a51a89e2da3a28f1c32b06e387201bc2d19791f622c673706b1"
 dependencies = [
  "cast",
- "itertools 0.10.5",
+ "itertools",
 ]
 
 [[package]]
@@ -2457,15 +2439,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2673,7 +2646,6 @@ dependencies = [
  "aws-sdk-s3",
  "axum",
  "axum-extra",
- "axum-negotiate",
  "axum-server",
  "base64 0.22.1",
  "bytes",
@@ -2685,6 +2657,7 @@ dependencies = [
  "headers",
  "hex",
  "ipnet",
+ "libgssapi",
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-util",
@@ -3436,7 +3409,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools",
  "proc-macro2",
  "quote",
  "syn 2.0.114",

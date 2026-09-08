@@ -18,6 +18,14 @@ COPY Cargo.toml Cargo.lock ./
 # Copy source code
 COPY src ./src
 
+# Cargo.toml declares `tools/loadgen` as a workspace member (unrelated to
+# this image — `default-members` keeps it out of the actual build) and a
+# `[[bench]]` list under `benches/`, but cargo parses the whole manifest
+# (workspace members + bench targets) before building anything, so both
+# must exist in the build context even though nothing here runs them.
+COPY tools ./tools
+COPY benches ./benches
+
 # Build release binary with Kerberos feature
 RUN cargo build --release --features kerberos-auth
 
@@ -41,6 +49,26 @@ COPY logthing.toml /etc/logthing/config.toml
 
 # Create directory for certificates and keytabs
 RUN mkdir -p /etc/logthing/certs /etc/logthing/keytabs
+
+# Generate a throwaway keytab for the e2e SPN, entirely offline. No KDC is
+# involved or required: writing a keytab entry is a local `ktutil`
+# operation, and acquiring a GSSAPI *acceptor* credential from it (what
+# `logthing` does at startup) only reads this file — it never contacts a
+# KDC. Path must match `security.kerberos.keytab` in
+# config/logthing-kerberos.toml.
+#
+# `addent -key` (a raw hex key), not `addent -password`: `-password` reads
+# via a getpass()-style prompt that requires a real terminal, which a
+# `RUN` step's piped, non-tty stdin can't satisfy — it silently fails to
+# read the "password" line and then chokes on it as an unrecognized
+# command. `-key` reads the same piped stdin as a plain hex string, which
+# works non-interactively. The hex string below is not derived from any
+# real secret — it exists only so the e2e fixture's keytab has a
+# structurally valid AES256 entry for the acceptor to load.
+RUN mkdir -p /etc/wef-server/keytabs && \
+    printf 'addent -key -p HTTP/wef-server@EXAMPLE.COM -k 1 -e aes256-cts-hmac-sha1-96\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd\nwkt /etc/wef-server/keytabs/wef.keytab\nquit\n' \
+        | ktutil && \
+    chmod 644 /etc/wef-server/keytabs/wef.keytab
 
 # Expose ports
 EXPOSE 5985 5986 9090

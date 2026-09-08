@@ -19,12 +19,32 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   labeled `protocol` with one of `syslog_udp`, `syslog_tcp`, `ipfix`,
   `sflow`, `zeek`, or `suricata`, so a misconfigured allowlist is visible in
   metrics rather than only in debug/warn logs.
+- `security.kerberos` (feature `kerberos-auth`) now performs real RFC 4559
+  SPNEGO/GSSAPI validation instead of the previous fail-closed stub.
+  **Behaviour change**: previously, enabling `security.kerberos` rejected
+  *every* request — 401 for a missing token, 501 for any `Negotiate` token,
+  because validation was never implemented. It now actually authenticates
+  clients holding a valid Kerberos ticket for the configured SPN. Only
+  two-pass SPNEGO is supported; NTLM-style multi-leg negotiation is not (see
+  README).
+- Replaced the LGPL-3.0-or-later `axum-negotiate` dependency (unused dead
+  weight, and incompatible with this crate's MIT licence for static-linked
+  release binaries) with MIT-licensed `libgssapi` for Kerberos SPNEGO
+  support.
 
 ### Added
 
 - A startup warning is now logged when `hec.enabled = true` and `hec.token`
   is left empty — that combination accepts any (or no) `Authorization`
   header on the HEC ingest routes, which is only intended for local dev.
+- The same warning now also covers `otlp.enabled = true` (feature `otlp`)
+  with an empty or unset `otlp.bearer_token` — that combination accepts any
+  (or no) `Authorization` header on `/v1/logs`.
+- `syslog.http_token` (optional, empty by default): when set, the `/syslog`
+  HTTP route requires `Authorization: Bearer <token>`, checked the same
+  constant-time way as the OTLP/HEC bearer tokens. Empty (the default)
+  preserves the existing no-auth behaviour, since `/syslog` is mounted
+  unconditionally regardless of `syslog.enabled`.
 
 ## [0.16.0] - 2026-09-06
 
