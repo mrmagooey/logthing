@@ -184,12 +184,22 @@ def test_metrics_endpoint():
         return True  # Don't fail on metrics issues
 
 
-def test_wsman_with_auth():
-    """Test that WEF endpoint accepts requests with Negotiate header."""
-    url = f"{WEF_ENDPOINT}/wsman"
-    print(f"\nTesting WEF endpoint with auth header: {url}")
+def test_wsman_rejects_garbage_token():
+    """Test that WEF endpoint rejects a syntactically valid but bogus
+    Negotiate token.
 
-    # Send a request with a dummy Negotiate token
+    This used to be `test_wsman_with_auth`, asserting the OPPOSITE: that any
+    non-401 response was a pass. That only worked because the server had no
+    real GSSAPI validation and returned 501 for any Negotiate header, so
+    "not 401" was trivially true. Now that SPNEGO validation is real, a
+    garbage token (base64 of the literal string "test", not an actual
+    SPNEGO token) must be rejected exactly like no token at all: 401, never
+    501 and never a bypass to 200.
+    """
+    url = f"{WEF_ENDPOINT}/wsman"
+    print(f"\nTesting WEF endpoint rejects a bogus Negotiate token: {url}")
+
+    # Send a request with a dummy, non-SPNEGO Negotiate token
     headers = {
         "Content-Type": "application/soap+xml",
         "Authorization": "Negotiate dGVzdA==",  # Base64 "test"
@@ -203,16 +213,14 @@ def test_wsman_with_auth():
 
     try:
         resp = requests.post(url, data=body, headers=headers, timeout=10)
-        # With the auth header, request should be processed (not 401)
-        # It may return 400 for bad XML, but should NOT return 401
         if resp.status_code == 401:
-            print(f"✗ WEF endpoint returned 401 even with Authorization header")
-            return False
+            print(f"✓ WEF endpoint correctly rejected a bogus Negotiate token (401)")
+            return True
         else:
             print(
-                f"✓ WEF endpoint accepted request with Authorization header (returned {resp.status_code})"
+                f"✗ WEF endpoint returned {resp.status_code} for a bogus Negotiate token, expected 401"
             )
-            return True
+            return False
     except requests.RequestException as e:
         print(f"✗ Request failed: {e}")
         return False
@@ -236,7 +244,9 @@ def main():
 
     results.append(("Health endpoint (no auth)", test_health_endpoint_no_auth()))
     results.append(("WEF endpoint requires auth", test_wsman_requires_auth()))
-    results.append(("WEF endpoint accepts auth", test_wsman_with_auth()))
+    results.append(
+        ("WEF endpoint rejects bogus auth token", test_wsman_rejects_garbage_token())
+    )
     results.append(
         ("WEF events endpoint requires auth", test_wsman_events_requires_auth())
     )

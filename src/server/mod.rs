@@ -134,6 +134,16 @@ impl Server {
                     info!("KRB5_KTNAME set to {:?}", keytab);
                 }
 
+                // Fail-fast: acquire (and immediately drop) a server
+                // credential for `spn` now, so a bad SPN, missing keytab, or
+                // unreadable key material aborts startup instead of quietly
+                // 401-ing every request later. We do not keep this
+                // credential around — see `acquire_kerberos_cred` for why a
+                // credential can't be shared across requests with this API.
+                acquire_kerberos_cred(&spn).map_err(|e| {
+                    anyhow!("Kerberos startup validation failed for SPN {}: {}", spn, e)
+                })?;
+
                 info!("Kerberos authentication enabled for SPN {}", spn);
             }
         }
@@ -564,6 +574,19 @@ impl Server {
         Ok(())
     }
 
+    /// NOTE ON LAYER ORDER: this is applied to `protected_router` *after*
+    /// `shared_layers` (the IP whitelist). `Route::layer` wraps the existing
+    /// service, so last-applied is outermost — meaning Kerberos runs BEFORE
+    /// the IP whitelist. While this middleware was an unimplemented stub that
+    /// returned instantly, that was free. It no longer is: a request from an
+    /// IP the allowlist would reject still costs a keytab read plus GSSAPI
+    /// crypto on a blocking thread first. It stays bounded by the router-wide
+    /// concurrency limit and timeout, so it is not an unbounded amplifier, but
+    /// applying this layer before `shared_layers` (making the whitelist
+    /// outermost) would be strictly cheaper. Left as-is deliberately: the
+    /// ordering predates this change, and `create_router`'s layer attachment
+    /// is not currently covered by any test, so a silent reordering mistake
+    /// would not be caught.
     #[cfg(feature = "kerberos-auth")]
     fn apply_kerberos_layer(&self, router: Router) -> anyhow::Result<Router> {
         let kerberos = &self.config.security.kerberos;
@@ -577,17 +600,14 @@ impl Server {
         })?;
 
         info!("Applying Kerberos authentication layer for SPN: {}", spn);
-        error!(
-            "SECURITY: Kerberos token validation is NOT implemented. \
-             The kerberos_auth_middleware will REJECT ALL requests (fail-closed) \
-             until real GSSAPI/SPNEGO validation is added. \
-             Do NOT use this in production without a complete implementation."
-        );
 
-        // Use route-layer approach with custom middleware
-        // The kerberos_auth_middleware fails closed: it rejects all requests
-        // because token validation is not implemented.
-        Ok(router.layer(middleware::from_fn(kerberos_auth_middleware)))
+        // Middleware state is just the SPN string — no GSS handle is shared
+        // across requests. See `acquire_kerberos_cred` for why.
+        let spn_state = Arc::new(spn.clone());
+        Ok(router.layer(middleware::from_fn_with_state(
+            spn_state,
+            kerberos_auth_middleware,
+        )))
     }
 
     #[cfg(not(feature = "kerberos-auth"))]
@@ -601,47 +621,217 @@ impl Server {
     }
 }
 
-/// Kerberos authentication middleware
+/// Acquire a GSSAPI server (acceptor) credential for `spn`, restricted to the
+/// SPNEGO mechanism.
 ///
-/// FAIL-CLOSED: GSSAPI/SPNEGO token validation is not implemented.
-/// This middleware rejects ALL requests rather than passing unvalidated tokens
-/// through. Any request without a `Negotiate` header gets a 401 challenge.
-/// Any request WITH a `Negotiate` token gets a 501 Not Implemented response,
-/// because we cannot validate the token and must not treat it as authenticated.
+/// Deliberately re-acquired for every request (see `accept_kerberos_token`)
+/// rather than acquired once and shared, even though that means reading the
+/// local keytab per request:
 ///
-/// To make this functional, replace the 501 path with real GSSAPI validation.
+/// * `libgssapi::credential::Cred` has no `Clone`/`Copy`, and its raw-handle
+///   constructor/accessor (`from_c`/`to_c`) are `pub(crate)` inside the
+///   `libgssapi` crate (credential.rs:239,243) — application code cannot
+///   duplicate a `Cred` or hand out a borrowed view of one.
+/// * `ServerCtx::new(cred: Cred)` takes the credential by value
+///   (context.rs:506) and never gives it back — no `&Cred` constructor, no
+///   way to reclaim the `Cred` afterward. Whatever `Cred` it's given dies
+///   (releasing the GSSAPI handle via `Cred`'s `Drop`, credential.rs:81-95)
+///   when that `ServerCtx` is dropped at the end of the request.
+/// * Reusing one long-lived `ServerCtx` across many requests instead of
+///   reusing the `Cred` is not a safe workaround either: once `step()`
+///   reaches `ServerCtxState::Complete` it short-circuits and returns
+///   `Ok(None)` without even inspecting the new token (context.rs:522-527).
+///   A second, unrelated client hitting that same already-complete context
+///   would be silently authenticated regardless of what — if anything — it
+///   sent: an auth bypass.
+///
+/// So: one `Cred`, thrown away with its `ServerCtx`, per request.
+/// `Cred::acquire` for an acceptor credential reads the local keytab and
+/// does not contact a KDC, and `/wsman` is a low-QPS endpoint, so this is an
+/// acceptable cost for correctness. Do not add a cache in front of this — a
+/// cache is exactly the shared-handle problem above, just deferred.
 #[cfg(feature = "kerberos-auth")]
-async fn kerberos_auth_middleware(request: Request, _next: Next) -> Response {
-    // Check if Authorization header is present with a Negotiate token.
-    let has_negotiate = request
-        .headers()
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.starts_with("Negotiate "))
-        .unwrap_or(false);
+fn acquire_kerberos_cred(spn: &str) -> anyhow::Result<libgssapi::credential::Cred> {
+    use libgssapi::{
+        credential::{Cred, CredUsage},
+        name::Name,
+        oid::{GSS_MECH_KRB5, GSS_MECH_SPNEGO, GSS_NT_KRB5_PRINCIPAL, OidSet},
+    };
 
-    if !has_negotiate {
-        // No token supplied — return 401 with WWW-Authenticate challenge.
-        return Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .header("WWW-Authenticate", "Negotiate")
-            .body(axum::body::Body::from("Unauthorized"))
-            .unwrap();
+    let name = Name::new(spn.as_bytes(), Some(&GSS_NT_KRB5_PRINCIPAL))
+        .map_err(|e| anyhow!("invalid Kerberos SPN {:?}: {}", spn, e))?;
+    // Canonicalize against krb5 so `Cred::acquire` gets an unambiguous
+    // mechanism name, matching the crate's own server-setup example.
+    let name = name
+        .canonicalize(Some(&GSS_MECH_KRB5))
+        .map_err(|e| anyhow!("failed to canonicalize Kerberos SPN {:?}: {}", spn, e))?;
+
+    let mut mechs =
+        OidSet::new().map_err(|e| anyhow!("gssapi OID set allocation failed: {}", e))?;
+    mechs
+        .add(&GSS_MECH_SPNEGO)
+        .map_err(|e| anyhow!("failed to build SPNEGO mechanism set: {}", e))?;
+
+    Cred::acquire(Some(&name), None, CredUsage::Accept, Some(&mechs)).map_err(|e| {
+        anyhow!(
+            "failed to acquire Kerberos credential for SPN {:?}: {}",
+            spn,
+            e
+        )
+    })
+}
+
+/// Outcome of one SPNEGO `accept_sec_context` step.
+#[cfg(feature = "kerberos-auth")]
+enum AcceptOutcome {
+    Authenticated {
+        /// Mutual-auth response token (RFC 4559), if the mechanism produced one.
+        response_token: Option<Vec<u8>>,
+        principal: String,
+    },
+    /// The context needs another leg. Multi-leg negotiation is unsupported
+    /// (see `kerberos_auth_middleware` docs) — callers must reject this.
+    ContinueNeeded,
+}
+
+/// Run one SPNEGO accept step against a freshly acquired credential.
+///
+/// Blocking: `gss_acquire_cred`/`gss_accept_sec_context` are synchronous
+/// GSSAPI calls (keytab I/O, crypto). Callers must run this via
+/// `tokio::task::spawn_blocking`, never directly on the async runtime.
+#[cfg(feature = "kerberos-auth")]
+fn accept_kerberos_token(spn: &str, token: &[u8]) -> anyhow::Result<AcceptOutcome> {
+    use libgssapi::context::{SecurityContext, ServerCtx};
+
+    let cred = acquire_kerberos_cred(spn)?;
+    let mut ctx = ServerCtx::new(cred);
+    let response_token = ctx.step(token)?;
+
+    if !ctx.is_complete() {
+        return Ok(AcceptOutcome::ContinueNeeded);
     }
 
-    // A Negotiate token was supplied but we cannot validate it: fail closed.
-    // Passing an unvalidated token through would be a complete auth bypass.
-    error!(
-        "Kerberos authentication is enabled but token validation is not implemented; \
-         refusing request (fail-closed)"
-    );
+    let principal = ctx
+        .source_name()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+
+    Ok(AcceptOutcome::Authenticated {
+        response_token: response_token.map(|tok| tok.to_vec()),
+        principal,
+    })
+}
+
+/// Classification of an `Authorization` header for SPNEGO purposes. Pure and
+/// GSSAPI-free on purpose, so the challenge/rejection logic is unit-testable
+/// without a keytab or KDC.
+#[cfg(feature = "kerberos-auth")]
+#[derive(Debug, PartialEq, Eq)]
+enum NegotiateHeader {
+    Missing,
+    WrongScheme,
+    MalformedBase64,
+    Token(Vec<u8>),
+}
+
+#[cfg(feature = "kerberos-auth")]
+fn classify_negotiate_header(header: Option<&str>) -> NegotiateHeader {
+    let Some(value) = header else {
+        return NegotiateHeader::Missing;
+    };
+    let Some(b64) = value.strip_prefix("Negotiate ") else {
+        return NegotiateHeader::WrongScheme;
+    };
+    use base64::Engine;
+    match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+        Ok(tok) => NegotiateHeader::Token(tok),
+        Err(_) => NegotiateHeader::MalformedBase64,
+    }
+}
+
+#[cfg(feature = "kerberos-auth")]
+fn kerberos_unauthorized() -> Response {
     Response::builder()
-        .status(StatusCode::NOT_IMPLEMENTED)
-        .body(axum::body::Body::from(
-            "Kerberos authentication is enabled but token validation is not implemented; \
-             refusing all requests",
-        ))
+        .status(StatusCode::UNAUTHORIZED)
+        .header("WWW-Authenticate", "Negotiate")
+        .body(axum::body::Body::from("Unauthorized"))
         .unwrap()
+}
+
+/// RFC 4559 SPNEGO ("Negotiate") authentication middleware.
+///
+/// Deliberately two-pass only: real Kerberos-over-HTTP is inherently
+/// two-legged (the client already holds a ticket from the KDC before it
+/// ever talks to us), so a single `Authorization: Negotiate` header carrying
+/// a complete token is all a genuine client ever sends. Multi-leg
+/// negotiation — which NTLM fallback would need — requires carrying GSSAPI
+/// state across requests; this middleware does not do that. A `step()` that
+/// comes back continue-needed is rejected with 401, not tracked for a
+/// follow-up leg. The LGPL `axum-negotiate` crate this replaced documented
+/// the same limitation.
+#[cfg(feature = "kerberos-auth")]
+async fn kerberos_auth_middleware(
+    State(spn): State<Arc<String>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let header = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    let token = match classify_negotiate_header(header.as_deref()) {
+        NegotiateHeader::Token(tok) => tok,
+        NegotiateHeader::Missing
+        | NegotiateHeader::WrongScheme
+        | NegotiateHeader::MalformedBase64 => {
+            return kerberos_unauthorized();
+        }
+    };
+
+    // GSSAPI work is blocking (keytab I/O + crypto) — never run it inline on
+    // the async runtime.
+    let result = tokio::task::spawn_blocking(move || accept_kerberos_token(&spn, &token)).await;
+
+    match result {
+        Ok(Ok(AcceptOutcome::Authenticated {
+            response_token,
+            principal,
+        })) => {
+            debug!("Kerberos authenticated client principal: {}", principal);
+            let mut response = next.run(request).await;
+            if let Some(tok) = response_token {
+                use base64::Engine;
+                let value = format!(
+                    "Negotiate {}",
+                    base64::engine::general_purpose::STANDARD.encode(tok)
+                );
+                if let Ok(value) = axum::http::HeaderValue::from_str(&value) {
+                    response.headers_mut().insert("WWW-Authenticate", value);
+                }
+            }
+            response
+        }
+        Ok(Ok(AcceptOutcome::ContinueNeeded)) => {
+            warn!(
+                "Kerberos: client at {} needs multi-leg negotiation, which is unsupported; rejecting",
+                addr
+            );
+            kerberos_unauthorized()
+        }
+        Ok(Err(e)) => {
+            // Log server-side only — the response body must not leak GSSAPI
+            // internals to the client.
+            warn!("Kerberos authentication failed for {}: {}", addr, e);
+            kerberos_unauthorized()
+        }
+        Err(join_err) => {
+            error!("Kerberos auth worker task panicked: {}", join_err);
+            kerberos_unauthorized()
+        }
+    }
 }
 
 async fn handle_wef_request(
@@ -988,29 +1178,46 @@ mod tests {
 
     #[tokio::test]
     async fn handle_syslog_http_parses_message() {
+        let state = default_state().await;
         let addr: SocketAddr = "192.0.2.10:5514".parse().unwrap();
         let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: client 192.168.1.100#12345: query: example.com IN A + (93.184.216.34)";
 
-        let ok_response = handle_syslog_http(ConnectInfo(addr), Bytes::from(msg))
-            .await
-            .into_response();
+        let ok_response = handle_syslog_http(
+            State(state.clone()),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+            Bytes::from(msg),
+        )
+        .await
+        .into_response();
         assert_eq!(ok_response.status(), StatusCode::OK);
 
-        let bad_response = handle_syslog_http(ConnectInfo(addr), Bytes::from("not syslog"))
-            .await
-            .into_response();
+        let bad_response = handle_syslog_http(
+            State(state),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+            Bytes::from("not syslog"),
+        )
+        .await
+        .into_response();
         assert_eq!(bad_response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn handle_syslog_http_with_rfc5424_message() {
+        let state = default_state().await;
         let addr: SocketAddr = "192.0.2.10:5514".parse().unwrap();
         // RFC 5424 format
         let msg = r#"<165>1 2024-01-15T10:33:45.000Z dns-server named 1234 - [dns@12345 query="example.com"] DNS query"#;
 
-        let response = handle_syslog_http(ConnectInfo(addr), Bytes::from(msg))
-            .await
-            .into_response();
+        let response = handle_syslog_http(
+            State(state),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+            Bytes::from(msg),
+        )
+        .await
+        .into_response();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -1224,13 +1431,19 @@ mod tests {
 
     #[tokio::test]
     async fn handle_syslog_http_with_dns_log() {
+        let state = default_state().await;
         let addr: SocketAddr = "192.0.2.10:5514".parse().unwrap();
         // BIND DNS query format
         let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: client 192.168.1.100#12345: query: example.com IN A + (93.184.216.34)";
 
-        let response = handle_syslog_http(ConnectInfo(addr), Bytes::from(msg))
-            .await
-            .into_response();
+        let response = handle_syslog_http(
+            State(state),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+            Bytes::from(msg),
+        )
+        .await
+        .into_response();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -1421,13 +1634,19 @@ mod tests {
     /// 400 for one that is structurally invalid (missing priority bracket).
     #[tokio::test]
     async fn handle_syslog_http_rejects_structurally_invalid_message() {
+        let state = default_state().await;
         let addr: SocketAddr = "10.0.0.2:514".parse().unwrap();
         // Missing the leading '<' so the PRI field is absent — not a valid syslog frame.
         let bad_msg = "134>Jun 22 09:00:00 host app[99]: message without pri bracket";
 
-        let response = handle_syslog_http(ConnectInfo(addr), Bytes::from(bad_msg))
-            .await
-            .into_response();
+        let response = handle_syslog_http(
+            State(state),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+            Bytes::from(bad_msg),
+        )
+        .await
+        .into_response();
         assert_eq!(
             response.status(),
             StatusCode::BAD_REQUEST,
@@ -1435,76 +1654,103 @@ mod tests {
         );
     }
 
-    /// CR-1 regression: kerberos_auth_middleware must fail CLOSED.
-    ///
-    /// A request bearing a syntactically valid `Authorization: Negotiate <token>`
-    /// header must NOT be passed through as authenticated. Because token validation
-    /// is not implemented the middleware must return a non-2xx error status (501)
-    /// rather than calling next and returning 200.
-    #[cfg(feature = "kerberos-auth")]
-    #[tokio::test]
-    async fn kerberos_middleware_rejects_negotiate_token_fail_closed() {
-        use axum::body::Body;
-        use axum::http::Request as HttpRequest;
-        use tower::ServiceExt; // for `oneshot`
-
-        // Build a minimal router with the kerberos middleware applied.
-        // The inner handler always returns 200 so any 200 response means
-        // the middleware passed the request through (a bypass).
-        let app = Router::new()
-            .route("/", axum::routing::get(|| async { StatusCode::OK }))
-            .layer(middleware::from_fn(kerberos_auth_middleware));
-
-        // Fire a request with a Negotiate token (base64 "foo" = Zm9v).
-        let request = HttpRequest::builder()
-            .uri("/")
-            .header("Authorization", "Negotiate Zm9v")
-            .body(Body::empty())
-            .unwrap();
-
-        let response = app.oneshot(request).await.unwrap();
-
-        // Must NOT be 200 — the token was never validated.
-        assert_ne!(
-            response.status(),
-            StatusCode::OK,
-            "kerberos middleware must not pass unvalidated Negotiate tokens through"
-        );
-        // Must be 501 Not Implemented (fail-closed denial).
-        assert_eq!(
-            response.status(),
-            StatusCode::NOT_IMPLEMENTED,
-            "kerberos middleware must return 501 when token validation is unimplemented"
-        );
+    /// Helper: build state with `syslog.http_token` set to `token`.
+    async fn state_with_syslog_token(token: &str) -> Arc<AppState> {
+        let mut cfg = Config::default();
+        cfg.syslog.http_token = token.to_string();
+        build_state_with_config(cfg).await
     }
 
-    /// CR-1 regression: kerberos_auth_middleware returns 401 challenge when no
-    /// Authorization header is present (unchanged behaviour, included for completeness).
-    #[cfg(feature = "kerberos-auth")]
     #[tokio::test]
-    async fn kerberos_middleware_challenges_unauthenticated_requests() {
-        use axum::body::Body;
-        use axum::http::Request as HttpRequest;
-        use tower::ServiceExt;
+    async fn handle_syslog_http_with_token_configured_rejects_missing_header() {
+        let state = state_with_syslog_token("s3cr3t").await;
+        let addr: SocketAddr = "10.0.0.3:514".parse().unwrap();
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: hello";
 
-        let app = Router::new()
-            .route("/", axum::routing::get(|| async { StatusCode::OK }))
-            .layer(middleware::from_fn(kerberos_auth_middleware));
-
-        let request = HttpRequest::builder().uri("/").body(Body::empty()).unwrap();
-
-        let response = app.oneshot(request).await.unwrap();
-
-        assert_eq!(
-            response.status(),
-            StatusCode::UNAUTHORIZED,
-            "kerberos middleware must challenge requests without an Authorization header"
-        );
-        assert!(
-            response.headers().contains_key("www-authenticate"),
-            "401 response must include WWW-Authenticate header"
-        );
+        let response = handle_syslog_http(
+            State(state),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+            Bytes::from(msg),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+
+    #[tokio::test]
+    async fn handle_syslog_http_with_token_configured_rejects_wrong_token() {
+        let state = state_with_syslog_token("s3cr3t").await;
+        let addr: SocketAddr = "10.0.0.3:514".parse().unwrap();
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: hello";
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong-token".parse().unwrap());
+
+        let response =
+            handle_syslog_http(State(state), ConnectInfo(addr), headers, Bytes::from(msg))
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn handle_syslog_http_with_token_configured_rejects_malformed_header() {
+        let state = state_with_syslog_token("s3cr3t").await;
+        let addr: SocketAddr = "10.0.0.3:514".parse().unwrap();
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: hello";
+        let mut headers = HeaderMap::new();
+        // Missing the "Bearer " prefix.
+        headers.insert("authorization", "s3cr3t".parse().unwrap());
+
+        let response =
+            handle_syslog_http(State(state), ConnectInfo(addr), headers, Bytes::from(msg))
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn handle_syslog_http_with_token_configured_accepts_correct_token() {
+        let state = state_with_syslog_token("s3cr3t").await;
+        let addr: SocketAddr = "10.0.0.3:514".parse().unwrap();
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: hello";
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer s3cr3t".parse().unwrap());
+
+        let response =
+            handle_syslog_http(State(state), ConnectInfo(addr), headers, Bytes::from(msg))
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Back-compat case: empty configured token (the default) must skip auth
+    /// entirely, even with no `Authorization` header — every existing
+    /// deployment must see zero behavior change.
+    #[tokio::test]
+    async fn handle_syslog_http_with_empty_token_and_no_header_returns_200() {
+        let state = default_state().await;
+        let addr: SocketAddr = "10.0.0.3:514".parse().unwrap();
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: hello";
+
+        let response = handle_syslog_http(
+            State(state),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+            Bytes::from(msg),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // CR-1's old fail-closed-stub regression tests (asserting the middleware
+    // returned 501 for any Negotiate token) lived here. They're superseded
+    // by the `kerberos_auth_tests` submodule near the end of this file,
+    // which covers the same "no Authorization header -> 401 challenge" case
+    // plus real classification/rejection paths now that GSSAPI validation
+    // is implemented — a Negotiate token is now expected to yield 401 (auth
+    // actually attempted and failed), never the old 501.
 
     // ------------------------------------------------------------------ //
     // build_tls_config error branches                                     //
@@ -2156,6 +2402,93 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------ //
+    // syslog.http_token: opt-in bearer auth on the unconditionally-mounted //
+    // /syslog route, exercised through the REAL create_router path.       //
+    // ------------------------------------------------------------------ //
+
+    /// Default config (empty `syslog.http_token`) must accept a request with
+    /// no `Authorization` header at all — the back-compat case that matters
+    /// most, since `/syslog` is mounted unconditionally for every deployment.
+    #[tokio::test]
+    async fn syslog_route_with_empty_token_accepts_request_without_header() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let config = Config::default(); // syslog.http_token defaults to ""
+        let server = build_server(config).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds");
+
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: hello";
+        let req = with_connect_info(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/syslog")
+                .body(Body::from(msg))
+                .unwrap(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// With `syslog.http_token` configured, a request with no `Authorization`
+    /// header is rejected with 401 through the real router.
+    #[tokio::test]
+    async fn syslog_route_with_token_configured_rejects_missing_header() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let mut config = Config::default();
+        config.syslog.http_token = "s3cr3t".to_string();
+        let server = build_server(config).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds");
+
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: hello";
+        let req = with_connect_info(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/syslog")
+                .body(Body::from(msg))
+                .unwrap(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// With `syslog.http_token` configured, the correct bearer token is
+    /// accepted through the real router.
+    #[tokio::test]
+    async fn syslog_route_with_token_configured_accepts_correct_bearer() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let mut config = Config::default();
+        config.syslog.http_token = "s3cr3t".to_string();
+        let server = build_server(config).await;
+        let router = server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds");
+
+        let msg = "<134>Jan 15 10:30:45 dns-server named[1234]: hello";
+        let req = with_connect_info(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/syslog")
+                .header("Authorization", "Bearer s3cr3t")
+                .body(Body::from(msg))
+                .unwrap(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn server_take_hec_worker_handles_returns_empty_when_hec_disabled() {
         let mut server = Server::new(
@@ -2665,6 +2998,142 @@ mod tests {
             );
         }
     }
+
+    // ------------------------------------------------------------------ //
+    // Kerberos SPNEGO middleware                                         //
+    //                                                                    //
+    // There is no KDC or keytab in this test environment (by design —    //
+    // see the plan), so only the paths that never need a real GSSAPI     //
+    // exchange are covered here:                                        //
+    //   * `classify_negotiate_header` — pure, GSSAPI-free header parsing //
+    //   * missing header / wrong scheme / malformed base64 — all three  //
+    //     short-circuit in the middleware before any GSSAPI call runs   //
+    //   * a well-formed-but-bogus token, which still exercises the      //
+    //     "the GSSAPI pipeline failed" branch end to end (whether it     //
+    //     fails at `Cred::acquire` for lack of a keytab, or at `step()`  //
+    //     for lack of a valid token, both map to 401 the same way)       //
+    //                                                                    //
+    // NOT covered, and cannot be from `cargo test`: a real SPNEGO        //
+    // handshake succeeding (needs a live KDC + keytab), and the mutual-  //
+    // auth `WWW-Authenticate` response header on success.                //
+    // ------------------------------------------------------------------ //
+    #[cfg(feature = "kerberos-auth")]
+    mod kerberos_auth_tests {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        const TEST_SPN: &str = "HTTP/test.invalid@EXAMPLE.COM";
+
+        fn kerberos_router() -> Router {
+            Router::new()
+                .route("/protected", axum::routing::get(|| async { "ok" }))
+                .layer(middleware::from_fn_with_state(
+                    Arc::new(TEST_SPN.to_string()),
+                    kerberos_auth_middleware,
+                ))
+        }
+
+        fn with_connect_info(mut req: HttpRequest<Body>) -> HttpRequest<Body> {
+            let addr: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+            req.extensions_mut().insert(ConnectInfo(addr));
+            req
+        }
+
+        #[test]
+        fn classify_missing_header() {
+            assert_eq!(classify_negotiate_header(None), NegotiateHeader::Missing);
+        }
+
+        #[test]
+        fn classify_wrong_scheme() {
+            assert_eq!(
+                classify_negotiate_header(Some("Basic dXNlcjpwYXNz")),
+                NegotiateHeader::WrongScheme
+            );
+        }
+
+        #[test]
+        fn classify_malformed_base64() {
+            assert_eq!(
+                classify_negotiate_header(Some("Negotiate not-valid-base64!!!")),
+                NegotiateHeader::MalformedBase64
+            );
+        }
+
+        #[test]
+        fn classify_well_formed_token() {
+            assert_eq!(
+                classify_negotiate_header(Some("Negotiate dGVzdA==")),
+                NegotiateHeader::Token(b"test".to_vec())
+            );
+        }
+
+        /// No `Authorization` header at all -> 401 with a `WWW-Authenticate:
+        /// Negotiate` challenge, not a panic or a 5xx.
+        #[tokio::test]
+        async fn missing_authorization_header_returns_401_with_challenge() {
+            let req = with_connect_info(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .body(Body::empty())
+                    .unwrap(),
+            );
+            let resp = kerberos_router().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(resp.headers().get("WWW-Authenticate").unwrap(), "Negotiate");
+        }
+
+        /// A non-Negotiate scheme (e.g. HTTP Basic) must be rejected with 401.
+        #[tokio::test]
+        async fn non_negotiate_scheme_returns_401() {
+            let req = with_connect_info(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header("Authorization", "Basic dXNlcjpwYXNz")
+                    .body(Body::empty())
+                    .unwrap(),
+            );
+            let resp = kerberos_router().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        /// Malformed base64 after `Negotiate ` must be rejected with 401, not
+        /// a panic.
+        #[tokio::test]
+        async fn malformed_base64_returns_401() {
+            let req = with_connect_info(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header("Authorization", "Negotiate not-valid-base64!!!")
+                    .body(Body::empty())
+                    .unwrap(),
+            );
+            let resp = kerberos_router().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        /// A well-formed-but-bogus Negotiate token must be rejected with
+        /// 401 — never the old fail-closed stub's 501, and never a panic.
+        /// In this keytab-less sandbox this exercises "the GSSAPI pipeline
+        /// failed" (acquire or step, whichever fails first), not
+        /// specifically "a live ServerCtx rejected a garbage token" — that
+        /// needs a real credential this environment cannot provide.
+        #[tokio::test]
+        async fn bogus_token_returns_401_not_501_or_panic() {
+            let req = with_connect_info(
+                HttpRequest::builder()
+                    .uri("/protected")
+                    .header("Authorization", "Negotiate dGVzdA==")
+                    .body(Body::empty())
+                    .unwrap(),
+            );
+            let resp = kerberos_router().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            assert_ne!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        }
+    }
 }
 
 /// Build a `RustlsConfig` from the TLS section of the server config.
@@ -2783,10 +3252,39 @@ async fn start_metrics_server(addr: SocketAddr) {
 }
 
 /// Handle syslog messages via HTTP POST
-async fn handle_syslog_http(
+///
+/// Auth: if `config.syslog.http_token` is non-empty, the request must carry
+/// `Authorization: Bearer <token>`. An empty (default) token skips the check
+/// entirely — the route is mounted unconditionally, so this preserves the
+/// pre-existing no-auth behaviour for every default deployment. Comparison
+/// mirrors `handle_otlp_logs`: constant-time on the equal-length path, with
+/// an early length-mismatch branch (token length is low-sensitivity).
+pub async fn handle_syslog_http(
+    State(app_state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    use subtle::ConstantTimeEq;
+
+    {
+        let cfg = app_state.config.read().await;
+        let expected_token = &cfg.syslog.http_token;
+        if !expected_token.is_empty() {
+            let provided = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "))
+                .unwrap_or("");
+            let a = expected_token.as_bytes();
+            let b = provided.as_bytes();
+            let ok: bool = a.len() == b.len() && a.ct_eq(b).into();
+            if !ok {
+                return (StatusCode::UNAUTHORIZED, "Unauthorized");
+            }
+        }
+    }
+
     let msg = String::from_utf8_lossy(&body);
 
     match SyslogMessage::parse(&msg) {
