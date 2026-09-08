@@ -1,7 +1,29 @@
-//! Shutdown utilities: deadline-bounded handle awaiting.
+//! Shutdown utilities: signal handling and deadline-bounded handle awaiting.
 
 use std::time::Duration;
 use tokio::task::JoinHandle;
+
+/// Resolves when the process receives SIGTERM or SIGINT.
+///
+/// SIGTERM is what Kubernetes and `docker stop` send. Handling it matters
+/// twice over in a container: the binary runs as PID 1 (`CMD ["logthing"]`),
+/// and the kernel discards signals at PID 1 whose disposition is still
+/// `SIG_DFL` rather than applying the default terminate action — so without
+/// this an unhandled SIGTERM is a no-op until the grace period expires and
+/// SIGKILL lands, skipping every buffered-writer flush.
+pub async fn wait_for_shutdown_signal() {
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler");
+
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => r.expect("Failed to install Ctrl+C handler"),
+        // ponytail: recv() -> None (signal driver torn down) is treated as a
+        // shutdown request. Worst case that starts a graceful shutdown one
+        // process-teardown early, which loses nothing.
+        _ = sigterm.recv() => {}
+    }
+}
 
 /// Await a list of `JoinHandle<()>` tasks, respecting a shared wall-clock
 /// deadline.
@@ -128,5 +150,57 @@ mod tests {
             elapsed < Duration::from_secs(1),
             "should not wait the full 10 s; took {elapsed:?}"
         );
+    }
+
+    /// Send `sig` to our own process via `kill(1)`. Avoids a `libc`/`nix`
+    /// dev-dependency for what is one subprocess call.
+    fn kill_self(sig: &str) {
+        let pid = std::process::id().to_string();
+        let status = std::process::Command::new("kill")
+            .args([format!("-{sig}").as_str(), pid.as_str()])
+            .status()
+            .expect("failed to run kill(1)");
+        assert!(status.success(), "kill -{sig} {pid} failed");
+    }
+
+    /// Both signals are exercised in ONE test, sequentially, and this must
+    /// remain the only test in the `--lib` binary that touches process
+    /// signals: `cargo test` runs a binary's tests as parallel threads and
+    /// signal delivery is process-wide, so two concurrent tests each holding
+    /// a live receiver would observe each other's kills.
+    ///
+    /// Polling the future once *before* signalling is what makes this
+    /// race-free. `tokio::signal::unix::signal()` is a synchronous fn that
+    /// installs the OS disposition at call time, and `tokio::signal::ctrl_c()`
+    /// calls that same synchronous registration inside its body on first
+    /// poll; `select!` must poll every branch. So after the first `select!`
+    /// below returns via its sleep arm, both dispositions are installed and
+    /// both receivers are live — the signal can neither hit default
+    /// disposition (which would kill the test binary) nor be missed.
+    ///
+    /// Note: tokio's SIGINT/SIGTERM disposition override outlives the
+    /// receivers, so for the rest of this test binary's life Ctrl+C no longer
+    /// default-terminates it. That is inherent to exercising real signal
+    /// handling in-process.
+    #[tokio::test]
+    async fn resolves_on_sigterm_and_on_sigint() {
+        for sig in ["TERM", "INT"] {
+            let mut fut = Box::pin(wait_for_shutdown_signal());
+
+            // Poll once so registration actually happens, and assert the
+            // future does not resolve with nothing pending.
+            tokio::select! {
+                _ = &mut fut => panic!("{sig}: resolved before any signal was sent"),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+
+            kill_self(sig);
+
+            tokio::time::timeout(Duration::from_secs(5), fut)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{sig} did not resolve the shutdown future within 5s")
+                });
+        }
     }
 }
