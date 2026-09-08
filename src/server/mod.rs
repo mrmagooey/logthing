@@ -574,6 +574,19 @@ impl Server {
         Ok(())
     }
 
+    /// NOTE ON LAYER ORDER: this is applied to `protected_router` *after*
+    /// `shared_layers` (the IP whitelist). `Route::layer` wraps the existing
+    /// service, so last-applied is outermost — meaning Kerberos runs BEFORE
+    /// the IP whitelist. While this middleware was an unimplemented stub that
+    /// returned instantly, that was free. It no longer is: a request from an
+    /// IP the allowlist would reject still costs a keytab read plus GSSAPI
+    /// crypto on a blocking thread first. It stays bounded by the router-wide
+    /// concurrency limit and timeout, so it is not an unbounded amplifier, but
+    /// applying this layer before `shared_layers` (making the whitelist
+    /// outermost) would be strictly cheaper. Left as-is deliberately: the
+    /// ordering predates this change, and `create_router`'s layer attachment
+    /// is not currently covered by any test, so a silent reordering mistake
+    /// would not be caught.
     #[cfg(feature = "kerberos-auth")]
     fn apply_kerberos_layer(&self, router: Router) -> anyhow::Result<Router> {
         let kerberos = &self.config.security.kerberos;

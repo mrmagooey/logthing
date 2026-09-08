@@ -61,8 +61,9 @@ in scope, so that comment becomes wrong the moment this lands.
 3. Malformed base64 or a non-Negotiate scheme → 401.
 
 `apply_kerberos_layer` switches from `middleware::from_fn` to
-`from_fn_with_state` carrying the acquired `Cred`, and drops the "NOT
-implemented / rejects all requests" SECURITY error log.
+`from_fn_with_state` carrying **only the SPN `String`** — never a GSS handle,
+per the corrected decision 3.4 — and drops the "NOT implemented / rejects all
+requests" SECURITY error log.
 
 ## Testing, and its honest limits
 

@@ -164,7 +164,7 @@ keytab = "/etc/logthing/krb5.keytab"
 ```
 
 - Build the binary or container with `--features kerberos-auth` so the Kerberos middleware is compiled in. (Without the feature the server will log a warning and continue without enforcing Negotiate.)
-- When `enabled = true`, every HTTP endpoint (`/wsman`, `/syslog`, admin API, etc.) enforces Kerberos authentication before any route logic runs.
+- When `enabled = true`, the main server's protected routes (`/wsman`, `/wsman/subscriptions`, `/wsman/events`, `/syslog`) enforce Kerberos authentication before any route logic runs. `/health` and `/stats/throughput` stay public. The **admin API is a separate server on its own port and is NOT covered by Kerberos** — it has its own Basic-auth/trusted-header authentication and its own IP allowlist.
 - `spn` must match the service principal registered in Active Directory (format `HTTP/hostname@REALM`).
 - `keytab` (optional) points to the keytab that contains the service principal’s keys. If provided, logthing sets `KRB5_KTNAME` automatically so `libgssapi` can decrypt tickets.
 - The middleware logs the authenticated client principal at `debug` level; there is no extractor exposing it to handlers.
