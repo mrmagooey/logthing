@@ -28,8 +28,11 @@ Delivered sequentially: Unit 1 → Unit 2 → Unit 3, one commit each.
 ## Unit 3 — /wsman real Kerberos SPNEGO
 
 - [ ] `Cargo.toml`: drop `axum-negotiate`; point `kerberos-auth` at `libgssapi`.
-- [ ] Acquire the server `Cred` once at startup from the keytab/SPN; surface
-      acquisition failure as a startup error (fail-closed).
+- [ ] Acquire a `Cred` at startup purely to VALIDATE the SPN/keytab, then drop
+      it; surface acquisition failure as a startup error (fail-closed). Acquire
+      a fresh `Cred` per request inside `spawn_blocking`, backing exactly one
+      `ServerCtx`. Sharing one `Cred` is unimplementable and reusing a completed
+      `ServerCtx` is an auth bypass — see decision 3.4 in the spec.
 - [ ] Replace the 501 stub in `kerberos_auth_middleware` with the RFC 4559
       two-pass flow from the spec. Log the authenticated principal at `debug!`.
 - [ ] `apply_kerberos_layer`: `from_fn_with_state` carrying the `Cred`; drop the
