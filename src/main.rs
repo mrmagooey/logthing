@@ -1,6 +1,6 @@
 use logthing::middleware::IpWhitelist;
 use logthing::server::Server;
-use logthing::shutdown::await_handles_with_deadline;
+use logthing::shutdown::{await_handles_with_deadline, drain_listener_handles};
 use logthing::{admin, config, forwarding, ipfix, sflow, stats, suricata, syslog, zeek};
 use std::sync::Arc;
 use std::time::Duration;
@@ -794,24 +794,15 @@ async fn async_main() -> anyhow::Result<()> {
     //    (`zeek/listener.rs:107-117`), and nothing here signals or aborts those
     //    tasks. See step 3.
     //
-    //    R-2: Capture abort_handle() before awaiting so that a timed-out
-    //    listener task is truly cancelled (not just detached).
-    let mut listener_abort_handles: Vec<tokio::task::AbortHandle> = Vec::new();
-    for handle in &listener_handles {
-        listener_abort_handles.push(handle.abort_handle());
-    }
-
-    for (handle, abort_handle) in listener_handles.into_iter().zip(listener_abort_handles) {
-        match tokio::time::timeout(Duration::from_secs(2), handle).await {
-            Ok(_) => {}
-            Err(_) => {
-                // Listener didn't exit cleanly within 2s — abort it so the task
-                // is truly cancelled (dropped), releasing the Arc<dyn Handler>
-                // which closes the writer's channel.
-                abort_handle.abort();
-            }
-        }
-    }
+    //    R-2: `drain_listener_handles` (src/shutdown.rs) captures
+    //    abort_handle() before awaiting so that a timed-out listener task is
+    //    truly cancelled (not just detached) — releasing the Arc<dyn Handler>
+    //    which closes the writer's channel. It also skips any handle already
+    //    polled to completion by the H-3 supervision arm above: awaiting the
+    //    same `JoinHandle` twice panics ("JoinHandle polled after
+    //    completion"), which is exactly what happens when a listener exits
+    //    (e.g. a bind failure) before shutdown is signalled.
+    drain_listener_handles(listener_handles, Duration::from_secs(2)).await;
 
     // 3. Await all writer tasks (plus the optional WEF worker) with a shared 10s
     //    combined timeout via `await_handles_with_deadline`.

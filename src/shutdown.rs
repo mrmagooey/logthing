@@ -74,6 +74,30 @@ pub async fn await_handles_with_deadline(
     completed
 }
 
+/// Wait for each listener task to exit, up to `per_handle_timeout` each,
+/// aborting any that overruns so its `Arc<dyn Handler>` clones are released.
+///
+/// Skips handles that have already finished. That is not an optimisation: the
+/// H-3 supervision arm in `main.rs` polls `&mut` borrows of these same handles
+/// to detect a listener exiting early, and tokio panics with "JoinHandle polled
+/// after completion" if such a handle is awaited a second time. Any listener
+/// failing to bind — a port collision, not just a privileged port — would
+/// otherwise take the whole process down instead of shutting down gracefully.
+pub async fn drain_listener_handles(handles: Vec<JoinHandle<()>>, per_handle_timeout: Duration) {
+    for handle in handles {
+        if handle.is_finished() {
+            continue;
+        }
+        let abort_handle = handle.abort_handle();
+        if tokio::time::timeout(per_handle_timeout, handle)
+            .await
+            .is_err()
+        {
+            abort_handle.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +172,74 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(1),
             "should not wait the full 10 s; took {elapsed:?}"
+        );
+    }
+
+    /// Regression: a handle already polled to completion by `main.rs`'s H-3
+    /// supervision arm must not be awaited a second time. Before the
+    /// `is_finished()` guard this panicked with "JoinHandle polled after
+    /// completion" and took the whole process down mid-shutdown.
+    #[tokio::test]
+    async fn already_polled_handle_does_not_panic() {
+        let mut handles: Vec<JoinHandle<()>> = vec![tokio::spawn(async {})];
+
+        // Poll to completion exactly as the H-3 arm does — via a `&mut`
+        // borrow inside a FuturesUnordered.
+        {
+            let mut futs = futures::stream::FuturesUnordered::new();
+            for h in &mut handles {
+                futs.push(h);
+            }
+            use futures::StreamExt;
+            let first = futs.next().await;
+            assert!(first.is_some(), "the spawned task should have completed");
+        }
+
+        // Second poll of the same handle — this is the crash site.
+        drain_listener_handles(handles, Duration::from_secs(2)).await;
+    }
+
+    /// A still-running handle that exceeds the timeout is aborted rather than
+    /// left to run to completion.
+    #[tokio::test]
+    async fn slow_handle_is_aborted_on_timeout() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let handle = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            // If the abort didn't happen, this would eventually run and
+            // signal completion — the test asserts it never does.
+            let _ = finished_tx.send(());
+        });
+
+        started_rx.await.expect("task should have started");
+
+        drain_listener_handles(vec![handle], Duration::from_millis(100)).await;
+
+        // The task was aborted before it could reach the `sleep`'s end and
+        // signal completion — a dropped sender closes the channel instead.
+        assert!(
+            finished_rx.try_recv().is_err(),
+            "aborted task must not have run to completion"
+        );
+    }
+
+    /// A normally-running handle that finishes within the timeout is awaited
+    /// cleanly — no abort, no leftover error.
+    #[tokio::test]
+    async fn fast_handle_completes_within_timeout() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _ = tx.send(());
+        });
+
+        drain_listener_handles(vec![handle], Duration::from_secs(5)).await;
+
+        assert!(
+            rx.await.is_ok(),
+            "fast handle should have run to completion before the timeout"
         );
     }
 
