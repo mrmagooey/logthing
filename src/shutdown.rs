@@ -12,9 +12,8 @@ use tokio::task::JoinHandle;
 /// this an unhandled SIGTERM is a no-op until the grace period expires and
 /// SIGKILL lands, skipping every buffered-writer flush.
 pub async fn wait_for_shutdown_signal() {
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("Failed to install SIGTERM handler");
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("Failed to install SIGTERM handler");
 
     tokio::select! {
         r = tokio::signal::ctrl_c() => r.expect("Failed to install Ctrl+C handler"),
@@ -198,9 +197,7 @@ mod tests {
 
             tokio::time::timeout(Duration::from_secs(5), fut)
                 .await
-                .unwrap_or_else(|_| {
-                    panic!("{sig} did not resolve the shutdown future within 5s")
-                });
+                .unwrap_or_else(|_| panic!("{sig} did not resolve the shutdown future within 5s"));
         }
     }
 }

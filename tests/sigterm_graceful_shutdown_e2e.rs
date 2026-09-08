@@ -101,8 +101,8 @@ async fn wait_for_received(url: &str, want: u64, deadline: Instant) {
         if let Ok(resp) = reqwest::get(url).await
             && let Ok(body) = resp.text().await
         {
-            last = logthing::profiling::parse_counter(&body, "syslog_messages_received")
-                .unwrap_or(0);
+            last =
+                logthing::profiling::parse_counter(&body, "syslog_messages_received").unwrap_or(0);
             if last >= want {
                 return;
             }
@@ -197,7 +197,9 @@ flush_interval_secs = 3600
     let mut before = Vec::new();
     walk_all_files(&out_dir, &mut before);
     assert!(
-        before.iter().all(|p| p.extension().is_none_or(|e| e != "parquet")),
+        before
+            .iter()
+            .all(|p| p.extension().is_none_or(|e| e != "parquet")),
         "a Parquet file existed before shutdown, so this test cannot \
          attribute the post-shutdown file to the drain: {before:?}"
     );
@@ -258,11 +260,10 @@ flush_interval_secs = 3600
     let mut rows = 0usize;
     for path in &parquet {
         let file = File::open(path).expect("open parquet");
-        let reader =
-            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-                .expect("parquet reader")
-                .build()
-                .expect("build reader");
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("parquet reader")
+            .build()
+            .expect("build reader");
         for batch in reader {
             rows += batch.expect("read batch").num_rows();
         }
