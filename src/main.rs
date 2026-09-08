@@ -736,9 +736,7 @@ async fn async_main() -> anyhow::Result<()> {
     // Shutdown signal task
     // -----------------------------------------------------------------------
     let shutdown_signal = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
+        logthing::shutdown::wait_for_shutdown_signal().await;
         info!("Shutdown signal received");
     };
 
