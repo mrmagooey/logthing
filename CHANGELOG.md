@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file, newest
 first, loosely following [Keep a Changelog](https://keepachangelog.com/).
 This file starts at 0.15.0; earlier releases are not backfilled.
 
-## [Unreleased]
+## [0.17.0] - 2026-09-07
 
 ### Changed
 
@@ -45,6 +45,24 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   constant-time way as the OTLP/HEC bearer tokens. Empty (the default)
   preserves the existing no-auth behaviour, since `/syslog` is mounted
   unconditionally regardless of `syslog.enabled`.
+
+### Fixed
+
+- **SIGTERM is now handled.** The process previously installed a handler only
+  for SIGINT, so the graceful-shutdown sequence — drain the listeners, flush
+  every buffered Parquet writer — ran on Ctrl+C but never on SIGTERM. Since
+  the container runs the binary as PID 1, where the kernel discards signals
+  with no handler installed, `kubectl delete pod` and `docker stop` left the
+  process running until the grace period expired and SIGKILL landed. Every
+  record buffered since the last periodic flush was lost on each restart.
+  Deployments relying on `flush_interval_secs` to bound data loss were losing
+  up to one full flush interval per pod termination.
+- **An early listener exit no longer panics the process.** If any of the five
+  socket listeners stopped before the shutdown signal — most commonly a bind
+  failure from a port collision — the supervision arm and the shutdown drain
+  both awaited the same `JoinHandle`, and the second await panicked with
+  "JoinHandle polled after completion". A single recoverable listener failure
+  therefore killed the whole process mid-shutdown, skipping the writer flush.
 
 ## [0.16.0] - 2026-09-06
 
