@@ -1312,6 +1312,21 @@ static REGISTRY: LazyLock<HashMap<&'static str, Arc<SchemaEntry>>> = LazyLock::n
     m
 });
 
+/// Bound a `_path` value to the set of modelled zeek streams, for use as a
+/// metric label. `_path` comes straight off the wire and is unbounded in both
+/// length and charset, so labelling a Prometheus counter with it raw lets any
+/// client that can reach the listener mint a permanent series per record.
+/// Returning the registry's own `&'static str` keys caps the label set at the
+/// modelled streams plus `"other"` — and drops the per-record string clone
+/// the label used to cost (the `counter!` macro's own one-element label Vec
+/// is unchanged).
+pub fn metric_log_path(log_path: &str) -> &'static str {
+    REGISTRY
+        .get_key_value(log_path)
+        .map(|(name, _)| *name)
+        .unwrap_or("other")
+}
+
 /// Look up the SchemaEntry for `log_path`. Falls back to the envelope schema for unknown paths.
 /// The envelope mapper always uses the actual `log_path` at call time via a wrapper.
 pub fn get_schema_entry(log_path: &str) -> Arc<SchemaEntry> {
@@ -1336,6 +1351,32 @@ mod tests {
     use crate::forwarding::buffered_writer::RecordBatchAccumulator;
     use arrow::array::{Array, StringArray, TimestampMicrosecondArray, UInt16Array, UInt64Array};
     use chrono::TimeZone;
+
+    /// `_path` is attacker-controlled, so the metric label must be drawn from
+    /// the fixed registry, never from the wire value.
+    #[test]
+    fn metric_log_path_bounds_the_label_to_modelled_streams() {
+        for known in ["conn", "dns", "http", "ssl", "files", "notice"] {
+            assert_eq!(
+                metric_log_path(known),
+                known,
+                "modelled streams keep their own series"
+            );
+        }
+        for hostile in [
+            "unknown",
+            "weird",
+            &"A".repeat(16_384),
+            "conn\u{0}injected",
+            "",
+        ] {
+            assert_eq!(
+                metric_log_path(hostile),
+                "other",
+                "an unmodelled _path must collapse to a single series, not mint a new one"
+            );
+        }
+    }
 
     /// A fixed, distinctive `received_at` for tests that don't care about its
     /// exact value -- deliberately far from any epoch-second `ts` fixture
