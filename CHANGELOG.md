@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file, newest
 first, loosely following [Keep a Changelog](https://keepachangelog.com/).
 This file starts at 0.15.0; earlier releases are not backfilled.
 
+## [0.18.0] - 2026-09-10
+
+### Fixed
+
+- `zeek_records_received` and `zeek_records_by_path` now appear on the
+  metrics endpoint. Both counters were incremented inside
+  `DefaultZeekHandler`, which is installed only when **no** Zeek forwarding
+  destination is configured — so any deployment with `[zeek.s3]` or
+  `[zeek.local]` set never emitted them at all. They now fire in the
+  listener's parse loop, which every handler routes through.
+
+### Changed
+
+- The `log_path` label on `zeek_records_by_path` is now drawn from the set
+  of modelled Zeek streams (`conn`, `dns`, `http`, `ssl`, `files`,
+  `notice`), with anything else collapsing to `other`. The label value comes
+  from the wire-supplied `_path` field, which is unbounded in length and
+  charset; emitted raw it would let any client that can reach the Zeek
+  listener mint a new permanent Prometheus series per record. Parquet
+  partitioning still uses the full normalised `_path`, so no stored data
+  changes — only the metric label is bucketed. A stream without a schema
+  entry is no longer separable on this metric.
+
 ## [0.17.0] - 2026-09-07
 
 ### Changed
