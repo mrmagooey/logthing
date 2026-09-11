@@ -46,11 +46,6 @@ pub struct DefaultZeekHandler;
 #[async_trait::async_trait]
 impl ZeekHandler for DefaultZeekHandler {
     async fn handle_record(&self, record: ZeekRecord, source: SocketAddr) {
-        metrics::counter!("zeek_records_received").increment(1);
-        metrics::counter!("zeek_records_by_path",
-            "log_path" => record.log_path.clone()
-        )
-        .increment(1);
         info!(
             "[{}] zeek record: path={} fields={}",
             source,
@@ -275,6 +270,15 @@ impl ZeekListener {
                             "unknown".to_string()
                         }
                     };
+                    // Counted here, not in a handler impl: every handler
+                    // (DefaultZeekHandler, MultiZeekHandler, Aggregating...) routes
+                    // through this one point, so the metric is emitted regardless of
+                    // which forwarding destinations are configured.
+                    metrics::counter!("zeek_records_received").increment(1);
+                    metrics::counter!("zeek_records_by_path",
+                        "log_path" => log_path.clone()
+                    )
+                    .increment(1);
                     let record = ZeekRecord {
                         log_path,
                         fields: value,
@@ -353,6 +357,83 @@ mod tests {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         assert_eq!(path, "unknown");
+    }
+
+    // -- Metrics: received counters fire for every handler --
+
+    /// Regression: `zeek_records_received` / `zeek_records_by_path` used to be
+    /// incremented inside `DefaultZeekHandler`, which `main.rs` only installs
+    /// when NO forwarding destination is configured. Any real deployment wires
+    /// a forwarding handler instead, so the counters never fired and never
+    /// appeared on `/metrics`. They now live in the connection parse path, so
+    /// they must be emitted with a non-default handler.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn received_counters_fire_with_a_non_default_handler() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // Thread-local recorder: `handle_tcp_connection` is awaited inline below
+        // (not spawned), so it runs on this thread and sees it.
+        let _guard = set_default_local_recorder(&recorder);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Write both lines and close the write half first; the payload is tiny
+        // enough to sit in the socket buffer until the reader drains it.
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"{\"_path\":\"conn\",\"uid\":\"C1\"}\n{\"_path\":\"dns\",\"uid\":\"C2\"}\n")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let (stream, src) = listener.accept().await.unwrap();
+        let handler = CapturingHandler::new();
+        ZeekListener::handle_tcp_connection(stream, src, handler.clone())
+            .await
+            .unwrap();
+        client.await.unwrap();
+
+        assert_eq!(handler.take_records().len(), 2, "both records parsed");
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let read = |key: CompositeKey| {
+            map.get(&key)
+                .map(|(_, _, v)| match v {
+                    DebugValue::Counter(c) => *c,
+                    _ => 0,
+                })
+                .unwrap_or(0)
+        };
+
+        assert_eq!(
+            read(CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("zeek_records_received"),
+            )),
+            2,
+            "zeek_records_received must count every parsed record"
+        );
+        for path in ["conn", "dns"] {
+            assert_eq!(
+                read(CompositeKey::new(
+                    MetricKind::Counter,
+                    metrics::Key::from_parts(
+                        "zeek_records_by_path",
+                        vec![metrics::Label::new("log_path", path)],
+                    ),
+                )),
+                1,
+                "zeek_records_by_path{{log_path=\"{path}\"}} must be emitted"
+            );
+        }
     }
 
     // -- Shutdown-arm test --
