@@ -88,13 +88,11 @@ fn dns_line(uid: &str) -> String {
 /// `# HELP` / `# TYPE` comment lines. Matches an exact metric line (name +
 /// optional `{labels}`) at the start of the line.
 fn find_metric_value(body: &str, exact_prefix: &str) -> Option<f64> {
-    body.lines()
-        .filter(|l| !l.starts_with('#'))
-        .find_map(|l| {
-            l.strip_prefix(exact_prefix)
-                .map(|rest| rest.trim())
-                .and_then(|v| v.parse::<f64>().ok())
-        })
+    body.lines().filter(|l| !l.starts_with('#')).find_map(|l| {
+        l.strip_prefix(exact_prefix)
+            .map(|rest| rest.trim())
+            .and_then(|v| v.parse::<f64>().ok())
+    })
 }
 
 #[tokio::test]
@@ -156,6 +154,9 @@ async fn zeek_records_received_visible_on_real_metrics_endpoint_with_forwarding_
         flush_interval_secs: 3600,
         channel_capacity: 256,
     };
+    // The writer JoinHandle is deliberately not awaited: this test asserts on
+    // the /metrics exposition only, never on flushed parquet, so the final
+    // flush the handle exists to await is irrelevant here.
     let (zeek_handler, _writer_task) = zeek_local_start(
         &zeek_local_cfg,
         sink,
@@ -245,15 +246,15 @@ async fn zeek_records_received_visible_on_real_metrics_endpoint_with_forwarding_
          is installed. Full scrape body:\n{body}"
     );
 
-    let conn_count =
-        find_metric_value(&body, "zeek_records_by_path{log_path=\"conn\"}").unwrap_or_else(|| {
+    let conn_count = find_metric_value(&body, "zeek_records_by_path{log_path=\"conn\"}")
+        .unwrap_or_else(|| {
             panic!(
                 "regression: zeek_records_by_path{{log_path=\"conn\"}} missing from /metrics \
                  body despite a forwarding handler being installed:\n{body}"
             )
         });
-    let dns_count =
-        find_metric_value(&body, "zeek_records_by_path{log_path=\"dns\"}").unwrap_or_else(|| {
+    let dns_count = find_metric_value(&body, "zeek_records_by_path{log_path=\"dns\"}")
+        .unwrap_or_else(|| {
             panic!(
                 "regression: zeek_records_by_path{{log_path=\"dns\"}} missing from /metrics \
                  body despite a forwarding handler being installed:\n{body}"

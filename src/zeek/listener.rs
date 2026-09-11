@@ -40,7 +40,9 @@ pub trait ZeekHandler: Send + Sync {
     async fn handle_record(&self, record: ZeekRecord, source: SocketAddr);
 }
 
-/// Default handler: logs a summary and increments metrics.
+/// Default handler: logs a summary. Installed only when no forwarding
+/// destination is configured; the ingest counters live in the listener's
+/// parse loop so they fire for every handler.
 pub struct DefaultZeekHandler;
 
 #[async_trait::async_trait]
@@ -276,7 +278,7 @@ impl ZeekListener {
                     // which forwarding destinations are configured.
                     metrics::counter!("zeek_records_received").increment(1);
                     metrics::counter!("zeek_records_by_path",
-                        "log_path" => log_path.clone()
+                        "log_path" => crate::zeek::schema::metric_log_path(&log_path)
                     )
                     .increment(1);
                     let record = ZeekRecord {
@@ -388,7 +390,9 @@ mod tests {
         let client = tokio::spawn(async move {
             let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
             stream
-                .write_all(b"{\"_path\":\"conn\",\"uid\":\"C1\"}\n{\"_path\":\"dns\",\"uid\":\"C2\"}\n")
+                .write_all(
+                    b"{\"_path\":\"conn\",\"uid\":\"C1\"}\n{\"_path\":\"dns\",\"uid\":\"C2\"}\n",
+                )
                 .await
                 .unwrap();
             stream.shutdown().await.unwrap();

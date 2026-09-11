@@ -49,7 +49,15 @@ use tokio::time::{Duration, sleep, timeout};
 fn metric_value(rendered: &str, prefix: &str) -> Option<f64> {
     rendered
         .lines()
-        .find(|line| !line.starts_with('#') && line.starts_with(prefix))
+        // The space check matters: a bare `starts_with` would let a future
+        // `zeek_records_received_errors` line satisfy a `zeek_records_received`
+        // lookup and silently return the wrong number.
+        .find(|line| {
+            !line.starts_with('#')
+                && line
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with(' '))
+        })
         .and_then(|line| line.rsplit(' ').next())
         .and_then(|v| v.trim().parse::<f64>().ok())
 }
@@ -81,6 +89,10 @@ async fn zeek_records_received_and_by_path_survive_the_real_accept_and_forwardin
         flush_interval_secs: 3600,
         channel_capacity: 256,
     };
+    // The writer JoinHandle is deliberately not awaited: this test asserts on
+    // ingest counters only, never on flushed parquet, so the final flush the
+    // handle exists to await is irrelevant here. Retain and await it in any
+    // test that does read the written files back.
     let (handler, _writer_handle) =
         zeek_local_start(&cfg, sink, Arc::new(SourceHourlyStats::new()), None);
 
