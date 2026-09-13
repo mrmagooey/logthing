@@ -177,7 +177,8 @@ optimisation off this document without new end-to-end evidence.
 **Do not ratio these against the 94.6 µs/datagram figure.** That number is
 whole-process CPU across all threads; these are single-threaded, single-record
 costs. Subtracting or dividing one by the other is precisely the error that
-`2026-07-25-cpu-profiling-instrumentation-design.md` was written to correct.
+`docs/superpowers/specs/2026-07-25-cpu-profiling-instrumentation-design.md`
+was written to correct.
 
 **The "~500 µs-1.3 ms per record" figure is wrong and retracted.** It appears in
 `docs/superpowers/specs/2026-07-24-performance-improvements-plan.md` §2.1 and
