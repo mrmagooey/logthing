@@ -36,7 +36,18 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run all criterion benchmarks
-        run: cargo bench
+        run: cargo bench -- --save-baseline ci-${{ github.sha }}
+
+      # Without this the job runs the full sampled suite and then throws every
+      # number away — target/ is not persisted, so a CI bench run could not be
+      # read after it finished. The sibling syslog-udp-baseline job in this
+      # file already uploads its artifacts; this brings criterion into line.
+      - name: Upload criterion results
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-baseline-${{ github.sha }}
+          path: target/criterion/
+          retention-days: 30
 
   syslog-udp-baseline:
     name: loadgen syslog-udp baseline run
