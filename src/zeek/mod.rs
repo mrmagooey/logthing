@@ -76,9 +76,15 @@ mod tests {
         let at = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let p = parse_line(r#"{"_path":"conn.2026-08-14-16-08-44","uid":"Cabc"}"#, at)
             .expect("valid NDJSON must parse");
-        assert_eq!(p.record.log_path, "conn", "rotation suffix must be normalized off");
+        assert_eq!(
+            p.record.log_path, "conn",
+            "rotation suffix must be normalized off"
+        );
         assert_eq!(p.record.fields["uid"], "Cabc");
-        assert_eq!(p.record.received_at, at, "received_at must be the caller's, not Utc::now()");
+        assert_eq!(
+            p.record.received_at, at,
+            "received_at must be the caller's, not Utc::now()"
+        );
         assert!(!p.path_was_missing);
     }
 
@@ -99,7 +105,10 @@ mod tests {
         let p = parse_line(r#"{"_path":"unknown","uid":"Cabc"}"#, chrono::Utc::now())
             .expect("valid NDJSON must parse");
         assert_eq!(p.record.log_path, "unknown");
-        assert!(!p.path_was_missing, "a present _path of \"unknown\" is not a missing _path");
+        assert!(
+            !p.path_was_missing,
+            "a present _path of \"unknown\" is not a missing _path"
+        );
     }
 
     #[test]
