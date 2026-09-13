@@ -159,6 +159,14 @@ harness = false
 # under `cargo test`.
 bench = false
 
+[[bin]]
+name = "logthing"
+path = "src/main.rs"
+# Same reason as [lib] above — the bin's test harness is also a bench target by
+# default, so it too would reject criterion's flags. Declared explicitly here
+# only to carry this setting; otherwise it is auto-discovered from src/main.rs.
+bench = false
+
 [[bench]]
 name = "generic_hec_to_record_batch"
 harness = false
