@@ -258,8 +258,8 @@ impl SuricataListener {
                     continue;
                 }
             };
-            // Parse JSON.
-            match serde_json::from_str::<serde_json::Value>(line) {
+            let parsed = match crate::suricata::parse_line(line, Utc::now()) {
+                Ok(p) => p,
                 Err(e) => {
                     metrics::counter!("suricata_parse_errors").increment(1);
                     warn!(
@@ -268,24 +268,13 @@ impl SuricataListener {
                         e,
                         &line[..line.len().min(120)],
                     );
+                    continue;
                 }
-                Ok(value) => {
-                    // Extract event_type.
-                    let event_type = match value.get("event_type").and_then(|v| v.as_str()) {
-                        Some(p) => p.to_string(),
-                        None => {
-                            metrics::counter!("suricata_missing_event_type").increment(1);
-                            "unknown".to_string()
-                        }
-                    };
-                    let record = SuricataRecord {
-                        event_type,
-                        fields: value,
-                        received_at: Utc::now(),
-                    };
-                    handler.handle_record(record, src).await;
-                }
+            };
+            if parsed.event_type_was_missing {
+                metrics::counter!("suricata_missing_event_type").increment(1);
             }
+            handler.handle_record(parsed.record, src).await;
         }
         Ok(())
     }
@@ -674,6 +663,67 @@ mod tests {
             records.is_empty(),
             "blocked source must not reach the handler; got {}",
             records.len()
+        );
+    }
+
+    /// Guards the `event_type_was_missing` wiring end to end through a real
+    /// socket: the counter must fire for an absent `event_type` and must NOT
+    /// fire for a record whose `event_type` is literally the string "unknown".
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn missing_event_type_counter_fires_only_for_an_absent_event_type() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // TWO absent event_type (must count) and ONE literal "unknown"
+            // (must not). The 2:1 split is load-bearing: with a symmetric 1:1
+            // mix an inverted `if !parsed.event_type_was_missing` would also
+            // yield 1 and the test would pass on the bug it exists to catch.
+            // Correct => 2, inverted => 1, dropped => 0, double => 4.
+            // Not covered: moving the increment after handle_record,
+            // which this aggregate assertion cannot see.
+            s.write_all(
+                b"{\"src_ip\":\"1.1.1.1\"}\n\
+                  {\"src_ip\":\"2.2.2.2\"}\n\
+                  {\"event_type\":\"unknown\",\"src_ip\":\"3.3.3.3\"}\n",
+            )
+            .await
+            .unwrap();
+            s.shutdown().await.unwrap();
+        });
+
+        let (stream, src) = listener.accept().await.unwrap();
+        SuricataListener::handle_tcp_connection(stream, src, CapturingHandler::new())
+            .await
+            .unwrap();
+        client.await.unwrap();
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let missing = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("suricata_missing_event_type"),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            missing, 2,
+            "two of the three records have an absent event_type; a literal \
+             event_type of \"unknown\" is a present value and must not be \
+             counted. Got 1 => the condition is inverted; got 0 => the \
+             increment was dropped."
         );
     }
 

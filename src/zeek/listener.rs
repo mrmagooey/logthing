@@ -1,7 +1,7 @@
 //! Zeek TCP NDJSON listener.
 
 use crate::middleware::IpWhitelist;
-use crate::zeek::{ZeekRecord, normalize_log_path};
+use crate::zeek::ZeekRecord;
 use chrono::Utc;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -252,8 +252,12 @@ impl ZeekListener {
                     continue;
                 }
             };
-            // Parse JSON.
-            match serde_json::from_str::<serde_json::Value>(line) {
+            // Parse JSON. The parse itself lives in `zeek::parse_line` so it can
+            // be unit-tested and benchmarked; this loop keeps the transport
+            // concerns (oversize guard, UTF-8, teardown) and the metrics, which
+            // need the peer address.
+            let parsed = match crate::zeek::parse_line(line, Utc::now()) {
+                Ok(p) => p,
                 Err(e) => {
                     metrics::counter!("zeek_parse_errors").increment(1);
                     warn!(
@@ -262,33 +266,23 @@ impl ZeekListener {
                         e,
                         &line[..line.len().min(120)],
                     );
+                    continue;
                 }
-                Ok(value) => {
-                    // Extract _path.
-                    let log_path = match value.get("_path").and_then(|v| v.as_str()) {
-                        Some(p) => normalize_log_path(p).to_string(),
-                        None => {
-                            metrics::counter!("zeek_missing_path").increment(1);
-                            "unknown".to_string()
-                        }
-                    };
-                    // Counted here, not in a handler impl: every handler
-                    // (DefaultZeekHandler, MultiZeekHandler, Aggregating...) routes
-                    // through this one point, so the metric is emitted regardless of
-                    // which forwarding destinations are configured.
-                    metrics::counter!("zeek_records_received").increment(1);
-                    metrics::counter!("zeek_records_by_path",
-                        "log_path" => crate::zeek::schema::metric_log_path(&log_path)
-                    )
-                    .increment(1);
-                    let record = ZeekRecord {
-                        log_path,
-                        fields: value,
-                        received_at: Utc::now(),
-                    };
-                    handler.handle_record(record, src).await;
-                }
+            };
+            if parsed.path_was_missing {
+                metrics::counter!("zeek_missing_path").increment(1);
             }
+            let record = parsed.record;
+            // Counted here, not in a handler impl: every handler
+            // (DefaultZeekHandler, MultiZeekHandler, Aggregating...) routes
+            // through this one point, so the metric is emitted regardless of
+            // which forwarding destinations are configured.
+            metrics::counter!("zeek_records_received").increment(1);
+            metrics::counter!("zeek_records_by_path",
+                "log_path" => crate::zeek::schema::metric_log_path(&record.log_path)
+            )
+            .increment(1);
+            handler.handle_record(record, src).await;
         }
         Ok(())
     }
@@ -359,6 +353,66 @@ mod tests {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         assert_eq!(path, "unknown");
+    }
+
+    /// Guards the `path_was_missing` wiring end to end through a real socket:
+    /// the counter must fire for an absent `_path` and must NOT fire for a
+    /// record whose `_path` is literally the string "unknown".
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn missing_path_counter_fires_only_for_an_absent_path() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // TWO absent _path (must count) and ONE literal "unknown" (must
+            // not). The 2:1 split is load-bearing: with a symmetric 1:1 mix an
+            // inverted `if !parsed.path_was_missing` would also yield 1 and the
+            // test would pass on the bug it exists to catch. Correct => 2,
+            // inverted => 1, dropped => 0, double-increment => 4.
+            // Not covered: moving the increment after handle_record, which
+            // this aggregate assertion cannot see.
+            s.write_all(
+                b"{\"uid\":\"C1\"}\n\
+                  {\"uid\":\"C2\"}\n\
+                  {\"_path\":\"unknown\",\"uid\":\"C3\"}\n",
+            )
+            .await
+            .unwrap();
+            s.shutdown().await.unwrap();
+        });
+
+        let (stream, src) = listener.accept().await.unwrap();
+        ZeekListener::handle_tcp_connection(stream, src, CapturingHandler::new())
+            .await
+            .unwrap();
+        client.await.unwrap();
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let missing = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("zeek_missing_path"),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            missing, 2,
+            "two of the three records have an absent _path; a literal _path of \
+             \"unknown\" is a present path and must not be counted. Got 1 => the \
+             condition is inverted; got 0 => the increment was dropped."
+        );
     }
 
     // -- Metrics: received counters fire for every handler --

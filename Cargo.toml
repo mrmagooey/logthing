@@ -152,6 +152,21 @@ harness = false
 name = "syslog_message_to_record_batch"
 harness = false
 
+[lib]
+# `cargo bench` otherwise treats the lib's own test harness as a bench target
+# and forwards criterion flags to it, where `--save-baseline` is unrecognized
+# and aborts the whole run. The lib has no #[bench] functions; its tests run
+# under `cargo test`.
+bench = false
+
+[[bin]]
+name = "logthing"
+path = "src/main.rs"
+# Same reason as [lib] above — the bin's test harness is also a bench target by
+# default, so it too would reject criterion's flags. Declared explicitly here
+# only to carry this setting; otherwise it is auto-discovered from src/main.rs.
+bench = false
+
 [[bench]]
 name = "generic_hec_to_record_batch"
 harness = false
@@ -162,6 +177,26 @@ harness = false
 
 [[bench]]
 name = "syslog_parse_recv_path"
+harness = false
+
+[[bench]]
+name = "zeek_parse_recv_path"
+harness = false
+
+[[bench]]
+name = "suricata_parse_recv_path"
+harness = false
+
+[[bench]]
+name = "ipfix_decode_recv_path"
+harness = false
+
+[[bench]]
+name = "sflow_decode_recv_path"
+harness = false
+
+[[bench]]
+name = "zeek_schema_encode"
 harness = false
 
 [profile.profiling]
