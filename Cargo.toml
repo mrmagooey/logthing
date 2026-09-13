@@ -152,6 +152,13 @@ harness = false
 name = "syslog_message_to_record_batch"
 harness = false
 
+[lib]
+# `cargo bench` otherwise treats the lib's own test harness as a bench target
+# and forwards criterion flags to it, where `--save-baseline` is unrecognized
+# and aborts the whole run. The lib has no #[bench] functions; its tests run
+# under `cargo test`.
+bench = false
+
 [[bench]]
 name = "generic_hec_to_record_batch"
 harness = false
