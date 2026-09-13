@@ -36,7 +36,6 @@ use std::net::{IpAddr, Ipv4Addr};
 
 // --- Fixtures transcribed from src/sflow/decoder.rs (see header) ---
 
-
 // ── fixture: flow sample with raw packet header (Ethernet/IPv4/TCP → 5-tuple) ──
 //
 // sFlow v5 datagram layout (all big-endian / XDR, 4-byte aligned):
@@ -133,8 +132,6 @@ const FIXTURE_SFLOW_FLOW_RAW_HEADER: &[u8] = &[
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
-
-
 // ── fixture: flow sample with sampled_ipv4 record (format 3 carries 5-tuple directly) ──
 //
 // Datagram header: identical to above (28 bytes), num_samples=1.
@@ -180,8 +177,6 @@ const FIXTURE_SFLOW_SAMPLED_IPV4: &[u8] = &[
     0x00, 0x00, 0x00, 0x00, // tcp_flags = 0
     0x00, 0x00, 0x00, 0x00, // tos = 0
 ];
-
-
 
 // ── fixture: counter sample with generic interface counters (format 1) ──
 //

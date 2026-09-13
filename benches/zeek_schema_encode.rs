@@ -24,8 +24,7 @@ use logthing::forwarding::buffered_writer::ParquetSink;
 use logthing::forwarding::zeek_s3::ZeekSink;
 use logthing::zeek::ZeekRecord;
 use logthing::zeek::schema::{
-    conn_schema, dns_schema, envelope_schema, files_schema, http_schema, notice_schema,
-    ssl_schema,
+    conn_schema, dns_schema, envelope_schema, files_schema, http_schema, notice_schema, ssl_schema,
 };
 use std::hint::black_box;
 

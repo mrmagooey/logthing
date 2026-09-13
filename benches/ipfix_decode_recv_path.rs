@@ -80,8 +80,8 @@ fn bench_decode(c: &mut Criterion) {
 
     // Steady state: template installed once, outside the timed loop.
     let mut warm = IpfixDecoder::new();
-    let installed = decode_datagram(&mut warm, TEMPLATE_THEN_DATA, exporter())
-        .expect("fixture must decode");
+    let installed =
+        decode_datagram(&mut warm, TEMPLATE_THEN_DATA, exporter()).expect("fixture must decode");
     assert_eq!(installed.len(), 1, "template+data fixture yields one flow");
 
     group.bench_function("warm_cache_data_only", |b| {
