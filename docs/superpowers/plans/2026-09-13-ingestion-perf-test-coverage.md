@@ -68,6 +68,81 @@ Established by survey on 2026-09-13, at crate version 0.18.0. Do not re-derive:
 
 Branch: `perf/recv-path-benches`, off current `master`. Verify the base with `git rev-parse HEAD` before starting; do not trust a remembered SHA.
 
+### Task 0: Prep commit — register all five bench targets with stubs
+
+**Coordinator does this before dispatching anything else.** Not a subagent task.
+
+**Files:**
+- Modify: `Cargo.toml` (five `[[bench]]` entries after the existing ones)
+- Create: five stub files under `benches/`
+
+**Why this exists:** Tasks 2-6 each add a `[[bench]]` entry, and five parallel worktrees editing `Cargo.toml` is five merge conflicts. But registering a bench target whose file does not exist is worse — **Cargo fails at manifest-parse time**, so `cargo build`, `cargo test` and `cargo bench --no-run` all break for the *whole package*, not just that one target:
+
+```
+error: Cargo.toml: can't find `ghost` bench at `benches/ghost.rs` ...
+error: could not parse `<pkg>` (manifest) due to 1 previous error
+```
+
+Verified directly, 2026-09-13. A stub file fixes it: with `harness = false`, a bench target whose body is `fn main() {}` compiles and `cargo bench --no-run` accepts it. So the prep commit registers the entry **and** the stub together, every commit stays buildable, and no subagent ever touches `Cargo.toml`.
+
+- [ ] **Step 1: Append the five entries**
+
+```toml
+[[bench]]
+name = "zeek_parse_recv_path"
+harness = false
+
+[[bench]]
+name = "suricata_parse_recv_path"
+harness = false
+
+[[bench]]
+name = "ipfix_decode_recv_path"
+harness = false
+
+[[bench]]
+name = "sflow_decode_recv_path"
+harness = false
+
+[[bench]]
+name = "zeek_schema_encode"
+harness = false
+```
+
+- [ ] **Step 2: Create the five stubs**
+
+```bash
+for b in zeek_parse_recv_path suricata_parse_recv_path ipfix_decode_recv_path \
+         sflow_decode_recv_path zeek_schema_encode; do
+  cat > "benches/$b.rs" <<EOF
+//! Stub — filled in by the task that owns this bench. Registered up front so
+//! every commit on this branch has a parseable manifest; see Task 0.
+fn main() {}
+EOF
+done
+```
+
+- [ ] **Step 3: Verify the manifest still parses and everything builds**
+
+Run: `cargo bench --no-run && cargo test --no-run`
+Expected: both succeed. If `cargo` reports `can't find ... bench`, a stub is missing or misnamed — fix before dispatching any subagent, because every worktree inherits this commit.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add Cargo.toml benches/
+git commit -m "chore(bench): register five bench targets with stubs
+
+Registered up front so the five bench tasks never touch Cargo.toml in
+parallel worktrees. Stubs rather than bare entries because Cargo fails
+at manifest-parse time on a [[bench]] whose file does not exist, which
+breaks build/test for the whole package, not just that target."
+```
+
+**Consequence for Tasks 2-6:** each one **overwrites its stub file** and must **not** edit `Cargo.toml`. Their "Register the bench" steps are already done — skip them.
+
+---
+
 ### Task 1: Extract `zeek::parse_line`
 
 **Files:**
@@ -77,7 +152,19 @@ Branch: `perf/recv-path-benches`, off current `master`. Verify the base with `gi
 
 **Interfaces:**
 - Consumes: `normalize_log_path(&str) -> &str` and `ZeekRecord { log_path: String, fields: serde_json::Value, received_at: DateTime<Utc> }`, both already in `src/zeek/mod.rs`.
-- Produces: `pub fn parse_line(line: &str, received_at: DateTime<Utc>) -> Option<ZeekRecord>` — `None` on JSON parse failure, `Some` otherwise with `log_path` defaulting to `"unknown"`. Task 2 benches it. Task 3 mirrors its shape for suricata.
+- Produces:
+  ```rust
+  pub struct ParsedZeekLine {
+      pub record: ZeekRecord,
+      /// `_path` was absent or non-string, so `record.log_path` is the
+      /// `"unknown"` fallback rather than a real stream name.
+      pub path_was_missing: bool,
+  }
+  pub fn parse_line(line: &str, received_at: DateTime<Utc>) -> Option<ParsedZeekLine>;
+  ```
+  `None` on JSON parse failure. Task 2 benches it. Task 3 mirrors its shape for suricata.
+
+**Why the flag rather than testing `log_path == "unknown"`:** the listener owns `zeek_missing_path`, and that counter must keep meaning exactly what it means today. A record whose `_path` is literally the string `"unknown"` is currently *not* counted as missing; sniffing the output string would start counting it, silently changing an operator-facing signal inside what is supposed to be a pure extraction. The flag costs one bool and keeps the refactor honest.
 
 **Why extract rather than bench the loop:** the loop is `async`, owns a socket, and interleaves transport concerns (oversize guard, connection teardown) with parse. A bench cannot reach it, and neither can a unit test — which is why the `_path` extraction currently has only indirect coverage via three tests that re-implement the extraction inline rather than calling it (`src/zeek/listener.rs`, `extract_log_path_from_json` and siblings). Those tests assert against a copy of the logic, not the logic.
 
@@ -89,20 +176,35 @@ Add to `src/zeek/mod.rs`'s existing `mod tests`:
     #[test]
     fn parse_line_extracts_normalized_path_and_fields() {
         let at = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let rec = parse_line(r#"{"_path":"conn.2026-08-14-16-08-44","uid":"Cabc"}"#, at)
+        let p = parse_line(r#"{"_path":"conn.2026-08-14-16-08-44","uid":"Cabc"}"#, at)
             .expect("valid NDJSON must parse");
-        assert_eq!(rec.log_path, "conn", "rotation suffix must be normalized off");
-        assert_eq!(rec.fields["uid"], "Cabc");
-        assert_eq!(rec.received_at, at, "received_at must be the caller's, not Utc::now()");
+        assert_eq!(p.record.log_path, "conn", "rotation suffix must be normalized off");
+        assert_eq!(p.record.fields["uid"], "Cabc");
+        assert_eq!(p.record.received_at, at, "received_at must be the caller's, not Utc::now()");
+        assert!(!p.path_was_missing);
     }
 
     #[test]
-    fn parse_line_defaults_missing_or_non_string_path_to_unknown() {
+    fn parse_line_flags_missing_or_non_string_path_and_falls_back_to_unknown() {
         let at = chrono::Utc::now();
         for line in [r#"{"uid":"Cabc"}"#, r#"{"_path":42,"uid":"Cabc"}"#] {
-            let rec = parse_line(line, at).expect("valid JSON, just no usable _path");
-            assert_eq!(rec.log_path, "unknown", "line: {line}");
+            let p = parse_line(line, at).expect("valid JSON, just no usable _path");
+            assert_eq!(p.record.log_path, "unknown", "line: {line}");
+            assert!(p.path_was_missing, "line: {line}");
         }
+    }
+
+    /// The regression the `path_was_missing` flag exists to prevent: a literal
+    /// `_path` of "unknown" is a present path, and must NOT be counted as a miss.
+    #[test]
+    fn parse_line_does_not_flag_a_literal_unknown_path_as_missing() {
+        let p = parse_line(r#"{"_path":"unknown","uid":"Cabc"}"#, chrono::Utc::now())
+            .expect("valid NDJSON must parse");
+        assert_eq!(p.record.log_path, "unknown");
+        assert!(
+            !p.path_was_missing,
+            "a present _path of \"unknown\" is not a missing _path"
+        );
     }
 
     #[test]
@@ -123,22 +225,36 @@ Expected: FAIL — `cannot find function 'parse_line' in this scope`.
 In `src/zeek/mod.rs`, after `normalize_log_path`:
 
 ```rust
-/// Parse one NDJSON line into a [`ZeekRecord`]. Returns `None` if the line is
-/// not valid JSON — the caller owns the `zeek_parse_errors` metric and the log
-/// line, since only it knows the peer address.
+/// A parsed NDJSON line plus whether its `_path` was usable.
+pub struct ParsedZeekLine {
+    pub record: ZeekRecord,
+    /// `_path` was absent or non-string, so [`ZeekRecord::log_path`] is the
+    /// `"unknown"` fallback rather than a real stream name. Distinct from a
+    /// record whose `_path` is literally the string `"unknown"`, which is a
+    /// present path — the listener's `zeek_missing_path` counter depends on
+    /// that distinction.
+    pub path_was_missing: bool,
+}
+
+/// Parse one NDJSON line. Returns `None` if the line is not valid JSON — the
+/// caller owns the `zeek_parse_errors` metric and the log line, since only it
+/// knows the peer address.
 ///
 /// `received_at` is passed in rather than read from the clock here so callers
 /// (and benches) are deterministic.
-pub fn parse_line(line: &str, received_at: DateTime<Utc>) -> Option<ZeekRecord> {
+pub fn parse_line(line: &str, received_at: DateTime<Utc>) -> Option<ParsedZeekLine> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    let log_path = match value.get("_path").and_then(|v| v.as_str()) {
-        Some(p) => normalize_log_path(p).to_string(),
-        None => "unknown".to_string(),
+    let (log_path, path_was_missing) = match value.get("_path").and_then(|v| v.as_str()) {
+        Some(p) => (normalize_log_path(p).to_string(), false),
+        None => ("unknown".to_string(), true),
     };
-    Some(ZeekRecord {
-        log_path,
-        fields: value,
-        received_at,
+    Some(ParsedZeekLine {
+        record: ZeekRecord {
+            log_path,
+            fields: value,
+            received_at,
+        },
+        path_was_missing,
     })
 }
 ```
@@ -153,7 +269,7 @@ Expected: PASS, 3 tests.
 Replace the `match serde_json::from_str::<serde_json::Value>(line) { ... }` block in `src/zeek/listener.rs`'s `handle_tcp_connection` with:
 
 ```rust
-            let Some(record) = crate::zeek::parse_line(line, Utc::now()) else {
+            let Some(parsed) = crate::zeek::parse_line(line, Utc::now()) else {
                 metrics::counter!("zeek_parse_errors").increment(1);
                 warn!(
                     "Zeek: JSON parse error from {} — line: {}",
@@ -162,9 +278,10 @@ Replace the `match serde_json::from_str::<serde_json::Value>(line) { ... }` bloc
                 );
                 continue;
             };
-            if record.log_path == "unknown" {
+            if parsed.path_was_missing {
                 metrics::counter!("zeek_missing_path").increment(1);
             }
+            let record = parsed.record;
             // Counted here, not in a handler impl: every handler routes through
             // this one point, so the metric is emitted regardless of which
             // forwarding destinations are configured.
@@ -176,7 +293,7 @@ Replace the `match serde_json::from_str::<serde_json::Value>(line) { ... }` bloc
             handler.handle_record(record, src).await;
 ```
 
-Note the one deliberate behaviour difference to check for: previously `zeek_missing_path` fired only when `_path` was absent or non-string. A record whose `_path` is literally the string `"unknown"` now also increments it. Confirm whether the existing test `listener_routes_missing_path_to_unknown` covers this; if a real `_path` of `"unknown"` matters, have `parse_line` return the miss explicitly instead — but do not add that complexity unless a test demands it.
+This is behaviour-preserving in every case, including the one that would otherwise drift: `zeek_missing_path` still fires exactly when `_path` is absent or non-string, never for a record whose `_path` is literally `"unknown"`. The third unit test from Step 1 is the guard.
 
 - [ ] **Step 6: Run the full zeek suite plus the metric tests**
 
@@ -201,25 +318,15 @@ Pure extraction: same metrics, same order, same values."
 
 **Files:**
 - Create: `benches/zeek_parse_recv_path.rs`
-- Modify: `Cargo.toml` (add a `[[bench]]` entry after the existing ones at lines 135-165)
+- Overwrite: `benches/zeek_parse_recv_path.rs` (stub created by Task 0; do NOT edit `Cargo.toml`)
 
 **Interfaces:**
 - Consumes: `logthing::zeek::parse_line` from Task 1.
 - Produces: nothing later tasks depend on; Task 7 runs it.
 
-- [ ] **Step 1: Register the bench target**
+- [ ] **Step 1: Write the bench**
 
-Append to `Cargo.toml`:
-
-```toml
-[[bench]]
-name = "zeek_parse_recv_path"
-harness = false
-```
-
-- [ ] **Step 2: Write the bench**
-
-Create `benches/zeek_parse_recv_path.rs`:
+Task 0 already registered this target and left a stub. **Overwrite** `benches/zeek_parse_recv_path.rs` and do not touch `Cargo.toml`:
 
 ```rust
 //! Criterion micro-benchmarks: the Zeek TCP *receive-path* parse cost that runs
@@ -273,6 +380,13 @@ fn bench_parse_line(c: &mut Criterion) {
         ("conn_rotated_path", ROTATED_LINE),
     ] {
         let at = chrono::Utc::now();
+        // Fail loudly at setup rather than silently timing the `.ok()?` early
+        // return: a typo in the JSON literal above would otherwise look like a
+        // very fast parse. Same guard the ipfix/sflow benches use.
+        assert!(
+            parse_line(line, at).is_some(),
+            "fixture {name} must parse; check the JSON literal"
+        );
         group.bench_function(name, |b| {
             b.iter(|| {
                 let rec = parse_line(black_box(line), black_box(at));
@@ -317,7 +431,7 @@ Expected: five reported timings. Sanity-check the magnitude against the known ra
 - [ ] **Step 5: Commit**
 
 ```bash
-git add benches/zeek_parse_recv_path.rs Cargo.toml
+git add benches/zeek_parse_recv_path.rs
 git commit -m "bench(zeek): add recv-path parse benchmark
 
 The recv/parse layer had exactly one bench in the suite (syslog UDP);
@@ -333,12 +447,19 @@ Suricata's loop is the same shape as zeek's, so this task does both the extracti
 **Files:**
 - Modify: `src/suricata/mod.rs` (add function; `#[cfg(test)] mod tests` already exists at line 19)
 - Modify: `src/suricata/listener.rs:260-289` (the `match serde_json::from_str` block)
-- Create: `benches/suricata_parse_recv_path.rs`
-- Modify: `Cargo.toml`
+- Overwrite: `benches/suricata_parse_recv_path.rs` (stub from Task 0; do NOT edit `Cargo.toml`)
 
 **Interfaces:**
 - Consumes: `SuricataRecord { event_type: String, fields: serde_json::Value, received_at: DateTime<Utc> }` from `src/suricata/mod.rs:7`.
-- Produces: `pub fn parse_line(line: &str, received_at: DateTime<Utc>) -> Option<SuricataRecord>`.
+- Produces:
+  ```rust
+  pub struct ParsedSuricataLine {
+      pub record: SuricataRecord,
+      pub event_type_was_missing: bool,
+  }
+  pub fn parse_line(line: &str, received_at: DateTime<Utc>) -> Option<ParsedSuricataLine>;
+  ```
+  Same shape and same reasoning as zeek's in Task 1: the flag keeps `suricata_missing_event_type` meaning exactly what it means today, rather than also firing for a record whose `event_type` is literally `"unknown"`.
 
 Note the asymmetry with zeek, and keep it: suricata has **no** `normalize_*` step — `event_type` is used raw. Do not add normalization; that would be an unrequested behaviour change.
 
@@ -350,20 +471,29 @@ Add to `src/suricata/mod.rs`'s `mod tests`:
     #[test]
     fn parse_line_extracts_event_type_and_fields() {
         let at = chrono::Utc::now();
-        let rec = parse_line(r#"{"event_type":"alert","src_ip":"10.0.0.1"}"#, at)
+        let p = parse_line(r#"{"event_type":"alert","src_ip":"10.0.0.1"}"#, at)
             .expect("valid EVE JSON must parse");
-        assert_eq!(rec.event_type, "alert");
-        assert_eq!(rec.fields["src_ip"], "10.0.0.1");
-        assert_eq!(rec.received_at, at);
+        assert_eq!(p.record.event_type, "alert");
+        assert_eq!(p.record.fields["src_ip"], "10.0.0.1");
+        assert_eq!(p.record.received_at, at);
+        assert!(!p.event_type_was_missing);
     }
 
     #[test]
-    fn parse_line_defaults_missing_or_non_string_event_type_to_unknown() {
+    fn parse_line_flags_missing_or_non_string_event_type() {
         let at = chrono::Utc::now();
         for line in [r#"{"src_ip":"10.0.0.1"}"#, r#"{"event_type":7}"#] {
-            let rec = parse_line(line, at).expect("valid JSON, just no usable event_type");
-            assert_eq!(rec.event_type, "unknown", "line: {line}");
+            let p = parse_line(line, at).expect("valid JSON, just no usable event_type");
+            assert_eq!(p.record.event_type, "unknown", "line: {line}");
+            assert!(p.event_type_was_missing, "line: {line}");
         }
+    }
+
+    #[test]
+    fn parse_line_does_not_flag_a_literal_unknown_event_type_as_missing() {
+        let p = parse_line(r#"{"event_type":"unknown"}"#, chrono::Utc::now())
+            .expect("valid EVE JSON must parse");
+        assert!(!p.event_type_was_missing);
     }
 
     #[test]
@@ -388,16 +518,27 @@ In `src/suricata/mod.rs`, after the `SuricataRecord` struct:
 ///
 /// Unlike Zeek's `_path`, `event_type` is used verbatim: Suricata does not
 /// rotate it into the value the way a log shipper rotates a filename.
-pub fn parse_line(line: &str, received_at: DateTime<Utc>) -> Option<SuricataRecord> {
+pub struct ParsedSuricataLine {
+    pub record: SuricataRecord,
+    /// `event_type` was absent or non-string. Distinct from a record whose
+    /// `event_type` is literally `"unknown"`, which is a present value.
+    pub event_type_was_missing: bool,
+}
+
+pub fn parse_line(line: &str, received_at: DateTime<Utc>) -> Option<ParsedSuricataLine> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    let event_type = match value.get("event_type").and_then(|v| v.as_str()) {
-        Some(t) => t.to_string(),
-        None => "unknown".to_string(),
-    };
-    Some(SuricataRecord {
-        event_type,
-        fields: value,
-        received_at,
+    let (event_type, event_type_was_missing) =
+        match value.get("event_type").and_then(|v| v.as_str()) {
+            Some(t) => (t.to_string(), false),
+            None => ("unknown".to_string(), true),
+        };
+    Some(ParsedSuricataLine {
+        record: SuricataRecord {
+            event_type,
+            fields: value,
+            received_at,
+        },
+        event_type_was_missing,
     })
 }
 ```
@@ -412,7 +553,7 @@ Expected: PASS, 3 tests.
 Replace the `match serde_json::from_str::<serde_json::Value>(line) { ... }` block in `src/suricata/listener.rs`'s `handle_tcp_connection` with:
 
 ```rust
-            let Some(record) = crate::suricata::parse_line(line, Utc::now()) else {
+            let Some(parsed) = crate::suricata::parse_line(line, Utc::now()) else {
                 metrics::counter!("suricata_parse_errors").increment(1);
                 warn!(
                     "Suricata: JSON parse error from {} — line: {}",
@@ -421,10 +562,10 @@ Replace the `match serde_json::from_str::<serde_json::Value>(line) { ... }` bloc
                 );
                 continue;
             };
-            if record.event_type == "unknown" {
+            if parsed.event_type_was_missing {
                 metrics::counter!("suricata_missing_event_type").increment(1);
             }
-            handler.handle_record(record, src).await;
+            handler.handle_record(parsed.record, src).await;
 ```
 
 Leave `suricata_records_received` / `suricata_records_by_event_type` where they are for now — moving them out of `DefaultSuricataHandler` is the separate known defect tracked outside this plan, and bundling it here would make this task's diff two changes wearing one hat.
@@ -434,17 +575,9 @@ Leave `suricata_records_received` / `suricata_records_by_event_type` where they 
 Run: `cargo test --lib suricata:: && cargo test --test suricata_local_integration`
 Expected: all PASS.
 
-- [ ] **Step 7: Register and write the bench**
+- [ ] **Step 7: Write the bench**
 
-Append to `Cargo.toml`:
-
-```toml
-[[bench]]
-name = "suricata_parse_recv_path"
-harness = false
-```
-
-Create `benches/suricata_parse_recv_path.rs`:
+Task 0 already registered this target and left a stub. **Overwrite** `benches/suricata_parse_recv_path.rs` and do not touch `Cargo.toml`:
 
 ```rust
 //! Criterion micro-benchmarks: the Suricata TCP *receive-path* parse cost that
@@ -486,6 +619,11 @@ fn bench_parse_line(c: &mut Criterion) {
         ("dns", DNS_LINE),
     ] {
         let at = chrono::Utc::now();
+        // See the zeek bench: guard against timing an early error return.
+        assert!(
+            parse_line(line, at).is_some(),
+            "fixture {name} must parse; check the JSON literal"
+        );
         group.bench_function(name, |b| {
             b.iter(|| black_box(parse_line(black_box(line), black_box(at))))
         });
@@ -523,7 +661,7 @@ Expected: four timings, low single-digit µs. Apply the same sanity gate as Task
 - [ ] **Step 9: Commit**
 
 ```bash
-git add src/suricata/mod.rs src/suricata/listener.rs benches/suricata_parse_recv_path.rs Cargo.toml
+git add src/suricata/mod.rs src/suricata/listener.rs benches/suricata_parse_recv_path.rs
 git commit -m "refactor(suricata): extract parse_line, add recv-path benchmark
 
 Mirrors the zeek extraction: the EVE JSON parse was inlined in the
@@ -537,8 +675,7 @@ connection loop and could be neither unit-tested nor benchmarked."
 No extraction needed — `logthing::ipfix::decoder::decode_datagram` is already `pub` (`src/ipfix/decoder.rs:1026`).
 
 **Files:**
-- Create: `benches/ipfix_decode_recv_path.rs`
-- Modify: `Cargo.toml`
+- Overwrite: `benches/ipfix_decode_recv_path.rs` (stub from Task 0; do NOT edit `Cargo.toml`)
 
 **Interfaces:**
 - Consumes: `logthing::ipfix::decoder::{IpfixDecoder, decode_datagram}`; `IpfixDecoder::new()` is `pub` (`src/ipfix/decoder.rs:111`), `decode_datagram(&mut IpfixDecoder, &[u8], IpAddr) -> Result<Vec<FlowRecord>, DecodeError>`.
@@ -546,17 +683,9 @@ No extraction needed — `logthing::ipfix::decoder::decode_datagram` is already 
 
 **The measurement that matters here:** IPFIX is stateful. The first datagram carrying a template populates the decoder's cache; every subsequent data-only datagram hits it. Real steady-state traffic is overwhelmingly cache hits, so a bench that re-decodes a template on every iteration measures a case that almost never happens. Bench both, separately, and label them.
 
-- [ ] **Step 1: Register the bench**
+- [ ] **Step 1: Write the bench**
 
-```toml
-[[bench]]
-name = "ipfix_decode_recv_path"
-harness = false
-```
-
-- [ ] **Step 2: Write the bench**
-
-Create `benches/ipfix_decode_recv_path.rs`:
+Task 0 already registered this target and left a stub. **Overwrite** `benches/ipfix_decode_recv_path.rs` and do not touch `Cargo.toml`:
 
 ```rust
 //! Criterion micro-benchmarks: the IPFIX *receive-path* binary decode cost that
@@ -687,7 +816,7 @@ Expected: two timings. `warm_cache_data_only` should be meaningfully cheaper tha
 - [ ] **Step 5: Commit**
 
 ```bash
-git add benches/ipfix_decode_recv_path.rs Cargo.toml
+git add benches/ipfix_decode_recv_path.rs
 git commit -m "bench(ipfix): add recv-path binary decode benchmark
 
 Splits warm-cache steady state from the template-refresh case; the
@@ -699,22 +828,15 @@ binary decode path had no benchmark coverage at all."
 ### Task 5: sFlow decode recv-path bench
 
 **Files:**
-- Create: `benches/sflow_decode_recv_path.rs`
-- Modify: `Cargo.toml`
+- Overwrite: `benches/sflow_decode_recv_path.rs` (stub from Task 0; do NOT edit `Cargo.toml`)
 
 **Interfaces:**
 - Consumes: `logthing::sflow::decoder::decode_datagram(&[u8], IpAddr) -> anyhow::Result<Vec<SflowRecord>>` (`src/sflow/decoder.rs:51`). Note it is **stateless**, unlike IPFIX — no decoder handle, no cache, so there is no warm/cold distinction to draw.
 - Produces: nothing later tasks depend on.
 
-- [ ] **Step 1: Register the bench**
+Task 0 already registered this target and left a stub. **Overwrite** `benches/sflow_decode_recv_path.rs` and do not touch `Cargo.toml`.
 
-```toml
-[[bench]]
-name = "sflow_decode_recv_path"
-harness = false
-```
-
-- [ ] **Step 2: Copy the fixtures out of the source**
+- [ ] **Step 1: Copy the fixtures out of the source**
 
 The three fixtures needed are `FIXTURE_SFLOW_FLOW_RAW_HEADER` (`src/sflow/decoder.rs:659`), `FIXTURE_SFLOW_SAMPLED_IPV4` (line 726), and `FIXTURE_SFLOW_COUNTER` (line 774). They are `#[cfg(test)] pub(crate)` inside a test module, so they must be transcribed into the bench verbatim.
 
@@ -814,7 +936,7 @@ Expected: three timings, with `counter` cheapest and `flow_raw_header` dearest. 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add benches/sflow_decode_recv_path.rs Cargo.toml
+git add benches/sflow_decode_recv_path.rs
 git commit -m "bench(sflow): add recv-path binary decode benchmark
 
 Three depths: raw-header flow sample (full Ethernet/IP/transport walk),
@@ -826,8 +948,7 @@ pre-parsed IPv4 flow sample, and counter sample."
 ### Task 6: Zeek non-`conn` encode coverage
 
 **Files:**
-- Create: `benches/zeek_schema_encode.rs`
-- Modify: `Cargo.toml`
+- Overwrite: `benches/zeek_schema_encode.rs` (stub from Task 0; do NOT edit `Cargo.toml`)
 
 **Interfaces:**
 - Consumes: `logthing::zeek::schema::get_schema_entry(&str) -> Arc<SchemaEntry>` (`src/zeek/schema.rs:1317`), `logthing::zeek::ZeekRecord`, and `ZeekSink::to_record_batch`. Read `benches/zeek_conn_batch_amortization.rs:48-88` for the exact call shape the existing bench uses and mirror it — do not invent a different one.
@@ -835,15 +956,9 @@ pre-parsed IPv4 flow sample, and counter sample."
 
 **Why a separate file from `zeek_conn_batch_amortization.rs`:** that bench answers "does the amortized accumulator beat the per-record path for `conn`?" This one answers "what does each schema cost to encode?" Different questions, different fixtures, and folding them together would make both harder to read. The `conn` schema is deliberately included here too, as the cross-reference point between the two files.
 
-- [ ] **Step 1: Register the bench**
+Task 0 already registered this target and left a stub. **Overwrite** `benches/zeek_schema_encode.rs` and do not touch `Cargo.toml`.
 
-```toml
-[[bench]]
-name = "zeek_schema_encode"
-harness = false
-```
-
-- [ ] **Step 2: Read the existing bench for the call shape**
+- [ ] **Step 1: Read the existing bench for the call shape**
 
 Run: `sed -n '1,90p' benches/zeek_conn_batch_amortization.rs`
 
@@ -886,7 +1001,7 @@ Expected: seven timings. **The `conn` case must land near 13.1µs** — that is 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add benches/zeek_schema_encode.rs Cargo.toml
+git add benches/zeek_schema_encode.rs
 git commit -m "bench(zeek): cover the six non-conn schemas and the envelope fallback
 
 Encode coverage was conn-only; dns/http/ssl/files/notice and the
@@ -932,10 +1047,15 @@ git rev-parse HEAD
 
 - [ ] **Step 4: Run the full suite with a named baseline**
 
-Run: `cargo bench -- --save-baseline v0.18.0`
-Expected: all 12 bench targets run (8 pre-existing + 4 new). Criterion's defaults are 100 samples, 3s warm-up, 5s measurement per function — expect roughly 10-20 minutes. No bench in this repo overrides those, and none should start.
+Criterion's defaults are 100 samples, 3s warm-up, 5s measurement per function, so 13 targets is roughly 10-20 minutes — **longer than the 10-minute ceiling on a foreground command**. Do not run it in the foreground and do not shorten the sampling to fit; run it detached and collect the log:
 
-Keep the full stdout; it is the raw material for the doc.
+```bash
+cargo bench -- --save-baseline v0.18.0 > /tmp/criterion-v0.18.0.log 2>&1
+```
+
+Run that with the Bash tool's `run_in_background: true`, then wait for the completion notification before reading `/tmp/criterion-v0.18.0.log`. No bench in this repo overrides criterion's defaults, and none should start doing so to make this step fit a timeout.
+
+Expected: all 13 bench targets run. Keep the full log; it is the raw material for the doc.
 
 - [ ] **Step 5: Write the results doc**
 
@@ -1013,7 +1133,7 @@ git push --no-verify origin perf/recv-path-benches
 ```
 Expected: all four green before the push. Push in the foreground.
 
-**Phase 1 exit criteria:** 12 bench targets present and passing `-- --test`; `cargo test` green; one committed results doc with disclosed hardware; CI persists baselines.
+**Phase 1 exit criteria:** 13 bench targets present and passing `-- --test`; `cargo test` green; one committed results doc with disclosed hardware; CI persists baselines.
 
 ---
 
@@ -1022,6 +1142,8 @@ Expected: all four green before the push. Push in the foreground.
 Branch: `perf/loadgen-formats`, off `master` after Phase 1 merges.
 
 **Execute this only after Phase 1 is merged.** It is independently valuable and independently reviewable; if effort has to be cut, cut here — Phase 1 produces the numbers, Phase 2 produces the load to stress them.
+
+To be precise about *why* sequential rather than concurrent, since it is a scheduling choice and not a hard dependency: `tools/loadgen` has no compile-time coupling to `src/zeek` at all — it only speaks the wire protocol to a running server, so Task 9's smoke test would pass equally well against pre-Task-1 code. The reason to serialise is narrower: Task 9 Step 4 asserts on `zeek_records_received` while Task 1 is refactoring the very listener that emits it, and debugging a load-generator bug against a moving target wastes more time than the serialisation costs.
 
 Context the executor needs: `tools/loadgen` is a separate, non-default workspace member with exactly one subcommand, `syslog-udp` (`tools/loadgen/src/main.rs:9-15`). The six others named in its design (`docs/superpowers/specs/2026-07-05-performance-testing-strategy-design.md`) were deliberately deferred. The docker-compose simulation environment's perf test drives **WEF over HTTP only**. This phase adds the two highest-volume non-syslog formats. Suricata, sFlow, HEC, and OTLP subcommands stay deferred.
 
@@ -1035,7 +1157,9 @@ Context the executor needs: `tools/loadgen` is a separate, non-default workspace
 - Consumes: the arg/pacing shape of `tools/loadgen/src/syslog_udp.rs` — read it first and mirror its `clap` derive, its rate pacing, and its progress reporting rather than inventing new ones.
 - Produces: `pub struct ZeekTcpArgs` (clap `Args`) and `pub async fn run(args: ZeekTcpArgs) -> anyhow::Result<()>`, registered as `Command::ZeekTcp`.
 
-Key difference from `syslog-udp` that the implementer must handle: zeek is **TCP and connection-oriented**, not fire-and-forget UDP. One connection carries many newline-delimited records; a dropped connection loses the stream. The generator must open one connection and hold it, write `\n`-terminated JSON, and report write errors rather than silently continuing.
+Key difference from `syslog-udp` that the implementer must handle: zeek is **TCP and connection-oriented**, not fire-and-forget UDP. One connection carries many newline-delimited records; a dropped connection loses the stream. The generator opens one connection and holds it for the whole run, writing `\n`-terminated JSON.
+
+**On a write error, abort the run and exit non-zero — do not reconnect.** This is deliberate. A silent reconnect-and-resume would paper over exactly the signal Task 12 is trying to measure: if the server closes the connection or stops reading, that is server-side backpressure, and a generator that quietly re-establishes the stream reports a clean run while hiding it. Print how many records were written before the failure so the run is still interpretable.
 
 - [ ] **Step 1: Read the existing subcommand end to end**
 
