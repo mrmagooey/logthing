@@ -164,6 +164,26 @@ harness = false
 name = "syslog_parse_recv_path"
 harness = false
 
+[[bench]]
+name = "zeek_parse_recv_path"
+harness = false
+
+[[bench]]
+name = "suricata_parse_recv_path"
+harness = false
+
+[[bench]]
+name = "ipfix_decode_recv_path"
+harness = false
+
+[[bench]]
+name = "sflow_decode_recv_path"
+harness = false
+
+[[bench]]
+name = "zeek_schema_encode"
+harness = false
+
 [profile.profiling]
 inherits = "release"
 debug = true
