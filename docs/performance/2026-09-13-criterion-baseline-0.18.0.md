@@ -171,6 +171,15 @@ costs. Subtracting or dividing one by the other is precisely the error that
 `to_record_batch` is **4.13-17.57 µs** across all sinks, as measured above —
 40-100× lower. Never cite the old figure.
 
+### One thing that was checked and needed no change
+
+The plan expected the pre-existing bench headers to carry stale column counts
+after the v0.16.0 `partition_time` addition. They do not — `grep -n
+"column\|field count\|5-column\|schema has" benches/*.rs` matches nothing in
+any of the seven `*_to_record_batch.rs` files or `syslog_parse_recv_path.rs`.
+Those headers never stated column counts, so there was nothing to correct. The
+comparability caveat below is recorded here instead.
+
 ### Comparability caveat
 
 v0.16.0 (2026-09-06, BREAKING) added a non-null `partition_time` column to all
