@@ -688,7 +688,9 @@ mod tests {
             // (must not). The 2:1 split is load-bearing: with a symmetric 1:1
             // mix an inverted `if !parsed.event_type_was_missing` would also
             // yield 1 and the test would pass on the bug it exists to catch.
-            // Correct => 2, inverted => 1, dropped => 0.
+            // Correct => 2, inverted => 1, dropped => 0, double => 4.
+            // Not covered: moving the increment after handle_record,
+            // which this aggregate assertion cannot see.
             s.write_all(
                 b"{\"src_ip\":\"1.1.1.1\"}\n\
                   {\"src_ip\":\"2.2.2.2\"}\n\

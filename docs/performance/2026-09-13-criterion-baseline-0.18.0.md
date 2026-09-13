@@ -107,16 +107,31 @@ sink with zero encode coverage.
 
 ## 3. What these numbers actually say
 
-**Binary decode is 30-70× cheaper than encode, and is not a bottleneck.**
-This is the headline new result. IPFIX decodes a data-only datagram in **308 ns**
-but spends **15.4 µs** encoding the resulting flow — a 50× gap. sFlow decodes in
-**~220 ns** and encodes in **9.3-10.5 µs** — a 45× gap. Both binary receive
-paths had never been measured before; neither deserves optimisation attention.
+**Binary decode is ~42-50× cheaper than encode, and is not a bottleneck.**
+This is the headline new result, and every pairing below is single-record
+against single-record:
+
+| | decode | encode | ratio |
+|---|---|---|---|
+| IPFIX (1 flow) | 308 ns | 15.44 µs | **50.1×** |
+| sFlow flow sample | 220 ns | 9.34 µs | **42.5×** |
+| sFlow counter sample | 230 ns | 10.52 µs | **45.7×** |
+
+Both binary receive paths had never been measured before; neither deserves
+optimisation attention.
+
+Do **not** widen this to "30-70×". The 70× end is only reachable by dividing
+the 10-flow IPFIX batch total (23.41 µs) by a *single*-flow decode (308 ns) —
+a batch-against-single unit mismatch — and the 30× end only by using the
+cold-cache decode (510 ns) that this same document says essentially no
+production traffic pays. Both are the exact error §4 below warns about.
 
 **Text parse is real but secondary.** Zeek parses a `conn` line in 2.86 µs and
 encodes it in 15.58 µs — encode dominates roughly 5:1. Suricata's `alert` parse
-(4.89 µs) is the dearest text parse measured, which tracks: it is the only
-fixture carrying nested `alert` and `flow` objects.
+(4.89 µs) is the dearest *pure* parse measured — the combined
+`from_utf8 + parse` rows (5.03 µs suricata, 3.37 µs zeek) are higher by
+construction since they include the UTF-8 validation step. That `alert` leads
+tracks: it is the only fixture carrying nested `alert` and `flow` objects.
 
 **The IPFIX template cache earns its keep.** A cold-cache decode costs 510 ns
 against 308 ns warm — a 1.65× penalty. Since a real exporter re-sends templates
@@ -165,11 +180,19 @@ costs. Subtracting or dividing one by the other is precisely the error that
 `2026-07-25-cpu-profiling-instrumentation-design.md` was written to correct.
 
 **The "~500 µs-1.3 ms per record" figure is wrong and retracted.** It appears in
-`2026-07-24-performance-improvements-plan.md` §2.1 and
-`2026-07-24-record-batch-amortization-benchmark-results.md`, and was retracted in
-`2026-07-25-cpu-profiling-instrumentation-design.md:46-62`. The real range for
-`to_record_batch` is **4.13-17.57 µs** across all sinks, as measured above —
-40-100× lower. Never cite the old figure.
+`docs/superpowers/specs/2026-07-24-performance-improvements-plan.md` §2.1 and
+`docs/superpowers/specs/2026-07-24-record-batch-amortization-benchmark-results.md`,
+and was retracted in
+`docs/superpowers/specs/2026-07-25-cpu-profiling-instrumentation-design.md:46-62`.
+The real range for `to_record_batch` is **4.13-17.57 µs** across all sinks, as
+measured above.
+
+Against *these* numbers the old figure is **28-315× too high** (500 µs ÷
+17.57 µs ≈ 28×; 1.3 ms ÷ 4.13 µs ≈ 315×). The "40-100×" wording used in the
+retraction doc was derived against that document's own narrower figure set and
+does not follow from the range restated here — if you need a multiplier, use
+the one derived from the numbers you are actually quoting. Never cite the old
+figure itself.
 
 ### One thing that was checked and needed no change
 
