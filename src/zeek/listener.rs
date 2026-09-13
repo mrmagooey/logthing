@@ -1,7 +1,7 @@
 //! Zeek TCP NDJSON listener.
 
 use crate::middleware::IpWhitelist;
-use crate::zeek::{ZeekRecord, normalize_log_path};
+use crate::zeek::ZeekRecord;
 use chrono::Utc;
 use std::net::SocketAddr;
 use std::sync::Arc;
