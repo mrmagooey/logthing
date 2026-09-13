@@ -29,6 +29,43 @@ pub fn normalize_log_path(raw: &str) -> &str {
     }
 }
 
+/// A parsed NDJSON line plus whether its `_path` was usable.
+pub struct ParsedZeekLine {
+    pub record: ZeekRecord,
+    /// `_path` was absent or non-string, so [`ZeekRecord::log_path`] is the
+    /// `"unknown"` fallback rather than a real stream name. Distinct from a
+    /// record whose `_path` is literally the string `"unknown"`, which is a
+    /// present path — the listener's `zeek_missing_path` counter depends on
+    /// that distinction.
+    pub path_was_missing: bool,
+}
+
+/// Parse one NDJSON line. The `serde_json::Error` is returned rather than
+/// swallowed so the caller can keep it in its log line — the caller owns the
+/// `zeek_parse_errors` metric and the warning, since only it knows the peer
+/// address.
+///
+/// `received_at` is passed in rather than read from the clock here so callers
+/// (and benches) are deterministic.
+pub fn parse_line(
+    line: &str,
+    received_at: DateTime<Utc>,
+) -> Result<ParsedZeekLine, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(line)?;
+    let (log_path, path_was_missing) = match value.get("_path").and_then(|v| v.as_str()) {
+        Some(p) => (normalize_log_path(p).to_string(), false),
+        None => ("unknown".to_string(), true),
+    };
+    Ok(ParsedZeekLine {
+        record: ZeekRecord {
+            log_path,
+            fields: value,
+            received_at,
+        },
+        path_was_missing,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
