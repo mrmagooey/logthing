@@ -141,6 +141,23 @@ breaks build/test for the whole package, not just that target."
 
 **Consequence for Tasks 2-6:** each one **overwrites its stub file** and must **not** edit `Cargo.toml`. Their "Register the bench" steps are already done — skip them.
 
+### Dispatch order — read before spawning anything
+
+Task 0 removes the `Cargo.toml` conflict, but it does **not** make Tasks 2-6 uniformly parallel. One hard compile-time dependency remains:
+
+| Task | Branch its worktree from | Why |
+|---|---|---|
+| T1 zeek extraction | Task 0's commit | independent |
+| T3 suricata extraction + bench | Task 0's commit | independent; bundles its own extraction, so it depends on nothing else |
+| T4 ipfix bench | Task 0's commit | `decode_datagram` is already `pub`; no new API needed |
+| T5 sflow bench | Task 0's commit | same |
+| T6 zeek schema encode | Task 0's commit | uses existing `pub` schema API only |
+| **T2 zeek recv bench** | **T1's commit — NOT Task 0's** | it does `use logthing::zeek::parse_line`, which does not exist until T1 lands. Branched off Task 0 it will not compile. |
+
+So: dispatch **T1, T3, T4, T5, T6 concurrently**; dispatch **T2 only after T1 merges**. T7 and T8 are coordinator-run after all of the above land.
+
+Every subagent must confirm its base with `git rev-parse HEAD` before starting rather than trusting the commit named in its prompt — worktrees in this repo have been observed to land on `master` rather than the requested commit.
+
 ---
 
 ### Task 1: Extract `zeek::parse_line`
@@ -160,9 +177,14 @@ breaks build/test for the whole package, not just that target."
       /// `"unknown"` fallback rather than a real stream name.
       pub path_was_missing: bool,
   }
-  pub fn parse_line(line: &str, received_at: DateTime<Utc>) -> Option<ParsedZeekLine>;
+  pub fn parse_line(
+      line: &str,
+      received_at: DateTime<Utc>,
+  ) -> Result<ParsedZeekLine, serde_json::Error>;
   ```
-  `None` on JSON parse failure. Task 2 benches it. Task 3 mirrors its shape for suricata.
+  Task 2 benches it. Task 3 mirrors its shape for suricata.
+
+**Why `Result` and not `Option`:** the listener's existing warn log includes the serde error (`"JSON parse error from {}: {} — line: {}"`, with `e`). Returning `Option` would throw that away and quietly degrade an operator-facing diagnostic — the same class of silent behaviour change this task is otherwise careful to avoid. Carrying the error costs nothing and keeps the log line byte-identical.
 
 **Why the flag rather than testing `log_path == "unknown"`:** the listener owns `zeek_missing_path`, and that counter must keep meaning exactly what it means today. A record whose `_path` is literally the string `"unknown"` is currently *not* counted as missing; sniffing the output string would start counting it, silently changing an operator-facing signal inside what is supposed to be a pure extraction. The flag costs one bool and keeps the refactor honest.
 
@@ -208,8 +230,10 @@ Add to `src/zeek/mod.rs`'s existing `mod tests`:
     }
 
     #[test]
-    fn parse_line_returns_none_on_malformed_json() {
-        assert!(parse_line("{not json", chrono::Utc::now()).is_none());
+    fn parse_line_returns_the_serde_error_on_malformed_json() {
+        // The error is returned, not swallowed, so the listener can keep it in
+        // its warn line.
+        assert!(parse_line("{not json", chrono::Utc::now()).is_err());
     }
 ```
 
@@ -236,19 +260,23 @@ pub struct ParsedZeekLine {
     pub path_was_missing: bool,
 }
 
-/// Parse one NDJSON line. Returns `None` if the line is not valid JSON — the
-/// caller owns the `zeek_parse_errors` metric and the log line, since only it
-/// knows the peer address.
+/// Parse one NDJSON line. The `serde_json::Error` is returned rather than
+/// swallowed so the caller can keep it in its log line — the caller owns the
+/// `zeek_parse_errors` metric and the warning, since only it knows the peer
+/// address.
 ///
 /// `received_at` is passed in rather than read from the clock here so callers
 /// (and benches) are deterministic.
-pub fn parse_line(line: &str, received_at: DateTime<Utc>) -> Option<ParsedZeekLine> {
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+pub fn parse_line(
+    line: &str,
+    received_at: DateTime<Utc>,
+) -> Result<ParsedZeekLine, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(line)?;
     let (log_path, path_was_missing) = match value.get("_path").and_then(|v| v.as_str()) {
         Some(p) => (normalize_log_path(p).to_string(), false),
         None => ("unknown".to_string(), true),
     };
-    Some(ParsedZeekLine {
+    Ok(ParsedZeekLine {
         record: ZeekRecord {
             log_path,
             fields: value,
@@ -269,14 +297,18 @@ Expected: PASS, 3 tests.
 Replace the `match serde_json::from_str::<serde_json::Value>(line) { ... }` block in `src/zeek/listener.rs`'s `handle_tcp_connection` with:
 
 ```rust
-            let Some(parsed) = crate::zeek::parse_line(line, Utc::now()) else {
-                metrics::counter!("zeek_parse_errors").increment(1);
-                warn!(
-                    "Zeek: JSON parse error from {} — line: {}",
-                    src,
-                    &line[..line.len().min(120)],
-                );
-                continue;
+            let parsed = match crate::zeek::parse_line(line, Utc::now()) {
+                Ok(p) => p,
+                Err(e) => {
+                    metrics::counter!("zeek_parse_errors").increment(1);
+                    warn!(
+                        "Zeek: JSON parse error from {}: {} — line: {}",
+                        src,
+                        e,
+                        &line[..line.len().min(120)],
+                    );
+                    continue;
+                }
             };
             if parsed.path_was_missing {
                 metrics::counter!("zeek_missing_path").increment(1);
@@ -295,12 +327,71 @@ Replace the `match serde_json::from_str::<serde_json::Value>(line) { ... }` bloc
 
 This is behaviour-preserving in every case, including the one that would otherwise drift: `zeek_missing_path` still fires exactly when `_path` is absent or non-string, never for a record whose `_path` is literally `"unknown"`. The third unit test from Step 1 is the guard.
 
-- [ ] **Step 6: Run the full zeek suite plus the metric tests**
+- [ ] **Step 6: Add the listener-level guard for `zeek_missing_path`**
+
+The existing tests are **not** an adequate guard for this refactor, and the plan should not pretend otherwise: `tests/zeek_received_metric_integration.rs` and `tests/zeek_received_metric_e2e.rs` never mention `zeek_missing_path`, and the two unit tests that touch a missing path (`missing_path_field_gives_unknown`, `listener_routes_missing_path_to_unknown`) only assert `log_path == "unknown"`, never the counter. An inverted `if parsed.path_was_missing` in Step 5 would pass every one of them — on the exact counter D1 exists to protect.
+
+Add this to `src/zeek/listener.rs`'s `mod tests`, modelled on the existing `received_counters_fire_with_a_non_default_handler` in the same file (copy its `DebuggingRecorder` + inline `handle_tcp_connection` setup verbatim — it is awaited on the calling task precisely so the thread-local recorder sees it):
+
+```rust
+    /// Guards the `path_was_missing` wiring end to end through a real socket:
+    /// the counter must fire for an absent `_path` and must NOT fire for a
+    /// record whose `_path` is literally the string "unknown".
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn missing_path_counter_fires_only_for_an_absent_path() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // One absent _path (must count), one literal "unknown" (must not).
+            s.write_all(
+                b"{\"uid\":\"C1\"}\n{\"_path\":\"unknown\",\"uid\":\"C2\"}\n",
+            )
+            .await
+            .unwrap();
+            s.shutdown().await.unwrap();
+        });
+
+        let (stream, src) = listener.accept().await.unwrap();
+        ZeekListener::handle_tcp_connection(stream, src, CapturingHandler::new())
+            .await
+            .unwrap();
+        client.await.unwrap();
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let missing = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("zeek_missing_path"),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            missing, 1,
+            "exactly one of the two records has an absent _path; a literal \
+             _path of \"unknown\" is a present path"
+        );
+    }
+```
+
+- [ ] **Step 7: Run the full zeek suite plus the metric tests**
 
 Run: `cargo test --lib zeek:: && cargo test --test zeek_received_metric_integration --test zeek_received_metric_e2e`
-Expected: all PASS. These three metric tests are the regression guard that the extraction did not move or drop a counter.
+Expected: all PASS, including the new guard from Step 6.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/zeek/mod.rs src/zeek/listener.rs
@@ -317,8 +408,7 @@ Pure extraction: same metrics, same order, same values."
 ### Task 2: Zeek recv-path bench
 
 **Files:**
-- Create: `benches/zeek_parse_recv_path.rs`
-- Overwrite: `benches/zeek_parse_recv_path.rs` (stub created by Task 0; do NOT edit `Cargo.toml`)
+- Overwrite: `benches/zeek_parse_recv_path.rs` (stub from Task 0; do NOT edit `Cargo.toml`)
 
 **Interfaces:**
 - Consumes: `logthing::zeek::parse_line` from Task 1.
@@ -384,7 +474,7 @@ fn bench_parse_line(c: &mut Criterion) {
         // return: a typo in the JSON literal above would otherwise look like a
         // very fast parse. Same guard the ipfix/sflow benches use.
         assert!(
-            parse_line(line, at).is_some(),
+            parse_line(line, at).is_ok(),
             "fixture {name} must parse; check the JSON literal"
         );
         group.bench_function(name, |b| {
@@ -457,7 +547,10 @@ Suricata's loop is the same shape as zeek's, so this task does both the extracti
       pub record: SuricataRecord,
       pub event_type_was_missing: bool,
   }
-  pub fn parse_line(line: &str, received_at: DateTime<Utc>) -> Option<ParsedSuricataLine>;
+  pub fn parse_line(
+      line: &str,
+      received_at: DateTime<Utc>,
+  ) -> Result<ParsedSuricataLine, serde_json::Error>;
   ```
   Same shape and same reasoning as zeek's in Task 1: the flag keeps `suricata_missing_event_type` meaning exactly what it means today, rather than also firing for a record whose `event_type` is literally `"unknown"`.
 
@@ -497,8 +590,8 @@ Add to `src/suricata/mod.rs`'s `mod tests`:
     }
 
     #[test]
-    fn parse_line_returns_none_on_malformed_json() {
-        assert!(parse_line("{not json", chrono::Utc::now()).is_none());
+    fn parse_line_returns_the_serde_error_on_malformed_json() {
+        assert!(parse_line("{not json", chrono::Utc::now()).is_err());
     }
 ```
 
@@ -525,14 +618,17 @@ pub struct ParsedSuricataLine {
     pub event_type_was_missing: bool,
 }
 
-pub fn parse_line(line: &str, received_at: DateTime<Utc>) -> Option<ParsedSuricataLine> {
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+pub fn parse_line(
+    line: &str,
+    received_at: DateTime<Utc>,
+) -> Result<ParsedSuricataLine, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(line)?;
     let (event_type, event_type_was_missing) =
         match value.get("event_type").and_then(|v| v.as_str()) {
             Some(t) => (t.to_string(), false),
             None => ("unknown".to_string(), true),
         };
-    Some(ParsedSuricataLine {
+    Ok(ParsedSuricataLine {
         record: SuricataRecord {
             event_type,
             fields: value,
@@ -553,14 +649,18 @@ Expected: PASS, 3 tests.
 Replace the `match serde_json::from_str::<serde_json::Value>(line) { ... }` block in `src/suricata/listener.rs`'s `handle_tcp_connection` with:
 
 ```rust
-            let Some(parsed) = crate::suricata::parse_line(line, Utc::now()) else {
-                metrics::counter!("suricata_parse_errors").increment(1);
-                warn!(
-                    "Suricata: JSON parse error from {} — line: {}",
-                    src,
-                    &line[..line.len().min(120)],
-                );
-                continue;
+            let parsed = match crate::suricata::parse_line(line, Utc::now()) {
+                Ok(p) => p,
+                Err(e) => {
+                    metrics::counter!("suricata_parse_errors").increment(1);
+                    warn!(
+                        "Suricata: JSON parse error from {}: {} — line: {}",
+                        src,
+                        e,
+                        &line[..line.len().min(120)],
+                    );
+                    continue;
+                }
             };
             if parsed.event_type_was_missing {
                 metrics::counter!("suricata_missing_event_type").increment(1);
@@ -570,12 +670,18 @@ Replace the `match serde_json::from_str::<serde_json::Value>(line) { ... }` bloc
 
 Leave `suricata_records_received` / `suricata_records_by_event_type` where they are for now — moving them out of `DefaultSuricataHandler` is the separate known defect tracked outside this plan, and bundling it here would make this task's diff two changes wearing one hat.
 
-- [ ] **Step 6: Run the suricata suite**
+- [ ] **Step 6: Add the listener-level guard for `suricata_missing_event_type`**
+
+Suricata has *no* metric-regression coverage at all — `tests/suricata_local_integration.rs` asserts nothing about the metrics endpoint, and there is no suricata analogue of zeek's two metric tests. So this guard is the only thing standing between an inverted condition and a silently broken counter.
+
+Add a test to `src/suricata/listener.rs`'s `mod tests` that is the exact analogue of the zeek one from Task 1 Step 6 — same `DebuggingRecorder` setup, same inline `handle_tcp_connection` call, two records (one with `event_type` absent, one with a literal `"event_type":"unknown"`), asserting `suricata_missing_event_type == 1`. Read Task 1 Step 6's code and adapt the names; do not invent a different structure.
+
+- [ ] **Step 7: Run the suricata suite**
 
 Run: `cargo test --lib suricata:: && cargo test --test suricata_local_integration`
-Expected: all PASS.
+Expected: all PASS, including the new guard.
 
-- [ ] **Step 7: Write the bench**
+- [ ] **Step 8: Write the bench**
 
 Task 0 already registered this target and left a stub. **Overwrite** `benches/suricata_parse_recv_path.rs` and do not touch `Cargo.toml`:
 
@@ -621,7 +727,7 @@ fn bench_parse_line(c: &mut Criterion) {
         let at = chrono::Utc::now();
         // See the zeek bench: guard against timing an early error return.
         assert!(
-            parse_line(line, at).is_some(),
+            parse_line(line, at).is_ok(),
             "fixture {name} must parse; check the JSON literal"
         );
         group.bench_function(name, |b| {
@@ -650,7 +756,7 @@ criterion_group!(benches, bench_parse_line, bench_utf8_plus_parse);
 criterion_main!(benches);
 ```
 
-- [ ] **Step 8: Verify and run**
+- [ ] **Step 9: Verify and run**
 
 Run: `cargo bench --bench suricata_parse_recv_path -- --test`
 Expected: PASS.
@@ -658,7 +764,7 @@ Expected: PASS.
 Run: `cargo bench --bench suricata_parse_recv_path`
 Expected: four timings, low single-digit µs. Apply the same sanity gate as Task 2 Step 4.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add src/suricata/mod.rs src/suricata/listener.rs benches/suricata_parse_recv_path.rs
@@ -958,13 +1064,19 @@ pre-parsed IPv4 flow sample, and counter sample."
 
 Task 0 already registered this target and left a stub. **Overwrite** `benches/zeek_schema_encode.rs` and do not touch `Cargo.toml`.
 
-- [ ] **Step 1: Read the existing bench for the call shape**
+- [ ] **Step 1: Read the existing bench for the call shape AND the mappers for the field shapes**
 
 Run: `sed -n '1,90p' benches/zeek_conn_batch_amortization.rs`
 
+Then read the six mapper functions that define what each schema actually expects — the field table below names which fields to populate, but these are the authority on their **types** (which JSON values map to which Arrow column), and a type mismatch is the likeliest way to get this task wrong:
+
+Run: `grep -n "fn map_conn\|fn map_dns\|fn map_http\|fn map_ssl\|fn map_files\|fn map_notice\|fn map_envelope" src/zeek/schema.rs`
+
+then read each. Populate every field the mapper reads; a fixture that omits fields yields a batch full of nulls and measures less work than real traffic does.
+
 Note exactly how it constructs the sink and calls `to_record_batch`, and reuse that. Note also that `ZeekSink::new_batch` + `RecordBatchAccumulator` is the *amortized* path and exists only for `conn` — the other six schemas have only the per-record path, which is what this bench measures.
 
-- [ ] **Step 3: Write the bench**
+- [ ] **Step 2: Write the bench**
 
 Create `benches/zeek_schema_encode.rs`. Structure: one `bench_function` per schema, each with a realistic single-record fixture, all in one group with `Throughput::Elements(1)`.
 
@@ -988,17 +1100,17 @@ Header comment must state:
 
 Construct each `ZeekRecord` once outside the `b.iter` closure, as every other bench in this suite does.
 
-- [ ] **Step 4: Verify**
+- [ ] **Step 3: Verify**
 
 Run: `cargo bench --bench zeek_schema_encode -- --test`
 Expected: PASS, 7 cases.
 
-- [ ] **Step 5: Run it, and cross-check against the known number**
+- [ ] **Step 4: Run it, and cross-check against the known number**
 
 Run: `cargo bench --bench zeek_schema_encode`
 Expected: seven timings. **The `conn` case must land near 13.1µs** — that is the committed per-record figure from the existing amortization bench, and this bench encodes the same record through the same function. A large divergence means this bench is measuring something different; find out what before recording anything. (Allow for the one extra `partition_time` column added since that figure was taken.)
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add benches/zeek_schema_encode.rs
