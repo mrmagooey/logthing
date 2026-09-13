@@ -41,9 +41,9 @@ Established by survey on 2026-09-13, at crate version 0.18.0. Do not re-derive:
 **Phase 1**
 | File | Responsibility |
 |---|---|
-| `src/zeek/mod.rs` (modify) | Gains `pub fn parse_line(line: &str, received_at) -> Option<ZeekRecord>`, extracted from the listener loop. Lives beside `normalize_log_path`, which it calls. |
+| `src/zeek/mod.rs` (modify) | Gains `ParsedZeekLine` and `pub fn parse_line(line: &str, received_at) -> Result<ParsedZeekLine, serde_json::Error>`, extracted from the listener loop. Lives beside `normalize_log_path`, which it calls. |
 | `src/zeek/listener.rs` (modify) | Loop calls `parse_line`; keeps the metric increments and the oversize/UTF-8 guards, which are transport concerns, not parse concerns. |
-| `src/suricata/mod.rs` (modify) | Gains `pub fn parse_line(line: &str, received_at) -> Option<SuricataRecord>`. |
+| `src/suricata/mod.rs` (modify) | Gains `ParsedSuricataLine` and `pub fn parse_line(line: &str, received_at) -> Result<ParsedSuricataLine, serde_json::Error>`. |
 | `src/suricata/listener.rs` (modify) | Same shape as zeek. |
 | `benches/zeek_parse_recv_path.rs` (create) | Zeek NDJSON recv path: `from_utf8` → `parse_line`, across conn/dns/http shapes. |
 | `benches/suricata_parse_recv_path.rs` (create) | Suricata EVE JSON recv path, across alert/flow/dns shapes. |
@@ -352,9 +352,15 @@ Add this to `src/zeek/listener.rs`'s `mod tests`, modelled on the existing `rece
         let addr = listener.local_addr().unwrap();
         let client = tokio::spawn(async move {
             let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-            // One absent _path (must count), one literal "unknown" (must not).
+            // TWO absent _path (must count) and ONE literal "unknown" (must
+            // not). The 2:1 split is load-bearing: with a symmetric 1:1 mix an
+            // inverted `if !parsed.path_was_missing` would also yield 1 and the
+            // test would pass on the bug it exists to catch. Correct => 2,
+            // inverted => 1, dropped => 0 — three distinguishable outcomes.
             s.write_all(
-                b"{\"uid\":\"C1\"}\n{\"_path\":\"unknown\",\"uid\":\"C2\"}\n",
+                b"{\"uid\":\"C1\"}\n\
+                  {\"uid\":\"C2\"}\n\
+                  {\"_path\":\"unknown\",\"uid\":\"C3\"}\n",
             )
             .await
             .unwrap();
@@ -379,9 +385,10 @@ Add this to `src/zeek/listener.rs`'s `mod tests`, modelled on the existing `rece
             })
             .unwrap_or(0);
         assert_eq!(
-            missing, 1,
-            "exactly one of the two records has an absent _path; a literal \
-             _path of \"unknown\" is a present path"
+            missing, 2,
+            "two of the three records have an absent _path; a literal _path of \
+             \"unknown\" is a present path and must not be counted. Got 1 => the \
+             condition is inverted; got 0 => the increment was dropped."
         );
     }
 ```
@@ -508,17 +515,17 @@ criterion_group!(benches, bench_parse_line, bench_utf8_plus_parse);
 criterion_main!(benches);
 ```
 
-- [ ] **Step 3: Verify it compiles and runs**
+- [ ] **Step 2: Verify it compiles and runs**
 
 Run: `cargo bench --bench zeek_parse_recv_path -- --test`
 Expected: PASS. `--test` runs each benchmark once instead of sampling, which is the fast correctness check; do not use it for numbers.
 
-- [ ] **Step 4: Run it for real and read the output**
+- [ ] **Step 3: Run it for real and read the output**
 
 Run: `cargo bench --bench zeek_parse_recv_path`
 Expected: five reported timings. Sanity-check the magnitude against the known range for this layer: the syslog recv path is ~6.1µs/datagram, and serde_json on a 12-field object should land in the low single-digit µs. **If any figure is above ~50µs or below ~100ns, stop and investigate before recording it** — that is the signature of a bench measuring the wrong thing (an unintended allocation in the loop, or a `black_box` that let the optimiser delete the work).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add benches/zeek_parse_recv_path.rs
@@ -605,9 +612,10 @@ Expected: FAIL — `cannot find function 'parse_line'`.
 In `src/suricata/mod.rs`, after the `SuricataRecord` struct:
 
 ```rust
-/// Parse one EVE JSON line into a [`SuricataRecord`]. Returns `None` if the
-/// line is not valid JSON — the caller owns the `suricata_parse_errors` metric
-/// and the log line, since only it knows the peer address.
+/// Parse one EVE JSON line. The `serde_json::Error` is returned rather than
+/// swallowed so the caller can keep it in its log line — the caller owns the
+/// `suricata_parse_errors` metric and the warning, since only it knows the
+/// peer address.
 ///
 /// Unlike Zeek's `_path`, `event_type` is used verbatim: Suricata does not
 /// rotate it into the value the way a log shipper rotates a filename.
@@ -674,7 +682,7 @@ Leave `suricata_records_received` / `suricata_records_by_event_type` where they 
 
 Suricata has *no* metric-regression coverage at all — `tests/suricata_local_integration.rs` asserts nothing about the metrics endpoint, and there is no suricata analogue of zeek's two metric tests. So this guard is the only thing standing between an inverted condition and a silently broken counter.
 
-Add a test to `src/suricata/listener.rs`'s `mod tests` that is the exact analogue of the zeek one from Task 1 Step 6 — same `DebuggingRecorder` setup, same inline `handle_tcp_connection` call, two records (one with `event_type` absent, one with a literal `"event_type":"unknown"`), asserting `suricata_missing_event_type == 1`. Read Task 1 Step 6's code and adapt the names; do not invent a different structure.
+Add a test to `src/suricata/listener.rs`'s `mod tests` that is the exact analogue of the zeek one from Task 1 Step 6 — same `DebuggingRecorder` setup, same inline `handle_tcp_connection` call. Keep the **2:1 asymmetry**: two records with `event_type` absent, one with a literal `"event_type":"unknown"`, asserting `suricata_missing_event_type == 2`. The asymmetry is the whole point — a 1:1 mix passes even with the condition inverted. Read Task 1 Step 6's code and adapt the names; do not invent a different structure.
 
 - [ ] **Step 7: Run the suricata suite**
 
@@ -909,17 +917,17 @@ criterion_group!(benches, bench_decode);
 criterion_main!(benches);
 ```
 
-- [ ] **Step 3: Verify the fixtures actually decode**
+- [ ] **Step 2: Verify the fixtures actually decode**
 
 Run: `cargo bench --bench ipfix_decode_recv_path -- --test`
 Expected: PASS. If the `assert_eq!(installed.len(), 1)` trips, the inline fixture bytes were transcribed wrong — fix them against `src/ipfix/decoder.rs:213` before going further. A bench that silently decodes zero flows would report the cost of an early error return, not of decoding.
 
-- [ ] **Step 4: Run it**
+- [ ] **Step 3: Run it**
 
 Run: `cargo bench --bench ipfix_decode_recv_path`
 Expected: two timings. `warm_cache_data_only` should be meaningfully cheaper than `cold_cache_template_then_data`; if they are within noise of each other, the template is not actually being cached across iterations and the bench is wrong.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add benches/ipfix_decode_recv_path.rs
@@ -954,7 +962,7 @@ sed -n '659,833p' src/sflow/decoder.rs
 
 Copy the three `pub(crate) const FIXTURE_*` blocks into the bench, dropping the `pub(crate)` and keeping every comment.
 
-- [ ] **Step 3: Write the bench**
+- [ ] **Step 2: Write the bench**
 
 Create `benches/sflow_decode_recv_path.rs` with this header and structure, pasting the three fixture constants from Step 2 where marked:
 
@@ -1029,17 +1037,17 @@ criterion_group!(benches, bench_decode);
 criterion_main!(benches);
 ```
 
-- [ ] **Step 4: Verify**
+- [ ] **Step 3: Verify**
 
 Run: `cargo bench --bench sflow_decode_recv_path -- --test`
 Expected: PASS. A panic here means a fixture was mistranscribed in Step 2.
 
-- [ ] **Step 5: Run it**
+- [ ] **Step 4: Run it**
 
 Run: `cargo bench --bench sflow_decode_recv_path`
 Expected: three timings, with `counter` cheapest and `flow_raw_header` dearest. If `flow_raw_header` is not the most expensive, the Ethernet walk is not running — check the fixture's `header_protocol` field.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add benches/sflow_decode_recv_path.rs
