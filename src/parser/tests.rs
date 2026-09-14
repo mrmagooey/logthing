@@ -1178,21 +1178,21 @@ fn test_parse_event_unknown_event_id_returns_none() {
 }
 
 // ---------------------------------------------------------------------------
-// BUG DOCUMENTATION: production config/event_parsers YAML files use
-// PascalCase source values (e.g. `source: EventData`) but the FieldSource
-// enum is `#[serde(rename_all = "lowercase")]` which only accepts lowercase
-// (e.g. `source: eventdata`). This means the production config directory
-// cannot currently be loaded via GenericEventParser::from_file(directory).
+// FIXED 2026-09-13: production config/event_parsers YAML files use PascalCase
+// source values (`source: EventData`) while FieldSource was
+// `#[serde(rename_all = "lowercase")]`, so all 50 shipped configs failed to
+// deserialize. `Server::new` catches that, logs a warning and continues with
+// `event_parser = None` — so ingestion kept working while every WEF event was
+// stored with no field extraction, and nothing outward-facing looked wrong.
 //
-// Test below characterises the existing broken behaviour so that any fix
-// to either the enum or the YAML files will be visible as a test flip.
+// The test below used to characterise the broken behaviour deliberately, "so
+// that any fix will be visible as a test flip". The fix (serde aliases on
+// FieldSource, accepting the Windows Event XML spelling the YAML already used)
+// flipped it, and it now asserts the working behaviour instead.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_from_file_real_config_directory_currently_fails_due_to_case_mismatch() {
-    // Bug: production YAML files use PascalCase source names ("EventData",
-    // "System", etc.) but FieldSource is serde(rename_all = "lowercase"),
-    // so deserialization fails.
+fn every_shipped_event_parser_config_loads() {
     let config_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("config")
         .join("event_parsers");
@@ -1201,16 +1201,22 @@ fn test_from_file_real_config_directory_currently_fails_due_to_case_mismatch() {
         return;
     }
 
-    let result = GenericEventParser::from_file(&config_dir);
-    assert!(
-        result.is_err(),
-        "Production config directory load should currently fail due to PascalCase source names vs lowercase enum (BUG)"
-    );
-    let err_msg = format!("{}", result.err().unwrap());
-    // The error should mention the case mismatch
-    assert!(
-        err_msg.contains("unknown variant") || err_msg.contains("Failed to parse"),
-        "Error should reference unknown variant, got: {err_msg}"
+    let shipped = std::fs::read_dir(&config_dir)
+        .expect("read config/event_parsers")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "yaml"))
+        .count();
+    assert!(shipped > 0, "expected shipped parser configs to guard");
+
+    let parser = GenericEventParser::from_file(&config_dir)
+        .unwrap_or_else(|e| panic!("every shipped parser config must load, got: {e}"));
+
+    assert_eq!(
+        parser.supported_events().len(),
+        shipped,
+        "all {shipped} shipped configs must yield usable parsers; a silent \
+         deserialization failure here disables WEF field extraction entirely \
+         while ingestion still appears healthy"
     );
 }
 

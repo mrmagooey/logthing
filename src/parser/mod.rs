@@ -40,9 +40,20 @@ pub struct FieldDefinition {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FieldSource {
+    /// Aliases accept the PascalCase spelling every shipped parser YAML in
+    /// `config/event_parsers/` actually uses — it matches the Windows Event XML
+    /// element names (`<EventData>`, `<System>`). Without these, all 50 configs
+    /// fail to deserialize, `Server::new` logs a warning and falls back to
+    /// `event_parser = None`, and every WEF event is stored with no field
+    /// extraction at all. The failure is silent from the outside: ingestion
+    /// keeps working, just unparsed.
+    #[serde(alias = "EventData")]
     EventData,
+    #[serde(alias = "System")]
     System,
+    #[serde(alias = "RenderingInfo")]
     RenderingInfo,
+    #[serde(alias = "UserData")]
     UserData,
 }
 
