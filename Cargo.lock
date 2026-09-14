@@ -2612,6 +2612,7 @@ dependencies = [
  "chrono",
  "clap",
  "logthing",
+ "serde_json",
  "tokio",
 ]
 

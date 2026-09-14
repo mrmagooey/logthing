@@ -91,6 +91,19 @@ docker compose -f "$COMPOSE_FILE" run --rm performance-test-500k || echo "500k R
 
 echo ""
 echo "========================================"
+echo "Running Zeek TCP Load Test (loadgen)"
+echo "========================================"
+docker compose -f "$COMPOSE_FILE" up -d logthing
+docker compose -f "$COMPOSE_FILE" run --rm loadgen-zeek
+
+echo ""
+echo "========================================"
+echo "Running IPFIX UDP Load Test (loadgen)"
+echo "========================================"
+docker compose -f "$COMPOSE_FILE" run --rm loadgen-ipfix
+
+echo ""
+echo "========================================"
 echo "Running TLS E2E Tests"
 echo "========================================"
 docker compose -f "$COMPOSE_FILE" stop logthing

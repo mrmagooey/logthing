@@ -187,14 +187,32 @@ fn paths_cargo_requires(manifest: &toml::Value, root: &Path) -> Vec<String> {
     required
 }
 
+/// Every Dockerfile in the repo that runs `cargo build` against the repo root
+/// as its context. All of them are subject to the same drift, so all of them
+/// are checked — the guard was originally root-only, which left the Kerberos
+/// and loadgen images unprotected against exactly the failure it exists to
+/// prevent.
+const CARGO_BUILDING_DOCKERFILES: &[&str] = &[
+    "Dockerfile",
+    "tests/e2e/simulation-environment/Dockerfile.kerberos",
+    "tests/e2e/simulation-environment/loadgen/Dockerfile",
+];
+
 #[test]
-fn dockerfile_copies_every_path_cargo_requires() {
+fn every_dockerfile_copies_every_path_cargo_requires() {
+    for relative in CARGO_BUILDING_DOCKERFILES {
+        assert_dockerfile_copies_required_paths(relative);
+    }
+}
+
+fn assert_dockerfile_copies_required_paths(relative: &str) {
     let root = repo_root();
     let manifest: toml::Value = std::fs::read_to_string(root.join("Cargo.toml"))
         .expect("read Cargo.toml")
         .parse()
         .expect("parse Cargo.toml");
-    let dockerfile = std::fs::read_to_string(root.join("Dockerfile")).expect("read Dockerfile");
+    let dockerfile = std::fs::read_to_string(root.join(relative))
+        .unwrap_or_else(|e| panic!("read {relative}: {e}"));
 
     let copy_sources = copy_sources_for_cargo_build_stage(&dockerfile);
     let required = paths_cargo_requires(&manifest, &root);
@@ -212,7 +230,7 @@ fn dockerfile_copies_every_path_cargo_requires() {
 
     assert!(
         missing.is_empty(),
-        "Cargo.toml declares paths the Dockerfile never copies into the build \
+        "{relative}: Cargo.toml declares paths this Dockerfile never copies into the build \
          context, so `cargo build --release` will fail at manifest-parse time \
          inside the image (this is exactly what broke the v0.10.0 release).\n\
          Missing: {missing:?}\n\

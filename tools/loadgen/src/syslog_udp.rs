@@ -17,10 +17,10 @@
 //! newline would make `logthing`'s `$`-anchored RFC3164 regex fail to
 //! match the whole datagram.
 
+use crate::pacing::tick_record_count;
 use anyhow::Context;
 use chrono::{Datelike, Timelike, Utc};
 use clap::Args;
-use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::time::MissedTickBehavior;
@@ -53,9 +53,15 @@ pub struct SyslogUdpArgs {
 }
 
 pub async fn run(args: SyslogUdpArgs) -> anyhow::Result<()> {
-    let target: SocketAddr = format!("{}:{}", args.host, args.port)
-        .parse()
-        .with_context(|| format!("invalid target address {}:{}", args.host, args.port))?;
+    // Resolve rather than `.parse::<SocketAddr>()`: parse only accepts a
+    // numeric IP, so a DNS name like the docker-compose service `logthing`
+    // fails with "invalid socket address syntax". Caught by the compose run;
+    // a localhost smoke test cannot surface it.
+    let target = tokio::net::lookup_host(format!("{}:{}", args.host, args.port))
+        .await
+        .with_context(|| format!("resolve target address {}:{}", args.host, args.port))?
+        .next()
+        .with_context(|| format!("no address resolved for {}:{}", args.host, args.port))?;
 
     // Bind an ephemeral local UDP socket, then `connect` it to fix the peer
     // so sends use `send` instead of `send_to` -- one syscall's worth of
@@ -96,7 +102,7 @@ pub async fn run(args: SyslogUdpArgs) -> anyhow::Result<()> {
         // faster than practical per-record timer resolution would allow,
         // batching multiple sends per tick instead of chasing unrealistic
         // per-record timer precision.
-        let per_tick_interval = Duration::from_micros(1000);
+        let per_tick_interval = crate::pacing::TICK;
         let records_per_tick_target = args.target_rate as f64 * per_tick_interval.as_secs_f64();
         let mut ticker = tokio::time::interval(per_tick_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
@@ -170,17 +176,6 @@ fn build_message(n: u64, structured: bool) -> String {
     }
 }
 
-/// Advances the rate-pacing accumulator by one tick and returns how many
-/// records to send this tick. `carry` carries the fractional remainder
-/// across ticks so low target rates (e.g. 0.1 records/tick) are honored
-/// exactly over many ticks instead of being rounded away on any single tick.
-fn tick_record_count(carry: &mut f64, records_per_tick_target: f64) -> u64 {
-    *carry += records_per_tick_target;
-    let count = carry.floor() as u64;
-    *carry -= count as f64;
-    count
-}
-
 fn month_abbrev(m: u32) -> &'static str {
     const NAMES: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -214,53 +209,6 @@ mod tests {
             parsed.message.starts_with("CEF:"),
             "message field must start with CEF: for the cef sub-parser to match, got: {}",
             parsed.message
-        );
-    }
-
-    /// Regression test for the bug fixed in 9c03a62: the old pacer computed
-    /// `round(target_rate * 0.001)` once and either floored sub-1/tick rates
-    /// to 0 forever, or clamped to a wrong minimum of 1. At target_rate=100
-    /// (records_per_tick_target=0.1/tick), the fractional accumulator must
-    /// still deliver ~300 records over a simulated 3s run (3000 ticks at the
-    /// real 1ms tick interval) instead of 0 or 3000.
-    #[test]
-    fn tick_record_count_honors_low_sub_one_per_tick_rate() {
-        let records_per_tick_target = 100.0_f64 * 0.001; // target_rate=100 -> 0.1/tick
-        let mut carry = 0.0_f64;
-        let total: u64 = (0..3000)
-            .map(|_| tick_record_count(&mut carry, records_per_tick_target))
-            .sum();
-        // Expected 300 exactly; independently verified in Python by the
-        // reviewer to land at 299 due to f64 drift accumulating over 3000
-        // additions of 0.1. Pin the exact reproducible value rather than a
-        // loose range so any future drift is caught, not silently absorbed.
-        assert_eq!(
-            total, 299,
-            "expected ~300 records over 3000 ticks at 0.1/tick (reviewer's independent \
-             simulation got 299 due to f64 accumulation drift), got {total}"
-        );
-    }
-
-    /// Safety net for exact-multiple rates: target_rate=10000 gives
-    /// records_per_tick_target=10.0/tick, which has no fractional remainder,
-    /// so the accumulator must reproduce the naive integer count exactly
-    /// with zero drift over many ticks. This is the rate Task 10's baseline
-    /// run depends on, and the original `.round()` bug affected all rates
-    /// (not just low ones), so this guards against a regression here too.
-    #[test]
-    fn tick_record_count_is_exact_for_integer_per_tick_rate() {
-        let records_per_tick_target = 10_000.0_f64 * 0.001; // target_rate=10000 -> 10.0/tick
-        let mut carry = 0.0_f64;
-        let total: u64 = (0..100)
-            .map(|_| tick_record_count(&mut carry, records_per_tick_target))
-            .sum();
-        assert_eq!(
-            total, 1000,
-            "10.0/tick * 100 ticks must be exact with zero drift"
-        );
-        assert_eq!(
-            carry, 0.0,
-            "carry must return to exactly 0.0 for an integer-valued rate"
         );
     }
 }
