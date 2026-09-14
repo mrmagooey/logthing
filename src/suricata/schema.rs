@@ -87,6 +87,31 @@ pub fn map_envelope(record: &SuricataRecord) -> anyhow::Result<RecordBatch> {
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
+/// Suricata's EVE `event_type` values, as a closed set. The wire value is
+/// unbounded in length and charset, so it must never reach a Prometheus label
+/// raw — see `zeek::schema::metric_log_path` for the same problem solved
+/// against a registry.
+///
+/// Hand-maintained, and that is a real difference from zeek's version, which
+/// self-updates when a schema is added. Adding a new EVE type here is a
+/// deliberate act; until it is added it reports as "other".
+const EVE_EVENT_TYPES: &[&str] = &[
+    "alert", "anomaly", "drop", "dns", "http", "tls", "ssh", "smtp", "ftp", "smb", "dhcp", "krb5",
+    "flow", "netflow", "fileinfo", "stats",
+];
+
+/// Bound an `event_type` value to the closed set above, for use as a metric
+/// label. `event_type` comes straight off the wire and is unbounded in both
+/// length and charset, so labelling a Prometheus counter with it raw lets any
+/// client that can reach the listener mint a permanent series per record.
+pub fn metric_event_type(event_type: &str) -> &'static str {
+    EVE_EVENT_TYPES
+        .iter()
+        .find(|known| **known == event_type)
+        .copied()
+        .unwrap_or("other")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +119,32 @@ mod tests {
     use arrow::array::StringArray;
     use arrow::datatypes::DataType;
     use chrono::Utc;
+
+    /// `event_type` is attacker-controlled, so the metric label must be
+    /// drawn from the fixed allowlist, never from the wire value.
+    #[test]
+    fn metric_event_type_bounds_the_label_to_the_known_set() {
+        for known in EVE_EVENT_TYPES {
+            assert_eq!(
+                metric_event_type(known),
+                *known,
+                "modelled event types keep their own series"
+            );
+        }
+        for hostile in [
+            "unknown",
+            "made_up_type",
+            &"A".repeat(16_384),
+            "alert\u{0}injected",
+            "",
+        ] {
+            assert_eq!(
+                metric_event_type(hostile),
+                "other",
+                "an unmodelled event_type must collapse to a single series, not mint a new one"
+            );
+        }
+    }
 
     fn make_alert_record() -> SuricataRecord {
         SuricataRecord {
