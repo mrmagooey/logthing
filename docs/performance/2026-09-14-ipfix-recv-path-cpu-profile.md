@@ -256,6 +256,31 @@ observed. A handler that genuinely awaited a slow operation inline (a blocking S
 buffering, for example) was not tested and would be expected to reproduce the literal mechanism
 more directly; this investigation did not construct one.
 
+## 4.4 The single most actionable number in this document
+
+Run A dropped **5.47% of offered datagrams while using 0.51 of 12 available
+cores** — about 4% of the machine. Eleven and a half cores sat idle while the
+kernel discarded datagrams for want of a consumer.
+
+**That rules out CPU capacity as the constraint and leaves concurrency.** One
+`recv_from` loop, on one task, serialises every datagram: allowed-IPs check,
+decode, handler dispatch. It sustained ~18.9k datagrams/s. Adding CPU cannot
+help a workload that is not using the CPU it already has; only adding
+*receivers* can.
+
+This reframes both hypotheses. (A) is why a single receiver tops out where it
+does — `recvfrom` + `epoll_wait` are 44.56% of its self-time, so most of the
+serial budget is syscall, not logthing code. (B) is why a real handler makes
+it worse — it competes for the same worker threads and the global allocator,
+not because it blocks recv.
+
+The obvious lever, untested here and therefore **a hypothesis, not a
+recommendation**: multiple receive tasks on `SO_REUSEPORT` sockets, or
+decoupling `recv_from` from decode-and-dispatch so the receive loop does
+nothing but drain into a queue. Either converts idle cores into receive
+capacity. Both are real design changes and neither should be adopted on the
+strength of one profile — see §6.
+
 ## 5. Verdict
 
 **Both hypotheses are supported, but for different handler shapes, and (B) is refined rather than
