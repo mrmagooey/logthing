@@ -1,0 +1,18 @@
+# Allowlist, not a denylist. The build context is the repo root for all three
+# images (Dockerfile, Dockerfile.kerberos, loadgen/Dockerfile) and the daemon
+# receives the entire context regardless of which paths the Dockerfile COPYs.
+# Before this file, every build shipped ~12 GB and took ~10 minutes just to
+# transfer — target/ is 76 GB and .claude/ and .superpowers/ are tens more.
+#
+# A denylist would need updating every time a new large directory appears at
+# the root, and would silently regress when someone forgets. This inverts it:
+# nothing is sent unless named here. All three Dockerfiles COPY exactly the
+# same five paths — keep this in sync if that changes, or the build fails
+# loudly at COPY (not silently).
+*
+!Cargo.toml
+!Cargo.lock
+!src
+!tools
+!benches
+!logthing.toml
