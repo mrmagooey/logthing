@@ -95,7 +95,7 @@ Unit-test it as `zeek::schema::metric_log_path` is tested: every listed type map
 
 - [ ] **Step 4c: Add the e2e test.** Create `tests/suricata_received_metric_e2e.rs`, mirroring `tests/zeek_received_metric_e2e.rs`: a real `Server` with `metrics.enabled = true`, a real `SuricataListener` with a real forwarding handler, EVE JSON over a real TCP connection, then scrape the production `/metrics` HTTP endpoint. One `#[tokio::test]` per binary — `Server::run` calls `metrics::set_global_recorder`, which panics on a second call.
 
-**Prove all three guard the bug**: revert the Step 3 move (counters back in `DefaultSuricataHandler`), confirm each of the three fails, restore. Commit before doing this — reverting a mutation with `git checkout` discards uncommitted work.
+- [ ] **Step 4d: Prove all three guard the bug.** Revert the Step 3 move (counters back in `DefaultSuricataHandler`), confirm each of the three fails, restore. Commit before doing this — reverting a mutation with `git checkout` discards uncommitted work.
 
 - [ ] **Step 5: Update `DefaultSuricataHandler`'s doc comment**, which will claim it "increments metrics" and no longer will.
 

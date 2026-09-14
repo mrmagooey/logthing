@@ -199,6 +199,18 @@ harness = false
 name = "zeek_schema_encode"
 harness = false
 
+[[bench]]
+name = "wef_parse_recv_path"
+harness = false
+
+[[bench]]
+name = "otlp_map_request"
+harness = false
+
+[[bench]]
+name = "structured_syslog_to_record_batch"
+harness = false
+
 [profile.profiling]
 inherits = "release"
 debug = true
