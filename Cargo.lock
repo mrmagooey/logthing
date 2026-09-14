@@ -2675,6 +2675,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
+ "socket2 0.6.2",
  "subtle",
  "tempfile",
  "thiserror 2.0.18",

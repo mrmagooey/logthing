@@ -13,6 +13,9 @@ use tracing::{debug, error, info, warn};
 pub struct IpfixListenerConfig {
     pub udp_port: u16,
     pub bind_address: String,
+    /// Requested `SO_RCVBUF` size in bytes. `None` leaves the OS default
+    /// alone. See `crate::net::bind_udp_with_recv_buffer`.
+    pub receive_buffer_bytes: Option<usize>,
 }
 
 impl Default for IpfixListenerConfig {
@@ -20,6 +23,7 @@ impl Default for IpfixListenerConfig {
         Self {
             udp_port: 4739,
             bind_address: "0.0.0.0".to_string(),
+            receive_buffer_bytes: Some(4 * 1024 * 1024),
         }
     }
 }
@@ -76,7 +80,9 @@ impl IpfixListener {
     pub async fn start(&self) -> anyhow::Result<()> {
         let addr: SocketAddr =
             format!("{}:{}", self.config.bind_address, self.config.udp_port).parse()?;
-        let socket = UdpSocket::bind(&addr).await?;
+        let socket =
+            crate::net::bind_udp_with_recv_buffer(&addr, self.config.receive_buffer_bytes, "ipfix")
+                .await?;
         self.run_with_socket(socket).await
     }
 
@@ -90,7 +96,9 @@ impl IpfixListener {
     ) -> anyhow::Result<()> {
         let addr: SocketAddr =
             format!("{}:{}", self.config.bind_address, self.config.udp_port).parse()?;
-        let socket = UdpSocket::bind(&addr).await?;
+        let socket =
+            crate::net::bind_udp_with_recv_buffer(&addr, self.config.receive_buffer_bytes, "ipfix")
+                .await?;
         let bound_addr = socket.local_addr()?;
         info!("IPFIX UDP listener started on {}", bound_addr);
 
@@ -283,6 +291,7 @@ mod tests {
         let config = IpfixListenerConfig {
             udp_port,
             bind_address: "127.0.0.1".to_string(),
+            ..IpfixListenerConfig::default()
         };
         let handler: Arc<dyn IpfixHandler> = Arc::new(DefaultIpfixHandler);
         let listener = IpfixListener::new(config, handler);
@@ -304,6 +313,51 @@ mod tests {
         assert!(
             result.is_ok(),
             "start_with_shutdown did not return after shutdown signal within 2 s"
+        );
+    }
+
+    /// Integration-level check for the `receive_buffer_bytes` config plumbing:
+    /// a listener started via the real `start_with_shutdown` production path
+    /// with a non-default buffer size still binds and decodes datagrams
+    /// normally. The socket-level assertion that the requested size actually
+    /// changes `SO_RCVBUF` lives in `crate::net`'s unit tests, against the
+    /// exact same `bind_udp_with_recv_buffer` call this listener makes.
+    #[tokio::test]
+    async fn start_with_shutdown_honors_configured_receive_buffer() {
+        use tokio::sync::watch;
+
+        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = tmp.local_addr().unwrap().port();
+        drop(tmp);
+
+        let config = IpfixListenerConfig {
+            udp_port,
+            bind_address: "127.0.0.1".to_string(),
+            receive_buffer_bytes: Some(1024 * 1024),
+        };
+        let handler = CapturingHandler::new();
+        let listener = IpfixListener::new(config, handler.clone());
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            listener.start_with_shutdown(shutdown_rx).await.ok();
+        });
+        sleep(Duration::from_millis(50)).await;
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(FIXTURE_NFV5_ONE_RECORD, ("127.0.0.1", udp_port))
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+
+        assert_eq!(
+            handler.batches().len(),
+            1,
+            "listener with a configured receive buffer must still decode datagrams"
         );
     }
 

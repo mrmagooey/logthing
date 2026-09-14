@@ -104,6 +104,7 @@ async fn run_syslog_case(allowed_ips: IpWhitelist) -> usize {
         tcp_port,
         bind_address: "127.0.0.1".to_string(),
         parse_dns_logs: false,
+        ..SyslogListenerConfig::default()
     };
     let handler = CapturingSyslogHandler::new();
     let listener = SyslogListener::new(config, handler.clone()).with_allowed_ips(allowed_ips);
@@ -195,6 +196,7 @@ async fn run_ipfix_case(allowed_ips: IpWhitelist) -> usize {
     let config = IpfixListenerConfig {
         udp_port,
         bind_address: "127.0.0.1".to_string(),
+        ..IpfixListenerConfig::default()
     };
     let handler = CapturingIpfixHandler::new();
     let listener = IpfixListener::new(config, handler.clone()).with_allowed_ips(allowed_ips);
