@@ -15,6 +15,7 @@ here because these are whole-system numbers:
   interface** — no governor to pin, no way to rule out host contention.
 - Generator and server run **in containers on the same host**, competing for
   the same 12 vCPUs. A real deployment has the sender on another machine.
+- Host: 61 GiB RAM, kernel `6.12.94+deb13-amd64`, Docker 29.6.1.
 - `net.core.rmem_default` = `net.core.rmem_max` = **212992** (208 KiB) in the
   container. This is the single most important number on the page for the UDP
   results, and it was not tuned.
@@ -32,7 +33,7 @@ results. Do not quote a max sustainable rate from this page.
 | Environment | `tests/e2e/simulation-environment`, `docker compose` |
 | Generators | `loadgen zeek-tcp`, `loadgen ipfix-udp` (`tools/loadgen`) |
 | Sinks | both S3 (MinIO) and local disk enabled per `config/logthing.toml` |
-| Server process | restarted immediately before the run, so all counters start at zero |
+| Server process | §1 ran against a freshly restarted server (counters from zero); §2 reads deltas from one long-lived process. The two disagree at 5,000/s — see §2. |
 
 ---
 
@@ -95,13 +96,27 @@ Two things to note honestly:
 
 | target rate | achieved | offered | reached app | kernel loss | templates missing |
 |---|---|---|---|---|---|
-| 5,000/s | 4,999.5/s | 99,990 | 89,694 | ~10% | 0 |
-| 20,000/s | 19,726/s | 394,531 | 322,686 | ~18% | 0 |
-| unbounded | 29,118/s | 582,358 | 419,377 | ~28% | 0 |
+| 5,000/s | 4,999.5/s | 99,990 | 89,694 | ~10.3% | 0 |
+| 20,000/s | 19,726/s | 394,531 | 322,686 | ~18.2% | 0 |
+| unbounded | 29,118/s | 582,358 | 419,377 | ~28.0% | 0 |
 
 Kernel loss scales with offered rate, as an undersized receive buffer predicts.
 The IPFIX generator sustains a materially higher rate than the Zeek one
 (29k/s vs 13k/s unbounded) because a UDP `send` does not wait for a peer.
+
+**These are a different run from §1, and the two disagree — which is itself a
+result.** §1's 5,000/s row was taken against a freshly restarted server so every
+counter started at zero; this sweep reuses one long-lived process and reads
+counter deltas. At the same nominal 5,000/s the two runs lost **13,473 (13.5%)**
+and **10,296 (10.3%)** respectively — a 3.2-percentage-point spread on an
+identical offered load.
+
+Do not average them or treat either as *the* number. Kernel-queue loss depends
+on scheduling luck between the sending and receiving processes, which on this
+host share 12 vCPUs; it is not a deterministic property of the server. The
+honest summary is "10-14% at 5,000/s on this host, varying run to run." Anyone
+wanting a stable figure needs a quiet host, a tuned `rmem`, and repeated runs
+with a reported spread — none of which this environment provides.
 
 ## 3. What to do with this
 
@@ -129,7 +144,37 @@ collapsing them into one "drop rate" hides which fix applies.
 - **Nothing comparable to a bare-metal deployment**, for every reason in the
   caveat at the top.
 
-## 5. Reproducing
+## 5. Environment fixes this run required
+
+Two things had to change before the environment would start at all. Both are
+committed separately from the loadgen work so they stay reviewable on their own.
+
+**MinIO moved off Docker Hub.** `docker pull minio/minio:RELEASE.2024-01-16T16-07-38Z`
+— the tag pinned in `docker-compose.yml` — now fails with *"pull access denied
+for minio/minio, repository does not exist or may require 'docker login'"*.
+Verified this is specific to that repository and not a network problem:
+`hello-world` and `rust:1.93-slim-bookworm` both pulled fine from Docker Hub in
+the same session, while `minio/minio:latest` failed identically to the pinned
+tag. `quay.io/minio/minio` and `quay.io/minio/mc` both pull, so the compose file
+now points there (commit `61dadf9`).
+
+Moved to a floating tag rather than re-pinning a specific release: the point of
+the old pin was reproducibility, and what it actually delivered was an
+environment that could not start. A pin to a registry path that no longer exists
+is worse than no pin. Re-pin to a `quay.io` release tag if reproducibility
+matters more than startability here.
+
+`rust:1.93-slim-bookworm`, the other tag the plan flagged as a staleness risk,
+still pulls fine.
+
+**Every build was shipping ~12 GB of context.** There was no `.dockerignore`,
+and the daemon receives the whole build context regardless of which paths a
+Dockerfile `COPY`s — `target/` alone is 76 GB here, with `.claude/` and
+`.superpowers/` adding ~55 GB more. Added an allowlist `.dockerignore` (nothing
+sent unless named); context is now 2.3 MB. This affected the pre-existing
+`logthing:e2e` and Kerberos images too, not just the new loadgen one.
+
+## 6. Reproducing
 
 ```bash
 cd tests/e2e/simulation-environment
