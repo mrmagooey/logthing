@@ -104,6 +104,8 @@ impl IpfixListener {
 
         let mut buf = vec![0u8; 65535];
         let mut decoder = IpfixDecoder::new();
+        let mut socket_stats = crate::net::SocketDropStats::new(&socket, "ipfix");
+        let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
         loop {
             tokio::select! {
@@ -138,6 +140,9 @@ impl IpfixListener {
                         }
                     }
                 }
+                _ = socket_stats_ticker.tick() => {
+                    socket_stats.poll().await;
+                }
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         info!("IPFIX listener: shutdown signal received");
@@ -161,35 +166,44 @@ impl IpfixListener {
 
         let mut buf = vec![0u8; 65535];
         let mut decoder = IpfixDecoder::new();
+        let mut socket_stats = crate::net::SocketDropStats::new(&socket, "ipfix");
+        let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
         loop {
-            match socket.recv_from(&mut buf).await {
-                Ok((len, src)) => {
-                    if !self.allowed_ips.is_allowed(&src) {
-                        metrics::counter!("listener_source_rejected", "protocol" => "ipfix")
-                            .increment(1);
-                        debug!("Rejected ipfix datagram from {} — not in allowed_ips", src);
-                        continue;
-                    }
-                    debug!("IPFIX datagram from {}: {} bytes", src, len);
-                    match decode_datagram(&mut decoder, &buf[..len], src.ip()) {
-                        Ok(flows) if flows.is_empty() => {
-                            debug!(
-                                "IPFIX datagram from {} produced no flows (template-only or empty)",
-                                src
-                            );
-                        }
-                        Ok(flows) => {
-                            self.handler.handle_flows(flows, src).await;
+            tokio::select! {
+                result = socket.recv_from(&mut buf) => {
+                    match result {
+                        Ok((len, src)) => {
+                            if !self.allowed_ips.is_allowed(&src) {
+                                metrics::counter!("listener_source_rejected", "protocol" => "ipfix")
+                                    .increment(1);
+                                debug!("Rejected ipfix datagram from {} — not in allowed_ips", src);
+                                continue;
+                            }
+                            debug!("IPFIX datagram from {}: {} bytes", src, len);
+                            match decode_datagram(&mut decoder, &buf[..len], src.ip()) {
+                                Ok(flows) if flows.is_empty() => {
+                                    debug!(
+                                        "IPFIX datagram from {} produced no flows (template-only or empty)",
+                                        src
+                                    );
+                                }
+                                Ok(flows) => {
+                                    self.handler.handle_flows(flows, src).await;
+                                }
+                                Err(e) => {
+                                    metrics::counter!("ipfix_decode_errors").increment(1);
+                                    warn!("IPFIX decode error from {}: {}", src, e);
+                                }
+                            }
                         }
                         Err(e) => {
-                            metrics::counter!("ipfix_decode_errors").increment(1);
-                            warn!("IPFIX decode error from {}: {}", src, e);
+                            error!("IPFIX UDP receive error: {}", e);
                         }
                     }
                 }
-                Err(e) => {
-                    error!("IPFIX UDP receive error: {}", e);
+                _ = socket_stats_ticker.tick() => {
+                    socket_stats.poll().await;
                 }
             }
         }
