@@ -43,6 +43,18 @@ mod tests {
         );
     }
 
+    /// Restores coverage lost when syslog_udp.rs's duplicate tests were
+    /// removed: at an exact integer rate the carry must not drift over many
+    /// ticks. A naive accumulator that added float error each tick would pass
+    /// the single-call test below and fail this one.
+    #[test]
+    fn exact_integer_rate_does_not_drift_over_many_ticks() {
+        let mut carry = 0.0_f64;
+        let total: u64 = (0..100).map(|_| tick_record_count(&mut carry, 20.0)).sum();
+        assert_eq!(total, 2000, "100 ticks at exactly 20/tick must be 2000");
+        assert_eq!(carry, 0.0, "an exact rate must leave no residual carry");
+    }
+
     #[test]
     fn tick_record_count_handles_many_per_tick() {
         // target_rate=200_000 -> 200/tick, no fractional part to carry.

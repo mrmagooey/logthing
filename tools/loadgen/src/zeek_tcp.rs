@@ -68,7 +68,45 @@ pub async fn run(args: ZeekTcpArgs) -> anyhow::Result<()> {
     // Write errors are handled here rather than bubbled straight out of the
     // loops below so we can report `sent` before aborting -- a partial run
     // is still interpretable if we say how far it got.
-    let write_result = send_records(&mut writer, &args, start, duration, &mut sent).await;
+    let write_result: anyhow::Result<()> = async {
+        if args.target_rate == 0 {
+            // Unbounded: write as fast as the connection will accept.
+            while start.elapsed() < duration {
+                write_record(&mut writer, sent, &args.log_path).await?;
+                sent += 1;
+            }
+        } else {
+            // Same 1ms-tick, fractional-carry pacing as syslog-udp -- see
+            // `crate::pacing` for why the carry accumulator is shared rather
+            // than reimplemented here.
+            let per_tick_interval = crate::pacing::TICK;
+            let records_per_tick_target = args.target_rate as f64 * per_tick_interval.as_secs_f64();
+            let mut ticker = tokio::time::interval(per_tick_interval);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
+            let mut carry: f64 = 0.0;
+
+            'send_loop: loop {
+                if start.elapsed() >= duration {
+                    break;
+                }
+                ticker.tick().await;
+                let records_this_tick = tick_record_count(&mut carry, records_per_tick_target);
+                for _ in 0..records_this_tick {
+                    if start.elapsed() >= duration {
+                        break 'send_loop;
+                    }
+                    write_record(&mut writer, sent, &args.log_path).await?;
+                    sent += 1;
+                }
+            }
+        }
+
+        // Flush the tail of the run -- BufWriter otherwise leaves the last
+        // partial buffer unsent once the process exits.
+        writer.flush().await.context("flush zeek TCP stream")?;
+        Ok(())
+    }
+    .await;
 
     if let Err(e) = write_result {
         eprintln!(
@@ -84,51 +122,6 @@ pub async fn run(args: ZeekTcpArgs) -> anyhow::Result<()> {
         sent as f64 / elapsed.as_secs_f64()
     );
 
-    Ok(())
-}
-
-async fn send_records(
-    writer: &mut BufWriter<TcpStream>,
-    args: &ZeekTcpArgs,
-    start: Instant,
-    duration: Duration,
-    sent: &mut u64,
-) -> anyhow::Result<()> {
-    if args.target_rate == 0 {
-        // Unbounded: write as fast as the connection will accept.
-        while start.elapsed() < duration {
-            write_record(writer, *sent, &args.log_path).await?;
-            *sent += 1;
-        }
-    } else {
-        // Same 1ms-tick, fractional-carry pacing as syslog-udp -- see
-        // `crate::pacing` for why the carry accumulator is shared rather
-        // than reimplemented here.
-        let per_tick_interval = crate::pacing::TICK;
-        let records_per_tick_target = args.target_rate as f64 * per_tick_interval.as_secs_f64();
-        let mut ticker = tokio::time::interval(per_tick_interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
-        let mut carry: f64 = 0.0;
-
-        'send_loop: loop {
-            if start.elapsed() >= duration {
-                break;
-            }
-            ticker.tick().await;
-            let records_this_tick = tick_record_count(&mut carry, records_per_tick_target);
-            for _ in 0..records_this_tick {
-                if start.elapsed() >= duration {
-                    break 'send_loop;
-                }
-                write_record(writer, *sent, &args.log_path).await?;
-                *sent += 1;
-            }
-        }
-    }
-
-    // Flush the tail of the run -- BufWriter otherwise leaves the last
-    // partial buffer unsent once the process exits.
-    writer.flush().await.context("flush zeek TCP stream")?;
     Ok(())
 }
 

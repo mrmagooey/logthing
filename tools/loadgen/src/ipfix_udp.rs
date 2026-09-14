@@ -105,7 +105,7 @@ pub async fn run(args: IpfixUdpArgs) -> anyhow::Result<()> {
         .await
         .context("send template datagram")?;
     seq = seq.wrapping_add(1);
-    let mut template = TemplateSchedule::new(template_interval, Instant::now());
+    let mut last_template_sent = Instant::now();
 
     // Borrowed into the send loops so a mid-run failure can still report how
     // far the run got — matching zeek-tcp, which prints its partial count on
@@ -115,13 +115,13 @@ pub async fn run(args: IpfixUdpArgs) -> anyhow::Result<()> {
         if args.target_rate == 0 {
             // Unbounded: send as fast as the socket will accept.
             while start.elapsed() < duration {
-                if template.due(Instant::now()) {
-                    socket
-                        .send(&build_template_datagram(seq))
-                        .await
-                        .context("send template datagram")?;
-                    seq = seq.wrapping_add(1);
-                }
+                resend_template_if_due(
+                    &socket,
+                    &mut last_template_sent,
+                    template_interval,
+                    &mut seq,
+                )
+                .await?;
                 socket
                     .send(&build_data_datagram(seq, sent))
                     .await
@@ -144,13 +144,13 @@ pub async fn run(args: IpfixUdpArgs) -> anyhow::Result<()> {
                 }
                 ticker.tick().await;
 
-                if template.due(Instant::now()) {
-                    socket
-                        .send(&build_template_datagram(seq))
-                        .await
-                        .context("send template datagram")?;
-                    seq = seq.wrapping_add(1);
-                }
+                resend_template_if_due(
+                    &socket,
+                    &mut last_template_sent,
+                    template_interval,
+                    &mut seq,
+                )
+                .await?;
 
                 let records_this_tick = tick_record_count(&mut carry, records_per_tick_target);
                 for _ in 0..records_this_tick {
@@ -173,7 +173,7 @@ pub async fn run(args: IpfixUdpArgs) -> anyhow::Result<()> {
     let elapsed = start.elapsed();
     if let Err(e) = send_result {
         eprintln!(
-            "loadgen ipfix-udp: send error after {sent} flows in {:.3}s — aborting",
+            "loadgen ipfix-udp: send error after {sent} flows in {:.3}s — aborting: {e:#}",
             elapsed.as_secs_f64()
         );
         return Err(e);
@@ -188,39 +188,38 @@ pub async fn run(args: IpfixUdpArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Decides when the template set is next due.
+/// Returns true if the template set is due at `now`, advancing `last_sent`.
 ///
-/// Extracted from the send loops purely so it is testable: the resend is the
+/// A free function rather than a struct: it needs no identity of its own, and
+/// taking `now` as an argument is what makes it testable — the resend is the
 /// only non-trivial thing this subcommand does, and getting it wrong fails
-/// *silently* — the collector drops every data set it cannot resolve a
-/// template for, while the generator still reports a full send count. A
-/// socket-and-wall-clock version of this logic cannot be unit-tested; this can.
-struct TemplateSchedule {
-    interval: Duration,
-    last_sent: Instant,
+/// *silently* (the collector drops every data set it cannot resolve a template
+/// for, while the generator still reports a full send count).
+fn template_due(last_sent: &mut Instant, interval: Duration, now: Instant) -> bool {
+    if now.duration_since(*last_sent) >= interval {
+        *last_sent = now;
+        true
+    } else {
+        false
+    }
 }
 
-impl TemplateSchedule {
-    /// `now` is the instant the initial template went out — construction
-    /// implies one has just been sent, so the first resend is one full interval
-    /// later, not immediately.
-    fn new(interval: Duration, now: Instant) -> Self {
-        Self {
-            interval,
-            last_sent: now,
-        }
+/// Send the template set if it is due. Both send loops need this and the
+/// build-send-increment triple was previously written out twice.
+async fn resend_template_if_due(
+    socket: &UdpSocket,
+    last_sent: &mut Instant,
+    interval: Duration,
+    seq: &mut u32,
+) -> anyhow::Result<()> {
+    if template_due(last_sent, interval, Instant::now()) {
+        socket
+            .send(&build_template_datagram(*seq))
+            .await
+            .context("send template datagram")?;
+        *seq = seq.wrapping_add(1);
     }
-
-    /// True if a template is due at `now`. Marks it sent, so two polls at the
-    /// same instant cannot both fire.
-    fn due(&mut self, now: Instant) -> bool {
-        if now.duration_since(self.last_sent) >= self.interval {
-            self.last_sent = now;
-            true
-        } else {
-            false
-        }
-    }
+    Ok(())
 }
 
 /// Derive distinct source/destination addresses for flow index `n`, so a run
@@ -313,23 +312,32 @@ mod tests {
     /// prevent: a data datagram sent to a decoder that has never seen the
     /// template yields zero flows (dropped, not decoded), because the
     /// collector has nowhere cached to look up field layout.
-    // --- TemplateSchedule: the resend logic, the only non-trivial thing this
+    // --- template_due: the resend logic, the only non-trivial thing this
     // --- subcommand does and the one whose failure mode is silent.
 
     #[test]
     fn template_is_not_due_before_one_full_interval_has_passed() {
         let t0 = Instant::now();
-        let mut s = TemplateSchedule::new(Duration::from_secs(10), t0);
-        assert!(!s.due(t0), "construction implies one was just sent");
-        assert!(!s.due(t0 + Duration::from_secs(9)));
+        let mut last = t0;
+        let interval = Duration::from_secs(10);
+        assert!(
+            !template_due(&mut last, interval, t0),
+            "construction implies one was just sent"
+        );
+        assert!(!template_due(
+            &mut last,
+            interval,
+            t0 + Duration::from_secs(9)
+        ));
     }
 
     #[test]
     fn template_is_due_at_exactly_one_interval() {
         let t0 = Instant::now();
-        let mut s = TemplateSchedule::new(Duration::from_secs(10), t0);
+        let mut last = t0;
+        let interval = Duration::from_secs(10);
         assert!(
-            s.due(t0 + Duration::from_secs(10)),
+            template_due(&mut last, interval, t0 + Duration::from_secs(10)),
             "must fire at exactly the interval, not strictly after it"
         );
     }
@@ -339,16 +347,21 @@ mod tests {
     #[test]
     fn firing_resets_the_clock_so_it_does_not_fire_twice_running() {
         let t0 = Instant::now();
-        let mut s = TemplateSchedule::new(Duration::from_secs(10), t0);
+        let mut last = t0;
+        let interval = Duration::from_secs(10);
         let at = t0 + Duration::from_secs(10);
-        assert!(s.due(at));
+        assert!(template_due(&mut last, interval, at));
         assert!(
-            !s.due(at),
+            !template_due(&mut last, interval, at),
             "second poll at the same instant must not re-fire"
         );
-        assert!(!s.due(at + Duration::from_secs(9)));
+        assert!(!template_due(
+            &mut last,
+            interval,
+            at + Duration::from_secs(9)
+        ));
         assert!(
-            s.due(at + Duration::from_secs(10)),
+            template_due(&mut last, interval, at + Duration::from_secs(10)),
             "next interval fires again"
         );
     }
@@ -357,9 +370,10 @@ mod tests {
     #[test]
     fn fires_once_per_interval_across_a_realistic_run() {
         let t0 = Instant::now();
-        let mut s = TemplateSchedule::new(Duration::from_secs(10), t0);
+        let mut last = t0;
+        let interval = Duration::from_secs(10);
         let fired = (1..=60)
-            .filter(|secs| s.due(t0 + Duration::from_secs(*secs)))
+            .filter(|secs| template_due(&mut last, interval, t0 + Duration::from_secs(*secs)))
             .count();
         assert_eq!(fired, 6, "10s interval over 60s must resend 6 times");
     }
