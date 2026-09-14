@@ -19,7 +19,7 @@
 use anyhow::Context;
 use chrono::Utc;
 use clap::Args;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::time::MissedTickBehavior;
@@ -57,9 +57,15 @@ pub struct IpfixUdpArgs {
 }
 
 pub async fn run(args: IpfixUdpArgs) -> anyhow::Result<()> {
-    let target: SocketAddr = format!("{}:{}", args.host, args.port)
-        .parse()
-        .with_context(|| format!("invalid target address {}:{}", args.host, args.port))?;
+    // Resolve rather than `.parse::<SocketAddr>()`: parse only accepts a
+    // numeric IP, so a DNS name like the docker-compose service `logthing`
+    // fails with "invalid socket address syntax". Caught by the compose run;
+    // a localhost smoke test cannot surface it.
+    let target = tokio::net::lookup_host(format!("{}:{}", args.host, args.port))
+        .await
+        .with_context(|| format!("resolve target address {}:{}", args.host, args.port))?
+        .next()
+        .with_context(|| format!("no address resolved for {}:{}", args.host, args.port))?;
 
     // Bind an ephemeral local UDP socket, then `connect` it to fix the peer
     // so sends use `send` instead of `send_to` (see syslog_udp.rs for why).

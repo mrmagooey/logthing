@@ -17,13 +17,12 @@
 //! newline would make `logthing`'s `$`-anchored RFC3164 regex fail to
 //! match the whole datagram.
 
+use crate::pacing::tick_record_count;
 use anyhow::Context;
 use chrono::{Datelike, Timelike, Utc};
 use clap::Args;
-use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use crate::pacing::tick_record_count;
 use tokio::time::MissedTickBehavior;
 
 #[derive(Args, Debug)]
@@ -54,9 +53,15 @@ pub struct SyslogUdpArgs {
 }
 
 pub async fn run(args: SyslogUdpArgs) -> anyhow::Result<()> {
-    let target: SocketAddr = format!("{}:{}", args.host, args.port)
-        .parse()
-        .with_context(|| format!("invalid target address {}:{}", args.host, args.port))?;
+    // Resolve rather than `.parse::<SocketAddr>()`: parse only accepts a
+    // numeric IP, so a DNS name like the docker-compose service `logthing`
+    // fails with "invalid socket address syntax". Caught by the compose run;
+    // a localhost smoke test cannot surface it.
+    let target = tokio::net::lookup_host(format!("{}:{}", args.host, args.port))
+        .await
+        .with_context(|| format!("resolve target address {}:{}", args.host, args.port))?
+        .next()
+        .with_context(|| format!("no address resolved for {}:{}", args.host, args.port))?;
 
     // Bind an ephemeral local UDP socket, then `connect` it to fix the peer
     // so sends use `send` instead of `send_to` -- one syscall's worth of
