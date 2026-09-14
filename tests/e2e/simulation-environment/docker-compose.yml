@@ -404,8 +404,9 @@ services:
     restart: "no"
 
   loadgen-ipfix:
-    # Reuses the image built by loadgen-zeek; `image:` is shared so compose does
-    # not rebuild the Rust workspace a second time.
+    # Shares loadgen-zeek's image tag, so both services resolve to one build
+    # rather than two. `docker compose build` still visits every service with a
+    # build: block, but the second is a BuildKit cache hit, not a recompile.
     build:
       context: ../../..
       dockerfile: tests/e2e/simulation-environment/loadgen/Dockerfile

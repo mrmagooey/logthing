@@ -107,50 +107,20 @@ pub async fn run(args: IpfixUdpArgs) -> anyhow::Result<()> {
     seq = seq.wrapping_add(1);
     let mut template = TemplateSchedule::new(template_interval, Instant::now());
 
-    if args.target_rate == 0 {
-        // Unbounded: send as fast as the socket will accept.
-        while start.elapsed() < duration {
-            if template.due(Instant::now()) {
-                socket
-                    .send(&build_template_datagram(seq))
-                    .await
-                    .context("send template datagram")?;
-                seq = seq.wrapping_add(1);
-            }
-            socket
-                .send(&build_data_datagram(seq, sent))
-                .await
-                .context("send data datagram")?;
-            seq = seq.wrapping_add(1);
-            sent += 1;
-        }
-    } else {
-        // Paced: same 1ms-tick, N-per-tick, fractional-carry pattern as
-        // syslog_udp.rs / pacing.rs.
-        let per_tick_interval = crate::pacing::TICK;
-        let records_per_tick_target = args.target_rate as f64 * per_tick_interval.as_secs_f64();
-        let mut ticker = tokio::time::interval(per_tick_interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
-        let mut carry: f64 = 0.0;
-
-        'send_loop: loop {
-            if start.elapsed() >= duration {
-                break;
-            }
-            ticker.tick().await;
-
-            if template.due(Instant::now()) {
-                socket
-                    .send(&build_template_datagram(seq))
-                    .await
-                    .context("send template datagram")?;
-                seq = seq.wrapping_add(1);
-            }
-
-            let records_this_tick = tick_record_count(&mut carry, records_per_tick_target);
-            for _ in 0..records_this_tick {
-                if start.elapsed() >= duration {
-                    break 'send_loop;
+    // Borrowed into the send loops so a mid-run failure can still report how
+    // far the run got — matching zeek-tcp, which prints its partial count on
+    // abort. Without it the operator gets only "send data datagram: ..." and
+    // cannot tell whether the run failed at flow 40 or flow 400,000.
+    let send_result: anyhow::Result<()> = async {
+        if args.target_rate == 0 {
+            // Unbounded: send as fast as the socket will accept.
+            while start.elapsed() < duration {
+                if template.due(Instant::now()) {
+                    socket
+                        .send(&build_template_datagram(seq))
+                        .await
+                        .context("send template datagram")?;
+                    seq = seq.wrapping_add(1);
                 }
                 socket
                     .send(&build_data_datagram(seq, sent))
@@ -159,10 +129,56 @@ pub async fn run(args: IpfixUdpArgs) -> anyhow::Result<()> {
                 seq = seq.wrapping_add(1);
                 sent += 1;
             }
+        } else {
+            // Paced: same 1ms-tick, N-per-tick, fractional-carry pattern as
+            // syslog_udp.rs / pacing.rs.
+            let per_tick_interval = crate::pacing::TICK;
+            let records_per_tick_target = args.target_rate as f64 * per_tick_interval.as_secs_f64();
+            let mut ticker = tokio::time::interval(per_tick_interval);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
+            let mut carry: f64 = 0.0;
+
+            'send_loop: loop {
+                if start.elapsed() >= duration {
+                    break;
+                }
+                ticker.tick().await;
+
+                if template.due(Instant::now()) {
+                    socket
+                        .send(&build_template_datagram(seq))
+                        .await
+                        .context("send template datagram")?;
+                    seq = seq.wrapping_add(1);
+                }
+
+                let records_this_tick = tick_record_count(&mut carry, records_per_tick_target);
+                for _ in 0..records_this_tick {
+                    if start.elapsed() >= duration {
+                        break 'send_loop;
+                    }
+                    socket
+                        .send(&build_data_datagram(seq, sent))
+                        .await
+                        .context("send data datagram")?;
+                    seq = seq.wrapping_add(1);
+                    sent += 1;
+                }
+            }
         }
+        Ok(())
     }
+    .await;
 
     let elapsed = start.elapsed();
+    if let Err(e) = send_result {
+        eprintln!(
+            "loadgen ipfix-udp: send error after {sent} flows in {:.3}s — aborting",
+            elapsed.as_secs_f64()
+        );
+        return Err(e);
+    }
+
     println!(
         "loadgen ipfix-udp: sent {sent} flows in {:.3}s (achieved rate: {:.1} flows/s)",
         elapsed.as_secs_f64(),
