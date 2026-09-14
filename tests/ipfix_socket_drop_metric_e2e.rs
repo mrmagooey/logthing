@@ -49,9 +49,7 @@ async fn reserve_udp_port() -> u16 {
 }
 
 async fn reserve_tcp_port() -> u16 {
-    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     probe.local_addr().unwrap().port()
 }
 

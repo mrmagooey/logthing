@@ -88,12 +88,10 @@ fn ipv4_hex(ip: Ipv4Addr) -> String {
 /// an IPv6 address, for `/proc/net/udp6`'s `local_address` field.
 fn ipv6_hex(ip: Ipv6Addr) -> String {
     let octets = ip.octets();
-    octets
-        .chunks_exact(4)
-        .map(|chunk| {
-            let word: [u8; 4] = chunk.try_into().expect("chunks_exact(4)");
-            format!("{:08X}", u32::from_le_bytes(word))
-        })
+    let (words, _remainder) = octets.as_chunks::<4>();
+    words
+        .iter()
+        .map(|word| format!("{:08X}", u32::from_le_bytes(*word)))
         .collect()
 }
 
@@ -360,6 +358,7 @@ mod tests {
     /// assert on the exact metric emitted, mirroring
     /// `received_counters_fire_with_a_non_default_handler` in
     /// `src/zeek/listener.rs`.
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
     #[tokio::test]
     async fn socket_drop_stats_observes_real_kernel_drops() {
         use metrics::set_default_local_recorder;
