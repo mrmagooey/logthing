@@ -69,7 +69,7 @@ fn bench_structured_syslog_record_construction(c: &mut Criterion) {
     let batch = sink.to_record_batch(&auditd_record, &schema).unwrap();
     assert_eq!(batch.num_rows(), 1, "auditd fixture must encode to one row");
 
-    let mut group = c.benchmark_group("structured_syslog_record_construction");
+    let mut group = c.benchmark_group("structured_syslog_to_record_batch");
     group.throughput(Throughput::Elements(1));
 
     group.bench_function("cef", |b| {
