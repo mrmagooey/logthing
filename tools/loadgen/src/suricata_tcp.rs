@@ -223,10 +223,10 @@ mod tests {
     /// two records at different sequence numbers must differ in `flow_id`.
     #[test]
     fn distinct_sequence_numbers_yield_distinct_records() {
-        let a = logthing::suricata::parse_line(&build_record(1, "alert"), chrono::Utc::now())
-            .unwrap();
-        let b = logthing::suricata::parse_line(&build_record(2, "alert"), chrono::Utc::now())
-            .unwrap();
+        let a =
+            logthing::suricata::parse_line(&build_record(1, "alert"), chrono::Utc::now()).unwrap();
+        let b =
+            logthing::suricata::parse_line(&build_record(2, "alert"), chrono::Utc::now()).unwrap();
         assert_ne!(a.record.fields["flow_id"], b.record.fields["flow_id"]);
     }
 
