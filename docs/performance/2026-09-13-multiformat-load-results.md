@@ -204,3 +204,63 @@ Three traps this run hit, all of which produce plausible-looking wrong results:
    `config/logthing.toml` overrides it.
 
 `curl` is not installed in the server image; `wget` is.
+
+## 7. `SO_RCVBUF` follow-up (Tier 2 Task 3, branch `t2/so-rcvbuf`)
+
+§1 attributed the 13.5% IPFIX kernel loss at 5,000/s to the default 208 KiB
+`SO_RCVBUF` and untouched `rmem_max`. `t2/so-rcvbuf` made the UDP receive
+buffer configurable (`receive_buffer_bytes: Option<usize>`, default 4 MiB) and
+applies it at bind time in all three UDP listeners via `socket2`. On this
+host (uid 1000, no `CAP_NET_ADMIN`, `rmem_max` = `rmem_default` = 212992) the
+request is clamped and doubled, and the server logs it on every startup:
+
+```
+WARN syslog_udp: SO_RCVBUF requested 4194304 bytes, kernel granted only 425984 bytes (clamped by net.core.rmem_max)
+WARN ipfix: SO_RCVBUF requested 4194304 bytes, kernel granted only 425984 bytes (clamped by net.core.rmem_max)
+```
+
+425984 vs 212992 — the actual buffer doubles, exactly as predicted before
+this task started. **The question was whether that doubling moves the
+kernel-loss number**, using the exact §6 reproduction steps, comparing commit
+`6570ccc` (pre-change, no `SO_RCVBUF` anywhere) against this branch's tip.
+Two 20 s runs per rate per commit, same host, same session:
+
+| rate | commit | run 1 loss | run 2 loss | pooled loss |
+|---|---|---|---|---|
+| 5,000/s | before (`6570ccc`) | 4,184 / 99,995 (4.18%) | 3,095 / 100,000 (3.10%) | 7,279 / 199,995 (**3.64%**) |
+| 5,000/s | after (`t2/so-rcvbuf`) | 4,887 / 99,990 (4.89%) | 3,053 / 99,995 (3.05%) | 7,940 / 199,985 (**3.97%**) |
+| 20,000/s | before (`6570ccc`) | 71,516 / 368,688 (19.40%) | 89,081 / 399,881 (22.28%) | 160,597 / 768,569 (**20.90%**) |
+| 20,000/s | after (`t2/so-rcvbuf`) | 53,235 / 398,044 (13.37%) | 75,924 / 380,372 (19.96%) | 129,159 / 778,416 (**16.59%**) |
+
+**At 5,000/s: no improvement.** Pooled loss is statistically indistinguishable
+before vs. after (3.64% vs 3.97%, after is nominally *worse*), and each
+commit's own two runs (4.18% vs 3.10%; 4.89% vs 3.05%) already span more than
+the before/after gap. Doubling the buffer bought nothing measurable at this
+rate on this host. That is itself informative: at 5,000/s the loss is not
+buffer-depth-limited — it tracks scheduling luck between the generator and
+server containers contending for the same 12 vCPUs, matching §2's own
+observation that identical offered load produced a 3.2-point spread run to
+run. Also worth noting this session's absolute numbers (3-5%) run well below
+§1/§2's original 10-14% at the same nominal rate — different day, different
+host contention, same generator and server code path — which is further
+evidence these are noisy attribution numbers, not a stable capacity figure.
+
+**At 20,000/s: a real but not fully resolved improvement.** Pooled loss drops
+from 20.90% to 16.59%, roughly a 4.3-point (~20% relative) reduction — a
+plausible payoff of a 2x buffer at a rate where the queue is under more
+sustained pressure. But it is not a clean win: the after-commit's two runs
+(13.37%, 19.96%) span 6.6 points, wide enough that its worse run overlaps the
+before-commit's range (19.40%–22.28%) entirely. Two runs per condition cannot
+rule out this being the same scheduling noise seen at 5,000/s, just larger in
+absolute terms at the higher rate. Call it a directional signal consistent
+with the task's predicted "real but bounded improvement," not a proven one —
+resolving it further needs more repetitions than this session's time budget
+allowed, or a host without generator/server vCPU contention.
+
+**Bottom line:** the setsockopt is correct and the logging surfaces the clamp
+exactly as designed (425984 vs 212992, every startup). Whether it *helps*
+loss is rate-dependent and, at the lower rate tested, indistinguishable from
+noise — do not read this task as having proven the fix's value at 5,000/s,
+only that it's wired up correctly and shows a suggestive-but-unconfirmed win
+at 20,000/s. Do not raise `rmem_max` on the host to chase a cleaner number;
+that changes what is being measured.
