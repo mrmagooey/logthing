@@ -7,7 +7,7 @@ use crate::syslog::{SyslogMessage, dns::DnsLogEntry, payload};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
@@ -580,6 +580,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
+    use tokio::net::UdpSocket;
     use tokio::time::sleep;
 
     /// Test handler that captures received messages.
