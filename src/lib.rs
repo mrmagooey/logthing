@@ -12,6 +12,7 @@ pub mod ingest;
 pub mod ipfix;
 pub mod middleware;
 pub mod models;
+pub mod net;
 pub mod parser;
 pub mod profiling;
 pub mod protocol;

@@ -34,6 +34,11 @@ pub struct SyslogListenerConfig {
     pub tcp_port: u16,
     pub bind_address: String,
     pub parse_dns_logs: bool,
+    /// Requested `SO_RCVBUF` size in bytes for the UDP socket. `None` leaves
+    /// the OS default alone. Only affects the UDP arm — TCP syslog has no
+    /// datagram-drop failure mode this addresses. See
+    /// `crate::net::bind_udp_with_recv_buffer`.
+    pub receive_buffer_bytes: Option<usize>,
 }
 
 impl Default for SyslogListenerConfig {
@@ -43,6 +48,7 @@ impl Default for SyslogListenerConfig {
             tcp_port: 601,
             bind_address: "0.0.0.0".to_string(),
             parse_dns_logs: true,
+            receive_buffer_bytes: Some(4 * 1024 * 1024),
         }
     }
 }
@@ -246,7 +252,12 @@ impl SyslogListener {
         let tcp_addr: SocketAddr =
             format!("{}:{}", self.config.bind_address, self.config.tcp_port).parse()?;
 
-        let udp_socket = UdpSocket::bind(&udp_addr).await?;
+        let udp_socket = crate::net::bind_udp_with_recv_buffer(
+            &udp_addr,
+            self.config.receive_buffer_bytes,
+            "syslog_udp",
+        )
+        .await?;
         info!("Syslog UDP listener started on {}", udp_addr);
         let tcp_listener = TcpListener::bind(&tcp_addr).await?;
         info!("Syslog TCP listener started on {}", tcp_addr);
@@ -339,7 +350,12 @@ impl SyslogListener {
         let addr: SocketAddr =
             format!("{}:{}", self.config.bind_address, self.config.udp_port).parse()?;
 
-        let socket = UdpSocket::bind(&addr).await?;
+        let socket = crate::net::bind_udp_with_recv_buffer(
+            &addr,
+            self.config.receive_buffer_bytes,
+            "syslog_udp",
+        )
+        .await?;
         info!("Syslog UDP listener started on {}", addr);
 
         let mut buf = vec![0u8; 65535];
@@ -811,6 +827,7 @@ mod tests {
             tcp_port,
             bind_address: "127.0.0.1".to_string(),
             parse_dns_logs: false,
+            ..SyslogListenerConfig::default()
         };
         let handler: Arc<dyn SyslogHandler> =
             Arc::new(DefaultSyslogHandler::new(false, false, None));
@@ -833,6 +850,61 @@ mod tests {
         assert!(
             result.is_ok(),
             "start_with_shutdown did not return after shutdown signal within 2 s"
+        );
+    }
+
+    /// Integration-level check for the `receive_buffer_bytes` config plumbing:
+    /// a listener started via the real `start_with_shutdown` production path
+    /// with a non-default buffer size still binds and processes UDP syslog
+    /// messages normally. The socket-level assertion that the requested size
+    /// actually changes `SO_RCVBUF` lives in `crate::net`'s unit tests,
+    /// against the exact same `bind_udp_with_recv_buffer` call this listener
+    /// makes.
+    #[tokio::test]
+    async fn start_with_shutdown_honors_configured_receive_buffer() {
+        use tokio::sync::watch;
+
+        let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = udp_socket.local_addr().unwrap().port();
+        drop(udp_socket);
+
+        let tcp_listener_raw = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tcp_listener_raw.local_addr().unwrap().port();
+        drop(tcp_listener_raw);
+
+        let config = SyslogListenerConfig {
+            udp_port,
+            tcp_port,
+            bind_address: "127.0.0.1".to_string(),
+            parse_dns_logs: false,
+            receive_buffer_bytes: Some(1024 * 1024),
+        };
+        let handler = CapturingHandler::new();
+        let listener = SyslogListener::new(config, handler.clone());
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            listener.start_with_shutdown(shutdown_rx).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(
+                b"<134>1 2026-09-13T00:00:00Z host app - - - test message",
+                ("127.0.0.1", udp_port),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        shutdown_tx.send(true).unwrap();
+        let _ = timeout(Duration::from_secs(2), task).await;
+
+        assert_eq!(
+            handler.take_messages().len(),
+            1,
+            "listener with a configured receive buffer must still process messages"
         );
     }
 
