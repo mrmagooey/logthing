@@ -1,0 +1,382 @@
+total leaf samples: 4736
+   samples    self%  frame
+       813   17.17%  posix_memalign
+       542   11.44%  free
+       408    8.61%  __lll_lock_wake_private
+       345    7.28%  malloc
+       294    6.21%  recvfrom
+       220    4.65%  core::sync::atomic::atomic_sub::<usize, usize>
+       216    4.56%  __lll_lock_wait_private
+       146    3.08%  epoll_wait
+       110    2.32%  core::sync::atomic::atomic_add::<usize, usize>
+        95    2.01%  mprotect
+        88    1.86%  core::ptr::copy_nonoverlapping::<u8>
+        51    1.08%  alloc::alloc::alloc
+        41    0.87%  clock_gettime
+        37    0.78%  core::sync::atomic::atomic_load::<usize>
+        36    0.76%  <&u8 as core::ops::bit::Shr<usize>>::shr
+        36    0.76%  <arrow_buffer::buffer::immutable::Buffer>::len
+        32    0.68%  <u8 as core::slice::cmp::SlicePartialEq<u8>>::equal_same_length
+        27    0.57%  <arrow_schema::datatype::DataType as core::cmp::PartialEq>::eq
+        20    0.42%  core::sync::atomic::atomic_load::<u32>
+        19    0.40%  <arrow_schema::datatype::DataType as core::clone::Clone>::clone
+        16    0.34%  <alloc::raw_vec::RawVec<alloc::sync::Arc<dyn arrow_array::array::Array>> as core::ops::drop::Drop>::drop
+        16    0.34%  <alloc::sync::Arc<arrow_buffer::bytes::Bytes> as core::ops::drop::Drop>::drop
+        15    0.32%  <arrow_data::data::ArrayDataBuilder>::nulls
+        15    0.32%  core::ptr::drop_glue::<tokio::task::coop::RestoreOnPending>
+        13    0.27%  <tokio::runtime::io::registration::Registration>::async_io::<(usize, core::net::socket_addr::SocketAddr), <tokio::net::udp::UdpSocket>::recv_from::{closure#0}::{closure#0}>::{closure#0}
+        13    0.27%  <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+        12    0.25%  <std::sys::pal::unix::time::Timespec>::now
+        12    0.25%  <tokio::runtime::scheduler::multi_thread::idle::Idle>::unpark_worker_by_id
+        12    0.25%  realloc
+        12    0.25%  std::sys::net::connection::socket::socket_addr_from_c
+        12    0.25%  <core::ptr::non_null::NonNull<alloc::sync::ArcInner<tokio::sync::mpsc::chan::Chan<alloc::vec::Vec<logthing::ipfix::FlowRecord>, tokio::sync::mpsc::bounded::Semaphore>>>>::as_ref
+        12    0.25%  <logthing::ipfix::listener::IpfixListener>::start_with_shutdown::{closure#0}
+        12    0.25%  ZSTD_cwksp_clean_tables
+        11    0.23%  <core::ptr::non_null::NonNull<alloc::sync::ArcInner<arrow_buffer::bytes::Bytes>>>::as_ref
+        11    0.23%  <alloc::vec::Vec<logthing::ipfix::FlowRecord>>::push_mut
+        11    0.23%  <tokio::runtime::scheduler::multi_thread::worker::Core>::tick
+        10    0.21%  core::sync::atomic::atomic_compare_exchange::<u8>
+        10    0.21%  arrow_select::concat::binary_capacity::<arrow_array::types::GenericStringType<i32>>
+        10    0.21%  <logthing::ipfix::listener::IpfixListener>::start_with_shutdown::{closure#0}::{closure#1}
+        10    0.21%  <arrow_buffer::bytes::Bytes as core::ops::drop::Drop>::drop
+        10    0.21%  logthing::forwarding::ipfix_s3::append_flow_record
+        10    0.21%  core::fmt::write
+        10    0.21%  <tokio::runtime::task::raw::RawTask>::schedule
+        10    0.21%  <core::ptr::non_null::NonNull<alloc::sync::ArcInner<tokio::runtime::scheduler::multi_thread::queue::Inner<alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>>>::as_ref
+         9    0.19%  alloc::alloc::dealloc_nonnull
+         9    0.19%  logthing::ipfix::decoder::parse_ipfix_data_set
+         9    0.19%  <tokio::sync::notify::NotifiedProject>::poll_notified
+         9    0.19%  core::sync::atomic::atomic_load::<u8>
+         9    0.19%  chrono::naive::date::cycle_to_yo
+         9    0.19%  <*mut ((core::net::ip_addr::IpAddr, u32, u16), alloc::vec::Vec<logthing::ipfix::decoder::FieldSpecifier>)>::sub
+         8    0.17%  metrics::recorder::with_recorder::<metrics::handles::Counter, logthing::ipfix::decoder::decode_datagram::{closure#0}>::{closure#0}
+         8    0.17%  <arrow_array::builder::primitive_builder::PrimitiveBuilder<arrow_array::types::TimestampMicrosecondType>>::with_capacity
+         8    0.17%  <arrow_data::data::ArrayDataBuilder>::add_buffer
+         8    0.17%  <core::ptr::non_null::NonNull<alloc::sync::ArcInner<dyn arrow_array::array::Array>>>::as_ref
+         8    0.17%  logthing::ipfix::decoder::read_u16_be
+         8    0.17%  <logthing::forwarding::buffered_writer::ParquetWriterHandle<logthing::forwarding::ipfix_s3::IpfixSink> as logthing::ipfix::listener::IpfixHandler>::handle_flows
+         8    0.17%  tokio::sync::watch::changed_impl::<bool>::{closure#0}
+         8    0.17%  <arrow_array::array::primitive_array::PrimitiveArray<arrow_array::types::UInt8Type> as core::clone::Clone>::clone
+         8    0.17%  <core::cell::Cell<*const tokio::runtime::scheduler::Context>>::get
+         8    0.17%  core::ptr::write::<arrow_data::data::ArrayData>
+         7    0.15%  <core::option::Option<arrow_buffer::builder::boolean::BooleanBufferBuilder>>::is_some
+         7    0.15%  tokio::runtime::context::CONTEXT::{K#0}::{closure#0}
+         7    0.15%  __rustc::__rdl_alloc
+         7    0.15%  <core::net::ip_addr::IpAddr as alloc::string::SpecToString>::spec_to_string
+         7    0.15%  core::ptr::drop_glue::<core::option::Option<alloc::sync::Arc<str>>>
+         7    0.15%  <std::alloc::System as core::alloc::global::GlobalAlloc>::alloc
+         7    0.15%  powf64
+         7    0.15%  <logthing::forwarding::ipfix_s3::IpfixSink as logthing::forwarding::buffered_writer::ParquetSink>::to_record_batch
+         7    0.15%  core::ptr::write_bytes::<u8>
+         7    0.15%  <alloc::vec::Vec<alloc::sync::Arc<dyn arrow_array::array::Array>>>::as_slice
+         7    0.15%  <core::ptr::non_null::NonNull<alloc::sync::ArcInner<metrics_exporter_prometheus::recorder::Inner>>>::as_ref
+         7    0.15%  <arrow_data::data::ArrayDataBuilder>::build_impl
+         6    0.13%  <tokio::runtime::task::core::Core<logthing::async_main::{closure#0}::{closure#8}, alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>>::poll::{closure#0}
+         6    0.13%  core::ptr::drop_glue::<arrow_schema::datatype::DataType>
+         6    0.13%  core::ptr::drop_glue::<dyn arrow_array::array::Array>
+         6    0.13%  <tokio::net::udp::UdpSocket>::recv_from::{closure#0}
+         6    0.13%  <*mut (alloc::string::String, ())>::sub
+         6    0.13%  core::ptr::drop_glue::<arrow_array::array::byte_array::GenericByteArray<arrow_array::types::GenericStringType<i32>>>
+         6    0.13%  core::hash::sip::u8to64_le
+         6    0.13%  logthing::ipfix::decoder::decode_ipfix
+         5    0.11%  <std::thread::local::LocalKey<tokio::runtime::context::Context>>::with::<tokio::runtime::context::thread_rng_n::{closure#0}, u32>
+         5    0.11%  <alloc::sync::Arc<dyn arrow_array::array::Array>>::drop_slow
+         5    0.11%  <arrow_array::array::primitive_array::PrimitiveArray<arrow_array::types::UInt32Type>>::is_compatible
+         5    0.11%  <mio::sys::unix::selector::Selector>::select
+         5    0.11%  <alloc::sync::Arc<dyn arrow_array::array::Array> as core::ops::deref::Deref>::deref
+         5    0.11%  <tokio::net::udp::UdpSocket>::recv_from::{closure#0}::{closure#0}
+         5    0.11%  <arrow_data::data::ArrayDataBuilder>::new
+         5    0.11%  <[u8] as core::cmp::PartialEq>::eq
+         5    0.11%  <tokio::runtime::task::harness::Harness<logthing::async_main::{closure#0}::{closure#8}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>::poll_inner
+         5    0.11%  <[u8] as ahash::convert::ReadFromSlice>::read_u32
+         5    0.11%  logthing::ipfix::decoder::decode_datagram
+         5    0.11%  <logthing::forwarding::ipfix_s3::FlowRecordBuilders>::new
+         5    0.11%  <arrow_array::builder::generic_bytes_builder::GenericByteBuilder<arrow_array::types::GenericStringType<i32>>>::finish
+         5    0.11%  <logthing::forwarding::buffered_writer::PartitionedParquetWriter<logthing::forwarding::ipfix_s3::IpfixSink>>::push::{closure#0}::{closure#4}
+         5    0.11%  <core::alloc::layout::Layout>::size
+         5    0.11%  <alloc::alloc::Global>::alloc_impl_runtime
+         5    0.11%  <metrics_util::registry::Registry<metrics::key::Key, metrics_util::registry::recency::GenerationalStorage<metrics_exporter_prometheus::registry::AtomicStorage>>>::get_hash_and_shard_for_counter
+         5    0.11%  core::ptr::drop_glue::<arrow_data::data::ArrayData>
+         5    0.11%  <core::ptr::non_null::NonNull<tokio::sync::mpsc::block::Block<alloc::vec::Vec<logthing::ipfix::FlowRecord>>>>::as_ref
+         4    0.08%  core::ptr::write::<alloc::boxed::Box<dyn for<'a, 'b> core::ops::function::Fn<(&'a mut arrow_data::transform::_MutableArrayData<'b>, usize, usize), Output = ()>>>
+         4    0.08%  <tokio::task::coop::Coop<tokio::sync::watch::changed_impl<bool>::{closure#0}> as core::future::future::Future>::poll
+         4    0.08%  core::sync::atomic::atomic_compare_exchange::<usize>
+         4    0.08%  <tokio::runtime::task::harness::Harness<logthing::async_main::{closure#0}::{closure#8}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>::poll
+         4    0.08%  <tokio::runtime::time::handle::Handle>::process_at_time
+         4    0.08%  <alloc::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle::<alloc::alloc::Global>
+         4    0.08%  <arrow_buffer::buffer::scalar::ScalarBuffer<i32>>::new
+         4    0.08%  <tokio::runtime::task::state::Snapshot>::ref_inc
+         4    0.08%  <chrono::naive::date::NaiveDate>::from_num_days_from_ce_opt
+         4    0.08%  <arrow_array::record_batch::RecordBatch>::try_new_impl
+         4    0.08%  <alloc::collections::btree::map::IntoIter<alloc::string::String, serde_json::value::Value>>::dying_next
+         4    0.08%  core::sync::atomic::atomic_compare_exchange_weak::<u8>
+         4    0.08%  <arrow_array::builder::primitive_builder::PrimitiveBuilder<arrow_array::types::UInt32Type>>::finish
+         4    0.08%  <u8 as core::fmt::Display>::fmt
+         4    0.08%  <tokio::runtime::scheduler::multi_thread::stats::Stats>::end_processing_scheduled_tasks
+         4    0.08%  <tokio::util::linked_list::LinkedList<tokio::sync::notify::Waiter, tokio::sync::notify::Waiter>>::push_front
+         4    0.08%  arrow_data::transform::utils::extend_offsets::<i32>::{closure#0}
+         4    0.08%  <ahash::fallback_hash::AHasher>::large_update
+         4    0.08%  <alloc::sync::Arc<dyn arrow_array::array::Array> as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global>
+         4    0.08%  <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&(core::net::ip_addr::IpAddr, u32, u16)>
+         4    0.08%  core::ptr::drop_glue::<alloc::collections::btree::map::IntoIter<alloc::string::String, serde_json::value::Value>>
+         4    0.08%  <logthing::ipfix::listener::IpfixListener>::start_with_shutdown::{closure#0}::{closure#8}
+         4    0.08%  <alloc::vec::Vec<arrow_data::data::ArrayData>>::push_mut
+         4    0.08%  <alloc::raw_vec::RawVecInner>::finish_grow
+         4    0.08%  <core::ops::range::Range<usize> as core::slice::index::SliceIndex<[u8]>>::index
+         4    0.08%  <core::pin::Pin<alloc::boxed::Box<dyn core::future::future::Future<Output = ()> + core::marker::Send>> as core::future::future::Future>::poll
+         4    0.08%  <std::net::udp::UdpSocket>::recv_from
+         4    0.08%  <tokio::runtime::time::wheel::Wheel>::next_expiration
+         4    0.08%  arrow_buffer::util::bit_util::round_upto_multiple_of_64
+         3    0.06%  <tokio::runtime::time::Driver>::park_internal
+         3    0.06%  <arrow_buffer::util::bit_chunk_iterator::UnalignedBitChunk>::new
+         3    0.06%  <arrow_data::data::ArrayDataBuilder>::len
+         3    0.06%  <arrow_array::array::primitive_array::PrimitiveArray<arrow_array::types::TimestampMicrosecondType>>::value_unchecked
+         3    0.06%  <arrow_buffer::builder::null::NullBufferBuilder>::finish
+         3    0.06%  core::ptr::metadata::from_raw_parts_mut::<core::ffi::c_void, ()>
+         3    0.06%  <core::cell::BorrowRefMut>::new
+         3    0.06%  <std::sys::net::connection::socket::unix::Socket>::recv_from_with_flags
+         3    0.06%  <tokio::runtime::time::wheel::Wheel>::poll
+         3    0.06%  std::sys::io::error::unix::decode_error_kind
+         3    0.06%  <tokio::runtime::io::scheduled_io::Readiness as core::future::future::Future>::poll
+         3    0.06%  <arrow_array::builder::primitive_builder::PrimitiveBuilder<arrow_array::types::UInt8Type>>::finish
+         3    0.06%  <core::ptr::non_null::NonNull<alloc::sync::ArcInner<core::sync::atomic::Atomic<u64>>>>::as_ref
+         3    0.06%  <tokio::runtime::io::scheduled_io::ScheduledIo>::readiness::{closure#0}
+         3    0.06%  <core::ptr::non_null::NonNull<alloc::sync::ArcInner<arrow_schema::schema::Schema>>>::as_ref
+         3    0.06%  <std::backtrace_rs::symbolize::gimli::stash::Stash>::allocate
+         3    0.06%  <alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Dying, alloc::string::String, serde_json::value::Value, alloc::collections::btree::node::marker::LeafOrInternal>>::first_leaf_edge
+         3    0.06%  <logthing::forwarding::buffered_writer::LiveInterval>::changed::{closure#0}
+         3    0.06%  arrow_data::transform::build_extend_null_bits::{closure#0}
+         3    0.06%  core::ptr::drop_glue::<arrow_array::builder::primitive_builder::PrimitiveBuilder<arrow_array::types::UInt32Type>>
+         3    0.06%  <tokio::sync::notify::Notified as core::future::future::Future>::poll
+         3    0.06%  <tokio::sync::watch::Receiver<bool>>::changed::{closure#0}
+         3    0.06%  core::sync::atomic::atomic_add::<u64, u64>
+         3    0.06%  core::mem::size_of_val_raw::<alloc::sync::ArcInner<dyn arrow_array::array::Array>>
+         3    0.06%  __errno_location
+         3    0.06%  <chrono::naive::date::NaiveDate>::add_days
+         3    0.06%  <alloc::sync::Arc<dyn metrics::handles::CounterFn + core::marker::Send + core::marker::Sync> as core::ops::deref::Deref>::deref
+         3    0.06%  core::ptr::copy_nonoverlapping::<logthing::ipfix::FlowRecord>
+         3    0.06%  <arrow_buffer::builder::null::NullBufferBuilder>::materialize
+         3    0.06%  <tokio::sync::mpsc::block::Block<alloc::vec::Vec<logthing::ipfix::FlowRecord>>>::is_at_index
+         3    0.06%  <core::option::Option<arrow_buffer::buffer::null::NullBuffer>>::as_ref
+         3    0.06%  <arrow_array::builder::primitive_builder::PrimitiveBuilder<arrow_array::types::UInt32Type>>::with_capacity
+         3    0.06%  <core::net::ip_addr::Ipv4Addr as core::fmt::Display>::fmt
+         3    0.06%  <alloc::sync::Arc<str>>::drop_slow
+         3    0.06%  <tokio::runtime::scheduler::multi_thread::worker::Context>::park_internal
+         3    0.06%  <arrow_buffer::bytes::Bytes>::capacity
+         3    0.06%  core::ptr::drop_glue::<(<tokio::net::udp::UdpSocket>::recv_from::{closure#0}, <tokio::sync::watch::Receiver<bool>>::changed::{closure#0})>
+         3    0.06%  logthing::ipfix::decoder::decode_datagram::{closure#0}
+         3    0.06%  core::sync::atomic::atomic_or::<usize, usize>
+         3    0.06%  ZSTD_compressBlock_doubleFast_noDict_generic
+         3    0.06%  syscall
+         2    0.04%  <tokio::runtime::scheduler::multi_thread::idle::Idle>::transition_worker_to_parked
+         2    0.04%  <arrow_buffer::buffer::immutable::Buffer>::typed_data::<i32>
+         2    0.04%  <tokio::io::ready::Ready>::from_interest
+         2    0.04%  core::mem::replace::<isize>
+         2    0.04%  <tokio::sync::notify::Notified as core::ops::drop::Drop>::drop
+         2    0.04%  <chrono::datetime::DateTime<chrono::offset::utc::Utc>>::checked_add_signed
+         2    0.04%  core::ptr::drop_glue::<arrow_array::builder::primitive_builder::PrimitiveBuilder<arrow_array::types::TimestampMicrosecondType>>
+         2    0.04%  std::sys::alloc::unix::aligned_malloc
+         2    0.04%  <u8>::_fmt_inner
+         2    0.04%  <arrow_data::data::ArrayDataBuilder>::buffers
+         2    0.04%  logthing::ipfix::decoder::set_addr_field
+         2    0.04%  <alloc::vec::Vec<i64> as core::iter::traits::collect::FromIterator<i64>>::from_iter::<core::iter::adapters::map::Map<core::slice::iter::Iter<usize>, <parquet::column::writer::encoder::ColumnValueEncoderImpl<parquet::data_type::Int64Type> as parquet::column::writer::encoder::ColumnValueEncoder>::write_gather::{closure#0}>>
+         2    0.04%  <tokio::runtime::io::driver::Driver>::turn
+         2    0.04%  logthing::forwarding::buffered_writer::partition_time
+         2    0.04%  <core::result::Result<arrow_array::record_batch::RecordBatch, anyhow::Error> as core::ops::try_trait::Try>::branch
+         2    0.04%  <core::option::Option<arrow_buffer::buffer::null::NullBuffer>>::or_else::<<arrow_data::data::ArrayDataBuilder>::build_impl::{closure#0}>
+         2    0.04%  <arrow_array::array::primitive_array::PrimitiveArray<arrow_array::types::UInt8Type> as core::convert::From<arrow_data::data::ArrayData>>::from
+         2    0.04%  logthing::ipfix::decoder::ie_info
+         2    0.04%  <core::fmt::Formatter>::pad_integral
+         2    0.04%  <metrics::key::Key>::from_parts::<&str, alloc::vec::Vec<metrics::label::Label>>
+         2    0.04%  <tokio::time::interval::Interval>::tick::{closure#0}::{closure#0}
+         2    0.04%  tokio::task::coop::has_budget_remaining::{closure#0}
+         2    0.04%  <arrow_buffer::buffer::immutable::Buffer>::as_slice
+         2    0.04%  <alloc::raw_vec::RawVecInner>::try_allocate_in
+         2    0.04%  <arrow_array::builder::generic_bytes_builder::GenericByteBuilder<arrow_array::types::GenericStringType<i32>>>::with_capacity
+         2    0.04%  <alloc::collections::btree::map::IntoIter<alloc::string::String, serde_json::value::Value> as core::ops::drop::Drop>::drop
+         2    0.04%  tokio::runtime::task::waker::clone_waker
+         2    0.04%  <tokio::runtime::runtime::Runtime as core::ops::drop::Drop>::drop
+         2    0.04%  <logthing::forwarding::buffered_writer::PartitionedParquetWriter<logthing::forwarding::ipfix_s3::IpfixSink>>::push::{closure#0}
+         2    0.04%  <arrow_array::array::primitive_array::PrimitiveArray<arrow_array::types::TimestampMicrosecondType> as arrow_array::array::Array>::to_data
+         2    0.04%  <tokio::runtime::task::core::TaskIdGuard as core::ops::drop::Drop>::drop
+         2    0.04%  core::ptr::read::<alloc::collections::btree::map::BTreeMap<alloc::string::String, serde_json::value::Value>>
+         2    0.04%  <chrono::naive::datetime::NaiveDateTime>::checked_add_offset
+         2    0.04%  <core::fmt::Formatter>::pad_integral::write_prefix
+         2    0.04%  <alloc::vec::Vec<libc::unix::linux_like::epoll_event>>::set_len
+         2    0.04%  <arrow_array::array::primitive_array::PrimitiveArray<arrow_array::types::TimestampMicrosecondType> as core::convert::From<arrow_data::data::ArrayData>>::from
+         2    0.04%  <std::sys::pal::unix::time::Timespec>::sub_timespec
+         2    0.04%  <arrow_buffer::builder::null::NullBufferBuilder>::append_null
+         2    0.04%  <arrow_buffer::buffer::mutable::MutableBuffer as core::default::Default>::default
+         2    0.04%  tokio::time::clock::now
+         2    0.04%  <dashmap::DashMap<alloc::string::String, logthing::stats::SourceBuckets> as dashmap::t::Map<alloc::string::String, logthing::stats::SourceBuckets, std::hash::random::RandomState>>::_entry
+         2    0.04%  <alloc::string::String as core::fmt::Write>::write_str
+         2    0.04%  <u8 as core::slice::cmp::SliceOrd>::compare
+         2    0.04%  <tokio::util::linked_list::LinkedList<tokio::sync::notify::Waiter, tokio::sync::notify::Waiter>>::remove
+         2    0.04%  arrow_select::concat::concat_fallback
+         2    0.04%  core::sync::atomic::atomic_sub::<u32, u32>
+         2    0.04%  arrow_select::interleave::interleave_fallback::{closure#0}
+         2    0.04%  <tokio::runtime::io::scheduled_io::ScheduledIo>::wake
+         2    0.04%  <core::option::Option<tokio::runtime::time::handle::Handle>>::as_ref
+         2    0.04%  <core::slice::iter::Iter<ipnet::ipnet::IpNet> as core::iter::traits::iterator::Iterator>::any::<<logthing::middleware::IpWhitelist>::is_allowed::{closure#0}>
+         2    0.04%  <logthing::forwarding::buffered_writer::PartitionedParquetWriter<logthing::forwarding::ipfix_s3::IpfixSink>>::try_flush_partition_async
+         2    0.04%  core::ptr::drop_glue::<tokio::sync::notify::Notified>
+         2    0.04%  <usize>::checked_add
+         2    0.04%  <tokio::runtime::time::source::TimeSource>::now
+         2    0.04%  <core::ops::range::Range<u32> as core::iter::range::RangeIteratorImpl>::spec_next
+         2    0.04%  <alloc::raw_vec::RawVecInner>::grow_amortized
+         2    0.04%  <core::ptr::non_null::NonNull<u8>>::new
+         2    0.04%  <arrow_data::transform::MutableArrayData>::with_capacities
+         2    0.04%  <tokio::io::ready::Ready>::from_mio
+         2    0.04%  <tokio::task::coop::Budget>::has_remaining
+         2    0.04%  <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds>>::reset
+         2    0.04%  tokio::runtime::task::waker::drop_waker
+         2    0.04%  <chrono::offset::utc::Utc>::now
+         2    0.04%  <arrow_array::builder::primitive_builder::PrimitiveBuilder<arrow_array::types::UInt64Type>>::finish
+         1    0.02%  <alloc::sync::Arc<arrow_schema::field::Field> as core::ops::drop::Drop>::drop
+         1    0.02%  <arrow_array::array::primitive_array::PrimitiveArray<arrow_array::types::UInt16Type> as core::convert::From<arrow_data::data::ArrayData>>::from
+         1    0.02%  arrow_buffer::util::bit_util::ceil
+         1    0.02%  <tokio::task::join_set::JoinSet<logthing::forwarding::buffered_writer::FlushOutcome>>::poll_join_next
+         1    0.02%  <tokio::runtime::task::raw::RawTask>::poll
+         1    0.02%  <core::option::Option<arrow_buffer::builder::boolean::BooleanBufferBuilder>>::as_mut
+         1    0.02%  __munmap
+         1    0.02%  core::ptr::drop_glue::<<logthing::forwarding::buffered_writer::ParquetWriterHandle<logthing::forwarding::ipfix_s3::IpfixSink> as logthing::ipfix::listener::IpfixHandler>::handle_flows::{closure#0}>
+         1    0.02%  <tokio::runtime::task::state::State>::transition_to_running
+         1    0.02%  <tokio::sync::mpsc::list::Rx<alloc::vec::Vec<logthing::ipfix::FlowRecord>>>::try_advancing_head
+         1    0.02%  <arrow_data::data::ArrayData>::buffer::<u8>
+         1    0.02%  core::ptr::drop_glue::<core::option::Option<arrow_buffer::buffer::null::NullBuffer>>
+         1    0.02%  <alloc::raw_vec::RawVec<arrow_buffer::buffer::immutable::Buffer>>::grow_one
+         1    0.02%  <alloc::sync::Weak<dyn arrow_array::array::Array, &alloc::alloc::Global>>::inner
+         1    0.02%  <usize>::overflowing_mul
+         1    0.02%  arrow_data::transform::build_extend
+         1    0.02%  <tokio::runtime::scheduler::multi_thread::worker::Core>::steal_work
+         1    0.02%  <arrow_array::array::byte_array::GenericByteArray<arrow_array::types::GenericStringType<i32>> as core::convert::From<arrow_data::data::ArrayData>>::from
+         1    0.02%  core::ptr::drop_glue::<parquet::column::page::Page>
+         1    0.02%  <hashbrown::control::tag::Tag>::full
+         1    0.02%  <arrow_array::builder::primitive_builder::PrimitiveBuilder<arrow_array::types::UInt64Type>>::append_null
+         1    0.02%  <logthing::forwarding::ipfix_s3::IpfixSink as logthing::forwarding::buffered_writer::ParquetSink>::day_and_batch
+         1    0.02%  tokio::macros::support::thread_rng_n
+         1    0.02%  core::intrinsics::unlikely
+         1    0.02%  ahash::operations::folded_multiply
+         1    0.02%  <core::result::Result<core::time::Duration, core::time::Duration>>::map_err::<std::time::SystemTimeError, std::time::SystemTimeError>
+         1    0.02%  <dyn core::any::Any>::is::<arrow_array::array::primitive_array::PrimitiveArray<arrow_array::types::TimestampMicrosecondType>>
+         1    0.02%  <tokio::sync::notify::AtomicNotification>::load
+         1    0.02%  logthing::forwarding::buffered_writer::day_from_batch::{closure#0}
+         1    0.02%  <tokio::runtime::scheduler::multi_thread::worker::Context>::reset_lifo_enabled
+         1    0.02%  <arrow_array::array::primitive_array::PrimitiveArray<arrow_array::types::TimestampMicrosecondType> as core::any::Any>::type_id
+         1    0.02%  <tokio::runtime::task::state::State>::transition_to_notified_by_val
+         1    0.02%  <tokio::time::interval::Interval>::poll_tick
+         1    0.02%  core::ptr::drop_glue::<serde_json::value::Value>
+         1    0.02%  <alloc::vec::Vec<arrow_buffer::buffer::immutable::Buffer>>::push_mut
+         1    0.02%  <tokio::sync::mpsc::bounded::Sender<alloc::vec::Vec<logthing::ipfix::FlowRecord>>>::try_send
+         1    0.02%  <hashbrown::map::HashMap<logthing::forwarding::buffered_writer::BufKey, logthing::forwarding::buffered_writer::PartitionBuffer<alloc::vec::Vec<logthing::ipfix::FlowRecord>>, std::hash::random::RandomState>>::get_mut::<logthing::forwarding::buffered_writer::BufKey>
+         1    0.02%  core::mem::take::<arrow_buffer::buffer::mutable::MutableBuffer>
+         1    0.02%  <tokio::runtime::scheduler::multi_thread::worker::Context>::run
+         1    0.02%  <core::ptr::non_null::NonNull<alloc::sync::ArcInner<dashmap::DashMap<alloc::string::String, logthing::stats::SourceBuckets>>>>::as_ref
+         1    0.02%  <hashbrown::table::Entry<u64>>::or_insert_with::<<parquet::util::interner::Interner<parquet::arrow::arrow_writer::byte_array::ByteArrayStorage>>::intern::{closure#2}>
+         1    0.02%  <parquet::column::writer::GenericColumnWriter<parquet::column::writer::encoder::ColumnValueEncoderImpl<parquet::data_type::Int32Type>>>::write_mini_batch
+         1    0.02%  <alloc::sync::Arc<arrow_buffer::bytes::Bytes>>::new
+         1    0.02%  <alloc::boxed::Box<dyn for<'a, 'b> core::ops::function::Fn<(&'a mut arrow_data::transform::_MutableArrayData<'b>, usize, usize), Output = ()>> as core::ops::function::Fn<(&mut arrow_data::transform::_MutableArrayData, usize, usize)>>::call
+         1    0.02%  core::mem::replace::<arrow_buffer::buffer::mutable::MutableBuffer>
+         1    0.02%  core::ptr::drop_glue::<[arrow_buffer::buffer::immutable::Buffer]>
+         1    0.02%  core::sync::atomic::atomic_store::<u32>
+         1    0.02%  <core::task::wake::Waker as core::clone::Clone>::clone
+         1    0.02%  <std::io::buffered::bufwriter::BufWriter<&mut alloc::vec::Vec<u8>>>::spare_capacity
+         1    0.02%  <arrow_data::data::ArrayData as core::convert::From<arrow_array::array::primitive_array::PrimitiveArray<arrow_array::types::UInt32Type>>>::from
+         1    0.02%  <arrow_buffer::buffer::immutable::Buffer>::slice_with_length
+         1    0.02%  <arrow_array::builder::primitive_builder::PrimitiveBuilder<arrow_array::types::UInt16Type>>::with_capacity
+         1    0.02%  <arrow_data::data::ArrayDataBuilder>::build_unchecked
+         1    0.02%  <core::mem::alignment::Alignment>::max
+         1    0.02%  serde_json::ser::to_vec::<serde_json::value::Value>
+         1    0.02%  <tokio::runtime::io::registration::Registration>::readiness::{closure#0}
+         1    0.02%  <tokio::runtime::scheduler::multi_thread::handle::Handle>::schedule_local
+         1    0.02%  <arrow_buffer::builder::null::NullBufferBuilder>::append_non_null
+         1    0.02%  <arrow_buffer::buffer::mutable::MutableBuffer>::resize
+         1    0.02%  <alloc::raw_vec::RawVecInner>::non_null::<arrow_data::data::ArrayData>
+         1    0.02%  tokio::runtime::blocking::pool::spawn_blocking::<logthing::forwarding::buffered_writer::encode_and_upload::{closure#0}::{closure#1}, core::result::Result<(alloc::vec::Vec<u8>, parquet::format::FileMetaData), anyhow::Error>>
+         1    0.02%  <arrow_array::array::primitive_array::PrimitiveArray<arrow_array::types::UInt64Type>>::is_compatible
+         1    0.02%  FSE_buildCTable_wksp
+         1    0.02%  <tokio::runtime::task::core::Cell<tokio::runtime::blocking::task::BlockingTask<tokio::fs::canonicalize::canonicalize<&std::path::Path>::{closure#0}::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>::new
+         1    0.02%  <arrow_buffer::buffer::mutable::MutableBuffer>::reallocate
+         1    0.02%  parking_lot_core::parking_lot::with_thread_data::<parking_lot_core::parking_lot::ParkResult, parking_lot_core::parking_lot::park<<parking_lot::condvar::Condvar>::wait_until_internal::{closure#0}, <parking_lot::condvar::Condvar>::wait_until_internal::{closure#1}, <parking_lot::condvar::Condvar>::wait_until_internal::{closure#2}>::{closure#0}>
+         1    0.02%  <chrono::naive::datetime::NaiveDateTime>::checked_sub_signed
+         1    0.02%  <std::sys::net::connection::socket::unix::Socket>::recv_from
+         1    0.02%  <logthing::forwarding::buffered_writer::ParquetWriterHandle<logthing::forwarding::ipfix_s3::IpfixSink>>::start_with_stats::{closure#0}::{closure#0}
+         1    0.02%  std::sys::io::error::unix::errno
+         1    0.02%  <alloc::sync::Arc<dyn metrics::handles::CounterFn + core::marker::Send + core::marker::Sync> as core::ops::drop::Drop>::drop
+         1    0.02%  core::ptr::drop_glue::<metrics_util::registry::recency::Generational<alloc::sync::Arc<core::sync::atomic::Atomic<u64>>>>
+         1    0.02%  <std::sys::time::unix::Instant>::now
+         1    0.02%  <arrow_array::record_batch::RecordBatch>::try_new
+         1    0.02%  core::slice::index::get_offset_len_noubcheck::<u8>
+         1    0.02%  <alloc::sync::Arc<dyn arrow_array::array::Array> as core::ops::drop::Drop>::drop
+         1    0.02%  tokio::runtime::context::with_scheduler::<(), tokio::runtime::scheduler::multi_thread::worker::with_current<(), <tokio::runtime::scheduler::multi_thread::handle::Handle>::schedule_task::{closure#0}>::{closure#0}>
+         1    0.02%  <arrow_buffer::buffer::scalar::ScalarBuffer<f64> as core::convert::From<arrow_buffer::buffer::immutable::Buffer>>::from
+         1    0.02%  arrow_buffer::util::bit_chunk_iterator::compute_suffix_mask
+         1    0.02%  <arrow_array::builder::generic_bytes_builder::GenericByteBuilder<arrow_array::types::GenericStringType<i32>>>::append_value::<alloc::string::String>
+         1    0.02%  ZSTD_CCtx_init_compressStream2
+         1    0.02%  <arrow_array::array::primitive_array::PrimitiveArray<arrow_array::types::TimestampMicrosecondType>>::is_compatible
+         1    0.02%  ZSTD_cpuid
+         1    0.02%  <tokio::sync::mpsc::list::Tx<alloc::vec::Vec<logthing::ipfix::FlowRecord>>>::push
+         1    0.02%  <arrow_buffer::buffer::null::NullBuffer>::new
+         1    0.02%  <i32>::div_euclid
+         1    0.02%  <tokio::runtime::task::harness::Harness<tokio::runtime::blocking::task::BlockingTask<tokio::fs::write::write_spawn_blocking::{closure#0}::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>::shutdown
+         1    0.02%  <arrow_buffer::buffer::boolean::BooleanBuffer as core::clone::Clone>::clone
+         1    0.02%  <u128>::wrapping_mul
+         1    0.02%  <u64>::wrapping_add
+         1    0.02%  <core::future::poll_fn::PollFn<<tokio::time::interval::Interval>::tick::{closure#0}::{closure#0}> as core::future::future::Future>::poll
+         1    0.02%  parquet::column::writer::encoder::get_min_max::<i32, core::slice::iter::Iter<i32>>
+         1    0.02%  <alloc::vec::Vec<metrics::label::Label> as core::ops::drop::Drop>::drop
+         1    0.02%  <core::option::Option<alloc::boxed::Box<dyn logthing::forwarding::buffered_writer::RecordBatchAccumulator<logthing::ingest::GenericRecord>>>>::as_mut
+         1    0.02%  __rustc::__rdl_realloc
+         1    0.02%  <std::sys::time::unix::SystemTime>::now
+         1    0.02%  <tokio::runtime::time::wheel::level::Level>::next_expiration
+         1    0.02%  <tokio::sync::notify::NotifiedProject>::drop_notified
+         1    0.02%  <arrow_buffer::buffer::scalar::ScalarBuffer<u16>>::new
+         1    0.02%  <arrow_array::array::primitive_array::PrimitiveArray<arrow_array::types::UInt16Type>>::is_compatible
+         1    0.02%  <parquet::file::metadata::LevelHistogram>::update_from_levels
+         1    0.02%  <arrow_array::builder::primitive_builder::PrimitiveBuilder<arrow_array::types::TimestampMicrosecondType>>::finish
+         1    0.02%  <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write_str
+         1    0.02%  core::ptr::drop_glue::<arrow_buffer::buffer::mutable::MutableBuffer>
+         1    0.02%  <arrow_data::transform::MutableArrayData>::with_capacities::{closure#19}
+         1    0.02%  core::mem::replace::<core::option::Option<tokio::runtime::scheduler::multi_thread::worker::with_current<(), <tokio::runtime::scheduler::multi_thread::handle::Handle>::schedule_task::{closure#0}>::{closure#0}>>
+         1    0.02%  <alloc::raw_vec::RawVecInner>::reserve
+         1    0.02%  <parquet::schema::types::BasicTypeInfo>::converted_type
+         1    0.02%  <tokio::util::wake_list::WakeList>::push
+         1    0.02%  tokio::task::coop::poll_budget_available
+         1    0.02%  <tokio::time::instant::Instant>::saturating_duration_since
+         1    0.02%  <parquet::encodings::rle::RleEncoder>::put
+         1    0.02%  <logthing::forwarding::buffered_writer::ParquetWriterHandle<logthing::forwarding::ipfix_s3::IpfixSink>>::start_with_stats::{closure#0}
+         1    0.02%  <arrow_array::builder::primitive_builder::PrimitiveBuilder<arrow_array::types::TimestampMicrosecondType>>::with_data_type
+         1    0.02%  HUF_compress_internal
+         1    0.02%  ZSTD_entropyCompressSeqStore_internal
+         1    0.02%  <tokio::runtime::task::core::Header>::get_scheduler::<alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>
+         1    0.02%  <[u8]>::align_to::<u64>
+         1    0.02%  ZSTD_storeSeq
+         1    0.02%  <tokio::task::coop::Budget>::decrement
+         1    0.02%  <std::path::Path>::join::<alloc::string::String>
+         1    0.02%  <logthing::forwarding::buffered_writer::PartitionedParquetWriter<logthing::forwarding::generic_s3::GenericSink>>::drop_oldest_to_cap
+         1    0.02%  <alloc::vec::Vec<parquet::arrow::arrow_writer::ArrowColumnWriter>>::push_mut
+         1    0.02%  __floattidf
+         1    0.02%  <tokio::sync::notify::Notify>::notified
+         1    0.02%  <core::ptr::non_null::NonNull<alloc::sync::ArcInner<tokio::runtime::io::scheduled_io::ScheduledIo>>>::as_ref
+         1    0.02%  core::sync::atomic::atomic_load::<*mut core::io::error::OsFunctions>
+         1    0.02%  core::sync::atomic::atomic_swap::<usize>
+         1    0.02%  <[metrics::label::Label] as core::cmp::PartialEq>::eq
+         1    0.02%  <std::alloc::System as core::alloc::global::GlobalAlloc>::realloc
+         1    0.02%  ahash::operations::read_small
+         1    0.02%  core::ptr::write_bytes::<hashbrown::control::tag::Tag>
+         1    0.02%  <arrow_buffer::buffer::scalar::ScalarBuffer<u16> as core::convert::From<arrow_buffer::buffer::immutable::Buffer>>::from
+         1    0.02%  <arrow_array::array::primitive_array::PrimitiveArray<arrow_array::types::UInt64Type> as core::convert::From<arrow_data::data::ArrayData>>::from
+         1    0.02%  <hashbrown::raw::RawTableInner>::find_inner
+         1    0.02%  core::sync::atomic::atomic_load::<u64>
+         1    0.02%  logthing::forwarding::drop_log::process_nanos
+         1    0.02%  <[core::mem::maybe_uninit::MaybeUninit<u8>]>::fill_with::<<[core::mem::maybe_uninit::MaybeUninit<u8>] as core::mem::maybe_uninit::SpecFill<u8>>::spec_fill::{closure#0}>
+         1    0.02%  <core::net::ip_addr::IpAddr as core::fmt::Display>::fmt
+         1    0.02%  <parquet::file::writer::SerializedRowGroupWriter<&mut alloc::vec::Vec<u8>>>::close
+         1    0.02%  <arrow_buffer::buffer::boolean::BooleanBuffer>::new
+         1    0.02%  <core::option::Option<core::time::Duration>>::unwrap_or_default
+         1    0.02%  core::sync::atomic::atomic_compare_exchange_weak::<u32>
+         1    0.02%  <alloc::raw_vec::RawVecInner>::non_null::<u8>
+         1    0.02%  alloc::alloc::realloc_nonnull
+         1    0.02%  <arrow_buffer::buffer::immutable::Buffer>::count_set_bits_offset
+         1    0.02%  arrow_data::transform::variable_size::build_extend::<i32>::{closure#0}
