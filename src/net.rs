@@ -23,7 +23,12 @@ pub async fn bind_udp_with_recv_buffer(
     protocol: &str,
 ) -> std::io::Result<UdpSocket> {
     let socket = UdpSocket::bind(addr).await?;
-    if let Some(requested) = requested {
+    // `0` is the operator-facing opt-out, not just `None`. TOML has no way to
+    // express `None`: omitting the key runs the serde default (4 MiB) and
+    // setting it yields `Some(n)`, so without this an operator has no
+    // reachable way to decline the larger buffer at all — which is exactly
+    // what the field's own docs promise they can do.
+    if let Some(requested) = requested.filter(|n| *n > 0) {
         let sock_ref = socket2::SockRef::from(&socket);
         if let Err(e) = sock_ref.set_recv_buffer_size(requested) {
             warn!("{protocol}: failed to set SO_RCVBUF to {requested} bytes: {e}");
@@ -49,6 +54,26 @@ mod tests {
 
     fn recv_buffer_size(socket: &UdpSocket) -> usize {
         socket2::SockRef::from(socket).recv_buffer_size().unwrap()
+    }
+
+    /// `receive_buffer_bytes = 0` is the only opt-out an operator can actually
+    /// write: TOML cannot express `None`, so omitting the key runs the serde
+    /// default and any value yields `Some(n)`. Guards the gap between what the
+    /// field's docs promise and what a config file can express.
+    #[tokio::test]
+    async fn zero_is_treated_as_opt_out_like_none() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let untouched = bind_udp_with_recv_buffer(&addr, None, "test")
+            .await
+            .unwrap();
+        let zero = bind_udp_with_recv_buffer(&addr, Some(0), "test")
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_buffer_size(&zero),
+            recv_buffer_size(&untouched),
+            "0 must leave the OS default alone, exactly as None does"
+        );
     }
 
     /// The kernel doubles whatever `SO_RCVBUF` value survives the clamp, and

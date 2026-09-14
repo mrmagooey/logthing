@@ -187,8 +187,9 @@ pub struct SyslogConfig {
     #[serde(default = "default_syslog_tcp_port")]
     pub tcp_port: u16,
 
-    /// Requested `SO_RCVBUF` size in bytes for the UDP socket. `None` means
-    /// "leave the OS default alone" — see `default_udp_receive_buffer_bytes`.
+    /// Requested `SO_RCVBUF` size in bytes for the UDP socket. Set `0` to
+    /// leave the OS default alone — TOML cannot express `None`, so `0` is the
+    /// opt-out an operator can actually write.
     /// TCP syslog is unaffected: `SO_RCVBUF` only applies to the UDP arm.
     #[serde(default = "default_udp_receive_buffer_bytes")]
     pub receive_buffer_bytes: Option<usize>,
@@ -251,9 +252,10 @@ pub struct IpfixConfig {
     #[serde(default = "default_ipfix_bind_address")]
     pub bind_address: String,
 
-    /// Requested `SO_RCVBUF` size in bytes for the UDP socket. `None` means
-    /// "leave the OS default alone" — a deliberate opt-out, since a larger
+    /// Requested `SO_RCVBUF` size in bytes for the UDP socket. Set `0` to
+    /// leave the OS default alone — a deliberate opt-out, since a larger
     /// buffer is kernel memory held per socket for the life of the process.
+    /// TOML cannot express `None`, so `0` is the reachable form of it.
     #[serde(default = "default_udp_receive_buffer_bytes")]
     pub receive_buffer_bytes: Option<usize>,
 
