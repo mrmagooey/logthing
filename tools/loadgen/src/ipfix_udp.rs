@@ -69,7 +69,16 @@ pub async fn run(args: IpfixUdpArgs) -> anyhow::Result<()> {
 
     // Bind an ephemeral local UDP socket, then `connect` it to fix the peer
     // so sends use `send` instead of `send_to` (see syslog_udp.rs for why).
-    let socket = UdpSocket::bind("0.0.0.0:0")
+    // Bind in the SAME address family the target resolved to. Hardcoding
+    // 0.0.0.0 breaks on a dual-stack host whose resolver returns AAAA first:
+    // connect() then fails on an address-family mismatch. TcpStream::connect
+    // (zeek-tcp) has that fallback built in; a bound UdpSocket does not.
+    let local: std::net::SocketAddr = if target.is_ipv6() {
+        "[::]:0".parse().expect("static addr")
+    } else {
+        "0.0.0.0:0".parse().expect("static addr")
+    };
+    let socket = UdpSocket::bind(local)
         .await
         .context("bind local UDP socket")?;
     socket
@@ -96,18 +105,17 @@ pub async fn run(args: IpfixUdpArgs) -> anyhow::Result<()> {
         .await
         .context("send template datagram")?;
     seq = seq.wrapping_add(1);
-    let mut last_template_sent = Instant::now();
+    let mut template = TemplateSchedule::new(template_interval, Instant::now());
 
     if args.target_rate == 0 {
         // Unbounded: send as fast as the socket will accept.
         while start.elapsed() < duration {
-            if last_template_sent.elapsed() >= template_interval {
+            if template.due(Instant::now()) {
                 socket
                     .send(&build_template_datagram(seq))
                     .await
                     .context("send template datagram")?;
                 seq = seq.wrapping_add(1);
-                last_template_sent = Instant::now();
             }
             socket
                 .send(&build_data_datagram(seq, sent))
@@ -131,13 +139,12 @@ pub async fn run(args: IpfixUdpArgs) -> anyhow::Result<()> {
             }
             ticker.tick().await;
 
-            if last_template_sent.elapsed() >= template_interval {
+            if template.due(Instant::now()) {
                 socket
                     .send(&build_template_datagram(seq))
                     .await
                     .context("send template datagram")?;
                 seq = seq.wrapping_add(1);
-                last_template_sent = Instant::now();
             }
 
             let records_this_tick = tick_record_count(&mut carry, records_per_tick_target);
@@ -163,6 +170,41 @@ pub async fn run(args: IpfixUdpArgs) -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+/// Decides when the template set is next due.
+///
+/// Extracted from the send loops purely so it is testable: the resend is the
+/// only non-trivial thing this subcommand does, and getting it wrong fails
+/// *silently* — the collector drops every data set it cannot resolve a
+/// template for, while the generator still reports a full send count. A
+/// socket-and-wall-clock version of this logic cannot be unit-tested; this can.
+struct TemplateSchedule {
+    interval: Duration,
+    last_sent: Instant,
+}
+
+impl TemplateSchedule {
+    /// `now` is the instant the initial template went out — construction
+    /// implies one has just been sent, so the first resend is one full interval
+    /// later, not immediately.
+    fn new(interval: Duration, now: Instant) -> Self {
+        Self {
+            interval,
+            last_sent: now,
+        }
+    }
+
+    /// True if a template is due at `now`. Marks it sent, so two polls at the
+    /// same instant cannot both fire.
+    fn due(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.last_sent) >= self.interval {
+            self.last_sent = now;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Derive distinct source/destination addresses for flow index `n`, so a run
@@ -233,7 +275,7 @@ fn build_data_datagram(seq: u32, n: u64) -> Vec<u8> {
 mod tests {
     use super::*;
     use logthing::ipfix::decoder::{IpfixDecoder, decode_datagram};
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::IpAddr;
 
     fn exporter() -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
@@ -255,6 +297,57 @@ mod tests {
     /// prevent: a data datagram sent to a decoder that has never seen the
     /// template yields zero flows (dropped, not decoded), because the
     /// collector has nowhere cached to look up field layout.
+    // --- TemplateSchedule: the resend logic, the only non-trivial thing this
+    // --- subcommand does and the one whose failure mode is silent.
+
+    #[test]
+    fn template_is_not_due_before_one_full_interval_has_passed() {
+        let t0 = Instant::now();
+        let mut s = TemplateSchedule::new(Duration::from_secs(10), t0);
+        assert!(!s.due(t0), "construction implies one was just sent");
+        assert!(!s.due(t0 + Duration::from_secs(9)));
+    }
+
+    #[test]
+    fn template_is_due_at_exactly_one_interval() {
+        let t0 = Instant::now();
+        let mut s = TemplateSchedule::new(Duration::from_secs(10), t0);
+        assert!(
+            s.due(t0 + Duration::from_secs(10)),
+            "must fire at exactly the interval, not strictly after it"
+        );
+    }
+
+    /// Guards the "forgot to reset last_sent" bug: without the reset every
+    /// later poll fires, and the generator floods templates instead of data.
+    #[test]
+    fn firing_resets_the_clock_so_it_does_not_fire_twice_running() {
+        let t0 = Instant::now();
+        let mut s = TemplateSchedule::new(Duration::from_secs(10), t0);
+        let at = t0 + Duration::from_secs(10);
+        assert!(s.due(at));
+        assert!(
+            !s.due(at),
+            "second poll at the same instant must not re-fire"
+        );
+        assert!(!s.due(at + Duration::from_secs(9)));
+        assert!(
+            s.due(at + Duration::from_secs(10)),
+            "next interval fires again"
+        );
+    }
+
+    /// A 60s run at a 10s interval must resend 6 times — not 0, not 60.
+    #[test]
+    fn fires_once_per_interval_across_a_realistic_run() {
+        let t0 = Instant::now();
+        let mut s = TemplateSchedule::new(Duration::from_secs(10), t0);
+        let fired = (1..=60)
+            .filter(|secs| s.due(t0 + Duration::from_secs(*secs)))
+            .count();
+        assert_eq!(fired, 6, "10s interval over 60s must resend 6 times");
+    }
+
     #[test]
     fn data_datagram_against_cold_decoder_yields_no_flows() {
         let mut dec = IpfixDecoder::new();
