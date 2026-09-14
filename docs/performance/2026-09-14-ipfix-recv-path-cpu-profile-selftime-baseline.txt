@@ -1,0 +1,133 @@
+total leaf samples: 1250
+   samples    self%  frame
+       373   29.84%  recvfrom
+       182   14.56%  epoll_wait
+        33    2.64%  clock_gettime
+        28    2.24%  <tokio::runtime::io::registration::Registration>::async_io::<(usize, core::net::socket_addr::SocketAddr), <tokio::net::udp::UdpSocket>::recv_from::{closure#0}::{closure#0}>::{closure#0}
+        28    2.24%  malloc
+        24    1.92%  core::sync::atomic::atomic_compare_exchange_weak::<u8>
+        23    1.84%  <alloc::sync::Arc<dyn logthing::ipfix::listener::IpfixHandler> as core::ops::deref::Deref>::deref
+        21    1.68%  core::sync::atomic::atomic_add::<usize, usize>
+        17    1.36%  logthing::ipfix::decoder::parse_ipfix_data_set
+        16    1.28%  std::sys::net::connection::socket::socket_addr_from_c
+        16    1.28%  <logthing::ipfix::listener::IpfixListener>::start_with_shutdown::{closure#0}::{closure#1}
+        14    1.12%  core::sync::atomic::atomic_load::<usize>
+        14    1.12%  alloc::alloc::alloc
+        13    1.04%  <chrono::naive::internals::YearFlags>::from_year_mod_400
+        13    1.04%  powf64
+        12    0.96%  <tokio::runtime::scheduler::multi_thread::idle::Idle>::is_parked
+        10    0.80%  tokio::sync::watch::changed_impl::<bool>::{closure#0}
+        10    0.80%  free
+        10    0.80%  <core::ptr::non_null::NonNull<alloc::sync::ArcInner<metrics_exporter_prometheus::recorder::Inner>>>::as_ref
+        10    0.80%  <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+        10    0.80%  <std::sys::pal::unix::time::Timespec>::now
+         9    0.72%  core::io::error::os_functions::decode_error_kind
+         9    0.72%  <tokio::runtime::scheduler::multi_thread::stats::Stats>::end_processing_scheduled_tasks
+         9    0.72%  core::sync::atomic::atomic_load::<u64>
+         9    0.72%  <tokio::runtime::scheduler::multi_thread::stats::Stats>::start_poll
+         9    0.72%  <std::thread::local::LocalKey<tokio::runtime::context::Context>>::with::<tokio::runtime::context::thread_rng_n::{closure#0}, u32>
+         8    0.64%  std::sys::pal::unix::cvt::<isize>
+         8    0.64%  logthing::ipfix::decoder::ie_info
+         8    0.64%  <tokio::runtime::io::scheduled_io::Readiness as core::future::future::Future>::poll
+         7    0.56%  <tokio::sync::notify::NotifiedProject>::poll_notified
+         7    0.56%  <tokio::runtime::time::wheel::Wheel>::poll
+         7    0.56%  <tokio::runtime::time::wheel::Wheel>::next_expiration
+         7    0.56%  logthing::ipfix::decoder::decode_datagram
+         6    0.48%  <alloc::vec::Vec<logthing::ipfix::FlowRecord>>::push_mut
+         6    0.48%  <logthing::ipfix::listener::DefaultIpfixHandler as logthing::ipfix::listener::IpfixHandler>::handle_flows::{closure#0}
+         6    0.48%  <u8 as core::slice::cmp::SlicePartialEq<u8>>::equal_same_length
+         6    0.48%  logthing::ipfix::decoder::set_addr_field
+         6    0.48%  core::hash::sip::u8to64_le
+         6    0.48%  logthing::ipfix::decoder::decode_datagram::{closure#0}
+         6    0.48%  <tokio::runtime::task::harness::Harness<logthing::async_main::{closure#0}::{closure#8}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>::poll
+         5    0.40%  core::ptr::drop_glue::<(<tokio::net::udp::UdpSocket>::recv_from::{closure#0}, <tokio::sync::watch::Receiver<bool>>::changed::{closure#0})>
+         5    0.40%  <tokio::runtime::io::registration::Registration>::readiness::{closure#0}
+         5    0.40%  <tokio::sync::watch::Receiver<bool>>::changed::{closure#0}
+         5    0.40%  <tokio::runtime::task::harness::Harness<logthing::async_main::{closure#0}::{closure#8}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>>::poll_inner
+         5    0.40%  tokio::runtime::task::waker::clone_waker
+         5    0.40%  <alloc::raw_vec::RawVecInner>::non_null::<logthing::ipfix::FlowRecord>
+         5    0.40%  <core::ops::range::Range<usize> as core::slice::index::SliceIndex<[u8]>>::index
+         5    0.40%  <tokio::runtime::task::raw::RawTask>::schedule
+         5    0.40%  core::sync::atomic::atomic_compare_exchange::<u8>
+         5    0.40%  core::sync::atomic::atomic_load::<u8>
+         5    0.40%  core::ptr::drop_glue::<serde_json::value::Value>
+         5    0.40%  <core::cell::Cell<*const tokio::runtime::scheduler::Context>>::get
+         5    0.40%  core::sync::atomic::atomic_sub::<u32, u32>
+         5    0.40%  <tokio::runtime::task::state::Snapshot>::ref_inc
+         4    0.32%  tokio::runtime::task::harness::poll_future::<logthing::async_main::{closure#0}::{closure#8}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>::{closure#0}
+         4    0.32%  core::mem::replace::<core::option::Option<alloc::collections::btree::navigate::LazyLeafHandle<alloc::collections::btree::node::marker::Dying, alloc::string::String, serde_json::value::Value>>>
+         4    0.32%  __rustc::__rdl_alloc
+         4    0.32%  <mio::sys::unix::selector::Selector>::select
+         4    0.32%  <tokio::time::instant::Instant>::saturating_duration_since
+         4    0.32%  <std::net::udp::UdpSocket>::recv_from
+         4    0.32%  logthing::ipfix::decoder::decode_ipfix
+         4    0.32%  <tokio::sync::watch::big_notify::BigNotify>::notified
+         4    0.32%  <tokio::runtime::scheduler::multi_thread::handle::Handle>::schedule_local
+         4    0.32%  __errno_location
+         4    0.32%  <std::sys::thread_local::native::eager::Storage<tokio::runtime::context::Context>>::get
+         4    0.32%  __floattidf
+         4    0.32%  <tokio::net::udp::UdpSocket>::recv_from::{closure#0}::{closure#0}
+         3    0.24%  <alloc::sync::Arc<dyn metrics::handles::CounterFn + core::marker::Send + core::marker::Sync> as core::ops::deref::Deref>::deref
+         3    0.24%  core::sync::atomic::atomic_compare_exchange_weak::<usize>
+         3    0.24%  <tokio::sync::notify::AtomicNotification>::load
+         3    0.24%  <tokio::runtime::task::core::Header>::get_scheduler::<alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle>>
+         3    0.24%  <*mut logthing::ipfix::FlowRecord>::add
+         3    0.24%  <tokio::runtime::time::handle::Handle>::process_at_time
+         3    0.24%  tokio::runtime::task::waker::drop_waker
+         3    0.24%  <tokio::runtime::task::core::TaskIdGuard as core::ops::drop::Drop>::drop
+         3    0.24%  core::mem::replace::<tokio::task::coop::Budget>
+         3    0.24%  core::ptr::drop_glue::<metrics_util::registry::recency::Generational<alloc::sync::Arc<core::sync::atomic::Atomic<u64>>>>
+         3    0.24%  std::sys::io::error::unix::decode_error_kind
+         3    0.24%  <alloc::vec::Vec<ipnet::ipnet::IpNet>>::len
+         2    0.16%  tokio::runtime::context::with_scheduler::<(), tokio::runtime::scheduler::multi_thread::worker::with_current<(), <tokio::runtime::scheduler::multi_thread::handle::Handle>::schedule_task::{closure#0}>::{closure#0}>
+         2    0.16%  <tokio::sync::notify::Notified as core::future::future::Future>::poll
+         2    0.16%  <core::pin::Pin<alloc::boxed::Box<dyn core::future::future::Future<Output = ()> + core::marker::Send>> as core::future::future::Future>::poll
+         2    0.16%  <tokio::runtime::task::core::Core<logthing::async_main::{closure#0}::{closure#8}, alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>>::poll::{closure#0}
+         2    0.16%  <tokio::runtime::task::state::State>::transition_to_idle
+         2    0.16%  <usize>::overflowing_mul
+         2    0.16%  <alloc::raw_vec::RawVecInner>::grow_amortized
+         2    0.16%  <tokio::runtime::task::raw::RawTask>::poll
+         2    0.16%  <tokio::io::ready::Ready>::from_usize
+         2    0.16%  <tokio::runtime::io::driver::Driver>::turn
+         2    0.16%  <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds>>::reset
+         2    0.16%  <alloc::raw_vec::RawVec<logthing::ipfix::FlowRecord>>::grow_one
+         2    0.16%  <alloc::alloc::Global>::deallocate_impl_runtime
+         2    0.16%  core::sync::atomic::atomic_compare_exchange::<usize>
+         2    0.16%  core::ptr::drop_glue::<<logthing::ipfix::listener::DefaultIpfixHandler as logthing::ipfix::listener::IpfixHandler>::handle_flows::{closure#0}>
+         2    0.16%  core::intrinsics::unlikely
+         2    0.16%  <tokio::sync::notify::Notified as core::ops::drop::Drop>::drop
+         2    0.16%  <alloc::collections::btree::map::IntoIter<alloc::string::String, serde_json::value::Value>>::dying_next
+         2    0.16%  tokio::runtime::context::CONTEXT::{K#0}::{closure#0}
+         2    0.16%  core::ptr::drop_glue::<tokio::sync::notify::Notified>
+         2    0.16%  <tokio::task::coop::RestoreOnPending as core::ops::drop::Drop>::drop
+         2    0.16%  tokio::sync::watch::maybe_changed::<bool>
+         2    0.16%  core::sync::atomic::atomic_load::<*mut core::io::error::OsFunctions>
+         2    0.16%  <logthing::ipfix::listener::DefaultIpfixHandler as logthing::ipfix::listener::IpfixHandler>::handle_flows
+         1    0.08%  <tokio::runtime::io::driver::Driver>::consume_signal_ready
+         1    0.08%  <logthing::ipfix::listener::IpfixListener>::start_with_shutdown::{closure#0}
+         1    0.08%  <alloc::collections::btree::map::IntoIter<alloc::string::String, serde_json::value::Value> as core::ops::drop::Drop>::drop
+         1    0.08%  <tokio::runtime::scheduler::multi_thread::worker::Context>::park_internal
+         1    0.08%  <std::alloc::System as core::alloc::global::GlobalAlloc>::alloc
+         1    0.08%  <tokio::runtime::signal::Driver>::process
+         1    0.08%  core::ptr::drop_glue::<alloc::collections::btree::map::IntoIter<alloc::string::String, serde_json::value::Value>>
+         1    0.08%  <tokio::runtime::runtime::Runtime as core::ops::drop::Drop>::drop
+         1    0.08%  core::ptr::drop_glue::<tokio::task::coop::RestoreOnPending>
+         1    0.08%  <std::sys::net::connection::socket::unix::Socket>::recv_from_with_flags
+         1    0.08%  <tokio::runtime::time::handle::Handle>::clear_entry
+         1    0.08%  <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&(core::net::ip_addr::IpAddr, u32, u16)>
+         1    0.08%  <alloc::vec::Vec<usize>>::push_mut
+         1    0.08%  epoll_pwait2
+         1    0.08%  <[u8] as core::cmp::PartialEq>::eq
+         1    0.08%  <tokio::util::linked_list::LinkedList<tokio::sync::notify::Waiter, tokio::sync::notify::Waiter>>::push_front
+         1    0.08%  core::ptr::drop_glue::<tokio::runtime::io::scheduled_io::Readiness>
+         1    0.08%  tokio::runtime::context::thread_rng_n
+         1    0.08%  <core::time::Duration>::new
+         1    0.08%  <alloc::sync::Arc<core::sync::atomic::Atomic<usize>> as core::ops::drop::Drop>::drop
+         1    0.08%  core::sync::atomic::atomic_sub::<usize, usize>
+         1    0.08%  <std::sys::time::unix::Instant>::now
+         1    0.08%  <core::option::Option<tokio::runtime::time::handle::Handle>>::as_ref
+         1    0.08%  <tokio::sync::notify::Notified>::poll_notified
+         1    0.08%  <alloc::vec::Vec<libc::unix::linux_like::epoll_event>>::set_len
+         1    0.08%  <alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handle> as tokio::runtime::task::Schedule>::schedule
+         1    0.08%  syscall
+         1    0.08%  core::sync::atomic::atomic_add::<u64, u64>
