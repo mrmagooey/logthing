@@ -95,6 +95,8 @@ impl SflowListener {
         info!("sFlow UDP listener started on {}", bound_addr);
 
         let mut buf = vec![0u8; 65535];
+        let mut socket_stats = crate::net::SocketDropStats::new(&socket, "sflow");
+        let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
         loop {
             tokio::select! {
@@ -126,6 +128,9 @@ impl SflowListener {
                         }
                     }
                 }
+                _ = socket_stats_ticker.tick() => {
+                    socket_stats.poll().await;
+                }
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         info!("sFlow listener: shutdown signal received");
@@ -148,32 +153,41 @@ impl SflowListener {
         info!("sFlow UDP listener started on {}", bound_addr);
 
         let mut buf = vec![0u8; 65535];
+        let mut socket_stats = crate::net::SocketDropStats::new(&socket, "sflow");
+        let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
         loop {
-            match socket.recv_from(&mut buf).await {
-                Ok((len, src)) => {
-                    if !self.allowed_ips.is_allowed(&src) {
-                        metrics::counter!("listener_source_rejected", "protocol" => "sflow")
-                            .increment(1);
-                        debug!("Rejected sflow datagram from {} — not in allowed_ips", src);
-                        continue;
-                    }
-                    debug!("sFlow datagram from {}: {} bytes", src, len);
-                    match decode_datagram(&buf[..len], src.ip()) {
-                        Ok(samples) if samples.is_empty() => {
-                            debug!("sFlow datagram from {} produced no samples", src);
-                        }
-                        Ok(samples) => {
-                            self.handler.handle_samples(samples, src).await;
+            tokio::select! {
+                result = socket.recv_from(&mut buf) => {
+                    match result {
+                        Ok((len, src)) => {
+                            if !self.allowed_ips.is_allowed(&src) {
+                                metrics::counter!("listener_source_rejected", "protocol" => "sflow")
+                                    .increment(1);
+                                debug!("Rejected sflow datagram from {} — not in allowed_ips", src);
+                                continue;
+                            }
+                            debug!("sFlow datagram from {}: {} bytes", src, len);
+                            match decode_datagram(&buf[..len], src.ip()) {
+                                Ok(samples) if samples.is_empty() => {
+                                    debug!("sFlow datagram from {} produced no samples", src);
+                                }
+                                Ok(samples) => {
+                                    self.handler.handle_samples(samples, src).await;
+                                }
+                                Err(e) => {
+                                    metrics::counter!("sflow_decode_errors").increment(1);
+                                    warn!("sFlow decode error from {}: {}", src, e);
+                                }
+                            }
                         }
                         Err(e) => {
-                            metrics::counter!("sflow_decode_errors").increment(1);
-                            warn!("sFlow decode error from {}: {}", src, e);
+                            error!("sFlow UDP receive error: {}", e);
                         }
                     }
                 }
-                Err(e) => {
-                    error!("sFlow UDP receive error: {}", e);
+                _ = socket_stats_ticker.tick() => {
+                    socket_stats.poll().await;
                 }
             }
         }

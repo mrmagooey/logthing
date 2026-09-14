@@ -265,6 +265,8 @@ impl SyslogListener {
         let mut buf = vec![0u8; 65535];
         let handler_udp = self.handler.clone();
         let handler_tcp = self.handler.clone();
+        let mut socket_stats = crate::net::SocketDropStats::new(&udp_socket, "syslog_udp");
+        let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
         loop {
             tokio::select! {
@@ -332,6 +334,10 @@ impl SyslogListener {
                         }
                     }
                 }
+                // Socket-drop/rx-queue metrics arm (UDP socket only; TCP has no analogous kernel drop counter here)
+                _ = socket_stats_ticker.tick() => {
+                    socket_stats.poll().await;
+                }
                 // Shutdown arm
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
@@ -359,36 +365,45 @@ impl SyslogListener {
         info!("Syslog UDP listener started on {}", addr);
 
         let mut buf = vec![0u8; 65535];
+        let mut socket_stats = crate::net::SocketDropStats::new(&socket, "syslog_udp");
+        let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
         loop {
-            match socket.recv_from(&mut buf).await {
-                Ok((len, src)) => {
-                    if !self.allowed_ips.is_allowed(&src) {
-                        metrics::counter!("listener_source_rejected", "protocol" => "syslog_udp")
-                            .increment(1);
-                        debug!(
-                            "Rejected syslog_udp datagram from {} — not in allowed_ips",
-                            src
-                        );
-                        continue;
-                    }
-                    let msg = String::from_utf8_lossy(&buf[..len]);
-                    debug!("Received UDP syslog message from {}: {} bytes", src, len);
+            tokio::select! {
+                result = socket.recv_from(&mut buf) => {
+                    match result {
+                        Ok((len, src)) => {
+                            if !self.allowed_ips.is_allowed(&src) {
+                                metrics::counter!("listener_source_rejected", "protocol" => "syslog_udp")
+                                    .increment(1);
+                                debug!(
+                                    "Rejected syslog_udp datagram from {} — not in allowed_ips",
+                                    src
+                                );
+                                continue;
+                            }
+                            let msg = String::from_utf8_lossy(&buf[..len]);
+                            debug!("Received UDP syslog message from {}: {} bytes", src, len);
 
-                    metrics::counter!("syslog_messages_received").increment(1);
-                    if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
-                        self.handler.handle_message(syslog_msg, src).await;
-                    } else {
-                        metrics::counter!("syslog_parse_errors").increment(1);
-                        warn!(
-                            "Failed to parse syslog message from {}: {}",
-                            src,
-                            &msg[..100.min(msg.len())]
-                        );
+                            metrics::counter!("syslog_messages_received").increment(1);
+                            if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
+                                self.handler.handle_message(syslog_msg, src).await;
+                            } else {
+                                metrics::counter!("syslog_parse_errors").increment(1);
+                                warn!(
+                                    "Failed to parse syslog message from {}: {}",
+                                    src,
+                                    &msg[..100.min(msg.len())]
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!("UDP receive error: {}", e);
+                        }
                     }
                 }
-                Err(e) => {
-                    error!("UDP receive error: {}", e);
+                _ = socket_stats_ticker.tick() => {
+                    socket_stats.poll().await;
                 }
             }
         }
