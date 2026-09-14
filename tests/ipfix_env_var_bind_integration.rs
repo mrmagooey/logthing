@@ -58,6 +58,7 @@ async fn env_var_override_binds_ipfix_listener_on_overridden_address_and_port() 
     let listener_config = IpfixListenerConfig {
         udp_port: cfg.ipfix.udp_port,
         bind_address: cfg.ipfix.bind_address.clone(),
+        ..IpfixListenerConfig::default()
     };
     let listener = IpfixListener::new(listener_config, Arc::new(DefaultIpfixHandler));
 

@@ -864,6 +864,7 @@ mod tests {
     #[tokio::test]
     async fn start_with_shutdown_honors_configured_receive_buffer() {
         use tokio::sync::watch;
+        use tokio::time::timeout;
 
         let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let udp_port = udp_socket.local_addr().unwrap().port();
