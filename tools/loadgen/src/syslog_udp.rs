@@ -23,6 +23,7 @@ use clap::Args;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+use crate::pacing::tick_record_count;
 use tokio::time::MissedTickBehavior;
 
 #[derive(Args, Debug)]
@@ -168,17 +169,6 @@ fn build_message(n: u64, structured: bool) -> String {
             std::process::id(),
         )
     }
-}
-
-/// Advances the rate-pacing accumulator by one tick and returns how many
-/// records to send this tick. `carry` carries the fractional remainder
-/// across ticks so low target rates (e.g. 0.1 records/tick) are honored
-/// exactly over many ticks instead of being rounded away on any single tick.
-fn tick_record_count(carry: &mut f64, records_per_tick_target: f64) -> u64 {
-    *carry += records_per_tick_target;
-    let count = carry.floor() as u64;
-    *carry -= count as f64;
-    count
 }
 
 fn month_abbrev(m: u32) -> &'static str {
