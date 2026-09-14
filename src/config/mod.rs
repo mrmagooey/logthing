@@ -187,6 +187,13 @@ pub struct SyslogConfig {
     #[serde(default = "default_syslog_tcp_port")]
     pub tcp_port: u16,
 
+    /// Requested `SO_RCVBUF` size in bytes for the UDP socket. Set `0` to
+    /// leave the OS default alone — TOML cannot express `None`, so `0` is the
+    /// opt-out an operator can actually write.
+    /// TCP syslog is unaffected: `SO_RCVBUF` only applies to the UDP arm.
+    #[serde(default = "default_udp_receive_buffer_bytes")]
+    pub receive_buffer_bytes: Option<usize>,
+
     #[serde(default = "default_syslog_parse_dns")]
     pub parse_dns: bool,
 
@@ -220,6 +227,19 @@ pub struct SyslogConfig {
     pub http_token: String,
 }
 
+/// Default `SO_RCVBUF` request for every UDP listener (ipfix, sflow,
+/// syslog). `rmem_default` on a stock Linux host is 208 KiB
+/// (`net.core.rmem_default` = 212992); 4 MiB is comfortably above that.
+///
+/// The kernel clamps this to `net.core.rmem_max` for a process without
+/// `CAP_NET_ADMIN` and then doubles whatever survives the clamp for
+/// bookkeeping — see `net::bind_udp_with_recv_buffer`, which logs the
+/// requested vs. actual value at bind time so the clamp is visible rather
+/// than showing up only as unexplained kernel-queue drops.
+fn default_udp_receive_buffer_bytes() -> Option<usize> {
+    Some(4 * 1024 * 1024)
+}
+
 /// Configuration for the IPFIX / NetFlow UDP listener.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct IpfixConfig {
@@ -231,6 +251,13 @@ pub struct IpfixConfig {
 
     #[serde(default = "default_ipfix_bind_address")]
     pub bind_address: String,
+
+    /// Requested `SO_RCVBUF` size in bytes for the UDP socket. Set `0` to
+    /// leave the OS default alone — a deliberate opt-out, since a larger
+    /// buffer is kernel memory held per socket for the life of the process.
+    /// TOML cannot express `None`, so `0` is the reachable form of it.
+    #[serde(default = "default_udp_receive_buffer_bytes")]
+    pub receive_buffer_bytes: Option<usize>,
 
     /// Optional S3 persistence for IPFIX flows.
     /// Absent from TOML → `None` → no S3 persistence (backward compatible).
@@ -250,6 +277,7 @@ impl Default for IpfixConfig {
             enabled: default_ipfix_enabled(),
             udp_port: default_ipfix_udp_port(),
             bind_address: default_ipfix_bind_address(),
+            receive_buffer_bytes: default_udp_receive_buffer_bytes(),
             s3: None,
             local: None,
         }
@@ -955,6 +983,11 @@ pub struct SflowConfig {
     #[serde(default = "default_sflow_bind_address")]
     pub bind_address: String,
 
+    /// Requested `SO_RCVBUF` size in bytes for the UDP socket. `None` means
+    /// "leave the OS default alone" — see `default_udp_receive_buffer_bytes`.
+    #[serde(default = "default_udp_receive_buffer_bytes")]
+    pub receive_buffer_bytes: Option<usize>,
+
     /// Optional S3 persistence. Absent from TOML → `None` (backward compatible).
     #[serde(default)]
     pub s3: Option<SflowS3Config>,
@@ -972,6 +1005,7 @@ impl Default for SflowConfig {
             enabled: default_sflow_enabled(),
             udp_port: default_sflow_udp_port(),
             bind_address: default_sflow_bind_address(),
+            receive_buffer_bytes: default_udp_receive_buffer_bytes(),
             s3: None,
             local: None,
         }
@@ -1058,6 +1092,7 @@ impl Default for SyslogConfig {
             enabled: default_syslog_enabled(),
             udp_port: default_syslog_udp_port(),
             tcp_port: default_syslog_tcp_port(),
+            receive_buffer_bytes: default_udp_receive_buffer_bytes(),
             parse_dns: default_syslog_parse_dns(),
             parse_payloads: false,
             s3: None,
@@ -1338,6 +1373,32 @@ mod tests {
         assert!(cfg.tls.enabled);
         assert_eq!(cfg.metrics.port, 9090);
         assert!(cfg.syslog.enabled);
+    }
+
+    #[test]
+    fn udp_receive_buffer_bytes_defaults_to_4mib_when_absent() {
+        let cfg = Config::default();
+        assert_eq!(cfg.ipfix.receive_buffer_bytes, Some(4 * 1024 * 1024));
+        assert_eq!(cfg.sflow.receive_buffer_bytes, Some(4 * 1024 * 1024));
+        assert_eq!(cfg.syslog.receive_buffer_bytes, Some(4 * 1024 * 1024));
+    }
+
+    #[test]
+    fn udp_receive_buffer_bytes_overrides_from_toml() {
+        let toml_str = r#"
+[ipfix]
+receive_buffer_bytes = 1048576
+
+[sflow]
+receive_buffer_bytes = 2097152
+
+[syslog]
+receive_buffer_bytes = 0
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse config");
+        assert_eq!(cfg.ipfix.receive_buffer_bytes, Some(1_048_576));
+        assert_eq!(cfg.sflow.receive_buffer_bytes, Some(2_097_152));
+        assert_eq!(cfg.syslog.receive_buffer_bytes, Some(0));
     }
 
     #[test]

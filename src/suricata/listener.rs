@@ -40,17 +40,14 @@ pub trait SuricataHandler: Send + Sync {
     async fn handle_record(&self, record: SuricataRecord, source: SocketAddr);
 }
 
-/// Default handler: logs a summary and increments metrics.
+/// Default handler: logs a summary. Installed only when no forwarding
+/// destination is configured; the ingest counters live in the listener's
+/// parse loop so they fire for every handler.
 pub struct DefaultSuricataHandler;
 
 #[async_trait::async_trait]
 impl SuricataHandler for DefaultSuricataHandler {
     async fn handle_record(&self, record: SuricataRecord, source: SocketAddr) {
-        metrics::counter!("suricata_records_received").increment(1);
-        metrics::counter!("suricata_records_by_event_type",
-            "event_type" => record.event_type.clone()
-        )
-        .increment(1);
         info!(
             "[{}] suricata record: event_type={} fields={}",
             source,
@@ -274,6 +271,15 @@ impl SuricataListener {
             if parsed.event_type_was_missing {
                 metrics::counter!("suricata_missing_event_type").increment(1);
             }
+            // Counted here, not in a handler impl: every handler
+            // (DefaultSuricataHandler, MultiSuricataHandler, ...) routes
+            // through this one point, so the metric is emitted regardless of
+            // which forwarding destinations are configured.
+            metrics::counter!("suricata_records_received").increment(1);
+            metrics::counter!("suricata_records_by_event_type",
+                "event_type" => crate::suricata::schema::metric_event_type(&parsed.record.event_type)
+            )
+            .increment(1);
             handler.handle_record(parsed.record, src).await;
         }
         Ok(())
@@ -725,6 +731,87 @@ mod tests {
              counted. Got 1 => the condition is inverted; got 0 => the \
              increment was dropped."
         );
+    }
+
+    // -- Metrics: received counters fire for every handler --
+
+    /// Regression: `suricata_records_received` / `suricata_records_by_event_type`
+    /// used to be incremented inside `DefaultSuricataHandler`, which `main.rs`
+    /// only installs when NO forwarding destination is configured. Any real
+    /// deployment wires a forwarding handler instead, so the counters never
+    /// fired and never appeared on `/metrics`. They now live in the
+    /// connection parse path, so they must be emitted with a non-default
+    /// handler.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn received_counters_fire_with_a_non_default_handler() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // Thread-local recorder: `handle_tcp_connection` is awaited inline below
+        // (not spawned), so it runs on this thread and sees it.
+        let _guard = set_default_local_recorder(&recorder);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Write both lines and close the write half first; the payload is tiny
+        // enough to sit in the socket buffer until the reader drains it.
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(
+                    b"{\"event_type\":\"alert\",\"src_ip\":\"1.2.3.4\"}\n\
+                      {\"event_type\":\"flow\",\"src_ip\":\"5.6.7.8\"}\n",
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let (stream, src) = listener.accept().await.unwrap();
+        let handler = CapturingHandler::new();
+        SuricataListener::handle_tcp_connection(stream, src, handler.clone())
+            .await
+            .unwrap();
+        client.await.unwrap();
+
+        assert_eq!(handler.take_records().len(), 2, "both records parsed");
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let read = |key: CompositeKey| {
+            map.get(&key)
+                .map(|(_, _, v)| match v {
+                    DebugValue::Counter(c) => *c,
+                    _ => 0,
+                })
+                .unwrap_or(0)
+        };
+
+        assert_eq!(
+            read(CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("suricata_records_received"),
+            )),
+            2,
+            "suricata_records_received must count every parsed record"
+        );
+        for event_type in ["alert", "flow"] {
+            assert_eq!(
+                read(CompositeKey::new(
+                    MetricKind::Counter,
+                    metrics::Key::from_parts(
+                        "suricata_records_by_event_type",
+                        vec![metrics::Label::new("event_type", event_type)],
+                    ),
+                )),
+                1,
+                "suricata_records_by_event_type{{event_type=\"{event_type}\"}} must be emitted"
+            );
+        }
     }
 
     /// A source inside `allowed_ips` reaches the handler as normal.

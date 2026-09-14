@@ -66,6 +66,9 @@ anyhow = "1.0"
 
 # IP/network utilities
 ipnet = "2.9"
+# SO_RCVBUF get/set on UDP listener sockets — already an indirect dependency
+# via tokio, pinned to the same 0.6 line so this doesn't add a second version.
+socket2 = "0.6"
 
 # Utilities
 uuid = { version = "1.7", features = ["v4", "serde"] }
@@ -197,6 +200,18 @@ harness = false
 
 [[bench]]
 name = "zeek_schema_encode"
+harness = false
+
+[[bench]]
+name = "wef_parse_recv_path"
+harness = false
+
+[[bench]]
+name = "otlp_map_request"
+harness = false
+
+[[bench]]
+name = "structured_syslog_to_record_batch"
 harness = false
 
 [profile.profiling]

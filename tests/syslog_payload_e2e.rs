@@ -70,6 +70,7 @@ async fn cef_datagram_produces_structured_record_with_cef_payload_type() {
         tcp_port, // verified-free ephemeral port; not exercised here
         bind_address: "127.0.0.1".to_string(),
         parse_dns_logs: false,
+        ..SyslogListenerConfig::default()
     };
 
     let listener = SyslogListener::new(cfg, handler);
@@ -164,6 +165,7 @@ async fn no_pri_cef_datagram_produces_structured_record_with_cef_payload_type() 
         tcp_port,
         bind_address: "127.0.0.1".to_string(),
         parse_dns_logs: false,
+        ..SyslogListenerConfig::default()
     };
 
     let listener = SyslogListener::new(cfg, handler);
@@ -222,6 +224,7 @@ async fn no_pri_cef_datagram_with_trailing_newline_produces_structured_record_wi
         tcp_port,
         bind_address: "127.0.0.1".to_string(),
         parse_dns_logs: false,
+        ..SyslogListenerConfig::default()
     };
 
     let listener = SyslogListener::new(cfg, handler);
@@ -277,6 +280,7 @@ async fn non_matching_datagram_produces_no_structured_record() {
         tcp_port,
         bind_address: "127.0.0.1".to_string(),
         parse_dns_logs: false,
+        ..SyslogListenerConfig::default()
     };
     let listener = SyslogListener::new(cfg, handler);
     let task = tokio::spawn(async move {
