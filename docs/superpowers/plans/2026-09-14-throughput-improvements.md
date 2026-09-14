@@ -48,6 +48,29 @@ Full detail in `docs/performance/2026-09-14-ipfix-recv-path-cpu-profile.md` and 
 
 ---
 
+> **⚠️ Amended 2026-09-14 after coherence review — read before running any acceptance measurement.**
+>
+> As originally written, the acceptance measurement ran only the default
+> `DefaultIpfixHandler` shape. **That gate could not fail.** Tier 1's
+> per-datagram allocation is only dangerous under a *real* handler (Run B:
+> allocator 39.44% of self-time; the trivial shape is 4.16%), and the
+> `parquet_s3_dropped` guard against relocating the drop downstream is never
+> emitted by `DefaultIpfixHandler` at all — so both the risk and its guard
+> were absent from the only run being measured.
+>
+> **Every tier's acceptance measurement now requires BOTH handler shapes**,
+> N≥5 runs each, before and after:
+> 1. trivial (`DefaultIpfixHandler`) — median loss down ≥50% relative, ranges non-overlapping;
+> 2. real (`[ipfix.local]`, local disk, no external service) — the same bar, **and**
+>    `parquet_s3_dropped{source="ipfix"}` not up >10% relative.
+>
+> A tier passes only if both clear the bar. This preserves three distinct
+> verdicts — helped, blocked (helped trivial but hurt real), and no measurable
+> difference — where one shape collapses them into a pass.
+>
+> Task 0.1's harness must therefore support both shapes (temp config, cleanup
+> between them). See `docs/superpowers/specs/2026-09-14-recv-decode-decouple-design.md`.
+
 ## Ranked proposals (summary)
 
 **0. Expose the socket's own drop counter and queue depth (Task 0.0) — do first.**
