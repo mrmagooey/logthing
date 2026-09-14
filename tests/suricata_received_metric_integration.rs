@@ -63,8 +63,7 @@ fn metric_value(rendered: &str, prefix: &str) -> Option<f64> {
 }
 
 #[tokio::test]
-async fn suricata_records_received_and_by_event_type_survive_the_real_accept_and_forwarding_path()
- {
+async fn suricata_records_received_and_by_event_type_survive_the_real_accept_and_forwarding_path() {
     // --- Install the real Prometheus recorder globally, exactly as
     // `start_metrics_server` in src/server/mod.rs does for the production
     // `/metrics` endpoint. Must happen exactly once per process; see the
@@ -161,7 +160,11 @@ async fn suricata_records_received_and_by_event_type_survive_the_real_accept_and
         .to_string()
     };
 
-    for line in [alert_line("ET TEST ONE"), alert_line("ET TEST TWO"), flow_line()] {
+    for line in [
+        alert_line("ET TEST ONE"),
+        alert_line("ET TEST TWO"),
+        flow_line(),
+    ] {
         stream
             .write_all(format!("{line}\n").as_bytes())
             .await

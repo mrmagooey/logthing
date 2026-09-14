@@ -185,14 +185,21 @@ async fn suricata_records_received_visible_on_real_metrics_endpoint_with_forward
     // --- Send real EVE JSON lines over the real TCP connection ---
     // 2x alert, 1x flow — distinct event_type values to verify per-type label
     // breakdown, not just the aggregate counter.
-    let lines = [alert_line("ET TEST ONE"), alert_line("ET TEST TWO"), flow_line()];
+    let lines = [
+        alert_line("ET TEST ONE"),
+        alert_line("ET TEST TWO"),
+        flow_line(),
+    ];
     for line in &lines {
         suricata_stream
             .write_all(format!("{line}\n").as_bytes())
             .await
             .expect("write suricata EVE JSON line");
     }
-    suricata_stream.shutdown().await.expect("shutdown write half");
+    suricata_stream
+        .shutdown()
+        .await
+        .expect("shutdown write half");
     drop(suricata_stream);
 
     // --- Scrape the real /metrics endpoint over real HTTP until the counter appears ---
@@ -243,16 +250,14 @@ async fn suricata_records_received_visible_on_real_metrics_endpoint_with_forward
              from /metrics body despite a forwarding handler being installed:\n{body}"
         )
     });
-    let flow_count = find_metric_value(
-        &body,
-        "suricata_records_by_event_type{event_type=\"flow\"}",
-    )
-    .unwrap_or_else(|| {
-        panic!(
-            "regression: suricata_records_by_event_type{{event_type=\"flow\"}} missing \
+    let flow_count =
+        find_metric_value(&body, "suricata_records_by_event_type{event_type=\"flow\"}")
+            .unwrap_or_else(|| {
+                panic!(
+                    "regression: suricata_records_by_event_type{{event_type=\"flow\"}} missing \
              from /metrics body despite a forwarding handler being installed:\n{body}"
-        )
-    });
+                )
+            });
     assert_eq!(
         alert_count, 2.0,
         "expected 2 alert records counted by event_type; full body:\n{body}"
