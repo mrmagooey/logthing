@@ -4,7 +4,7 @@
 
 **Goal:** Close the items deferred by `2026-09-13-ingestion-perf-test-coverage.md`, fixing the two real defects first and adding measurement only where something is genuinely unmeasured.
 
-**Architecture:** Four tiers, executable independently and in priority order. Tier 1 is production defects. Tier 2 is the one change that would actually improve throughput rather than measure it. Tier 3 closes the last real measurement gaps. Tier 4 is more load generators, and is the first thing to cut.
+**Architecture:** Four tiers, executable independently and in priority order. Tier 1 is production defects. Tier 2 is the only change here that could improve throughput rather than measure it — whether it does is the task's question, not its premise. Tier 3 closes the last real measurement gaps. Tier 4 is more load generators, and is the first thing to cut.
 
 **Spec:** The "Explicitly deferred" table in `docs/superpowers/plans/2026-09-13-ingestion-perf-test-coverage.md`, plus residuals surfaced while executing it (recorded in `docs/performance/2026-09-13-multiformat-load-results.md`).
 
@@ -26,7 +26,7 @@ Verified 2026-09-13 at `master` `fdfe806`. Do not re-derive:
 
 1. **`suricata_records_received` and `suricata_records_by_event_type` are dead in production** (`src/suricata/listener.rs:49-50`). They live in `DefaultSuricataHandler`, which `main.rs` installs only when zero forwarding destinations are configured. Identical to the zeek defect fixed in v0.18.0. Suricata is the last protocol with this shape.
 2. **`scripts/run-with-profiling.sh` is provably rotted** — 9 references to `LOGTHING__FORWARDING__DESTINATIONS__0__*`, a config shape that no longer exists (`src/config/mod.rs` mentions "destinations" only in an unrelated doc comment).
-3. **`SO_RCVBUF` is never set on any listener socket.** Phase 2 measured 13.5% IPFIX loss in the kernel receive queue at 5,000/s with `rmem_default` = 208 KiB. This is the only finding from the whole exercise that would improve throughput rather than describe it.
+3. **`SO_RCVBUF` is never set on any listener socket.** Phase 2 measured 13.5% IPFIX loss in the kernel receive queue at 5,000/s with `rmem_default` = 208 KiB. Measured on this host 2026-09-13: uid 1000, no `CAP_NET_ADMIN`, so a 4 MiB request clamps — but still yields an actual buffer of **425984 vs the 212992 default**, a 2x gain with no sysctl change. Whether that translates into less loss is Tier 2's question.
 4. **Two parse paths are genuinely unmeasured**: `WefParser::parse_event` (`src/parser/mod.rs:201`, `pub`) and `map_otlp_request` (`src/server/otlp.rs:26`, `pub`). Both are `pub`, so both are benchable without extraction.
 5. **`StructuredSyslogSink::to_record_batch`** (`src/forwarding/structured_syslog_s3.rs:137`) is the only sink with zero encode coverage.
 6. **`loadgen` has 3 of 7 subcommands.** Suricata is the cheapest remaining — identical TCP NDJSON shape to `zeek-tcp`.
@@ -60,9 +60,42 @@ It must: start a real `SuricataListener` with a **non-default** handler (suricat
 
 In `src/suricata/listener.rs`, delete both `metrics::counter!` calls from `DefaultSuricataHandler::handle_record` and emit them in `handle_tcp_connection` immediately before `handler.handle_record(parsed.record, src).await`, next to the existing `suricata_missing_event_type` increment.
 
-**Bound the label.** `event_type` is wire-supplied and unbounded, exactly like zeek's `_path`. Zeek solved this with `zeek::schema::metric_log_path`, which maps to the schema registry's `&'static str` keys or `"other"`. Suricata has only one schema (`envelope_schema`), so there is no registry to draw from — **use a fixed allowlist of the EVE event types the codebase already knows about**, everything else to `"other"`. Grep `src/suricata/` and `tests/` for which `event_type` values appear; `alert`, `flow`, `dns`, `http`, `tls`, `fileinfo` are the likely set. Put the function next to the schema code and unit-test it with a 16 KiB hostile input, as `zeek::schema::metric_log_path` is tested.
+**Bound the label.** `event_type` is wire-supplied and unbounded, exactly like zeek's `_path`. Zeek solved this with `zeek::schema::metric_log_path`, mapping to the schema registry's `&'static str` keys or `"other"`. Suricata has one schema (`envelope_schema`) and therefore no registry to derive from, so the allowlist is written out explicitly:
+
+```rust
+/// Suricata's EVE `event_type` values, as a closed set. The wire value is
+/// unbounded in length and charset, so it must never reach a Prometheus label
+/// raw — see `zeek::schema::metric_log_path` for the same problem solved
+/// against a registry.
+///
+/// Hand-maintained, and that is a real difference from zeek's version, which
+/// self-updates when a schema is added. Adding a new EVE type here is a
+/// deliberate act; until it is added it reports as "other".
+const EVE_EVENT_TYPES: &[&str] = &[
+    "alert", "anomaly", "drop", "dns", "http", "tls", "ssh", "smtp", "ftp",
+    "smb", "dhcp", "krb5", "flow", "netflow", "fileinfo", "stats",
+];
+
+pub fn metric_event_type(event_type: &str) -> &'static str {
+    EVE_EVENT_TYPES
+        .iter()
+        .find(|known| **known == event_type)
+        .copied()
+        .unwrap_or("other")
+}
+```
+
+**Do NOT derive this list by grepping the codebase.** Only `alert`, `anomaly`, `dns`, `flow`, `stats` and `unknown` appear in `src/suricata/` and `tests/` today — `http`, `tls` and `ssh` appear nowhere, yet they are among the highest-volume types in real deployments. A grep-derived list would silently collapse them into `"other"` and destroy exactly the visibility this metric exists to give.
+
+Unit-test it as `zeek::schema::metric_log_path` is tested: every listed type maps to itself, and hostile inputs (a 16 KiB string, an embedded NUL, empty) all map to `"other"`.
 
 - [ ] **Step 4: Confirm the test now passes**, plus `cargo test --lib suricata::` and `cargo test --test suricata_local_integration`.
+
+- [ ] **Step 4b: Add the unit-level test.** The zeek fix shipped at three levels and this must match — the standing project policy requires unit, integration and e2e for new behaviour. Add a suricata analogue of `received_counters_fire_with_a_non_default_handler` (`src/zeek/listener.rs:428`) to `src/suricata/listener.rs`'s test module: a `DebuggingRecorder` with `set_default_local_recorder`, driving `handle_tcp_connection` inline over a real socket with `CapturingHandler` (NOT `DefaultSuricataHandler` — that is the whole point), asserting `suricata_records_received` and the labelled `suricata_records_by_event_type`.
+
+- [ ] **Step 4c: Add the e2e test.** Create `tests/suricata_received_metric_e2e.rs`, mirroring `tests/zeek_received_metric_e2e.rs`: a real `Server` with `metrics.enabled = true`, a real `SuricataListener` with a real forwarding handler, EVE JSON over a real TCP connection, then scrape the production `/metrics` HTTP endpoint. One `#[tokio::test]` per binary — `Server::run` calls `metrics::set_global_recorder`, which panics on a second call.
+
+**Prove all three guard the bug**: revert the Step 3 move (counters back in `DefaultSuricataHandler`), confirm each of the three fails, restore. Commit before doing this — reverting a mutation with `git checkout` discards uncommitted work.
 
 - [ ] **Step 5: Update `DefaultSuricataHandler`'s doc comment**, which will claim it "increments metrics" and no longer will.
 
@@ -78,7 +111,7 @@ In `src/suricata/listener.rs`, delete both `metrics::counter!` calls from `Defau
 
 ---
 
-## Tier 2 — The one change that improves throughput
+## Tier 2 — The only change here that could improve throughput
 
 Branch: `perf/so-rcvbuf`.
 
@@ -98,7 +131,9 @@ Phase 2 measured 13.5% IPFIX loss in the kernel queue at only 5,000/s. `rmem_def
 
 - [ ] **Step 5: Verify it actually helps.** Re-run the Phase 2 IPFIX measurement (`docs/performance/2026-09-13-multiformat-load-results.md` §6 has the exact commands) before and after, at 5,000/s and 20,000/s. Record kernel loss both ways.
 
-**If loss does not improve, say so and do not claim it did.** The host's `rmem_max` is 212992, so an unprivileged process may be clamped straight back to where it started — in which case the finding is "this needs a sysctl the container does not have", which is still a useful, publishable result.
+**The clamp behaviour here is already measured — do not re-derive it, and do not assume it means failure.** On this host (uid 1000, no `CAP_NET_ADMIN` in the effective set, `rmem_max` = `rmem_default` = 212992), requesting 4 MiB yields an actual `SO_RCVBUF` of **425984**: the kernel clamps the request to `rmem_max` and then doubles it for bookkeeping. So the buffer still **doubles** versus the 212992 default, unprivileged, with no sysctl change.
+
+That means the expected outcome is a real but bounded improvement, not nothing. Report the measured kernel-loss delta whatever it is. **If loss does not improve despite the buffer doubling, say so plainly** — that would mean the loss is driven by recv-task scheduling rather than buffer depth, which is a more interesting finding than the one this task set out to confirm.
 
 - [ ] **Step 6: Commit, and update the results doc** with the before/after, including a clamp caveat if one applied.
 
@@ -158,6 +193,8 @@ Branch: `perf/loadgen-suricata`.
 **Files:** `tools/loadgen/src/suricata_tcp.rs` (create), `tools/loadgen/src/main.rs` (modify)
 
 The cheapest remaining format: identical TCP NDJSON transport to `zeek-tcp`.
+
+**On why this is included at all**, given the plan lists Tier 4 as first to cut: it exercises Task 1's fix against real sustained wire traffic, which the committed tests do not. That is incidental validation, **not** a substitute for Task 1's own three-level coverage — its smoke check is a manual one-off, not a CI-run regression test. If effort runs short, cut this and lose nothing that Task 1 Steps 1-4c do not already guard.
 
 - [ ] **Read `tools/loadgen/src/zeek_tcp.rs` first and mirror it.** Same arg names, same one-held-connection, same abort-on-write-error (never reconnect — a silent reconnect hides the server-side backpressure the generator exists to measure), same inline `async {}` block for partial-count reporting, same `crate::pacing` use.
 - [ ] `--event-type` (default `alert`) in place of zeek's `--log-path`.
