@@ -54,11 +54,17 @@ Both generators offered **the same rate for the same duration** — 5,000/s for
 
 **TCP loses nothing; UDP loses 13.5% before logthing executes a single line of
 code.** The `ipfix_datagrams_received` counter increments on entry to
-`decode_datagram`, so `offered − datagrams_received` is by construction loss in
-the kernel receive queue, not in the application. With `rmem_default` at 208 KiB
-and no `SO_RCVBUF` tuning, that is the expected result, and it is consistent
-with `docs/performance/2026-07-25-syslog-udp-cpu-profile.md`'s conclusion that
-the bottleneck sits upstream of the writer.
+`decode_datagram`, so `offered − datagrams_received` is by construction loss
+before the application sees the datagram.
+
+> **⚠️ Correction, 2026-09-14.** This section originally went on to attribute
+> that loss to `rmem_default` being 208 KiB with no `SO_RCVBUF` tuning — i.e.
+> to the buffer being too small. **That attribution was wrong**, and §7 and §8
+> below record the evidence that overturned it. The loss *site* is confirmed
+> (the receiver's socket buffer), but buffer size is not the *cause*: raising
+> `SO_RCVBUF` to double the actual buffer produced no improvement at 5,000/s.
+> The constraint is the consumer's drain rate. Read §8 before acting on
+> anything in this section.
 
 **`ipfix_templates_missing` is 0 at every rate tested.** That matters: a missing
 template silently discards the data set, which would have looked identical to a
@@ -115,17 +121,25 @@ Do not average them or treat either as *the* number. Kernel-queue loss depends
 on scheduling luck between the sending and receiving processes, which on this
 host share 12 vCPUs; it is not a deterministic property of the server. The
 honest summary is "10-14% at 5,000/s on this host, varying run to run." Anyone
-wanting a stable figure needs a quiet host, a tuned `rmem`, and repeated runs
-with a reported spread — none of which this environment provides.
+wanting a stable figure needs a quiet host, the generator off-box, and repeated
+runs with a reported spread — none of which this environment provides. (Note
+this paragraph's "scheduling luck" reading held up: §8 confirms the binding
+constraint is the recv task's drain rate, not buffer depth.)
 
 ## 3. What to do with this
 
-**The actionable finding is `rmem`, not code.** Before anyone optimises the
-IPFIX or sFlow decode path on the strength of these numbers, note that
-`2026-09-13-criterion-baseline-0.18.0.md` measures that decode at **308 ns per
-datagram** — roughly 0.3% of a 100 µs/datagram budget at 10k/s. The records lost
-here were never decoded at all. Raising `net.core.rmem_max` and setting
-`SO_RCVBUF` on the listener sockets is the lever; the decoder is not.
+**The decoder is not the lever.** `2026-09-13-criterion-baseline-0.18.0.md`
+measures IPFIX decode at **308 ns per datagram** — 0.6% of the per-datagram
+budget at the observed rate. The records lost here were never decoded at all.
+Do not open a decoder optimisation on the strength of these numbers.
+
+> **⚠️ Corrected 2026-09-14.** This section previously said the lever was
+> `rmem` — "raising `net.core.rmem_max` and setting `SO_RCVBUF` on the listener
+> sockets". **That was wrong.** §7 raised the actual buffer from 212992 to
+> 425984 and measured no improvement at 5,000/s. §8 shows why: the receiver's
+> socket buffer is where the loss *happens*, but the binding constraint is the
+> rate the recv task drains it. Enlarging a buffer whose consumer is too slow
+> only delays the overflow. Read §8 before acting here.
 
 **A useful invariant fell out of this run:** `offered − datagrams_received` is
 kernel loss, and `parquet_s3_dropped` is writer-channel loss. They are
@@ -264,3 +278,70 @@ noise — do not read this task as having proven the fix's value at 5,000/s,
 only that it's wired up correctly and shows a suggestive-but-unconfirmed win
 at 20,000/s. Do not raise `rmem_max` on the host to chase a cleaner number;
 that changes what is being measured.
+
+## 8. Root cause: where the loss happens, and why
+
+Established 2026-09-14 by counter reconciliation on a controlled loopback run
+(IPFIX, 20,000/s, 15 s) — loopback deliberately, to remove the docker bridge
+and the NIC from the picture entirely:
+
+| | count |
+|---|---|
+| generator reported sending | 299,977 |
+| application saw (`ipfix_datagrams_received`) | 277,571 |
+| **loss** | **22,406** |
+| `RcvbufErrors` delta (`/proc/net/snmp`) | **22,407** |
+| `SndbufErrors` delta | **0** |
+
+The loss and `RcvbufErrors` reconcile to within one datagram — the template
+datagram, which is sent once and counted separately. So:
+
+**The loss site is the receiver's socket buffer. Definitively.** Three
+hypotheses die here:
+
+- **Not the sender.** `SndbufErrors` is 0; the sending kernel never failed to
+  buffer. Note that the generator's `sent` count is successful `send()`
+  syscall returns, so this had to be checked rather than assumed.
+- **Not the network fabric.** This was loopback.
+- **Not decode.** `decode_datagram` costs 308 ns (see the criterion baseline) —
+  0.6% of the per-datagram budget at the observed rate.
+
+**But buffer size is not the cause.** §7's before/after study raised the actual
+buffer from 212992 to 425984 and found *no* improvement at 5,000/s. A buffer
+only overflows if the consumer is persistently slower than the producer; a
+larger one then merely delays the overflow.
+
+**The consumer is the constraint.** That run sustained 277,571 datagrams in
+15 s ≈ **18.5k/s** against 20k offered — roughly **54 µs per datagram**, of
+which decode is 0.3 µs. **~99% of the per-datagram budget is something other
+than parsing.** That echoes `2026-07-25-syslog-udp-cpu-profile.md`, which
+could not attribute ~85% of its own per-datagram figure either.
+
+Two candidate explanations remain, and this measurement does not separate them:
+
+1. **Per-datagram overhead outside the decoder** — syscalls, tokio scheduling,
+   futex contention, logging macros, the allowed-IPs check.
+2. **Recv/handler coupling.** `src/ipfix/listener.rs`'s loop calls
+   `self.handler.handle_flows(flows, src).await` *inline on the recv task*.
+   While that await is pending nothing calls `recv_from`, so the socket has no
+   consumer at all — receive capacity is coupled to downstream latency, and UDP
+   answers by dropping. This is exactly why zeek over TCP loses nothing at the
+   same offered rate: TCP backpressures the sender instead.
+
+Against (2) on its own: the run above used a trivial handler and still lost
+3-4% at 5,000/s, far below the ceiling — that residual looks like scheduling
+jitter (generator and server share 12 vCPUs on this host), not saturation.
+
+**Do not "fix" this by raising `rmem_max`.** That enlarges the buffer whose
+size has already been shown not to be the binding constraint.
+
+### Reproducing the attribution
+
+```bash
+udp() { awk '/^Udp:/{if(++n==2){print $2,$4,$6,$7}}' /proc/net/snmp; }  # In InErr Rcvbuf Sndbuf
+LOGTHING__IPFIX__ENABLED=true LOGTHING__SYSLOG__ENABLED=false ./target/release/logthing &
+udp   # before
+./target/release/loadgen ipfix-udp --host 127.0.0.1 --port 4739     --target-rate 20000 --duration-secs 15
+udp   # after
+wget -qO- http://127.0.0.1:9090/metrics | grep ipfix_datagrams_received
+```
