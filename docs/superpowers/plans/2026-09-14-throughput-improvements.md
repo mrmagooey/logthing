@@ -50,6 +50,14 @@ Full detail in `docs/performance/2026-09-14-ipfix-recv-path-cpu-profile.md` and 
 
 ## Ranked proposals (summary)
 
+**0. Expose the socket's own drop counter and queue depth (Task 0.0) — do first.**
+Not a throughput change at all: it makes the loss *visible from inside the
+process*. 100% of measured loss happens in the receive socket buffer and nothing
+in logthing counts it; every number in the profile doc was reconstructed by
+hand-diffing `/proc/net/snmp`. This is also the acceptance instrument for every
+tier below, so it lands before anything it would measure.
+
+
 | Rank | Proposal | Site addressed | Mechanism | Confidence | Tier |
 |---|---|---|---|---|---|
 | 1 | Decouple `recv_from` from decode+dispatch (bounded channel, single consumer) | Kernel `RcvbufErrors` | Recv task no longer blocked behind decode/handler; `recv_from` calls run back-to-back | High — directly targets finding #4 | 1 |
@@ -69,6 +77,86 @@ Full detail in `docs/performance/2026-09-14-ipfix-recv-path-cpu-profile.md` and 
 ## Tier 0 — Repeatable measurement harness
 
 Branch: none (infra used by every later tier; land it on `master` via its own small PR before Tier 1 starts, or as Tier 1's first commit if a separate PR is overhead the maintainer doesn't want).
+
+### Task 0.0: Expose the socket's own drop counter and queue depth
+
+**Do this first — it is the acceptance instrument for every other tier, and it
+is the single most valuable thing in this plan independent of any tier landing.**
+
+**Files:** `src/net.rs` (extend), `src/ipfix/listener.rs`, `src/sflow/listener.rs`, `src/syslog/listener.rs`
+
+**The gap.** 100% of measured loss happens in the receiver's socket buffer, and
+the process is blind to it. `<proto>_datagrams_received` counts what arrived;
+**nothing counts what did not**. Every figure in
+`docs/performance/2026-09-14-ipfix-recv-path-cpu-profile.md` was reconstructed
+by hand-diffing `/proc/net/snmp`, which is process-wide (it includes unrelated
+sockets) and unavailable to an operator in production. Meanwhile the writer
+channel — where ~0% of the loss occurred — already has four gauges you can
+watch fill (`parquet_s3_channel_available`, `_queued`, `_buffer_rows`,
+`_flushes_in_flight`). That asymmetry is backwards.
+
+**Add two metrics per UDP listener**, both read from the one `/proc/net/udp`
+line belonging to that listener's own socket:
+
+| metric | type | meaning |
+|---|---|---|
+| `<proto>_socket_drops` | counter | the `drops` column — datagrams the kernel discarded for this socket. **This is the loss.** |
+| `<proto>_socket_rx_queue_bytes` | gauge | the `rx_queue` column — current backlog, so the buffer filling is visible *before* it overflows |
+
+`<proto>` ∈ `ipfix`, `sflow`, `syslog_udp`, matching the existing
+`listener_source_rejected{protocol}` naming.
+
+- [ ] **Step 1: Confirm the columns are readable for our own socket.** They are —
+      verified 2026-09-14. Find the socket's local port via `UdpSocket::local_addr()`,
+      match the hex `local_address` field in `/proc/net/udp`, read `rx_queue`
+      (second half of the `tx_queue:rx_queue` field) and the final `drops` column.
+      Handle IPv6 by also checking `/proc/net/udp6`; a socket bound to `[::]` will
+      not appear in `/proc/net/udp` at all.
+
+- [ ] **Step 2: Drive it from a timer, never from the hot path.** Reuse the
+      pattern at `src/forwarding/buffered_writer.rs:697` — `CHANNEL_GAUGE_INTERVAL`
+      is 1 s and its comment is explicit that this is "one timer wakeup per second
+      per writer, with **no per-record cost** in the drain loop". Do the same: one
+      `/proc` read per second per listener, zero per-datagram cost.
+
+      **This constraint is load-bearing, not stylistic.** `src/forwarding/drop_log.rs`
+      records that per-drop *logging* on the recv path cost ~21% of throughput at
+      50k/s. Instrumentation that samples the hot path per datagram would be the
+      same mistake in different packaging — and this plan exists because of a
+      measurement, so it must not perturb the thing it measures.
+
+- [ ] **Step 3: `drops` is monotonic per socket; the metric must be too.**
+      `/proc` reports an absolute value, `metrics::counter!` wants an increment.
+      Track the previous reading and emit the delta. Handle the socket being
+      rebound or the value going backwards (treat a decrease as a reset, emit 0,
+      do not emit a huge bogus delta).
+
+- [ ] **Step 4: Tests at all three levels.**
+      - *Unit*: parse a known `/proc/net/udp` line (inline fixture, real format)
+        and assert the extracted `rx_queue`/`drops`. Include a line for a
+        *different* port to prove the port match is doing its job — reading
+        another process's socket would be a silent wrong answer, far worse than
+        no metric.
+      - *Integration*: bind a real socket, flood it without reading until the
+        kernel drops, assert `<proto>_socket_drops` goes non-zero. This is the
+        test that proves the metric measures what its name claims.
+      - *E2E*: scrape `/metrics` from a real server and assert both series are
+        present and correctly labelled.
+
+- [ ] **Step 5: Validate against the established figure.** Re-run §8's loopback
+      reproduction. `ipfix_socket_drops` must reconcile with
+      `offered − ipfix_datagrams_received` and with the `/proc/net/snmp`
+      `RcvbufErrors` delta — all three within a datagram or two, as every prior
+      run has. **If they disagree, the metric is wrong; do not ship it and do not
+      adjust the expected number to match.**
+
+- [ ] **Step 6: Commit**, explicit paths.
+
+**Consequence for the rest of the plan:** every later tier's acceptance
+measurement should read `<proto>_socket_drops` from `/metrics` rather than
+diffing `/proc/net/snmp`. Keep the `/proc` cross-check in Task 0.1's harness as
+an independent second opinion — but the primary number now comes from the
+process itself.
 
 ### Task 0.1: Script the N-repeat loopback reproduction and commit its baseline
 
