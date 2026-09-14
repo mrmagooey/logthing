@@ -97,7 +97,7 @@ pub async fn run(args: SyslogUdpArgs) -> anyhow::Result<()> {
         // faster than practical per-record timer resolution would allow,
         // batching multiple sends per tick instead of chasing unrealistic
         // per-record timer precision.
-        let per_tick_interval = Duration::from_micros(1000);
+        let per_tick_interval = crate::pacing::TICK;
         let records_per_tick_target = args.target_rate as f64 * per_tick_interval.as_secs_f64();
         let mut ticker = tokio::time::interval(per_tick_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
