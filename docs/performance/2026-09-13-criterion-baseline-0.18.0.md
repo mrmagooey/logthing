@@ -40,6 +40,23 @@ this machine is "a VM, and we cannot see more than that."
 
 All figures below are the **median** of criterion's 100-sample estimate.
 
+## Provenance — second run (WEF parse, OTLP mapping, structured syslog)
+
+Same VM, same hardware disclosure above — the machine is a QEMU/KVM guest with
+no `cpufreq`, 12 vCPUs, 61 GiB RAM, kernel `6.12.94+deb13-amd64`. This run adds
+the three benches that closed Tier 3 of
+`docs/superpowers/plans/2026-09-13-perf-deferred-items.md`; everything else in
+this document is unchanged from the first provenance block above.
+
+| | |
+|---|---|
+| Crate version | 0.18.0 |
+| Git commit | `a68b4986f2db00b6415787e4423ca4e811d8e311` (branch `perf/deferred-items`, via `t3/baseline-numbers`) |
+| Date | 2026-09-13 (same calendar date as the first run, different commit/session) |
+| Toolchain | `rustc 1.98.1 (48a229cea 2026-09-01)` |
+| Command | `cargo bench --bench wef_parse_recv_path`, `cargo bench --bench otlp_map_request`, `cargo bench --bench structured_syslog_to_record_batch` (run individually, not as part of a full `cargo bench`) |
+| Criterion settings | defaults — 100 samples, 3 s warm-up, 5 s measurement. Same as the first run. |
+
 ---
 
 ## 1. Receive path — bytes off the wire → in-memory record
@@ -67,14 +84,20 @@ Before this release, this layer had **exactly one bench in the entire repo**
 | | `payload::dispatch`, all-miss | 1.22 µs | pre-existing |
 | | `payload::dispatch`, CEF hit | 2.95 µs | pre-existing |
 | | combined recv path | 8.03 µs | pre-existing |
+| **WEF** (XML event field extraction) | `logon_4624`, 5 configured fields | **104.48 µs** | new, measured 2026-09-13 (second run) — see anomaly note in §3 |
+| | `failed_logon_4625`, 6 configured fields | 112.26 µs | new, measured 2026-09-13 (second run) |
+| | `no_parser_9999`, unregistered event id (miss path) | 55.13 ns | new, measured 2026-09-13 (second run) — hash-map miss only, no field extraction runs |
+| **OTLP** (protobuf → `GenericRecord`) | single-record request | 5.14 µs | new, measured 2026-09-13 (second run) |
+| | 100-record batch, total | 359.14 µs (3.59 µs/record) | new, measured 2026-09-13 (second run) — see batching note in §3 |
 
 ### Still not covered at this layer
 
-Listed so the gap stays visible rather than silently absent: **syslog TCP**,
-**syslog HTTP** (`POST /syslog`), **HEC** (HTTP body → `GenericRecord`), **WEF**
-(XML event parse), **OTLP** (protobuf request mapping). WEF and OTLP are the
-two worth doing next — both are genuinely unmeasured parse work not shared
-with any benched transport.
+After this run, only **syslog TCP** and **syslog HTTP** (`POST /syslog`) remain
+unmeasured at this layer — and both share their message parse with **syslog
+UDP**, which is already covered above (RFC 3164 envelope, `payload::dispatch`).
+There is no remaining unshared parse work to bench here; do not add a
+syslog-TCP or syslog-HTTP parse bench expecting new numbers; the wire framing
+differs but the parse function does not.
 
 ## 2. Encode path — record → Arrow `RecordBatch`
 
@@ -99,9 +122,12 @@ with any benched transport.
 | suricata envelope | 5.57 µs | pre-existing |
 | WEF | 6.32 µs | pre-existing |
 | generic/HEC | 4.13 µs | pre-existing |
+| structured syslog, CEF payload | 5.28 µs | new, measured 2026-09-13 (second run) — cheaper than plain syslog, see §3 |
+| structured syslog, auditd payload | 6.80 µs | new, measured 2026-09-13 (second run) |
 
-**Structured syslog** (`StructuredSyslogSink::to_record_batch`) remains the one
-sink with zero encode coverage.
+Structured syslog (`StructuredSyslogSink::to_record_batch`) was the one sink
+with zero encode coverage before this run; it no longer is. After this run,
+every `ParquetSink` adapter in the repo has an encode-path bench.
 
 ---
 
@@ -144,6 +170,33 @@ That is the opposite of the intuition that a generic fallback must be slower —
 it carries the JSON through as one string rather than building a dozen typed
 Arrow columns. Worth knowing before anyone "optimises" it.
 
+### WEF parse is the one place parse costs *more* than encode
+
+Every other pairing in this document has encode dominating parse. WEF
+inverts it:
+
+| | parse (field extraction) | encode (`to_record_batch`) | ratio |
+|---|---|---|---|
+| WEF `logon_4624` | 104.48 µs | 6.32 µs | **16.5×** (104.48 ÷ 6.32) |
+| WEF `failed_logon_4625` | 112.26 µs | 6.32 µs | **17.8×** (112.26 ÷ 6.32) |
+
+This is not a bench bug — it was investigated directly. `parse_event`'s
+final step, `format_message` (`src/parser/mod.rs:391-425`), calls
+`AhoCorasick::new(&patterns)` to build a fresh multi-pattern automaton on
+**every single call**, for the 5-6 placeholder patterns in that event's
+output template, then discards it. An ad hoc instrumented run (10,000
+iterations, warmed up, reverted before commit — not part of this repo)
+measured that automaton construction alone at ~99 µs of `logon_4624`'s
+~104 µs, i.e. it is essentially the entire cost. The miss path
+(`no_parser_9999`, 55.13 ns) never reaches `format_message` and is
+unaffected — consistent with the hit paths being ~1,900-2,000× more
+expensive than the miss path for reasons unrelated to XML size.
+
+This is a real optimisation opportunity (cache the automaton per parser
+definition instead of rebuilding it per event) but fixing it is out of
+scope for this measurement-only task — recorded here as a residual for
+whoever picks up WEF parser work next, not opened as a new tier.
+
 ### A prediction in the plan that was wrong
 
 The plan for the sFlow bench asserted that `flow_raw_header` would be the most
@@ -163,6 +216,37 @@ fixed per-datagram cost (header parse, `Vec` allocation, building an
 because it populates 10 counter fields against the flow sample's ~7.
 
 No bug. The bench is correct; the expectation written into the plan was not.
+
+### OTLP batching amortizes the per-record mapping cost
+
+`map_otlp_request` median cost: **5.14 µs** for a single-record request,
+**359.14 µs total** for a 100-record request. Dividing the batch total by
+its own element count (359.14 µs ÷ 100 = 3.59 µs/record) gives the
+per-record cost inside a batch, which is directly comparable to the
+single-record figure because both are per-record units:
+
+5.14 µs ÷ 3.59 µs ≈ **1.43×** — batching 100 records into one request cuts
+the per-record mapping cost by about 30%.
+
+This matters because OTLP clients batch aggressively in practice (the
+single-record case is the atypical one operationally), so quoting only the
+5.14 µs single-record figure would understate real-world throughput.
+
+### Structured syslog encodes faster than plain syslog, not slower
+
+| | encode | vs. plain syslog (8.83 µs) |
+|---|---|---|
+| plain syslog | 8.83 µs | — |
+| structured syslog, CEF | 5.28 µs | 8.83 ÷ 5.28 ≈ **1.67×** cheaper |
+| structured syslog, auditd | 6.80 µs | 8.83 ÷ 6.80 ≈ **1.30×** cheaper |
+
+Despite doing CEF/auditd key-value extraction ahead of encode (dispatch and
+`StructuredSyslogRecord` construction happen before the timed
+`to_record_batch` call in this bench — see the bench header), the structured
+sink is cheaper to encode than plain syslog for both payload shapes measured.
+This bench does not investigate why (schema column count and/or column
+types likely differ between the two sinks); recorded as an observation, not
+an explained result.
 
 ## 4. What these numbers do NOT say
 
@@ -224,6 +308,19 @@ cargo bench -- --save-baseline v0.18.0
 
 Takes ~15 minutes for 13 targets. Results land in `target/criterion/`, which is
 gitignored; CI now uploads them as an artifact (`.github/workflows/performance.yml`).
+
+The WEF, OTLP and structured-syslog figures in this document were measured in
+a second session, one target at a time rather than via the full sweep above:
+
+```bash
+export CC=/usr/bin/gcc CXX=/usr/bin/g++
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc
+cargo bench --bench wef_parse_recv_path
+cargo bench --bench otlp_map_request
+cargo bench --bench structured_syslog_to_record_batch
+```
+
+There are now 16 bench targets in total.
 
 Note `[lib] bench = false` and `[[bin]] bench = false` in `Cargo.toml`: without
 them `cargo bench` treats the lib and bin test harnesses as bench targets and
