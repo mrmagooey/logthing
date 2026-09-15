@@ -291,3 +291,93 @@ async fn sflow_local_start_emits_iceberg_descriptor_when_configured() {
         "expected at least one descriptor .json file under {descriptor_dir:?}"
     );
 }
+
+/// Drives individual `SflowRecord` pushes (one push per record, unlike
+/// IPFIX's one-push-per-datagram) across the real writer path
+/// (`sflow_local_start`) far enough to cross `BUILDER_BATCH_ROWS` (1000,
+/// `buffered_writer.rs`) for BOTH the "flow" and "counter" partitions --
+/// the point at which `push()` force-materializes each partition's live
+/// accumulator (`FlowSampleAccumulator` / `CounterSampleAccumulator`) into a
+/// stored batch mid-stream, before any flush. Asserts the exact total row
+/// count landed on disk per partition, not just that "some" data landed.
+#[tokio::test]
+async fn sflow_samples_crossing_builder_batch_rows_land_exact_row_count_on_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = Arc::new(
+        LocalDiskSink::new(dir.path().to_path_buf())
+            .await
+            .expect("LocalDiskSink::new"),
+    );
+    let cfg = SflowLocalConfig {
+        directory: dir.path().to_path_buf(),
+        prefix: "sflow".to_string(),
+        max_buffer_rows: 100_000, // row-count flush trigger must not fire early
+        flush_threshold_bytes: usize::MAX, // byte flush trigger must not fire early
+        flush_interval_secs: 3600, // age trigger must not fire
+        channel_capacity: 4096,
+    };
+
+    let (handler, writer_task) = sflow_local_start(
+        &cfg,
+        sink,
+        Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+
+    let src: std::net::SocketAddr = "127.0.0.1:6343".parse().unwrap();
+
+    // 1200 of each kind, crossing BUILDER_BATCH_ROWS=1000 partway through
+    // each partition's own live accumulator.
+    const FLOW_COUNT: usize = 1200;
+    const COUNTER_COUNT: usize = 1200;
+    let mut samples: Vec<SflowRecord> = Vec::with_capacity(FLOW_COUNT + COUNTER_COUNT);
+    for i in 0..FLOW_COUNT {
+        let mut r = make_flow_record();
+        r.src_port = Some((1000 + (i % 60_000)) as u16);
+        samples.push(r);
+    }
+    for i in 0..COUNTER_COUNT {
+        let mut r = make_counter_record();
+        r.if_index = Some(i as u32);
+        samples.push(r);
+    }
+    handler.handle_samples(samples, src).await;
+
+    // Drop the handler to close the channel; background task flushes
+    // whatever remains (materialized + still-live) on exit.
+    drop(handler);
+    tokio::time::timeout(std::time::Duration::from_secs(10), writer_task)
+        .await
+        .expect("writer task must exit within 10s")
+        .expect("writer task must not panic");
+
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let count_rows = |partition_dir: &std::path::Path| -> usize {
+        let mut total = 0usize;
+        for file_path in walk_all_files(partition_dir)
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|ext| ext == "parquet"))
+        {
+            let bytes = std::fs::read(&file_path).expect("read parquet file");
+            let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+                .expect("parquet builder");
+            let reader = builder.build().expect("parquet reader");
+            for batch in reader {
+                total += batch.expect("batch ok").num_rows();
+            }
+        }
+        total
+    };
+
+    let flow_rows = count_rows(&dir.path().join("sflow/flow"));
+    let counter_rows = count_rows(&dir.path().join("sflow/counter"));
+
+    assert_eq!(
+        flow_rows, FLOW_COUNT,
+        "exact total row count in the 'flow' partition must match every flow sample pushed"
+    );
+    assert_eq!(
+        counter_rows, COUNTER_COUNT,
+        "exact total row count in the 'counter' partition must match every counter sample pushed"
+    );
+}

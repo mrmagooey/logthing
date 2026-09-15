@@ -112,185 +112,335 @@ impl ParquetSink for SflowSink {
             SampleType::Counter => counter_to_record_batch(record, schema),
         }
     }
+
+    /// Amortized-builder fast path. Unlike IPFIX/Suricata's single schema,
+    /// sFlow has two -- gate on `Arc::ptr_eq` against each of `FLOW_SCHEMA`
+    /// and `COUNTER_SCHEMA` (mirroring `ZeekSink::new_batch`'s per-schema
+    /// gating) so a partition buffer only ever gets the accumulator that
+    /// matches the exact schema `push()` resolved for it.
+    fn new_batch(
+        &self,
+        schema: &Arc<arrow_schema::Schema>,
+    ) -> Option<Box<dyn crate::forwarding::buffered_writer::RecordBatchAccumulator<SflowRecord>>>
+    {
+        if Arc::ptr_eq(schema, &FLOW_SCHEMA) {
+            Some(Box::new(FlowSampleAccumulator::new()))
+        } else if Arc::ptr_eq(schema, &COUNTER_SCHEMA) {
+            Some(Box::new(CounterSampleAccumulator::new()))
+        } else {
+            None
+        }
+    }
+
+    /// Overrides the default `day_and_batch`: derives the day directly from
+    /// `record.received_at` without building a batch. Load-bearing for the
+    /// same reason as `IpfixSink`'s / `ZeekSink`'s overrides -- `push()`
+    /// calls this before it knows whether the record goes to the amortized
+    /// live builder, so building a batch here just to learn the day would
+    /// make every push pay for a throwaway `RecordBatch`, defeating the
+    /// entire point of `FlowSampleAccumulator`/`CounterSampleAccumulator`.
+    ///
+    /// Must match today's (default `day_and_batch` + `day_from_batch`)
+    /// behaviour exactly: `day_from_batch` reads `partition_time` row 0 of
+    /// the materialized batch, and both mappers set `partition_time` to
+    /// exactly `partition_time(Some(record.received_at), record.received_at)`
+    /// -- replicating that same call here picks the identical day without
+    /// needing the batch at all.
+    ///
+    /// Unlike `IpfixSink` (which has no per-record receipt instant and must
+    /// use `push()`'s single `now`), `SflowRecord` already carries its own
+    /// stamped `received_at` (like `SuricataRecord`), so `now` is unused
+    /// here -- using it instead would disagree with what the accumulator
+    /// itself derives the day from.
+    fn day_and_batch(
+        &self,
+        record: &SflowRecord,
+        _schema: &Arc<arrow_schema::Schema>,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<(chrono::NaiveDate, Option<arrow_array::RecordBatch>)> {
+        let day = crate::forwarding::buffered_writer::partition_time(
+            Some(record.received_at),
+            record.received_at,
+        )
+        .date_naive();
+        Ok((day, None))
+    }
 }
 
-fn flow_to_record_batch(r: &SflowRecord, schema: &Arc<Schema>) -> anyhow::Result<RecordBatch> {
-    let extra_str = serde_json::to_string(&r.extra).unwrap_or_else(|_| "[]".to_string());
-    // sFlow has no absolute event timestamp (sample timestamps are
-    // offset-based), so `received_at` is both the event and the receipt
-    // instant. Routed through the shared helper (rather than assigned
-    // directly) so every sink derives `partition_time` via one code path.
-    let partition_time =
-        crate::forwarding::buffered_writer::partition_time(Some(r.received_at), r.received_at);
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new({
-            let mut b = StringBuilder::new();
-            b.append_value(match r.sample_type {
-                SampleType::Flow => "flow",
-                SampleType::Counter => "counter",
-            });
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = StringBuilder::new();
-            b.append_value(r.exporter.to_string());
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
-                TimeUnit::Microsecond,
-                Some("UTC".into()),
-            ));
-            b.append_value(r.received_at.timestamp_micros());
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = StringBuilder::new();
-            b.append_option(r.src_addr.as_ref().map(|a| a.to_string()));
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = StringBuilder::new();
-            b.append_option(r.dst_addr.as_ref().map(|a| a.to_string()));
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = UInt16Builder::new();
-            b.append_option(r.src_port);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = UInt16Builder::new();
-            b.append_option(r.dst_port);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = UInt8Builder::new();
-            b.append_option(r.ip_protocol);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = UInt32Builder::new();
-            b.append_option(r.sampling_rate);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = UInt32Builder::new();
-            b.append_option(r.input_ifindex);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = UInt32Builder::new();
-            b.append_option(r.output_ifindex);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = StringBuilder::new();
-            b.append_value(&extra_str);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
-                TimeUnit::Microsecond,
-                Some("UTC".into()),
-            ));
-            b.append_value(partition_time.timestamp_micros());
-            b.finish()
-        }),
-    ];
-    Ok(RecordBatch::try_new(schema.clone(), columns)?)
+// ---------------------------------------------------------------------------
+// FlowSampleAccumulator / CounterSampleAccumulator — amortized-builder fast path
+// ---------------------------------------------------------------------------
+
+/// Amortized builder set for flow-sample rows (`FLOW_SCHEMA`). Holds the
+/// same 13 Arrow builders `flow_to_record_batch` used to create fresh on
+/// every call, as persistent fields, reused across many records via
+/// `finish(&mut self)` instead of reallocated per record. Mirrors
+/// `suricata::schema::EnvelopeAccumulator`.
+pub(crate) struct FlowSampleAccumulator {
+    b_sample_type: StringBuilder,
+    b_exporter: StringBuilder,
+    b_received_at: TimestampMicrosecondBuilder,
+    b_src_addr: StringBuilder,
+    b_dst_addr: StringBuilder,
+    b_src_port: UInt16Builder,
+    b_dst_port: UInt16Builder,
+    b_ip_protocol: UInt8Builder,
+    b_sampling_rate: UInt32Builder,
+    b_input_ifindex: UInt32Builder,
+    b_output_ifindex: UInt32Builder,
+    b_extra: StringBuilder,
+    b_partition_time: TimestampMicrosecondBuilder,
+    rows: usize,
 }
 
-fn counter_to_record_batch(r: &SflowRecord, schema: &Arc<Schema>) -> anyhow::Result<RecordBatch> {
-    let extra_str = serde_json::to_string(&r.extra).unwrap_or_else(|_| "[]".to_string());
-    // See flow_to_record_batch: counter samples likewise have no absolute
-    // event timestamp, so `received_at` stands in for both helper arguments.
-    let partition_time =
-        crate::forwarding::buffered_writer::partition_time(Some(r.received_at), r.received_at);
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new({
-            let mut b = StringBuilder::new();
-            b.append_value("counter");
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = StringBuilder::new();
-            b.append_value(r.exporter.to_string());
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+impl FlowSampleAccumulator {
+    pub(crate) fn new() -> Self {
+        Self {
+            b_sample_type: StringBuilder::new(),
+            b_exporter: StringBuilder::new(),
+            b_received_at: TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
                 TimeUnit::Microsecond,
                 Some("UTC".into()),
-            ));
-            b.append_value(r.received_at.timestamp_micros());
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = UInt32Builder::new();
-            b.append_option(r.if_index);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = UInt32Builder::new();
-            b.append_option(r.if_type);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = UInt64Builder::new();
-            b.append_option(r.if_speed);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = UInt32Builder::new();
-            b.append_option(r.if_direction);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = UInt64Builder::new();
-            b.append_option(r.if_in_octets);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = UInt64Builder::new();
-            b.append_option(r.if_out_octets);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = UInt64Builder::new();
-            b.append_option(r.if_in_ucast_pkts);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = UInt64Builder::new();
-            b.append_option(r.if_out_ucast_pkts);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = UInt32Builder::new();
-            b.append_option(r.if_in_errors);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = UInt32Builder::new();
-            b.append_option(r.if_out_errors);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = StringBuilder::new();
-            b.append_value(&extra_str);
-            b.finish()
-        }),
-        Arc::new({
-            let mut b = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+            )),
+            b_src_addr: StringBuilder::new(),
+            b_dst_addr: StringBuilder::new(),
+            b_src_port: UInt16Builder::new(),
+            b_dst_port: UInt16Builder::new(),
+            b_ip_protocol: UInt8Builder::new(),
+            b_sampling_rate: UInt32Builder::new(),
+            b_input_ifindex: UInt32Builder::new(),
+            b_output_ifindex: UInt32Builder::new(),
+            b_extra: StringBuilder::new(),
+            b_partition_time: TimestampMicrosecondBuilder::new().with_data_type(
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            rows: 0,
+        }
+    }
+
+    /// Append one flow-sample `SflowRecord` into the persistent builders.
+    /// Shared by both the amortized path (`RecordBatchAccumulator::try_append`)
+    /// and `flow_to_record_batch`'s single-record wrapper below -- identical
+    /// extraction logic either way, so there is exactly one place that knows
+    /// how a flow-sample `SflowRecord` becomes a row.
+    fn append_flow_value(&mut self, r: &SflowRecord) {
+        let extra_str = serde_json::to_string(&r.extra).unwrap_or_else(|_| "[]".to_string());
+        // sFlow has no absolute event timestamp (sample timestamps are
+        // offset-based), so `received_at` is both the event and the receipt
+        // instant. Routed through the shared helper (rather than assigned
+        // directly) so every sink derives `partition_time` via one code path.
+        let partition_time =
+            crate::forwarding::buffered_writer::partition_time(Some(r.received_at), r.received_at);
+
+        self.b_sample_type.append_value("flow");
+        self.b_exporter.append_value(r.exporter.to_string());
+        self.b_received_at
+            .append_value(r.received_at.timestamp_micros());
+        self.b_src_addr
+            .append_option(r.src_addr.as_ref().map(|a| a.to_string()));
+        self.b_dst_addr
+            .append_option(r.dst_addr.as_ref().map(|a| a.to_string()));
+        self.b_src_port.append_option(r.src_port);
+        self.b_dst_port.append_option(r.dst_port);
+        self.b_ip_protocol.append_option(r.ip_protocol);
+        self.b_sampling_rate.append_option(r.sampling_rate);
+        self.b_input_ifindex.append_option(r.input_ifindex);
+        self.b_output_ifindex.append_option(r.output_ifindex);
+        self.b_extra.append_value(&extra_str);
+        self.b_partition_time
+            .append_value(partition_time.timestamp_micros());
+        self.rows += 1;
+    }
+
+    fn finish_batch(&mut self) -> anyhow::Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.b_sample_type.finish()),
+            Arc::new(self.b_exporter.finish()),
+            Arc::new(self.b_received_at.finish()),
+            Arc::new(self.b_src_addr.finish()),
+            Arc::new(self.b_dst_addr.finish()),
+            Arc::new(self.b_src_port.finish()),
+            Arc::new(self.b_dst_port.finish()),
+            Arc::new(self.b_ip_protocol.finish()),
+            Arc::new(self.b_sampling_rate.finish()),
+            Arc::new(self.b_input_ifindex.finish()),
+            Arc::new(self.b_output_ifindex.finish()),
+            Arc::new(self.b_extra.finish()),
+            Arc::new(self.b_partition_time.finish()),
+        ];
+        self.rows = 0;
+        Ok(RecordBatch::try_new(FLOW_SCHEMA.clone(), columns)?)
+    }
+}
+
+impl crate::forwarding::buffered_writer::RecordBatchAccumulator<SflowRecord>
+    for FlowSampleAccumulator
+{
+    /// sFlow has two schemas selected by `record.sample_type` (unlike
+    /// Suricata/IPFIX's single schema), so a counter-sample record handed to
+    /// a flow accumulator is a real mismatch, not a defensive-only case:
+    /// return `Ok(false)` so `push()` falls back to `to_record_batch` (which
+    /// dispatches on `record.sample_type` itself and always lands the record
+    /// in its own correct partition/schema).
+    fn try_append(
+        &mut self,
+        record: &SflowRecord,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        if record.sample_type != SampleType::Flow {
+            return Ok(false);
+        }
+        self.append_flow_value(record);
+        Ok(true)
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+        self.finish_batch()
+    }
+}
+
+/// Amortized builder set for counter-sample rows (`COUNTER_SCHEMA`). Same
+/// shape as `FlowSampleAccumulator`, mirroring its own fixed schema.
+pub(crate) struct CounterSampleAccumulator {
+    b_sample_type: StringBuilder,
+    b_exporter: StringBuilder,
+    b_received_at: TimestampMicrosecondBuilder,
+    b_if_index: UInt32Builder,
+    b_if_type: UInt32Builder,
+    b_if_speed: UInt64Builder,
+    b_if_direction: UInt32Builder,
+    b_if_in_octets: UInt64Builder,
+    b_if_out_octets: UInt64Builder,
+    b_if_in_ucast_pkts: UInt64Builder,
+    b_if_out_ucast_pkts: UInt64Builder,
+    b_if_in_errors: UInt32Builder,
+    b_if_out_errors: UInt32Builder,
+    b_extra: StringBuilder,
+    b_partition_time: TimestampMicrosecondBuilder,
+    rows: usize,
+}
+
+impl CounterSampleAccumulator {
+    pub(crate) fn new() -> Self {
+        Self {
+            b_sample_type: StringBuilder::new(),
+            b_exporter: StringBuilder::new(),
+            b_received_at: TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
                 TimeUnit::Microsecond,
                 Some("UTC".into()),
-            ));
-            b.append_value(partition_time.timestamp_micros());
-            b.finish()
-        }),
-    ];
-    Ok(RecordBatch::try_new(schema.clone(), columns)?)
+            )),
+            b_if_index: UInt32Builder::new(),
+            b_if_type: UInt32Builder::new(),
+            b_if_speed: UInt64Builder::new(),
+            b_if_direction: UInt32Builder::new(),
+            b_if_in_octets: UInt64Builder::new(),
+            b_if_out_octets: UInt64Builder::new(),
+            b_if_in_ucast_pkts: UInt64Builder::new(),
+            b_if_out_ucast_pkts: UInt64Builder::new(),
+            b_if_in_errors: UInt32Builder::new(),
+            b_if_out_errors: UInt32Builder::new(),
+            b_extra: StringBuilder::new(),
+            b_partition_time: TimestampMicrosecondBuilder::new().with_data_type(
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            rows: 0,
+        }
+    }
+
+    /// Append one counter-sample `SflowRecord` into the persistent builders.
+    /// Shared by both the amortized path and `counter_to_record_batch`'s
+    /// single-record wrapper below -- see `FlowSampleAccumulator::append_flow_value`.
+    fn append_counter_value(&mut self, r: &SflowRecord) {
+        let extra_str = serde_json::to_string(&r.extra).unwrap_or_else(|_| "[]".to_string());
+        // See append_flow_value: counter samples likewise have no absolute
+        // event timestamp, so `received_at` stands in for both helper arguments.
+        let partition_time =
+            crate::forwarding::buffered_writer::partition_time(Some(r.received_at), r.received_at);
+
+        self.b_sample_type.append_value("counter");
+        self.b_exporter.append_value(r.exporter.to_string());
+        self.b_received_at
+            .append_value(r.received_at.timestamp_micros());
+        self.b_if_index.append_option(r.if_index);
+        self.b_if_type.append_option(r.if_type);
+        self.b_if_speed.append_option(r.if_speed);
+        self.b_if_direction.append_option(r.if_direction);
+        self.b_if_in_octets.append_option(r.if_in_octets);
+        self.b_if_out_octets.append_option(r.if_out_octets);
+        self.b_if_in_ucast_pkts.append_option(r.if_in_ucast_pkts);
+        self.b_if_out_ucast_pkts.append_option(r.if_out_ucast_pkts);
+        self.b_if_in_errors.append_option(r.if_in_errors);
+        self.b_if_out_errors.append_option(r.if_out_errors);
+        self.b_extra.append_value(&extra_str);
+        self.b_partition_time
+            .append_value(partition_time.timestamp_micros());
+        self.rows += 1;
+    }
+
+    fn finish_batch(&mut self) -> anyhow::Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.b_sample_type.finish()),
+            Arc::new(self.b_exporter.finish()),
+            Arc::new(self.b_received_at.finish()),
+            Arc::new(self.b_if_index.finish()),
+            Arc::new(self.b_if_type.finish()),
+            Arc::new(self.b_if_speed.finish()),
+            Arc::new(self.b_if_direction.finish()),
+            Arc::new(self.b_if_in_octets.finish()),
+            Arc::new(self.b_if_out_octets.finish()),
+            Arc::new(self.b_if_in_ucast_pkts.finish()),
+            Arc::new(self.b_if_out_ucast_pkts.finish()),
+            Arc::new(self.b_if_in_errors.finish()),
+            Arc::new(self.b_if_out_errors.finish()),
+            Arc::new(self.b_extra.finish()),
+            Arc::new(self.b_partition_time.finish()),
+        ];
+        self.rows = 0;
+        Ok(RecordBatch::try_new(COUNTER_SCHEMA.clone(), columns)?)
+    }
+}
+
+impl crate::forwarding::buffered_writer::RecordBatchAccumulator<SflowRecord>
+    for CounterSampleAccumulator
+{
+    /// See `FlowSampleAccumulator::try_append`: the mirror-image mismatch --
+    /// a flow-sample record handed to the counter accumulator falls back to
+    /// `to_record_batch` for just that one record.
+    fn try_append(
+        &mut self,
+        record: &SflowRecord,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        if record.sample_type != SampleType::Counter {
+            return Ok(false);
+        }
+        self.append_counter_value(record);
+        Ok(true)
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+        self.finish_batch()
+    }
+}
+
+fn flow_to_record_batch(r: &SflowRecord, _schema: &Arc<Schema>) -> anyhow::Result<RecordBatch> {
+    let mut acc = FlowSampleAccumulator::new();
+    acc.append_flow_value(r);
+    acc.finish_batch()
+}
+
+fn counter_to_record_batch(r: &SflowRecord, _schema: &Arc<Schema>) -> anyhow::Result<RecordBatch> {
+    let mut acc = CounterSampleAccumulator::new();
+    acc.append_counter_value(r);
+    acc.finish_batch()
 }
 
 // ── SflowS3Handler — type alias + SflowHandler impl ─────────────────────────
@@ -674,6 +824,331 @@ mod tests {
                 partition
             );
         }
+    }
+
+    // -- FlowSampleAccumulator / CounterSampleAccumulator unit tests --
+
+    fn make_flow_records(n: usize) -> Vec<SflowRecord> {
+        (0..n)
+            .map(|i| {
+                let mut r = make_flow_record();
+                r.src_port = Some(1000 + i as u16);
+                r
+            })
+            .collect()
+    }
+
+    fn make_counter_records(n: usize) -> Vec<SflowRecord> {
+        (0..n)
+            .map(|i| {
+                let mut r = make_counter_record();
+                r.if_index = Some(i as u32);
+                r
+            })
+            .collect()
+    }
+
+    #[test]
+    fn flow_accumulator_matches_to_record_batch_output_row_for_row() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+
+        let records = make_flow_records(3);
+        let schema = FLOW_SCHEMA.clone();
+
+        // Baseline: today's exact per-record path, N single-row batches concatenated.
+        let single_row_batches: Vec<RecordBatch> = records
+            .iter()
+            .map(|r| flow_to_record_batch(r, &schema).unwrap())
+            .collect();
+        let expected = arrow::compute::concat_batches(&schema, &single_row_batches).unwrap();
+
+        // Amortized path: one accumulator, N appends, one finish.
+        let mut acc = FlowSampleAccumulator::new();
+        for r in &records {
+            assert!(acc.try_append(r, chrono::Utc::now()).unwrap());
+        }
+        let actual = acc.finish().unwrap();
+
+        assert_eq!(actual.num_rows(), expected.num_rows());
+        assert_eq!(actual.schema(), expected.schema());
+        for col_idx in 0..expected.num_columns() {
+            assert_eq!(
+                format!("{:?}", actual.column(col_idx)),
+                format!("{:?}", expected.column(col_idx)),
+                "column {col_idx} differs between amortized and per-record paths"
+            );
+        }
+    }
+
+    #[test]
+    fn counter_accumulator_matches_to_record_batch_output_row_for_row() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+
+        let records = make_counter_records(3);
+        let schema = COUNTER_SCHEMA.clone();
+
+        let single_row_batches: Vec<RecordBatch> = records
+            .iter()
+            .map(|r| counter_to_record_batch(r, &schema).unwrap())
+            .collect();
+        let expected = arrow::compute::concat_batches(&schema, &single_row_batches).unwrap();
+
+        let mut acc = CounterSampleAccumulator::new();
+        for r in &records {
+            assert!(acc.try_append(r, chrono::Utc::now()).unwrap());
+        }
+        let actual = acc.finish().unwrap();
+
+        assert_eq!(actual.num_rows(), expected.num_rows());
+        assert_eq!(actual.schema(), expected.schema());
+        for col_idx in 0..expected.num_columns() {
+            assert_eq!(
+                format!("{:?}", actual.column(col_idx)),
+                format!("{:?}", expected.column(col_idx)),
+                "column {col_idx} differs between amortized and per-record paths"
+            );
+        }
+    }
+
+    #[test]
+    fn flow_accumulator_len_and_is_empty() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+
+        let mut acc = FlowSampleAccumulator::new();
+        assert_eq!(acc.len(), 0);
+        assert!(acc.is_empty());
+
+        acc.try_append(&make_flow_record(), chrono::Utc::now())
+            .unwrap();
+        assert_eq!(acc.len(), 1);
+        assert!(!acc.is_empty());
+
+        acc.try_append(&make_flow_record(), chrono::Utc::now())
+            .unwrap();
+        assert_eq!(acc.len(), 2);
+
+        acc.finish().unwrap();
+        assert_eq!(acc.len(), 0, "finish must reset the row count");
+        assert!(acc.is_empty());
+    }
+
+    #[test]
+    fn counter_accumulator_len_and_is_empty() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+
+        let mut acc = CounterSampleAccumulator::new();
+        assert_eq!(acc.len(), 0);
+        assert!(acc.is_empty());
+
+        acc.try_append(&make_counter_record(), chrono::Utc::now())
+            .unwrap();
+        assert_eq!(acc.len(), 1);
+        assert!(!acc.is_empty());
+
+        acc.finish().unwrap();
+        assert_eq!(acc.len(), 0, "finish must reset the row count");
+        assert!(acc.is_empty());
+    }
+
+    #[test]
+    fn flow_accumulator_finish_twice_produces_independent_batches() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+
+        let mut acc = FlowSampleAccumulator::new();
+
+        let mut rec_a = make_flow_record();
+        rec_a.src_port = Some(1111);
+        acc.try_append(&rec_a, chrono::Utc::now()).unwrap();
+        let batch_a = acc.finish().unwrap();
+        assert_eq!(
+            batch_a.num_rows(),
+            1,
+            "first finish must contain exactly the rows appended before it"
+        );
+
+        let mut rec_b = make_flow_record();
+        rec_b.src_port = Some(2222);
+        let mut rec_c = make_flow_record();
+        rec_c.src_port = Some(3333);
+        acc.try_append(&rec_b, chrono::Utc::now()).unwrap();
+        acc.try_append(&rec_c, chrono::Utc::now()).unwrap();
+        let batch_b = acc.finish().unwrap();
+
+        assert_eq!(
+            batch_b.num_rows(),
+            2,
+            "second finish must contain exactly the rows appended since the first finish -- \
+             a builder that retained prior rows would produce 3 here, silently duplicating data"
+        );
+        let src_ports = batch_b
+            .column_by_name("src_port")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::UInt16Array>()
+            .unwrap();
+        assert_eq!(src_ports.value(0), 2222);
+        assert_eq!(src_ports.value(1), 3333);
+    }
+
+    #[test]
+    fn counter_accumulator_finish_twice_produces_independent_batches() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+
+        let mut acc = CounterSampleAccumulator::new();
+
+        let mut rec_a = make_counter_record();
+        rec_a.if_index = Some(11);
+        acc.try_append(&rec_a, chrono::Utc::now()).unwrap();
+        let batch_a = acc.finish().unwrap();
+        assert_eq!(batch_a.num_rows(), 1);
+
+        let mut rec_b = make_counter_record();
+        rec_b.if_index = Some(22);
+        let mut rec_c = make_counter_record();
+        rec_c.if_index = Some(33);
+        acc.try_append(&rec_b, chrono::Utc::now()).unwrap();
+        acc.try_append(&rec_c, chrono::Utc::now()).unwrap();
+        let batch_b = acc.finish().unwrap();
+
+        assert_eq!(batch_b.num_rows(), 2);
+        let if_indexes = batch_b
+            .column_by_name("if_index")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(if_indexes.value(0), 22);
+        assert_eq!(if_indexes.value(1), 33);
+    }
+
+    /// The cross-schema rejection case that makes sFlow's fallback path
+    /// REAL (unlike Suricata/IPFIX's always-`Ok(true)` single-schema
+    /// accumulators): a flow-sample accumulator handed a counter-sample
+    /// record must reject it, unmodified, so `push()` falls back to
+    /// `to_record_batch` for just that one record.
+    #[test]
+    fn flow_accumulator_rejects_counter_sample_record() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+
+        let mut acc = FlowSampleAccumulator::new();
+        let rejected = acc
+            .try_append(&make_counter_record(), chrono::Utc::now())
+            .unwrap();
+        assert!(
+            !rejected,
+            "a counter-sample record must not be accepted by the flow accumulator"
+        );
+        assert_eq!(
+            acc.len(),
+            0,
+            "a rejected record must not have been appended"
+        );
+    }
+
+    /// Mirror image of the above: a counter-sample accumulator handed a
+    /// flow-sample record must likewise reject it.
+    #[test]
+    fn counter_accumulator_rejects_flow_sample_record() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+
+        let mut acc = CounterSampleAccumulator::new();
+        let rejected = acc
+            .try_append(&make_flow_record(), chrono::Utc::now())
+            .unwrap();
+        assert!(
+            !rejected,
+            "a flow-sample record must not be accepted by the counter accumulator"
+        );
+        assert_eq!(
+            acc.len(),
+            0,
+            "a rejected record must not have been appended"
+        );
+    }
+
+    #[test]
+    fn sflow_sink_new_batch_activates_for_both_real_schemas_and_rejects_unrelated() {
+        let sink = SflowSink;
+        assert!(
+            sink.new_batch(&FLOW_SCHEMA).is_some(),
+            "new_batch must activate for the real FLOW_SCHEMA"
+        );
+        assert!(
+            sink.new_batch(&COUNTER_SCHEMA).is_some(),
+            "new_batch must activate for the real COUNTER_SCHEMA"
+        );
+
+        let other_schema: Arc<Schema> = Arc::new(Schema::new(vec![Field::new(
+            "unrelated",
+            DataType::Utf8,
+            false,
+        )]));
+        assert!(
+            sink.new_batch(&other_schema).is_none(),
+            "new_batch must not activate for a schema that isn't FLOW_SCHEMA or COUNTER_SCHEMA"
+        );
+    }
+
+    // -- SflowSink::day_and_batch unit tests --
+
+    #[test]
+    fn day_and_batch_matches_default_day_from_batch_mechanism_for_flow() {
+        let sink = SflowSink;
+        let schema = FLOW_SCHEMA.clone();
+        let mut r = make_flow_record();
+        r.received_at = chrono::DateTime::parse_from_rfc3339("2026-05-06T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let now = chrono::Utc::now(); // deliberately far from r.received_at; must be ignored
+
+        let (day, pre_mapped) = sink.day_and_batch(&r, &schema, now).unwrap();
+        assert!(
+            pre_mapped.is_none(),
+            "day_and_batch must not build a batch just to compute the day"
+        );
+        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2026, 5, 6).unwrap());
+
+        // Cross-check against the default mechanism: build the batch and
+        // read the day back off it via the same column the trait's default
+        // day_and_batch/day_from_batch would use.
+        let batch = flow_to_record_batch(&r, &schema).unwrap();
+        let col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .unwrap();
+        let default_day = chrono::DateTime::from_timestamp_micros(col.value(0))
+            .unwrap()
+            .date_naive();
+        assert_eq!(day, default_day);
+    }
+
+    #[test]
+    fn day_and_batch_matches_default_day_from_batch_mechanism_for_counter() {
+        let sink = SflowSink;
+        let schema = COUNTER_SCHEMA.clone();
+        let mut r = make_counter_record();
+        r.received_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T23:59:59Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let now = chrono::Utc::now();
+
+        let (day, pre_mapped) = sink.day_and_batch(&r, &schema, now).unwrap();
+        assert!(pre_mapped.is_none());
+        assert_eq!(day, chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap());
+
+        let batch = counter_to_record_batch(&r, &schema).unwrap();
+        let col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .unwrap();
+        let default_day = chrono::DateTime::from_timestamp_micros(col.value(0))
+            .unwrap()
+            .date_naive();
+        assert_eq!(day, default_day);
     }
 
     #[tokio::test]
