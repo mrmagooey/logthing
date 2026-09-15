@@ -13,7 +13,9 @@ use crate::config::SyslogS3Config;
 use crate::forwarding::buffered_writer::ParquetSink;
 use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::syslog::SyslogMessage;
-use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt8Array};
+use arrow::array::{ArrayRef, StringBuilder, TimestampMicrosecondBuilder, UInt8Builder};
+#[cfg(test)]
+use arrow::array::{StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use std::sync::{Arc, LazyLock};
@@ -61,79 +63,158 @@ pub fn syslog_schema() -> Arc<Schema> {
 // Row mapping
 // ---------------------------------------------------------------------------
 
+/// Amortized builder set for `syslog_schema()`. Holds the same 13 Arrow
+/// builders `syslog_message_to_batch` used to create fresh on every call, as
+/// persistent fields, so they can be reused across many records via
+/// `finish(&mut self)` instead of reallocated per record. Mirrors
+/// `suricata::schema::EnvelopeAccumulator`.
+pub(crate) struct SyslogAccumulator {
+    b_priority: UInt8Builder,
+    b_severity: UInt8Builder,
+    b_facility: UInt8Builder,
+    b_timestamp: TimestampMicrosecondBuilder,
+    b_hostname: StringBuilder,
+    b_app_name: StringBuilder,
+    b_proc_id: StringBuilder,
+    b_msg_id: StringBuilder,
+    b_message: StringBuilder,
+    b_structured_data: StringBuilder,
+    b_protocol: StringBuilder,
+    b_received_at: TimestampMicrosecondBuilder,
+    b_partition_time: TimestampMicrosecondBuilder,
+    rows: usize,
+}
+
+impl SyslogAccumulator {
+    pub(crate) fn new() -> Self {
+        let ts_type = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        Self {
+            b_priority: UInt8Builder::new(),
+            b_severity: UInt8Builder::new(),
+            b_facility: UInt8Builder::new(),
+            b_timestamp: TimestampMicrosecondBuilder::new().with_data_type(ts_type.clone()),
+            b_hostname: StringBuilder::new(),
+            b_app_name: StringBuilder::new(),
+            b_proc_id: StringBuilder::new(),
+            b_msg_id: StringBuilder::new(),
+            b_message: StringBuilder::new(),
+            b_structured_data: StringBuilder::new(),
+            b_protocol: StringBuilder::new(),
+            b_received_at: TimestampMicrosecondBuilder::new().with_data_type(ts_type.clone()),
+            b_partition_time: TimestampMicrosecondBuilder::new().with_data_type(ts_type),
+            rows: 0,
+        }
+    }
+
+    /// Append one `SyslogMessage` into the persistent builders. Shared by
+    /// both the amortized path (`RecordBatchAccumulator::try_append`) and
+    /// `syslog_message_to_batch`'s single-record wrapper below -- identical
+    /// extraction logic either way, so there is exactly one place that knows
+    /// how a `SyslogMessage` becomes a row.
+    ///
+    /// `now` is bound ONCE by the caller and reused for BOTH `received_at`
+    /// and the derivation of `partition_time`. Two separate `Utc::now()`
+    /// calls either side of midnight would put different days in the two
+    /// columns -- `partition_time` is what the buffer's day key and the
+    /// eventual Iceberg partition are derived from, so if it disagreed with
+    /// `received_at` (the fallback `day_from_batch` would otherwise read) a
+    /// flush could still land in a file declared for a different day than
+    /// the value actually stamped into `received_at`. This is why `now` is a
+    /// parameter here rather than a fresh `chrono::Utc::now()` call -- see
+    /// the `RecordBatchAccumulator::try_append` trait doc comment for why
+    /// the live-builder path must not read the clock itself.
+    fn append_syslog_value(&mut self, msg: &SyslogMessage, now: chrono::DateTime<chrono::Utc>) {
+        self.b_priority.append_value(msg.priority);
+        self.b_severity.append_value(msg.severity);
+        self.b_facility.append_value(msg.facility);
+        self.b_timestamp
+            .append_option(msg.timestamp.map(|t| t.timestamp_micros()));
+        self.b_hostname.append_option(msg.hostname.as_deref());
+        self.b_app_name.append_option(msg.app_name.as_deref());
+        self.b_proc_id.append_option(msg.proc_id.as_deref());
+        self.b_msg_id.append_option(msg.msg_id.as_deref());
+        self.b_message.append_value(&msg.message);
+        let structured_data = msg
+            .structured_data
+            .as_ref()
+            .and_then(|sd| serde_json::to_string(sd).ok());
+        self.b_structured_data
+            .append_option(structured_data.as_deref());
+        self.b_protocol.append_value(format!("{:?}", msg.protocol));
+        self.b_received_at.append_value(now.timestamp_micros());
+        let partition_time_value =
+            crate::forwarding::buffered_writer::partition_time(msg.timestamp, now);
+        self.b_partition_time
+            .append_value(partition_time_value.timestamp_micros());
+        self.rows += 1;
+    }
+
+    fn finish_batch(&mut self) -> anyhow::Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.b_priority.finish()),
+            Arc::new(self.b_severity.finish()),
+            Arc::new(self.b_facility.finish()),
+            Arc::new(self.b_timestamp.finish()),
+            Arc::new(self.b_hostname.finish()),
+            Arc::new(self.b_app_name.finish()),
+            Arc::new(self.b_proc_id.finish()),
+            Arc::new(self.b_msg_id.finish()),
+            Arc::new(self.b_message.finish()),
+            Arc::new(self.b_structured_data.finish()),
+            Arc::new(self.b_protocol.finish()),
+            Arc::new(self.b_received_at.finish()),
+            Arc::new(self.b_partition_time.finish()),
+        ];
+        self.rows = 0;
+        Ok(RecordBatch::try_new(syslog_schema(), columns)?)
+    }
+}
+
+impl crate::forwarding::buffered_writer::RecordBatchAccumulator<SyslogMessage>
+    for SyslogAccumulator
+{
+    fn try_append(
+        &mut self,
+        record: &SyslogMessage,
+        // `push()`'s single per-push clock read, used as the receipt instant
+        // for both `received_at` and `partition_time` -- see
+        // `append_syslog_value`'s doc comment. `SyslogMessage` carries no
+        // logthing-stamped receipt instant of its own (unlike
+        // `SuricataRecord::received_at`), so unlike `EnvelopeAccumulator`
+        // this accumulator actually uses the `now` argument instead of
+        // ignoring it.
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        // Syslog has exactly one schema, unlike Zeek's per-log-path
+        // registry, so there is no mismatch case to fall back from: every
+        // SyslogMessage belongs to this accumulator.
+        self.append_syslog_value(record, now);
+        Ok(true)
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+        self.finish_batch()
+    }
+}
+
 /// Map one `SyslogMessage` to a single-row `RecordBatch`.
 ///
 /// Stamps `received_at` with `Utc::now()` here -- the row-mapping
-/// boundary, called exactly once per push from `SyslogSink::to_record_batch`
-/// -- mirroring `StructuredSyslogRecord::from`'s identical stamp. This is
-/// deliberately NOT a field on `SyslogMessage` itself: that struct is
+/// boundary, called exactly once per push -- mirroring
+/// `StructuredSyslogRecord::from`'s identical stamp. This is deliberately
+/// NOT a field on `SyslogMessage` itself: that struct is
 /// `Serialize`/`Deserialize` (a new field would change JSON forwarding
 /// output) and is consumed by `aggregate/fields.rs` and `channel_budget.rs`.
-///
-/// That single stamp is bound to a local ONCE (`now` below) and reused for
-/// BOTH `received_at` and the derivation of `partition_time`. Two separate
-/// `Utc::now()` calls either side of midnight would put different days in
-/// the two columns -- `partition_time` is what the buffer's day key and the
-/// eventual Iceberg partition are derived from, so if it disagreed with
-/// `received_at` (the fallback `day_from_batch` would otherwise read) a
-/// flush could still land in a file declared for a different day than the
-/// value actually stamped into `received_at`. Because `day_and_batch`'s
-/// default calls this function exactly once and then reads the day back off
-/// the very batch it returns, this is also the only clock read the
-/// day-bucketing fallback chain sees -- there is no second read to disagree
-/// with it.
+/// See `SyslogAccumulator::append_syslog_value` for why that single stamp
+/// must be reused for both `received_at` and `partition_time`.
 pub fn syslog_message_to_batch(msg: &SyslogMessage) -> anyhow::Result<RecordBatch> {
-    let schema = syslog_schema();
-
-    let now = chrono::Utc::now();
-
-    let priority = Arc::new(UInt8Array::from(vec![msg.priority])) as ArrayRef;
-    let severity = Arc::new(UInt8Array::from(vec![msg.severity])) as ArrayRef;
-    let facility = Arc::new(UInt8Array::from(vec![msg.facility])) as ArrayRef;
-    let tz: Arc<str> = Arc::from("UTC");
-    let timestamp = Arc::new(
-        TimestampMicrosecondArray::from(vec![msg.timestamp.map(|t| t.timestamp_micros())])
-            .with_timezone(tz.clone()),
-    ) as ArrayRef;
-    let hostname = Arc::new(StringArray::from(vec![msg.hostname.clone()])) as ArrayRef;
-    let app_name = Arc::new(StringArray::from(vec![msg.app_name.clone()])) as ArrayRef;
-    let proc_id = Arc::new(StringArray::from(vec![msg.proc_id.clone()])) as ArrayRef;
-    let msg_id = Arc::new(StringArray::from(vec![msg.msg_id.clone()])) as ArrayRef;
-    let message = Arc::new(StringArray::from(vec![msg.message.clone()])) as ArrayRef;
-    let structured_data = Arc::new(StringArray::from(vec![
-        msg.structured_data
-            .as_ref()
-            .and_then(|sd| serde_json::to_string(sd).ok()),
-    ])) as ArrayRef;
-    let protocol = Arc::new(StringArray::from(vec![format!("{:?}", msg.protocol)])) as ArrayRef;
-    let received_at = Arc::new(
-        TimestampMicrosecondArray::from(vec![now.timestamp_micros()]).with_timezone(tz.clone()),
-    ) as ArrayRef;
-    let partition_time_value =
-        crate::forwarding::buffered_writer::partition_time(msg.timestamp, now);
-    let partition_time = Arc::new(
-        TimestampMicrosecondArray::from(vec![partition_time_value.timestamp_micros()])
-            .with_timezone(tz),
-    ) as ArrayRef;
-
-    Ok(RecordBatch::try_new(
-        schema,
-        vec![
-            priority,
-            severity,
-            facility,
-            timestamp,
-            hostname,
-            app_name,
-            proc_id,
-            msg_id,
-            message,
-            structured_data,
-            protocol,
-            received_at,
-            partition_time,
-        ],
-    )?)
+    let mut acc = SyslogAccumulator::new();
+    acc.append_syslog_value(msg, chrono::Utc::now());
+    acc.finish_batch()
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +283,48 @@ impl ParquetSink for SyslogSink {
         _schema: &Arc<arrow_schema::Schema>,
     ) -> anyhow::Result<arrow_array::RecordBatch> {
         syslog_message_to_batch(record)
+    }
+
+    /// Amortized-builder fast path: syslog has exactly one schema, so this
+    /// always matches -- gated on `Arc::ptr_eq` rather than unconditionally
+    /// returning `Some` purely defensively, mirroring
+    /// `SuricataSink`/`IpfixSink::new_batch`.
+    fn new_batch(
+        &self,
+        schema: &Arc<arrow_schema::Schema>,
+    ) -> Option<Box<dyn crate::forwarding::buffered_writer::RecordBatchAccumulator<SyslogMessage>>>
+    {
+        if Arc::ptr_eq(schema, &syslog_schema()) {
+            Some(Box::new(SyslogAccumulator::new()))
+        } else {
+            None
+        }
+    }
+
+    /// Overrides the default `day_and_batch`: derives the day directly from
+    /// `partition_time(record.timestamp, now)` instead of building a batch
+    /// first. Load-bearing for the same reason as `SuricataSink`'s /
+    /// `IpfixSink`'s overrides -- `push()` calls this before it knows
+    /// whether the record goes to the amortized `SyslogAccumulator`, so
+    /// building a batch here just to learn the day would make every record
+    /// pay for a throwaway `RecordBatch`, defeating the entire point of the
+    /// accumulator.
+    ///
+    /// Must reproduce the default's day exactly: the default's
+    /// `day_from_batch` reads `partition_time.value(0)` -- always non-null
+    /// by construction -- which `SyslogAccumulator` derives from
+    /// `partition_time(msg.timestamp, now)` using this SAME `now`: the
+    /// single per-push clock read `push()` threads through both
+    /// `day_and_batch` and `try_append`, so the two can never disagree.
+    fn day_and_batch(
+        &self,
+        record: &SyslogMessage,
+        _schema: &Arc<arrow_schema::Schema>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<(chrono::NaiveDate, Option<arrow_array::RecordBatch>)> {
+        let day =
+            crate::forwarding::buffered_writer::partition_time(record.timestamp, now).date_naive();
+        Ok((day, None))
     }
 }
 
@@ -596,38 +719,43 @@ mod tests {
     // -- Trait-level fallback-chain wiring: these are the tests that
     // actually guard the feature. They go through `SyslogSink::day_and_batch`
     // (the real call path `PartitionedParquetWriter::push` uses), not just
-    // the raw column values `syslog_message_to_batch` wrote. Each passes a
-    // `now` far in the future (2099) so that if the wiring silently
-    // degenerates to the wall-clock fallback -- e.g. `time_column()`
-    // returning a column name that doesn't exist, or `received_at` being
-    // ignored -- the returned day is unmistakably wrong (2099-01-01)
-    // instead of coincidentally right.
+    // the raw column values `syslog_message_to_batch` wrote.
+    //
+    // Since the accumulator conversion, `day_and_batch`'s `now` argument IS
+    // the receipt instant (see `SyslogAccumulator::append_syslog_value`'s
+    // doc comment) -- `push()` reads the clock exactly once and threads that
+    // same value through both `day_and_batch` and `try_append`, so
+    // `SyslogMessage` (which carries no receipt instant of its own) uses it
+    // directly instead of a second, independent `Utc::now()` read. So unlike
+    // before this conversion, these tests pick a realistic FIXED `now` and
+    // compute event timestamps relative to it (mirroring
+    // `IpfixSink::day_and_batch`'s tests) rather than passing a wall-clock-
+    // divorced sentinel `now` -- `now` is no longer a value the fallback
+    // chain should ignore, it is the fallback value itself.
 
     #[test]
     fn day_and_batch_uses_timestamp_column_when_present() {
         use chrono::TimeZone;
         let sink = SyslogSink;
         let schema = sink.schema(None);
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 15, 3, 0, 0).unwrap();
         let mut msg = sample_rfc5424();
         // 30 hours back is inside the partition_time clamp window (30-day
         // backfill) but guaranteed to land on a different UTC calendar day
-        // than "now" -- unlike a fixed historical date, which the clamp
-        // would now reject and collapse onto received_at.
-        let event = chrono::Utc::now() - chrono::TimeDelta::hours(30);
+        // than `now`.
+        let event = now - chrono::TimeDelta::hours(30);
         msg.timestamp = Some(event);
-        let distant_now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
 
-        let (day, _batch) = sink.day_and_batch(&msg, &schema, distant_now).unwrap();
+        let (day, pre_mapped) = sink.day_and_batch(&msg, &schema, now).unwrap();
 
-        assert_ne!(
-            day,
-            distant_now.date_naive(),
-            "day must not come from the wall-clock fallback"
+        assert!(
+            pre_mapped.is_none(),
+            "day_and_batch must not build a batch just to compute the day"
         );
         assert_eq!(day, event.date_naive());
         assert_ne!(
             day,
-            chrono::Utc::now().date_naive(),
+            now.date_naive(),
             "test is only meaningful if the event's day differs from receipt's day"
         );
     }
@@ -637,20 +765,15 @@ mod tests {
         use chrono::TimeZone;
         let sink = SyslogSink;
         let schema = sink.schema(None);
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 15, 3, 0, 0).unwrap();
         let mut msg = sample_rfc5424();
-        msg.timestamp = Some(chrono::Utc::now() - chrono::TimeDelta::days(60));
-        let distant_now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+        msg.timestamp = Some(now - chrono::TimeDelta::days(60));
 
-        let (day, _batch) = sink.day_and_batch(&msg, &schema, distant_now).unwrap();
+        let (day, _pre_mapped) = sink.day_and_batch(&msg, &schema, now).unwrap();
 
-        assert_ne!(
-            day,
-            distant_now.date_naive(),
-            "day must not come from the wall-clock fallback"
-        );
         assert_eq!(
             day,
-            chrono::Utc::now().date_naive(),
+            now.date_naive(),
             "an event timestamp outside the clamp window must bucket by receipt day"
         );
     }
@@ -668,22 +791,20 @@ mod tests {
         use chrono::TimeZone;
         let sink = SyslogSink;
         let schema = sink.schema(None);
-        let distant_now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 15, 3, 0, 0).unwrap();
 
         // Record A: no parseable header timestamp -- falls back to received_at.
         let msg_a = dummy_msg("cef-like, no header timestamp");
-        let (day_a, _) = sink.day_and_batch(&msg_a, &schema, distant_now).unwrap();
+        let (day_a, _) = sink.day_and_batch(&msg_a, &schema, now).unwrap();
 
-        // Record B: a valid timestamp a couple of seconds before "now" --
-        // inside the clamp window and, barring a test run landing in the
-        // last couple of seconds before UTC midnight, on the same calendar
-        // day as record A's receipt time.
+        // Record B: a valid timestamp a couple of seconds before `now` --
+        // inside the clamp window and on the same calendar day as record A's
+        // receipt time.
         let mut msg_b = sample_rfc5424();
-        msg_b.timestamp = Some(chrono::Utc::now() - chrono::TimeDelta::seconds(2));
-        let (day_b, _) = sink.day_and_batch(&msg_b, &schema, distant_now).unwrap();
+        msg_b.timestamp = Some(now - chrono::TimeDelta::seconds(2));
+        let (day_b, _) = sink.day_and_batch(&msg_b, &schema, now).unwrap();
 
-        assert_ne!(day_a, distant_now.date_naive());
-        assert_ne!(day_b, distant_now.date_naive());
+        assert_eq!(day_a, now.date_naive());
         assert_eq!(
             day_a, day_b,
             "a null-timestamp row and a valid-timestamp row received on the \
@@ -696,23 +817,15 @@ mod tests {
         use chrono::TimeZone;
         let sink = SyslogSink;
         let schema = sink.schema(None);
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 15, 3, 0, 0).unwrap();
         let msg = dummy_msg("no timestamp in this message");
-        let distant_now = chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
 
-        let (day, _batch) = sink.day_and_batch(&msg, &schema, distant_now).unwrap();
+        let (day, _pre_mapped) = sink.day_and_batch(&msg, &schema, now).unwrap();
 
-        // The load-bearing assertion: without it, this test would still
-        // pass if the fallback chain silently degraded all the way to the
-        // wall-clock `now` argument instead of reading `received_at`.
-        assert_ne!(
-            day,
-            distant_now.date_naive(),
-            "day must not come from the wall-clock fallback"
-        );
         assert_eq!(
             day,
-            chrono::Utc::now().date_naive(),
-            "day must come from the received_at stamp, which is today's real UTC date"
+            now.date_naive(),
+            "day must come from the received_at (now) stamp when timestamp is null"
         );
     }
 
@@ -937,6 +1050,189 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(hostname.value(0), "mymachine");
+    }
+
+    // -- SyslogAccumulator tests --
+
+    #[test]
+    fn syslog_accumulator_matches_single_row_batches_concatenated() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+        use chrono::TimeZone;
+
+        // Fixed `now`, shared by baseline and accumulator paths: the public
+        // `syslog_message_to_batch` reads its own clock internally and
+        // cannot be pinned, so the baseline here is built directly through
+        // the same private accumulator helper `syslog_message_to_batch`
+        // itself calls -- exactly what "one to_record_batch call per
+        // record, concatenated" meant before this conversion.
+        let now = chrono::Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).unwrap();
+        let records = vec![
+            sample_rfc5424(),
+            // Missing timestamp/hostname/app_name -> null columns, exercised
+            // through the accumulator.
+            dummy_msg("no timestamp in this message"),
+            {
+                let mut m = sample_rfc5424();
+                m.hostname = None;
+                m.app_name = None;
+                m.structured_data = None;
+                m
+            },
+        ];
+
+        let single_row_batches: Vec<RecordBatch> = records
+            .iter()
+            .map(|r| {
+                let mut acc = SyslogAccumulator::new();
+                acc.try_append(r, now).unwrap();
+                acc.finish().unwrap()
+            })
+            .collect();
+        let expected =
+            arrow::compute::concat_batches(&syslog_schema(), &single_row_batches).unwrap();
+
+        // Amortized path: one accumulator, N appends, one finish.
+        let mut acc = SyslogAccumulator::new();
+        for r in &records {
+            assert!(acc.try_append(r, now).unwrap());
+        }
+        let actual = acc.finish().unwrap();
+
+        assert_eq!(actual.num_rows(), expected.num_rows());
+        assert_eq!(actual.schema(), expected.schema());
+        for col_idx in 0..expected.num_columns() {
+            assert_eq!(
+                format!("{:?}", actual.column(col_idx)),
+                format!("{:?}", expected.column(col_idx)),
+                "column {col_idx} differs between amortized and per-record paths"
+            );
+        }
+    }
+
+    #[test]
+    fn syslog_accumulator_len_and_is_empty() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+
+        let mut acc = SyslogAccumulator::new();
+        assert_eq!(acc.len(), 0);
+        assert!(acc.is_empty());
+
+        let now = chrono::Utc::now();
+        acc.try_append(&dummy_msg("a"), now).unwrap();
+        assert_eq!(acc.len(), 1);
+        assert!(!acc.is_empty());
+
+        acc.try_append(&dummy_msg("b"), now).unwrap();
+        assert_eq!(acc.len(), 2);
+
+        acc.finish().unwrap();
+        assert_eq!(acc.len(), 0, "finish must reset the row count");
+        assert!(acc.is_empty());
+    }
+
+    #[test]
+    fn syslog_accumulator_finish_twice_produces_independent_batches() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+
+        let mut acc = SyslogAccumulator::new();
+        let now = chrono::Utc::now();
+
+        acc.try_append(&dummy_msg("first"), now).unwrap();
+        let batch_a = acc.finish().unwrap();
+        assert_eq!(
+            batch_a.num_rows(),
+            1,
+            "first finish must contain exactly the rows appended before it"
+        );
+
+        acc.try_append(&dummy_msg("second"), now).unwrap();
+        acc.try_append(&dummy_msg("third"), now).unwrap();
+        let batch_b = acc.finish().unwrap();
+
+        assert_eq!(
+            batch_b.num_rows(),
+            2,
+            "second finish must contain exactly the rows appended since the first finish -- \
+             a builder that retained prior rows would produce 3 here, silently duplicating data"
+        );
+        let messages = batch_b
+            .column_by_name("message")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(messages.value(0), "second");
+        assert_eq!(messages.value(1), "third");
+    }
+
+    /// Runtime-activation check: `new_batch` must actually return `Some` for
+    /// the real syslog schema `push()` passes it, and `None` for a distinct
+    /// schema Arc -- proving the amortized-builder fast path is really wired
+    /// up, not silently falling back to a fresh `to_record_batch` per push
+    /// (which would make the accumulator a no-op).
+    #[test]
+    fn syslog_sink_new_batch_activates_for_the_real_syslog_schema() {
+        let schema = SyslogSink.schema(None);
+        assert!(
+            Arc::ptr_eq(&schema, &syslog_schema()),
+            "sanity: SyslogSink::schema must return the same Arc as syslog_schema()"
+        );
+        let acc = SyslogSink.new_batch(&schema);
+        assert!(
+            acc.is_some(),
+            "new_batch must return Some(SyslogAccumulator) for syslog_schema() -- \
+             if this is None, push() falls back to a fresh builder per record and the \
+             accumulator never activates"
+        );
+
+        let other_schema: Arc<arrow_schema::Schema> =
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "unrelated",
+                arrow_schema::DataType::Utf8,
+                true,
+            )]));
+        assert!(
+            SyslogSink.new_batch(&other_schema).is_none(),
+            "new_batch must return None for a schema that isn't syslog_schema()'s Arc"
+        );
+    }
+
+    /// `day_and_batch` must not build a batch just to compute the day --
+    /// that would allocate the full 13-builder set on every push and defeat
+    /// the entire point of `SyslogAccumulator`. Also proves parity with the
+    /// default `day_from_batch` mechanism: build the row-0 reference batch
+    /// directly via the accumulator (same mechanism, same `now`) and compare
+    /// days.
+    #[test]
+    fn day_and_batch_matches_default_day_from_batch_mechanism_and_skips_batch_build() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+        use chrono::TimeZone;
+
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 15, 3, 0, 0).unwrap();
+        let mut msg = sample_rfc5424();
+        msg.timestamp = Some(chrono::Utc.with_ymd_and_hms(2026, 6, 14, 23, 0, 0).unwrap()); // previous day, within clamp
+
+        let mut acc = SyslogAccumulator::new();
+        acc.try_append(&msg, now).unwrap();
+        let batch = acc.finish().unwrap();
+        let partition_time_col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let expected_day = chrono::DateTime::from_timestamp_micros(partition_time_col.value(0))
+            .unwrap()
+            .date_naive();
+
+        let sink = SyslogSink;
+        let schema = sink.schema(None);
+        let (day, pre_mapped) = sink.day_and_batch(&msg, &schema, now).unwrap();
+        assert!(
+            pre_mapped.is_none(),
+            "day_and_batch must not build a batch just to compute the day"
+        );
+        assert_eq!(day, expected_day);
     }
 
     #[tokio::test]
