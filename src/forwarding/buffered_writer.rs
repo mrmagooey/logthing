@@ -160,6 +160,21 @@ pub trait RecordBatchAccumulator<Record>: Send {
     /// already performs) -- the caller must then fall back to
     /// `to_record_batch` for just this one record.
     ///
+    /// `now` is `push()`'s single per-push clock read -- the same value
+    /// threaded through `ParquetSink::day_and_batch` -- passed in rather
+    /// than read here. `ConnAccumulator` and `EnvelopeAccumulator` derive
+    /// their own event/receipt instant from the record itself and simply
+    /// ignore it; it exists for an accumulator like IPFIX's
+    /// `FlowRecordAccumulator`, which is long-lived across many pushes and
+    /// has no per-record receipt instant of its own to fall back on.
+    /// Calling `Utc::now()` inside `try_append` would reintroduce a second
+    /// clock read on either side of midnight that could disagree with the
+    /// `now` `day_and_batch` already used to pick this very buffer; binding
+    /// `now` once at construction instead would be worse, since the
+    /// accumulator outlives any single `now` and records appended after
+    /// midnight would still be stamped with a stale day. Do not
+    /// "simplify" this away by calling the clock inside an implementation.
+    ///
     /// Contract implementers must uphold: on `Ok(true)`, `len()` must be
     /// exactly `rows_before + N` where `N` is the number of rows this
     /// `Record` contributed (1 for a one-row-per-record sink, more for a
@@ -172,7 +187,11 @@ pub trait RecordBatchAccumulator<Record>: Send {
     /// `row_count`-driven behavior: the `max_rows` flush trigger, the
     /// `BUILDER_BATCH_ROWS` force-materialize check, and
     /// `drop_oldest_to_cap`'s hard-cap eviction loop.
-    fn try_append(&mut self, record: &Record) -> anyhow::Result<bool>;
+    fn try_append(
+        &mut self,
+        record: &Record,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool>;
 
     /// Rows appended so far, not yet finished into a `RecordBatch`.
     fn len(&self) -> usize;
@@ -930,7 +949,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
 
         let (n_rows, byte_delta) = if let Some(builder) = buf.live_builder.as_mut() {
             let rows_before = builder.len();
-            match builder.try_append(&record) {
+            match builder.try_append(&record, now) {
                 Ok(true) => {
                     // Accepted into the live builder. row_count is exact and
                     // immediate; byte_count is deliberately deferred to
@@ -2365,7 +2384,11 @@ max_partitions = 128
     }
 
     impl RecordBatchAccumulator<String> for MockAccumulator {
-        fn try_append(&mut self, record: &String) -> anyhow::Result<bool> {
+        fn try_append(
+            &mut self,
+            record: &String,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<bool> {
             self.builder.append_value(record);
             self.rows += 1;
             Ok(true)
@@ -2461,7 +2484,11 @@ max_partitions = 128
     }
 
     impl RecordBatchAccumulator<Vec<String>> for MultiRowMockAccumulator {
-        fn try_append(&mut self, record: &Vec<String>) -> anyhow::Result<bool> {
+        fn try_append(
+            &mut self,
+            record: &Vec<String>,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<bool> {
             for v in record {
                 self.builder.append_value(v);
             }
@@ -2518,18 +2545,22 @@ max_partitions = 128
         let mut acc = MultiRowMockAccumulator::new();
         assert_eq!(acc.len(), 0);
 
-        acc.try_append(&vec!["a".to_string(), "b".to_string(), "c".to_string()])
-            .unwrap();
+        acc.try_append(
+            &vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            chrono::Utc::now(),
+        )
+        .unwrap();
         assert_eq!(acc.len(), 3, "a 3-element record must add exactly 3 rows");
 
-        acc.try_append(&vec![]).unwrap();
+        acc.try_append(&vec![], chrono::Utc::now()).unwrap();
         assert_eq!(
             acc.len(),
             3,
             "an empty record must add 0 rows, not silently count as 1"
         );
 
-        acc.try_append(&vec!["d".to_string()]).unwrap();
+        acc.try_append(&vec!["d".to_string()], chrono::Utc::now())
+            .unwrap();
         assert_eq!(
             acc.len(),
             4,
@@ -2657,7 +2688,8 @@ max_partitions = 128
         // short string actually written. `used_bytes` must not fall for the
         // same trap.
         let mut acc = MockAccumulator::new();
-        acc.try_append(&"r0".to_string()).unwrap();
+        acc.try_append(&"r0".to_string(), chrono::Utc::now())
+            .unwrap();
         let batch = acc.finish().unwrap();
         assert_eq!(batch.num_rows(), 1);
 

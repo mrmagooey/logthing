@@ -57,7 +57,11 @@ struct MultiRowAccumulator {
 }
 
 impl RecordBatchAccumulator<Vec<String>> for MultiRowAccumulator {
-    fn try_append(&mut self, record: &Vec<String>) -> anyhow::Result<bool> {
+    fn try_append(
+        &mut self,
+        record: &Vec<String>,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
         for v in record {
             self.builder.append_value(v);
         }

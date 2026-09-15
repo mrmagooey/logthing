@@ -578,7 +578,15 @@ impl ConnAccumulator {
 impl crate::forwarding::buffered_writer::RecordBatchAccumulator<crate::zeek::ZeekRecord>
     for ConnAccumulator
 {
-    fn try_append(&mut self, record: &crate::zeek::ZeekRecord) -> anyhow::Result<bool> {
+    fn try_append(
+        &mut self,
+        record: &crate::zeek::ZeekRecord,
+        // Zeek's own `received_at` (stamped on the record at ingest, see
+        // `ZeekRecord`) is what `zeek_partition_time` already derives from --
+        // the shared per-push clock read has nothing to add here. See the
+        // trait doc comment for why the parameter exists at all.
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
         // Mirror to_record_batch's existing per-record fallback check: only
         // accept a record whose RAW log_path resolves (via the registry) to
         // exactly the conn schema. A mismatch (e.g. raw "Conn" vs the

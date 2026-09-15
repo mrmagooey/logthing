@@ -221,3 +221,90 @@ async fn ipfix_local_start_emits_iceberg_descriptor_when_configured() {
         "expected at least one descriptor .json file under {descriptor_dir:?}"
     );
 }
+
+/// Drives multi-flow `Vec<FlowRecord>` pushes across the real writer path
+/// (`ipfix_local_start`) far enough to cross `BUILDER_BATCH_ROWS` (1000,
+/// `buffered_writer.rs`) -- the point at which `push()` force-materializes
+/// the live `FlowRecordAccumulator` into a stored batch mid-stream, before
+/// any flush. Regression target: `FlowRecordAccumulator::try_append` must
+/// increment its row counter once per FLOW, not once per PUSH -- a
+/// once-per-push counter would make this take 1000 datagrams (not ~3) to
+/// cross the threshold, and would silently corrupt every row_count-driven
+/// behavior downstream (this exact flush trigger included). Asserts the
+/// exact total row count across every Parquet file written, not just that
+/// "some" data landed.
+#[tokio::test]
+async fn ipfix_flows_crossing_builder_batch_rows_land_exact_row_count_on_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = Arc::new(
+        LocalDiskSink::new(dir.path().to_path_buf())
+            .await
+            .expect("LocalDiskSink::new"),
+    );
+    let cfg = IpfixLocalConfig {
+        directory: dir.path().to_path_buf(),
+        prefix: "ipfix".to_string(),
+        max_buffer_rows: 100_000, // row-count flush trigger must not fire early
+        flush_threshold_bytes: usize::MAX, // byte flush trigger must not fire early
+        flush_interval_secs: 3600, // age trigger must not fire
+        channel_capacity: 256,
+    };
+
+    let (handler, writer_task) = ipfix_local_start(
+        &cfg,
+        sink,
+        Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+
+    let src: std::net::SocketAddr = "127.0.0.1:4739".parse().unwrap();
+
+    // 3 datagrams of 400 flows each = 1200 total flows, crossing
+    // BUILDER_BATCH_ROWS=1000 partway through the 3rd push.
+    const FLOWS_PER_DATAGRAM: usize = 400;
+    const DATAGRAMS: usize = 3;
+    for d in 0..DATAGRAMS {
+        let flows: Vec<FlowRecord> = (0..FLOWS_PER_DATAGRAM)
+            .map(|i| make_flow_record("10.1.2.3", (d * FLOWS_PER_DATAGRAM + i) as u64))
+            .collect();
+        handler.handle_flows(flows, src).await;
+    }
+
+    // Drop the handler to close the channel; background task flushes
+    // whatever remains (materialized + still-live) on exit.
+    drop(handler);
+    tokio::time::timeout(std::time::Duration::from_secs(5), writer_task)
+        .await
+        .expect("writer task must exit within 5s")
+        .expect("writer task must not panic");
+
+    let ipfix_dir = dir.path().join("ipfix");
+    let parquet_files: Vec<_> = walk_all_files(&ipfix_dir)
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|ext| ext == "parquet"))
+        .collect();
+    assert!(
+        !parquet_files.is_empty(),
+        "expected at least one Parquet file under {ipfix_dir:?}"
+    );
+
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let mut total_rows = 0usize;
+    for file_path in &parquet_files {
+        let bytes = std::fs::read(file_path).expect("read parquet file");
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .expect("parquet builder");
+        let reader = builder.build().expect("parquet reader");
+        for batch in reader {
+            total_rows += batch.expect("batch ok").num_rows();
+        }
+    }
+
+    assert_eq!(
+        total_rows,
+        FLOWS_PER_DATAGRAM * DATAGRAMS,
+        "exact total row count across every Parquet file must match every flow pushed, \
+         not just some of them -- a once-per-push (rather than once-per-flow) row counter \
+         would silently drop rows from this total well before it ever surfaced as a lost file"
+    );
+}

@@ -117,7 +117,16 @@ impl EnvelopeAccumulator {
 impl crate::forwarding::buffered_writer::RecordBatchAccumulator<SuricataRecord>
     for EnvelopeAccumulator
 {
-    fn try_append(&mut self, record: &SuricataRecord) -> anyhow::Result<bool> {
+    fn try_append(
+        &mut self,
+        record: &SuricataRecord,
+        // Suricata's own `received_at` (stamped on the record at ingest) is
+        // both the event and receipt instant `append_envelope_value` already
+        // derives `partition_time` from -- the shared per-push clock read has
+        // nothing to add here. See the trait doc comment for why the
+        // parameter exists at all.
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
         // Suricata has exactly one schema (the envelope), unlike Zeek's
         // per-log-path registry, so there is no mismatch case to fall back
         // from: every SuricataRecord belongs to this accumulator.
@@ -424,7 +433,7 @@ mod tests {
         // Amortized path: one accumulator, N appends, one finish.
         let mut acc = EnvelopeAccumulator::new();
         for r in &records {
-            assert!(acc.try_append(r).unwrap());
+            assert!(acc.try_append(r, chrono::Utc::now()).unwrap());
         }
         let actual = acc.finish().unwrap();
 
@@ -447,11 +456,13 @@ mod tests {
         assert_eq!(acc.len(), 0);
         assert!(acc.is_empty());
 
-        acc.try_append(&make_alert_record()).unwrap();
+        acc.try_append(&make_alert_record(), chrono::Utc::now())
+            .unwrap();
         assert_eq!(acc.len(), 1);
         assert!(!acc.is_empty());
 
-        acc.try_append(&make_alert_record()).unwrap();
+        acc.try_append(&make_alert_record(), chrono::Utc::now())
+            .unwrap();
         assert_eq!(acc.len(), 2);
 
         acc.finish().unwrap();
@@ -470,7 +481,7 @@ mod tests {
             fields: serde_json::json!({"src_ip": "1.1.1.1"}),
             received_at: Utc::now(),
         };
-        acc.try_append(&rec_a).unwrap();
+        acc.try_append(&rec_a, chrono::Utc::now()).unwrap();
         let batch_a = acc.finish().unwrap();
         assert_eq!(
             batch_a.num_rows(),
@@ -488,8 +499,8 @@ mod tests {
             fields: serde_json::json!({"src_ip": "3.3.3.3"}),
             received_at: Utc::now(),
         };
-        acc.try_append(&rec_b).unwrap();
-        acc.try_append(&rec_c).unwrap();
+        acc.try_append(&rec_b, chrono::Utc::now()).unwrap();
+        acc.try_append(&rec_c, chrono::Utc::now()).unwrap();
         let batch_b = acc.finish().unwrap();
 
         assert_eq!(

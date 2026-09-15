@@ -9,7 +9,7 @@
 //! - `ipfix_start()` — convenience constructor wiring `IpfixS3Config` → `ParquetWriterHandle`
 
 use crate::config::IpfixS3Config;
-use crate::forwarding::buffered_writer::ParquetSink;
+use crate::forwarding::buffered_writer::{ParquetSink, RecordBatchAccumulator};
 use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::ipfix::FlowRecord;
 use arrow::array::{
@@ -245,6 +245,61 @@ pub fn finish_batch(
 }
 
 // ---------------------------------------------------------------------------
+// FlowRecordAccumulator — amortized-builder fast path
+// ---------------------------------------------------------------------------
+
+/// Amortized builder state for IPFIX flow records. Holds one persistent
+/// `FlowRecordBuilders` set, reused across many pushes via `finish(&mut
+/// self)` instead of reallocated per push. Mirrors `zeek::schema::ConnAccumulator`
+/// / `suricata::schema::EnvelopeAccumulator`, but its `Record` is
+/// `Vec<FlowRecord>` (one push per UDP datagram, already batched at the
+/// listener) rather than one row per record -- `try_append` therefore loops
+/// over the `Vec` and increments the row counter once per flow, not once per
+/// call.
+pub(crate) struct FlowRecordAccumulator {
+    builders: FlowRecordBuilders,
+}
+
+impl FlowRecordAccumulator {
+    pub(crate) fn new() -> Self {
+        Self {
+            builders: FlowRecordBuilders::new(),
+        }
+    }
+}
+
+impl crate::forwarding::buffered_writer::RecordBatchAccumulator<Vec<FlowRecord>>
+    for FlowRecordAccumulator
+{
+    /// IPFIX has exactly one schema (`flow_record_schema()`), unlike Zeek's
+    /// per-log-path registry, so there is no per-record mismatch case to
+    /// fall back from: every flow in every `Vec<FlowRecord>` belongs to this
+    /// accumulator. `now` is the one clock read `push()` bound for this
+    /// whole call (see `IpfixSink::to_record_batch`'s doc comment for why it
+    /// must not be read again here) and is threaded straight into
+    /// `append_flow_record` as `received_at` for every flow in the batch.
+    fn try_append(&mut self, record: &Vec<FlowRecord>, now: DateTime<Utc>) -> anyhow::Result<bool> {
+        for flow in record {
+            append_flow_record(&mut self.builders, flow, now)?;
+        }
+        Ok(true)
+    }
+
+    fn len(&self) -> usize {
+        self.builders.row_count
+    }
+
+    fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+        // finish_batch consumes FlowRecordBuilders by value, so swap in a
+        // fresh, empty set -- this is what makes finish() reusable rather
+        // than one-shot: a builder that instead kept accumulating into the
+        // same finished set would silently duplicate rows on the next call.
+        let builders = std::mem::take(&mut self.builders);
+        finish_batch(builders, flow_record_schema())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // IpfixSink — ParquetSink adapter
 // ---------------------------------------------------------------------------
 
@@ -288,28 +343,90 @@ impl ParquetSink for IpfixSink {
     /// could then mint one live day-buffer per distinct claimed date
     /// (~49,710 of them), each eventually its own single-row Parquet PUT.
     ///
-    /// So this mapper binds exactly ONE `Utc::now()` here, for the whole
-    /// batch, and threads it through `append_flow_record` as `received_at`
-    /// -- unlike the other eight sinks' `to_record_batch`, which are pure
-    /// and clock-free. This is safe for the same reason syslog's single
-    /// `Utc::now()` read is (see `syslog_message_to_batch`): the one bound
-    /// value is written into the `partition_time` column of the SAME batch
-    /// that `day_and_batch`'s default reads the buffer-key day back from,
-    /// so the buffer key and the persisted column can never disagree, even
-    /// though the value itself is a wall-clock read. Do NOT "fix" this back
-    /// to `export_time` for both arguments -- that reinstates the inert
-    /// clamp above.
+    /// So a batch of `FlowRecord`s must be mapped against exactly ONE bound
+    /// `Utc::now()`, threaded through `append_flow_record` as `received_at`
+    /// for every flow in the batch -- unlike the other eight sinks' mappers,
+    /// which are pure and clock-free. This is safe for the same reason
+    /// syslog's single `Utc::now()` read is (see `syslog_message_to_batch`):
+    /// the one bound value is written into the `partition_time` column of
+    /// the SAME batch whose buffer-key day is derived from that same value
+    /// (see `day_and_batch` below), so the buffer key and the persisted
+    /// column can never disagree, even though the value itself is a
+    /// wall-clock read. Do NOT "fix" this back to `export_time` for both
+    /// arguments -- that reinstates the inert clamp above.
+    ///
+    /// In the production `push()` path this method is never actually
+    /// called: `new_batch` below always matches (IPFIX has one schema), so
+    /// every record goes through `FlowRecordAccumulator`, fed the single
+    /// `now` `push()` already read and passed via `day_and_batch`. This
+    /// implementation exists as the direct-call path (`ParquetSink`'s own
+    /// tests, and any caller that invokes `to_record_batch` outside the
+    /// writer) and binds its own `Utc::now()` for that path only, via the
+    /// same accumulator so the row-mapping logic exists in exactly one
+    /// place.
     fn to_record_batch(
         &self,
         records: &Vec<FlowRecord>,
-        schema: &Arc<arrow_schema::Schema>,
+        _schema: &Arc<arrow_schema::Schema>,
     ) -> anyhow::Result<arrow_array::RecordBatch> {
-        let mut builders = FlowRecordBuilders::new();
-        let received_at = chrono::Utc::now();
-        for r in records {
-            append_flow_record(&mut builders, r, received_at)?;
+        let mut acc = FlowRecordAccumulator::new();
+        acc.try_append(records, chrono::Utc::now())?;
+        acc.finish()
+    }
+
+    /// Amortized-builder fast path: IPFIX has exactly one schema
+    /// (`flow_record_schema()`), so this always matches -- gated on
+    /// `Arc::ptr_eq` rather than unconditionally returning `Some` purely
+    /// defensively, mirroring `ZeekSink::new_batch` / `SuricataSink::new_batch`.
+    fn new_batch(
+        &self,
+        schema: &Arc<arrow_schema::Schema>,
+    ) -> Option<Box<dyn crate::forwarding::buffered_writer::RecordBatchAccumulator<Vec<FlowRecord>>>>
+    {
+        if Arc::ptr_eq(schema, &flow_record_schema()) {
+            Some(Box::new(FlowRecordAccumulator::new()))
+        } else {
+            None
         }
-        finish_batch(builders, schema.clone())
+    }
+
+    /// Overrides the default `day_and_batch`: derives the day directly from
+    /// the FIRST flow in the `Vec`, without building a batch. Load-bearing
+    /// for the same reason as `ZeekSink`'s / `SuricataSink`'s overrides --
+    /// `push()` calls this before it knows whether the record goes to the
+    /// amortized live builder, so building a batch here just to learn the
+    /// day would make every push pay for a throwaway `RecordBatch` (the
+    /// full 19-builder `FlowRecordBuilders` set), defeating the entire point
+    /// of `FlowRecordAccumulator`.
+    ///
+    /// Must match today's (default `day_and_batch` + `day_from_batch`)
+    /// behaviour exactly: `day_from_batch` reads `ts.value(0)` -- row 0 only
+    /// -- of the materialized batch's `partition_time` column. Row 0 always
+    /// corresponds to `records[0]` (`append_flow_record` appends in order),
+    /// so replicating `partition_time(Some(records[0].export_time), now)`
+    /// here picks the identical day without needing the batch at all. A
+    /// datagram with multiple flows spanning midnight keys on its first
+    /// flow today and must continue to -- do not average, sort, or use the
+    /// last flow instead.
+    ///
+    /// `now` here IS the same single per-push clock read `to_record_batch`
+    /// binds independently in its own fallback path -- unlike Zeek/Suricata,
+    /// IPFIX has no per-record receipt instant to fall back to, so this
+    /// method actually uses its `now` argument instead of ignoring it.
+    fn day_and_batch(
+        &self,
+        records: &Vec<FlowRecord>,
+        _schema: &Arc<arrow_schema::Schema>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<(chrono::NaiveDate, Option<arrow_array::RecordBatch>)> {
+        let day = match records.first() {
+            Some(first) => {
+                crate::forwarding::buffered_writer::partition_time(Some(first.export_time), now)
+                    .date_naive()
+            }
+            None => now.date_naive(),
+        };
+        Ok((day, None))
     }
 }
 
@@ -802,6 +919,210 @@ mod tests {
             "time_column() returned {:?}, which is not a field in the schema",
             col
         );
+    }
+
+    // -- FlowRecordAccumulator unit tests --
+
+    #[test]
+    fn flow_record_accumulator_appends_exact_row_count_for_ten_flows() {
+        let records: Vec<FlowRecord> = (0..10)
+            .map(|i| make_flow_record(Some("10.0.0.1"), Some(i as u64), serde_json::json!({})))
+            .collect();
+
+        let mut acc = FlowRecordAccumulator::new();
+        assert_eq!(acc.len(), 0);
+        assert!(acc.try_append(&records, Utc::now()).unwrap());
+        assert_eq!(
+            acc.len(),
+            10,
+            "10 flows in one push must add exactly 10 rows"
+        );
+
+        let batch = acc.finish().unwrap();
+        assert_eq!(batch.num_rows(), 10);
+        assert_eq!(acc.len(), 0, "finish must reset the row count");
+    }
+
+    #[test]
+    fn flow_record_accumulator_single_flow_and_empty_vec() {
+        let mut acc = FlowRecordAccumulator::new();
+
+        // N=0: an empty datagram must add 0 rows, not silently count as 1.
+        assert!(acc.try_append(&vec![], Utc::now()).unwrap());
+        assert_eq!(acc.len(), 0, "an empty Vec<FlowRecord> must add 0 rows");
+
+        // N=1.
+        let r = make_flow_record(Some("10.0.0.1"), Some(1), serde_json::json!({}));
+        assert!(acc.try_append(&vec![r], Utc::now()).unwrap());
+        assert_eq!(acc.len(), 1, "a single-flow push must add exactly 1 row");
+    }
+
+    #[test]
+    fn flow_record_accumulator_finish_twice_produces_independent_batches() {
+        let mut acc = FlowRecordAccumulator::new();
+
+        let r_a = make_flow_record(Some("10.0.0.1"), Some(1), serde_json::json!({}));
+        acc.try_append(&vec![r_a], Utc::now()).unwrap();
+        let batch_a = acc.finish().unwrap();
+        assert_eq!(
+            batch_a.num_rows(),
+            1,
+            "first finish must contain exactly the rows appended before it"
+        );
+
+        let r_b = make_flow_record(Some("10.0.0.2"), Some(2), serde_json::json!({}));
+        let r_c = make_flow_record(Some("10.0.0.3"), Some(3), serde_json::json!({}));
+        acc.try_append(&vec![r_b, r_c], Utc::now()).unwrap();
+        let batch_b = acc.finish().unwrap();
+        assert_eq!(
+            batch_b.num_rows(),
+            2,
+            "second finish must contain exactly the rows appended since the first finish -- \
+             a builder that retained prior rows would produce 3 here, silently duplicating data"
+        );
+    }
+
+    #[test]
+    fn flow_record_accumulator_matches_append_flow_record_output_row_for_row() {
+        // Baseline: today's exact per-record path, N single-record calls
+        // into the same builders, concatenated -- i.e. exactly what
+        // `to_record_batch` used to do inline before routing through the
+        // accumulator.
+        let now = Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).unwrap();
+        let mut r0 = make_flow_record(
+            Some("10.0.0.1"),
+            Some(1234),
+            serde_json::json!({"ie200": "0xdeadbeef", "nested": {"k": 1}}),
+        );
+        r0.flow_start = Some(Utc.with_ymd_and_hms(2026, 4, 2, 7, 59, 0).unwrap());
+        r0.flow_end = Some(Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 30).unwrap());
+        let r1 = make_flow_record(None, None, serde_json::json!({})); // nullable fields all absent
+        let records = vec![r0, r1];
+
+        let mut expected_builders = FlowRecordBuilders::new();
+        for r in &records {
+            append_flow_record(&mut expected_builders, r, now).unwrap();
+        }
+        let expected = finish_batch(expected_builders, flow_record_schema()).unwrap();
+
+        // Accumulator path: one accumulator, one multi-flow append, one finish.
+        let mut acc = FlowRecordAccumulator::new();
+        acc.try_append(&records, now).unwrap();
+        let actual = acc.finish().unwrap();
+
+        assert_eq!(actual.num_rows(), expected.num_rows());
+        assert_eq!(actual.schema(), expected.schema());
+        for col_idx in 0..expected.num_columns() {
+            assert_eq!(
+                format!("{:?}", actual.column(col_idx)),
+                format!("{:?}", expected.column(col_idx)),
+                "column {col_idx} differs between the accumulator and per-record paths"
+            );
+        }
+    }
+
+    #[test]
+    fn ipfix_sink_new_batch_gates_on_schema_ptr_eq() {
+        let sink = IpfixSink;
+        assert!(
+            sink.new_batch(&flow_record_schema()).is_some(),
+            "new_batch must activate for the real flow_record_schema()"
+        );
+
+        let other_schema = Arc::new(Schema::new(Vec::<Field>::new()));
+        assert!(
+            sink.new_batch(&other_schema).is_none(),
+            "new_batch must not activate for a schema that isn't flow_record_schema()"
+        );
+    }
+
+    // -- IpfixSink::day_and_batch unit tests --
+
+    #[test]
+    fn day_and_batch_matches_default_day_from_batch_mechanism() {
+        // The default `ParquetSink::day_and_batch` would build a batch and
+        // read `ts.value(0)` off its `partition_time` column (row 0 only).
+        // `IpfixSink::day_and_batch` must derive the identical day without
+        // building that batch. Prove parity by building the row-0 reference
+        // batch directly via the accumulator (same mechanism, same `now`)
+        // and comparing days.
+        let now = Utc.with_ymd_and_hms(2026, 6, 15, 3, 0, 0).unwrap();
+        let mut r0 = make_flow_record(Some("10.0.0.1"), Some(1), serde_json::json!({}));
+        r0.export_time = Utc.with_ymd_and_hms(2026, 6, 14, 23, 0, 0).unwrap(); // previous day, within clamp
+        let r1 = make_flow_record(None, None, serde_json::json!({}));
+        let records = vec![r0, r1];
+
+        let mut acc = FlowRecordAccumulator::new();
+        acc.try_append(&records, now).unwrap();
+        let batch = acc.finish().unwrap();
+        let partition_time_col = batch
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .unwrap();
+        let expected_day = DateTime::from_timestamp_micros(partition_time_col.value(0))
+            .unwrap()
+            .date_naive();
+
+        let sink = IpfixSink;
+        let schema = sink.schema(None);
+        let (day, pre_mapped) = sink.day_and_batch(&records, &schema, now).unwrap();
+        assert!(
+            pre_mapped.is_none(),
+            "day_and_batch must not build a batch just to compute the day"
+        );
+        assert_eq!(day, expected_day);
+    }
+
+    #[test]
+    fn day_and_batch_empty_vec_uses_now() {
+        let now = Utc.with_ymd_and_hms(2030, 12, 25, 0, 0, 0).unwrap();
+        let sink = IpfixSink;
+        let schema = sink.schema(None);
+        let (day, pre_mapped) = sink.day_and_batch(&vec![], &schema, now).unwrap();
+        assert!(pre_mapped.is_none());
+        assert_eq!(day, now.date_naive());
+    }
+
+    /// Day-key regression test guarding the security invariant: a
+    /// multi-flow datagram whose FIRST flow has a spoofed `export_time` --
+    /// once far in the future, once far in the past -- must bucket by the
+    /// day `partition_time`'s clamp produces (the real receipt day), never
+    /// by the spoofed claimed date. If `day_and_batch` ever read its own
+    /// clock instead of the `now` threaded in from `push()`, or if
+    /// `try_append` ever stamped a different `now` into the persisted
+    /// column than `day_and_batch` used to pick the buffer, this test would
+    /// only fail once in a blue moon (both reads are "now" microseconds
+    /// apart) -- the case that reliably catches a broken clamp is the
+    /// spoofed-date assertions below, not a hypothetical clock race.
+    #[test]
+    fn day_and_batch_rejects_spoofed_first_flow_export_time_far_future_and_far_past() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap();
+        let far_future = Utc.with_ymd_and_hms(2090, 3, 1, 0, 0, 0).unwrap();
+        let far_past = Utc.with_ymd_and_hms(1975, 6, 1, 0, 0, 0).unwrap();
+
+        for spoofed in [far_future, far_past] {
+            let mut r0 = make_flow_record(Some("10.0.0.1"), Some(1), serde_json::json!({}));
+            r0.export_time = spoofed;
+            let r1 = make_flow_record(None, None, serde_json::json!({}));
+            let records = vec![r0, r1];
+
+            let sink = IpfixSink;
+            let schema = sink.schema(None);
+            let (day, _) = sink.day_and_batch(&records, &schema, now).unwrap();
+
+            assert_eq!(
+                day,
+                now.date_naive(),
+                "a spoofed first-flow export_time must bucket by the receipt day, not the claimed date"
+            );
+            assert_ne!(
+                day,
+                spoofed.date_naive(),
+                "the buffer-key day must never equal the spoofed export_time's day"
+            );
+        }
     }
 
     // -- Task 2: writer push accumulation and bounded buffer under S3 outage --
@@ -1331,6 +1652,136 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Day-key regression test guarding the security invariant, driven
+    /// through the REAL writer path (`ipfix_local_start` -> `push()` ->
+    /// on-disk Parquet), not just a direct `day_and_batch` call. The S3/local
+    /// key layout embeds the buffer's day key as `year=Y/month=M/day=D` (see
+    /// `build_key`); this test extracts that day from the on-disk path and
+    /// compares it against the day of the `partition_time` value actually
+    /// written into row 0 of the file's own contents. A regression that
+    /// reintroduces the second clock read (`day_and_batch` computing its own
+    /// `Utc::now()` instead of using the one `push()` passed in) would make
+    /// the two disagree once in a while near midnight; a regression that
+    /// reinstates the inert clamp (passing `export_time` as both arguments
+    /// to `partition_time`) would instead make the spoofed date show up
+    /// directly in the directory path -- both are asserted against below.
+    #[tokio::test]
+    async fn day_key_regression_spoofed_export_time_lands_on_receipt_day_not_claimed_date() {
+        use crate::config::IpfixLocalConfig;
+        use crate::forwarding::local_sink::LocalDiskSink;
+        use crate::ipfix::listener::IpfixHandler;
+        use arrow::array::TimestampMicrosecondArray;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sink = Arc::new(
+            LocalDiskSink::new(dir.path().to_path_buf())
+                .await
+                .expect("LocalDiskSink::new"),
+        );
+        let cfg = IpfixLocalConfig {
+            directory: dir.path().to_path_buf(),
+            prefix: "ipfix".to_string(),
+            max_buffer_rows: 100,
+            flush_threshold_bytes: usize::MAX, // only the shutdown flush fires
+            flush_interval_secs: 3600,
+            channel_capacity: 64,
+        };
+        let (handler, writer_task) = ipfix_local_start(
+            &cfg,
+            sink,
+            Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
+        );
+
+        let far_future = Utc.with_ymd_and_hms(2090, 3, 1, 0, 0, 0).unwrap();
+        let far_past = Utc.with_ymd_and_hms(1975, 6, 1, 0, 0, 0).unwrap();
+
+        // First flow in the datagram carries the spoofed export_time --
+        // day_and_batch keys the whole push on row 0.
+        let mut r_future = make_flow_record(Some("10.0.0.1"), Some(1), serde_json::json!({}));
+        r_future.export_time = far_future;
+        let mut r_past = make_flow_record(None, None, serde_json::json!({}));
+        r_past.export_time = far_past;
+
+        let before = Utc::now();
+        let src: std::net::SocketAddr = "127.0.0.1:4739".parse().unwrap();
+        handler.handle_flows(vec![r_future], src).await;
+        handler.handle_flows(vec![r_past], src).await;
+        let after = Utc::now();
+
+        drop(handler);
+        tokio::time::timeout(std::time::Duration::from_secs(5), writer_task)
+            .await
+            .expect("writer task must exit within 5s")
+            .expect("writer task must not panic");
+
+        let ipfix_dir = dir.path().join("ipfix");
+        let parquet_files: Vec<_> = walkdir_flat(&ipfix_dir)
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+            .collect();
+        assert_eq!(
+            parquet_files.len(),
+            1,
+            "both spoofed dates must collapse onto the SAME receipt-day buffer, \
+             not mint one file per claimed date; found {parquet_files:?}"
+        );
+
+        let path_str = parquet_files[0].to_string_lossy().to_string();
+        let key_day = day_from_key_path(&path_str)
+            .unwrap_or_else(|| panic!("could not parse year=/month=/day= from {path_str}"));
+
+        let bytes = std::fs::read(&parquet_files[0]).expect("read parquet file");
+        let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            bytes::Bytes::from(bytes),
+        )
+        .expect("parquet builder");
+        let mut reader = builder.build().expect("parquet reader");
+        let rb = reader
+            .next()
+            .expect("at least one batch")
+            .expect("batch ok");
+        let partition_time_col = rb
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let row0_day = DateTime::from_timestamp_micros(partition_time_col.value(0))
+            .unwrap()
+            .date_naive();
+
+        assert_eq!(
+            key_day, row0_day,
+            "the buffer-key day (from the on-disk path) must equal the day of the \
+             partition_time value actually written into row 0"
+        );
+        assert_ne!(key_day, far_future.date_naive());
+        assert_ne!(key_day, far_past.date_naive());
+        assert!(
+            key_day >= before.date_naive() && key_day <= after.date_naive(),
+            "the buffer-key day must be the real receipt day ({before}..{after}), got {key_day}"
+        );
+    }
+
+    /// Parse the `year=YYYY/month=MM/day=DD` segments out of an on-disk (or
+    /// S3) key path built by `build_key`.
+    fn day_from_key_path(path: &str) -> Option<chrono::NaiveDate> {
+        let mut year = None;
+        let mut month = None;
+        let mut day = None;
+        for seg in path.split(['/', '\\']) {
+            if let Some(v) = seg.strip_prefix("year=") {
+                year = v.parse::<i32>().ok();
+            } else if let Some(v) = seg.strip_prefix("month=") {
+                month = v.parse::<u32>().ok();
+            } else if let Some(v) = seg.strip_prefix("day=") {
+                day = v.parse::<u32>().ok();
+            }
+        }
+        chrono::NaiveDate::from_ymd_opt(year?, month?, day?)
     }
 
     // -- MultiIpfixHandler tests --
