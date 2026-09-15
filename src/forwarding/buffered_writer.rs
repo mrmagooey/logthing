@@ -159,6 +159,19 @@ pub trait RecordBatchAccumulator<Record>: Send {
     /// per-record schema-mismatch fallback the adapter's `to_record_batch`
     /// already performs) -- the caller must then fall back to
     /// `to_record_batch` for just this one record.
+    ///
+    /// Contract implementers must uphold: on `Ok(true)`, `len()` must be
+    /// exactly `rows_before + N` where `N` is the number of rows this
+    /// `Record` contributed (1 for a one-row-per-record sink, more for a
+    /// sink whose `Record` carries multiple rows, e.g. a batch of flow
+    /// records). This method must never internally call `finish` (which
+    /// would reset `len()` back to zero). The caller
+    /// (`PartitionedParquetWriter::push`) derives the exact row count to
+    /// add to its own bookkeeping from the `len()` delta across this call
+    /// rather than assuming 1, so a violation here silently corrupts
+    /// `row_count`-driven behavior: the `max_rows` flush trigger, the
+    /// `BUILDER_BATCH_ROWS` force-materialize check, and
+    /// `drop_oldest_to_cap`'s hard-cap eviction loop.
     fn try_append(&mut self, record: &Record) -> anyhow::Result<bool>;
 
     /// Rows appended so far, not yet finished into a `RecordBatch`.
@@ -916,12 +929,23 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         }
 
         let (n_rows, byte_delta) = if let Some(builder) = buf.live_builder.as_mut() {
+            let rows_before = builder.len();
             match builder.try_append(&record) {
                 Ok(true) => {
                     // Accepted into the live builder. row_count is exact and
                     // immediate; byte_count is deliberately deferred to
                     // materialization time (see design doc §5).
-                    (1usize, 0usize)
+                    //
+                    // Derived as a delta rather than assumed to be 1: a
+                    // `Record` need not be exactly one row (e.g. a future
+                    // `IpfixSink::Record = Vec<FlowRecord>`, one push per
+                    // UDP datagram). `RecordBatchAccumulator::try_append`'s
+                    // contract guarantees `len()` increases by exactly the
+                    // number of rows appended, so this delta is exact for
+                    // both today's one-row sinks and any future multi-row
+                    // sink. Saturating so a contract-violating accumulator
+                    // can't underflow `n_rows`.
+                    (builder.len().saturating_sub(rows_before), 0usize)
                 }
                 Ok(false) => {
                     // Rejected: this record doesn't match the accumulator's
@@ -2408,6 +2432,157 @@ max_partitions = 128
             buf.live_builder.as_ref().map(|b| b.len()),
             Some(5),
             "all 5 records should be sitting in the live builder"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-row accumulator tests (row-count accounting fix) -- no real
+    // sink has a `Record` carrying more than one row yet (the motivating
+    // case is a future `IpfixSink::Record = Vec<FlowRecord>`, one push per
+    // UDP datagram), so this test-only accumulator/sink pair is the only
+    // way to exercise that shape today.
+    // -----------------------------------------------------------------------
+
+    /// Appends every element of a `Vec<String>` record as its own row --
+    /// i.e. `try_append` can add more than one row per call, unlike
+    /// `MockAccumulator` above.
+    struct MultiRowMockAccumulator {
+        builder: StringBuilder,
+        rows: usize,
+    }
+
+    impl MultiRowMockAccumulator {
+        fn new() -> Self {
+            Self {
+                builder: StringBuilder::new(),
+                rows: 0,
+            }
+        }
+    }
+
+    impl RecordBatchAccumulator<Vec<String>> for MultiRowMockAccumulator {
+        fn try_append(&mut self, record: &Vec<String>) -> anyhow::Result<bool> {
+            for v in record {
+                self.builder.append_value(v);
+            }
+            self.rows += record.len();
+            Ok(true)
+        }
+        fn len(&self) -> usize {
+            self.rows
+        }
+        fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+            let col: Arc<dyn arrow::array::Array> = Arc::new(self.builder.finish());
+            self.rows = 0;
+            Ok(RecordBatch::try_new(test_schema(), vec![col])?)
+        }
+    }
+
+    struct MultiRowMockSink;
+    impl ParquetSink for MultiRowMockSink {
+        type Record = Vec<String>;
+        fn source(&self) -> &'static str {
+            "test"
+        }
+        fn partition(&self, _r: &Vec<String>) -> Option<String> {
+            None
+        }
+        fn schema(&self, _p: Option<&str>) -> Arc<Schema> {
+            test_schema()
+        }
+        fn to_record_batch(
+            &self,
+            record: &Vec<String>,
+            schema: &Arc<Schema>,
+        ) -> anyhow::Result<RecordBatch> {
+            let col = Arc::new(StringArray::from(
+                record.iter().map(String::as_str).collect::<Vec<_>>(),
+            ));
+            Ok(RecordBatch::try_new(schema.clone(), vec![col])?)
+        }
+        fn new_batch(
+            &self,
+            _schema: &Arc<Schema>,
+        ) -> Option<Box<dyn RecordBatchAccumulator<Vec<String>>>> {
+            Some(Box::new(MultiRowMockAccumulator::new()))
+        }
+    }
+
+    /// Direct, no-writer-involved unit test of the accumulator's own
+    /// contract: `len()` must increase by exactly the number of elements
+    /// appended, never by 1 regardless of record size -- this is the
+    /// invariant `PartitionedParquetWriter::push`'s row-count delta relies
+    /// on.
+    #[test]
+    fn multi_row_accumulator_len_advances_by_exact_row_count_appended() {
+        let mut acc = MultiRowMockAccumulator::new();
+        assert_eq!(acc.len(), 0);
+
+        acc.try_append(&vec!["a".to_string(), "b".to_string(), "c".to_string()])
+            .unwrap();
+        assert_eq!(acc.len(), 3, "a 3-element record must add exactly 3 rows");
+
+        acc.try_append(&vec![]).unwrap();
+        assert_eq!(
+            acc.len(),
+            3,
+            "an empty record must add 0 rows, not silently count as 1"
+        );
+
+        acc.try_append(&vec!["d".to_string()]).unwrap();
+        assert_eq!(
+            acc.len(),
+            4,
+            "a 1-element record must add exactly 1 row on top of the prior 3"
+        );
+    }
+
+    /// The bug this branch fixes: `push()` used to hardcode `n_rows = 1`
+    /// for every record accepted into the live builder, which is only
+    /// correct for a `Record` that is exactly one row. Pushing records
+    /// that carry N>1 rows must increase `buf.row_count` by exactly N,
+    /// covering N=3, N=1, and the N=0 edge case (which must not be
+    /// silently counted as 1).
+    #[tokio::test]
+    async fn push_multi_row_record_increases_row_count_by_the_actual_row_count() {
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(1_000_000); // nothing flushes
+        let mut w = PartitionedParquetWriter::new(MultiRowMockSink, s3, cfg, policy);
+
+        // N=3
+        w.push(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            w.buffer_by_partition("").unwrap().row_count,
+            3,
+            "a 3-row record must increase row_count by 3, not 1"
+        );
+
+        // N=0 -- must not be silently counted as 1.
+        w.push(vec![]).await.unwrap();
+        assert_eq!(
+            w.buffer_by_partition("").unwrap().row_count,
+            3,
+            "an empty record must add 0 rows to row_count"
+        );
+
+        // N=1
+        w.push(vec!["d".to_string()]).await.unwrap();
+        assert_eq!(
+            w.buffer_by_partition("").unwrap().row_count,
+            4,
+            "a 1-row record must add exactly 1 row on top of the prior 3"
+        );
+
+        assert_eq!(
+            w.buffer_by_partition("")
+                .unwrap()
+                .live_builder
+                .as_ref()
+                .map(|b| b.len()),
+            Some(4),
+            "the live builder's own row count must match buf.row_count exactly"
         );
     }
 
@@ -4473,6 +4648,60 @@ secret_key  = "SECRET"
              in the live builder during an in-flight flush",
             buf.row_count,
             hard_cap
+        );
+
+        gate.add_permits(1);
+        w.drain_pending_flushes().await;
+    }
+
+    /// Same scenario as `in_flight_flush_still_hard_caps_rows_accumulating_in_the_live_builder`,
+    /// but with a sink whose `Record` carries 3 rows per push. Before the
+    /// row-count accounting fix, `row_count` would advance by 1 per push
+    /// regardless of the real 3-row content, so `drop_oldest_to_cap`'s
+    /// `while row_count > cap` loop would see a row_count roughly a third
+    /// of reality and evict far too rarely -- silently letting real
+    /// buffered data grow well past the intended hard cap even though
+    /// `row_count` itself stayed small. This checks the REAL held row
+    /// count (materialized batches + live builder), not just the
+    /// `row_count` bookkeeping field, since a buggy row_count would
+    /// otherwise stay numerically small enough to pass a naive
+    /// `row_count <= hard_cap` check while still being wrong.
+    #[tokio::test]
+    async fn drop_oldest_to_cap_bounds_real_rows_for_multi_row_records() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let sink: Arc<dyn UploadSink> = Arc::new(BlockingSink { gate: gate.clone() });
+        let max_rows = 1usize;
+        let (cfg, policy) = test_config(max_rows);
+        let hard_cap = max_rows.saturating_mul(4); // 4
+        let rows_per_push = 3usize;
+        let mut w = PartitionedParquetWriter::new(MultiRowMockSink, sink, cfg, policy);
+
+        // First push (3 rows) triggers a flush that blocks forever until
+        // `gate` fires.
+        w.push(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+            .await
+            .unwrap();
+        assert!(w.buffer_by_partition("").unwrap().in_flight);
+
+        // Push far more 3-row records while the first flush is stuck
+        // in-flight.
+        for i in 1..(hard_cap * 3) {
+            w.push(vec![format!("r{i}a"), format!("r{i}b"), format!("r{i}c")])
+                .await
+                .unwrap();
+        }
+
+        let buf = w.buffer_by_partition("").unwrap();
+        let real_rows_held: usize = buf.buffer.iter().map(|(b, _)| b.num_rows()).sum::<usize>()
+            + buf.live_builder.as_ref().map(|b| b.len()).unwrap_or(0);
+        assert!(
+            real_rows_held <= hard_cap + rows_per_push,
+            "real buffered rows {real_rows_held} must stay bounded near hard_cap \
+             {hard_cap} (+ one push's worth of slack for eviction granularity) even \
+             though every push carries {rows_per_push} rows -- under the pre-fix \
+             per-push-counts-as-1 bug this grows unbounded because the eviction \
+             loop's row_count undercounts real content by a factor of \
+             {rows_per_push}x"
         );
 
         gate.add_permits(1);
