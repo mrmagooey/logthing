@@ -209,3 +209,142 @@ async fn hec_local_start_emits_iceberg_descriptor_when_configured() {
         "expected at least one descriptor .json file under {descriptor_dir:?}"
     );
 }
+
+/// Pushes 1800 real HEC records across two sourcetype partitions through the
+/// real pipeline (`hec_local_start` → `PartitionedParquetWriter` →
+/// `LocalDiskSink`), crossing the `BUILDER_BATCH_ROWS` (1000) threshold in
+/// `GenericAccumulator`'s live builder mid-burst for one partition while the
+/// other stays well under it -- proving the amortized builder correctly
+/// materializes once at row 1000 and resumes accumulating the remainder in a
+/// fresh builder, without losing or duplicating rows, AND that this all
+/// happens per-partition (each sourcetype gets its own independent
+/// accumulator instance). Mirrors
+/// `suricata_local_burst_of_1500_alert_records_crosses_builder_batch_rows`.
+/// Every 7th record has no `host`/`time`, exercising the nullable columns
+/// through the accumulator path across the materialize boundary too.
+#[tokio::test]
+async fn hec_local_burst_crossing_builder_batch_rows_across_multiple_partitions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = std::sync::Arc::new(
+        LocalDiskSink::new(dir.path().to_path_buf())
+            .await
+            .expect("LocalDiskSink::new"),
+    );
+    // Row/byte/time thresholds all high enough that no in-loop flush fires;
+    // the only flush is the shutdown flush once the handler is dropped.
+    let cfg = GenericLocalConfig {
+        directory: dir.path().to_path_buf(),
+        prefix: "hec".to_string(),
+        max_buffer_rows: 100_000,
+        flush_threshold_bytes: 100_000_000,
+        flush_interval_secs: 3600,
+        channel_capacity: 2_000,
+    };
+
+    let (handler, join_handle) = hec_local_start(
+        &cfg,
+        sink,
+        64,
+        std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+
+    const N_A: usize = 1500; // crosses BUILDER_BATCH_ROWS (1000) mid-burst
+    const N_B: usize = 300; // stays well under it -- independent accumulator
+    for i in 0..N_A {
+        let rec = if i % 7 == 0 {
+            GenericRecord {
+                sourcetype: "type_a".to_string(),
+                host: None,
+                time: None,
+                fields: serde_json::json!({"i": i}),
+                received_at: chrono::Utc::now(),
+            }
+        } else {
+            GenericRecord {
+                sourcetype: "type_a".to_string(),
+                host: Some(format!("host-{i}")),
+                time: Some(chrono::Utc::now()),
+                fields: serde_json::json!({"i": i}),
+                received_at: chrono::Utc::now(),
+            }
+        };
+        handler.try_send(rec).expect("channel has ample capacity");
+    }
+    for i in 0..N_B {
+        let rec = GenericRecord {
+            sourcetype: "type_b".to_string(),
+            host: Some(format!("other-{i}")),
+            time: Some(chrono::Utc::now()),
+            fields: serde_json::json!({"i": i}),
+            received_at: chrono::Utc::now(),
+        };
+        handler.try_send(rec).expect("channel has ample capacity");
+    }
+
+    // Drop the handler to close the channel; the writer task's shutdown path
+    // drains any in-flight flushes and then performs one final, synchronous
+    // flush covering everything still buffered (materialized + still-live).
+    drop(handler);
+    tokio::time::timeout(std::time::Duration::from_secs(10), join_handle)
+        .await
+        .expect("writer task exits within 10s")
+        .expect("writer task must not panic");
+
+    let count_rows_under = |partition: &str| -> (usize, usize) {
+        let partition_dir = dir.path().join("hec").join(partition);
+        let mut all_files = Vec::new();
+        walk_all_files(&partition_dir, &mut all_files);
+        let parquet_files: Vec<_> = all_files
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+            .collect();
+        let mut total_rows = 0usize;
+        let mut null_host_count = 0usize;
+        for file_path in &parquet_files {
+            let bytes = std::fs::read(file_path).expect("read parquet file");
+            let builder =
+                ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes)).expect("builder");
+            let reader = builder.build().expect("reader");
+            for rb in reader {
+                let rb = rb.expect("batch ok");
+                total_rows += rb.num_rows();
+                use arrow::array::{Array, StringArray};
+                let host_col = rb
+                    .column_by_name("host")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for i in 0..rb.num_rows() {
+                    if host_col.is_null(i) {
+                        null_host_count += 1;
+                    }
+                }
+            }
+        }
+        (total_rows, null_host_count)
+    };
+
+    let (rows_a, nulls_a) = count_rows_under("type_a");
+    let (rows_b, nulls_b) = count_rows_under("type_b");
+
+    assert_eq!(
+        rows_a, N_A,
+        "expected exactly {N_A} rows across all type_a Parquet files, proving the \
+         BUILDER_BATCH_ROWS (1000) materialize threshold was crossed at least once \
+         mid-burst without losing or duplicating rows"
+    );
+    assert_eq!(
+        nulls_a,
+        N_A.div_ceil(7),
+        "every 7th type_a record had no host and must round-trip as null through \
+         the materialize boundary"
+    );
+    assert_eq!(
+        rows_b, N_B,
+        "type_b's independent accumulator (never crossing BUILDER_BATCH_ROWS) must \
+         still land every row exactly once"
+    );
+    assert_eq!(nulls_b, 0, "no type_b record had a null host");
+}
