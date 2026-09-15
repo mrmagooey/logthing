@@ -12,9 +12,10 @@
 use crate::config::HecS3Config;
 use crate::forwarding::buffered_writer::ParquetSink;
 use crate::ingest::GenericRecord;
-use arrow_array::{RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow_array::builder::{StringBuilder, TimestampMicrosecondBuilder};
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 // ---------------------------------------------------------------------------
 // GenericSink — ParquetSink adapter
@@ -24,27 +25,135 @@ use std::sync::Arc;
 pub struct GenericSink;
 
 /// Build the fixed 6-column schema used for all HEC partitions.
+///
+/// `LazyLock`-cached (one `Arc` for the process lifetime) so `new_batch`'s
+/// `Arc::ptr_eq` gate against this same value is meaningful -- a fresh
+/// `Arc::new(Schema::new(..))` on every call would never `ptr_eq`-match
+/// anything, silently defeating the amortized-builder fast path. Mirrors
+/// `ipfix::schema::flow_record_schema` / `suricata::schema::envelope_schema`.
 fn generic_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("sourcetype", DataType::Utf8, false),
-        Field::new("host", DataType::Utf8, true),
-        Field::new(
-            "time",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            true,
-        ),
-        Field::new(
-            "received_at",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        ),
-        Field::new("fields", DataType::Utf8, false),
-        Field::new(
-            "partition_time",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        ),
-    ]))
+    static S: LazyLock<Arc<Schema>> = LazyLock::new(|| {
+        Arc::new(Schema::new(vec![
+            Field::new("sourcetype", DataType::Utf8, false),
+            Field::new("host", DataType::Utf8, true),
+            Field::new(
+                "time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new(
+                "received_at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("fields", DataType::Utf8, false),
+            Field::new(
+                "partition_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+        ]))
+    });
+    S.clone()
+}
+
+/// Amortized builder set for the fixed 6-column HEC/generic schema. Holds
+/// the same 6 Arrow builders `to_record_batch` used to create fresh on
+/// every call, as persistent fields, so they can be reused across many
+/// records via `finish(&mut self)` instead of reallocated per record.
+/// Mirrors `suricata::schema::EnvelopeAccumulator`.
+pub(crate) struct GenericAccumulator {
+    b_sourcetype: StringBuilder,
+    b_host: StringBuilder,
+    b_time: TimestampMicrosecondBuilder,
+    b_received_at: TimestampMicrosecondBuilder,
+    b_fields: StringBuilder,
+    b_partition_time: TimestampMicrosecondBuilder,
+    rows: usize,
+}
+
+impl GenericAccumulator {
+    fn new() -> Self {
+        let ts_dtype = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        Self {
+            b_sourcetype: StringBuilder::new(),
+            b_host: StringBuilder::new(),
+            b_time: TimestampMicrosecondBuilder::new().with_data_type(ts_dtype.clone()),
+            b_received_at: TimestampMicrosecondBuilder::new().with_data_type(ts_dtype.clone()),
+            b_fields: StringBuilder::new(),
+            b_partition_time: TimestampMicrosecondBuilder::new().with_data_type(ts_dtype),
+            rows: 0,
+        }
+    }
+
+    /// Append one `GenericRecord` into the persistent builders. Shared by
+    /// both the amortized path (`RecordBatchAccumulator::try_append`) and
+    /// `to_record_batch`'s single-record wrapper below -- identical
+    /// extraction logic either way, so there is exactly one place that
+    /// knows how a `GenericRecord` becomes a row.
+    fn append_record_value(&mut self, record: &GenericRecord) {
+        self.b_sourcetype.append_value(&record.sourcetype);
+        self.b_host.append_option(record.host.as_deref());
+        match record.time {
+            Some(dt) => self.b_time.append_value(dt.timestamp_micros()),
+            None => self.b_time.append_null(),
+        }
+        self.b_received_at
+            .append_value(record.received_at.timestamp_micros());
+        let fields_json =
+            serde_json::to_string(&record.fields).unwrap_or_else(|_| "{}".to_string());
+        self.b_fields.append_value(&fields_json);
+        // partition_time -- derived from the nullable `time` (HEC's
+        // application-supplied event time), clamped against and falling
+        // back to `received_at`. See
+        // `crate::forwarding::buffered_writer::partition_time`.
+        let partition_time_value =
+            crate::forwarding::buffered_writer::partition_time(record.time, record.received_at);
+        self.b_partition_time
+            .append_value(partition_time_value.timestamp_micros());
+        self.rows += 1;
+    }
+
+    fn finish_batch(&mut self) -> anyhow::Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.b_sourcetype.finish()),
+            Arc::new(self.b_host.finish()),
+            Arc::new(self.b_time.finish()),
+            Arc::new(self.b_received_at.finish()),
+            Arc::new(self.b_fields.finish()),
+            Arc::new(self.b_partition_time.finish()),
+        ];
+        self.rows = 0;
+        Ok(RecordBatch::try_new(generic_schema(), columns)?)
+    }
+}
+
+impl crate::forwarding::buffered_writer::RecordBatchAccumulator<GenericRecord>
+    for GenericAccumulator
+{
+    fn try_append(
+        &mut self,
+        record: &GenericRecord,
+        // Every `GenericRecord` carries its own `time`/`received_at`, which
+        // `append_record_value` already derives `partition_time` from -- the
+        // shared per-push clock read has nothing to add here. See the trait
+        // doc comment for why the parameter exists at all.
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        // GenericSink has exactly one schema (the fixed 6-column schema),
+        // unlike Zeek's per-log-path registry, so there is no mismatch case
+        // to fall back from: every GenericRecord belongs to this accumulator.
+        self.append_record_value(record);
+        Ok(true)
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+        self.finish_batch()
+    }
 }
 
 impl ParquetSink for GenericSink {
@@ -75,58 +184,58 @@ impl ParquetSink for GenericSink {
         Some("partition_time")
     }
 
+    /// Map one `GenericRecord` to a single-row `RecordBatch`. Thin wrapper
+    /// over `GenericAccumulator` -- the field-extraction logic exists in
+    /// exactly one place (`append_record_value`), shared with the amortized
+    /// `try_append` path below. Mirrors `suricata::schema::map_envelope`.
     fn to_record_batch(
         &self,
         record: &GenericRecord,
-        schema: &Arc<Schema>,
+        _schema: &Arc<Schema>,
     ) -> anyhow::Result<RecordBatch> {
-        // col 0: sourcetype (Utf8, non-null)
-        let sourcetype = StringArray::from(vec![record.sourcetype.as_str()]);
+        let mut acc = GenericAccumulator::new();
+        acc.append_record_value(record);
+        acc.finish_batch()
+    }
 
-        // col 1: host (Utf8, nullable)
-        let host: StringArray = StringArray::from(vec![record.host.as_deref()]);
-
-        // col 2: time (Timestamp(Microsecond, UTC), nullable)
-        // IMPORTANT: must call .with_timezone("UTC") so the array's DataType
-        // matches the schema field's Timestamp(Microsecond, Some("UTC")).
-        let time_col = match &record.time {
-            Some(dt) => TimestampMicrosecondArray::from(vec![Some(dt.timestamp_micros())]),
-            None => TimestampMicrosecondArray::from(vec![None::<i64>]),
+    /// Amortized-builder fast path: `GenericSink` has exactly one schema
+    /// (the fixed 6-column schema), so this always matches -- gated on
+    /// `Arc::ptr_eq` rather than unconditionally returning `Some` purely
+    /// defensively, mirroring `SuricataSink::new_batch`, in case a second
+    /// schema is ever added.
+    fn new_batch(
+        &self,
+        schema: &Arc<Schema>,
+    ) -> Option<Box<dyn crate::forwarding::buffered_writer::RecordBatchAccumulator<GenericRecord>>>
+    {
+        if Arc::ptr_eq(schema, &generic_schema()) {
+            Some(Box::new(GenericAccumulator::new()))
+        } else {
+            None
         }
-        .with_timezone("UTC");
+    }
 
-        // col 3: received_at (Timestamp(Microsecond, UTC), non-null)
-        let received_col =
-            TimestampMicrosecondArray::from(vec![Some(record.received_at.timestamp_micros())])
-                .with_timezone("UTC");
-
-        // col 4: fields (Utf8, non-null) — JSON-serialized
-        let fields_json =
-            serde_json::to_string(&record.fields).unwrap_or_else(|_| "{}".to_string());
-        let fields_col = StringArray::from(vec![fields_json.as_str()]);
-
-        // col 5: partition_time (Timestamp(Microsecond, UTC), non-null) —
-        // derived from the nullable `time` (HEC's application-supplied event
-        // time), clamped against and falling back to `received_at`. See
-        // `crate::forwarding::buffered_writer::partition_time`.
-        let partition_time_value =
-            crate::forwarding::buffered_writer::partition_time(record.time, record.received_at);
-        let partition_time_col =
-            TimestampMicrosecondArray::from(vec![Some(partition_time_value.timestamp_micros())])
-                .with_timezone("UTC");
-
-        RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(sourcetype),
-                Arc::new(host),
-                Arc::new(time_col),
-                Arc::new(received_col),
-                Arc::new(fields_col),
-                Arc::new(partition_time_col),
-            ],
-        )
-        .map_err(|e| anyhow::anyhow!("GenericSink RecordBatch error: {e}"))
+    /// Overrides the default `day_and_batch`: derives the day directly from
+    /// `partition_time(time, received_at)` instead of building a batch
+    /// first. Load-bearing for the same reason as `SuricataSink`'s
+    /// override -- `push()` calls this before it knows whether the record
+    /// goes to the amortized `GenericAccumulator`, so building a batch here
+    /// just to learn the day would make every record pay for a throwaway
+    /// `RecordBatch`, defeating the entire point of the accumulator. Must
+    /// reproduce `day_from_batch`'s precedence exactly: `time_column()`
+    /// returns `"partition_time"`, which `to_record_batch` always populates
+    /// as non-null, so the primary (never-fallback) path is the only one
+    /// that can ever be taken here.
+    fn day_and_batch(
+        &self,
+        record: &GenericRecord,
+        _schema: &Arc<Schema>,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<(chrono::NaiveDate, Option<RecordBatch>)> {
+        let day =
+            crate::forwarding::buffered_writer::partition_time(record.time, record.received_at)
+                .date_naive();
+        Ok((day, None))
     }
 }
 
@@ -709,5 +818,144 @@ mod tests {
         let row = snapshot.iter().find(|r| r.source == "hec").unwrap();
         let total: u64 = row.hours.iter().map(|h| h.count).sum();
         assert_eq!(total, 1);
+    }
+
+    // --- GenericAccumulator tests ---
+
+    fn make_accumulator_test_records() -> Vec<GenericRecord> {
+        vec![
+            make_record("access_log"),
+            // Missing host and time -> null columns, exercised through the
+            // accumulator (partition_time must still fall back to
+            // received_at).
+            GenericRecord {
+                sourcetype: "audit_log".to_string(),
+                host: None,
+                time: None,
+                fields: json!({"uptime": 42}),
+                received_at: Utc::now(),
+            },
+            // Unusual/attacker-shaped sourcetype -- must round-trip byte for
+            // byte, not just for the common ASCII case. `sourcetype` is
+            // operator- (admin-token-)controlled, not sanitized like
+            // Suricata's `event_type`, so it must survive verbatim.
+            GenericRecord {
+                sourcetype: "évèpredator🔥/../../etc".to_string(),
+                host: Some("h".to_string()),
+                time: Some(Utc::now()),
+                fields: json!({"note": "unicode sourcetype"}),
+                received_at: Utc::now(),
+            },
+        ]
+    }
+
+    #[test]
+    fn generic_accumulator_matches_to_record_batch_output_row_for_row() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+
+        let records = make_accumulator_test_records();
+
+        // Baseline: today's exact per-record path, N single-row batches
+        // concatenated.
+        let schema = generic_schema();
+        let single_row_batches: Vec<RecordBatch> = records
+            .iter()
+            .map(|r| GenericSink.to_record_batch(r, &schema).unwrap())
+            .collect();
+        let expected = arrow::compute::concat_batches(&schema, &single_row_batches).unwrap();
+
+        // Amortized path: one accumulator, N appends, one finish.
+        let mut acc = GenericAccumulator::new();
+        for r in &records {
+            assert!(acc.try_append(r, Utc::now()).unwrap());
+        }
+        let actual = acc.finish().unwrap();
+
+        assert_eq!(actual.num_rows(), expected.num_rows());
+        assert_eq!(actual.schema(), expected.schema());
+        for col_idx in 0..expected.num_columns() {
+            assert_eq!(
+                format!("{:?}", actual.column(col_idx)),
+                format!("{:?}", expected.column(col_idx)),
+                "column {col_idx} differs between amortized and per-record paths"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_accumulator_len_and_is_empty() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+
+        let mut acc = GenericAccumulator::new();
+        assert_eq!(acc.len(), 0);
+        assert!(acc.is_empty());
+
+        acc.try_append(&make_record("a"), Utc::now()).unwrap();
+        assert_eq!(acc.len(), 1);
+        assert!(!acc.is_empty());
+
+        acc.try_append(&make_record("b"), Utc::now()).unwrap();
+        assert_eq!(acc.len(), 2);
+
+        acc.finish().unwrap();
+        assert_eq!(acc.len(), 0, "finish must reset the row count");
+        assert!(acc.is_empty());
+    }
+
+    #[test]
+    fn generic_accumulator_finish_twice_produces_independent_batches() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+
+        let mut acc = GenericAccumulator::new();
+
+        acc.try_append(&make_record("a"), Utc::now()).unwrap();
+        let batch_a = acc.finish().unwrap();
+        assert_eq!(
+            batch_a.num_rows(),
+            1,
+            "first finish must contain exactly the rows appended before it"
+        );
+
+        acc.try_append(&make_record("b"), Utc::now()).unwrap();
+        acc.try_append(&make_record("c"), Utc::now()).unwrap();
+        let batch_b = acc.finish().unwrap();
+
+        assert_eq!(
+            batch_b.num_rows(),
+            2,
+            "second finish must contain exactly the rows appended since the first finish -- \
+             a builder that retained prior rows would produce 3 here, silently duplicating data"
+        );
+        use arrow::array::StringArray;
+        let sourcetypes = batch_b
+            .column_by_name("sourcetype")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(sourcetypes.value(0), "b");
+        assert_eq!(sourcetypes.value(1), "c");
+    }
+
+    #[test]
+    fn new_batch_activates_for_real_schema_and_not_for_an_unrelated_one() {
+        // Guards the conversion actually compiling AND engaging at runtime --
+        // a `new_batch` that always returned `None` would compile fine and
+        // silently make the whole accumulator a no-op.
+        let real_schema = GenericSink.schema(Some("anything"));
+        assert!(
+            GenericSink.new_batch(&real_schema).is_some(),
+            "new_batch must activate for GenericSink's own schema"
+        );
+
+        let unrelated_schema: Arc<Schema> = Arc::new(Schema::new(vec![Field::new(
+            "unrelated",
+            DataType::Utf8,
+            false,
+        )]));
+        assert!(
+            GenericSink.new_batch(&unrelated_schema).is_none(),
+            "new_batch must not activate for a schema Arc it doesn't own"
+        );
     }
 }
