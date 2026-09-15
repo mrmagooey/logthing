@@ -758,6 +758,29 @@ pub struct PartitionedParquetWriter<S: ParquetSink> {
     flush_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
+/// Bytes a batch's data actually occupies, as opposed to the capacity its
+/// builders allocated.
+///
+/// `RecordBatch::get_array_memory_size()` reports allocated capacity. For a
+/// batch built one row at a time that is dominated by a fixed per-builder
+/// allocation — measured at 94,080 bytes for a 1-row IPFIX batch whose real
+/// payload is 109 — a ~860x overstatement that drove the byte-based flush
+/// threshold 1-2 orders of magnitude too early. See
+/// `docs/performance/2026-09-14-writer-channel-loss.md`.
+///
+/// `get_slice_memory_size` is arrow's own used-bytes accounting: slice-aware
+/// (a hand-rolled `buffers().map(|b| b.len())` sum reports the *parent*
+/// buffer for a sliced array, reintroducing an overstatement of the same
+/// kind) and recursive into child data, so it stays correct if a nested
+/// column type is ever added.
+fn used_bytes(batch: &arrow_array::RecordBatch) -> usize {
+    batch
+        .columns()
+        .iter()
+        .map(|c| c.to_data().get_slice_memory_size().unwrap_or(0))
+        .sum()
+}
+
 impl<S: ParquetSink> PartitionedParquetWriter<S> {
     pub fn new(
         sink: S,
@@ -911,7 +934,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                     };
                     match mapped {
                         Ok(b) => {
-                            let est_bytes = b.get_array_memory_size();
+                            let est_bytes = used_bytes(&b);
                             let n = b.num_rows();
                             buf.buffer.push_back((b, est_bytes));
                             (n, est_bytes)
@@ -943,7 +966,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             };
             match mapped {
                 Ok(b) => {
-                    let est_bytes = b.get_array_memory_size();
+                    let est_bytes = used_bytes(&b);
                     let n = b.num_rows();
                     buf.buffer.push_back((b, est_bytes));
                     (n, est_bytes)
@@ -1418,7 +1441,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         {
             match builder.finish() {
                 Ok(batch) => {
-                    let est_bytes = batch.get_array_memory_size();
+                    let est_bytes = used_bytes(&batch);
                     buf.byte_count += est_bytes;
                     buf.buffer.push_back((batch, est_bytes));
                 }
@@ -2445,6 +2468,37 @@ max_partitions = 128
              pending rows were materialized before the buffer was taken"
         );
         assert!(recorded[0].1 > 0, "uploaded body must be non-empty");
+    }
+
+    // -----------------------------------------------------------------------
+    // used_bytes — flush byte-accounting fix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn used_bytes_reports_a_small_figure_for_a_1_row_batch_built_via_a_builder() {
+        // A builder-backed batch (the accumulator path every real sink goes
+        // through) allocates default capacity up front, so
+        // `get_array_memory_size()` reports that capacity, not the single
+        // short string actually written. `used_bytes` must not fall for the
+        // same trap.
+        let mut acc = MockAccumulator::new();
+        acc.try_append(&"r0".to_string()).unwrap();
+        let batch = acc.finish().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        let capacity_estimate = batch.get_array_memory_size();
+        let used = used_bytes(&batch);
+
+        assert!(
+            used < 1024,
+            "a 1-row batch's real payload should be well under 1KiB, got {used}"
+        );
+        assert!(
+            used < capacity_estimate,
+            "used_bytes ({used}) must be strictly less than the capacity-based \
+             estimate ({capacity_estimate}) it replaces -- otherwise the fix \
+             changed nothing"
+        );
     }
 
     #[tokio::test]
