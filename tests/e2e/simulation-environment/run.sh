@@ -104,6 +104,18 @@ docker compose -f "$COMPOSE_FILE" run --rm loadgen-ipfix
 
 echo ""
 echo "========================================"
+echo "Running HEC HTTP Load Test (loadgen)"
+echo "========================================"
+docker compose -f "$COMPOSE_FILE" run --rm loadgen-hec
+
+echo ""
+echo "========================================"
+echo "Running Generic HTTP Load Test (loadgen)"
+echo "========================================"
+docker compose -f "$COMPOSE_FILE" run --rm loadgen-generic
+
+echo ""
+echo "========================================"
 echo "Running TLS E2E Tests"
 echo "========================================"
 docker compose -f "$COMPOSE_FILE" stop logthing

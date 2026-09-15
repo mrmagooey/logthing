@@ -77,6 +77,20 @@ directory             = "/var/log/wef-local"
 flush_threshold_bytes = 1
 flush_interval_secs   = 5
 
+# Local-disk only (no `[hec.s3]`) -- minio-setup only pre-creates the
+# wef-events/ipfix-flows/zeek-logs buckets, and local-disk persistence is
+# already sufficient to prove records were accepted and written, same as
+# how the `*-local-verifier` services check zeek/ipfix.
+[hec]
+enabled = true
+token   = "e2e-hec-token"
+
+[hec.local]
+directory             = "/var/log/hec-local"
+prefix                = "hec"
+flush_threshold_bytes = 1
+flush_interval_secs   = 5
+
 [iceberg.local]
 directory = "/var/log/iceberg-local"
 prefix    = "_iceberg_descriptors"

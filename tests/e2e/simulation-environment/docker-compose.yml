@@ -16,6 +16,7 @@ services:
       - zeek-local-data:/var/log/zeek-local
       - ipfix-local-data:/var/log/ipfix-local
       - wef-local-data:/var/log/wef-local
+      - hec-local-data:/var/log/hec-local
       - iceberg-local-data:/var/log/iceberg-local
     depends_on:
       - minio
@@ -424,6 +425,44 @@ services:
       - e2e
     restart: "no"
 
+  loadgen-hec:
+    # Shares loadgen-zeek's image tag -- see that service's comment.
+    build:
+      context: ../../..
+      dockerfile: tests/e2e/simulation-environment/loadgen/Dockerfile
+    image: logthing:loadgen
+    command:
+      - hec-http
+      - --host=logthing
+      - --port=5985
+      - --token=e2e-hec-token
+      - --target-rate=${LOADGEN_HEC_RATE:-2000}
+      - --duration-secs=${LOADGEN_DURATION:-60}
+    depends_on:
+      - logthing
+    networks:
+      - e2e
+    restart: "no"
+
+  loadgen-generic:
+    # Shares loadgen-zeek's image tag -- see that service's comment.
+    build:
+      context: ../../..
+      dockerfile: tests/e2e/simulation-environment/loadgen/Dockerfile
+    image: logthing:loadgen
+    command:
+      - generic-http
+      - --host=logthing
+      - --port=5985
+      - --token=e2e-hec-token
+      - --target-rate=${LOADGEN_GENERIC_RATE:-2000}
+      - --duration-secs=${LOADGEN_DURATION:-60}
+    depends_on:
+      - logthing
+    networks:
+      - e2e
+    restart: "no"
+
   zeek-s3-verifier:
     build:
       context: .
@@ -465,4 +504,5 @@ volumes:
   zeek-local-data:
   ipfix-local-data:
   wef-local-data:
+  hec-local-data:
   iceberg-local-data:

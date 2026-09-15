@@ -247,10 +247,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].sourcetype, "fallback_st");
         assert!(
-            records[0].fields["msg"]
-                .as_str()
-                .unwrap()
-                .contains("#42"),
+            records[0].fields["msg"].as_str().unwrap().contains("#42"),
             "record must carry the sequence number, got: {}",
             records[0].fields
         );
@@ -309,9 +306,7 @@ mod tests {
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), 65536)
-            .await
-            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["code"], 0);
     }
