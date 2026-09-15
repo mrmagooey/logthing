@@ -101,6 +101,43 @@ impl ParquetSink for SuricataSink {
     ) -> anyhow::Result<arrow_array::RecordBatch> {
         map_envelope(record)
     }
+
+    /// Amortized-builder fast path: Suricata has exactly one schema (the
+    /// envelope), so this always matches -- gated on `Arc::ptr_eq` rather
+    /// than unconditionally returning `Some` purely defensively, mirroring
+    /// `ZeekSink::new_batch`, in case a second schema is ever added.
+    fn new_batch(
+        &self,
+        schema: &Arc<arrow_schema::Schema>,
+    ) -> Option<Box<dyn crate::forwarding::buffered_writer::RecordBatchAccumulator<SuricataRecord>>>
+    {
+        if Arc::ptr_eq(schema, &envelope_schema()) {
+            Some(Box::new(crate::suricata::schema::EnvelopeAccumulator::new()))
+        } else {
+            None
+        }
+    }
+
+    /// Overrides the default `day_and_batch`: derives the day directly from
+    /// `partition_time(received_at, received_at)` instead of building a
+    /// batch first. Load-bearing for the same reason as `ZeekSink`'s
+    /// override -- `push()` calls this before it knows whether the record
+    /// goes to the amortized `EnvelopeAccumulator`, so building a batch here
+    /// just to learn the day would make every record pay for a throwaway
+    /// `RecordBatch`, defeating the entire point of the accumulator.
+    fn day_and_batch(
+        &self,
+        record: &SuricataRecord,
+        _schema: &Arc<arrow_schema::Schema>,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<(chrono::NaiveDate, Option<arrow_array::RecordBatch>)> {
+        let day = crate::forwarding::buffered_writer::partition_time(
+            Some(record.received_at),
+            record.received_at,
+        )
+        .date_naive();
+        Ok((day, None))
+    }
 }
 
 // ---------------------------------------------------------------------------
