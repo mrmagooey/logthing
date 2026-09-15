@@ -244,9 +244,9 @@ async fn ipfix_flows_crossing_builder_batch_rows_land_exact_row_count_on_disk() 
     let cfg = IpfixLocalConfig {
         directory: dir.path().to_path_buf(),
         prefix: "ipfix".to_string(),
-        max_buffer_rows: 100_000,          // row-count flush trigger must not fire early
+        max_buffer_rows: 100_000, // row-count flush trigger must not fire early
         flush_threshold_bytes: usize::MAX, // byte flush trigger must not fire early
-        flush_interval_secs: 3600,         // age trigger must not fire
+        flush_interval_secs: 3600, // age trigger must not fire
         channel_capacity: 256,
     };
 

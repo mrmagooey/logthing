@@ -932,7 +932,11 @@ mod tests {
         let mut acc = FlowRecordAccumulator::new();
         assert_eq!(acc.len(), 0);
         assert!(acc.try_append(&records, Utc::now()).unwrap());
-        assert_eq!(acc.len(), 10, "10 flows in one push must add exactly 10 rows");
+        assert_eq!(
+            acc.len(),
+            10,
+            "10 flows in one push must add exactly 10 rows"
+        );
 
         let batch = acc.finish().unwrap();
         assert_eq!(batch.num_rows(), 10);
@@ -1057,10 +1061,9 @@ mod tests {
             .as_any()
             .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
             .unwrap();
-        let expected_day =
-            DateTime::from_timestamp_micros(partition_time_col.value(0))
-                .unwrap()
-                .date_naive();
+        let expected_day = DateTime::from_timestamp_micros(partition_time_col.value(0))
+            .unwrap()
+            .date_naive();
 
         let sink = IpfixSink;
         let schema = sink.schema(None);
@@ -1731,13 +1734,15 @@ mod tests {
             .unwrap_or_else(|| panic!("could not parse year=/month=/day= from {path_str}"));
 
         let bytes = std::fs::read(&parquet_files[0]).expect("read parquet file");
-        let builder =
-            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
-                bytes::Bytes::from(bytes),
-            )
-            .expect("parquet builder");
+        let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            bytes::Bytes::from(bytes),
+        )
+        .expect("parquet builder");
         let mut reader = builder.build().expect("parquet reader");
-        let rb = reader.next().expect("at least one batch").expect("batch ok");
+        let rb = reader
+            .next()
+            .expect("at least one batch")
+            .expect("batch ok");
         let partition_time_col = rb
             .column_by_name("partition_time")
             .unwrap()
