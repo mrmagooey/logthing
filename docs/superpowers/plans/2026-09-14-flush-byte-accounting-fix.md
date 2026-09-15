@@ -53,13 +53,13 @@
 
 **Files:** `src/forwarding/buffered_writer.rs` (all three call sites: ~914, ~946, ~1421)
 
-- [ ] **Step 1: Write the failing unit test.** In `buffered_writer.rs`'s test module, build a 1-row `RecordBatch` from any sink's schema and assert `used_bytes` returns a small figure — low hundreds of bytes — rather than the ~94 KB `get_array_memory_size()` reports. This test fails today.
+- [x] **Step 1: Write the failing unit test.** In `buffered_writer.rs`'s test module, build a 1-row `RecordBatch` from any sink's schema and assert `used_bytes` returns a small figure — low hundreds of bytes — rather than the ~94 KB `get_array_memory_size()` reports. This test fails today.
 
 **Do not write the oracle as a hand-summed `buffers().map(|b| b.len())` total.** That is the slice-unsafe formula Step 3 deliberately rejects, and using it as the comparison basis would re-derive the discarded computation inside the test. Assert against a plain upper bound instead (e.g. `< 1024` for a 1-row batch, and `< get_array_memory_size()`): the point is catching capacity-scale overstatement, not pinning a byte-exact value that would churn whenever a schema gains a column.
 
-- [ ] **Step 2: Run it, confirm it fails** with the capacity figure.
+- [x] **Step 2: Run it, confirm it fails** with the capacity figure.
 
-- [ ] **Step 3: Implement — use arrow-rs's own API, do not hand-roll this.**
+- [x] **Step 3: Implement — use arrow-rs's own API, do not hand-roll this.**
 
 `ArrayData::get_slice_memory_size()` already does exactly what is needed: it
 sums **used** bytes per buffer (fixed-width by `len * byte_width`, variable-width
@@ -100,31 +100,31 @@ today only by `ZeekSink`). An earlier draft of this plan said "both call
 sites" and missed `:1421` — leaving it would half-fix a defect this plan's own
 Finding #6 describes as shared across every sink.
 
-- [ ] **Step 4: Run the test, confirm it passes.**
+- [x] **Step 4: Run the test, confirm it passes.**
 
-- [ ] **Step 5: Commit** before any mutation testing.
+- [x] **Step 5: Commit** before any mutation testing.
 
-- [ ] **Step 6: Prove the test guards the bug.** Revert to `get_array_memory_size()`, confirm the test fails, restore from a file copy (**not** `git checkout` — that discards uncommitted work). Paste both outputs.
+- [x] **Step 6: Prove the test guards the bug.** Revert to `get_array_memory_size()`, confirm the test fails, restore from a file copy (**not** `git checkout` — that discards uncommitted work). Paste both outputs.
 
 ## Task 2: Integration coverage for flush cadence
 
 **Files:** `tests/flush_byte_accounting_integration.rs` (create)
 
-- [ ] Drive a writer with many small batches through the real `start_writer` path and assert the flush count is proportional to *actual* bytes, not batch count. Use a small `flush_threshold_bytes` so the test is fast. Read `tests/buffered_writer_flush_decoupling_integration.rs` for the established harness shape and reuse it.
-- [ ] Assert `parquet_s3_buffer_dropped` stays 0 — guards the under-counting direction.
-- [ ] Commit.
+- [x] Drive a writer with many small batches through the real `start_writer` path and assert the flush count is proportional to *actual* bytes, not batch count. Use a small `flush_threshold_bytes` so the test is fast. Read `tests/buffered_writer_flush_decoupling_integration.rs` for the established harness shape and reuse it.
+- [x] Assert `parquet_s3_buffer_dropped` stays 0 — guards the under-counting direction.
+- [x] Commit.
 
 ## Task 3: Measure the effect
 
-- [ ] Use `scripts/repeat-ipfix-loopback-loss.sh` (already on the branch, supports `SHAPE=real`). N≥5 at 20,000/s, before and after.
-- [ ] Record: `parquet_s3_dropped`, flush count (`parquet_s3_uploads`), `parquet_s3_records_written`, `parquet_s3_buffer_rows`, and kernel loss for context.
-- [ ] Write `docs/performance/2026-09-14-flush-accounting-fix-results.md` with before/after, median/min/max, the standard hardware caveat, and the exact reproduction command.
-- [ ] **Decide by the measured number, using this rule — set in advance so it is not argued after the fact:**
+- [x] Use `scripts/repeat-ipfix-loopback-loss.sh` (already on the branch, supports `SHAPE=real`). N≥5 at 20,000/s, before and after.
+- [x] Record: `parquet_s3_dropped`, flush count (`parquet_s3_uploads`), `parquet_s3_records_written`, `parquet_s3_buffer_rows`, and kernel loss for context.
+- [x] Write `docs/performance/2026-09-14-flush-accounting-fix-results.md` with before/after, median/min/max, the standard hardware caveat, and the exact reproduction command.
+- [x] **Decide by the measured number, using this rule — set in advance so it is not argued after the fact:**
   - **≥90% reduction** → success as specified. Land it.
   - **Material but short of 90% (roughly 30-90%)** → **land it anyway, and say so precisely.** This is the *most likely* outcome and is not a failure: the characterisation attributes the 12× drain gap to two mechanisms, and this fix only addresses one. `concat_batches` over ~1,456 tiny batches per flush is removed; the per-push 19-builder allocation churn behind the profile's ~40% allocator / ~12.5% futex time is **not** — that is the deferred accumulator work. Record the residual gap and name accumulators as the follow-up, with the measured number that justifies it.
   - **<30%, or worse** → do not land quietly. The mechanism was confirmed in isolation but not end to end; report that, and treat the accumulator work as the primary candidate instead.
-- [ ] **If the fix does not materially reduce `parquet_s3_dropped`, say so plainly.** The characterisation named the mechanism with strong evidence, but a mechanism confirmed in isolation is not the same as a fix confirmed end to end. Report what actually happened.
-- [ ] Commit.
+- [x] **If the fix does not materially reduce `parquet_s3_dropped`, say so plainly.** The characterisation named the mechanism with strong evidence, but a mechanism confirmed in isolation is not the same as a fix confirmed end to end. Report what actually happened.
+- [x] Commit.
 
 ---
 
