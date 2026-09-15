@@ -21,14 +21,17 @@
 
 ## Findings that drive this plan — measured, do not re-derive
 
-1. **The flush threshold uses `RecordBatch::get_array_memory_size()`** (`src/forwarding/buffered_writer.rs:914,946`), which reports **allocated capacity**, not bytes used.
+1. **The flush threshold uses `RecordBatch::get_array_memory_size()`** at **three** sites (`src/forwarding/buffered_writer.rs:914`, `:946`, `:1421`), which reports **allocated capacity**, not bytes used.
 2. **Measured overstatement, IPFIX sink:**
 
    | rows in batch | reported (capacity) | actual (used bytes) | overstatement |
    |---|---|---|---|
-   | 1 | 94,080 | 125 | **753×** |
-   | 100 | 94,080 | 10,394 | 9× |
-   | 1000 | 109,440 | 103,766 | 1× |
+   | 1 | 94,080 | **109** | **863×** |
+   | 100 | 94,080 | 10,378 | 9× |
+   | 1000 | 109,440 | 103,750 | 1× |
+
+   (used-bytes column measured via `ArrayData::get_slice_memory_size()`, the
+   API the fix uses.)
 
    The reported figure is dominated by a fixed ~94 KB — 19 Arrow builders at arrow-rs's default 1024-element capacity — independent of how many rows the batch holds.
 3. **Consequence:** with 1-row batches the 100 MiB threshold is reached after ~1,114 rows instead of ~1,000,000. A 15 s run at 20,000/s flushed **49 times instead of ~1**, each flush `concat_batches`-ing ~1,456 single-row batches.
@@ -39,7 +42,7 @@
 
 ## Success criteria
 
-- `used_bytes` for a 1-row IPFIX batch is within ~2× of the real payload, not 753× over.
+- `used_bytes` for a 1-row IPFIX batch reports ~109 bytes, not the 94,080 capacity figure.
 - At 20,000/s for 15 s with the real `[ipfix.local]` handler, **flush count drops from ~49 to single digits** and `parquet_s3_dropped{source="ipfix"}` falls by **≥90% relative**, N≥5 runs, before/after ranges non-overlapping.
 - **No sink's flush cadence becomes pathologically *long*.** The opposite failure — under-counting bytes so a buffer grows unbounded until the row cap evicts — must be checked: `parquet_s3_buffer_dropped` must stay at 0, and `parquet_s3_buffer_rows` must not climb monotonically across a run.
 - Full suite green; every existing sink's tests still pass.
@@ -48,40 +51,52 @@
 
 ## Task 1: Replace the capacity-based byte estimate with used bytes
 
-**Files:** `src/forwarding/buffered_writer.rs` (both call sites, lines ~914 and ~946)
+**Files:** `src/forwarding/buffered_writer.rs` (all three call sites: ~914, ~946, ~1421)
 
 - [ ] **Step 1: Write the failing unit test.** In `buffered_writer.rs`'s test module, build a 1-row `RecordBatch` from any sink's schema and assert the estimator returns something within 2× of the summed buffer lengths — not the ~94 KB `get_array_memory_size()` reports. This test fails today.
 
 - [ ] **Step 2: Run it, confirm it fails** with the capacity figure.
 
-- [ ] **Step 3: Implement.** Add one helper beside the call sites:
+- [ ] **Step 3: Implement — use arrow-rs's own API, do not hand-roll this.**
+
+`ArrayData::get_slice_memory_size()` already does exactly what is needed: it
+sums **used** bytes per buffer (fixed-width by `len * byte_width`, variable-width
+via offset arithmetic, null bitmaps as `ceil(len, 8)`) **and recurses into
+`child_data()`**.
 
 ```rust
-/// Bytes actually occupied by a batch's data, as opposed to the capacity its
+/// Bytes a batch's data actually occupies, as opposed to the capacity its
 /// builders allocated.
 ///
 /// `RecordBatch::get_array_memory_size()` reports allocated capacity. For a
 /// batch built one row at a time that is dominated by a fixed per-builder
 /// allocation — measured at 94,080 bytes for a 1-row IPFIX batch whose real
-/// payload is 125 bytes, a 753x overstatement — which drives the byte-based
-/// flush threshold 1-2 orders of magnitude too early. See
+/// payload is 109 — a ~860x overstatement that drove the byte-based flush
+/// threshold 1-2 orders of magnitude too early. See
 /// `docs/performance/2026-09-14-writer-channel-loss.md`.
-fn used_bytes(batch: &RecordBatch) -> usize {
+///
+/// `get_slice_memory_size` is arrow's own used-bytes accounting: slice-aware
+/// (a hand-rolled `buffers().map(|b| b.len())` sum reports the *parent*
+/// buffer for a sliced array, reintroducing an overstatement of the same
+/// kind) and recursive into child data, so it stays correct if a nested
+/// column type is ever added.
+fn used_bytes(batch: &arrow_array::RecordBatch) -> usize {
     batch
         .columns()
         .iter()
-        .map(|c| {
-            let d = c.to_data();
-            d.buffers().iter().map(|b| b.len()).sum::<usize>()
-                + d.nulls().map_or(0, |n| n.buffer().len())
-        })
+        .map(|c| c.to_data().get_slice_memory_size().unwrap_or(0))
         .sum()
 }
 ```
 
-Replace both `let est_bytes = b.get_array_memory_size();` with `let est_bytes = used_bytes(&b);`.
+`to_data()` is cheap — `self.clone().into()`, Arc-based, no copy — so this is
+safe on the writer's hot path.
 
-**Verify this covers nested/child data.** `to_data().buffers()` does not recurse into child arrays — if any sink's schema has a `List`/`Struct` column, its children's bytes are missed. Check every sink's schema; if nested types exist, recurse into `d.child_data()`. Under-counting is the failure mode called out in the success criteria.
+**Replace ALL THREE call sites**, not two: `buffered_writer.rs:914`, `:946`,
+and **`:1421`** (inside `materialize_live_builder`, the accumulator path used
+today only by `ZeekSink`). An earlier draft of this plan said "both call
+sites" and missed `:1421` — leaving it would half-fix a defect this plan's own
+Finding #6 describes as shared across every sink.
 
 - [ ] **Step 4: Run the test, confirm it passes.**
 
@@ -102,6 +117,10 @@ Replace both `let est_bytes = b.get_array_memory_size();` with `let est_bytes = 
 - [ ] Use `scripts/repeat-ipfix-loopback-loss.sh` (already on the branch, supports `SHAPE=real`). N≥5 at 20,000/s, before and after.
 - [ ] Record: `parquet_s3_dropped`, flush count (`parquet_s3_uploads`), `parquet_s3_records_written`, `parquet_s3_buffer_rows`, and kernel loss for context.
 - [ ] Write `docs/performance/2026-09-14-flush-accounting-fix-results.md` with before/after, median/min/max, the standard hardware caveat, and the exact reproduction command.
+- [ ] **Decide by the measured number, using this rule — set in advance so it is not argued after the fact:**
+  - **≥90% reduction** → success as specified. Land it.
+  - **Material but short of 90% (roughly 30-90%)** → **land it anyway, and say so precisely.** This is the *most likely* outcome and is not a failure: the characterisation attributes the 12× drain gap to two mechanisms, and this fix only addresses one. `concat_batches` over ~1,456 tiny batches per flush is removed; the per-push 19-builder allocation churn behind the profile's ~40% allocator / ~12.5% futex time is **not** — that is the deferred accumulator work. Record the residual gap and name accumulators as the follow-up, with the measured number that justifies it.
+  - **<30%, or worse** → do not land quietly. The mechanism was confirmed in isolation but not end to end; report that, and treat the accumulator work as the primary candidate instead.
 - [ ] **If the fix does not materially reduce `parquet_s3_dropped`, say so plainly.** The characterisation named the mechanism with strong evidence, but a mechanism confirmed in isolation is not the same as a fix confirmed end to end. Report what actually happened.
 - [ ] Commit.
 
