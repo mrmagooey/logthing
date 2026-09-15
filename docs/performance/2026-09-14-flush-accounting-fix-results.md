@@ -169,3 +169,41 @@ scenario.
    headroom at 20,000/s) is adequate once per-push cost drops — this
    measurement cannot distinguish "channel too small" from "drain too slow"
    as the more fixable lever until the accumulator work is in.
+
+## 6. Durability caveat this fix exposes (behaviour change, not a regression)
+
+Before the fix, the overstated byte estimate made every sink flush far more
+often than its configuration asked for — the IPFIX run in §3 flushed 37
+times in 15 s against a configured 900 s / 100 MiB cadence. That frequent
+flushing was **accidental durability**: nobody configured it, a defect
+produced it, and the measured cost of producing it was the `concat_batches`
+overhead this fix removes.
+
+With correct accounting the configured cadence is now actually honoured.
+`flush_interval_secs` defaults to **900 (15 minutes) for every sink** —
+zeek, suricata, wef, hec, ipfix, sflow and the aggregate writer
+(`src/config/mod.rs:371`, `:479`, `:547`, `:632`, `:931`, `:1048`,
+`:1147`). So at low-to-moderate ingest rates, where neither
+`flush_threshold_bytes` nor `max_buffer_rows` is reached, buffered records
+can now sit in memory for up to 15 minutes before being written to object
+storage, where previously they were written within seconds.
+
+**What is and is not at risk:**
+
+- Graceful shutdown (SIGTERM/SIGINT) flushes buffers, so a normal restart,
+  deploy or rolling upgrade loses nothing.
+- An **ungraceful** loss of the process — SIGKILL, OOM kill, host power
+  loss, container eviction — now discards up to `flush_interval_secs`
+  worth of buffered records instead of a few seconds' worth.
+
+**This is deliberately left as-is.** Lowering the default would be a
+repo-wide behaviour change affecting all seven sinks, and it is a durability
+policy decision, not part of closing the accounting defect. Operators with a
+tighter recovery-point objective should set `flush_interval_secs` explicitly
+per sink; the existing config knob is sufficient and needs no code change.
+
+The honest framing: the 900 s default was always the configured intent, and
+was always the documented behaviour — it simply never happened. This fix
+makes configuration and behaviour agree. If 900 s is the wrong default, that
+is a pre-existing question about the default, surfaced rather than caused by
+this work.

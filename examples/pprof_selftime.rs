@@ -83,7 +83,7 @@ fn main() {
     }
 
     let mut rows: Vec<(&str, i64)> = leaf_samples.into_iter().collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|a| std::cmp::Reverse(a.1));
 
     println!("total leaf samples: {total}");
     println!("{:>10}  {:>7}  frame", "samples", "self%");
