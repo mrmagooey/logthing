@@ -40,51 +40,105 @@ pub fn envelope_schema() -> Arc<Schema> {
     S.clone()
 }
 
+/// Amortized builder set for the envelope schema. Holds the same 5 Arrow
+/// builders `map_envelope` used to create fresh on every call, as persistent
+/// fields, so they can be reused across many records via `finish(&mut self)`
+/// instead of reallocated per record. Mirrors `zeek::schema::ConnAccumulator`.
+pub(crate) struct EnvelopeAccumulator {
+    b_event_type: StringBuilder,
+    b_received_at: TimestampMicrosecondBuilder,
+    b_src_ip: StringBuilder,
+    b_payload: StringBuilder,
+    b_partition_time: TimestampMicrosecondBuilder,
+    rows: usize,
+}
+
+impl EnvelopeAccumulator {
+    pub(crate) fn new() -> Self {
+        Self {
+            b_event_type: StringBuilder::new(),
+            b_received_at: TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            )),
+            b_src_ip: StringBuilder::new(),
+            b_payload: StringBuilder::new(),
+            b_partition_time: TimestampMicrosecondBuilder::new().with_data_type(
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            rows: 0,
+        }
+    }
+
+    /// Append one `SuricataRecord` into the persistent builders. Shared by
+    /// both the amortized path (`RecordBatchAccumulator::try_append`) and
+    /// `map_envelope`'s single-record wrapper below -- identical extraction
+    /// logic either way, so there is exactly one place that knows how a
+    /// `SuricataRecord` becomes an envelope row.
+    fn append_envelope_value(&mut self, record: &SuricataRecord) {
+        let src_ip = record
+            .fields
+            .get("src_ip")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let received_at = record.received_at.timestamp_micros();
+        let payload = record.fields.to_string();
+        // Suricata has no event-carried timestamp, so `received_at` is both the
+        // event and the receipt instant. Routed through the shared helper (rather
+        // than assigned directly) so every sink derives `partition_time` via one
+        // code path.
+        let partition_time = crate::forwarding::buffered_writer::partition_time(
+            Some(record.received_at),
+            record.received_at,
+        );
+
+        self.b_event_type.append_value(&record.event_type);
+        self.b_received_at.append_value(received_at);
+        self.b_src_ip.append_option(src_ip.as_deref());
+        self.b_payload.append_value(&payload);
+        self.b_partition_time
+            .append_value(partition_time.timestamp_micros());
+        self.rows += 1;
+    }
+
+    fn finish_batch(&mut self) -> anyhow::Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.b_event_type.finish()),
+            Arc::new(self.b_received_at.finish()),
+            Arc::new(self.b_src_ip.finish()),
+            Arc::new(self.b_payload.finish()),
+            Arc::new(self.b_partition_time.finish()),
+        ];
+        self.rows = 0;
+        Ok(RecordBatch::try_new(envelope_schema(), columns)?)
+    }
+}
+
+impl crate::forwarding::buffered_writer::RecordBatchAccumulator<SuricataRecord>
+    for EnvelopeAccumulator
+{
+    fn try_append(&mut self, record: &SuricataRecord) -> anyhow::Result<bool> {
+        // Suricata has exactly one schema (the envelope), unlike Zeek's
+        // per-log-path registry, so there is no mismatch case to fall back
+        // from: every SuricataRecord belongs to this accumulator.
+        self.append_envelope_value(record);
+        Ok(true)
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+        self.finish_batch()
+    }
+}
+
 /// Map one `SuricataRecord` to a single-row `RecordBatch` using the envelope schema.
 pub fn map_envelope(record: &SuricataRecord) -> anyhow::Result<RecordBatch> {
-    let schema = envelope_schema();
-
-    let src_ip = record
-        .fields
-        .get("src_ip")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let received_at = record.received_at.timestamp_micros();
-    let payload = record.fields.to_string();
-    // Suricata has no event-carried timestamp, so `received_at` is both the
-    // event and the receipt instant. Routed through the shared helper (rather
-    // than assigned directly) so every sink derives `partition_time` via one
-    // code path.
-    let partition_time = crate::forwarding::buffered_writer::partition_time(
-        Some(record.received_at),
-        record.received_at,
-    );
-
-    let mut b_event_type = StringBuilder::new();
-    let mut b_received_at = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
-        TimeUnit::Microsecond,
-        Some("UTC".into()),
-    ));
-    let mut b_src_ip = StringBuilder::new();
-    let mut b_payload = StringBuilder::new();
-    let mut b_partition_time = TimestampMicrosecondBuilder::new().with_data_type(
-        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-    );
-
-    b_event_type.append_value(&record.event_type);
-    b_received_at.append_value(received_at);
-    b_src_ip.append_option(src_ip.as_deref());
-    b_payload.append_value(&payload);
-    b_partition_time.append_value(partition_time.timestamp_micros());
-
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(b_event_type.finish()),
-        Arc::new(b_received_at.finish()),
-        Arc::new(b_src_ip.finish()),
-        Arc::new(b_payload.finish()),
-        Arc::new(b_partition_time.finish()),
-    ];
-    Ok(RecordBatch::try_new(schema, columns)?)
+    let mut acc = EnvelopeAccumulator::new();
+    acc.append_envelope_value(record);
+    acc.finish_batch()
 }
 
 /// Suricata's EVE `event_type` values, as a closed set. The wire value is
@@ -332,5 +386,125 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(event_type_col.value(0), "alert");
+    }
+
+    // --- EnvelopeAccumulator tests ---
+
+    fn make_accumulator_test_records() -> Vec<SuricataRecord> {
+        vec![
+            make_alert_record(),
+            // Missing src_ip -> null column, exercised through the accumulator.
+            SuricataRecord {
+                event_type: "stats".to_string(),
+                fields: serde_json::json!({"uptime": 42}),
+                received_at: Utc::now(),
+            },
+            // Non-ASCII, "odd" event_type -- must round-trip byte for byte,
+            // not just for the common ASCII case.
+            SuricataRecord {
+                event_type: "évèpredator🔥".to_string(),
+                fields: serde_json::json!({"src_ip": "10.1.2.3", "note": "unicode event_type"}),
+                received_at: Utc::now(),
+            },
+        ]
+    }
+
+    #[test]
+    fn envelope_accumulator_matches_map_envelope_output_row_for_row() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+
+        let records = make_accumulator_test_records();
+
+        // Baseline: today's exact per-record path, N single-row batches concatenated.
+        let single_row_batches: Vec<RecordBatch> =
+            records.iter().map(|r| map_envelope(r).unwrap()).collect();
+        let expected =
+            arrow::compute::concat_batches(&envelope_schema(), &single_row_batches).unwrap();
+
+        // Amortized path: one accumulator, N appends, one finish.
+        let mut acc = EnvelopeAccumulator::new();
+        for r in &records {
+            assert!(acc.try_append(r).unwrap());
+        }
+        let actual = acc.finish().unwrap();
+
+        assert_eq!(actual.num_rows(), expected.num_rows());
+        assert_eq!(actual.schema(), expected.schema());
+        for col_idx in 0..expected.num_columns() {
+            assert_eq!(
+                format!("{:?}", actual.column(col_idx)),
+                format!("{:?}", expected.column(col_idx)),
+                "column {col_idx} differs between amortized and per-record paths"
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_accumulator_len_and_is_empty() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+
+        let mut acc = EnvelopeAccumulator::new();
+        assert_eq!(acc.len(), 0);
+        assert!(acc.is_empty());
+
+        acc.try_append(&make_alert_record()).unwrap();
+        assert_eq!(acc.len(), 1);
+        assert!(!acc.is_empty());
+
+        acc.try_append(&make_alert_record()).unwrap();
+        assert_eq!(acc.len(), 2);
+
+        acc.finish().unwrap();
+        assert_eq!(acc.len(), 0, "finish must reset the row count");
+        assert!(acc.is_empty());
+    }
+
+    #[test]
+    fn envelope_accumulator_finish_twice_produces_independent_batches() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+
+        let mut acc = EnvelopeAccumulator::new();
+
+        let rec_a = SuricataRecord {
+            event_type: "alert".to_string(),
+            fields: serde_json::json!({"src_ip": "1.1.1.1"}),
+            received_at: Utc::now(),
+        };
+        acc.try_append(&rec_a).unwrap();
+        let batch_a = acc.finish().unwrap();
+        assert_eq!(
+            batch_a.num_rows(),
+            1,
+            "first finish must contain exactly the rows appended before it"
+        );
+
+        let rec_b = SuricataRecord {
+            event_type: "flow".to_string(),
+            fields: serde_json::json!({"src_ip": "2.2.2.2"}),
+            received_at: Utc::now(),
+        };
+        let rec_c = SuricataRecord {
+            event_type: "dns".to_string(),
+            fields: serde_json::json!({"src_ip": "3.3.3.3"}),
+            received_at: Utc::now(),
+        };
+        acc.try_append(&rec_b).unwrap();
+        acc.try_append(&rec_c).unwrap();
+        let batch_b = acc.finish().unwrap();
+
+        assert_eq!(
+            batch_b.num_rows(),
+            2,
+            "second finish must contain exactly the rows appended since the first finish -- \
+             a builder that retained prior rows would produce 3 here, silently duplicating data"
+        );
+        let event_types = batch_b
+            .column_by_name("event_type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(event_types.value(0), "flow");
+        assert_eq!(event_types.value(1), "dns");
     }
 }

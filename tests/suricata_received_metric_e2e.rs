@@ -138,15 +138,22 @@ async fn suricata_records_received_visible_on_real_metrics_endpoint_with_forward
     let suricata_local_cfg = SuricataLocalConfig {
         directory: disk_dir.path().to_path_buf(),
         prefix: "suricata".to_string(),
-        max_buffer_rows: 100_000,
-        flush_threshold_bytes: 100_000_000,
+        // Flush on every push so this test can also verify the records that
+        // travel the real TCP -> EnvelopeAccumulator -> Parquet path (not
+        // just the /metrics counters) actually land on disk correctly.
+        max_buffer_rows: 1,
+        flush_threshold_bytes: 1,
         flush_interval_secs: 3600,
         channel_capacity: 256,
     };
-    // The writer JoinHandle is deliberately not awaited: this test asserts on
-    // the /metrics exposition only, never on flushed parquet, so the final
-    // flush the handle exists to await is irrelevant here.
-    let (suricata_handler, _writer_task) = suricata_local_start(
+    // The writer JoinHandle IS awaited below, after the listener shuts down
+    // and drops the last handler reference: with two alert pushes landing in
+    // the same (partition, day) buffer back to back, the second can arrive
+    // while the first's flush is still in flight, in which case it is left
+    // sitting in the buffer rather than flushed immediately (see
+    // `try_flush_partition_async`'s `in_flight` coalescing) -- only the
+    // channel-close-triggered `flush_all` is guaranteed to land it on disk.
+    let (suricata_handler, writer_task) = suricata_local_start(
         &suricata_local_cfg,
         sink,
         Arc::new(SourceHourlyStats::new()),
@@ -268,6 +275,12 @@ async fn suricata_records_received_visible_on_real_metrics_endpoint_with_forward
     );
 
     // --- Clean shutdown ---
+    // Shut the listener down first: this drops the last `Arc<dyn
+    // SuricataHandler>` reference (held inside `suricata_listener`), which
+    // closes the writer's channel and lets its background task run its
+    // final synchronous `flush_all` before `writer_task` resolves below --
+    // the only point at which every pushed record is guaranteed to be on
+    // disk (see the `in_flight` coalescing note above).
     suricata_shutdown_tx
         .send(true)
         .expect("suricata shutdown signal must send");
@@ -275,6 +288,99 @@ async fn suricata_records_received_visible_on_real_metrics_endpoint_with_forward
         .await
         .expect("suricata listener task must join after shutdown")
         .expect("suricata listener task must not panic");
+    tokio::time::timeout(Duration::from_secs(5), writer_task)
+        .await
+        .expect("suricata writer task must join after shutdown")
+        .expect("suricata writer task must not panic");
+
+    // --- Verify the records also reached Parquet on disk via the real
+    // EnvelopeAccumulator path (RecordBatchAccumulator<SuricataRecord>),
+    // not just the /metrics counters. The writer task above has already run
+    // its shutdown flush_all, so every pushed record is on disk by now.
+    fn read_event_type_and_src_ip(dir: &std::path::Path) -> Vec<(String, Option<String>)> {
+        use arrow::array::{Array, StringArray};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let mut rows = Vec::new();
+        if !dir.is_dir() {
+            return rows;
+        }
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rows.extend(read_event_type_and_src_ip(&path));
+                continue;
+            }
+            if path.extension().is_some_and(|e| e == "parquet") {
+                let bytes = std::fs::read(&path).unwrap();
+                let builder =
+                    ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes)).unwrap();
+                let reader = builder.build().unwrap();
+                for rb in reader {
+                    let rb = rb.unwrap();
+                    let event_type = rb
+                        .column_by_name("event_type")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    let src_ip = rb
+                        .column_by_name("src_ip")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    for i in 0..rb.num_rows() {
+                        rows.push((
+                            event_type.value(i).to_string(),
+                            if src_ip.is_null(i) {
+                                None
+                            } else {
+                                Some(src_ip.value(i).to_string())
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    let suricata_root = disk_dir.path().join("suricata");
+    let mut all_rows = read_event_type_and_src_ip(&suricata_root);
+    all_rows.sort();
+
+    assert_eq!(
+        all_rows.len(),
+        3,
+        "expected all 3 records ingested over the real TCP connection to reach \
+         Parquet on disk via the real EnvelopeAccumulator path after shutdown flush, \
+         got: {all_rows:?}"
+    );
+    let alert_rows: Vec<_> = all_rows.iter().filter(|(et, _)| et == "alert").collect();
+    let flow_rows: Vec<_> = all_rows.iter().filter(|(et, _)| et == "flow").collect();
+    assert_eq!(
+        alert_rows.len(),
+        2,
+        "expected 2 alert rows on disk, got: {all_rows:?}"
+    );
+    assert_eq!(
+        flow_rows.len(),
+        1,
+        "expected 1 flow row on disk, got: {all_rows:?}"
+    );
+    assert!(
+        alert_rows
+            .iter()
+            .all(|(_, ip)| ip.as_deref() == Some("10.0.0.1")),
+        "alert rows must carry the src_ip sent over the wire, got: {all_rows:?}"
+    );
+    assert!(
+        flow_rows
+            .iter()
+            .all(|(_, ip)| ip.as_deref() == Some("10.0.0.2")),
+        "flow row must carry the src_ip sent over the wire, got: {all_rows:?}"
+    );
 
     server_shutdown_tx
         .send(true)
