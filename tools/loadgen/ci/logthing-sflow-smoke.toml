@@ -1,0 +1,24 @@
+# Smoke-test config for tools/loadgen's sflow-udp subcommand: sflow only,
+# local-disk persistence (not MinIO), mirroring logthing-baseline.toml's
+# shape for syslog-udp.
+bind_address = "0.0.0.0:5986"
+
+[tls]
+enabled = false
+
+[metrics]
+enabled = true
+port = 9090
+
+# syslog defaults to enabled = true on port 514 (default_syslog_enabled ->
+# true), which needs root -- must be disabled explicitly for an sflow-only
+# smoke run under a non-root user.
+[syslog]
+enabled = false
+
+[sflow]
+enabled = true
+udp_port = 16343
+
+[sflow.local]
+directory = "/tmp/logthing-sflow-smoke"

@@ -1,13 +1,14 @@
 //! `loadgen` -- wire-format load generator for a live `logthing` instance.
 //!
-//! Four of the seven formats in
+//! Five of the seven formats in
 //! `docs/superpowers/specs/2026-07-05-performance-testing-strategy-design.md`
-//! are implemented: `syslog-udp`, `zeek-tcp`, `ipfix-udp`, `suricata-tcp`. The
-//! remaining three (sflow, hec, otlp) are still deferred -- see that design's
-//! "Deferred" section for what each would need.
+//! are implemented: `syslog-udp`, `zeek-tcp`, `ipfix-udp`, `suricata-tcp`,
+//! `sflow-udp`. The remaining two (hec, otlp) are still deferred -- see that
+//! design's "Deferred" section for what each would need.
 
 mod ipfix_udp;
 mod pacing;
+mod sflow_udp;
 mod suricata_tcp;
 mod syslog_udp;
 mod zeek_tcp;
@@ -33,6 +34,9 @@ enum Command {
     /// Send Suricata EVE NDJSON records over a single TCP connection at a
     /// paced rate.
     SuricataTcp(suricata_tcp::SuricataTcpArgs),
+    /// Send sFlow v5 datagrams over UDP at a paced rate, each carrying one
+    /// flow sample and one counter sample.
+    SflowUdp(sflow_udp::SflowUdpArgs),
 }
 
 #[tokio::main]
@@ -43,5 +47,6 @@ async fn main() -> anyhow::Result<()> {
         Command::ZeekTcp(args) => zeek_tcp::run(args).await,
         Command::IpfixUdp(args) => ipfix_udp::run(args).await,
         Command::SuricataTcp(args) => suricata_tcp::run(args).await,
+        Command::SflowUdp(args) => sflow_udp::run(args).await,
     }
 }
