@@ -393,6 +393,38 @@ mod tests {
         assert_eq!(src.value(0), "192.168.1.1");
     }
 
+    /// Runtime-activation check: `new_batch` must actually return `Some` for
+    /// the real envelope schema `push()` passes it, and `None` for a
+    /// distinct schema Arc -- proving the amortized-builder fast path is
+    /// really wired up, not silently falling back to a fresh `to_record_batch`
+    /// per push (which would make the accumulator a no-op).
+    #[test]
+    fn suricata_sink_new_batch_activates_for_the_real_envelope_schema() {
+        let schema = SuricataSink.schema(Some("alert"));
+        assert!(
+            Arc::ptr_eq(&schema, &envelope_schema()),
+            "sanity: SuricataSink::schema must return the same Arc as envelope_schema()"
+        );
+        let acc = SuricataSink.new_batch(&schema);
+        assert!(
+            acc.is_some(),
+            "new_batch must return Some(EnvelopeAccumulator) for the envelope schema -- \
+             if this is None, push() falls back to a fresh builder per record and the \
+             accumulator never activates"
+        );
+
+        let other_schema: Arc<arrow_schema::Schema> =
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "unrelated",
+                arrow_schema::DataType::Utf8,
+                false,
+            )]));
+        assert!(
+            SuricataSink.new_batch(&other_schema).is_none(),
+            "new_batch must return None for a schema that isn't envelope_schema()'s Arc"
+        );
+    }
+
     // -- S3 key layout --
 
     #[test]
