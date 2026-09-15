@@ -53,7 +53,9 @@
 
 **Files:** `src/forwarding/buffered_writer.rs` (all three call sites: ~914, ~946, ~1421)
 
-- [ ] **Step 1: Write the failing unit test.** In `buffered_writer.rs`'s test module, build a 1-row `RecordBatch` from any sink's schema and assert the estimator returns something within 2× of the summed buffer lengths — not the ~94 KB `get_array_memory_size()` reports. This test fails today.
+- [ ] **Step 1: Write the failing unit test.** In `buffered_writer.rs`'s test module, build a 1-row `RecordBatch` from any sink's schema and assert `used_bytes` returns a small figure — low hundreds of bytes — rather than the ~94 KB `get_array_memory_size()` reports. This test fails today.
+
+**Do not write the oracle as a hand-summed `buffers().map(|b| b.len())` total.** That is the slice-unsafe formula Step 3 deliberately rejects, and using it as the comparison basis would re-derive the discarded computation inside the test. Assert against a plain upper bound instead (e.g. `< 1024` for a 1-row batch, and `< get_array_memory_size()`): the point is catching capacity-scale overstatement, not pinning a byte-exact value that would churn whenever a schema gains a column.
 
 - [ ] **Step 2: Run it, confirm it fails** with the capacity figure.
 
