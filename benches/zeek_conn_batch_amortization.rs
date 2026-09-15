@@ -76,7 +76,7 @@ fn bench_conn_record_construction(c: &mut Criterion) {
                     .new_batch(black_box(&schema))
                     .expect("ZeekSink must opt into the amortized path for the conn schema");
                 for r in &records {
-                    acc.try_append(black_box(r)).unwrap();
+                    acc.try_append(black_box(r), Utc::now()).unwrap();
                 }
                 let batch = acc.finish().unwrap();
                 black_box(batch);
