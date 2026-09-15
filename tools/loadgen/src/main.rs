@@ -1,11 +1,14 @@
 //! `loadgen` -- wire-format load generator for a live `logthing` instance.
 //!
-//! Four of the seven formats in
+//! Six of the seven formats in
 //! `docs/superpowers/specs/2026-07-05-performance-testing-strategy-design.md`
-//! are implemented: `syslog-udp`, `zeek-tcp`, `ipfix-udp`, `suricata-tcp`. The
-//! remaining three (sflow, hec, otlp) are still deferred -- see that design's
-//! "Deferred" section for what each would need.
+//! are implemented: `syslog-udp`, `zeek-tcp`, `ipfix-udp`, `suricata-tcp`,
+//! `hec-http`, `generic-http`. The remaining one (sflow) is still deferred --
+//! see that design's "Deferred" section for what it would need. `otlp` is
+//! also still deferred -- HTTP ingest coverage here is HEC/generic only.
 
+mod generic_http;
+mod hec_http;
 mod ipfix_udp;
 mod pacing;
 mod suricata_tcp;
@@ -33,6 +36,12 @@ enum Command {
     /// Send Suricata EVE NDJSON records over a single TCP connection at a
     /// paced rate.
     SuricataTcp(suricata_tcp::SuricataTcpArgs),
+    /// Send Splunk HEC events over HTTP (`/services/collector/event`) at a
+    /// paced, concurrent rate.
+    HecHttp(hec_http::HecHttpArgs),
+    /// Send generic NDJSON records over HTTP (`/ingest`) at a paced,
+    /// concurrent rate.
+    GenericHttp(generic_http::GenericHttpArgs),
 }
 
 #[tokio::main]
@@ -43,5 +52,7 @@ async fn main() -> anyhow::Result<()> {
         Command::ZeekTcp(args) => zeek_tcp::run(args).await,
         Command::IpfixUdp(args) => ipfix_udp::run(args).await,
         Command::SuricataTcp(args) => suricata_tcp::run(args).await,
+        Command::HecHttp(args) => hec_http::run(args).await,
+        Command::GenericHttp(args) => generic_http::run(args).await,
     }
 }

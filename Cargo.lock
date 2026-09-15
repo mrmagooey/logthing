@@ -2609,11 +2609,14 @@ name = "loadgen"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "logthing",
+ "reqwest",
  "serde_json",
  "tokio",
+ "tower 0.4.13",
 ]
 
 [[package]]
