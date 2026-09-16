@@ -180,3 +180,69 @@ fn the_counting_allocator_actually_counts() {
     assert_eq!(v.len(), 4096);
     assert!(real >= 4096, "counting allocator saw only {real} bytes");
 }
+
+/// An array wrapping one small object with a string value — the shape
+/// sFlow's `extra` takes for a non-curated record (`{ "format", "length",
+/// "data_hex" }`, produced by `push`ing onto a `Vec` one record at a time,
+/// per `decode_flow_sample`/`decode_counter_sample` in `src/sflow/decoder.rs`).
+///
+/// This shape is not covered by the small-scalar-object or nested-object
+/// cases above: it is the *array* wrapper, and the `Vec<Value>` it wraps is
+/// built by repeated `push` rather than allocated at its final size in one
+/// shot (as `serde_json::json!` array literals and IPFIX's `.collect()`
+/// fixture are). A `push`-built `Vec`'s capacity can differ from a literal's
+/// exact-capacity allocation, so this drives the *real* sFlow decoder over a
+/// hand-built datagram rather than typing out an equivalent `json!` value,
+/// to measure what production code actually allocates.
+///
+/// Backs `SFLOW_RECORD_BYTES` in `src/forwarding/channel_budget.rs`, whose
+/// own unit test (`measured_sflow_record_bytes_matches_constant`) only
+/// proves the constant agrees with `json_heap_bytes` — same rationale as
+/// this file's header comment.
+#[test]
+fn json_heap_bytes_matches_real_allocation_for_a_populated_sflow_extra() {
+    use logthing::sflow::decoder::decode_datagram;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    // Minimal sFlow v5 datagram: one flow_sample (format 1) carrying one
+    // flow record of format 1001 (not one of the three curated formats: 1
+    // raw_packet_header, 3 sampled_ipv4, 4 sampled_ipv6), modelling a real
+    // switch's `extended_switch` VLAN/priority record. Byte layout matches
+    // `build_sflow_flow_sample_with_extension_record` in
+    // `src/forwarding/channel_budget.rs`'s tests -- duplicated rather than
+    // shared for the same reason this file's header comment gives for the
+    // zeek/suricata fixtures.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&5u32.to_be_bytes()); // version = 5
+    buf.extend_from_slice(&1u32.to_be_bytes()); // agent_addr_type = IPv4
+    buf.extend_from_slice(&[10, 0, 0, 1]); // agent_addr
+    buf.extend_from_slice(&0u32.to_be_bytes()); // sub_agent_id
+    buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
+    buf.extend_from_slice(&1u32.to_be_bytes()); // uptime_ms
+    buf.extend_from_slice(&1u32.to_be_bytes()); // num_samples = 1
+    buf.extend_from_slice(&1u32.to_be_bytes()); // data_format = flow_sample
+    buf.extend_from_slice(&56u32.to_be_bytes()); // sample_length = 32+8+16
+    buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
+    buf.extend_from_slice(&1u32.to_be_bytes()); // source_id
+    buf.extend_from_slice(&1000u32.to_be_bytes()); // sampling_rate
+    buf.extend_from_slice(&1000u32.to_be_bytes()); // sample_pool
+    buf.extend_from_slice(&0u32.to_be_bytes()); // drops
+    buf.extend_from_slice(&1u32.to_be_bytes()); // input ifindex
+    buf.extend_from_slice(&2u32.to_be_bytes()); // output ifindex
+    buf.extend_from_slice(&1u32.to_be_bytes()); // num_flow_records = 1
+    buf.extend_from_slice(&1001u32.to_be_bytes()); // flow_data_format = 1001
+    buf.extend_from_slice(&16u32.to_be_bytes()); // flow_data_length = 16
+    buf.extend_from_slice(&[0u8; 16]); // in_vlan, in_pri, out_vlan, out_pri
+
+    let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let (extra, real) = live_heap_of(|| {
+        let mut records = decode_datagram(&buf, exporter).expect("must decode");
+        records.pop().expect("one record").extra
+    });
+    assert!(
+        extra.as_array().is_some_and(|a| !a.is_empty()),
+        "fixture must populate extra; got {extra}"
+    );
+    let estimated = logthing::forwarding::channel_budget::json_heap_bytes(&extra);
+    assert_within_10pct(real, estimated, "sflow populated extra");
+}
