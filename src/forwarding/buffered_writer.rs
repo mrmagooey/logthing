@@ -1023,7 +1023,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 }
             }
         };
-        self.source_stats.record(self.sink.source(), 1);
+        self.source_stats.record(self.sink.source(), n_rows as u64);
 
         let buf = self.buffers.get_mut(&effective_key).unwrap();
         buf.row_count += n_rows;

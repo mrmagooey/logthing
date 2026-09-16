@@ -818,6 +818,11 @@ mod tests {
     /// admin server over a live loopback socket. Catches an Arc-identity
     /// mistake (writer and admin server holding *different* instances) that
     /// would compile cleanly but leave /stats.json permanently empty.
+    ///
+    /// The sink's `Record` is `Vec<String>` (3 rows per push), mirroring
+    /// IPFIX's `Vec<FlowRecord>`, so this also catches the source-stats
+    /// row-count regression end to end: a push-count-only fix would report
+    /// 1 event over this exact HTTP response, not 3.
     #[tokio::test]
     async fn e2e_shared_source_stats_reach_stats_json_over_real_socket() {
         use crate::config::S3ConnectionConfig;
@@ -858,11 +863,11 @@ mod tests {
 
         struct E2eSink;
         impl crate::forwarding::buffered_writer::ParquetSink for E2eSink {
-            type Record = String;
+            type Record = Vec<String>;
             fn source(&self) -> &'static str {
                 "e2e_source"
             }
-            fn partition(&self, _r: &String) -> Option<String> {
+            fn partition(&self, _r: &Vec<String>) -> Option<String> {
                 None
             }
             fn schema(&self, _p: Option<&str>) -> Arc<arrow_schema::Schema> {
@@ -874,10 +879,12 @@ mod tests {
             }
             fn to_record_batch(
                 &self,
-                record: &String,
+                record: &Vec<String>,
                 schema: &Arc<arrow_schema::Schema>,
             ) -> anyhow::Result<arrow_array::RecordBatch> {
-                let col = Arc::new(arrow_array::StringArray::from(vec![record.as_str()]));
+                let col = Arc::new(arrow_array::StringArray::from(
+                    record.iter().map(String::as_str).collect::<Vec<_>>(),
+                ));
                 Ok(arrow_array::RecordBatch::try_new(
                     schema.clone(),
                     vec![col],
@@ -893,7 +900,12 @@ mod tests {
             source_stats.clone(),
             None,
         );
-        writer.push("hello".to_string()).await.unwrap();
+        // 3 rows in one push, mirroring one IPFIX UDP datagram carrying 3
+        // flows: real row count must reach the HTTP response as 3, not 1.
+        writer
+            .push(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+            .await
+            .unwrap();
 
         // Step 3: spawn the real admin router, sharing the SAME Arc.
         let server_config = AdminServerConfig {
@@ -944,9 +956,10 @@ mod tests {
         let row = rows.iter().find(|r| r.source == "e2e_source").unwrap();
         let total: u64 = row.hours.iter().map(|h| h.count).sum();
         assert_eq!(
-            total, 1,
+            total, 3,
             "count recorded via the writer's Arc must be visible through the \
-             admin server's Arc — they must be the SAME instance"
+             admin server's Arc (same instance), AND must reflect the real \
+             row count (3) of the single push, not the push count (1)"
         );
     }
 
