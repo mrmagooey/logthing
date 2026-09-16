@@ -4,6 +4,100 @@ All notable changes to this project are documented in this file, newest
 first, loosely following [Keep a Changelog](https://keepachangelog.com/).
 This file starts at 0.15.0; earlier releases are not backfilled.
 
+## [0.19.0] - 2026-09-15
+
+### Performance
+
+- Every `ParquetSink` now appends into long-lived Arrow builders via a
+  `RecordBatchAccumulator` instead of allocating a fresh builder set per
+  record. Previously only Zeek's `conn` schema did. Measured on a quiet
+  12-vCPU host, 30s runs at 40,000 records/s offered, all at **0.00% channel
+  error rate** where the pre-change figures are per-sink saturation:
+
+  | sink | before | after |
+  |---|---|---|
+  | IPFIX | ~3,400 eps, 82% loss | 39,968 eps, 0% |
+  | Zeek `dns` | ~5,700 eps (throttled) | 40,000 eps, 0% |
+  | Zeek `http` | ~6,800 eps (throttled) | 39,997 eps, 0% |
+  | Suricata | 9,100 eps (throttled) | 38,613 eps, 0% |
+  | sFlow | ~65% loss at 40k samples/s | 79,984 samples/s, 0% |
+  | syslog | 13-16% channel drops | 0% channel drops |
+
+  No sink is the measured bottleneck any more — the load generator is, so
+  these are floors rather than ceilings. Zeek `conn`, already converted,
+  was unchanged and served as the control: same transport, backpressure and
+  writer, differing only in whether the schema had an accumulator.
+
+- **No measurable change for HEC/OTLP/generic**, which share one
+  `ParquetWriterHandle<GenericSink>`. At saturation, before 44.4%/48.0% vs
+  after 45.1%/49.8% — indistinguishable. Its mapper is the cheapest in the
+  repo (4.13us/record), so there was little allocation to remove, and at
+  high concurrency the CPU goes to HTTP framing and JSON parsing on the
+  ingest side. Landed for consistency, not throughput.
+
+### Fixed
+
+- The buffered writer's flush threshold used `RecordBatch::get_array_memory_size()`,
+  which reports allocated **capacity** rather than bytes used. A 1-row IPFIX
+  batch reported 94,080 bytes against 109 real — an ~860x overstatement that
+  made every sink but Zeek flush one to two orders of magnitude earlier than
+  configured. Now uses `ArrayData::get_slice_memory_size()`, which is
+  slice-aware and recurses into child data. Kernel-level UDP loss fell from
+  4.32% to 0.03% median as a side effect.
+- `push()` hardcoded a row count of 1 when a record was accepted into an
+  accumulator. Correct for one-row records, wrong for any multi-row `Record`
+  (e.g. `IpfixSink::Record = Vec<FlowRecord>`, one push per datagram), where
+  it corrupted the `max_rows` flush trigger, the `BUILDER_BATCH_ROWS`
+  materialize check and `drop_oldest_to_cap`'s eviction loop. Now derived
+  from the accumulator's `len()` delta.
+- A deployment with only HTTP ingest enabled (HEC/WEF/OTLP/generic, no
+  wire-protocol listener) started and then shut itself down within
+  milliseconds, logging nothing. `main.rs`'s listener-supervision `select!`
+  arm polled a `FuturesUnordered` built from the wire-protocol listener
+  handles only; with none configured that set is empty and resolves
+  immediately, so the arm won its first poll and fell through into the
+  graceful-shutdown sequence. The supervision future now pends forever on an
+  empty set, and startup logs explicitly when only HTTP ingest is active.
+- `suricata_records_received` and `suricata_records_by_event_type` now appear
+  on the metrics endpoint. Both were incremented inside
+  `DefaultSuricataHandler`, which is installed only when no Suricata
+  forwarding destination is configured, so no real deployment ever emitted
+  them. Same defect fixed for Zeek in 0.18.0.
+
+### Added
+
+- `loadgen` gains `sflow-udp`, `hec-http` and `generic-http` subcommands.
+  Six of seven wire formats now have generators; only OTLP remains. Each is
+  integration-tested against logthing's own decoder/handler, so a generator
+  whose payloads were silently rejected cannot produce a false zero-loss
+  measurement.
+
+### Changed
+
+- `RecordBatchAccumulator::try_append` now takes a `now:
+  DateTime<Utc>` argument, threaded from `push()`'s single per-push clock
+  read. This is load-bearing for correctness, not ergonomics: IPFIX
+  `export_time` arrives on unauthenticated, spoofable UDP and `FlowRecord`
+  carries no receipt instant, so `partition_time` must clamp it against a
+  trusted clock. An accumulator calling `Utc::now()` itself would reopen the
+  two-reads-either-side-of-midnight race that `push()`'s single read exists
+  to close, and binding the clock at construction is worse still, since a
+  long-lived accumulator would stamp post-midnight rows with a stale day
+  that disagrees with their buffer key.
+
+### Known issues
+
+- With byte accounting corrected, the configured `flush_interval_secs`
+  (default 900 for every sink) is now actually honoured. Graceful shutdown
+  still flushes, so restarts and deploys lose nothing, but an **ungraceful**
+  loss (SIGKILL, OOM, power) now discards up to 15 minutes of buffered
+  records where the accounting bug previously forced a flush every few
+  seconds. Operators with a tighter recovery-point objective should set
+  `flush_interval_secs` explicitly.
+- syslog now loses ~16.8% of datagrams in the kernel UDP socket at 40,000/s.
+  This is upstream of the writer (channel drops are 0) and is unaffected by
+  the work above; it is now syslog's binding constraint.
+
 ## [0.18.0] - 2026-09-10
 
 ### Fixed
