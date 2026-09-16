@@ -1,6 +1,8 @@
 use logthing::middleware::IpWhitelist;
 use logthing::server::Server;
-use logthing::shutdown::{await_handles_with_deadline, drain_listener_handles};
+use logthing::shutdown::{
+    await_handles_with_deadline, drain_listener_handles, supervise_listener_handles,
+};
 use logthing::{admin, config, forwarding, ipfix, sflow, stats, suricata, syslog, zeek};
 use std::sync::Arc;
 use std::time::Duration;
@@ -718,6 +720,13 @@ async fn async_main() -> anyhow::Result<()> {
         listener_handles.push(handle);
     }
 
+    if listener_handles.is_empty() {
+        info!(
+            "No wire-protocol listeners configured (syslog/IPFIX/Zeek/Suricata/sFlow); \
+             only HTTP ingest is active"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Create axum server
     // -----------------------------------------------------------------------
@@ -756,16 +765,10 @@ async fn async_main() -> anyhow::Result<()> {
         _ = shutdown_signal => {
             info!("Shutting down gracefully");
         }
-        // H-3: Supervise listener tasks — log if any exits unexpectedly
-        result = async {
-            // Wait for the first listener handle to complete (unexpectedly)
-            let mut futs = futures::stream::FuturesUnordered::new();
-            for h in &mut listener_handles {
-                futs.push(h);
-            }
-            use futures::StreamExt;
-            futs.next().await
-        } => {
+        // H-3: Supervise listener tasks — log if any exits unexpectedly. Pends
+        // forever when `listener_handles` is empty (HTTP-only deployments)
+        // rather than resolving immediately — see `supervise_listener_handles`.
+        result = supervise_listener_handles(&mut listener_handles) => {
             match result {
                 Some(Ok(())) => {
                     warn!("A listener task exited unexpectedly (returned Ok); check logs");
