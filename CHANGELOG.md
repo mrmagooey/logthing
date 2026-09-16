@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file, newest
 first, loosely following [Keep a Changelog](https://keepachangelog.com/).
 This file starts at 0.15.0; earlier releases are not backfilled.
 
-## [Unreleased]
+## [0.19.1] - 2026-09-16
 
 ### Changed
 
@@ -23,6 +23,35 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   old IPFIX throughput number will show a step change after upgrading** —
   the new number is the correct one; recalibrate thresholds rather than
   reverting.
+
+### Fixed
+
+- `SFLOW_RECORD_BYTES` was a 4.17x undercount, so sFlow's channel was sized
+  against a per-record footprint that only holds for curated samples.
+  `size_of::<SflowRecord>()` really is 256 bytes and a record with an empty
+  `extra` measures exactly that — but the decoder curates only
+  `raw_packet_header`, `sampled_ipv4`/`ipv6` and `generic_if_counters`, and
+  pushes every other record format into `extra` verbatim. That includes
+  `extended_switch` (VLAN tag/priority), which is near-universal on
+  switch-sourced flow samples. Measured through the real decoder against a
+  counting allocator, such a record is **1,068 bytes**. The constant is now
+  1280 (rounded to the file's 256-byte convention), so the derived channel
+  capacity falls from 409,600 to 81,920 slots — still the deepest of any
+  source, but no longer resting on an unrepresentative sample. An
+  allocator-validated test now pins the measured footprint so the constant
+  cannot silently drift from reality again.
+
+### Documentation
+
+- Added a **Host tuning for UDP ingest** section to the README. The UDP
+  listeners request a 4 MiB `SO_RCVBUF`; Linux clamps that to
+  `net.core.rmem_max`, whose stock value of 212992 bytes is ~20x smaller.
+  logthing already detects this and warns naming the sysctl, but the
+  requirement was documented only in internal performance notes. At 40,000
+  syslog messages/s against the stock limit, ~16.8% of datagrams are lost in
+  the kernel socket with **zero** drops recorded inside logthing — correctly,
+  because those messages never arrived. Watch `syslog_socket_drops` and
+  `syslog_socket_rx_queue_bytes`, not `parquet_s3_dropped`.
 
 ## [0.19.0] - 2026-09-15
 
