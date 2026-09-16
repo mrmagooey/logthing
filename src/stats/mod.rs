@@ -232,9 +232,15 @@ impl SourceHourlyStats {
     }
 
     /// Record `count` ingested records for `source` in the current hour.
+    /// A `count` of 0 (e.g. a template-only IPFIX datagram that decoded to
+    /// zero flows) is a no-op: it must not create an entry for `source` or
+    /// a spurious zero-count hour bucket.
     /// Sync: `DashMap` entry access has no await point, so there is no
     /// value in making this `async fn`.
     pub fn record(&self, source: &str, count: u64) {
+        if count == 0 {
+            return;
+        }
         let hour = current_hour();
         self.inner
             .entry(source.to_string())
@@ -504,5 +510,35 @@ mod tests {
     fn source_hourly_snapshot_empty_when_nothing_recorded() {
         let stats = SourceHourlyStats::new();
         assert!(stats.snapshot().is_empty());
+    }
+
+    #[test]
+    fn record_with_zero_count_is_a_no_op() {
+        let stats = SourceHourlyStats::new();
+        // A 0-row push (e.g. a template-only IPFIX datagram that decoded to
+        // zero flows) must not create an entry for the source at all --
+        // not a bucket with count 0, and not an event.
+        stats.record("ipfix", 0);
+        assert!(
+            stats.snapshot().is_empty(),
+            "recording a 0 count must not create any bucket or source entry"
+        );
+    }
+
+    #[test]
+    fn source_buckets_aggregate_within_hour_and_separate_across_hours() {
+        // Exercises the private SourceBuckets directly (same-module test)
+        // to verify counts > 1 aggregate correctly within an hour bucket
+        // and start a new bucket once the hour changes.
+        let mut buckets = SourceBuckets::default();
+        buckets.record(100, 3);
+        buckets.record(100, 4); // same hour: coalesces into one bucket
+        buckets.record(101, 5); // new hour: separate bucket
+
+        assert_eq!(buckets.buckets.len(), 2);
+        assert_eq!(buckets.buckets[0].hour, 100);
+        assert_eq!(buckets.buckets[0].count, 7);
+        assert_eq!(buckets.buckets[1].hour, 101);
+        assert_eq!(buckets.buckets[1].count, 5);
     }
 }

@@ -205,3 +205,149 @@ async fn max_rows_flush_trigger_fires_on_row_count_not_push_count() {
     drop(handler);
     join_handle.await.expect("writer task must not panic");
 }
+
+/// `source_stats.record` in `push()` used to hardcode a count of 1 per push,
+/// regardless of how many rows the push actually contributed. For a
+/// multi-row `Record` (IPFIX's `Vec<FlowRecord>`, one push per UDP
+/// datagram) that undercounts `/stats/throughput` and the admin dashboard
+/// by the row-to-push ratio -- a 3-row push here should count as 3 events,
+/// not 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_stats_records_real_row_count_not_push_count() {
+    let cfg = BufferedWriterConfig {
+        connection: logthing::config::S3ConnectionConfig {
+            endpoint: String::new(),
+            bucket: String::new(),
+            region: String::new(),
+            access_key: String::new(),
+            secret_key: String::new(),
+        },
+        prefix: "test".to_string(),
+        max_buffer_rows: usize::MAX,
+        flush_threshold_bytes: usize::MAX,
+        flush_interval_secs: 3600,
+        channel_capacity: 64,
+        max_partitions: 8,
+    };
+    let policy = FlushPolicy {
+        max_rows: usize::MAX,
+        max_bytes: usize::MAX,
+        interval: LiveInterval::new(Duration::from_secs(3600)),
+    };
+    let sink = Arc::new(CountingUploadSink::default());
+    let sink_dyn: Arc<dyn UploadSink> = sink.clone();
+    let source_stats = Arc::new(SourceHourlyStats::new());
+
+    let (handler, join_handle) = ParquetWriterHandle::<MultiRowSink>::start_with_stats(
+        MultiRowSink,
+        sink_dyn,
+        cfg,
+        policy,
+        source_stats.clone(),
+        None,
+    );
+
+    // 3 pushes * 3 rows each = 9 real rows. Under the pre-fix bug this
+    // would record 3 (one per push) instead of 9.
+    for i in 0..3 {
+        handler
+            .try_send(three_row_record(&format!("q{i}")))
+            .expect("channel has ample capacity");
+    }
+
+    // Poll rather than sleep a fixed interval -- the record happens on the
+    // background writer task, and a fixed sleep here would be exactly the
+    // flaky pattern that already bit this test suite once.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut total = 0u64;
+    while std::time::Instant::now() < deadline {
+        total = source_stats
+            .snapshot()
+            .iter()
+            .find(|s| s.source == "test")
+            .map(|s| s.hours.iter().map(|h| h.count).sum())
+            .unwrap_or(0);
+        if total >= 9 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        total, 9,
+        "source_stats must record the real row count (9), not the push count (3)"
+    );
+
+    drop(handler);
+    join_handle.await.expect("writer task must not panic");
+}
+
+/// An empty `Record` (e.g. a template-only IPFIX datagram, which decodes to
+/// zero `FlowRecord`s) must record zero events -- not one "push", and not a
+/// spurious zero-count bucket either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_stats_zero_row_push_records_nothing() {
+    let cfg = BufferedWriterConfig {
+        connection: logthing::config::S3ConnectionConfig {
+            endpoint: String::new(),
+            bucket: String::new(),
+            region: String::new(),
+            access_key: String::new(),
+            secret_key: String::new(),
+        },
+        prefix: "test".to_string(),
+        max_buffer_rows: usize::MAX,
+        flush_threshold_bytes: usize::MAX,
+        flush_interval_secs: 3600,
+        channel_capacity: 64,
+        max_partitions: 8,
+    };
+    let policy = FlushPolicy {
+        max_rows: usize::MAX,
+        max_bytes: usize::MAX,
+        interval: LiveInterval::new(Duration::from_secs(3600)),
+    };
+    let sink = Arc::new(CountingUploadSink::default());
+    let sink_dyn: Arc<dyn UploadSink> = sink.clone();
+    let source_stats = Arc::new(SourceHourlyStats::new());
+
+    let (handler, join_handle) = ParquetWriterHandle::<MultiRowSink>::start_with_stats(
+        MultiRowSink,
+        sink_dyn,
+        cfg,
+        policy,
+        source_stats.clone(),
+        None,
+    );
+
+    // Template-only datagram: zero rows.
+    handler
+        .try_send(Vec::new())
+        .expect("channel has ample capacity");
+    // Followed by a real 3-row push, so we have something to poll for --
+    // proves the empty push contributed exactly 0, not 1.
+    handler
+        .try_send(three_row_record("r0"))
+        .expect("channel has ample capacity");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut total = 0u64;
+    while std::time::Instant::now() < deadline {
+        total = source_stats
+            .snapshot()
+            .iter()
+            .find(|s| s.source == "test")
+            .map(|s| s.hours.iter().map(|h| h.count).sum())
+            .unwrap_or(0);
+        if total >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        total, 3,
+        "the empty push must contribute 0 events; only the 3-row push should count"
+    );
+
+    drop(handler);
+    join_handle.await.expect("writer task must not panic");
+}

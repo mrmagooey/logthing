@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file, newest
 first, loosely following [Keep a Changelog](https://keepachangelog.com/).
 This file starts at 0.15.0; earlier releases are not backfilled.
 
+## [Unreleased]
+
+### Changed
+
+- `/stats/throughput` and the admin dashboard now count real rows ingested
+  per source, not the number of writer `push()` calls. Previously,
+  `source_stats.record` hardcoded a count of 1 per push regardless of how
+  many rows that push contributed. For every sink whose `Record` is exactly
+  one row (Zeek, Suricata, syslog, WEF, sFlow) push count and row count are
+  the same, so this changes nothing for them. **IPFIX is affected**: its
+  `Record` is `Vec<FlowRecord>`, one push per UDP datagram, commonly
+  carrying 10+ flows and sometimes hundreds — its counted rate was
+  previously the datagram rate, and is now the flow rate, a step change of
+  up to two orders of magnitude on the same graph. A push with zero rows
+  (a template-only IPFIX datagram) now correctly records nothing, rather
+  than being counted as one event. **Any dashboard or alert keyed to the
+  old IPFIX throughput number will show a step change after upgrading** —
+  the new number is the correct one; recalibrate thresholds rather than
+  reverting.
+
 ## [0.18.0] - 2026-09-10
 
 ### Fixed
