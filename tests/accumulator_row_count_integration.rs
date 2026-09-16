@@ -185,7 +185,16 @@ async fn max_rows_flush_trigger_fires_on_row_count_not_push_count() {
     handler
         .try_send(three_row_record("p3"))
         .expect("channel has ample capacity");
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Poll rather than sleep a fixed interval: the flush happens on a
+    // background writer task, and on a loaded host a fixed 200ms wait is not
+    // reliably long enough for it to be scheduled. Polling to a generous
+    // deadline keeps the test fast when the machine is idle and correct when
+    // it is not -- a fixed sleep here made this test fail under a concurrent
+    // cargo build.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while *sink.uploads.lock().unwrap() == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert!(
         *sink.uploads.lock().unwrap() >= 1,
         "the 4th push (12 real rows) must cross max_rows=10 and trigger a flush -- \
