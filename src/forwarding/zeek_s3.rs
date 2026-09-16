@@ -151,8 +151,28 @@ impl ParquetSink for ZeekSink {
         schema: &Arc<arrow_schema::Schema>,
     ) -> Option<Box<dyn crate::forwarding::buffered_writer::RecordBatchAccumulator<ZeekRecord>>>
     {
-        if Arc::ptr_eq(schema, &crate::zeek::schema::conn_schema()) {
-            Some(Box::new(crate::zeek::schema::ConnAccumulator::new()))
+        use crate::zeek::schema as zs;
+        // Every Zeek schema has an accumulator. Dispatch on the schema Arc the
+        // writer hands us -- NOT on the record's log_path, which may be a raw
+        // spelling that only `get_schema_entry` resolves. Each accumulator
+        // re-checks the record's own resolved schema in `try_append` and
+        // returns Ok(false) on a mismatch (e.g. raw "Conn" vs sanitized
+        // "conn"), so a stray record falls back to to_record_batch rather
+        // than being appended into the wrong builder set.
+        if Arc::ptr_eq(schema, &zs::conn_schema()) {
+            Some(Box::new(zs::ConnAccumulator::new()))
+        } else if Arc::ptr_eq(schema, &zs::dns_schema()) {
+            Some(Box::new(zs::DnsAccumulator::new()))
+        } else if Arc::ptr_eq(schema, &zs::http_schema()) {
+            Some(Box::new(zs::HttpAccumulator::new()))
+        } else if Arc::ptr_eq(schema, &zs::ssl_schema()) {
+            Some(Box::new(zs::SslAccumulator::new()))
+        } else if Arc::ptr_eq(schema, &zs::files_schema()) {
+            Some(Box::new(zs::FilesAccumulator::new()))
+        } else if Arc::ptr_eq(schema, &zs::notice_schema()) {
+            Some(Box::new(zs::NoticeAccumulator::new()))
+        } else if Arc::ptr_eq(schema, &zs::envelope_schema()) {
+            Some(Box::new(zs::EnvelopeAccumulator::new()))
         } else {
             None
         }
