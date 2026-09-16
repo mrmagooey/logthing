@@ -618,11 +618,89 @@ fn map_conn(
     acc.finish_batch()
 }
 
-fn map_dns(
+/// Amortized builder set for the `dns.log` schema.
+///
+/// Holds the 15 columns `map_dns` used to allocate fresh on every record as
+/// persistent builders. The field extraction lives exactly once, in
+/// `append_dns_row`; `map_dns` is a `new -> append -> finish` wrapper over it,
+/// so the amortized path and the single-record fallback cannot drift apart.
+pub(crate) struct DnsAccumulator {
+    b_ts: TimestampMicrosecondBuilder,
+    b_uid: StringBuilder,
+    b_id_orig_h: StringBuilder,
+    b_id_orig_p: UInt16Builder,
+    b_id_resp_h: StringBuilder,
+    b_id_resp_p: UInt16Builder,
+    b_proto: StringBuilder,
+    b_trans_id: UInt32Builder,
+    b_query: StringBuilder,
+    b_qtype_name: StringBuilder,
+    b_qclass_name: StringBuilder,
+    b_rcode_name: StringBuilder,
+    b_answers: StringBuilder,
+    b_extra: StringBuilder,
+    b_partition_time: TimestampMicrosecondBuilder,
+    rows: usize,
+}
+
+impl DnsAccumulator {
+    pub(crate) fn new() -> Self {
+        let ts = || {
+            TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ))
+        };
+        Self {
+            b_ts: ts(),
+            b_uid: StringBuilder::new(),
+            b_id_orig_h: StringBuilder::new(),
+            b_id_orig_p: UInt16Builder::new(),
+            b_id_resp_h: StringBuilder::new(),
+            b_id_resp_p: UInt16Builder::new(),
+            b_proto: StringBuilder::new(),
+            b_trans_id: UInt32Builder::new(),
+            b_query: StringBuilder::new(),
+            b_qtype_name: StringBuilder::new(),
+            b_qclass_name: StringBuilder::new(),
+            b_rcode_name: StringBuilder::new(),
+            b_answers: StringBuilder::new(),
+            b_extra: StringBuilder::new(),
+            b_partition_time: ts(),
+            rows: 0,
+        }
+    }
+
+    fn finish_batch(&mut self) -> anyhow::Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.b_ts.finish()),
+            Arc::new(self.b_uid.finish()),
+            Arc::new(self.b_id_orig_h.finish()),
+            Arc::new(self.b_id_orig_p.finish()),
+            Arc::new(self.b_id_resp_h.finish()),
+            Arc::new(self.b_id_resp_p.finish()),
+            Arc::new(self.b_proto.finish()),
+            Arc::new(self.b_trans_id.finish()),
+            Arc::new(self.b_query.finish()),
+            Arc::new(self.b_qtype_name.finish()),
+            Arc::new(self.b_qclass_name.finish()),
+            Arc::new(self.b_rcode_name.finish()),
+            Arc::new(self.b_answers.finish()),
+            Arc::new(self.b_extra.finish()),
+            Arc::new(self.b_partition_time.finish()),
+        ];
+        self.rows = 0;
+        Ok(RecordBatch::try_new(dns_schema(), columns)?)
+    }
+}
+
+/// Extract one `dns.log` record from raw Zeek JSON and append it to `acc`.
+/// This is the single implementation of the dns row mapping.
+fn append_dns_row(
+    acc: &mut DnsAccumulator,
     value: &serde_json::Value,
     received_at: chrono::DateTime<chrono::Utc>,
-) -> anyhow::Result<RecordBatch> {
-    let schema = dns_schema();
+) {
     let promoted = &[
         "ts",
         "uid",
@@ -696,68 +774,148 @@ fn map_dns(
     let extra = build_extra(value, promoted, &mismatches);
     let partition_time = zeek_partition_time(value, received_at);
 
-    let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
-        TimeUnit::Microsecond,
-        Some("UTC".into()),
-    ));
-    let mut b_uid = StringBuilder::new();
-    let mut b_id_orig_h = StringBuilder::new();
-    let mut b_id_orig_p = UInt16Builder::new();
-    let mut b_id_resp_h = StringBuilder::new();
-    let mut b_id_resp_p = UInt16Builder::new();
-    let mut b_proto = StringBuilder::new();
-    let mut b_trans_id = UInt32Builder::new();
-    let mut b_query = StringBuilder::new();
-    let mut b_qtype_name = StringBuilder::new();
-    let mut b_qclass_name = StringBuilder::new();
-    let mut b_rcode_name = StringBuilder::new();
-    let mut b_answers = StringBuilder::new();
-    let mut b_extra = StringBuilder::new();
-    let mut b_partition_time = TimestampMicrosecondBuilder::new().with_data_type(
-        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-    );
-
-    b_ts.append_option(ts);
-    b_uid.append_option(uid.as_deref());
-    b_id_orig_h.append_option(id_orig_h.as_deref());
-    b_id_orig_p.append_option(id_orig_p);
-    b_id_resp_h.append_option(id_resp_h.as_deref());
-    b_id_resp_p.append_option(id_resp_p);
-    b_proto.append_option(proto.as_deref());
-    b_trans_id.append_option(trans_id);
-    b_query.append_option(query.as_deref());
-    b_qtype_name.append_option(qtype_name.as_deref());
-    b_qclass_name.append_option(qclass_name.as_deref());
-    b_rcode_name.append_option(rcode_name.as_deref());
-    b_answers.append_option(answers.as_deref());
-    b_extra.append_value(&extra);
-    b_partition_time.append_value(partition_time.timestamp_micros());
-
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(b_ts.finish()),
-        Arc::new(b_uid.finish()),
-        Arc::new(b_id_orig_h.finish()),
-        Arc::new(b_id_orig_p.finish()),
-        Arc::new(b_id_resp_h.finish()),
-        Arc::new(b_id_resp_p.finish()),
-        Arc::new(b_proto.finish()),
-        Arc::new(b_trans_id.finish()),
-        Arc::new(b_query.finish()),
-        Arc::new(b_qtype_name.finish()),
-        Arc::new(b_qclass_name.finish()),
-        Arc::new(b_rcode_name.finish()),
-        Arc::new(b_answers.finish()),
-        Arc::new(b_extra.finish()),
-        Arc::new(b_partition_time.finish()),
-    ];
-    Ok(RecordBatch::try_new(schema, columns)?)
+    acc.b_ts.append_option(ts);
+    acc.b_uid.append_option(uid.as_deref());
+    acc.b_id_orig_h.append_option(id_orig_h.as_deref());
+    acc.b_id_orig_p.append_option(id_orig_p);
+    acc.b_id_resp_h.append_option(id_resp_h.as_deref());
+    acc.b_id_resp_p.append_option(id_resp_p);
+    acc.b_proto.append_option(proto.as_deref());
+    acc.b_trans_id.append_option(trans_id);
+    acc.b_query.append_option(query.as_deref());
+    acc.b_qtype_name.append_option(qtype_name.as_deref());
+    acc.b_qclass_name.append_option(qclass_name.as_deref());
+    acc.b_rcode_name.append_option(rcode_name.as_deref());
+    acc.b_answers.append_option(answers.as_deref());
+    acc.b_extra.append_value(&extra);
+    acc.b_partition_time
+        .append_value(partition_time.timestamp_micros());
+    acc.rows += 1;
 }
 
-fn map_http(
+impl crate::forwarding::buffered_writer::RecordBatchAccumulator<crate::zeek::ZeekRecord>
+    for DnsAccumulator
+{
+    /// `_now` is unused: `ZeekRecord` carries its own `received_at`.
+    fn try_append(
+        &mut self,
+        record: &crate::zeek::ZeekRecord,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        // Mirror map_conn/ConnAccumulator's gate: only accept a record whose
+        // RAW log_path resolves to exactly the dns schema. A mismatch falls
+        // back to to_record_batch for that one record.
+        let entry = get_schema_entry(&record.log_path);
+        if !Arc::ptr_eq(&entry.schema, &dns_schema()) {
+            return Ok(false);
+        }
+        append_dns_row(self, &record.fields, record.received_at);
+        Ok(true)
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+        self.finish_batch()
+    }
+}
+
+/// Map one `dns.log` record to a single-row `RecordBatch`.
+///
+/// Thin wrapper over `DnsAccumulator` so the mapping has one implementation.
+fn map_dns(
     value: &serde_json::Value,
     received_at: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<RecordBatch> {
-    let schema = http_schema();
+    let mut acc = DnsAccumulator::new();
+    append_dns_row(&mut acc, value, received_at);
+    acc.finish_batch()
+}
+
+/// Amortized builder set for the `http.log` schema.
+///
+/// Holds the columns `map_http` used to allocate fresh on every record as
+/// persistent builders. The field extraction lives exactly once, in
+/// `append_http_row`; `map_http` is a `new -> append -> finish` wrapper,
+/// so the amortized path and the single-record fallback cannot drift apart.
+pub(crate) struct HttpAccumulator {
+    b_ts: TimestampMicrosecondBuilder,
+    b_uid: StringBuilder,
+    b_id_orig_h: StringBuilder,
+    b_id_orig_p: UInt16Builder,
+    b_id_resp_h: StringBuilder,
+    b_id_resp_p: UInt16Builder,
+    b_method: StringBuilder,
+    b_host: StringBuilder,
+    b_uri: StringBuilder,
+    b_status_code: UInt16Builder,
+    b_user_agent: StringBuilder,
+    b_request_body_len: UInt64Builder,
+    b_response_body_len: UInt64Builder,
+    b_extra: StringBuilder,
+    b_partition_time: TimestampMicrosecondBuilder,
+    rows: usize,
+}
+
+impl HttpAccumulator {
+    pub(crate) fn new() -> Self {
+        Self {
+            b_ts: TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            )),
+            b_uid: StringBuilder::new(),
+            b_id_orig_h: StringBuilder::new(),
+            b_id_orig_p: UInt16Builder::new(),
+            b_id_resp_h: StringBuilder::new(),
+            b_id_resp_p: UInt16Builder::new(),
+            b_method: StringBuilder::new(),
+            b_host: StringBuilder::new(),
+            b_uri: StringBuilder::new(),
+            b_status_code: UInt16Builder::new(),
+            b_user_agent: StringBuilder::new(),
+            b_request_body_len: UInt64Builder::new(),
+            b_response_body_len: UInt64Builder::new(),
+            b_extra: StringBuilder::new(),
+            b_partition_time: TimestampMicrosecondBuilder::new().with_data_type(
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            rows: 0,
+        }
+    }
+
+    fn finish_batch(&mut self) -> anyhow::Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.b_ts.finish()),
+            Arc::new(self.b_uid.finish()),
+            Arc::new(self.b_id_orig_h.finish()),
+            Arc::new(self.b_id_orig_p.finish()),
+            Arc::new(self.b_id_resp_h.finish()),
+            Arc::new(self.b_id_resp_p.finish()),
+            Arc::new(self.b_method.finish()),
+            Arc::new(self.b_host.finish()),
+            Arc::new(self.b_uri.finish()),
+            Arc::new(self.b_status_code.finish()),
+            Arc::new(self.b_user_agent.finish()),
+            Arc::new(self.b_request_body_len.finish()),
+            Arc::new(self.b_response_body_len.finish()),
+            Arc::new(self.b_extra.finish()),
+            Arc::new(self.b_partition_time.finish()),
+        ];
+        self.rows = 0;
+        Ok(RecordBatch::try_new(http_schema(), columns)?)
+    }
+}
+
+/// Extract one `http.log` record from raw Zeek JSON and append it to `acc`.
+/// Single implementation of the http row mapping.
+fn append_http_row(
+    acc: &mut HttpAccumulator,
+    value: &serde_json::Value,
+    received_at: chrono::DateTime<chrono::Utc>,
+) {
     let promoted = &[
         "ts",
         "uid",
@@ -831,68 +989,136 @@ fn map_http(
     let extra = build_extra(value, promoted, &mismatches);
     let partition_time = zeek_partition_time(value, received_at);
 
-    let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
-        TimeUnit::Microsecond,
-        Some("UTC".into()),
-    ));
-    let mut b_uid = StringBuilder::new();
-    let mut b_id_orig_h = StringBuilder::new();
-    let mut b_id_orig_p = UInt16Builder::new();
-    let mut b_id_resp_h = StringBuilder::new();
-    let mut b_id_resp_p = UInt16Builder::new();
-    let mut b_method = StringBuilder::new();
-    let mut b_host = StringBuilder::new();
-    let mut b_uri = StringBuilder::new();
-    let mut b_status_code = UInt16Builder::new();
-    let mut b_user_agent = StringBuilder::new();
-    let mut b_request_body_len = UInt64Builder::new();
-    let mut b_response_body_len = UInt64Builder::new();
-    let mut b_extra = StringBuilder::new();
-    let mut b_partition_time = TimestampMicrosecondBuilder::new().with_data_type(
-        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-    );
-
-    b_ts.append_option(ts);
-    b_uid.append_option(uid.as_deref());
-    b_id_orig_h.append_option(id_orig_h.as_deref());
-    b_id_orig_p.append_option(id_orig_p);
-    b_id_resp_h.append_option(id_resp_h.as_deref());
-    b_id_resp_p.append_option(id_resp_p);
-    b_method.append_option(method.as_deref());
-    b_host.append_option(host.as_deref());
-    b_uri.append_option(uri.as_deref());
-    b_status_code.append_option(status_code);
-    b_user_agent.append_option(user_agent.as_deref());
-    b_request_body_len.append_option(request_body_len);
-    b_response_body_len.append_option(response_body_len);
-    b_extra.append_value(&extra);
-    b_partition_time.append_value(partition_time.timestamp_micros());
-
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(b_ts.finish()),
-        Arc::new(b_uid.finish()),
-        Arc::new(b_id_orig_h.finish()),
-        Arc::new(b_id_orig_p.finish()),
-        Arc::new(b_id_resp_h.finish()),
-        Arc::new(b_id_resp_p.finish()),
-        Arc::new(b_method.finish()),
-        Arc::new(b_host.finish()),
-        Arc::new(b_uri.finish()),
-        Arc::new(b_status_code.finish()),
-        Arc::new(b_user_agent.finish()),
-        Arc::new(b_request_body_len.finish()),
-        Arc::new(b_response_body_len.finish()),
-        Arc::new(b_extra.finish()),
-        Arc::new(b_partition_time.finish()),
-    ];
-    Ok(RecordBatch::try_new(schema, columns)?)
+    acc.b_ts.append_option(ts);
+    acc.b_uid.append_option(uid.as_deref());
+    acc.b_id_orig_h.append_option(id_orig_h.as_deref());
+    acc.b_id_orig_p.append_option(id_orig_p);
+    acc.b_id_resp_h.append_option(id_resp_h.as_deref());
+    acc.b_id_resp_p.append_option(id_resp_p);
+    acc.b_method.append_option(method.as_deref());
+    acc.b_host.append_option(host.as_deref());
+    acc.b_uri.append_option(uri.as_deref());
+    acc.b_status_code.append_option(status_code);
+    acc.b_user_agent.append_option(user_agent.as_deref());
+    acc.b_request_body_len.append_option(request_body_len);
+    acc.b_response_body_len.append_option(response_body_len);
+    acc.b_extra.append_value(&extra);
+    acc.b_partition_time
+        .append_value(partition_time.timestamp_micros());
+    acc.rows += 1;
 }
 
-fn map_ssl(
+impl crate::forwarding::buffered_writer::RecordBatchAccumulator<crate::zeek::ZeekRecord>
+    for HttpAccumulator
+{
+    /// `_now` is unused: `ZeekRecord` carries its own `received_at`.
+    fn try_append(
+        &mut self,
+        record: &crate::zeek::ZeekRecord,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        let entry = get_schema_entry(&record.log_path);
+        if !Arc::ptr_eq(&entry.schema, &http_schema()) {
+            return Ok(false);
+        }
+        append_http_row(self, &record.fields, record.received_at);
+        Ok(true)
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+        self.finish_batch()
+    }
+}
+
+/// Map one `http.log` record to a single-row `RecordBatch`.
+fn map_http(
     value: &serde_json::Value,
     received_at: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<RecordBatch> {
-    let schema = ssl_schema();
+    let mut acc = HttpAccumulator::new();
+    append_http_row(&mut acc, value, received_at);
+    acc.finish_batch()
+}
+/// Amortized builder set for the `ssl.log` schema.
+///
+/// Holds the columns `map_ssl` used to allocate fresh on every record as
+/// persistent builders. The field extraction lives exactly once, in
+/// `append_ssl_row`; `map_ssl` is a `new -> append -> finish` wrapper,
+/// so the amortized path and the single-record fallback cannot drift apart.
+pub(crate) struct SslAccumulator {
+    b_ts: TimestampMicrosecondBuilder,
+    b_uid: StringBuilder,
+    b_id_orig_h: StringBuilder,
+    b_id_orig_p: UInt16Builder,
+    b_id_resp_h: StringBuilder,
+    b_id_resp_p: UInt16Builder,
+    b_version: StringBuilder,
+    b_cipher: StringBuilder,
+    b_curve: StringBuilder,
+    b_server_name: StringBuilder,
+    b_validation_status: StringBuilder,
+    b_extra: StringBuilder,
+    b_partition_time: TimestampMicrosecondBuilder,
+    rows: usize,
+}
+
+impl SslAccumulator {
+    pub(crate) fn new() -> Self {
+        Self {
+            b_ts: TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            )),
+            b_uid: StringBuilder::new(),
+            b_id_orig_h: StringBuilder::new(),
+            b_id_orig_p: UInt16Builder::new(),
+            b_id_resp_h: StringBuilder::new(),
+            b_id_resp_p: UInt16Builder::new(),
+            b_version: StringBuilder::new(),
+            b_cipher: StringBuilder::new(),
+            b_curve: StringBuilder::new(),
+            b_server_name: StringBuilder::new(),
+            b_validation_status: StringBuilder::new(),
+            b_extra: StringBuilder::new(),
+            b_partition_time: TimestampMicrosecondBuilder::new().with_data_type(
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            rows: 0,
+        }
+    }
+
+    fn finish_batch(&mut self) -> anyhow::Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.b_ts.finish()),
+            Arc::new(self.b_uid.finish()),
+            Arc::new(self.b_id_orig_h.finish()),
+            Arc::new(self.b_id_orig_p.finish()),
+            Arc::new(self.b_id_resp_h.finish()),
+            Arc::new(self.b_id_resp_p.finish()),
+            Arc::new(self.b_version.finish()),
+            Arc::new(self.b_cipher.finish()),
+            Arc::new(self.b_curve.finish()),
+            Arc::new(self.b_server_name.finish()),
+            Arc::new(self.b_validation_status.finish()),
+            Arc::new(self.b_extra.finish()),
+            Arc::new(self.b_partition_time.finish()),
+        ];
+        self.rows = 0;
+        Ok(RecordBatch::try_new(ssl_schema(), columns)?)
+    }
+}
+
+/// Extract one `ssl.log` record from raw Zeek JSON and append it to `acc`.
+/// Single implementation of the ssl row mapping.
+fn append_ssl_row(
+    acc: &mut SslAccumulator,
+    value: &serde_json::Value,
+    received_at: chrono::DateTime<chrono::Utc>,
+) {
     let promoted = &[
         "ts",
         "uid",
@@ -956,62 +1182,126 @@ fn map_ssl(
     let extra = build_extra(value, promoted, &mismatches);
     let partition_time = zeek_partition_time(value, received_at);
 
-    let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
-        TimeUnit::Microsecond,
-        Some("UTC".into()),
-    ));
-    let mut b_uid = StringBuilder::new();
-    let mut b_id_orig_h = StringBuilder::new();
-    let mut b_id_orig_p = UInt16Builder::new();
-    let mut b_id_resp_h = StringBuilder::new();
-    let mut b_id_resp_p = UInt16Builder::new();
-    let mut b_version = StringBuilder::new();
-    let mut b_cipher = StringBuilder::new();
-    let mut b_curve = StringBuilder::new();
-    let mut b_server_name = StringBuilder::new();
-    let mut b_validation_status = StringBuilder::new();
-    let mut b_extra = StringBuilder::new();
-    let mut b_partition_time = TimestampMicrosecondBuilder::new().with_data_type(
-        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-    );
-
-    b_ts.append_option(ts);
-    b_uid.append_option(uid.as_deref());
-    b_id_orig_h.append_option(id_orig_h.as_deref());
-    b_id_orig_p.append_option(id_orig_p);
-    b_id_resp_h.append_option(id_resp_h.as_deref());
-    b_id_resp_p.append_option(id_resp_p);
-    b_version.append_option(version.as_deref());
-    b_cipher.append_option(cipher.as_deref());
-    b_curve.append_option(curve.as_deref());
-    b_server_name.append_option(server_name.as_deref());
-    b_validation_status.append_option(validation_status.as_deref());
-    b_extra.append_value(&extra);
-    b_partition_time.append_value(partition_time.timestamp_micros());
-
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(b_ts.finish()),
-        Arc::new(b_uid.finish()),
-        Arc::new(b_id_orig_h.finish()),
-        Arc::new(b_id_orig_p.finish()),
-        Arc::new(b_id_resp_h.finish()),
-        Arc::new(b_id_resp_p.finish()),
-        Arc::new(b_version.finish()),
-        Arc::new(b_cipher.finish()),
-        Arc::new(b_curve.finish()),
-        Arc::new(b_server_name.finish()),
-        Arc::new(b_validation_status.finish()),
-        Arc::new(b_extra.finish()),
-        Arc::new(b_partition_time.finish()),
-    ];
-    Ok(RecordBatch::try_new(schema, columns)?)
+    acc.b_ts.append_option(ts);
+    acc.b_uid.append_option(uid.as_deref());
+    acc.b_id_orig_h.append_option(id_orig_h.as_deref());
+    acc.b_id_orig_p.append_option(id_orig_p);
+    acc.b_id_resp_h.append_option(id_resp_h.as_deref());
+    acc.b_id_resp_p.append_option(id_resp_p);
+    acc.b_version.append_option(version.as_deref());
+    acc.b_cipher.append_option(cipher.as_deref());
+    acc.b_curve.append_option(curve.as_deref());
+    acc.b_server_name.append_option(server_name.as_deref());
+    acc.b_validation_status
+        .append_option(validation_status.as_deref());
+    acc.b_extra.append_value(&extra);
+    acc.b_partition_time
+        .append_value(partition_time.timestamp_micros());
+    acc.rows += 1;
 }
 
-fn map_files(
+impl crate::forwarding::buffered_writer::RecordBatchAccumulator<crate::zeek::ZeekRecord>
+    for SslAccumulator
+{
+    /// `_now` is unused: `ZeekRecord` carries its own `received_at`.
+    fn try_append(
+        &mut self,
+        record: &crate::zeek::ZeekRecord,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        let entry = get_schema_entry(&record.log_path);
+        if !Arc::ptr_eq(&entry.schema, &ssl_schema()) {
+            return Ok(false);
+        }
+        append_ssl_row(self, &record.fields, record.received_at);
+        Ok(true)
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+        self.finish_batch()
+    }
+}
+
+/// Map one `ssl.log` record to a single-row `RecordBatch`.
+fn map_ssl(
     value: &serde_json::Value,
     received_at: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<RecordBatch> {
-    let schema = files_schema();
+    let mut acc = SslAccumulator::new();
+    append_ssl_row(&mut acc, value, received_at);
+    acc.finish_batch()
+}
+/// Amortized builder set for the `files.log` schema.
+///
+/// Holds the columns `map_files` used to allocate fresh on every record as
+/// persistent builders. The field extraction lives exactly once, in
+/// `append_files_row`; `map_files` is a `new -> append -> finish` wrapper,
+/// so the amortized path and the single-record fallback cannot drift apart.
+pub(crate) struct FilesAccumulator {
+    b_ts: TimestampMicrosecondBuilder,
+    b_fuid: StringBuilder,
+    b_tx_hosts: StringBuilder,
+    b_rx_hosts: StringBuilder,
+    b_source: StringBuilder,
+    b_mime_type: StringBuilder,
+    b_filename: StringBuilder,
+    b_total_bytes: UInt64Builder,
+    b_extra: StringBuilder,
+    b_partition_time: TimestampMicrosecondBuilder,
+    rows: usize,
+}
+
+impl FilesAccumulator {
+    pub(crate) fn new() -> Self {
+        Self {
+            b_ts: TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            )),
+            b_fuid: StringBuilder::new(),
+            b_tx_hosts: StringBuilder::new(),
+            b_rx_hosts: StringBuilder::new(),
+            b_source: StringBuilder::new(),
+            b_mime_type: StringBuilder::new(),
+            b_filename: StringBuilder::new(),
+            b_total_bytes: UInt64Builder::new(),
+            b_extra: StringBuilder::new(),
+            b_partition_time: TimestampMicrosecondBuilder::new().with_data_type(
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            rows: 0,
+        }
+    }
+
+    fn finish_batch(&mut self) -> anyhow::Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.b_ts.finish()),
+            Arc::new(self.b_fuid.finish()),
+            Arc::new(self.b_tx_hosts.finish()),
+            Arc::new(self.b_rx_hosts.finish()),
+            Arc::new(self.b_source.finish()),
+            Arc::new(self.b_mime_type.finish()),
+            Arc::new(self.b_filename.finish()),
+            Arc::new(self.b_total_bytes.finish()),
+            Arc::new(self.b_extra.finish()),
+            Arc::new(self.b_partition_time.finish()),
+        ];
+        self.rows = 0;
+        Ok(RecordBatch::try_new(files_schema(), columns)?)
+    }
+}
+
+/// Extract one `files.log` record from raw Zeek JSON and append it to `acc`.
+/// Single implementation of the files row mapping.
+fn append_files_row(
+    acc: &mut FilesAccumulator,
+    value: &serde_json::Value,
+    received_at: chrono::DateTime<chrono::Utc>,
+) {
     let promoted = &[
         "ts",
         "fuid",
@@ -1060,53 +1350,128 @@ fn map_files(
     let extra = build_extra(value, promoted, &mismatches);
     let partition_time = zeek_partition_time(value, received_at);
 
-    let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
-        TimeUnit::Microsecond,
-        Some("UTC".into()),
-    ));
-    let mut b_fuid = StringBuilder::new();
-    let mut b_tx_hosts = StringBuilder::new();
-    let mut b_rx_hosts = StringBuilder::new();
-    let mut b_source = StringBuilder::new();
-    let mut b_mime_type = StringBuilder::new();
-    let mut b_filename = StringBuilder::new();
-    let mut b_total_bytes = UInt64Builder::new();
-    let mut b_extra = StringBuilder::new();
-    let mut b_partition_time = TimestampMicrosecondBuilder::new().with_data_type(
-        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-    );
-
-    b_ts.append_option(ts);
-    b_fuid.append_option(fuid.as_deref());
-    b_tx_hosts.append_option(tx_hosts.as_deref());
-    b_rx_hosts.append_option(rx_hosts.as_deref());
-    b_source.append_option(source.as_deref());
-    b_mime_type.append_option(mime_type.as_deref());
-    b_filename.append_option(filename.as_deref());
-    b_total_bytes.append_option(total_bytes);
-    b_extra.append_value(&extra);
-    b_partition_time.append_value(partition_time.timestamp_micros());
-
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(b_ts.finish()),
-        Arc::new(b_fuid.finish()),
-        Arc::new(b_tx_hosts.finish()),
-        Arc::new(b_rx_hosts.finish()),
-        Arc::new(b_source.finish()),
-        Arc::new(b_mime_type.finish()),
-        Arc::new(b_filename.finish()),
-        Arc::new(b_total_bytes.finish()),
-        Arc::new(b_extra.finish()),
-        Arc::new(b_partition_time.finish()),
-    ];
-    Ok(RecordBatch::try_new(schema, columns)?)
+    acc.b_ts.append_option(ts);
+    acc.b_fuid.append_option(fuid.as_deref());
+    acc.b_tx_hosts.append_option(tx_hosts.as_deref());
+    acc.b_rx_hosts.append_option(rx_hosts.as_deref());
+    acc.b_source.append_option(source.as_deref());
+    acc.b_mime_type.append_option(mime_type.as_deref());
+    acc.b_filename.append_option(filename.as_deref());
+    acc.b_total_bytes.append_option(total_bytes);
+    acc.b_extra.append_value(&extra);
+    acc.b_partition_time
+        .append_value(partition_time.timestamp_micros());
+    acc.rows += 1;
 }
 
-fn map_notice(
+impl crate::forwarding::buffered_writer::RecordBatchAccumulator<crate::zeek::ZeekRecord>
+    for FilesAccumulator
+{
+    /// `_now` is unused: `ZeekRecord` carries its own `received_at`.
+    fn try_append(
+        &mut self,
+        record: &crate::zeek::ZeekRecord,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        let entry = get_schema_entry(&record.log_path);
+        if !Arc::ptr_eq(&entry.schema, &files_schema()) {
+            return Ok(false);
+        }
+        append_files_row(self, &record.fields, record.received_at);
+        Ok(true)
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+        self.finish_batch()
+    }
+}
+
+/// Map one `files.log` record to a single-row `RecordBatch`.
+fn map_files(
     value: &serde_json::Value,
     received_at: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<RecordBatch> {
-    let schema = notice_schema();
+    let mut acc = FilesAccumulator::new();
+    append_files_row(&mut acc, value, received_at);
+    acc.finish_batch()
+}
+/// Amortized builder set for the `notice.log` schema.
+///
+/// Holds the columns `map_notice` used to allocate fresh on every record as
+/// persistent builders. The field extraction lives exactly once, in
+/// `append_notice_row`; `map_notice` is a `new -> append -> finish` wrapper,
+/// so the amortized path and the single-record fallback cannot drift apart.
+pub(crate) struct NoticeAccumulator {
+    b_ts: TimestampMicrosecondBuilder,
+    b_uid: StringBuilder,
+    b_id_orig_h: StringBuilder,
+    b_id_orig_p: UInt16Builder,
+    b_id_resp_h: StringBuilder,
+    b_id_resp_p: UInt16Builder,
+    b_note: StringBuilder,
+    b_msg: StringBuilder,
+    b_sub: StringBuilder,
+    b_actions: StringBuilder,
+    b_extra: StringBuilder,
+    b_partition_time: TimestampMicrosecondBuilder,
+    rows: usize,
+}
+
+impl NoticeAccumulator {
+    pub(crate) fn new() -> Self {
+        Self {
+            b_ts: TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            )),
+            b_uid: StringBuilder::new(),
+            b_id_orig_h: StringBuilder::new(),
+            b_id_orig_p: UInt16Builder::new(),
+            b_id_resp_h: StringBuilder::new(),
+            b_id_resp_p: UInt16Builder::new(),
+            b_note: StringBuilder::new(),
+            b_msg: StringBuilder::new(),
+            b_sub: StringBuilder::new(),
+            b_actions: StringBuilder::new(),
+            b_extra: StringBuilder::new(),
+            b_partition_time: TimestampMicrosecondBuilder::new().with_data_type(
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            rows: 0,
+        }
+    }
+
+    fn finish_batch(&mut self) -> anyhow::Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.b_ts.finish()),
+            Arc::new(self.b_uid.finish()),
+            Arc::new(self.b_id_orig_h.finish()),
+            Arc::new(self.b_id_orig_p.finish()),
+            Arc::new(self.b_id_resp_h.finish()),
+            Arc::new(self.b_id_resp_p.finish()),
+            Arc::new(self.b_note.finish()),
+            Arc::new(self.b_msg.finish()),
+            Arc::new(self.b_sub.finish()),
+            Arc::new(self.b_actions.finish()),
+            Arc::new(self.b_extra.finish()),
+            Arc::new(self.b_partition_time.finish()),
+        ];
+        self.rows = 0;
+        Ok(RecordBatch::try_new(notice_schema(), columns)?)
+    }
+}
+
+/// Extract one `notice.log` record from raw Zeek JSON and append it to `acc`.
+/// Single implementation of the notice row mapping.
+fn append_notice_row(
+    acc: &mut NoticeAccumulator,
+    value: &serde_json::Value,
+    received_at: chrono::DateTime<chrono::Utc>,
+) {
     let promoted = &[
         "ts",
         "uid",
@@ -1165,109 +1530,192 @@ fn map_notice(
     let extra = build_extra(value, promoted, &mismatches);
     let partition_time = zeek_partition_time(value, received_at);
 
-    let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
-        TimeUnit::Microsecond,
-        Some("UTC".into()),
-    ));
-    let mut b_uid = StringBuilder::new();
-    let mut b_id_orig_h = StringBuilder::new();
-    let mut b_id_orig_p = UInt16Builder::new();
-    let mut b_id_resp_h = StringBuilder::new();
-    let mut b_id_resp_p = UInt16Builder::new();
-    let mut b_note = StringBuilder::new();
-    let mut b_msg = StringBuilder::new();
-    let mut b_sub = StringBuilder::new();
-    let mut b_actions = StringBuilder::new();
-    let mut b_extra = StringBuilder::new();
-    let mut b_partition_time = TimestampMicrosecondBuilder::new().with_data_type(
-        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-    );
-
-    b_ts.append_option(ts);
-    b_uid.append_option(uid.as_deref());
-    b_id_orig_h.append_option(id_orig_h.as_deref());
-    b_id_orig_p.append_option(id_orig_p);
-    b_id_resp_h.append_option(id_resp_h.as_deref());
-    b_id_resp_p.append_option(id_resp_p);
-    b_note.append_option(note.as_deref());
-    b_msg.append_option(msg.as_deref());
-    b_sub.append_option(sub.as_deref());
-    b_actions.append_option(actions.as_deref());
-    b_extra.append_value(&extra);
-    b_partition_time.append_value(partition_time.timestamp_micros());
-
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(b_ts.finish()),
-        Arc::new(b_uid.finish()),
-        Arc::new(b_id_orig_h.finish()),
-        Arc::new(b_id_orig_p.finish()),
-        Arc::new(b_id_resp_h.finish()),
-        Arc::new(b_id_resp_p.finish()),
-        Arc::new(b_note.finish()),
-        Arc::new(b_msg.finish()),
-        Arc::new(b_sub.finish()),
-        Arc::new(b_actions.finish()),
-        Arc::new(b_extra.finish()),
-        Arc::new(b_partition_time.finish()),
-    ];
-    Ok(RecordBatch::try_new(schema, columns)?)
+    acc.b_ts.append_option(ts);
+    acc.b_uid.append_option(uid.as_deref());
+    acc.b_id_orig_h.append_option(id_orig_h.as_deref());
+    acc.b_id_orig_p.append_option(id_orig_p);
+    acc.b_id_resp_h.append_option(id_resp_h.as_deref());
+    acc.b_id_resp_p.append_option(id_resp_p);
+    acc.b_note.append_option(note.as_deref());
+    acc.b_msg.append_option(msg.as_deref());
+    acc.b_sub.append_option(sub.as_deref());
+    acc.b_actions.append_option(actions.as_deref());
+    acc.b_extra.append_value(&extra);
+    acc.b_partition_time
+        .append_value(partition_time.timestamp_micros());
+    acc.rows += 1;
 }
 
-fn map_envelope(
+impl crate::forwarding::buffered_writer::RecordBatchAccumulator<crate::zeek::ZeekRecord>
+    for NoticeAccumulator
+{
+    /// `_now` is unused: `ZeekRecord` carries its own `received_at`.
+    fn try_append(
+        &mut self,
+        record: &crate::zeek::ZeekRecord,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        let entry = get_schema_entry(&record.log_path);
+        if !Arc::ptr_eq(&entry.schema, &notice_schema()) {
+            return Ok(false);
+        }
+        append_notice_row(self, &record.fields, record.received_at);
+        Ok(true)
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+        self.finish_batch()
+    }
+}
+
+/// Map one `notice.log` record to a single-row `RecordBatch`.
+fn map_notice(
+    value: &serde_json::Value,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<RecordBatch> {
+    let mut acc = NoticeAccumulator::new();
+    append_notice_row(&mut acc, value, received_at);
+    acc.finish_batch()
+}
+/// Amortized builder set for the envelope schema -- the fallback every
+/// unmodelled Zeek stream takes.
+///
+/// The field extraction lives exactly once, in `append_envelope_row`;
+/// `map_envelope` is a `new -> append -> finish` wrapper over it.
+pub(crate) struct EnvelopeAccumulator {
+    b_ts: TimestampMicrosecondBuilder,
+    b_uid: StringBuilder,
+    b_id_orig_h: StringBuilder,
+    b_id_orig_p: UInt16Builder,
+    b_id_resp_h: StringBuilder,
+    b_id_resp_p: UInt16Builder,
+    b_log_path: StringBuilder,
+    b_ingest_time: TimestampMicrosecondBuilder,
+    b_payload: StringBuilder,
+    b_partition_time: TimestampMicrosecondBuilder,
+    rows: usize,
+}
+
+impl EnvelopeAccumulator {
+    pub(crate) fn new() -> Self {
+        let ts = || {
+            TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ))
+        };
+        Self {
+            b_ts: ts(),
+            b_uid: StringBuilder::new(),
+            b_id_orig_h: StringBuilder::new(),
+            b_id_orig_p: UInt16Builder::new(),
+            b_id_resp_h: StringBuilder::new(),
+            b_id_resp_p: UInt16Builder::new(),
+            b_log_path: StringBuilder::new(),
+            b_ingest_time: ts(),
+            b_payload: StringBuilder::new(),
+            b_partition_time: ts(),
+            rows: 0,
+        }
+    }
+
+    fn finish_batch(&mut self) -> anyhow::Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.b_ts.finish()),
+            Arc::new(self.b_uid.finish()),
+            Arc::new(self.b_id_orig_h.finish()),
+            Arc::new(self.b_id_orig_p.finish()),
+            Arc::new(self.b_id_resp_h.finish()),
+            Arc::new(self.b_id_resp_p.finish()),
+            Arc::new(self.b_log_path.finish()),
+            Arc::new(self.b_ingest_time.finish()),
+            Arc::new(self.b_payload.finish()),
+            Arc::new(self.b_partition_time.finish()),
+        ];
+        self.rows = 0;
+        Ok(RecordBatch::try_new(envelope_schema(), columns)?)
+    }
+}
+
+/// Extract one envelope row and append it to `acc`. Single implementation of
+/// the envelope row mapping.
+fn append_envelope_row(
+    acc: &mut EnvelopeAccumulator,
     value: &serde_json::Value,
     log_path: &str,
     received_at: chrono::DateTime<chrono::Utc>,
-) -> anyhow::Result<RecordBatch> {
-    let schema = envelope_schema();
-
+) {
     let ts = json_ts_micros(value, "ts");
     let uid = json_str(value, "uid");
     let id_orig_h = json_str(value, "id.orig_h");
     let id_orig_p = json_u16(value, "id.orig_p");
     let id_resp_h = json_str(value, "id.resp_h");
     let id_resp_p = json_u16(value, "id.resp_p");
+    // Read per row, NOT from the writer's threaded `now`: `ingest_time` is
+    // this row's own receipt-into-storage instant, and every row of an
+    // accumulated batch is appended at a different moment. Unlike
+    // `partition_time` this is not a buffer key, so a per-row read cannot
+    // produce a non-day-clean file -- the race `push()`'s single clock read
+    // exists to prevent does not apply here.
     let ingest_time = chrono::Utc::now().timestamp_micros();
     let payload = value.to_string();
     let partition_time = zeek_partition_time(value, received_at);
 
-    let ts_type = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
-    let mut b_ts = TimestampMicrosecondBuilder::new().with_data_type(ts_type.clone());
-    let mut b_uid = StringBuilder::new();
-    let mut b_id_orig_h = StringBuilder::new();
-    let mut b_id_orig_p = UInt16Builder::new();
-    let mut b_id_resp_h = StringBuilder::new();
-    let mut b_id_resp_p = UInt16Builder::new();
-    let mut b_log_path = StringBuilder::new();
-    let mut b_ingest_time = TimestampMicrosecondBuilder::new().with_data_type(ts_type.clone());
-    let mut b_payload = StringBuilder::new();
-    let mut b_partition_time = TimestampMicrosecondBuilder::new().with_data_type(ts_type);
-
-    b_ts.append_option(ts);
-    b_uid.append_option(uid.as_deref());
-    b_id_orig_h.append_option(id_orig_h.as_deref());
-    b_id_orig_p.append_option(id_orig_p);
-    b_id_resp_h.append_option(id_resp_h.as_deref());
-    b_id_resp_p.append_option(id_resp_p);
-    b_log_path.append_value(log_path);
-    b_ingest_time.append_value(ingest_time);
-    b_payload.append_value(&payload);
-    b_partition_time.append_value(partition_time.timestamp_micros());
-
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(b_ts.finish()),
-        Arc::new(b_uid.finish()),
-        Arc::new(b_id_orig_h.finish()),
-        Arc::new(b_id_orig_p.finish()),
-        Arc::new(b_id_resp_h.finish()),
-        Arc::new(b_id_resp_p.finish()),
-        Arc::new(b_log_path.finish()),
-        Arc::new(b_ingest_time.finish()),
-        Arc::new(b_payload.finish()),
-        Arc::new(b_partition_time.finish()),
-    ];
-    Ok(RecordBatch::try_new(schema, columns)?)
+    acc.b_ts.append_option(ts);
+    acc.b_uid.append_option(uid.as_deref());
+    acc.b_id_orig_h.append_option(id_orig_h.as_deref());
+    acc.b_id_orig_p.append_option(id_orig_p);
+    acc.b_id_resp_h.append_option(id_resp_h.as_deref());
+    acc.b_id_resp_p.append_option(id_resp_p);
+    acc.b_log_path.append_value(log_path);
+    acc.b_ingest_time.append_value(ingest_time);
+    acc.b_payload.append_value(&payload);
+    acc.b_partition_time
+        .append_value(partition_time.timestamp_micros());
+    acc.rows += 1;
 }
 
+impl crate::forwarding::buffered_writer::RecordBatchAccumulator<crate::zeek::ZeekRecord>
+    for EnvelopeAccumulator
+{
+    /// `_now` is unused: `ZeekRecord` carries its own `received_at`, and
+    /// `ingest_time` is deliberately read per row (see `append_envelope_row`).
+    fn try_append(
+        &mut self,
+        record: &crate::zeek::ZeekRecord,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        let entry = get_schema_entry(&record.log_path);
+        if !Arc::ptr_eq(&entry.schema, &envelope_schema()) {
+            return Ok(false);
+        }
+        append_envelope_row(self, &record.fields, &record.log_path, record.received_at);
+        Ok(true)
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+        self.finish_batch()
+    }
+}
+
+/// Map one unmodelled Zeek record to a single-row envelope `RecordBatch`.
+fn map_envelope(
+    value: &serde_json::Value,
+    log_path: &str,
+    received_at: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<RecordBatch> {
+    let mut acc = EnvelopeAccumulator::new();
+    append_envelope_row(&mut acc, value, log_path, received_at);
+    acc.finish_batch()
+}
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -1393,6 +1841,191 @@ mod tests {
     /// of the real one would visibly fail rather than passing by accident.
     fn rx() -> chrono::DateTime<chrono::Utc> {
         chrono::Utc.with_ymd_and_hms(2024, 3, 15, 12, 0, 0).unwrap()
+    }
+
+    // --- amortized accumulator tests (all six non-conn schemas) ---
+
+    /// For each schema: N records through one accumulator must equal N
+    /// single-row batches concatenated. This is the test that would catch the
+    /// extraction logic having been altered rather than moved during the
+    /// hoist into `append_*_row`.
+    macro_rules! accumulator_parity_test {
+        ($test:ident, $acc:ident, $append:ident, $schema:ident, $json:expr) => {
+            #[test]
+            fn $test() {
+                use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+                let records: Vec<serde_json::Value> = (0..4).map($json).collect();
+
+                let singles: Vec<RecordBatch> = records
+                    .iter()
+                    .map(|v| {
+                        let mut a = $acc::new();
+                        $append(&mut a, v, rx());
+                        a.finish_batch().unwrap()
+                    })
+                    .collect();
+                let expected = arrow::compute::concat_batches(&$schema(), &singles).unwrap();
+
+                let mut acc = $acc::new();
+                assert!(acc.is_empty());
+                for (i, v) in records.iter().enumerate() {
+                    $append(&mut acc, v, rx());
+                    assert_eq!(acc.len(), i + 1, "len must advance one row per record");
+                }
+                let actual = acc.finish().unwrap();
+
+                assert_eq!(actual.num_rows(), expected.num_rows());
+                assert_eq!(actual.schema(), expected.schema());
+                for c in 0..expected.num_columns() {
+                    assert_eq!(
+                        format!("{:?}", actual.column(c)),
+                        format!("{:?}", expected.column(c)),
+                        "column {} ({}) differs between amortized and per-record paths",
+                        c,
+                        expected.schema().field(c).name()
+                    );
+                }
+
+                // finish() must reset: a builder retaining rows would
+                // silently duplicate data into the next flush.
+                assert_eq!(acc.len(), 0);
+                $append(&mut acc, &records[0], rx());
+                assert_eq!(acc.finish().unwrap().num_rows(), 1);
+            }
+        };
+    }
+
+    accumulator_parity_test!(
+        dns_accumulator_matches_per_record_path,
+        DnsAccumulator,
+        append_dns_row,
+        dns_schema,
+        |i: i32| serde_json::json!({
+            "ts": 1700000000.0 + i as f64, "uid": format!("C{i}"),
+            "id.orig_h": "10.0.0.1", "id.orig_p": 1234u16 + i as u16,
+            "id.resp_h": "10.0.0.2", "id.resp_p": 53u16, "proto": "udp",
+            "trans_id": 42u32 + i as u32, "query": format!("h{i}.example.com"),
+            "qtype_name": "A", "qclass_name": "C_INTERNET", "rcode_name": "NOERROR",
+            "answers": ["1.2.3.4"], "unmodelled": i,
+        })
+    );
+
+    accumulator_parity_test!(
+        http_accumulator_matches_per_record_path,
+        HttpAccumulator,
+        append_http_row,
+        http_schema,
+        |i: i32| serde_json::json!({
+            "ts": 1700000000.0 + i as f64, "uid": format!("C{i}"),
+            "id.orig_h": "10.0.0.1", "id.orig_p": 1234u16 + i as u16,
+            "id.resp_h": "10.0.0.2", "id.resp_p": 80u16,
+            "method": "GET", "host": "example.com", "uri": format!("/p/{i}"),
+            "status_code": 200u16, "user_agent": "curl/8", "unmodelled": i,
+        })
+    );
+
+    accumulator_parity_test!(
+        ssl_accumulator_matches_per_record_path,
+        SslAccumulator,
+        append_ssl_row,
+        ssl_schema,
+        |i: i32| serde_json::json!({
+            "ts": 1700000000.0 + i as f64, "uid": format!("C{i}"),
+            "id.orig_h": "10.0.0.1", "id.orig_p": 1234u16 + i as u16,
+            "id.resp_h": "10.0.0.2", "id.resp_p": 443u16,
+            "version": "TLSv13", "server_name": format!("h{i}.example.com"),
+            "established": true, "unmodelled": i,
+        })
+    );
+
+    accumulator_parity_test!(
+        files_accumulator_matches_per_record_path,
+        FilesAccumulator,
+        append_files_row,
+        files_schema,
+        |i: i32| serde_json::json!({
+            "ts": 1700000000.0 + i as f64, "fuid": format!("F{i}"),
+            "source": "HTTP", "mime_type": "text/plain",
+            "filename": format!("f{i}.txt"), "seen_bytes": 100u64 + i as u64,
+            "unmodelled": i,
+        })
+    );
+
+    accumulator_parity_test!(
+        notice_accumulator_matches_per_record_path,
+        NoticeAccumulator,
+        append_notice_row,
+        notice_schema,
+        |i: i32| serde_json::json!({
+            "ts": 1700000000.0 + i as f64, "uid": format!("C{i}"),
+            "note": "Scan::Port_Scan", "msg": format!("m{i}"),
+            "src": "10.0.0.1", "dst": "10.0.0.2", "unmodelled": i,
+        })
+    );
+
+    /// Envelope takes an extra `log_path` argument, so it does not fit the
+    /// macro above.
+    #[test]
+    fn envelope_accumulator_matches_per_record_path() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+        let records: Vec<serde_json::Value> = (0..4)
+            .map(|i| serde_json::json!({ "ts": 1700000000.0 + i as f64, "uid": format!("C{i}"), "x": i }))
+            .collect();
+
+        let mut acc = EnvelopeAccumulator::new();
+        for v in &records {
+            append_envelope_row(&mut acc, v, "weird_stream", rx());
+        }
+        let actual = acc.finish().unwrap();
+        assert_eq!(actual.num_rows(), records.len());
+
+        // ingest_time is read per row and so legitimately differs between the
+        // amortized and per-record paths; every OTHER column must match.
+        let singles: Vec<RecordBatch> = records
+            .iter()
+            .map(|v| map_envelope(v, "weird_stream", rx()).unwrap())
+            .collect();
+        let expected = arrow::compute::concat_batches(&envelope_schema(), &singles).unwrap();
+        for c in 0..expected.num_columns() {
+            if expected.schema().field(c).name() == "ingest_time" {
+                continue;
+            }
+            assert_eq!(
+                format!("{:?}", actual.column(c)),
+                format!("{:?}", expected.column(c)),
+                "column {} differs",
+                expected.schema().field(c).name()
+            );
+        }
+    }
+
+    /// An accumulator handed a record belonging to a DIFFERENT schema must
+    /// return Ok(false) and append nothing, so push() falls back to
+    /// to_record_batch for that record instead of writing it through the
+    /// wrong builder set -- silent cross-schema data corruption.
+    #[test]
+    fn accumulators_reject_records_from_another_schema() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+        let http_rec = crate::zeek::ZeekRecord {
+            log_path: "http".to_string(),
+            fields: serde_json::json!({ "ts": 1700000000.0, "method": "GET" }),
+            received_at: rx(),
+        };
+        let mut dns = DnsAccumulator::new();
+        assert!(
+            !dns.try_append(&http_rec, rx()).unwrap(),
+            "dns accumulator must reject an http record"
+        );
+        assert_eq!(dns.len(), 0, "a rejected record must not add a row");
+
+        let dns_rec = crate::zeek::ZeekRecord {
+            log_path: "dns".to_string(),
+            fields: serde_json::json!({ "ts": 1700000000.0, "query": "a.example.com" }),
+            received_at: rx(),
+        };
+        let mut http = HttpAccumulator::new();
+        assert!(!http.try_append(&dns_rec, rx()).unwrap());
+        assert_eq!(http.len(), 0);
     }
 
     // --- conn schema tests ---
