@@ -1,7 +1,7 @@
 //! Shutdown utilities: signal handling and deadline-bounded handle awaiting.
 
 use std::time::Duration;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 
 /// Resolves when the process receives SIGTERM or SIGINT.
 ///
@@ -74,6 +74,30 @@ pub async fn await_handles_with_deadline(
     completed
 }
 
+/// Wait for the first of `handles` to complete (unexpectedly), for the
+/// `main.rs` H-3 supervision `select!` arm.
+///
+/// An empty `handles` is a legitimate deployment shape (e.g. HTTP-ingest-only,
+/// with no syslog/IPFIX/Zeek/Suricata/sFlow listener enabled) — not an error.
+/// `FuturesUnordered::next()` on an empty set resolves immediately with
+/// `None`, so without this check the H-3 `select!` arm would win instantly on
+/// every poll and fall straight through into the shutdown sequence, taking
+/// the whole process down seconds after a valid startup. Pending forever here
+/// instead lets the other `select!` arms (server, shutdown signal) decide.
+pub async fn supervise_listener_handles(
+    handles: &mut [JoinHandle<()>],
+) -> Option<Result<(), JoinError>> {
+    if handles.is_empty() {
+        return std::future::pending().await;
+    }
+    let mut futs = futures::stream::FuturesUnordered::new();
+    for h in handles.iter_mut() {
+        futs.push(h);
+    }
+    use futures::StreamExt;
+    futs.next().await
+}
+
 /// Wait for each listener task to exit, up to `per_handle_timeout` each,
 /// aborting any that overruns so its `Arc<dyn Handler>` clones are released.
 ///
@@ -102,6 +126,43 @@ pub async fn drain_listener_handles(handles: Vec<JoinHandle<()>>, per_handle_tim
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// Regression for the HTTP-only-deployment bug: an empty handle set must
+    /// never resolve. Before the fix, `FuturesUnordered::next()` on an empty
+    /// set returned `Poll::Ready(None)` immediately, so the H-3 `select!` arm
+    /// in `main.rs` won instantly on every poll and the process fell straight
+    /// through into shutdown seconds after a valid startup with no
+    /// wire-protocol listeners configured.
+    #[tokio::test]
+    async fn supervise_pends_forever_when_handles_empty() {
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
+
+        tokio::select! {
+            _ = supervise_listener_handles(&mut handles) => {
+                panic!("supervise_listener_handles resolved on an empty handle set");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(300)) => {
+                // Expected: still pending after a generous wait.
+            }
+        }
+    }
+
+    /// A non-empty handle set still resolves as soon as a handle completes —
+    /// the empty-set guard must not break the real supervision behaviour.
+    #[tokio::test]
+    async fn supervise_resolves_when_a_handle_completes() {
+        let mut handles: Vec<JoinHandle<()>> =
+            vec![tokio::spawn(async { /* exits immediately */ })];
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            supervise_listener_handles(&mut handles),
+        )
+        .await
+        .expect("supervise_listener_handles must resolve once a handle completes");
+
+        assert!(matches!(result, Some(Ok(()))));
+    }
 
     /// All handles complete quickly — function returns the full count well
     /// within the deadline.
