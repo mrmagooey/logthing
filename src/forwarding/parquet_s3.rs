@@ -10,7 +10,7 @@
 use crate::config::WefS3Config;
 use crate::forwarding::buffered_writer::ParquetSink;
 use crate::models::WindowsEvent;
-use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt32Array};
+use arrow::array::{ArrayRef, StringBuilder, TimestampMicrosecondBuilder, UInt32Builder};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use std::sync::{Arc, LazyLock};
@@ -92,15 +92,96 @@ impl ParquetSink for WefSink {
     fn to_record_batch(
         &self,
         record: &Arc<WindowsEvent>,
-        schema: &Arc<arrow_schema::Schema>,
+        _schema: &Arc<arrow_schema::Schema>,
     ) -> anyhow::Result<arrow_array::RecordBatch> {
+        let mut acc = WefAccumulator::new();
+        acc.append_event(record)?;
+        acc.finish_batch()
+    }
+
+    /// Opt into the amortized builder path. Gated on the schema Arc even
+    /// though this sink has one schema, mirroring the other sinks.
+    fn new_batch(
+        &self,
+        schema: &Arc<arrow_schema::Schema>,
+    ) -> Option<
+        Box<dyn crate::forwarding::buffered_writer::RecordBatchAccumulator<Arc<WindowsEvent>>>,
+    > {
+        if Arc::ptr_eq(schema, &WEF_SCHEMA) {
+            Some(Box::new(WefAccumulator::new()))
+        } else {
+            None
+        }
+    }
+
+    /// Overrides the default `day_and_batch`, which would call
+    /// `to_record_batch` and read the day off the built batch -- allocating
+    /// the full builder set on every push before `new_batch`'s accumulator is
+    /// consulted, making the amortized path a no-op.
+    ///
+    /// `partition_time` is written as `partition_time(Some(received_at),
+    /// received_at)`, so this reproduces the default's row-0 read exactly.
+    /// Unparsed events (which `to_record_batch` rejects) still get a day here;
+    /// they are dropped later by the per-record fallback, exactly as before.
+    fn day_and_batch(
+        &self,
+        record: &Arc<WindowsEvent>,
+        _schema: &Arc<arrow_schema::Schema>,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<(chrono::NaiveDate, Option<arrow_array::RecordBatch>)> {
+        let day = crate::forwarding::buffered_writer::partition_time(
+            Some(record.received_at),
+            record.received_at,
+        )
+        .date_naive();
+        Ok((day, None))
+    }
+}
+
+/// Amortized builder set for the WEF schema. Holds the six columns
+/// `to_record_batch` used to build fresh per record as persistent builders.
+///
+/// The row mapping lives here exactly once; `WefSink::to_record_batch` is a
+/// `new -> append -> finish` wrapper over it, so the amortized path and the
+/// single-record fallback cannot drift apart.
+pub(crate) struct WefAccumulator {
+    b_event_id: UInt32Builder,
+    b_timestamp: TimestampMicrosecondBuilder,
+    b_source_host: StringBuilder,
+    b_subscription_id: StringBuilder,
+    b_event_data: StringBuilder,
+    b_partition_time: TimestampMicrosecondBuilder,
+    rows: usize,
+}
+
+impl WefAccumulator {
+    pub(crate) fn new() -> Self {
+        let ts = || {
+            TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ))
+        };
+        Self {
+            b_event_id: UInt32Builder::new(),
+            b_timestamp: ts(),
+            b_source_host: StringBuilder::new(),
+            b_subscription_id: StringBuilder::new(),
+            b_event_data: StringBuilder::new(),
+            b_partition_time: ts(),
+            rows: 0,
+        }
+    }
+
+    /// Append one event. Returns `Err` for an unparsed event or a
+    /// serialization failure, matching the original mapper's contract --
+    /// the generic writer logs a warn and skips.
+    fn append_event(&mut self, record: &Arc<WindowsEvent>) -> anyhow::Result<()> {
         // Unparsed events are silently skipped (matches legacy behavior).
-        // Return Err here; the generic writer logs a warn and continues.
         let parsed = record
             .parsed
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WEF event has no parsed data; skipping"))?;
-
         let event_data = serde_json::to_string(record.as_ref())
             .map_err(|e| anyhow::anyhow!("WEF event JSON serialization failed: {e}"))?;
 
@@ -114,24 +195,61 @@ impl ParquetSink for WefSink {
             record.received_at,
         );
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(vec![parsed.event_id])) as ArrayRef,
-                Arc::new(
-                    TimestampMicrosecondArray::from(vec![record.received_at.timestamp_micros()])
-                        .with_timezone(Arc::<str>::from("UTC")),
-                ) as ArrayRef,
-                Arc::new(StringArray::from(vec![record.source_host.as_str()])) as ArrayRef,
-                Arc::new(StringArray::from(vec![record.subscription_id.as_deref()])) as ArrayRef,
-                Arc::new(StringArray::from(vec![event_data.as_str()])) as ArrayRef,
-                Arc::new(
-                    TimestampMicrosecondArray::from(vec![partition_time.timestamp_micros()])
-                        .with_timezone(Arc::<str>::from("UTC")),
-                ) as ArrayRef,
-            ],
-        )?;
-        Ok(batch)
+        self.b_event_id.append_value(parsed.event_id);
+        self.b_timestamp
+            .append_value(record.received_at.timestamp_micros());
+        self.b_source_host.append_value(&record.source_host);
+        self.b_subscription_id
+            .append_option(record.subscription_id.as_deref());
+        self.b_event_data.append_value(&event_data);
+        self.b_partition_time
+            .append_value(partition_time.timestamp_micros());
+        self.rows += 1;
+        Ok(())
+    }
+
+    fn finish_batch(&mut self) -> anyhow::Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.b_event_id.finish()),
+            Arc::new(self.b_timestamp.finish()),
+            Arc::new(self.b_source_host.finish()),
+            Arc::new(self.b_subscription_id.finish()),
+            Arc::new(self.b_event_data.finish()),
+            Arc::new(self.b_partition_time.finish()),
+        ];
+        self.rows = 0;
+        Ok(RecordBatch::try_new(WEF_SCHEMA.clone(), columns)?)
+    }
+}
+
+impl crate::forwarding::buffered_writer::RecordBatchAccumulator<Arc<WindowsEvent>>
+    for WefAccumulator
+{
+    /// Returns `Ok(false)` for an event this accumulator cannot take, so
+    /// `push()` falls back to `to_record_batch` for that one record --
+    /// which returns `Err`, and the writer logs a warn and skips it. That
+    /// reproduces the pre-accumulator behaviour for unparsed events exactly,
+    /// rather than inventing a second skip path here.
+    ///
+    /// `_now` is unused: `WindowsEvent` carries its own `received_at`.
+    fn try_append(
+        &mut self,
+        record: &Arc<WindowsEvent>,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        if record.parsed.is_none() {
+            return Ok(false);
+        }
+        self.append_event(record)?;
+        Ok(true)
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+        self.finish_batch()
     }
 }
 
@@ -203,6 +321,7 @@ mod tests {
     use crate::config::WefS3Config;
     use crate::forwarding::buffered_writer::ParquetSink;
     use crate::models::{EventLevel, ParsedEvent, WindowsEvent};
+    use arrow::array::TimestampMicrosecondArray;
     use chrono::Utc;
 
     fn sample_parsed_event(event_id: u32) -> ParsedEvent {
@@ -234,6 +353,133 @@ mod tests {
 
     fn make_unparsed_event() -> Arc<WindowsEvent> {
         Arc::new(WindowsEvent::new("host".into(), "<Event/>".into()))
+    }
+
+    // -- RecordBatchAccumulator (amortized builder path) --
+
+    /// The amortized path must produce byte-identical columns to the
+    /// single-record path, including the nullable `subscription_id`.
+    #[test]
+    fn wef_accumulator_matches_single_record_batches_column_for_column() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+        let events = [
+            make_parsed_event(4624),
+            make_parsed_event(4625),
+            make_parsed_event(4688),
+        ];
+        let schema = WefSink.schema(None);
+
+        let mut acc = WefAccumulator::new();
+        assert!(acc.is_empty());
+        for (i, e) in events.iter().enumerate() {
+            assert!(acc.try_append(e, Utc::now()).unwrap());
+            assert_eq!(acc.len(), i + 1);
+        }
+        let batched = acc.finish().unwrap();
+        assert_eq!(batched.num_rows(), events.len());
+
+        for (i, e) in events.iter().enumerate() {
+            let single = WefSink.to_record_batch(e, &schema).unwrap();
+            for col in 0..single.num_columns() {
+                assert_eq!(
+                    single.column(col).to_data(),
+                    batched.column(col).slice(i, 1).to_data(),
+                    "row {i} column {} differs between amortized and single-record paths",
+                    schema.field(col).name()
+                );
+            }
+        }
+    }
+
+    /// An unparsed event must be REJECTED by try_append (Ok(false)) so push()
+    /// falls back to to_record_batch, which errors and makes the writer log
+    /// and skip it -- the pre-accumulator behaviour. Appending it instead
+    /// would either panic or write a bogus row.
+    #[test]
+    fn wef_accumulator_rejects_unparsed_event_and_appends_nothing() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+        let mut acc = WefAccumulator::new();
+        assert!(
+            !acc.try_append(&make_unparsed_event(), Utc::now()).unwrap(),
+            "unparsed event must return Ok(false) so the per-record fallback skips it"
+        );
+        assert_eq!(acc.len(), 0, "a rejected event must not add a row");
+        assert!(acc.is_empty());
+
+        // And the fallback it defers to still errors, as before.
+        let schema = WefSink.schema(None);
+        assert!(
+            WefSink
+                .to_record_batch(&make_unparsed_event(), &schema)
+                .is_err(),
+            "to_record_batch must still reject unparsed events"
+        );
+    }
+
+    /// A builder retaining prior rows would silently duplicate data into the
+    /// next flush.
+    #[test]
+    fn wef_accumulator_finish_twice_produces_independent_batches() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+        let mut acc = WefAccumulator::new();
+        acc.try_append(&make_parsed_event(1), Utc::now()).unwrap();
+        acc.try_append(&make_parsed_event(2), Utc::now()).unwrap();
+        let first = acc.finish().unwrap();
+        assert_eq!(first.num_rows(), 2);
+        assert_eq!(acc.len(), 0);
+
+        acc.try_append(&make_parsed_event(3), Utc::now()).unwrap();
+        let second = acc.finish().unwrap();
+        assert_eq!(second.num_rows(), 1);
+        let ids = second
+            .column_by_name("event_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::UInt32Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), 3);
+    }
+
+    /// Guards the silent no-op: new_batch returning None would leave push()
+    /// allocating a fresh builder set per record, with every other test still
+    /// passing.
+    #[test]
+    fn wef_new_batch_activates_for_the_real_schema_and_not_an_unrelated_one() {
+        let schema = WefSink.schema(None);
+        assert!(Arc::ptr_eq(&schema, &WEF_SCHEMA));
+        assert!(
+            WefSink.new_batch(&schema).is_some(),
+            "new_batch must return Some -- if None, the accumulator never activates"
+        );
+        let other: Arc<Schema> = Arc::new(Schema::new(vec![Field::new(
+            "unrelated",
+            DataType::Utf8,
+            false,
+        )]));
+        assert!(WefSink.new_batch(&other).is_none());
+    }
+
+    /// day_and_batch must give the day the default would have read off row 0,
+    /// and must NOT build a batch -- building one reinstates the per-push
+    /// allocation the override exists to remove.
+    #[test]
+    fn wef_day_and_batch_matches_default_mechanism_without_building_a_batch() {
+        let e = make_parsed_event(4624);
+        let schema = WefSink.schema(None);
+        let (day, batch) = WefSink.day_and_batch(&e, &schema, Utc::now()).unwrap();
+        assert!(batch.is_none(), "must not build a batch");
+
+        let built = WefSink.to_record_batch(&e, &schema).unwrap();
+        let pt = built
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .unwrap();
+        let expected = chrono::DateTime::from_timestamp_micros(pt.value(0))
+            .unwrap()
+            .date_naive();
+        assert_eq!(day, expected);
     }
 
     // WefSink unit tests
