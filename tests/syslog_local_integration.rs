@@ -133,6 +133,143 @@ async fn syslog_messages_appear_as_parquet_on_local_disk() {
     assert!(!hostnames.is_null(0));
 }
 
+/// Pushes 1500 real syslog messages through the real pipeline
+/// (`SyslogS3Handler` local variant -> `PartitionedParquetWriter` ->
+/// `LocalDiskSink`), crossing the `BUILDER_BATCH_ROWS` (1000) threshold in
+/// `SyslogAccumulator`'s live builder mid-burst -- proving the amortized
+/// builder correctly materializes once at row 1000 and resumes accumulating
+/// the remaining 500 rows in a fresh builder, rather than silently dropping
+/// or corrupting rows across that boundary. Mirrors
+/// `suricata_local_burst_of_1500_alert_records_crosses_builder_batch_rows`.
+/// Every 7th message has no `hostname` (a CEF/LEEF-like payload with no
+/// parseable header), exercising the nullable column through the
+/// accumulator path across the materialize boundary too.
+#[tokio::test]
+async fn syslog_local_burst_of_1500_messages_crosses_builder_batch_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = std::sync::Arc::new(
+        LocalDiskSink::new(dir.path().to_path_buf())
+            .await
+            .expect("LocalDiskSink::new"),
+    );
+    // Row/byte/time thresholds all high enough that no in-loop flush fires;
+    // the only flush is the shutdown `flush_all` once the handler is
+    // dropped. `channel_capacity` is comfortably above the message count so
+    // `handle_message`'s `try_send` never actually fills under this
+    // single-threaded burst.
+    let cfg = SyslogLocalConfig {
+        directory: dir.path().to_path_buf(),
+        prefix: "syslog".to_string(),
+        max_buffer_rows: 100_000,
+        flush_interval_secs: 3600,
+        channel_capacity: 2000,
+    };
+
+    let (handler, writer_task) = syslog_local_start(
+        &cfg,
+        sink,
+        std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+
+    let src: SocketAddr = "127.0.0.1:5514".parse().unwrap();
+    const N: usize = 1500;
+    for i in 0..N {
+        let msg = if i % 7 == 0 {
+            SyslogMessage {
+                priority: 13,
+                severity: 5,
+                facility: 1,
+                timestamp: None,
+                hostname: None,
+                app_name: None,
+                proc_id: None,
+                msg_id: None,
+                message: format!("cef-like payload {i}"),
+                structured_data: None,
+                protocol: SyslogProtocol::Unknown,
+            }
+        } else {
+            SyslogMessage {
+                priority: 34,
+                severity: 2,
+                facility: 4,
+                timestamp: Some(chrono::Utc::now()),
+                hostname: Some(format!("host-{i}")),
+                app_name: Some("sshd".to_string()),
+                proc_id: Some(i.to_string()),
+                msg_id: None,
+                message: format!("message {i}"),
+                structured_data: None,
+                protocol: SyslogProtocol::Rfc3164,
+            }
+        };
+        handler.handle_message(msg, src).await;
+    }
+
+    // Drop the handler to close the channel; the writer task's shutdown
+    // path drains any in-flight flushes and then performs one final,
+    // synchronous `flush_all` covering everything still buffered.
+    drop(handler);
+    tokio::time::timeout(std::time::Duration::from_secs(10), writer_task)
+        .await
+        .expect("writer task exits within 10s")
+        .expect("writer task must not panic");
+
+    let mut all_files = Vec::new();
+    walk_all_files(dir.path(), &mut all_files);
+    let parquet_files: Vec<_> = all_files
+        .iter()
+        .filter(|p| p.extension().is_some_and(|ext| ext == "parquet"))
+        .collect();
+    assert!(
+        !parquet_files.is_empty(),
+        "expected at least one Parquet file under {:?}",
+        dir.path()
+    );
+
+    use arrow::array::{Array, StringArray};
+
+    let mut hostnames: Vec<Option<String>> = Vec::with_capacity(N);
+    for file_path in &parquet_files {
+        let bytes = std::fs::read(file_path).expect("read parquet file");
+        let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))
+            .expect("parquet builder for syslog burst");
+        let reader = builder.build().expect("parquet reader for syslog burst");
+        for rb in reader {
+            let rb = rb.expect("batch ok");
+            let hostname_col = rb
+                .column_by_name("hostname")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..rb.num_rows() {
+                hostnames.push(if hostname_col.is_null(i) {
+                    None
+                } else {
+                    Some(hostname_col.value(i).to_string())
+                });
+            }
+        }
+    }
+
+    assert_eq!(
+        hostnames.len(),
+        N,
+        "expected exactly {N} rows across all syslog Parquet files, proving the \
+         BUILDER_BATCH_ROWS (1000) materialize threshold was crossed at least \
+         once mid-burst without losing or duplicating rows"
+    );
+    let null_count = hostnames.iter().filter(|v| v.is_none()).count();
+    assert_eq!(
+        null_count,
+        N.div_ceil(7),
+        "every 7th message had no hostname and must round-trip as null through \
+         the accumulator, including across the materialize boundary"
+    );
+}
+
 #[tokio::test]
 async fn syslog_local_start_emits_iceberg_descriptor_when_configured() {
     let parquet_dir = tempfile::tempdir().expect("parquet tempdir");
