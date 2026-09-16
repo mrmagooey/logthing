@@ -10,7 +10,7 @@
 use crate::config::SyslogS3Config;
 use crate::forwarding::buffered_writer::ParquetSink;
 use crate::syslog::payload::StructuredSyslogRecord;
-use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt8Array};
+use arrow::array::{ArrayRef, StringBuilder, TimestampMicrosecondBuilder, UInt8Builder};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use std::sync::{Arc, LazyLock};
@@ -54,54 +54,134 @@ pub fn structured_syslog_schema() -> Arc<Schema> {
 // Row mapping
 // ---------------------------------------------------------------------------
 
+/// Amortized builder set for the structured-syslog schema. Holds the same 10
+/// Arrow columns `structured_syslog_record_to_batch` used to build fresh on
+/// every call, as persistent builders reused across many records.
+///
+/// The extraction logic lives here exactly once: `structured_syslog_record_to_batch`
+/// below is a thin `new -> append -> finish` wrapper over it, so the amortized
+/// path and the single-record fallback can never drift apart. (Contrast
+/// `zeek::schema::ConnAccumulator`, which duplicates `map_conn` and needs a
+/// parity test to stay in sync.)
+pub(crate) struct StructuredSyslogAccumulator {
+    b_priority: UInt8Builder,
+    b_severity: UInt8Builder,
+    b_facility: UInt8Builder,
+    b_timestamp: TimestampMicrosecondBuilder,
+    b_hostname: StringBuilder,
+    b_app_name: StringBuilder,
+    b_received_at: TimestampMicrosecondBuilder,
+    b_payload_type: StringBuilder,
+    b_parsed: StringBuilder,
+    b_partition_time: TimestampMicrosecondBuilder,
+    rows: usize,
+}
+
+impl StructuredSyslogAccumulator {
+    pub(crate) fn new() -> Self {
+        let ts = || {
+            TimestampMicrosecondBuilder::new().with_data_type(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ))
+        };
+        Self {
+            b_priority: UInt8Builder::new(),
+            b_severity: UInt8Builder::new(),
+            b_facility: UInt8Builder::new(),
+            b_timestamp: ts(),
+            b_hostname: StringBuilder::new(),
+            b_app_name: StringBuilder::new(),
+            b_received_at: ts(),
+            b_payload_type: StringBuilder::new(),
+            b_parsed: StringBuilder::new(),
+            b_partition_time: ts(),
+            rows: 0,
+        }
+    }
+
+    /// Append one record. Mirrors the original mapper's field handling
+    /// exactly, including `timestamp`'s nullability and `partition_time`'s
+    /// derivation from the nullable `timestamp` clamped against the non-null
+    /// `received_at`.
+    fn append_record(&mut self, rec: &StructuredSyslogRecord) {
+        self.b_priority.append_value(rec.priority);
+        self.b_severity.append_value(rec.severity);
+        self.b_facility.append_value(rec.facility);
+        self.b_timestamp
+            .append_option(rec.timestamp.map(|t| t.timestamp_micros()));
+        self.b_hostname.append_option(rec.hostname.as_deref());
+        self.b_app_name.append_option(rec.app_name.as_deref());
+        self.b_received_at
+            .append_value(rec.received_at.timestamp_micros());
+        self.b_payload_type.append_value(rec.payload_type);
+        self.b_parsed.append_value(
+            serde_json::to_string(&rec.parsed).unwrap_or_else(|_| "null".to_string()),
+        );
+        // `timestamp` is the syslog header's event time (nullable -- absent for
+        // e.g. some CEF/LEEF payloads); `partition_time` derives the buffer's
+        // day-clean column from it, clamped against and falling back to the
+        // non-null `received_at`. See `crate::forwarding::buffered_writer::partition_time`.
+        let partition_time_value =
+            crate::forwarding::buffered_writer::partition_time(rec.timestamp, rec.received_at);
+        self.b_partition_time
+            .append_value(partition_time_value.timestamp_micros());
+        self.rows += 1;
+    }
+
+    fn finish_batch(&mut self) -> anyhow::Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.b_priority.finish()),
+            Arc::new(self.b_severity.finish()),
+            Arc::new(self.b_facility.finish()),
+            Arc::new(self.b_timestamp.finish()),
+            Arc::new(self.b_hostname.finish()),
+            Arc::new(self.b_app_name.finish()),
+            Arc::new(self.b_received_at.finish()),
+            Arc::new(self.b_payload_type.finish()),
+            Arc::new(self.b_parsed.finish()),
+            Arc::new(self.b_partition_time.finish()),
+        ];
+        self.rows = 0;
+        Ok(RecordBatch::try_new(structured_syslog_schema(), columns)?)
+    }
+}
+
+impl crate::forwarding::buffered_writer::RecordBatchAccumulator<StructuredSyslogRecord>
+    for StructuredSyslogAccumulator
+{
+    /// `_now` is unused: `StructuredSyslogRecord` carries its own non-null
+    /// `received_at`, so the receipt instant never comes from the clock here.
+    /// (IPFIX threads `now` through because `FlowRecord` has no trustworthy
+    /// receipt instant of its own.)
+    fn try_append(
+        &mut self,
+        record: &StructuredSyslogRecord,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<bool> {
+        self.append_record(record);
+        Ok(true)
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+        self.finish_batch()
+    }
+}
+
+/// Map one `StructuredSyslogRecord` to a single-row `RecordBatch`.
+///
+/// Thin wrapper over `StructuredSyslogAccumulator` so the column mapping has
+/// exactly one implementation shared with the amortized path.
 pub fn structured_syslog_record_to_batch(
     rec: &StructuredSyslogRecord,
 ) -> anyhow::Result<RecordBatch> {
-    let schema = structured_syslog_schema();
-    let priority = Arc::new(UInt8Array::from(vec![rec.priority])) as ArrayRef;
-    let severity = Arc::new(UInt8Array::from(vec![rec.severity])) as ArrayRef;
-    let facility = Arc::new(UInt8Array::from(vec![rec.facility])) as ArrayRef;
-    let tz: Arc<str> = Arc::from("UTC");
-    let timestamp = Arc::new(
-        TimestampMicrosecondArray::from(vec![rec.timestamp.map(|t| t.timestamp_micros())])
-            .with_timezone(tz.clone()),
-    ) as ArrayRef;
-    let hostname = Arc::new(StringArray::from(vec![rec.hostname.clone()])) as ArrayRef;
-    let app_name = Arc::new(StringArray::from(vec![rec.app_name.clone()])) as ArrayRef;
-    let received_at = Arc::new(
-        TimestampMicrosecondArray::from(vec![rec.received_at.timestamp_micros()])
-            .with_timezone(tz.clone()),
-    ) as ArrayRef;
-    let payload_type = Arc::new(StringArray::from(vec![rec.payload_type])) as ArrayRef;
-    let parsed = Arc::new(StringArray::from(vec![
-        serde_json::to_string(&rec.parsed).unwrap_or_else(|_| "null".to_string()),
-    ])) as ArrayRef;
-    // `timestamp` is the syslog header's event time (nullable -- absent for
-    // e.g. some CEF/LEEF payloads); `partition_time` derives the buffer's
-    // day-clean column from it, clamped against and falling back to the
-    // non-null `received_at`. See `crate::forwarding::buffered_writer::partition_time`.
-    let partition_time_value =
-        crate::forwarding::buffered_writer::partition_time(rec.timestamp, rec.received_at);
-    let partition_time = Arc::new(
-        TimestampMicrosecondArray::from(vec![partition_time_value.timestamp_micros()])
-            .with_timezone(tz),
-    ) as ArrayRef;
-
-    Ok(RecordBatch::try_new(
-        schema,
-        vec![
-            priority,
-            severity,
-            facility,
-            timestamp,
-            hostname,
-            app_name,
-            received_at,
-            payload_type,
-            parsed,
-            partition_time,
-        ],
-    )?)
+    let mut acc = StructuredSyslogAccumulator::new();
+    acc.append_record(rec);
+    acc.finish_batch()
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +220,46 @@ impl ParquetSink for StructuredSyslogSink {
         _schema: &Arc<arrow_schema::Schema>,
     ) -> anyhow::Result<arrow_array::RecordBatch> {
         structured_syslog_record_to_batch(record)
+    }
+
+    /// Opt into the amortized builder path. Gated on the schema Arc even
+    /// though this sink has only one schema, mirroring `ZeekSink`/`SflowSink`
+    /// so a future second schema cannot silently accumulate into the wrong
+    /// builder set.
+    fn new_batch(
+        &self,
+        schema: &Arc<arrow_schema::Schema>,
+    ) -> Option<
+        Box<dyn crate::forwarding::buffered_writer::RecordBatchAccumulator<StructuredSyslogRecord>>,
+    > {
+        if Arc::ptr_eq(schema, &structured_syslog_schema()) {
+            Some(Box::new(StructuredSyslogAccumulator::new()))
+        } else {
+            None
+        }
+    }
+
+    /// Overrides the default `day_and_batch`, which would call
+    /// `to_record_batch` and read the day back off the built batch --
+    /// allocating the full builder set on every push, before `new_batch`'s
+    /// accumulator is ever consulted, making the amortized path a no-op.
+    ///
+    /// Derives the identical day directly: the default reads `ts.value(0)`
+    /// from the `partition_time` column (row 0 only), and that column is
+    /// written as `partition_time(rec.timestamp, rec.received_at)`, so this
+    /// reproduces it exactly without building anything.
+    fn day_and_batch(
+        &self,
+        record: &StructuredSyslogRecord,
+        _schema: &Arc<arrow_schema::Schema>,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<(chrono::NaiveDate, Option<arrow_array::RecordBatch>)> {
+        let day = crate::forwarding::buffered_writer::partition_time(
+            record.timestamp,
+            record.received_at,
+        )
+        .date_naive();
+        Ok((day, None))
     }
 }
 
@@ -195,6 +315,144 @@ mod tests {
     use crate::forwarding::buffered_writer::ParquetSink;
     use crate::syslog::payload::StructuredSyslogRecord;
     use arrow::array::{StringArray, UInt8Array};
+
+    // -- RecordBatchAccumulator (amortized builder path) --
+
+    /// The amortized path must produce byte-identical columns to the
+    /// single-record path. This is the test that would catch the accumulator
+    /// and the fallback mapper drifting apart -- except they cannot drift,
+    /// because `structured_syslog_record_to_batch` IS the accumulator. This
+    /// pins that invariant so a future refactor that re-duplicates the
+    /// mapping gets caught.
+    #[test]
+    fn accumulator_matches_single_record_batches_column_for_column() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+        let recs = [
+            sample_record("cef"),
+            {
+                // timestamp absent -- exercises the nullable column and the
+                // partition_time fallback to received_at.
+                let mut r = sample_record("leef");
+                r.timestamp = None;
+                r
+            },
+            {
+                let mut r = sample_record("auditd");
+                r.hostname = None;
+                r.app_name = None;
+                r
+            },
+        ];
+
+        let mut acc = StructuredSyslogAccumulator::new();
+        assert!(acc.is_empty());
+        for (i, r) in recs.iter().enumerate() {
+            assert!(acc.try_append(r, chrono::Utc::now()).unwrap());
+            assert_eq!(acc.len(), i + 1);
+        }
+        let batched = acc.finish().unwrap();
+        assert_eq!(batched.num_rows(), recs.len());
+
+        for (i, r) in recs.iter().enumerate() {
+            let single = structured_syslog_record_to_batch(r).unwrap();
+            for col in 0..single.num_columns() {
+                let a = single.column(col).to_data();
+                let b = batched.column(col).slice(i, 1).to_data();
+                assert_eq!(
+                    a,
+                    b,
+                    "row {i} column {} ({}) differs between the amortized and \
+                     single-record paths",
+                    col,
+                    structured_syslog_schema().field(col).name()
+                );
+            }
+        }
+    }
+
+    /// A builder that kept prior rows would silently duplicate data into the
+    /// next flush. `finish` must reset to empty and stay reusable.
+    #[test]
+    fn accumulator_finish_twice_produces_independent_batches() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+        let mut acc = StructuredSyslogAccumulator::new();
+        acc.try_append(&sample_record("cef"), chrono::Utc::now())
+            .unwrap();
+        acc.try_append(&sample_record("cef"), chrono::Utc::now())
+            .unwrap();
+        let first = acc.finish().unwrap();
+        assert_eq!(first.num_rows(), 2);
+        assert_eq!(acc.len(), 0, "finish must reset the row count");
+        assert!(acc.is_empty());
+
+        acc.try_append(&sample_record("dhcp"), chrono::Utc::now())
+            .unwrap();
+        let second = acc.finish().unwrap();
+        assert_eq!(
+            second.num_rows(),
+            1,
+            "second batch must hold only the rows appended after the first finish"
+        );
+        let ptype = second
+            .column_by_name("payload_type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(ptype.value(0), "dhcp");
+    }
+
+    /// Guards the silent no-op: a conversion that compiles and passes every
+    /// other test while `new_batch` never returns `Some`, so `push()` keeps
+    /// allocating a fresh builder set per record and the amortized path is
+    /// dead code. This has actually happened on another branch in this repo.
+    #[test]
+    fn new_batch_activates_for_the_real_schema_and_not_an_unrelated_one() {
+        let schema = StructuredSyslogSink.schema(Some("cef"));
+        assert!(Arc::ptr_eq(&schema, &structured_syslog_schema()));
+        assert!(
+            StructuredSyslogSink.new_batch(&schema).is_some(),
+            "new_batch must return Some for the real schema -- if None, the \
+             accumulator never activates and the conversion is a no-op"
+        );
+        let other: Arc<Schema> = Arc::new(Schema::new(vec![Field::new(
+            "unrelated",
+            DataType::Utf8,
+            false,
+        )]));
+        assert!(StructuredSyslogSink.new_batch(&other).is_none());
+    }
+
+    /// `day_and_batch` must return the same day the default implementation
+    /// would have read off row 0 of the built batch, and must NOT build one.
+    #[test]
+    fn day_and_batch_matches_the_default_mechanism_without_building_a_batch() {
+        let rec = sample_record("cef");
+        let schema = StructuredSyslogSink.schema(Some("cef"));
+        let (day, batch) = StructuredSyslogSink
+            .day_and_batch(&rec, &schema, chrono::Utc::now())
+            .unwrap();
+        assert!(
+            batch.is_none(),
+            "must not build a batch -- doing so reinstates the per-push \
+             allocation this override exists to avoid"
+        );
+
+        let built = structured_syslog_record_to_batch(&rec).unwrap();
+        let pt = built
+            .column_by_name("partition_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .unwrap();
+        let expected = chrono::DateTime::from_timestamp_micros(pt.value(0))
+            .unwrap()
+            .date_naive();
+        assert_eq!(
+            day, expected,
+            "buffer-key day must equal row 0 partition_time"
+        );
+    }
 
     fn sample_record(ptype: &'static str) -> StructuredSyslogRecord {
         StructuredSyslogRecord {
