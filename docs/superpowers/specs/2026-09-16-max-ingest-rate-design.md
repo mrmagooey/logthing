@@ -160,7 +160,12 @@ the metric set to scrape:
 | `zeek` | `zeek-tcp` | 47760 | `zeek_records_received` | n/a (TCP) | `…{source="zeek"}` |
 | `suricata` | `suricata-tcp` | 47761 | `suricata_records_received` | n/a (TCP) | `…{source="suricata"}` |
 | `hec` | `hec-http` | 5985 | `hec_events_received` | n/a | `…{source="hec"}` |
-| `generic` | `generic-http` | 5985 | **missing — see §6.4** | n/a | `…{source="generic"}` |
+
+Sink `source` labels are the sinks' own `source()` values: `syslog`,
+`structured_syslog`, `ipfix`, `sflow`, `zeek`, `suricata`, `hec`.
+`loadgen syslog-udp --structured` routes to the `structured_syslog` sink
+instead of `syslog`, so the syslog metric map is selected by that flag.
+| `generic` | `generic-http` | 5985 | `hec_events_received` (shared — §6.4) | n/a | `…{source="hec"}` (shared — §6.4) |
 
 All three UDP listeners already report `<protocol>_socket_drops` through
 `SocketDropStats` (`src/net.rs:222`), so kernel loss is observable for every
@@ -203,12 +208,19 @@ hard cap) in addition to the total. The baseline doc's finding that
 `parquet_s3_dropped` reached 70–75% of delivered datagrams while kernel loss
 was 3.6% is exactly the information a single aggregated percentage destroys.
 
-### 6.4 Prerequisite: `/ingest` has no received counter
+### 6.4 `hec` and `generic` share every counter
 
-`handle_ndjson` (`src/ingest/handlers.rs`, routed at `src/server/mod.rs:465`)
-increments no receive counter, so `generic-http` cannot be measured at all.
-A `generic_records_received` counter is added, following the shape of
-`hec_events_received`.
+`handle_ndjson` (`src/ingest/handlers.rs:219`) increments
+`hec_events_received`, the same counter the two HEC routes use, and its
+records land in the same `GenericSink`, whose `source()` is `"hec"`
+(`src/forwarding/generic_s3.rs:163`). The two formats are therefore
+indistinguishable in the metrics.
+
+No production code changes for this. The harness runs exactly one format at a
+time against a freshly restarted server, so the attribution is unambiguous by
+construction — but the results document must state which generator produced
+each `hec`-labelled row, and the harness must refuse to run `hec` and
+`generic` concurrently.
 
 ## 7. Phase 3 — results document
 
