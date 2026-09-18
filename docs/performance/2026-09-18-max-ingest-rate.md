@@ -160,7 +160,7 @@ rows as lower bounds, not ceilings** — see the per-format detail below and
 
 ### Per-format detail
 
-#### syslog — CEILING 20,000/s (`.superpowers/sdd/2026-09-16-max-ingest-rate/ramps/syslog-run3.log`)
+#### syslog — CEILING 20,000/s (`2026-09-18-max-ingest-rate-syslog.log`)
 
 | rate | run | offered | kernel_drops | writer_drops | buffer_drops | total_loss% | verdict |
 |---|---|---|---|---|---|---|---|
@@ -175,7 +175,7 @@ against the listener's own `/proc/net/udp` counter); writer- and buffer-drop
 columns are 0 at every rate in this log, including the failing ones.
 **Verdict: kernel-limited.**
 
-#### ipfix — CEILING 37,500/s (`ramps/ipfix.log`)
+#### ipfix — CEILING 37,500/s (`2026-09-18-max-ingest-rate-ipfix.log`)
 
 | rate | run | offered | kernel_drops | writer_drops | buffer_drops | total_loss% | verdict |
 |---|---|---|---|---|---|---|---|
@@ -188,7 +188,7 @@ different picture from the stale 2026-09-14 baseline, where writer-channel
 drops dominated IPFIX loss — that was fixed by commit `c103de3` before this
 campaign ran.)
 
-#### sflow — CEILING 40,000/s (`ramps/sflow.log`)
+#### sflow — CEILING 40,000/s (`2026-09-18-max-ingest-rate-sflow.log`)
 
 | rate | run | offered | kernel_drops | writer_drops | buffer_drops | total_loss% | verdict |
 |---|---|---|---|---|---|---|---|
@@ -198,7 +198,7 @@ campaign ran.)
 All loss is kernel-socket drop; writer/buffer are 0 throughout. **Verdict:
 kernel-limited.**
 
-#### hec — CEILING 173,750/s (`ramps/hec.log`, `EVENTS_PER_REQUEST=100`)
+#### hec — CEILING 173,750/s (`2026-09-18-max-ingest-rate-hec.log`, `EVENTS_PER_REQUEST=100`)
 
 | rate | run | offered | writer_drops | buffer_drops | total_loss% | verdict |
 |---|---|---|---|---|---|---|
@@ -209,7 +209,7 @@ Kernel loss is `n/a` for HTTP (no socket buffer to overflow). All measured
 loss is writer-channel drop (`parquet_s3_dropped{source="hec"}`); buffer
 hard-cap drops are 0 throughout. **Verdict: writer-limited.**
 
-#### generic — CEILING 183,750/s (`ramps/generic-run2.log`, `EVENTS_PER_REQUEST=100`)
+#### generic — CEILING 183,750/s (`2026-09-18-max-ingest-rate-generic.log`, `EVENTS_PER_REQUEST=100`)
 
 | rate | run | offered | writer_drops | buffer_drops | total_loss% | verdict |
 |---|---|---|---|---|---|---|
@@ -219,7 +219,7 @@ hard-cap drops are 0 throughout. **Verdict: writer-limited.**
 Same shape as hec: all measured loss is writer-channel drop, landing in the
 same `source="hec"`-labelled counter (see §3). **Verdict: writer-limited.**
 
-#### zeek — ≥55,000/s, ceiling NOT found (`ramps/zeek-fixed-55000.log`, `zeek-fixed-50000.log`, `zeek-run2.log`)
+#### zeek — ≥55,000/s, ceiling NOT found (`2026-09-18-max-ingest-rate-zeek-fixed-55000.log`)
 
 | rate | run | offered | achieved | writer_drops | buffer_drops | total_loss% | verdict |
 |---|---|---|---|---|---|---|---|
@@ -241,7 +241,7 @@ vCPUs (see §5) — Task 2's own trivial-shape, no-server-contention measurement
 put this same 4-process generator at 743,793/s, over 13x the generator-limited
 figure seen here.
 
-#### suricata — ≥40,000/s, ceiling NOT found (`ramps/suricata-fixed-50000.log`, `suricata-run2.log`)
+#### suricata — ≥40,000/s, ceiling NOT found (`2026-09-18-max-ingest-rate-suricata-fixed-50000.log`)
 
 | rate | run | offered | achieved | writer_drops | buffer_drops | total_loss% | verdict |
 |---|---|---|---|---|---|---|---|
