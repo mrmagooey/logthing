@@ -66,10 +66,12 @@ fi
 [ -x "$LOADGEN" ] || { echo "FATAL: $LOADGEN not found. cargo build --release -p loadgen"; exit 1; }
 
 TMP="$(mktemp -d)" || exit 1
+GEN_PIDS=()
 
 cleanup() {
     rm -rf "$TMP"
     if [ -n "${BLACKHOLE_PID:-}" ]; then kill "$BLACKHOLE_PID" 2>/dev/null; fi
+    if [ "${#GEN_PIDS[@]}" -gt 0 ]; then kill "${GEN_PIDS[@]}" 2>/dev/null; fi
 }
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT TERM
