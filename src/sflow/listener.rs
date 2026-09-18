@@ -17,6 +17,21 @@ pub struct SflowListenerConfig {
     /// Requested `SO_RCVBUF` size in bytes. `None` leaves the OS default
     /// alone. See `crate::net::bind_udp_with_recv_buffer`.
     pub receive_buffer_bytes: Option<usize>,
+    /// Number of `SO_REUSEPORT` sockets, each drained by its own task. `1`
+    /// (the default) uses a single plain socket and is byte-for-byte today's
+    /// behaviour. Above 1, the kernel fans datagrams across the group; the
+    /// sFlow decoder is stateless (see `crate::sflow::decoder`'s module
+    /// docs), so unlike IPFIX no cache needs to be shared across tasks.
+    ///
+    /// The kernel picks a socket by hashing each datagram's source/
+    /// destination address-port 4-tuple, so a given source port always
+    /// lands on the same socket. Throughput therefore scales with the
+    /// number of *distinct senders* (or, for one sender, distinct source
+    /// ports), not with this value: raising it for a deployment with a
+    /// single sFlow agent sending from one fixed source port yields zero
+    /// benefit, because every datagram still hashes to the same socket.
+    /// `0` is treated the same as `1` (single-socket path), not as "disabled".
+    pub recv_tasks: usize,
 }
 
 impl Default for SflowListenerConfig {
@@ -25,6 +40,7 @@ impl Default for SflowListenerConfig {
             udp_port: 6343,
             bind_address: "0.0.0.0".to_string(),
             receive_buffer_bytes: Some(4 * 1024 * 1024),
+            recv_tasks: 1,
         }
     }
 }
@@ -81,63 +97,126 @@ impl SflowListener {
     /// Bind the UDP socket and run the receive loop with graceful shutdown support.
     ///
     /// The listener exits cleanly when `shutdown_rx` receives `true` (or is closed).
-    /// Used from `main.rs`; tests continue to use `run_with_socket()`.
+    /// Used from `main.rs`; tests continue to use `start()` or `run_with_socket()`.
+    ///
+    /// `recv_tasks <= 1` (the default) is this exact loop, unchanged — that
+    /// is the property that makes the fan-out below safe to deploy. Above 1,
+    /// N `SO_REUSEPORT` sockets are bound and each drained by its own task.
+    /// The sFlow decoder is stateless, so unlike IPFIX no state needs to be
+    /// shared across tasks — only the drop-stats tracker is shared, since
+    /// all N sockets share one address:port and `/proc/net/udp` already
+    /// sums their lines (see `sflow_recv_loop` and its call site below).
     pub async fn start_with_shutdown(
         &self,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let addr: SocketAddr =
             format!("{}:{}", self.config.bind_address, self.config.udp_port).parse()?;
-        let socket =
-            crate::net::bind_udp_with_recv_buffer(&addr, self.config.receive_buffer_bytes, "sflow")
-                .await?;
-        let bound_addr = socket.local_addr()?;
-        info!("sFlow UDP listener started on {}", bound_addr);
 
-        let mut buf = vec![0u8; 65535];
-        let mut socket_stats = crate::net::SocketDropStats::new(&socket, "sflow");
-        let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
+        if self.config.recv_tasks <= 1 {
+            let socket = crate::net::bind_udp_with_recv_buffer(
+                &addr,
+                self.config.receive_buffer_bytes,
+                "sflow",
+            )
+            .await?;
+            let bound_addr = socket.local_addr()?;
+            info!("sFlow UDP listener started on {}", bound_addr);
 
-        loop {
-            tokio::select! {
-                result = socket.recv_from(&mut buf) => {
-                    match result {
-                        Ok((len, src)) => {
-                            // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
-                            if !self.allowed_ips.is_allowed(&src) {
-                                metrics::counter!("listener_source_rejected", "protocol" => "sflow").increment(1);
-                                debug!("Rejected sflow datagram from {} — not in allowed_ips", src);
-                                continue;
+            let mut buf = vec![0u8; 65535];
+            let mut socket_stats = crate::net::SocketDropStats::new(&socket, "sflow");
+            let mut socket_stats_ticker =
+                tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
+
+            loop {
+                tokio::select! {
+                    result = socket.recv_from(&mut buf) => {
+                        match result {
+                            Ok((len, src)) => {
+                                // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                                if !self.allowed_ips.is_allowed(&src) {
+                                    metrics::counter!("listener_source_rejected", "protocol" => "sflow").increment(1);
+                                    debug!("Rejected sflow datagram from {} — not in allowed_ips", src);
+                                    continue;
+                                }
+                                debug!("sFlow datagram from {}: {} bytes", src, len);
+                                match decode_datagram(&buf[..len], src.ip()) {
+                                    Ok(samples) if samples.is_empty() => {
+                                        debug!("sFlow datagram from {} produced no samples", src);
+                                    }
+                                    Ok(samples) => {
+                                        self.handler.handle_samples(samples, src).await;
+                                    }
+                                    Err(e) => {
+                                        metrics::counter!("sflow_decode_errors").increment(1);
+                                        warn!("sFlow decode error from {}: {}", src, e);
+                                    }
+                                }
                             }
-                            debug!("sFlow datagram from {}: {} bytes", src, len);
-                            match decode_datagram(&buf[..len], src.ip()) {
-                                Ok(samples) if samples.is_empty() => {
-                                    debug!("sFlow datagram from {} produced no samples", src);
-                                }
-                                Ok(samples) => {
-                                    self.handler.handle_samples(samples, src).await;
-                                }
-                                Err(e) => {
-                                    metrics::counter!("sflow_decode_errors").increment(1);
-                                    warn!("sFlow decode error from {}: {}", src, e);
-                                }
+                            Err(e) => {
+                                error!("sFlow UDP receive error: {}", e);
                             }
-                        }
-                        Err(e) => {
-                            error!("sFlow UDP receive error: {}", e);
                         }
                     }
-                }
-                _ = socket_stats_ticker.tick() => {
-                    socket_stats.poll().await;
-                }
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        info!("sFlow listener: shutdown signal received");
-                        break;
+                    _ = socket_stats_ticker.tick() => {
+                        socket_stats.poll().await;
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            info!("sFlow listener: shutdown signal received");
+                            break;
+                        }
                     }
                 }
             }
+
+            return Ok(());
+        }
+
+        // Fan-out path: recv_tasks > 1. Bind N SO_REUSEPORT sockets on the
+        // same address:port and drain each from its own task.
+        let mut sockets = Vec::with_capacity(self.config.recv_tasks);
+        for _ in 0..self.config.recv_tasks {
+            sockets.push(
+                crate::net::bind_udp_reuseport_with_recv_buffer(
+                    &addr,
+                    self.config.receive_buffer_bytes,
+                    "sflow",
+                )
+                .await?,
+            );
+        }
+        let bound_addr = sockets[0].local_addr()?;
+        info!(
+            "sFlow UDP listener started on {} ({} recv tasks)",
+            bound_addr,
+            sockets.len()
+        );
+
+        // All N sockets share one address:port, so /proc/net/udp already
+        // sums their lines (see `parse_proc_net_udp`) — one tracker polled
+        // once per group; one per task would multiply-count the same total.
+        let mut socket_stats = Some(crate::net::SocketDropStats::new(&sockets[0], "sflow"));
+
+        let mut tasks = Vec::with_capacity(sockets.len());
+        for (i, socket) in sockets.into_iter().enumerate() {
+            let handler = self.handler.clone();
+            let allowed_ips = self.allowed_ips.clone();
+            let shutdown_rx = shutdown_rx.clone();
+            // Only the first task takes the shared drop-stats tracker, so it
+            // is polled exactly once per SO_REUSEPORT group.
+            let stats = if i == 0 { socket_stats.take() } else { None };
+            tasks.push(tokio::spawn(sflow_recv_loop(
+                socket,
+                handler,
+                allowed_ips,
+                shutdown_rx,
+                stats,
+            )));
+        }
+
+        for task in tasks {
+            let _ = task.await;
         }
 
         Ok(())
@@ -188,6 +267,66 @@ impl SflowListener {
                 }
                 _ = socket_stats_ticker.tick() => {
                     socket_stats.poll().await;
+                }
+            }
+        }
+    }
+}
+
+/// The recv loop run by each task in the `recv_tasks > 1` fan-out. Same
+/// body as the `recv_tasks <= 1` path in `start_with_shutdown`, parameterized
+/// so it can be spawned once per `SO_REUSEPORT` socket. `socket_stats` is
+/// `Some` for exactly one task per group (see the call site) so the shared
+/// drop counter is polled once, not once per task.
+async fn sflow_recv_loop(
+    socket: UdpSocket,
+    handler: Arc<dyn SflowHandler>,
+    allowed_ips: IpWhitelist,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut socket_stats: Option<crate::net::SocketDropStats>,
+) {
+    let mut buf = vec![0u8; 65535];
+    let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
+
+    loop {
+        tokio::select! {
+            result = socket.recv_from(&mut buf) => {
+                match result {
+                    Ok((len, src)) => {
+                        // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                        if !allowed_ips.is_allowed(&src) {
+                            metrics::counter!("listener_source_rejected", "protocol" => "sflow").increment(1);
+                            debug!("Rejected sflow datagram from {} — not in allowed_ips", src);
+                            continue;
+                        }
+                        debug!("sFlow datagram from {}: {} bytes", src, len);
+                        match decode_datagram(&buf[..len], src.ip()) {
+                            Ok(samples) if samples.is_empty() => {
+                                debug!("sFlow datagram from {} produced no samples", src);
+                            }
+                            Ok(samples) => {
+                                handler.handle_samples(samples, src).await;
+                            }
+                            Err(e) => {
+                                metrics::counter!("sflow_decode_errors").increment(1);
+                                warn!("sFlow decode error from {}: {}", src, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("sFlow UDP receive error: {}", e);
+                    }
+                }
+            }
+            _ = socket_stats_ticker.tick(), if socket_stats.is_some() => {
+                if let Some(stats) = socket_stats.as_mut() {
+                    stats.poll().await;
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("sFlow listener: shutdown signal received");
+                    break;
                 }
             }
         }
@@ -314,6 +453,7 @@ mod tests {
             udp_port,
             bind_address: "127.0.0.1".to_string(),
             receive_buffer_bytes: Some(1024 * 1024),
+            ..SflowListenerConfig::default()
         };
         let handler = CapturingHandler::new();
         let listener = SflowListener::new(config, handler.clone());
@@ -441,5 +581,197 @@ mod tests {
             "allowed source must reach the handler; got {}",
             batches.len()
         );
+    }
+
+    /// A handler that counts total records across all received batches —
+    /// used by the fan-out test where records may arrive interleaved across
+    /// several tasks and only the total matters.
+    struct CountingHandler {
+        count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                count: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn record_count(&self) -> usize {
+            self.count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SflowHandler for CountingHandler {
+        async fn handle_samples(&self, samples: Vec<SflowRecord>, _source: SocketAddr) {
+            self.count
+                .fetch_add(samples.len(), std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Every datagram this builder emits carries exactly one flow sample
+    /// (sampled_ipv4) + one counter sample (generic_if_counters) — same
+    /// byte layout as `tools/loadgen/src/sflow_udp.rs`'s `build_datagram`,
+    /// confirmed there (`ten_datagrams_decode_to_twenty_records_with_no_drops`)
+    /// to decode to exactly 2 records per datagram.
+    const RECORDS_PER_DATAGRAM: usize = 2;
+
+    /// Fixed IPv4 agent address embedded in every datagram's header — same
+    /// as `tools/loadgen/src/sflow_udp.rs::AGENT_ADDR`.
+    const AGENT_ADDR: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 200, 0, 1);
+
+    /// Derive distinct source/destination addresses for datagram index `n` —
+    /// same convention as `tools/loadgen/src/sflow_udp.rs::flow_addrs`.
+    fn flow_addrs(n: u64) -> (std::net::Ipv4Addr, std::net::Ipv4Addr) {
+        let hi = ((n >> 8) & 0xFF) as u8;
+        let lo = (n & 0xFF) as u8;
+        (
+            std::net::Ipv4Addr::new(10, 0, hi, lo),
+            std::net::Ipv4Addr::new(192, 168, hi, lo),
+        )
+    }
+
+    /// Build one sFlow v5 datagram: header + one flow sample (sampled_ipv4)
+    /// + one counter sample (generic_if_counters) — byte-for-byte the same
+    /// layout as `tools/loadgen/src/sflow_udp.rs`'s `build_datagram`.
+    fn build_datagram(seq: u32, n: u64) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(256);
+
+        // ── Datagram header (28 bytes) ──
+        buf.extend_from_slice(&5u32.to_be_bytes()); // version = 5
+        buf.extend_from_slice(&1u32.to_be_bytes()); // agent_addr_type = 1 (IPv4)
+        buf.extend_from_slice(&AGENT_ADDR.octets());
+        buf.extend_from_slice(&0u32.to_be_bytes()); // sub_agent_id = 0
+        buf.extend_from_slice(&seq.to_be_bytes()); // sequence_number
+        buf.extend_from_slice(&seq.to_be_bytes()); // uptime_ms (unused by decoder; reuse seq)
+        buf.extend_from_slice(&2u32.to_be_bytes()); // num_samples = 2
+
+        // ── flow_sample (data_format=1), one sampled_ipv4 (format 3) record ──
+        let (src, dst) = flow_addrs(n);
+        let src_port = 1024 + (n % 60_000) as u32;
+        let dst_port = 443u32;
+        let protocol = 6u32; // TCP
+        let sampling_rate = 1000u32;
+        let input_ifindex = 1 + (n % 4) as u32;
+        let output_ifindex = 1 + ((n + 1) % 4) as u32;
+
+        buf.extend_from_slice(&1u32.to_be_bytes()); // data_format = flow_sample
+        buf.extend_from_slice(&72u32.to_be_bytes()); // sample_length
+        buf.extend_from_slice(&seq.to_be_bytes()); // sequence_number
+        buf.extend_from_slice(&1u32.to_be_bytes()); // source_id
+        buf.extend_from_slice(&sampling_rate.to_be_bytes());
+        buf.extend_from_slice(&sampling_rate.to_be_bytes()); // sample_pool
+        buf.extend_from_slice(&0u32.to_be_bytes()); // drops
+        buf.extend_from_slice(&input_ifindex.to_be_bytes());
+        buf.extend_from_slice(&output_ifindex.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes()); // num_flow_records = 1
+        buf.extend_from_slice(&3u32.to_be_bytes()); // flow_data_format = 3 (sampled_ipv4)
+        buf.extend_from_slice(&32u32.to_be_bytes()); // flow_data_length = 32
+        buf.extend_from_slice(&60u32.to_be_bytes()); // original packet length (arbitrary)
+        buf.extend_from_slice(&protocol.to_be_bytes());
+        buf.extend_from_slice(&src.octets());
+        buf.extend_from_slice(&dst.octets());
+        buf.extend_from_slice(&src_port.to_be_bytes());
+        buf.extend_from_slice(&dst_port.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes()); // tcp_flags
+        buf.extend_from_slice(&0u32.to_be_bytes()); // tos
+
+        // ── counter_sample (data_format=2), one generic_if_counters record ──
+        let if_index = 1 + (n % 4) as u32;
+        let if_in_octets = 1_000_000u64 + n * 1_000;
+        let if_out_octets = 500_000u64 + n * 500;
+        let if_in_ucast_pkts = 1_000u32 + (n % 10_000) as u32;
+        let if_out_ucast_pkts = 500u32 + (n % 5_000) as u32;
+
+        buf.extend_from_slice(&2u32.to_be_bytes()); // data_format = counter_sample
+        buf.extend_from_slice(&108u32.to_be_bytes()); // sample_length
+        buf.extend_from_slice(&seq.to_be_bytes()); // sequence_number
+        buf.extend_from_slice(&1u32.to_be_bytes()); // source_id
+        buf.extend_from_slice(&1u32.to_be_bytes()); // num_counter_records = 1
+        buf.extend_from_slice(&1u32.to_be_bytes()); // counter_data_format = 1
+        buf.extend_from_slice(&88u32.to_be_bytes()); // counter_data_length = 88
+        buf.extend_from_slice(&if_index.to_be_bytes());
+        buf.extend_from_slice(&6u32.to_be_bytes()); // ifType = 6 (ethernetCsmacd)
+        buf.extend_from_slice(&1_000_000_000u64.to_be_bytes()); // ifSpeed
+        buf.extend_from_slice(&1u32.to_be_bytes()); // ifDirection = full-duplex
+        buf.extend_from_slice(&3u32.to_be_bytes()); // ifStatus = admin+oper up
+        buf.extend_from_slice(&if_in_octets.to_be_bytes());
+        buf.extend_from_slice(&if_in_ucast_pkts.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes()); // ifInMulticastPkts
+        buf.extend_from_slice(&0u32.to_be_bytes()); // ifInBroadcastPkts
+        buf.extend_from_slice(&0u32.to_be_bytes()); // ifInDiscards
+        buf.extend_from_slice(&0u32.to_be_bytes()); // ifInErrors
+        buf.extend_from_slice(&0u32.to_be_bytes()); // ifInUnknownProtos
+        buf.extend_from_slice(&if_out_octets.to_be_bytes());
+        buf.extend_from_slice(&if_out_ucast_pkts.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes()); // ifOutMulticastPkts
+        buf.extend_from_slice(&0u32.to_be_bytes()); // ifOutBroadcastPkts
+        buf.extend_from_slice(&0u32.to_be_bytes()); // ifOutDiscards
+        buf.extend_from_slice(&0u32.to_be_bytes()); // ifOutErrors
+        buf.extend_from_slice(&0u32.to_be_bytes()); // ifPromiscuousMode
+
+        buf
+    }
+
+    /// Starts a real `SflowListener` via `start_with_shutdown` (the
+    /// production path) bound to an ephemeral port, with `recv_tasks`
+    /// configured as given. Returns the listener's join handle, its bound
+    /// address, the shutdown sender, and a handler that counts total
+    /// records.
+    async fn start_test_listener(
+        recv_tasks: usize,
+    ) -> (
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        Arc<CountingHandler>,
+    ) {
+        // Bind briefly to obtain an ephemeral port, then drop so the
+        // listener (and, for recv_tasks > 1, its SO_REUSEPORT group) can
+        // bind the same address — same pattern as the other tests here.
+        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = tmp.local_addr().unwrap().port();
+        drop(tmp);
+        let bound: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
+
+        let config = SflowListenerConfig {
+            udp_port,
+            bind_address: "127.0.0.1".to_string(),
+            recv_tasks,
+            ..SflowListenerConfig::default()
+        };
+        let handler = CountingHandler::new();
+        let listener = SflowListener::new(config, handler.clone());
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { listener.start_with_shutdown(shutdown_rx).await });
+
+        // Give every recv task time to bind and enter its recv loop.
+        sleep(Duration::from_millis(50)).await;
+
+        (task, bound, shutdown_tx, handler)
+    }
+
+    /// Datagrams from several source ports must all be handled when fanned out.
+    /// sFlow's decoder is stateless, so the only risk is a lost or misrouted
+    /// datagram, not a decode failure.
+    #[tokio::test]
+    async fn fanned_out_listener_receives_from_several_source_ports() {
+        let (listener, bound, shutdown_tx, handler) = start_test_listener(4).await;
+
+        for i in 0..4u32 {
+            let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            for n in 0..10u64 {
+                sock.send_to(&build_datagram(i * 10 + n as u32 + 1, n), bound)
+                    .await
+                    .unwrap();
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let _ = shutdown_tx.send(true);
+        let _ = listener.await;
+
+        assert_eq!(handler.record_count(), 40 * RECORDS_PER_DATAGRAM);
     }
 }

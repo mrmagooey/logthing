@@ -1007,6 +1007,21 @@ pub struct SflowConfig {
     #[serde(default = "default_udp_receive_buffer_bytes")]
     pub receive_buffer_bytes: Option<usize>,
 
+    /// Number of UDP receive tasks (default: 1). Raise to spread socket
+    /// draining across cores when the kernel is dropping datagrams while CPU
+    /// sits idle. See docs/performance/2026-09-18-udp-recv-fanout-results.md.
+    ///
+    /// The kernel distributes datagrams across the group by hashing each
+    /// packet's source/destination address-port 4-tuple, so throughput
+    /// scales with the number of distinct senders (or, for one sender,
+    /// distinct source ports) — not with the value of this knob. A
+    /// deployment with a single exporter sending from one fixed source port
+    /// will see no benefit from raising it, because every datagram still
+    /// hashes to the same socket. `0` is treated the same as `1`, not as
+    /// "disabled".
+    #[serde(default = "default_sflow_recv_tasks")]
+    pub recv_tasks: usize,
+
     /// Optional S3 persistence. Absent from TOML → `None` (backward compatible).
     #[serde(default)]
     pub s3: Option<SflowS3Config>,
@@ -1025,6 +1040,7 @@ impl Default for SflowConfig {
             udp_port: default_sflow_udp_port(),
             bind_address: default_sflow_bind_address(),
             receive_buffer_bytes: default_udp_receive_buffer_bytes(),
+            recv_tasks: default_sflow_recv_tasks(),
             s3: None,
             local: None,
         }
@@ -1036,6 +1052,9 @@ fn default_sflow_enabled() -> bool {
 }
 fn default_sflow_udp_port() -> u16 {
     6343
+}
+fn default_sflow_recv_tasks() -> usize {
+    1
 }
 fn default_sflow_bind_address() -> String {
     "0.0.0.0".to_string()
