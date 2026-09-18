@@ -259,6 +259,12 @@ pub struct IpfixConfig {
     #[serde(default = "default_udp_receive_buffer_bytes")]
     pub receive_buffer_bytes: Option<usize>,
 
+    /// Number of UDP receive tasks (default: 1). Raise to spread socket
+    /// draining across cores when the kernel is dropping datagrams while CPU
+    /// sits idle. See docs/performance/2026-09-18-udp-recv-fanout-results.md.
+    #[serde(default = "default_ipfix_recv_tasks")]
+    pub recv_tasks: usize,
+
     /// Optional S3 persistence for IPFIX flows.
     /// Absent from TOML → `None` → no S3 persistence (backward compatible).
     #[serde(default)]
@@ -278,6 +284,7 @@ impl Default for IpfixConfig {
             udp_port: default_ipfix_udp_port(),
             bind_address: default_ipfix_bind_address(),
             receive_buffer_bytes: default_udp_receive_buffer_bytes(),
+            recv_tasks: default_ipfix_recv_tasks(),
             s3: None,
             local: None,
         }
@@ -289,6 +296,9 @@ fn default_ipfix_enabled() -> bool {
 }
 fn default_ipfix_udp_port() -> u16 {
     4739
+}
+fn default_ipfix_recv_tasks() -> usize {
+    1
 }
 fn default_ipfix_bind_address() -> String {
     "0.0.0.0".to_string()

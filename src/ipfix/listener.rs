@@ -16,6 +16,11 @@ pub struct IpfixListenerConfig {
     /// Requested `SO_RCVBUF` size in bytes. `None` leaves the OS default
     /// alone. See `crate::net::bind_udp_with_recv_buffer`.
     pub receive_buffer_bytes: Option<usize>,
+    /// Number of `SO_REUSEPORT` sockets, each drained by its own task. `1`
+    /// (the default) uses a single plain socket and is byte-for-byte today's
+    /// behaviour. Above 1, the kernel fans datagrams across the group; all
+    /// tasks share one template cache, so any task can decode any exporter.
+    pub recv_tasks: usize,
 }
 
 impl Default for IpfixListenerConfig {
@@ -24,6 +29,7 @@ impl Default for IpfixListenerConfig {
             udp_port: 4739,
             bind_address: "0.0.0.0".to_string(),
             receive_buffer_bytes: Some(4 * 1024 * 1024),
+            recv_tasks: 1,
         }
     }
 }
@@ -90,66 +96,134 @@ impl IpfixListener {
     ///
     /// The listener exits cleanly when `shutdown_rx` receives `true` (or is closed).
     /// Used from `main.rs`; tests continue to use `start()` or `run_with_socket()`.
+    ///
+    /// `recv_tasks <= 1` (the default) is this exact loop, unchanged — that
+    /// is the property that makes the fan-out below safe to deploy. Above 1,
+    /// N `SO_REUSEPORT` sockets are bound and each drained by its own task,
+    /// all sharing one `IpfixDecoder` handle (and so one template cache) and
+    /// one `SocketDropStats` (see `ipfix_recv_loop` and its call site below).
     pub async fn start_with_shutdown(
         &self,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let addr: SocketAddr =
             format!("{}:{}", self.config.bind_address, self.config.udp_port).parse()?;
-        let socket =
-            crate::net::bind_udp_with_recv_buffer(&addr, self.config.receive_buffer_bytes, "ipfix")
-                .await?;
-        let bound_addr = socket.local_addr()?;
-        info!("IPFIX UDP listener started on {}", bound_addr);
 
-        let mut buf = vec![0u8; 65535];
-        let mut decoder = IpfixDecoder::new();
-        let mut socket_stats = crate::net::SocketDropStats::new(&socket, "ipfix");
-        let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
+        if self.config.recv_tasks <= 1 {
+            let socket = crate::net::bind_udp_with_recv_buffer(
+                &addr,
+                self.config.receive_buffer_bytes,
+                "ipfix",
+            )
+            .await?;
+            let bound_addr = socket.local_addr()?;
+            info!("IPFIX UDP listener started on {}", bound_addr);
 
-        loop {
-            tokio::select! {
-                result = socket.recv_from(&mut buf) => {
-                    match result {
-                        Ok((len, src)) => {
-                            // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
-                            if !self.allowed_ips.is_allowed(&src) {
-                                metrics::counter!("listener_source_rejected", "protocol" => "ipfix").increment(1);
-                                debug!("Rejected ipfix datagram from {} — not in allowed_ips", src);
-                                continue;
+            let mut buf = vec![0u8; 65535];
+            let mut decoder = IpfixDecoder::new();
+            let mut socket_stats = crate::net::SocketDropStats::new(&socket, "ipfix");
+            let mut socket_stats_ticker =
+                tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
+
+            loop {
+                tokio::select! {
+                    result = socket.recv_from(&mut buf) => {
+                        match result {
+                            Ok((len, src)) => {
+                                // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                                if !self.allowed_ips.is_allowed(&src) {
+                                    metrics::counter!("listener_source_rejected", "protocol" => "ipfix").increment(1);
+                                    debug!("Rejected ipfix datagram from {} — not in allowed_ips", src);
+                                    continue;
+                                }
+                                debug!("IPFIX datagram from {}: {} bytes", src, len);
+                                match decode_datagram(&mut decoder, &buf[..len], src.ip()) {
+                                    Ok(flows) if flows.is_empty() => {
+                                        debug!(
+                                            "IPFIX datagram from {} produced no flows (template-only or empty)",
+                                            src
+                                        );
+                                    }
+                                    Ok(flows) => {
+                                        self.handler.handle_flows(flows, src).await;
+                                    }
+                                    Err(e) => {
+                                        metrics::counter!("ipfix_decode_errors").increment(1);
+                                        warn!("IPFIX decode error from {}: {}", src, e);
+                                    }
+                                }
                             }
-                            debug!("IPFIX datagram from {}: {} bytes", src, len);
-                            match decode_datagram(&mut decoder, &buf[..len], src.ip()) {
-                                Ok(flows) if flows.is_empty() => {
-                                    debug!(
-                                        "IPFIX datagram from {} produced no flows (template-only or empty)",
-                                        src
-                                    );
-                                }
-                                Ok(flows) => {
-                                    self.handler.handle_flows(flows, src).await;
-                                }
-                                Err(e) => {
-                                    metrics::counter!("ipfix_decode_errors").increment(1);
-                                    warn!("IPFIX decode error from {}: {}", src, e);
-                                }
+                            Err(e) => {
+                                error!("IPFIX UDP receive error: {}", e);
                             }
-                        }
-                        Err(e) => {
-                            error!("IPFIX UDP receive error: {}", e);
                         }
                     }
-                }
-                _ = socket_stats_ticker.tick() => {
-                    socket_stats.poll().await;
-                }
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        info!("IPFIX listener: shutdown signal received");
-                        break;
+                    _ = socket_stats_ticker.tick() => {
+                        socket_stats.poll().await;
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            info!("IPFIX listener: shutdown signal received");
+                            break;
+                        }
                     }
                 }
             }
+
+            return Ok(());
+        }
+
+        // Fan-out path: recv_tasks > 1. Bind N SO_REUSEPORT sockets on the
+        // same address:port and drain each from its own task.
+        let mut sockets = Vec::with_capacity(self.config.recv_tasks);
+        for _ in 0..self.config.recv_tasks {
+            sockets.push(
+                crate::net::bind_udp_reuseport_with_recv_buffer(
+                    &addr,
+                    self.config.receive_buffer_bytes,
+                    "ipfix",
+                )
+                .await?,
+            );
+        }
+        let bound_addr = sockets[0].local_addr()?;
+        info!(
+            "IPFIX UDP listener started on {} ({} recv tasks)",
+            bound_addr,
+            sockets.len()
+        );
+
+        // All N sockets share one address:port, so /proc/net/udp already
+        // sums their lines (see `parse_proc_net_udp`) — one tracker polled
+        // once per group; one per task would multiply-count the same total.
+        let mut socket_stats = Some(crate::net::SocketDropStats::new(&sockets[0], "ipfix"));
+
+        let decoder = IpfixDecoder::new();
+        let mut tasks = Vec::with_capacity(sockets.len());
+        for (i, socket) in sockets.into_iter().enumerate() {
+            // One handle per task, all sharing one template cache (see
+            // IpfixDecoder's docs) — so an exporter's data decodes on
+            // whichever task receives it, whatever the kernel's steering
+            // does.
+            let decoder = decoder.clone();
+            let handler = self.handler.clone();
+            let allowed_ips = self.allowed_ips.clone();
+            let shutdown_rx = shutdown_rx.clone();
+            // Only the first task takes the shared drop-stats tracker, so it
+            // is polled exactly once per SO_REUSEPORT group.
+            let stats = if i == 0 { socket_stats.take() } else { None };
+            tasks.push(tokio::spawn(ipfix_recv_loop(
+                socket,
+                decoder,
+                handler,
+                allowed_ips,
+                shutdown_rx,
+                stats,
+            )));
+        }
+
+        for task in tasks {
+            let _ = task.await;
         }
 
         Ok(())
@@ -204,6 +278,70 @@ impl IpfixListener {
                 }
                 _ = socket_stats_ticker.tick() => {
                     socket_stats.poll().await;
+                }
+            }
+        }
+    }
+}
+
+/// The recv loop run by each task in the `recv_tasks > 1` fan-out. Same
+/// body as the `recv_tasks <= 1` path in `start_with_shutdown`, parameterized
+/// so it can be spawned once per `SO_REUSEPORT` socket. `socket_stats` is
+/// `Some` for exactly one task per group (see the call site) so the shared
+/// drop counter is polled once, not once per task.
+async fn ipfix_recv_loop(
+    socket: UdpSocket,
+    mut decoder: IpfixDecoder,
+    handler: Arc<dyn IpfixHandler>,
+    allowed_ips: IpWhitelist,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut socket_stats: Option<crate::net::SocketDropStats>,
+) {
+    let mut buf = vec![0u8; 65535];
+    let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
+
+    loop {
+        tokio::select! {
+            result = socket.recv_from(&mut buf) => {
+                match result {
+                    Ok((len, src)) => {
+                        // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                        if !allowed_ips.is_allowed(&src) {
+                            metrics::counter!("listener_source_rejected", "protocol" => "ipfix").increment(1);
+                            debug!("Rejected ipfix datagram from {} — not in allowed_ips", src);
+                            continue;
+                        }
+                        debug!("IPFIX datagram from {}: {} bytes", src, len);
+                        match decode_datagram(&mut decoder, &buf[..len], src.ip()) {
+                            Ok(flows) if flows.is_empty() => {
+                                debug!(
+                                    "IPFIX datagram from {} produced no flows (template-only or empty)",
+                                    src
+                                );
+                            }
+                            Ok(flows) => {
+                                handler.handle_flows(flows, src).await;
+                            }
+                            Err(e) => {
+                                metrics::counter!("ipfix_decode_errors").increment(1);
+                                warn!("IPFIX decode error from {}: {}", src, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("IPFIX UDP receive error: {}", e);
+                    }
+                }
+            }
+            _ = socket_stats_ticker.tick(), if socket_stats.is_some() => {
+                if let Some(stats) = socket_stats.as_mut() {
+                    stats.poll().await;
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("IPFIX listener: shutdown signal received");
+                    break;
                 }
             }
         }
@@ -348,6 +486,7 @@ mod tests {
             udp_port,
             bind_address: "127.0.0.1".to_string(),
             receive_buffer_bytes: Some(1024 * 1024),
+            ..IpfixListenerConfig::default()
         };
         let handler = CapturingHandler::new();
         let listener = IpfixListener::new(config, handler.clone());
@@ -447,6 +586,161 @@ mod tests {
             batches.is_empty(),
             "blocked source must not reach the handler; got {} batches",
             batches.len()
+        );
+    }
+
+    /// A handler that counts total flows across all received batches —
+    /// used by the fan-out tests where flows may arrive interleaved across
+    /// several tasks and only the total matters.
+    struct CountingHandler {
+        count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                count: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn flow_count(&self) -> usize {
+            self.count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IpfixHandler for CountingHandler {
+        async fn handle_flows(&self, flows: Vec<FlowRecord>, _source: SocketAddr) {
+            self.count
+                .fetch_add(flows.len(), std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Build an IPFIX v10 datagram containing only the template set for
+    /// template id 256 (IE 8 sourceIPv4Address + IE 12
+    /// destinationIPv4Address, 4 bytes each) — same layout as
+    /// `tools/loadgen/src/ipfix_udp.rs`'s `build_template_datagram`.
+    fn template_datagram(seq: u32) -> Vec<u8> {
+        const TEMPLATE_ID: u16 = 256;
+        let export_time = 0u32;
+        let mut buf = Vec::with_capacity(32);
+        buf.extend_from_slice(&10u16.to_be_bytes()); // version
+        buf.extend_from_slice(&32u16.to_be_bytes()); // total length
+        buf.extend_from_slice(&export_time.to_be_bytes());
+        buf.extend_from_slice(&seq.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes()); // observation domain id
+        buf.extend_from_slice(&2u16.to_be_bytes()); // set id = 2 (template set)
+        buf.extend_from_slice(&16u16.to_be_bytes()); // set length
+        buf.extend_from_slice(&TEMPLATE_ID.to_be_bytes());
+        buf.extend_from_slice(&2u16.to_be_bytes()); // field count
+        buf.extend_from_slice(&8u16.to_be_bytes()); // ie 8: sourceIPv4Address
+        buf.extend_from_slice(&4u16.to_be_bytes()); // length 4
+        buf.extend_from_slice(&12u16.to_be_bytes()); // ie 12: destinationIPv4Address
+        buf.extend_from_slice(&4u16.to_be_bytes()); // length 4
+        buf
+    }
+
+    /// Build an IPFIX v10 datagram with one data record for template id 256,
+    /// addresses derived from flow index `n` so records are distinguishable
+    /// — same layout as `tools/loadgen/src/ipfix_udp.rs`'s
+    /// `build_data_datagram`.
+    fn data_datagram(seq: u32, n: u64) -> Vec<u8> {
+        const TEMPLATE_ID: u16 = 256;
+        let export_time = 0u32;
+        let hi = ((n >> 8) & 0xFF) as u8;
+        let lo = (n & 0xFF) as u8;
+        let src = std::net::Ipv4Addr::new(10, 0, hi, lo);
+        let dst = std::net::Ipv4Addr::new(192, 168, hi, lo);
+        let mut buf = Vec::with_capacity(28);
+        buf.extend_from_slice(&10u16.to_be_bytes()); // version
+        buf.extend_from_slice(&28u16.to_be_bytes()); // total length
+        buf.extend_from_slice(&export_time.to_be_bytes());
+        buf.extend_from_slice(&seq.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes()); // observation domain id
+        buf.extend_from_slice(&TEMPLATE_ID.to_be_bytes()); // set id = template id
+        buf.extend_from_slice(&12u16.to_be_bytes()); // set length
+        buf.extend_from_slice(&src.octets());
+        buf.extend_from_slice(&dst.octets());
+        buf
+    }
+
+    /// Starts a real `IpfixListener` via `start_with_shutdown` (the
+    /// production path) bound to an ephemeral port, with `recv_tasks`
+    /// configured as given. Returns the listener's join handle, its bound
+    /// address, the shutdown sender, and a handler that counts total flows.
+    async fn start_test_listener(
+        recv_tasks: usize,
+    ) -> (
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        Arc<CountingHandler>,
+    ) {
+        // Bind briefly to obtain an ephemeral port, then drop so the
+        // listener (and, for recv_tasks > 1, its SO_REUSEPORT group) can
+        // bind the same address — same pattern as the other tests here.
+        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = tmp.local_addr().unwrap().port();
+        drop(tmp);
+        let bound: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
+
+        let config = IpfixListenerConfig {
+            udp_port,
+            bind_address: "127.0.0.1".to_string(),
+            recv_tasks,
+            ..IpfixListenerConfig::default()
+        };
+        let handler = CountingHandler::new();
+        let listener = IpfixListener::new(config, handler.clone());
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { listener.start_with_shutdown(shutdown_rx).await });
+
+        // Give every recv task time to bind and enter its recv loop.
+        sleep(Duration::from_millis(50)).await;
+
+        (task, bound, shutdown_tx, handler)
+    }
+
+    /// The decisive test for this plan. Templates arrive from one source port
+    /// and data from a DIFFERENT one, so under SO_REUSEPORT they hash to
+    /// different sockets and are received by different tasks. With a shared
+    /// template cache every data set still decodes. With the prototype's
+    /// per-task decoders this test fails — which is exactly the silent
+    /// data-loss path it exists to close.
+    #[tokio::test]
+    async fn data_decodes_when_template_and_data_arrive_on_different_sockets() {
+        let (listener, bound, shutdown_tx, handler) = start_test_listener(4).await;
+
+        // Separate client sockets => different source ports => different
+        // SO_REUSEPORT group members.
+        let template_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let data_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert_ne!(
+            template_sock.local_addr().unwrap().port(),
+            data_sock.local_addr().unwrap().port(),
+            "the two client sockets must differ, or this test proves nothing"
+        );
+
+        template_sock
+            .send_to(&template_datagram(1), bound)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        for n in 0..50u64 {
+            data_sock
+                .send_to(&data_datagram(n as u32 + 2, n), bound)
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let _ = shutdown_tx.send(true);
+        let _ = listener.await;
+
+        assert_eq!(
+            handler.flow_count(),
+            50,
+            "every data record must decode even though its template arrived on another socket"
         );
     }
 
