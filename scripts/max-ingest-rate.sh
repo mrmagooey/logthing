@@ -50,6 +50,42 @@ parse_achieved() { printf '%s\n' "$1" | sed -n 's/.*achieved rate: \([0-9.]\{1,\
 # command line against the binary path -- which also matched the invoking
 # shell's own command text and killed it too. Symptom was a bare exit 144
 # with no output. A pidfile kills exactly the process we started.
+#
+# DEFECT FIX 2: the old script's cleanup did `rm -f logthing.admin.toml`,
+# deleting a TRACKED file. logthing.admin.toml is also loaded AFTER
+# logthing.toml and silently overrides it (the server exits immediately if
+# left in place alongside this harness's config), so it must be moved aside
+# for the run's duration and moved back in cleanup -- never removed, and the
+# restore is verified by checksum against its own backup.
+#
+# `cleanup` is defined and both traps are registered BEFORE any tracked
+# file is touched (before PIDFILE/TMP_ROOT even exist), so a signal landing
+# anywhere after this point -- including in the couple of statements before
+# logthing.admin.toml is actually moved aside -- always has a handler ready
+# to put things back. Every var cleanup touches is pre-declared empty so
+# `set -u` doesn't choke if cleanup runs before that var is ever assigned,
+# and every restore step is individually guarded on its source existing.
+SRV_PID=""
+PIDFILE=""
+TMP_ROOT=""
+CONFIG_BACKUP=""
+ADMIN_BACKUP=""
+HAD_ADMIN=0
+cleanup() {
+    stop_server
+    [ -n "$CONFIG_BACKUP" ] && [ -f "$CONFIG_BACKUP" ] && cp "$CONFIG_BACKUP" "$REPO/logthing.toml" 2>/dev/null
+    if [ "$HAD_ADMIN" -eq 1 ] && [ -n "$TMP_ROOT" ] && [ -f "$TMP_ROOT/logthing.admin.toml.aside" ]; then
+        mv "$TMP_ROOT/logthing.admin.toml.aside" "$REPO/logthing.admin.toml" 2>/dev/null
+        if ! cmp -s "$ADMIN_BACKUP" "$REPO/logthing.admin.toml"; then
+            echo "FATAL: logthing.admin.toml restore did not match backup checksum" >&2
+        fi
+    fi
+    [ -n "$PIDFILE" ] && rm -f "$PIDFILE"
+    [ -n "$TMP_ROOT" ] && rm -rf "$TMP_ROOT"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
+
 PIDFILE="$(mktemp)" || exit 1
 
 TMP_ROOT="$(mktemp -d)" || exit 1
@@ -57,37 +93,14 @@ LOCAL_DIR="$TMP_ROOT/parquet-local"
 mkdir -p "$LOCAL_DIR"
 cd "$REPO" || exit 1
 
-# DEFECT FIX 2: the old script's cleanup did `rm -f logthing.admin.toml`,
-# deleting a TRACKED file. logthing.admin.toml is also loaded AFTER
-# logthing.toml and silently overrides it (the server exits immediately if
-# left in place alongside this harness's config), so it must be moved aside
-# for the run's duration and moved back in cleanup -- never removed, and the
-# restore is verified by checksum against its own backup.
 CONFIG_BACKUP="$TMP_ROOT/logthing.toml.orig"
 ADMIN_BACKUP="$TMP_ROOT/logthing.admin.toml.orig"
 cp logthing.toml "$CONFIG_BACKUP" || exit 1
-HAD_ADMIN=0
 if [ -f logthing.admin.toml ]; then
     HAD_ADMIN=1
     cp logthing.admin.toml "$ADMIN_BACKUP"
     mv logthing.admin.toml "$TMP_ROOT/logthing.admin.toml.aside"
 fi
-
-SRV_PID=""
-cleanup() {
-    stop_server
-    cp "$CONFIG_BACKUP" "$REPO/logthing.toml" 2>/dev/null
-    if [ "$HAD_ADMIN" -eq 1 ]; then
-        mv "$TMP_ROOT/logthing.admin.toml.aside" "$REPO/logthing.admin.toml" 2>/dev/null
-        if ! cmp -s "$ADMIN_BACKUP" "$REPO/logthing.admin.toml"; then
-            echo "FATAL: logthing.admin.toml restore did not match backup checksum" >&2
-        fi
-    fi
-    rm -f "$PIDFILE"
-    rm -rf "$TMP_ROOT"
-}
-trap cleanup EXIT
-trap 'cleanup; exit 130' INT TERM
 
 write_config() {
     {
