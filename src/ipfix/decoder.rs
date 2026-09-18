@@ -76,6 +76,7 @@ pub fn ie_info(id: u16) -> Option<(&'static str, IeType)> {
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::{Arc, RwLock};
 
 /// Identifies a template within a specific exporter and observation domain.
 pub type TemplateKey = (IpAddr, u32, u16);
@@ -98,21 +99,54 @@ pub struct FieldSpecifier {
 /// keys are always allowed to be updated (templates are periodically re-sent).
 pub const MAX_CACHED_TEMPLATES: usize = 100_000;
 
-/// Stateful IPFIX / NetFlow decoder.
-/// Owns the template cache; safe to use single-threaded from a listener task.
+/// The template map plus the one-shot warning flag, together under a single
+/// lock. They are one unit of state: the flag describes whether we have
+/// already warned about *this* map being full, so splitting them would let
+/// the warning and the capacity check disagree.
+#[derive(Debug, Default)]
+pub(crate) struct TemplateCache {
+    map: HashMap<TemplateKey, Vec<FieldSpecifier>>,
+    limit_warned: bool,
+}
+
+/// Decoder handle. Cloning yields another handle onto the SAME template
+/// cache, which is what lets N recv tasks decode each other's exporters'
+/// data. Read-mostly: a template is written once per exporter re-send
+/// interval and read once per data set, so an `RwLock` read is the common
+/// path and it is cheap against a syscall-bound receive loop.
+#[derive(Debug, Clone, Default)]
 pub struct IpfixDecoder {
-    pub(crate) cache: HashMap<TemplateKey, Vec<FieldSpecifier>>,
-    /// Tracks whether we have already emitted the cache-capacity warning so we
-    /// don't log-spam on every subsequent insert attempt.
-    template_limit_warned: bool,
+    cache: Arc<RwLock<TemplateCache>>,
 }
 
 impl IpfixDecoder {
     pub fn new() -> Self {
-        Self {
-            cache: HashMap::new(),
-            template_limit_warned: false,
-        }
+        Self::default()
+    }
+
+    pub(crate) fn cache_get(&self, key: &TemplateKey) -> Option<Vec<FieldSpecifier>> {
+        self.cache
+            .read()
+            .expect("template cache lock poisoned")
+            .map
+            .get(key)
+            .cloned()
+    }
+
+    pub(crate) fn cache_len(&self) -> usize {
+        self.cache.read().expect("template cache lock poisoned").map.len()
+    }
+
+    pub(crate) fn cache_contains_key(&self, key: &TemplateKey) -> bool {
+        self.cache
+            .read()
+            .expect("template cache lock poisoned")
+            .map
+            .contains_key(key)
+    }
+
+    pub(crate) fn cache_is_empty(&self) -> bool {
+        self.cache.read().expect("template cache lock poisoned").map.is_empty()
     }
 
     /// Insert `fields` for `key` into the template cache, enforcing the capacity bound.
@@ -121,10 +155,11 @@ impl IpfixDecoder {
     /// - If `key` is new and the cache is at `MAX_CACHED_TEMPLATES` capacity,
     ///   the insert is refused, `ipfix_templates_dropped` is incremented, and a
     ///   warning is logged (at most once until capacity drops below the limit).
-    pub(crate) fn try_insert_template(&mut self, key: TemplateKey, fields: Vec<FieldSpecifier>) {
-        if !self.cache.contains_key(&key) && self.cache.len() >= MAX_CACHED_TEMPLATES {
+    pub(crate) fn try_insert_template(&self, key: TemplateKey, fields: Vec<FieldSpecifier>) {
+        let mut guard = self.cache.write().expect("template cache lock poisoned");
+        if !guard.map.contains_key(&key) && guard.map.len() >= MAX_CACHED_TEMPLATES {
             metrics::counter!("ipfix_templates_dropped").increment(1);
-            if !self.template_limit_warned {
+            if !guard.limit_warned {
                 tracing::warn!(
                     "ipfix: template cache full ({MAX_CACHED_TEMPLATES} entries); \
                      new template from exporter {} (domain {}, id {}) dropped. \
@@ -133,22 +168,16 @@ impl IpfixDecoder {
                     key.1,
                     key.2,
                 );
-                self.template_limit_warned = true;
+                guard.limit_warned = true;
             }
             return;
         }
         // Reset the warned flag once we're back below capacity (key already existed
         // and was updated, so cache size did not grow).
-        if self.cache.len() < MAX_CACHED_TEMPLATES {
-            self.template_limit_warned = false;
+        if guard.map.len() < MAX_CACHED_TEMPLATES {
+            guard.limit_warned = false;
         }
-        self.cache.insert(key, fields);
-    }
-}
-
-impl Default for IpfixDecoder {
-    fn default() -> Self {
-        Self::new()
+        guard.map.insert(key, fields);
     }
 }
 
@@ -585,8 +614,8 @@ fn parse_ipfix_data_set(
     export_time: DateTime<Utc>,
 ) -> Result<Vec<FlowRecord>, DecodeError> {
     let key: TemplateKey = (exporter, obs_domain_id, set_id);
-    let fields = match decoder.cache.get(&key) {
-        Some(f) => f.clone(),
+    let fields = match decoder.cache_get(&key) {
+        Some(f) => f,
         None => {
             metrics::counter!("ipfix_templates_missing").increment(1);
             tracing::debug!(
@@ -1122,7 +1151,7 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr};
 
         let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let mut decoder = IpfixDecoder::new();
+        let decoder = IpfixDecoder::new();
         let key: TemplateKey = (exporter, 0, 256);
         let fields = vec![
             FieldSpecifier {
@@ -1136,9 +1165,73 @@ mod tests {
                 enterprise_number: None,
             },
         ];
-        decoder.cache.insert(key, fields.clone());
-        assert_eq!(decoder.cache.get(&key).unwrap().len(), 2);
-        assert_eq!(decoder.cache.get(&key).unwrap()[0].ie_id, 8);
+        decoder.try_insert_template(key, fields.clone());
+        assert_eq!(decoder.cache_get(&key).unwrap().len(), 2);
+        assert_eq!(decoder.cache_get(&key).unwrap()[0].ie_id, 8);
+    }
+
+    /// The decisive property this plan turns on: two decoder handles share one
+    /// template cache, so a template learned through one is visible through the
+    /// other. This is what lets any recv task decode any datagram, and it is
+    /// what removes the dependence on the kernel steering an exporter's packets
+    /// to a fixed socket.
+    #[test]
+    fn cloned_decoders_share_one_template_cache() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let a = IpfixDecoder::new();
+        let b = a.clone();
+        let key: TemplateKey = (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 0, 256);
+        let fields = vec![FieldSpecifier {
+            ie_id: 8,
+            length: 4,
+            enterprise_number: None,
+        }];
+
+        a.try_insert_template(key, fields.clone());
+
+        assert_eq!(
+            b.cache_get(&key).map(|f| f.len()),
+            Some(1),
+            "a template inserted through one handle must be visible through the other"
+        );
+        assert_eq!(a.cache_len(), b.cache_len(), "both handles see one cache");
+    }
+
+    /// The capacity bound must be enforced across ALL handles, not per handle —
+    /// otherwise N recv tasks would each admit MAX_CACHED_TEMPLATES entries and
+    /// the flood protection would be N times weaker than documented.
+    #[test]
+    fn template_capacity_bound_is_shared_across_handles() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let a = IpfixDecoder::new();
+        let b = a.clone();
+        // template_id is u16 (max 65535), so MAX_CACHED_TEMPLATES (100_000) distinct
+        // keys cannot be produced by varying template_id alone — spread across
+        // exporter IPs and obs-domain-ids too, same as
+        // `template_cache_rejects_new_key_when_full` above, to avoid id collisions
+        // silently updating existing entries instead of growing the cache.
+        for i in 0u32..MAX_CACHED_TEMPLATES as u32 {
+            let a_oct = (i >> 16) as u8;
+            let b_oct = (i >> 8) as u8;
+            let c_oct = i as u8;
+            let exporter = IpAddr::V4(Ipv4Addr::new(10, a_oct, b_oct, c_oct));
+            let tmpl_id = ((i % 65000) + 256) as u16;
+            let obs_domain = i / 65000;
+            a.try_insert_template((exporter, obs_domain, tmpl_id), vec![]);
+        }
+        assert_eq!(a.cache_len(), MAX_CACHED_TEMPLATES);
+
+        let new_exporter = IpAddr::V4(Ipv4Addr::new(192, 168, 99, 99));
+        let new_key: TemplateKey = (new_exporter, 9999, 9999);
+        b.try_insert_template(new_key, vec![]);
+        assert_eq!(
+            b.cache_len(),
+            MAX_CACHED_TEMPLATES,
+            "inserting through a second handle must not exceed the shared bound"
+        );
+        assert!(!b.cache_contains_key(&new_key));
     }
 
     // ---- IPFIX v10 decode tests (Task 4) ----
@@ -1383,12 +1476,12 @@ mod tests {
     #[test]
     fn template_cache_rejects_new_key_when_full() {
         use std::net::{IpAddr, Ipv4Addr};
-        let mut dec = IpfixDecoder::new();
+        let dec = IpfixDecoder::new();
 
-        // Pre-fill the cache to MAX_CACHED_TEMPLATES by directly inserting into
-        // the underlying HashMap. Keys use (exporter_ip, obs_domain, tmpl_id)
-        // triples constructed from the loop index (spread across exporter IPs and
-        // obs-domain-ids to avoid u16 template-id overflow at 65536).
+        // Pre-fill the cache to MAX_CACHED_TEMPLATES via the accessor. Keys use
+        // (exporter_ip, obs_domain, tmpl_id) triples constructed from the loop
+        // index (spread across exporter IPs and obs-domain-ids to avoid u16
+        // template-id overflow at 65536).
         for i in 0u32..MAX_CACHED_TEMPLATES as u32 {
             let a = (i >> 16) as u8;
             let b = (i >> 8) as u8;
@@ -1396,10 +1489,10 @@ mod tests {
             let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, a, b, c));
             let tmpl_id = ((i % 65000) + 256) as u16;
             let obs_domain = i / 65000;
-            dec.cache.insert((exporter, obs_domain, tmpl_id), vec![]);
+            dec.try_insert_template((exporter, obs_domain, tmpl_id), vec![]);
         }
         assert_eq!(
-            dec.cache.len(),
+            dec.cache_len(),
             MAX_CACHED_TEMPLATES,
             "cache should be at capacity"
         );
@@ -1408,16 +1501,16 @@ mod tests {
         let new_exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 99, 99));
         let new_key: TemplateKey = (new_exporter, 9999, 256);
         assert!(
-            !dec.cache.contains_key(&new_key),
+            !dec.cache_contains_key(&new_key),
             "new_key must not already be in the cache"
         );
         dec.try_insert_template(new_key, vec![]);
         assert!(
-            !dec.cache.contains_key(&new_key),
+            !dec.cache_contains_key(&new_key),
             "new key must be refused when cache is full"
         );
         assert_eq!(
-            dec.cache.len(),
+            dec.cache_len(),
             MAX_CACHED_TEMPLATES,
             "cache size must not grow beyond the limit"
         );
@@ -1427,7 +1520,7 @@ mod tests {
         let existing_exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0));
         let existing_key: TemplateKey = (existing_exporter, 0, 256);
         assert!(
-            dec.cache.contains_key(&existing_key),
+            dec.cache_contains_key(&existing_key),
             "existing_key must be in the cache"
         );
         let updated_fields = vec![FieldSpecifier {
@@ -1437,7 +1530,7 @@ mod tests {
         }];
         dec.try_insert_template(existing_key, updated_fields);
         assert_eq!(
-            dec.cache.get(&existing_key).map(|v| v.len()),
+            dec.cache_get(&existing_key).map(|v| v.len()),
             Some(1),
             "existing key must be updatable even when cache is full"
         );
@@ -1450,7 +1543,7 @@ mod tests {
     #[test]
     fn ipfix_decoder_default_creates_empty_decoder() {
         let dec = IpfixDecoder::default();
-        assert!(dec.cache.is_empty());
+        assert!(dec.cache_is_empty());
     }
 
     // ---- DecodeError::Malformed display ----
@@ -1596,7 +1689,7 @@ mod tests {
         // Template 320 should now be cached
         let key: TemplateKey = (exporter, 0, 320);
         assert!(
-            dec.cache.contains_key(&key),
+            dec.cache_contains_key(&key),
             "options template should be stored in cache"
         );
     }
@@ -1682,7 +1775,7 @@ mod tests {
             decode_ipfix(&mut dec, buf, exporter).expect("enterprise IE template must not error");
         assert_eq!(records.len(), 0);
         let key: TemplateKey = (exporter, 0, 300);
-        let fields = dec.cache.get(&key).expect("template 300 should be cached");
+        let fields = dec.cache_get(&key).expect("template 300 should be cached");
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].ie_id, 1); // top bit cleared
         assert_eq!(fields[0].enterprise_number, Some(0xDEAD_BEEF));
@@ -2230,7 +2323,7 @@ mod tests {
 
         // Manually insert a zero-length template (field_count=0)
         let key: TemplateKey = (exporter, 0, 300);
-        dec.cache.insert(key, vec![]);
+        dec.try_insert_template(key, vec![]);
 
         // A data set for template 300 — decoder should return empty due to record_len==0
         // msg: 16 + (4+8 = 12 data set) = 28 bytes
@@ -2427,9 +2520,9 @@ mod tests {
     #[test]
     fn template_cache_warned_flag_resets_after_update() {
         use std::net::{IpAddr, Ipv4Addr};
-        let mut dec = IpfixDecoder::new();
+        let dec = IpfixDecoder::new();
 
-        // Fill to capacity using direct inserts
+        // Fill to capacity via the accessor
         for i in 0u32..MAX_CACHED_TEMPLATES as u32 {
             let a = (i >> 16) as u8;
             let b = (i >> 8) as u8;
@@ -2437,24 +2530,26 @@ mod tests {
             let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, a, b, c));
             let tmpl_id = ((i % 65000) + 256) as u16;
             let obs_domain = i / 65000;
-            dec.cache.insert((exporter, obs_domain, tmpl_id), vec![]);
+            dec.try_insert_template((exporter, obs_domain, tmpl_id), vec![]);
         }
 
-        // Attempt to insert a new key → rejected, warns
+        // Attempt to insert a new key → rejected. The warned flag is now private
+        // state behind the lock, so we assert the observable effect instead: the
+        // key is absent and the cache size is unchanged.
         let new_exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 99, 1));
-        dec.try_insert_template((new_exporter, 0, 300), vec![]);
+        let new_key: TemplateKey = (new_exporter, 0, 300);
+        dec.try_insert_template(new_key, vec![]);
         assert!(
-            dec.template_limit_warned,
-            "warned flag should be set after rejection"
+            !dec.cache_contains_key(&new_key),
+            "new key must be refused once the cache is at capacity"
         );
+        assert_eq!(dec.cache_len(), MAX_CACHED_TEMPLATES);
 
-        // Update an *existing* key — cache size stays at MAX, so warned stays true
-        // (the reset only happens when len < MAX after an insert that *reduces* cache
-        // size, which can't happen via try_insert_template).
-        // We can verify the update path: existing key is always accepted.
+        // Update an *existing* key — cache size stays at MAX; existing key is
+        // always accepted regardless of the warned flag.
         let existing_exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0));
         let existing_key: TemplateKey = (existing_exporter, 0, 256);
-        assert!(dec.cache.contains_key(&existing_key));
+        assert!(dec.cache_contains_key(&existing_key));
         dec.try_insert_template(
             existing_key,
             vec![FieldSpecifier {
@@ -2463,13 +2558,22 @@ mod tests {
                 enterprise_number: None,
             }],
         );
-        // The key was already present so it was updated (cache.len() stays the same).
-        // warned flag reset happens only when cache.len() < MAX — not the case here.
         assert_eq!(
-            dec.cache.get(&existing_key).unwrap().len(),
+            dec.cache_get(&existing_key).unwrap().len(),
             1,
             "existing key updated"
         );
+
+        // A further attempt at a *different* new key must still be refused —
+        // observable proof that the one-shot warning does not cause the cache to
+        // start silently admitting entries once it has already warned once.
+        let another_new_key: TemplateKey = (new_exporter, 0, 301);
+        dec.try_insert_template(another_new_key, vec![]);
+        assert!(
+            !dec.cache_contains_key(&another_new_key),
+            "capacity bound must keep rejecting new keys after the warning was emitted"
+        );
+        assert_eq!(dec.cache_len(), MAX_CACHED_TEMPLATES);
     }
 
     // ---- parse_ipfix_options_template_set: enterprise field in options template ----
@@ -2500,8 +2604,7 @@ mod tests {
         assert_eq!(records.len(), 0);
         let key: TemplateKey = (exporter, 0, 320);
         let fields = dec
-            .cache
-            .get(&key)
+            .cache_get(&key)
             .expect("options template 320 should be cached");
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].enterprise_number, Some(10000));
@@ -2534,7 +2637,7 @@ mod tests {
         // Template 5 should NOT be cached
         let key: TemplateKey = (exporter, 0, 5);
         assert!(
-            !dec.cache.contains_key(&key),
+            !dec.cache_contains_key(&key),
             "template_id<256 must not be cached"
         );
     }
@@ -2630,7 +2733,7 @@ mod tests {
         // v9 template key uses source_id=5
         let v9_key: TemplateKey = (exporter, 5, 256);
         assert!(
-            dec.cache.contains_key(&v9_key),
+            dec.cache_contains_key(&v9_key),
             "v9 template must be keyed by source_id"
         );
 
@@ -2638,7 +2741,7 @@ mod tests {
         // a v10 with obs_domain=0 must NOT find the v9 template under domain=0.
         let v10_key_wrong_domain: TemplateKey = (exporter, 0, 256);
         assert!(
-            !dec.cache.contains_key(&v10_key_wrong_domain),
+            !dec.cache_contains_key(&v10_key_wrong_domain),
             "v10 domain=0 template must not exist in v9-populated cache"
         );
     }
