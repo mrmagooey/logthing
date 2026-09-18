@@ -363,8 +363,11 @@ echo "# server restarted between every run; $RECV_METRIC/$DROP_METRIC_DISPLAY/pa
 if [ -n "$DROP_METRIC" ]; then
     echo "# RcvbufErrors is host-wide and NOT reset by restart -- diffed before/after around each run's load."
 fi
-echo -e "run\tformat\tshape\toffered\tachieved\treceived\tkernel_drops\twriter_drops\tbuffer_drops\twritten\tloss_pct\tgen_cores\tsrv_cores\tverdict"
+echo -e "run\tformat\tshape\toffered\tachieved\treceived\tkernel_drops\twriter_drops\tbuffer_drops\twritten\tkernel_loss_pct\ttotal_loss_pct\tgen_cores\tsrv_cores\tverdict"
 
+# LOSS_LIST holds total_loss_pct (the figure classify_run actually acts on,
+# and what the summary below aggregates) for every run of every format --
+# kernel-only loss is not applicable to TCP/HTTP, but total loss always is.
 LOSS_LIST=""
 DROPS_LIST=""
 WRITER_DROPS_LIST=""
@@ -445,16 +448,20 @@ for i in $(seq 1 "$RUNS"); do
     fi
 
     if [ -n "$DROP_METRIC" ]; then
-        LOSS_PCT="$(awk -v d="$KERNEL_DROPS_INT" -v o="$OFFERED" 'BEGIN{ if (o==0) print "nan"; else printf "%.4f", (d/o)*100 }')"
+        KERNEL_LOSS_PCT="$(awk -v d="$KERNEL_DROPS_INT" -v o="$OFFERED" 'BEGIN{ if (o==0) print "nan"; else printf "%.4f", (d/o)*100 }')"
     else
-        LOSS_PCT="n/a"
+        KERNEL_LOSS_PCT="n/a"
     fi
 
     # Total loss for the verdict: kernel socket drops (0 contribution where
     # not applicable -- TCP/HTTP genuinely cannot lose datagrams in a socket
     # buffer, so 0 is correct here, not a stand-in for "unmeasured") plus the
     # two writer-side drop sites, over offered. Independent of
-    # parquet_s3_records_written -- see drain_until_stable's comment.
+    # parquet_s3_records_written -- see drain_until_stable's comment. This is
+    # the figure classify_run actually acts on, so it is reported as its own
+    # column (total_loss_pct) alongside the kernel-only figure above -- a
+    # FAIL-LOSS row must show the number that produced that verdict without
+    # the reader summing three columns and dividing by offered themselves.
     KERNEL_FOR_TOTAL=0
     [ -n "$DROP_METRIC" ] && KERNEL_FOR_TOTAL="$KERNEL_DROPS_INT"
     WRITER_DROPS_INT="${WRITER_DROPS%.*}"
@@ -463,34 +470,43 @@ for i in $(seq 1 "$RUNS"); do
     TOTAL_LOSS_PCT="$(awk -v d="$TOTAL_DROPS" -v o="$OFFERED" 'BEGIN{ if (o==0) print 0; else printf "%.4f", (d/o)*100 }')"
     VERDICT="$(classify_run "$ACHIEVED" "$RATE" "$TOTAL_LOSS_PCT" "$LOSS_BUDGET")"
 
-    echo -e "$i\t$FORMAT\t$SHAPE\t$OFFERED\t$ACHIEVED\t$RECEIVED\t$KERNEL_DROPS\t$WRITER_DROPS\t$BUFFER_DROPS\t$WRITTEN\t$LOSS_PCT\t$GEN_CORES\t$SRV_CORES\t$VERDICT"
+    echo -e "$i\t$FORMAT\t$SHAPE\t$OFFERED\t$ACHIEVED\t$RECEIVED\t$KERNEL_DROPS\t$WRITER_DROPS\t$BUFFER_DROPS\t$WRITTEN\t$KERNEL_LOSS_PCT\t$TOTAL_LOSS_PCT\t$GEN_CORES\t$SRV_CORES\t$VERDICT"
 
+    # total_loss_pct is meaningful for every format (kernel contributes 0
+    # where not applicable, which is correct, not unmeasured), so it is
+    # collected unconditionally -- this is what the median/min/max summary
+    # below aggregates. DROPS_LIST (raw kernel drop counts, for the
+    # kernel-specific zero-loss NOTE) stays guarded on DROP_METRIC.
+    LOSS_LIST="$LOSS_LIST"$'\n'"$TOTAL_LOSS_PCT"
     if [ -n "$DROP_METRIC" ]; then
-        LOSS_LIST="$LOSS_LIST"$'\n'"$LOSS_PCT"
         DROPS_LIST="$DROPS_LIST"$'\n'"$KERNEL_DROPS_INT"
     fi
     WRITER_DROPS_LIST="$WRITER_DROPS_LIST"$'\n'"$WRITER_DROPS"
 done
 
 echo "# --- summary: format=$FORMAT shape=$SHAPE rate=$RATE runs=$RUNS ---"
+# median/min/max aggregate total_loss_pct (the figure classify_run acts on),
+# not kernel_loss_pct -- total loss applies to every format (kernel
+# contributes 0, correctly, where the transport cannot lose datagrams in a
+# socket buffer), so this block is no longer guarded on DROP_METRIC.
+MEDIAN="$(printf '%s\n' "$LOSS_LIST" | grep -v '^$' | median_of)"
+MIN="$(printf '%s\n' "$LOSS_LIST" | grep -v '^$' | min_of)"
+MAX="$(printf '%s\n' "$LOSS_LIST" | grep -v '^$' | max_of)"
+
+echo -e "median\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t-\t$MEDIAN\t-\t-\t-"
+echo -e "min\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t-\t$MIN\t-\t-\t-"
+echo -e "max\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t-\t$MAX\t-\t-\t-"
+
 if [ -n "$DROP_METRIC" ]; then
-    MEDIAN="$(printf '%s\n' "$LOSS_LIST" | grep -v '^$' | median_of)"
-    MIN="$(printf '%s\n' "$LOSS_LIST" | grep -v '^$' | min_of)"
-    MAX="$(printf '%s\n' "$LOSS_LIST" | grep -v '^$' | max_of)"
-
-    echo -e "median\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t$MEDIAN\t-\t-\t-"
-    echo -e "min\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t$MIN\t-\t-\t-"
-    echo -e "max\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t$MAX\t-\t-\t-"
-
     ALL_ZERO=1
     for d in $(printf '%s\n' "$DROPS_LIST" | grep -v '^$'); do
         [ "$d" -ne 0 ] && ALL_ZERO=0
     done
     if [ "$ALL_ZERO" -eq 1 ]; then
-        echo "# NOTE: zero loss ($DROP_METRIC == 0) on every run -- rate/duration did not saturate the receive buffer on this host. Do not report the median above as a meaningful loss figure; raise RATE or DURATION to produce a measurable baseline instead."
+        echo "# NOTE: zero kernel-socket loss ($DROP_METRIC == 0) on every run -- rate/duration did not saturate the receive buffer on this host. This does not by itself mean total_loss_pct above is zero (writer_drops/buffer_drops can still be non-zero); if it is also zero, raise RATE or DURATION to produce a measurable baseline instead."
     fi
 else
-    echo "# kernel-loss is not applicable for format=$FORMAT (transport=$TRANSPORT cannot lose datagrams in a socket buffer): loss_pct/median/min/max and the RcvbufErrors reconciliation are skipped above, not reported as zero."
+    echo "# kernel-loss is not applicable for format=$FORMAT (transport=$TRANSPORT cannot lose datagrams in a socket buffer): kernel_loss_pct is n/a on every row above (not reported as zero) and the RcvbufErrors reconciliation is skipped. total_loss_pct above already reflects only the drop sites that apply to this format (writer/buffer, kernel contributing 0)."
 fi
 
 if [ "$SHAPE" = "real" ] && [ -n "$WRITER_DROPS_LIST" ]; then
