@@ -23,6 +23,12 @@ figure is loss at a fixed, reproduced offered rate.
 
 ## Reproduce
 
+`scripts/repeat-ipfix-loopback-loss.sh` was renamed and generalised to
+`scripts/max-ingest-rate.sh` on 2026-09-16 (Task 6 of the max-ingest-rate
+plan). The old script's `pkill -f` (which could kill the invoking shell
+instead of the server) and its `rm logthing.admin.toml` (which deleted a
+tracked file) are both gone from the replacement.
+
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 export CC=/usr/bin/gcc CXX=/usr/bin/g++
@@ -30,10 +36,10 @@ export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc
 cargo build --release --bin logthing
 cargo build --release -p loadgen
 
-RATE=20000 DURATION=15 RUNS=5 SHAPE=trivial ./scripts/repeat-ipfix-loopback-loss.sh
-RATE=20000 DURATION=15 RUNS=5 SHAPE=real    ./scripts/repeat-ipfix-loopback-loss.sh
-RATE=5000  DURATION=15 RUNS=5 SHAPE=trivial ./scripts/repeat-ipfix-loopback-loss.sh
-RATE=5000  DURATION=15 RUNS=5 SHAPE=real    ./scripts/repeat-ipfix-loopback-loss.sh
+FORMAT=ipfix RATE=20000 DURATION=15 RUNS=5 SHAPE=trivial ./scripts/max-ingest-rate.sh
+FORMAT=ipfix RATE=20000 DURATION=15 RUNS=5 SHAPE=real    ./scripts/max-ingest-rate.sh
+FORMAT=ipfix RATE=5000  DURATION=15 RUNS=5 SHAPE=trivial ./scripts/max-ingest-rate.sh
+FORMAT=ipfix RATE=5000  DURATION=15 RUNS=5 SHAPE=real    ./scripts/max-ingest-rate.sh
 ```
 
 `SHAPE=trivial` runs `DefaultIpfixHandler` with no `[ipfix.*]` sink
@@ -85,6 +91,21 @@ delivered. This is finding #6 from the plan at far larger magnitude than
 previously measured; it is reported here for completeness but is a
 *different* drop site from the kernel loss the median/min/max above
 describes, and the two must not be added together.
+
+> **⚠️ Stale as of 2026-09-18 — do not trust this section's writer-channel
+> figures going forward.** Commit `c103de3` ("Merge perf/ipfix-accumulator:
+> IPFIX 82% loss -> zero, ~18x throughput"), landed the day after this
+> baseline and confirmed an ancestor of the current `HEAD`
+> (`git merge-base --is-ancestor c103de3 HEAD`), eliminated the writer-channel
+> drop behavior described above. `docs/performance/2026-09-18-max-ingest-rate.md`
+> re-measured IPFIX real-shape loss under the same restart-per-run,
+> RcvbufReconciled harness and found `parquet_s3_dropped{source="ipfix"}` at
+> **0** on every run, at every rate tested, including the failing ones — all
+> loss at this campaign's ceiling is kernel-socket drop, not writer-channel.
+> The 3.6331% *kernel*-loss median above is not itself contradicted (that
+> drop site is unrelated to the accumulator fix), but do not use this
+> document's writer-channel numbers, or its "3-4x undercount" framing of
+> total loss, as current — see the newer document for the post-fix picture.
 
 ## 5,000/s — lower-rate sanity check (plan's own secondary rate)
 

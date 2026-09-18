@@ -4,6 +4,41 @@ All notable changes to this project are documented in this file, newest
 first, loosely following [Keep a Changelog](https://keepachangelog.com/).
 This file starts at 0.15.0; earlier releases are not backfilled.
 
+## [Unreleased]
+
+### Added
+
+- `scripts/max-ingest-rate.sh` — per-format maximum sustainable ingest rate
+  harness: restarts `logthing` between runs, reconciles kernel-socket drops
+  against `/proc/net/udp` (per-listener, not host-wide), and does a coarse
+  doubling + bisection search to the first rate whose median loss (across
+  `RUNS` repeats) exceeds a configurable loss budget, refusing to report a
+  ceiling when the generator itself can't sustain the offered rate.
+- `scripts/loadgen-ceiling.sh` — measures the load generator's own maximum
+  emission rate (`BLACKHOLE=1`, no receiver) across 1/2/4 concurrent
+  processes, independent of any server, so a generator ceiling is never
+  mistaken for a server one.
+
+### Changed
+
+- `loadgen`'s `hec-http` and `generic-http` subcommands gained
+  `--events-per-request`, batching that many NDJSON/HEC events per HTTP
+  request instead of one event per request. Without it, both generators were
+  measuring HTTP request rate, not record rate — a flat ~21,000-25,000/s
+  ceiling regardless of process count, versus a ~385k records/s single-
+  threaded per-record decode cost. Batched at 100 events/request, measured
+  ceilings for both formats rose 7-9x (see
+  `docs/performance/2026-09-18-max-ingest-rate.md`).
+
+### Removed
+
+- `scripts/repeat-ipfix-loopback-loss.sh` — replaced by
+  `scripts/max-ingest-rate.sh`, which generalizes the same restart-per-run,
+  zeroed-counter, kernel-drop-reconciling approach across all seven formats
+  and drops two defects: a `pkill -f` that could kill the invoking shell
+  instead of the server, and a cleanup step that deleted the tracked
+  `logthing.admin.toml`.
+
 ## [0.19.1] - 2026-09-16
 
 ### Changed

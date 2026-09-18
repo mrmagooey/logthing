@@ -71,6 +71,13 @@ pub struct HecHttpArgs {
     /// the achieved rate plateaus below `--target-rate` with CPU to spare.
     #[arg(long, default_value_t = 64)]
     pub concurrency: usize,
+
+    /// Records per HTTP request. One request per record (the default) measures
+    /// reqwest's request rate rather than logthing's ingest rate; real
+    /// shippers batch. `/services/collector/event` splits the body on
+    /// newlines, so a batch is newline-joined JSON objects.
+    #[arg(long, default_value_t = 1)]
+    pub events_per_request: usize,
 }
 
 /// Shared, cheaply-cloned state every in-flight request task needs.
@@ -84,6 +91,7 @@ struct HecCtx {
     sent: Arc<AtomicU64>,
     errors: Arc<AtomicU64>,
     auth_failed: Arc<AtomicBool>,
+    events_per_request: usize,
 }
 
 pub async fn run(args: HecHttpArgs) -> anyhow::Result<()> {
@@ -109,7 +117,9 @@ pub async fn run(args: HecHttpArgs) -> anyhow::Result<()> {
         sent: Arc::new(AtomicU64::new(0)),
         errors: Arc::new(AtomicU64::new(0)),
         auth_failed: Arc::new(AtomicBool::new(false)),
+        events_per_request: args.events_per_request.max(1),
     };
+    let batch = ctx.events_per_request as u64;
 
     let duration = Duration::from_secs(args.duration_secs);
     let start = Instant::now();
@@ -120,15 +130,18 @@ pub async fn run(args: HecHttpArgs) -> anyhow::Result<()> {
         // Unbounded: launch requests as fast as `--concurrency` allows.
         while start.elapsed() < duration && !ctx.auth_failed.load(Ordering::Relaxed) {
             spawn_request(&ctx, &mut tasks, n).await;
-            n += 1;
+            n += batch;
         }
     } else {
         // Same 1ms-tick, fractional-carry pacing as every other subcommand
         // -- see `crate::pacing` for why the carry accumulator is shared
         // rather than reimplemented here. Here it controls how many
-        // requests are *launched* per tick, not how many complete.
+        // requests are *launched* per tick, not how many complete, scaled
+        // down by the batch size so `--target-rate` stays a records/sec
+        // figure rather than becoming requests/sec.
         let per_tick_interval = crate::pacing::TICK;
-        let records_per_tick_target = args.target_rate as f64 * per_tick_interval.as_secs_f64();
+        let requests_per_tick_target =
+            (args.target_rate as f64 / batch as f64) * per_tick_interval.as_secs_f64();
         let mut ticker = tokio::time::interval(per_tick_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
         let mut carry: f64 = 0.0;
@@ -138,13 +151,13 @@ pub async fn run(args: HecHttpArgs) -> anyhow::Result<()> {
                 break;
             }
             ticker.tick().await;
-            let records_this_tick = tick_record_count(&mut carry, records_per_tick_target);
-            for _ in 0..records_this_tick {
+            let requests_this_tick = tick_record_count(&mut carry, requests_per_tick_target);
+            for _ in 0..requests_this_tick {
                 if start.elapsed() >= duration || ctx.auth_failed.load(Ordering::Relaxed) {
                     break 'send_loop;
                 }
                 spawn_request(&ctx, &mut tasks, n).await;
-                n += 1;
+                n += batch;
             }
         }
     }
@@ -193,14 +206,15 @@ async fn spawn_request(ctx: &HecCtx, tasks: &mut JoinSet<()>, n: u64) {
     let ctx = ctx.clone();
     tasks.spawn(async move {
         let _permit = permit;
-        let body = build_event_json(n, &ctx.sourcetype);
-        let mut req = ctx.client.post(ctx.url.as_ref()).json(&body);
+        let body = build_batch_body(n, ctx.events_per_request, &ctx.sourcetype);
+        let mut req = ctx.client.post(ctx.url.as_ref()).body(body);
         if !ctx.token.is_empty() {
             req = req.header("Authorization", format!("Splunk {}", ctx.token));
         }
         match req.send().await {
             Ok(resp) if is_accepted(resp.status()) => {
-                ctx.sent.fetch_add(1, Ordering::Relaxed);
+                ctx.sent
+                    .fetch_add(ctx.events_per_request as u64, Ordering::Relaxed);
             }
             Ok(resp) => {
                 let status = resp.status();
@@ -247,6 +261,20 @@ fn build_event_json(n: u64, sourcetype: &str) -> Value {
             "src_ip": format!("10.0.{}.{}", (n / 256) % 256, n % 256),
         }
     })
+}
+
+/// Build a batch of `count` HEC event envelopes starting at sequence
+/// `start`, newline-joined. `/services/collector/event` splits the body on
+/// `\n`, so this is what a multi-event request body looks like on the wire.
+fn build_batch_body(start: u64, count: usize, sourcetype: &str) -> String {
+    let mut body = String::with_capacity(count * 160);
+    for i in 0..count as u64 {
+        if i > 0 {
+            body.push('\n');
+        }
+        body.push_str(&build_event_json(start + i, sourcetype).to_string());
+    }
+    body
 }
 
 #[cfg(test)]
@@ -363,5 +391,32 @@ mod tests {
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A batch body must be exactly `count` newline-separated JSON objects, with
+    /// no trailing blank line beyond what the handler tolerates, and every record
+    /// distinct.
+    #[test]
+    fn batch_body_has_one_json_object_per_line() {
+        let body = build_batch_body(100, 4, "loadgen");
+        let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 4);
+        let mut seqs = Vec::new();
+        for line in lines {
+            let v: serde_json::Value = serde_json::from_str(line).expect("each line is valid JSON");
+            seqs.push(v["event"]["seq"].as_u64().unwrap());
+        }
+        assert_eq!(seqs, vec![100, 101, 102, 103]);
+    }
+
+    /// Decisive test: the batch must come back out of logthing's own parser as
+    /// `count` records, not one. A body the server silently parses as a single
+    /// record would inflate the achieved rate by the batch factor.
+    #[test]
+    fn batch_body_parses_as_count_records_by_logthings_own_parser() {
+        let body = build_batch_body(0, 8, "loadgen");
+        let records = logthing::ingest::parse_hec_event_body(body.as_bytes(), "loadgen")
+            .expect("batch body must parse");
+        assert_eq!(records.len(), 8);
     }
 }
