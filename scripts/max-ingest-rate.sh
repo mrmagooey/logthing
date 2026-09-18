@@ -99,7 +99,14 @@ write_config() {
         echo '[ipfix]'; echo 'enabled = true'
         echo "udp_port = 4739"; echo 'bind_address = "0.0.0.0"'
         if [ "$SHAPE" = "real" ]; then
+            # flush_interval_secs defaults to 900s and flush_threshold_bytes
+            # to 100 MiB; a short run reaches neither, so the writer buffers
+            # everything and flushes nothing durably -- parquet_s3_records_written
+            # would be absent from /metrics entirely (not zero: the counter
+            # doesn't exist until the first flush). Force a flush well inside
+            # DURATION so the real shape exercises the actual write path.
             echo '[ipfix.local]'; echo "directory = \"$LOCAL_DIR\""
+            echo 'flush_interval_secs = 5'
         fi
     } > "$REPO/logthing.toml"
 }
@@ -137,7 +144,7 @@ echo "# RcvbufErrors is host-wide and NOT reset by restart -- diffed before/afte
 if [ "$SHAPE" = "trivial" ]; then
     echo -e "run\tshape\toffered\treceived\tsocket_drops\trcvbuf_errors_delta\tloss_pct"
 else
-    echo -e "run\tshape\toffered\treceived\tsocket_drops\trcvbuf_errors_delta\tparquet_s3_dropped_ipfix\tloss_pct"
+    echo -e "run\tshape\toffered\treceived\tsocket_drops\trcvbuf_errors_delta\tparquet_s3_dropped_ipfix\tparquet_s3_written_ipfix\tloss_pct"
 fi
 
 LOSS_LIST=""
@@ -179,6 +186,8 @@ for i in $(seq 1 "$RUNS"); do
     if [ "$SHAPE" = "real" ]; then
         PARQUET_DROPPED="$(metric_labeled parquet_s3_dropped 'source="ipfix"')"
         PARQUET_DROPPED="${PARQUET_DROPPED:-0}"
+        PARQUET_WRITTEN="$(metric_labeled parquet_s3_records_written 'source="ipfix"')"
+        PARQUET_WRITTEN="${PARQUET_WRITTEN:-0}"
     fi
 
     stop_server
@@ -191,12 +200,27 @@ for i in $(seq 1 "$RUNS"); do
         exit 1
     fi
 
+    # Liveness assertion: a real-shape sink that never durably wrote
+    # anything (0, or absent from /metrics entirely and defaulted to 0
+    # above) did not exercise the write path this run is supposed to
+    # measure -- e.g. flush_interval_secs/flush_threshold_bytes never
+    # tripped inside DURATION. That is not "zero loss"; it means the run's
+    # numbers are meaningless and must not be reported. Treated exactly as
+    # seriously as the RcvbufErrors reconciliation check above.
+    if [ "$SHAPE" = "real" ]; then
+        PARQUET_WRITTEN_INT="${PARQUET_WRITTEN%.*}"
+        if [ "$PARQUET_WRITTEN_INT" -eq 0 ]; then
+            echo "FATAL: run $i: parquet_s3_records_written{source=\"ipfix\"} was 0 (or absent) -- the sink produced no durable writes this run. This run is invalid, not lossless; check flush_interval_secs/flush_threshold_bytes against DURATION."
+            exit 1
+        fi
+    fi
+
     LOSS_PCT="$(awk -v d="$SOCKET_DROPS_INT" -v o="$OFFERED" 'BEGIN{ if (o==0) print "nan"; else printf "%.4f", (d/o)*100 }')"
 
     if [ "$SHAPE" = "trivial" ]; then
         echo -e "$i\t$SHAPE\t$OFFERED\t$RECEIVED\t$SOCKET_DROPS_INT\t$SNMP_DELTA\t$LOSS_PCT"
     else
-        echo -e "$i\t$SHAPE\t$OFFERED\t$RECEIVED\t$SOCKET_DROPS_INT\t$SNMP_DELTA\t$PARQUET_DROPPED\t$LOSS_PCT"
+        echo -e "$i\t$SHAPE\t$OFFERED\t$RECEIVED\t$SOCKET_DROPS_INT\t$SNMP_DELTA\t$PARQUET_DROPPED\t$PARQUET_WRITTEN\t$LOSS_PCT"
         PARQUET_LIST="$PARQUET_LIST"$'\n'"$PARQUET_DROPPED"
     fi
 
