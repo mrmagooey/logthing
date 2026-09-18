@@ -56,7 +56,7 @@ if [ "$BLACKHOLE" = "1" ]; then
         echo "(scripts/max-ingest-rate.sh SHAPE=trivial) and label the number as such."
         exit 1
     fi
-    if ss -lun 2>/dev/null | awk '{print $5}' | grep -q ":$BLACKHOLE_PORT\$"; then
+    if ss -lun 2>/dev/null | awk '{print $4}' | grep -q ":$BLACKHOLE_PORT\$"; then
         echo "FATAL: something is bound to UDP $BLACKHOLE_PORT; it must be unbound to act as a blackhole."
         exit 1
     fi
