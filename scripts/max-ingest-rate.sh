@@ -10,6 +10,28 @@ median_of() { sort -n | awk '{a[NR]=$1} END {n=NR; if(n==0){print "nan"; exit} i
 min_of() { sort -n | head -1; }
 max_of() { sort -n | tail -1; }
 
+# Fraction of target the generator must actually achieve for the run's loss
+# figure to mean anything. docs/performance/2026-09-13-multiformat-load-results.md
+# §2 read zeek achieving 15,283/s against a 20,000/s target as a generator
+# ceiling; on TCP that signature is equally consistent with server
+# backpressure. This harness refuses to call either one a ceiling.
+ACHIEVED_FLOOR_PCT="${ACHIEVED_FLOOR_PCT:-99}"
+
+classify_run() {
+    local achieved="$1" target="$2" loss="$3" budget="$4"
+    if [ "$target" != "0" ]; then
+        local ok
+        ok="$(awk -v a="$achieved" -v t="$target" -v f="$ACHIEVED_FLOOR_PCT" \
+              'BEGIN { print (a >= t * f / 100) ? 1 : 0 }')"
+        if [ "$ok" != "1" ]; then echo "GENERATOR-LIMITED"; return 0; fi
+    fi
+    if [ "$(awk -v l="$loss" -v b="$budget" 'BEGIN { print (l <= b) ? 1 : 0 }')" = "1" ]; then
+        echo "PASS"
+    else
+        echo "FAIL-LOSS"
+    fi
+}
+
 # Sink `source` labels below are the sinks' own source() values
 # (src/forwarding/*_s3.rs). Note `generic` and `hec` share BOTH the received
 # counter (src/ingest/handlers.rs:219) and the sink label
@@ -80,6 +102,16 @@ RECONCILE_TOLERANCE=2
 # rather than DURATION. Single source of truth for both write_config and the
 # guard right below, so the two can never drift apart.
 FLUSH_INTERVAL_SECS=5
+# Disjoint cpusets so generator and server never contend for the same cores
+# -- a shared core would make either side's CPU figure (and thus the
+# generator-saturation verdict) reflect contention instead of the thing it
+# claims to measure. 12 vCPU host: generator 0-3, server 4-11.
+GEN_CPUS="${GEN_CPUS:-0-3}"
+SRV_CPUS="${SRV_CPUS:-4-11}"
+# See design doc §6.3: passing requires median total loss <= LOSS_BUDGET
+# (percent) AND the generator achieving >= ACHIEVED_FLOOR_PCT of target in
+# every run; classify_run checks the latter first (see its own comment).
+LOSS_BUDGET="${LOSS_BUDGET:-0.1}"
 
 resolve_format || exit 1
 
@@ -109,6 +141,21 @@ snmp_rcvbuf_errors() {
 }
 parse_sent()     { printf '%s\n' "$1" | sed -n 's/.*sent \([0-9]\{1,\}\) \(flows\|datagrams\|records\) in .*/\1/p' | tail -1; }
 parse_achieved() { printf '%s\n' "$1" | sed -n 's/.*achieved rate: \([0-9.]\{1,\}\).*/\1/p' | tail -1; }
+
+# utime+stime in clock ticks from /proc/<pid>/stat (fields 14 and 15). Read
+# before and after the load burst and diff; divide by `getconf CLK_TCK` and
+# the wall-clock duration to get cores-used. A generator at ~4.0 cores on a
+# 4-core cpuset IS the ceiling, and the run must be read as generator-limited
+# regardless of what classify_run says about the rate.
+cpu_ticks() {
+    awk '{print $14 + $15}' "/proc/$1/stat" 2>/dev/null || echo 0
+}
+CLK_TCK="$(getconf CLK_TCK)"
+cores_used() {
+    local tick_delta="$1" wall_secs="$2"
+    awk -v d="$tick_delta" -v s="$wall_secs" -v hz="$CLK_TCK" \
+        'BEGIN { if (s <= 0) { print "0.00" } else { printf "%.2f", (d / hz) / s } }'
+}
 
 # DEFECT FIX 1 (vs repeat-ipfix-loopback-loss.sh): that script killed
 # leftover servers at startup and in its EXIT trap by matching the whole
@@ -219,7 +266,7 @@ write_config() {
 
 start_server() {
     local run_id="$1"
-    "$BIN" > "$TMP_ROOT/server-$run_id.log" 2>&1 &
+    taskset -c "$SRV_CPUS" "$BIN" > "$TMP_ROOT/server-$run_id.log" 2>&1 &
     SRV_PID=$!
     echo "$SRV_PID" > "$PIDFILE"
     local up=0
@@ -242,6 +289,13 @@ stop_server() {
     SRV_PID=""
 }
 
+# Reports GEN_CORES back to the caller through a file under $TMP_ROOT, not
+# a global -- the caller invokes this via `$(run_generator ...)` to capture
+# loadgen's stdout, which forks a subshell; a plain variable assignment in
+# here would be lost when that subshell exits. Backgrounded so its own CPU
+# ticks can be polled while it runs; /proc/<pid>/stat is gone by the time a
+# foregrounded `wait` returns, which is too late to read a meaningful
+# "after" sample.
 run_generator() {
     local rate="$1" secs="$2"
     local extra=""
@@ -249,9 +303,24 @@ run_generator() {
         hec|generic) extra="--events-per-request ${EVENTS_PER_REQUEST:-1} --concurrency ${CONCURRENCY:-64}" ;;
         syslog)      [ "${STRUCTURED:-0}" = "1" ] && extra="--structured" ;;
     esac
+    local out_file
+    out_file="$(mktemp)"
     # shellcheck disable=SC2086
-    "$LOADGEN" "$SUB" --host 127.0.0.1 --port "$PORT" \
-        --target-rate "$rate" --duration-secs "$secs" $extra 2>&1
+    taskset -c "$GEN_CPUS" "$LOADGEN" "$SUB" --host 127.0.0.1 --port "$PORT" \
+        --target-rate "$rate" --duration-secs "$secs" $extra > "$out_file" 2>&1 &
+    local gen_pid=$! gen_before gen_after
+    gen_before="$(cpu_ticks "$gen_pid")"
+    gen_after="$gen_before"
+    while kill -0 "$gen_pid" 2>/dev/null; do
+        gen_after="$(cpu_ticks "$gen_pid")"
+        sleep 0.5
+    done
+    wait "$gen_pid"
+    local gen_rc=$?
+    cores_used "$((gen_after - gen_before))" "$secs" > "$TMP_ROOT/gen_cores.txt"
+    cat "$out_file"
+    rm -f "$out_file"
+    return "$gen_rc"
 }
 
 # Prints: received  kernel_drops  writer_drops  buffer_drops  written
@@ -265,6 +334,27 @@ scrape_losses() {
     printf '%s\t%s\t%s\t%s\t%s\n' "$recv" "$kd" "$wd" "$bd" "$wr"
 }
 
+# Polls parquet_s3_records_written until it stops climbing, so in-flight rows
+# have actually landed (or been dropped) before scrape_losses reads the drop
+# counters -- NOT so offered-minus-written can be treated as loss (it isn't:
+# total loss is the sum of the three drop-site counters over offered,
+# independent of parquet_s3_records_written; the written counter is used here
+# purely as a settle signal because it is the counter that moves last).
+DRAIN_MAX_SECS="${DRAIN_MAX_SECS:-30}"
+drain_until_stable() {
+    local metric_name="$1" label="$2"
+    local prev="" cur elapsed=0
+    while [ "$elapsed" -lt "$DRAIN_MAX_SECS" ]; do
+        sleep 2; elapsed=$((elapsed + 2))
+        cur="$(metric_labeled "$metric_name" "source=\"$label\"")"
+        cur="${cur:-0}"
+        if [ "$cur" = "$prev" ]; then echo "$cur"; return 0; fi
+        prev="$cur"
+    done
+    echo "WARN: $metric_name still climbing after ${DRAIN_MAX_SECS}s; this run's written count is a lower bound" >&2
+    echo "$prev"
+}
+
 write_config
 
 echo "# format=$FORMAT shape=$SHAPE rate=$RATE duration=${DURATION}s runs=$RUNS transport=$TRANSPORT port=$PORT"
@@ -273,7 +363,7 @@ echo "# server restarted between every run; $RECV_METRIC/$DROP_METRIC_DISPLAY/pa
 if [ -n "$DROP_METRIC" ]; then
     echo "# RcvbufErrors is host-wide and NOT reset by restart -- diffed before/after around each run's load."
 fi
-echo -e "run\tformat\tshape\toffered\tachieved\treceived\tkernel_drops\twriter_drops\tbuffer_drops\twritten\tloss_pct"
+echo -e "run\tformat\tshape\toffered\tachieved\treceived\tkernel_drops\twriter_drops\tbuffer_drops\twritten\tloss_pct\tgen_cores\tsrv_cores\tverdict"
 
 LOSS_LIST=""
 DROPS_LIST=""
@@ -284,8 +374,12 @@ for i in $(seq 1 "$RUNS"); do
 
     SNMP_BEFORE="$(snmp_rcvbuf_errors)"
 
+    SRV_BEFORE="$(cpu_ticks "$SRV_PID")"
     LOADGEN_OUT="$(run_generator "$RATE" "$DURATION")"
     LOADGEN_RC=$?
+    SRV_AFTER="$(cpu_ticks "$SRV_PID")"
+    SRV_CORES="$(cores_used "$((SRV_AFTER - SRV_BEFORE))" "$DURATION")"
+    GEN_CORES="$(cat "$TMP_ROOT/gen_cores.txt" 2>/dev/null || echo n/a)"
     if [ "$LOADGEN_RC" -ne 0 ]; then
         echo "FATAL: loadgen exited $LOADGEN_RC on run $i:"
         echo "$LOADGEN_OUT"
@@ -301,9 +395,15 @@ for i in $(seq 1 "$RUNS"); do
     ACHIEVED="$(parse_achieved "$LOADGEN_OUT")"
     ACHIEVED="${ACHIEVED:-n/a}"
 
-    # Let the last 1s /proc/net/udp poll tick land, and any in-flight
-    # decode+dispatch drain, before scraping final counters.
-    sleep 2
+    if [ "$SHAPE" = "real" ]; then
+        # Poll the writer's own counter to stability so the drop counters
+        # scraped below reflect settled state, not rows still in flight.
+        drain_until_stable parquet_s3_records_written "$SOURCE_LABEL" >/dev/null
+    else
+        # trivial shape has no writer; just let the last 1s /proc/net/udp
+        # poll tick land.
+        sleep 2
+    fi
 
     SCRAPE="$(scrape_losses)"
     RECEIVED="$(printf '%s' "$SCRAPE" | cut -f1)"
@@ -350,7 +450,20 @@ for i in $(seq 1 "$RUNS"); do
         LOSS_PCT="n/a"
     fi
 
-    echo -e "$i\t$FORMAT\t$SHAPE\t$OFFERED\t$ACHIEVED\t$RECEIVED\t$KERNEL_DROPS\t$WRITER_DROPS\t$BUFFER_DROPS\t$WRITTEN\t$LOSS_PCT"
+    # Total loss for the verdict: kernel socket drops (0 contribution where
+    # not applicable -- TCP/HTTP genuinely cannot lose datagrams in a socket
+    # buffer, so 0 is correct here, not a stand-in for "unmeasured") plus the
+    # two writer-side drop sites, over offered. Independent of
+    # parquet_s3_records_written -- see drain_until_stable's comment.
+    KERNEL_FOR_TOTAL=0
+    [ -n "$DROP_METRIC" ] && KERNEL_FOR_TOTAL="$KERNEL_DROPS_INT"
+    WRITER_DROPS_INT="${WRITER_DROPS%.*}"
+    BUFFER_DROPS_INT="${BUFFER_DROPS%.*}"
+    TOTAL_DROPS=$((KERNEL_FOR_TOTAL + WRITER_DROPS_INT + BUFFER_DROPS_INT))
+    TOTAL_LOSS_PCT="$(awk -v d="$TOTAL_DROPS" -v o="$OFFERED" 'BEGIN{ if (o==0) print 0; else printf "%.4f", (d/o)*100 }')"
+    VERDICT="$(classify_run "$ACHIEVED" "$RATE" "$TOTAL_LOSS_PCT" "$LOSS_BUDGET")"
+
+    echo -e "$i\t$FORMAT\t$SHAPE\t$OFFERED\t$ACHIEVED\t$RECEIVED\t$KERNEL_DROPS\t$WRITER_DROPS\t$BUFFER_DROPS\t$WRITTEN\t$LOSS_PCT\t$GEN_CORES\t$SRV_CORES\t$VERDICT"
 
     if [ -n "$DROP_METRIC" ]; then
         LOSS_LIST="$LOSS_LIST"$'\n'"$LOSS_PCT"
@@ -365,9 +478,9 @@ if [ -n "$DROP_METRIC" ]; then
     MIN="$(printf '%s\n' "$LOSS_LIST" | grep -v '^$' | min_of)"
     MAX="$(printf '%s\n' "$LOSS_LIST" | grep -v '^$' | max_of)"
 
-    echo -e "median\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t$MEDIAN"
-    echo -e "min\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t$MIN"
-    echo -e "max\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t$MAX"
+    echo -e "median\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t$MEDIAN\t-\t-\t-"
+    echo -e "min\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t$MIN\t-\t-\t-"
+    echo -e "max\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t$MAX\t-\t-\t-"
 
     ALL_ZERO=1
     for d in $(printf '%s\n' "$DROPS_LIST" | grep -v '^$'); do
@@ -419,6 +532,16 @@ if [ "${SELFTEST:-0}" = "1" ]; then
     check "resolve syslog struct" "$(FORMAT=syslog STRUCTURED=1 resolve_format && echo "$SOURCE_LABEL")" "structured_syslog"
     check "resolve syslog plain"  "$(FORMAT=syslog STRUCTURED=0 resolve_format && echo "$SOURCE_LABEL")" "syslog"
     check "resolve unknown rc"    "$(FORMAT=nope resolve_format >/dev/null 2>&1; echo $?)"    "1"
+    # target 20000, 99% floor = 19800
+    check "classify pass"        "$(classify_run 19999 20000 0.05 0.1)" "PASS"
+    check "classify at floor"    "$(classify_run 19800 20000 0.05 0.1)" "PASS"
+    check "classify loss fail"   "$(classify_run 19999 20000 0.50 0.1)" "FAIL-LOSS"
+    check "classify gen limited" "$(classify_run 15283 20000 0.00 0.1)" "GENERATOR-LIMITED"
+    # Generator saturation is checked FIRST: a run the generator could not
+    # sustain says nothing about loss, in either direction.
+    check "gen limit beats loss" "$(classify_run 15283 20000 9.90 0.1)" "GENERATOR-LIMITED"
+    check "classify exact budget" "$(classify_run 20000 20000 0.10 0.1)" "PASS"
+    check "unbounded target"     "$(classify_run 12796 0 0.00 0.1)"     "PASS"
     [ "$fail" -eq 0 ] && echo "SELFTEST PASS" || echo "SELFTEST FAIL"
     exit "$fail"
 fi
