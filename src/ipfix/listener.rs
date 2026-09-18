@@ -20,6 +20,15 @@ pub struct IpfixListenerConfig {
     /// (the default) uses a single plain socket and is byte-for-byte today's
     /// behaviour. Above 1, the kernel fans datagrams across the group; all
     /// tasks share one template cache, so any task can decode any exporter.
+    ///
+    /// The kernel picks a socket by hashing each datagram's source/
+    /// destination address-port 4-tuple, so a given source port always
+    /// lands on the same socket. Throughput therefore scales with the
+    /// number of *distinct senders* (or, for one sender, distinct source
+    /// ports), not with this value: raising it for a deployment with a
+    /// single exporter sending from one fixed source port yields zero
+    /// benefit, because every datagram still hashes to the same socket.
+    /// `0` is treated the same as `1` (single-socket path), not as "disabled".
     pub recv_tasks: usize,
 }
 
@@ -701,25 +710,50 @@ mod tests {
         (task, bound, shutdown_tx, handler)
     }
 
-    /// The decisive test for this plan. Templates arrive from one source port
-    /// and data from a DIFFERENT one, so under SO_REUSEPORT they hash to
-    /// different sockets and are received by different tasks. With a shared
-    /// template cache every data set still decodes. With the prototype's
-    /// per-task decoders this test fails — which is exactly the silent
-    /// data-loss path it exists to close.
+    /// Sends the template from one source port and data from EIGHT distinct
+    /// other source ports, against a 4-member `SO_REUSEPORT` group.
+    ///
+    /// This is a probabilistic regression check, not a structural guarantee:
+    /// which socket a datagram lands on is decided by the kernel's hash of
+    /// the packet's 4-tuple, which userspace cannot observe or control. A
+    /// single data source port could, by chance, hash to the same socket as
+    /// the template and the cross-cache path would go unexercised for that
+    /// one send — that's why the old version of this test (one data source
+    /// port, "decisive" in name) could pass even under a per-task-decoder
+    /// design that never actually shares the cache: a 1-in-4 chance of a
+    /// false pass. With eight independent source ports the chance every one
+    /// of them collides onto the template's socket is roughly (1/4)^8 ≈
+    /// 1.5e-5 — a false pass is not impossible, just negligible. If this
+    /// starts flaking, that is why.
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
     #[tokio::test]
-    async fn data_decodes_when_template_and_data_arrive_on_different_sockets() {
+    async fn data_decodes_when_sent_from_eight_source_ports_other_than_the_templates() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // Current-thread `#[tokio::test]` runtime: every task this test
+        // spawns (the listener's own recv tasks included) runs on this same
+        // OS thread, so the thread-local recorder sees them all.
+        let _guard = set_default_local_recorder(&recorder);
+
         let (listener, bound, shutdown_tx, handler) = start_test_listener(4).await;
 
-        // Separate client sockets => different source ports => different
-        // SO_REUSEPORT group members.
         let template_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let data_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        assert_ne!(
-            template_sock.local_addr().unwrap().port(),
-            data_sock.local_addr().unwrap().port(),
-            "the two client sockets must differ, or this test proves nothing"
-        );
+        let mut data_socks = Vec::new();
+        for _ in 0..8 {
+            data_socks.push(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        }
+        let template_port = template_sock.local_addr().unwrap().port();
+        for sock in &data_socks {
+            assert_ne!(
+                sock.local_addr().unwrap().port(),
+                template_port,
+                "each data source port must differ from the template's, or this test proves nothing"
+            );
+        }
 
         template_sock
             .send_to(&template_datagram(1), bound)
@@ -727,7 +761,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         for n in 0..50u64 {
-            data_sock
+            data_socks[(n % 8) as usize]
                 .send_to(&data_datagram(n as u32 + 2, n), bound)
                 .await
                 .unwrap();
@@ -741,6 +775,22 @@ mod tests {
             handler.flow_count(),
             50,
             "every data record must decode even though its template arrived on another socket"
+        );
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let templates_missing = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("ipfix_templates_missing"),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            templates_missing, 0,
+            "no data set should ever be dropped for a missing template"
         );
     }
 

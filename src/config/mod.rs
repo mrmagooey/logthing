@@ -262,6 +262,15 @@ pub struct IpfixConfig {
     /// Number of UDP receive tasks (default: 1). Raise to spread socket
     /// draining across cores when the kernel is dropping datagrams while CPU
     /// sits idle. See docs/performance/2026-09-18-udp-recv-fanout-results.md.
+    ///
+    /// The kernel distributes datagrams across the group by hashing each
+    /// packet's source/destination address-port 4-tuple, so throughput
+    /// scales with the number of distinct senders (or, for one sender,
+    /// distinct source ports) — not with the value of this knob. A
+    /// deployment with a single exporter sending from one fixed source port
+    /// will see no benefit from raising it, because every datagram still
+    /// hashes to the same socket. `0` is treated the same as `1`, not as
+    /// "disabled".
     #[serde(default = "default_ipfix_recv_tasks")]
     pub recv_tasks: usize,
 
