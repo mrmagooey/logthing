@@ -160,24 +160,51 @@ aggregate does not scale with process count. If it scales, the answer is
 | sflow | 75,814.5/s | 254,048.5/s (3.35x) | yes | no prior figure — not measured in any committed doc | no — run N processes |
 | zeek | 164,698.4/s | 743,792.7/s (4.52x) | yes | 15,283/s against a 20,000/s target (`2026-09-13-multiformat-load-results.md` §2) | no — run N processes (1-proc ceiling is ~10.8x the prior real-sink figure and it scales super-linearly) |
 | suricata | 107,626.3/s | 468,785.9/s (4.36x) | yes | no prior figure — not measured in any committed doc | no — run N processes |
-| hec | 21,845.0/s | 24,958.0/s (1.14x) | no — flat, per-process rate collapses as procs increase | no prior figure — not measured in any committed doc | no — see note below |
-| generic | 22,297.4/s | 25,487.1/s (1.14x) | no — flat, per-process rate collapses as procs increase | no prior figure — not measured in any committed doc | no — see note below |
+| hec | 21,845.0/s | 24,958.0/s (1.14x) | no — flat, per-process rate collapses as procs increase | no prior figure — not measured in any committed doc | yes — Task 4 (`--events-per-request`): the measured ceiling is in requests/s, not records/s; batching is what converts it to a records/s figure |
+| generic | 22,297.4/s | 25,487.1/s (1.14x) | no — flat, per-process rate collapses as procs increase | no prior figure — not measured in any committed doc | yes — Task 4 (`--events-per-request`): same reasoning as hec |
 
-**Note on hec/generic:** these are the only two formats where the aggregate
-does not scale with process count — a textbook downstream-bottleneck
-signature (flat aggregate, per-process rate falling in inverse proportion to
-process count). That satisfies the gate's second condition. The first
-condition (1-proc ceiling within ~20% of a previously demonstrated
-real-sink rate) cannot be checked: no committed doc has ever measured HEC or
-generic-HTTP against a real sink, so there is nothing to compare against —
-this is stated plainly rather than invented. However, the practical
-conclusion is unaffected by that missing data point: the flat-aggregate
-result was produced under the *trivial* server shape (no persistence sink,
-`Default*Handler` only), so the bottleneck is already downstream of the
-generator at a single process, before any writer/sink work even enters the
-picture. A faster generator could not raise this ceiling — more output has
-nowhere to go. **Needs generator work? No**, on the strength of the scaling
-evidence alone, independent of the missing real-sink comparator.
+**Note on hec/generic (revised — see fix round 1):** these are the only two
+formats where the aggregate does not scale with process count — a textbook
+downstream-bottleneck signature (flat aggregate, per-process rate falling in
+inverse proportion to process count). That satisfies the gate's second
+condition literally. But the gate's "scales with process count?" question
+implicitly assumes the generator is already sending records at whatever rate
+the wire protocol allows, and for these two formats that assumption does not
+hold: `hec-http` and `generic-http` each send **one HTTP request per single
+event**. A flat ceiling of ~21-25k/s is therefore a ceiling in *requests* per
+second, and requests/s is not the quantity this plan exists to measure —
+records/s is. `parse_hec_event_body` and `parse_ndjson_body`
+(`src/ingest/parse.rs`) already split each request body on newlines, i.e.
+the wire protocol accepts many records per request; the generator simply
+never exercises that. Separately, this repo's committed criterion benches
+put the generic/hec per-record parse+handle cost at roughly 2.6
+microseconds — around 385k records/s single-threaded, about 17x above what
+was measured here — which is consistent with the ~22k/s figure being a
+per-transaction (accept/parse-HTTP-headers/respond) cost rather than a
+per-record cost.
+
+**The original version of this note claimed the bottleneck was already
+downstream of the generator and that a faster generator could not move the
+number. That sentence has been struck: nothing in this run tested it.**
+There are two live, competing hypotheses this run cannot distinguish:
+
+1. **Per-transaction HTTP overhead dominates.** The ~22k/s ceiling is a
+   request-handling cost (accept, parse headers, single-event JSON parse,
+   respond), and batching multiple events into each request would raise the
+   records/s ceiling substantially — plausibly toward the same 107k-743k/s
+   range the five persistent-socket formats reach.
+2. **The server is genuinely saturated for this ingest path regardless of
+   batching** (e.g. some other per-request cost, like TLS/keep-alive
+   handling or a shared lock, that survives batching).
+
+The only way to tell these apart is to run the generator with several events
+per request and see whether the aggregate records/s rises. That is exactly
+Task 4's `--events-per-request` work. **Needs generator work? Yes** for both
+rows, on that basis — not on the struck causal claim. If batching does
+*not* move the record rate once measured, that outcome is itself the
+finding (HTTP ingest is request-bound end to end, not generator-bound), so
+Task 4 is worth running either way: it either unlocks a materially higher
+ceiling or converts an assumption into a confirmed result.
 
 ## What this run overturns / confirms
 
@@ -200,8 +227,13 @@ path, the docker-compose environment, or the older harness/loadgen
 implementation available at that commit — this run does not distinguish
 between those) is downstream of the generator, not the generator itself.
 This also means Task 2's own finding is consistent for every other
-peer-requiring format measured today: all five TCP/UDP formats that show
+socket-based format measured today: all five TCP/UDP formats that show
 clean scaling (syslog, ipfix, sflow, zeek, suricata) have generator ceilings
 far above any rate this codebase has ever sustained against a real sink —
 none of them are generator-bound, and no generator-optimisation task is
-justified by this data for any of the seven formats measured.
+justified by this data for those five. `hec` and `generic` are the
+exception (see the revised gate-table note above): their flat ceiling is a
+requests/s ceiling from one-event-per-request HTTP, not a demonstrated
+records/s limit, so Task 4's batching work is gated *on* for those two,
+pending the run that would actually distinguish per-transaction overhead
+from genuine server saturation.
