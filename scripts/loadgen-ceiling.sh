@@ -28,12 +28,14 @@ LOADGEN="$REPO/target/release/loadgen"
 FORMAT="${FORMAT:-ipfix}"
 PROCS="${PROCS:-1 2 4}"
 DURATION="${DURATION:-10}"
-# BLACKHOLE=1 targets a port nothing is bound to. The kernel discards at the
-# socket layer, so the send syscall costs exactly what it normally costs and
-# no receiver can be the bottleneck -- a pure generator ceiling. UDP only: a
-# TCP or HTTP generator needs a peer to connect to.
+# BLACKHOLE=1 targets a bound-but-never-drained UDP socket. A bound port
+# generates no ICMP port-unreachable (which loadgen's connect()ed socket would
+# surface as ECONNREFUSED and abort on), and because nothing ever calls recv,
+# no userspace receiver can become the bottleneck. The kernel fills the socket
+# buffer and then drops silently. UDP only; TCP or HTTP generators need a peer.
 BLACKHOLE="${BLACKHOLE:-0}"
 BLACKHOLE_PORT="${BLACKHOLE_PORT:-39999}"
+BLACKHOLE_TTL="${BLACKHOLE_TTL:-3600}"
 GEN_CPUS="${GEN_CPUS:-0-3}"
 
 case "$FORMAT" in
@@ -64,7 +66,24 @@ fi
 [ -x "$LOADGEN" ] || { echo "FATAL: $LOADGEN not found. cargo build --release -p loadgen"; exit 1; }
 
 TMP="$(mktemp -d)" || exit 1
-trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP"; [ -n "${BLACKHOLE_PID:-}" ] && kill "$BLACKHOLE_PID" 2>/dev/null' EXIT
+
+if [ "$BLACKHOLE" = "1" ]; then
+    # A bound-but-never-drained UDP socket is the blackhole: a bound port
+    # generates no ICMP port-unreachable (which loadgen's connect()ed socket
+    # would surface as ECONNREFUSED and abort on), and because nothing ever
+    # calls recv, no userspace receiver can become the bottleneck. The kernel
+    # fills the socket buffer and then drops silently.
+    python3 -c "
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(('127.0.0.1', $BLACKHOLE_PORT))
+time.sleep($BLACKHOLE_TTL)
+" &
+    BLACKHOLE_PID=$!
+    sleep 0.5
+    kill -0 "$BLACKHOLE_PID" 2>/dev/null || { echo "FATAL: blackhole listener failed to start on UDP $BLACKHOLE_PORT"; exit 1; }
+fi
 
 echo "# format=$FORMAT sub=$SUB port=$PORT transport=$TRANSPORT blackhole=$BLACKHOLE duration=${DURATION}s gen_cpus=$GEN_CPUS"
 printf 'procs\tper_proc_rates\taggregate_rate\ttotal_sent\n'
