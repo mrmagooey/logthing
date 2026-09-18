@@ -120,7 +120,7 @@ resolve_format() {
     case "${FORMAT:-}" in
         syslog)
             SUB="syslog-udp"; PORT=514; TRANSPORT=udp
-            RECV_METRIC="syslog_messages_received"; DROP_METRIC="syslog_socket_drops"
+            RECV_METRIC="syslog_messages_received"; DROP_METRIC="syslog_udp_socket_drops"
             CONFIG_SECTION="syslog"
             if [ "$STRUCTURED" = "1" ]; then SOURCE_LABEL="structured_syslog"; else SOURCE_LABEL="syslog"; fi
             ;;
