@@ -10,6 +10,21 @@ median_of() { sort -n | awk '{a[NR]=$1} END {n=NR; if(n==0){print "nan"; exit} i
 min_of() { sort -n | head -1; }
 max_of() { sort -n | tail -1; }
 
+# Sums the drops field (last column) across every /proc/net/udp row (read
+# from stdin) whose local_address (2nd column) equals $1 -- rather than
+# taking just the first match -- so a port shared by more than one socket
+# (SO_REUSEPORT) reports the total, not one socket's share of it. Defined
+# up here, outside the SELFTEST gate below, purely as text-processing over
+# stdin so SELFTEST can drive it against fixture text instead of the live
+# table; socket_rcvbuf_drops (which knows about $PORT and the real
+# /proc/net/udp path) wraps this for actual use. Always prints a number
+# (0 when nothing matches), never empty, so callers can do arithmetic on
+# the result unconditionally.
+sum_proc_net_udp_drops() {
+    local needle="$1"
+    awk -v needle="$needle" 'NR>1 && $2==needle {sum+=$NF} END {print sum+0}'
+}
+
 # Fraction of target the generator must actually achieve for the run's loss
 # figure to mean anything. docs/performance/2026-09-13-multiformat-load-results.md
 # §2 read zeek achieving 15,283/s against a 20,000/s target as a generator
@@ -225,10 +240,16 @@ metric_labeled() {
 # parse_proc_net_udp in src/net.rs does: two sockets can share a port bound
 # to different addresses. Bind address is always 0.0.0.0 (write_config
 # above), so only /proc/net/udp is relevant -- this harness never binds v6.
+#
+# Sums across every socket on that port (sum_proc_net_udp_drops, defined
+# near the top of the file so SELFTEST can exercise it against fixture text
+# without needing a live /proc/net/udp) rather than taking just the first --
+# SO_REUSEPORT puts more than one socket on the same local_address:port, and
+# stopping at the first would silently discard every other socket's drops.
 socket_rcvbuf_drops() {
     local port_hex
     port_hex="$(printf '%04X' "$PORT")"
-    awk -v needle="00000000:$port_hex" 'NR>1 && $2==needle {print $NF; exit}' /proc/net/udp
+    sum_proc_net_udp_drops "00000000:$port_hex" < /proc/net/udp
 }
 parse_sent()     { printf '%s\n' "$1" | sed -n 's/.*sent \([0-9]\{1,\}\) \(flows\|datagrams\|records\) in .*/\1/p' | tail -1; }
 parse_achieved() { printf '%s\n' "$1" | sed -n 's/.*achieved rate: \([0-9.]\{1,\}\).*/\1/p' | tail -1; }
@@ -770,6 +791,20 @@ if [ "${SELFTEST:-0}" = "1" ]; then
     check "min"          "$(printf '%s\n' 3 1 2     | min_of)"    "1"
     check "max"          "$(printf '%s\n' 3 1 2     | max_of)"    "3"
     check "median decimals" "$(printf '%s\n' 0.0413 0.0000 0.0000 0.0000 0.0000 | median_of)" "0.0000"
+    # sum_proc_net_udp_drops: fixture mirrors /proc/net/udp's header line
+    # plus rows, matched on local_address like the real table. Two sockets
+    # sharing 0.0.0.0:0044 (SO_REUSEPORT) must sum, not report just the
+    # first -- this is the check that would fail if `exit` ever crept back
+    # into the awk.
+    check "udp drops sums two reuseport sockets" \
+        "$(printf '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n 1: 00000000:0044 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 1 2 0 5\n 2: 00000000:0044 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 2 2 0 7\n' | sum_proc_net_udp_drops "00000000:0044")" \
+        "12"
+    check "udp drops single socket" \
+        "$(printf '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n 1: 00000000:0044 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 1 2 0 5\n' | sum_proc_net_udp_drops "00000000:0044")" \
+        "5"
+    check "udp drops no match yields 0" \
+        "$(printf '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n 1: 00000000:0044 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 1 2 0 5\n' | sum_proc_net_udp_drops "00000000:1234")" \
+        "0"
     check "resolve ipfix sub"     "$(FORMAT=ipfix    resolve_format && echo "$SUB")"          "ipfix-udp"
     check "resolve ipfix drop"    "$(FORMAT=ipfix    resolve_format && echo "$DROP_METRIC")"  "ipfix_socket_drops"
     check "resolve zeek drop"     "$(FORMAT=zeek     resolve_format && echo "$DROP_METRIC")"  ""
