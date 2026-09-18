@@ -73,11 +73,23 @@ DURATION="${DURATION:-15}"
 RUNS="${RUNS:-5}"
 METRICS_PORT="${METRICS_PORT:-9090}"
 RECONCILE_TOLERANCE=2
+# Real-shape local sinks flush on this interval (write_config below); a run
+# shorter than twice it can end before the first flush ever fires, so
+# parquet_s3_records_written stays 0/absent and the liveness assertion FATALs
+# with a message that (correctly, but unhelpfully in a hurry) blames the sink
+# rather than DURATION. Single source of truth for both write_config and the
+# guard right below, so the two can never drift apart.
+FLUSH_INTERVAL_SECS=5
 
 resolve_format || exit 1
 
 [ -x "$BIN" ]     || { echo "FATAL: $BIN missing. cargo build --release --bin logthing"; exit 1; }
 [ -x "$LOADGEN" ] || { echo "FATAL: $LOADGEN missing. cargo build --release -p loadgen"; exit 1; }
+
+if [ "$SHAPE" = "real" ] && [ "$DURATION" -lt $((FLUSH_INTERVAL_SECS * 2)) ]; then
+    echo "FATAL: real-shape runs need DURATION >= $((FLUSH_INTERVAL_SECS * 2))s because the local sink is configured with flush_interval_secs=$FLUSH_INTERVAL_SECS and nothing is durably written before the first flush; use a longer DURATION, or SHAPE=trivial if you do not need the writer path."
+    exit 1
+fi
 
 fetch() {
     if command -v curl >/dev/null 2>&1; then curl -sf "$1"; else wget -qO- "$1"; fi
@@ -200,7 +212,7 @@ write_config() {
             # DURATION so the real shape exercises the actual write path.
             echo "[$CONFIG_SECTION.local]"
             echo "directory = \"$LOCAL_DIR\""
-            echo 'flush_interval_secs = 5'
+            echo "flush_interval_secs = $FLUSH_INTERVAL_SECS"
         fi
     } > "$REPO/logthing.toml"
 }
