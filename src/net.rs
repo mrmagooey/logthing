@@ -49,6 +49,44 @@ pub async fn bind_udp_with_recv_buffer(
     Ok(socket)
 }
 
+/// Bind a UDP socket at `addr` with `SO_REUSEPORT` set, so multiple sockets
+/// can share the same `addr`. The kernel fans datagrams out across the
+/// group by a hash of the packet's 4-tuple, so a given sender lands on the
+/// same socket for the life of the group. Same `SO_RCVBUF` handling as
+/// `bind_udp_with_recv_buffer`.
+pub async fn bind_udp_reuseport_with_recv_buffer(
+    addr: &SocketAddr,
+    requested: Option<usize>,
+    protocol: &str,
+) -> std::io::Result<UdpSocket> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    sock.set_reuse_port(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&(*addr).into())?;
+    if let Some(requested) = requested.filter(|n| *n > 0) {
+        if let Err(e) = sock.set_recv_buffer_size(requested) {
+            warn!("{protocol}: failed to set SO_RCVBUF to {requested} bytes: {e}");
+        } else {
+            match sock.recv_buffer_size() {
+                Ok(actual) if actual < requested => warn!(
+                    "{protocol}: SO_RCVBUF requested {requested} bytes, kernel granted only \
+                     {actual} bytes (clamped by net.core.rmem_max)"
+                ),
+                Ok(actual) => info!(
+                    "{protocol}: SO_RCVBUF requested {requested} bytes, kernel granted {actual} bytes"
+                ),
+                Err(e) => warn!("{protocol}: SO_RCVBUF set but readback failed: {e}"),
+            }
+        }
+    }
+    UdpSocket::from_std(sock.into())
+}
+
 // ---------------------------------------------------------------------------
 // Socket-level drop counter / rx-queue gauge (Task 0.0)
 // ---------------------------------------------------------------------------
@@ -307,6 +345,40 @@ mod tests {
             .unwrap();
 
         assert_eq!(recv_buffer_size(&untouched), default_size);
+    }
+
+    /// Two sockets must be able to share one address:port under SO_REUSEPORT —
+    /// without it the second bind fails with EADDRINUSE. Port 0 lets the kernel
+    /// pick, then the second binds explicitly to whatever it chose.
+    #[tokio::test]
+    async fn reuseport_allows_two_sockets_on_one_port() {
+        let first = bind_udp_reuseport_with_recv_buffer(
+            &"127.0.0.1:0".parse().unwrap(), None, "test_proto",
+        )
+        .await
+        .expect("first reuseport bind");
+        let addr = first.local_addr().expect("local addr");
+
+        let second = bind_udp_reuseport_with_recv_buffer(&addr, None, "test_proto")
+            .await
+            .expect("second bind on the same port must succeed under SO_REUSEPORT");
+
+        assert_eq!(first.local_addr().unwrap(), second.local_addr().unwrap());
+    }
+
+    /// A plain bind must still refuse to share a port — proving the test above
+    /// demonstrates SO_REUSEPORT rather than some ambient permissiveness.
+    #[tokio::test]
+    async fn plain_bind_still_refuses_a_shared_port() {
+        let first = bind_udp_with_recv_buffer(&"127.0.0.1:0".parse().unwrap(), None, "test_proto")
+            .await
+            .expect("first plain bind");
+        let addr = first.local_addr().expect("local addr");
+
+        assert!(
+            bind_udp_with_recv_buffer(&addr, None, "test_proto").await.is_err(),
+            "a second plain bind on the same port must fail"
+        );
     }
 
     /// Known-good encoding check: 127.0.0.1 is the textbook `/proc/net/udp`
