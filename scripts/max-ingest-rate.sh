@@ -32,6 +32,49 @@ classify_run() {
     fi
 }
 
+BISECT_RESOLUTION="${BISECT_RESOLUTION:-1000}"
+RAMP_MAX="${RAMP_MAX:-500000}"
+
+# Coarse doubling to the first failing rate, then bisect between the last
+# passing and first failing rate down to BISECT_RESOLUTION. A linear sweep
+# would spend most of its runs far below the answer. Calls `measure_rate`,
+# defined below for real use and overridden by a stub in SELFTEST so the
+# search itself is under test, not the server. A GENERATOR-LIMITED verdict
+# anywhere aborts the search and is reported as itself -- never treated as a
+# failing rate, which would report the generator's limit as the server's
+# ceiling (see the module comment on ACHIEVED_FLOOR_PCT for why that
+# conflation is a documented past mistake, not a hypothetical one).
+ramp() {
+    local rate="$1" last_pass=0 first_fail=0 verdict
+
+    while [ "$rate" -le "$RAMP_MAX" ]; do
+        verdict="$(measure_rate "$rate")"
+        case "$verdict" in
+            PASS)              last_pass="$rate" ;;
+            GENERATOR-LIMITED) echo "GENERATOR-LIMITED $rate"; return 0 ;;
+            *)                 first_fail="$rate"; break ;;
+        esac
+        rate=$((rate * 2))
+    done
+
+    if [ "$first_fail" -eq 0 ]; then
+        echo "NO-CEILING-FOUND $last_pass"
+        return 0
+    fi
+
+    while [ $((first_fail - last_pass)) -gt "$BISECT_RESOLUTION" ]; do
+        local mid=$(( (last_pass + first_fail) / 2 ))
+        verdict="$(measure_rate "$mid")"
+        case "$verdict" in
+            PASS)              last_pass="$mid" ;;
+            GENERATOR-LIMITED) echo "GENERATOR-LIMITED $mid"; return 0 ;;
+            *)                 first_fail="$mid" ;;
+        esac
+    done
+
+    echo "CEILING $last_pass"
+}
+
 # Sink `source` labels below are the sinks' own source() values
 # (src/forwarding/*_s3.rs). Note `generic` and `hec` share BOTH the received
 # counter (src/ingest/handlers.rs:219) and the sink label
@@ -90,7 +133,8 @@ BIN="$REPO/target/release/logthing"
 LOADGEN="$REPO/target/release/loadgen"
 FORMAT="${FORMAT:-ipfix}"
 SHAPE="${SHAPE:-real}"
-RATE="${RATE:-20000}"
+# Unset by default -> ramp mode (see the RATE-set/unset branch near the end
+# of this block). Set RATE explicitly for the old fixed-rate reproductions.
 DURATION="${DURATION:-15}"
 RUNS="${RUNS:-5}"
 METRICS_PORT="${METRICS_PORT:-9090}"
@@ -108,6 +152,12 @@ FLUSH_INTERVAL_SECS=5
 # claims to measure. 12 vCPU host: generator 0-3, server 4-11.
 GEN_CPUS="${GEN_CPUS:-0-3}"
 SRV_CPUS="${SRV_CPUS:-4-11}"
+# Concurrent generator processes (not threads -- that in-process --workers
+# flag was cancelled). One loadgen process tops out well below some formats'
+# real server ceiling; splitting the target rate across GEN_PROCS processes,
+# all still pinned to GEN_CPUS, lets the harness reach past a single
+# process's own ceiling. Default 1 keeps today's behaviour unchanged.
+GEN_PROCS="${GEN_PROCS:-1}"
 # See design doc §6.3: passing requires median total loss <= LOSS_BUDGET
 # (percent) AND the generator achieving >= ACHIEVED_FLOOR_PCT of target in
 # every run; classify_run checks the latter first (see its own comment).
@@ -303,23 +353,94 @@ run_generator() {
         hec|generic) extra="--events-per-request ${EVENTS_PER_REQUEST:-1} --concurrency ${CONCURRENCY:-64}" ;;
         syslog)      [ "${STRUCTURED:-0}" = "1" ] && extra="--structured" ;;
     esac
-    local out_file
-    out_file="$(mktemp)"
-    # shellcheck disable=SC2086
-    taskset -c "$GEN_CPUS" "$LOADGEN" "$SUB" --host 127.0.0.1 --port "$PORT" \
-        --target-rate "$rate" --duration-secs "$secs" $extra > "$out_file" 2>&1 &
-    local gen_pid=$! gen_before gen_after
-    gen_before="$(cpu_ticks "$gen_pid")"
-    gen_after="$gen_before"
-    while kill -0 "$gen_pid" 2>/dev/null; do
-        gen_after="$(cpu_ticks "$gen_pid")"
-        sleep 0.5
+    local n="${GEN_PROCS:-1}"
+
+    if [ "$n" -le 1 ]; then
+        # Single-process path, byte-for-byte unchanged from before GEN_PROCS
+        # existed -- GEN_PROCS=1 (the default) must mean exactly what it
+        # meant before this knob was added.
+        local out_file
+        out_file="$(mktemp)"
+        # shellcheck disable=SC2086
+        taskset -c "$GEN_CPUS" "$LOADGEN" "$SUB" --host 127.0.0.1 --port "$PORT" \
+            --target-rate "$rate" --duration-secs "$secs" $extra > "$out_file" 2>&1 &
+        local gen_pid=$! gen_before gen_after
+        gen_before="$(cpu_ticks "$gen_pid")"
+        gen_after="$gen_before"
+        while kill -0 "$gen_pid" 2>/dev/null; do
+            gen_after="$(cpu_ticks "$gen_pid")"
+            sleep 0.5
+        done
+        wait "$gen_pid"
+        local gen_rc=$?
+        cores_used "$((gen_after - gen_before))" "$secs" > "$TMP_ROOT/gen_cores.txt"
+        cat "$out_file"
+        rm -f "$out_file"
+        return "$gen_rc"
+    fi
+
+    # GEN_PROCS>1: split the target rate across N concurrent generator
+    # processes (processes, not threads -- the in-process --workers flag
+    # is still cancelled) so the offered load can exceed one process's own
+    # ceiling. Remainder from integer division goes to the first
+    # `remainder` processes so the parts sum to exactly `rate` -- dropping
+    # it would silently under-offer load that reads back as a server limit.
+    # All N stay inside GEN_CPUS; the server keeps SRV_CPUS untouched.
+    local base=$((rate / n)) remainder=$((rate % n))
+    local pids="" out_files="" i rp out_file
+    for i in $(seq 1 "$n"); do
+        rp="$base"
+        [ "$i" -le "$remainder" ] && rp=$((base + 1))
+        out_file="$(mktemp)"
+        out_files="$out_files $out_file"
+        # shellcheck disable=SC2086
+        taskset -c "$GEN_CPUS" "$LOADGEN" "$SUB" --host 127.0.0.1 --port "$PORT" \
+            --target-rate "$rp" --duration-secs "$secs" $extra > "$out_file" 2>&1 &
+        pids="$pids $!"
     done
-    wait "$gen_pid"
-    local gen_rc=$?
+
+    local pid gen_before=0 gen_after=0 sum alive
+    for pid in $pids; do gen_before=$((gen_before + $(cpu_ticks "$pid"))); done
+    gen_after="$gen_before"
+    alive=1
+    while [ "$alive" -eq 1 ]; do
+        alive=0
+        sum=0
+        for pid in $pids; do
+            kill -0 "$pid" 2>/dev/null && alive=1
+            sum=$((sum + $(cpu_ticks "$pid")))
+        done
+        gen_after="$sum"
+        [ "$alive" -eq 1 ] && sleep 0.5
+    done
+
+    # Wait only on the pids this call spawned -- a bare `wait` would also
+    # block on anything else backgrounded in this script (e.g. the server),
+    # which has already caused a hang once in this plan.
+    local gen_rc=0
+    for pid in $pids; do
+        wait "$pid" || gen_rc=1
+    done
     cores_used "$((gen_after - gen_before))" "$secs" > "$TMP_ROOT/gen_cores.txt"
-    cat "$out_file"
-    rm -f "$out_file"
+
+    # Sum each process's own sent/achieved figures via the existing parsers
+    # so classify_run's 99% floor applies to the aggregate the harness
+    # actually offered, not to any single process's share of it. Raw
+    # per-process output is echoed first (for FATAL-path debugging); the
+    # synthesized totals are echoed last so parse_sent/parse_achieved's
+    # `tail -1` picks up the aggregate instead of one process's numbers.
+    local total_sent=0 total_ach=0 content s a
+    for out_file in $out_files; do
+        content="$(cat "$out_file")"
+        echo "$content"
+        s="$(parse_sent "$content")"
+        a="$(parse_achieved "$content")"
+        [ -n "$s" ] && total_sent=$((total_sent + s))
+        [ -n "$a" ] && total_ach="$(awk -v x="$total_ach" -v y="$a" 'BEGIN{printf "%.4f", x+y}')"
+        rm -f "$out_file"
+    done
+    echo "sent $total_sent records in ${secs}s (GEN_PROCS=$n)"
+    echo "achieved rate: $total_ach"
     return "$gen_rc"
 }
 
@@ -357,7 +478,7 @@ drain_until_stable() {
 
 write_config
 
-echo "# format=$FORMAT shape=$SHAPE rate=$RATE duration=${DURATION}s runs=$RUNS transport=$TRANSPORT port=$PORT"
+echo "# format=$FORMAT shape=$SHAPE duration=${DURATION}s runs=$RUNS transport=$TRANSPORT port=$PORT"
 DROP_METRIC_DISPLAY="${DROP_METRIC:-n/a}"
 echo "# server restarted between every run; $RECV_METRIC/$DROP_METRIC_DISPLAY/parquet_s3_dropped are per-run values (fresh process), not deltas."
 if [ -n "$DROP_METRIC" ]; then
@@ -365,35 +486,37 @@ if [ -n "$DROP_METRIC" ]; then
 fi
 echo -e "run\tformat\tshape\toffered\tachieved\treceived\tkernel_drops\twriter_drops\tbuffer_drops\twritten\tkernel_loss_pct\ttotal_loss_pct\tgen_cores\tsrv_cores\tverdict"
 
-# LOSS_LIST holds total_loss_pct (the figure classify_run actually acts on,
-# and what the summary below aggregates) for every run of every format --
-# kernel-only loss is not applicable to TCP/HTTP, but total loss always is.
-LOSS_LIST=""
-DROPS_LIST=""
-WRITER_DROPS_LIST=""
-
-for i in $(seq 1 "$RUNS"); do
-    start_server "$i"
+# Runs one full restart-generate-scrape-verdict cycle at `rate`, printed as
+# run `run_id`. Sets RUN_LOSS (total_loss_pct: the three-drop-site total over
+# offered -- NOT (offered-written)/offered, which would report near-total
+# "loss" on every short run since parquet_s3_records_written legitimately
+# still has rows buffered) and RUN_ACHIEVED for the caller, and returns
+# non-zero only on a hard failure (server wouldn't start, loadgen failed,
+# RcvbufErrors reconciliation disagreed, or the real-shape liveness check
+# failed) -- never for a merely bad rate, which is a verdict, not a failure.
+run_one() {
+    local run_id="$1" rate="$2"
+    start_server "$run_id"
 
     SNMP_BEFORE="$(snmp_rcvbuf_errors)"
 
     SRV_BEFORE="$(cpu_ticks "$SRV_PID")"
-    LOADGEN_OUT="$(run_generator "$RATE" "$DURATION")"
+    LOADGEN_OUT="$(run_generator "$rate" "$DURATION")"
     LOADGEN_RC=$?
     SRV_AFTER="$(cpu_ticks "$SRV_PID")"
     SRV_CORES="$(cores_used "$((SRV_AFTER - SRV_BEFORE))" "$DURATION")"
     GEN_CORES="$(cat "$TMP_ROOT/gen_cores.txt" 2>/dev/null || echo n/a)"
     if [ "$LOADGEN_RC" -ne 0 ]; then
-        echo "FATAL: loadgen exited $LOADGEN_RC on run $i:"
+        echo "FATAL: loadgen exited $LOADGEN_RC on run $run_id:"
         echo "$LOADGEN_OUT"
-        exit 1
+        return 1
     fi
 
     OFFERED="$(parse_sent "$LOADGEN_OUT")"
     if [ -z "$OFFERED" ]; then
-        echo "FATAL: could not parse offered count from loadgen output on run $i:"
+        echo "FATAL: could not parse offered count from loadgen output on run $run_id:"
         echo "$LOADGEN_OUT"
-        exit 1
+        return 1
     fi
     ACHIEVED="$(parse_achieved "$LOADGEN_OUT")"
     ACHIEVED="${ACHIEVED:-n/a}"
@@ -426,9 +549,9 @@ for i in $(seq 1 "$RUNS"); do
         KERNEL_DROPS_INT="${KERNEL_DROPS%.*}"
         DIFF=$(( KERNEL_DROPS_INT > SNMP_DELTA ? KERNEL_DROPS_INT - SNMP_DELTA : SNMP_DELTA - KERNEL_DROPS_INT ))
         if [ "$DIFF" -gt "$RECONCILE_TOLERANCE" ]; then
-            echo "FATAL: run $i: $DROP_METRIC ($KERNEL_DROPS_INT) and RcvbufErrors delta ($SNMP_DELTA) disagree by $DIFF (tolerance $RECONCILE_TOLERANCE)."
+            echo "FATAL: run $run_id: $DROP_METRIC ($KERNEL_DROPS_INT) and RcvbufErrors delta ($SNMP_DELTA) disagree by $DIFF (tolerance $RECONCILE_TOLERANCE)."
             echo "This has reconciled exactly on every prior run of this reproduction; a disagreement means something is wrong (stale process, wrong metrics port, etc.) and these numbers must not be trusted."
-            exit 1
+            return 1
         fi
     fi
 
@@ -442,8 +565,8 @@ for i in $(seq 1 "$RUNS"); do
     if [ "$SHAPE" = "real" ]; then
         WRITTEN_INT="${WRITTEN%.*}"
         if [ "$WRITTEN_INT" -eq 0 ]; then
-            echo "FATAL: run $i: parquet_s3_records_written{source=\"$SOURCE_LABEL\"} was 0 (or absent) -- the sink produced no durable writes this run. This run is invalid, not lossless; check flush_interval_secs/flush_threshold_bytes against DURATION."
-            exit 1
+            echo "FATAL: run $run_id: parquet_s3_records_written{source=\"$SOURCE_LABEL\"} was 0 (or absent) -- the sink produced no durable writes this run. This run is invalid, not lossless; check flush_interval_secs/flush_threshold_bytes against DURATION."
+            return 1
         fi
     fi
 
@@ -468,55 +591,94 @@ for i in $(seq 1 "$RUNS"); do
     BUFFER_DROPS_INT="${BUFFER_DROPS%.*}"
     TOTAL_DROPS=$((KERNEL_FOR_TOTAL + WRITER_DROPS_INT + BUFFER_DROPS_INT))
     TOTAL_LOSS_PCT="$(awk -v d="$TOTAL_DROPS" -v o="$OFFERED" 'BEGIN{ if (o==0) print 0; else printf "%.4f", (d/o)*100 }')"
-    VERDICT="$(classify_run "$ACHIEVED" "$RATE" "$TOTAL_LOSS_PCT" "$LOSS_BUDGET")"
+    VERDICT="$(classify_run "$ACHIEVED" "$rate" "$TOTAL_LOSS_PCT" "$LOSS_BUDGET")"
 
-    echo -e "$i\t$FORMAT\t$SHAPE\t$OFFERED\t$ACHIEVED\t$RECEIVED\t$KERNEL_DROPS\t$WRITER_DROPS\t$BUFFER_DROPS\t$WRITTEN\t$KERNEL_LOSS_PCT\t$TOTAL_LOSS_PCT\t$GEN_CORES\t$SRV_CORES\t$VERDICT"
+    echo -e "$run_id\t$FORMAT\t$SHAPE\t$OFFERED\t$ACHIEVED\t$RECEIVED\t$KERNEL_DROPS\t$WRITER_DROPS\t$BUFFER_DROPS\t$WRITTEN\t$KERNEL_LOSS_PCT\t$TOTAL_LOSS_PCT\t$GEN_CORES\t$SRV_CORES\t$VERDICT"
 
     # total_loss_pct is meaningful for every format (kernel contributes 0
     # where not applicable, which is correct, not unmeasured), so it is
-    # collected unconditionally -- this is what the median/min/max summary
-    # below aggregates. DROPS_LIST (raw kernel drop counts, for the
+    # collected unconditionally into the caller's (measure_rate's) globals,
+    # reset once per rate. DROPS_LIST (raw kernel drop counts, for the
     # kernel-specific zero-loss NOTE) stays guarded on DROP_METRIC.
-    LOSS_LIST="$LOSS_LIST"$'\n'"$TOTAL_LOSS_PCT"
     if [ -n "$DROP_METRIC" ]; then
         DROPS_LIST="$DROPS_LIST"$'\n'"$KERNEL_DROPS_INT"
     fi
     WRITER_DROPS_LIST="$WRITER_DROPS_LIST"$'\n'"$WRITER_DROPS"
-done
 
-echo "# --- summary: format=$FORMAT shape=$SHAPE rate=$RATE runs=$RUNS ---"
-# median/min/max aggregate total_loss_pct (the figure classify_run acts on),
-# not kernel_loss_pct -- total loss applies to every format (kernel
-# contributes 0, correctly, where the transport cannot lose datagrams in a
-# socket buffer), so this block is no longer guarded on DROP_METRIC.
-MEDIAN="$(printf '%s\n' "$LOSS_LIST" | grep -v '^$' | median_of)"
-MIN="$(printf '%s\n' "$LOSS_LIST" | grep -v '^$' | min_of)"
-MAX="$(printf '%s\n' "$LOSS_LIST" | grep -v '^$' | max_of)"
+    RUN_LOSS="$TOTAL_LOSS_PCT"
+    RUN_ACHIEVED="$ACHIEVED"
+}
 
-echo -e "median\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t-\t$MEDIAN\t-\t-\t-"
-echo -e "min\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t-\t$MIN\t-\t-\t-"
-echo -e "max\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t-\t$MAX\t-\t-\t-"
-
-if [ -n "$DROP_METRIC" ]; then
-    ALL_ZERO=1
-    for d in $(printf '%s\n' "$DROPS_LIST" | grep -v '^$'); do
-        [ "$d" -ne 0 ] && ALL_ZERO=0
+# Runs `RUNS` full runs at `rate` and prints one verdict for the rate on
+# stdout (PASS/FAIL-LOSS/GENERATOR-LIMITED) and nothing else -- `ramp`'s
+# `$(measure_rate ...)` capture must get exactly that single token, so every
+# per-run table row and diagnostic below goes to stderr instead. In fixed-
+# rate mode the entry point below redirects this call's stdout to
+# /dev/null, so the stderr tables are what a fixed-rate run actually shows.
+# Any GENERATOR-LIMITED run poisons the whole rate: the remaining runs
+# cannot rescue a figure the generator could not offer.
+#
+# Uses the median of both the loss series AND the achieved-rate series
+# (not the last run's achieved rate) so classify_run's two arguments
+# describe the same underlying run.
+measure_rate() {
+    local rate="$1" i losses="" achieveds="" verdict
+    echo "# --- rate=$rate ---" >&2
+    DROPS_LIST=""
+    WRITER_DROPS_LIST=""
+    for i in $(seq 1 "$RUNS"); do
+        run_one "$i" "$rate" >&2 || return 1
+        verdict="$(classify_run "$RUN_ACHIEVED" "$rate" "$RUN_LOSS" "$LOSS_BUDGET")"
+        if [ "$verdict" = "GENERATOR-LIMITED" ]; then echo "GENERATOR-LIMITED"; return 0; fi
+        losses="$losses"$'\n'"$RUN_LOSS"
+        achieveds="$achieveds"$'\n'"$RUN_ACHIEVED"
     done
-    if [ "$ALL_ZERO" -eq 1 ]; then
-        echo "# NOTE: zero kernel-socket loss ($DROP_METRIC == 0) on every run -- rate/duration did not saturate the receive buffer on this host. This does not by itself mean total_loss_pct above is zero (writer_drops/buffer_drops can still be non-zero); if it is also zero, raise RATE or DURATION to produce a measurable baseline instead."
+
+    local med min max med_ach
+    med="$(printf '%s' "$losses" | grep -v '^$' | median_of)"
+    min="$(printf '%s' "$losses" | grep -v '^$' | min_of)"
+    max="$(printf '%s' "$losses" | grep -v '^$' | max_of)"
+    med_ach="$(printf '%s' "$achieveds" | grep -v '^$' | median_of)"
+
+    echo "# --- summary: format=$FORMAT shape=$SHAPE rate=$rate runs=$RUNS ---" >&2
+    echo -e "median\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t-\t$med\t-\t-\t-" >&2
+    echo -e "min\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t-\t$min\t-\t-\t-" >&2
+    echo -e "max\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t-\t$max\t-\t-\t-" >&2
+
+    if [ -n "$DROP_METRIC" ]; then
+        local all_zero=1 d
+        for d in $(printf '%s\n' "$DROPS_LIST" | grep -v '^$'); do
+            [ "$d" -ne 0 ] && all_zero=0
+        done
+        if [ "$all_zero" -eq 1 ]; then
+            echo "# NOTE: zero kernel-socket loss ($DROP_METRIC == 0) on every run at rate=$rate -- rate/duration did not saturate the receive buffer on this host. This does not by itself mean total_loss_pct above is zero (writer_drops/buffer_drops can still be non-zero); if it is also zero, raise the rate or DURATION to produce a measurable baseline instead." >&2
+        fi
+    else
+        echo "# kernel-loss is not applicable for format=$FORMAT (transport=$TRANSPORT cannot lose datagrams in a socket buffer): kernel_loss_pct is n/a on every row above (not reported as zero) and the RcvbufErrors reconciliation is skipped. total_loss_pct above already reflects only the drop sites that apply to this format (writer/buffer, kernel contributing 0)." >&2
     fi
+
+    if [ "$SHAPE" = "real" ] && [ -n "$WRITER_DROPS_LIST" ]; then
+        local p_all_zero=1 d
+        for d in $(printf '%s\n' "$WRITER_DROPS_LIST" | grep -v '^$'); do
+            [ "$d" -ne 0 ] && p_all_zero=0
+        done
+        if [ "$p_all_zero" -eq 0 ]; then
+            echo "# NOTE: parquet_s3_dropped{source=\"$SOURCE_LABEL\"} was non-zero on at least one run at rate=$rate -- a second, distinct drop site downstream of the kernel socket. Report it separately; do not fold it into the kernel loss figure above." >&2
+        fi
+    fi
+
+    echo "# rate=$rate median_loss=${med}% median_achieved=${med_ach}" >&2
+    classify_run "$med_ach" "$rate" "$med" "$LOSS_BUDGET"
+}
+
+# RATE set -> fixed-rate mode (reproduces the old repeat-ipfix harness and
+# the Task 6 reproduce commands, which pass RATE= explicitly and keep
+# working unchanged). RATE unset -> ramp mode: coarse-double then bisect to
+# this format's ceiling.
+if [ -n "${RATE:-}" ]; then
+    measure_rate "$RATE" >/dev/null
 else
-    echo "# kernel-loss is not applicable for format=$FORMAT (transport=$TRANSPORT cannot lose datagrams in a socket buffer): kernel_loss_pct is n/a on every row above (not reported as zero) and the RcvbufErrors reconciliation is skipped. total_loss_pct above already reflects only the drop sites that apply to this format (writer/buffer, kernel contributing 0)."
-fi
-
-if [ "$SHAPE" = "real" ] && [ -n "$WRITER_DROPS_LIST" ]; then
-    P_ALL_ZERO=1
-    for d in $(printf '%s\n' "$WRITER_DROPS_LIST" | grep -v '^$'); do
-        [ "$d" -ne 0 ] && P_ALL_ZERO=0
-    done
-    if [ "$P_ALL_ZERO" -eq 0 ]; then
-        echo "# NOTE: parquet_s3_dropped{source=\"$SOURCE_LABEL\"} was non-zero on at least one run -- a second, distinct drop site downstream of the kernel socket. Report it separately; do not fold it into the kernel loss figure above."
-    fi
+    ramp "${RAMP_START:-5000}"
 fi
 
 echo "artifacts (server logs): $TMP_ROOT (removed on exit; rerun with TMP_ROOT preserved manually if needed for debugging)"
@@ -558,6 +720,34 @@ if [ "${SELFTEST:-0}" = "1" ]; then
     check "gen limit beats loss" "$(classify_run 15283 20000 9.90 0.1)" "GENERATOR-LIMITED"
     check "classify exact budget" "$(classify_run 20000 20000 0.10 0.1)" "PASS"
     check "unbounded target"     "$(classify_run 12796 0 0.00 0.1)"     "PASS"
+
+    # Stub measure_rate with a known ceiling so the search itself is under
+    # test, not the server. Records every rate tried, in order.
+    TRIED=""
+    measure_rate() {
+        TRIED="$TRIED $1"
+        if [ "$1" -le "$STUB_CEILING" ]; then echo "PASS"; else echo "FAIL-LOSS"; fi
+    }
+
+    STUB_CEILING=26000 TRIED="" BISECT_RESOLUTION=1000
+    RESULT="$(STUB_CEILING=26000 BISECT_RESOLUTION=1000 ramp 5000)"
+    # Trace: doubling 5000/10000/20000 PASS, 40000 FAIL; bisect 30000 FAIL,
+    # 25000 PASS, 27500 FAIL, 26250 FAIL, 25625 PASS; 26250-25625=625 <= 1000
+    # so the search stops and reports the last passing rate.
+    check "ramp finds ceiling" "$RESULT" "CEILING 25625"
+
+    # A ramp that never fails must not claim a ceiling -- it only proves the
+    # server survived everything offered.
+    STUB_CEILING=99999999
+    RESULT="$(STUB_CEILING=99999999 BISECT_RESOLUTION=1000 RAMP_MAX=80000 ramp 5000)"
+    check "ramp hits RAMP_MAX" "$RESULT" "NO-CEILING-FOUND 80000"
+
+    # A GENERATOR-LIMITED verdict anywhere aborts the search rather than
+    # being treated as a failing rate (which would report a fake ceiling).
+    measure_rate() { TRIED="$TRIED $1"; [ "$1" -ge 20000 ] && echo "GENERATOR-LIMITED" || echo "PASS"; }
+    RESULT="$(BISECT_RESOLUTION=1000 ramp 5000)"
+    check "ramp aborts on gen limit" "$RESULT" "GENERATOR-LIMITED 20000"
+
     [ "$fail" -eq 0 ] && echo "SELFTEST PASS" || echo "SELFTEST FAIL"
     exit "$fail"
 fi
