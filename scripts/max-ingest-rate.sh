@@ -44,6 +44,17 @@ RAMP_MAX="${RAMP_MAX:-500000}"
 # failing rate, which would report the generator's limit as the server's
 # ceiling (see the module comment on ACHIEVED_FLOOR_PCT for why that
 # conflation is a documented past mistake, not a hypothetical one).
+#
+# HARD-FAILURE gets the identical abort-and-report treatment, for the same
+# reason: an infrastructure failure (server wouldn't start, the RcvbufErrors
+# reconciliation disagreed, the writer-liveness check fired) says nothing
+# about whether the rate itself is sustainable. Without this arm it falls
+# into the default `*)` branch below and gets bisected exactly like a real
+# FAIL-LOSS, producing a confident-looking `CEILING <n>` from a run that
+# never actually measured loss at that rate -- the one output this whole
+# harness exists to never print. Four outcomes, each meaning something
+# different: PASS/FAIL-LOSS drive the search, GENERATOR-LIMITED and
+# HARD-FAILURE both abort it, and neither collapses into CEILING.
 ramp() {
     local rate="$1" last_pass=0 first_fail=0 verdict
 
@@ -52,6 +63,7 @@ ramp() {
         case "$verdict" in
             PASS)              last_pass="$rate" ;;
             GENERATOR-LIMITED) echo "GENERATOR-LIMITED $rate"; return 0 ;;
+            HARD-FAILURE)      echo "HARD-FAILURE $rate"; return 0 ;;
             *)                 first_fail="$rate"; break ;;
         esac
         rate=$((rate * 2))
@@ -68,6 +80,7 @@ ramp() {
         case "$verdict" in
             PASS)              last_pass="$mid" ;;
             GENERATOR-LIMITED) echo "GENERATOR-LIMITED $mid"; return 0 ;;
+            HARD-FAILURE)      echo "HARD-FAILURE $mid"; return 0 ;;
             *)                 first_fail="$mid" ;;
         esac
     done
@@ -496,6 +509,11 @@ echo -e "run\tformat\tshape\toffered\tachieved\treceived\tkernel_drops\twriter_d
 # failed) -- never for a merely bad rate, which is a verdict, not a failure.
 run_one() {
     local run_id="$1" rate="$2"
+    # Reset every call so a stale value can never leak into a later run's
+    # verdict -- each hard-failure branch below sets this explicitly right
+    # before its `return 1`, so the caller never has to infer "hard failure"
+    # from an empty/unset variable.
+    RUN_VERDICT=""
     start_server "$run_id"
 
     SNMP_BEFORE="$(snmp_rcvbuf_errors)"
@@ -509,6 +527,7 @@ run_one() {
     if [ "$LOADGEN_RC" -ne 0 ]; then
         echo "FATAL: loadgen exited $LOADGEN_RC on run $run_id:"
         echo "$LOADGEN_OUT"
+        RUN_VERDICT="HARD-FAILURE"
         return 1
     fi
 
@@ -516,6 +535,7 @@ run_one() {
     if [ -z "$OFFERED" ]; then
         echo "FATAL: could not parse offered count from loadgen output on run $run_id:"
         echo "$LOADGEN_OUT"
+        RUN_VERDICT="HARD-FAILURE"
         return 1
     fi
     ACHIEVED="$(parse_achieved "$LOADGEN_OUT")"
@@ -551,6 +571,7 @@ run_one() {
         if [ "$DIFF" -gt "$RECONCILE_TOLERANCE" ]; then
             echo "FATAL: run $run_id: $DROP_METRIC ($KERNEL_DROPS_INT) and RcvbufErrors delta ($SNMP_DELTA) disagree by $DIFF (tolerance $RECONCILE_TOLERANCE)."
             echo "This has reconciled exactly on every prior run of this reproduction; a disagreement means something is wrong (stale process, wrong metrics port, etc.) and these numbers must not be trusted."
+            RUN_VERDICT="HARD-FAILURE"
             return 1
         fi
     fi
@@ -566,6 +587,7 @@ run_one() {
         WRITTEN_INT="${WRITTEN%.*}"
         if [ "$WRITTEN_INT" -eq 0 ]; then
             echo "FATAL: run $run_id: parquet_s3_records_written{source=\"$SOURCE_LABEL\"} was 0 (or absent) -- the sink produced no durable writes this run. This run is invalid, not lossless; check flush_interval_secs/flush_threshold_bytes against DURATION."
+            RUN_VERDICT="HARD-FAILURE"
             return 1
         fi
     fi
@@ -627,7 +649,12 @@ measure_rate() {
     DROPS_LIST=""
     WRITER_DROPS_LIST=""
     for i in $(seq 1 "$RUNS"); do
-        run_one "$i" "$rate" >&2 || return 1
+        # A hard run_one failure poisons the whole rate exactly like a
+        # GENERATOR-LIMITED run does -- the remaining runs' medians must
+        # not paper over it. run_one sets RUN_VERDICT itself on every
+        # failure path, so this never depends on inferring the reason from
+        # an empty/unset variable.
+        run_one "$i" "$rate" >&2 || { echo "$RUN_VERDICT"; return 0; }
         verdict="$(classify_run "$RUN_ACHIEVED" "$rate" "$RUN_LOSS" "$LOSS_BUDGET")"
         if [ "$verdict" = "GENERATOR-LIMITED" ]; then echo "GENERATOR-LIMITED"; return 0; fi
         losses="$losses"$'\n'"$RUN_LOSS"
@@ -747,6 +774,28 @@ if [ "${SELFTEST:-0}" = "1" ]; then
     measure_rate() { TRIED="$TRIED $1"; [ "$1" -ge 20000 ] && echo "GENERATOR-LIMITED" || echo "PASS"; }
     RESULT="$(BISECT_RESOLUTION=1000 ramp 5000)"
     check "ramp aborts on gen limit" "$RESULT" "GENERATOR-LIMITED 20000"
+
+    # A HARD-FAILURE verdict during doubling aborts the search immediately,
+    # same as GENERATOR-LIMITED -- an infrastructure failure says nothing
+    # about the rate, so it must never fall into the failing-rate branch.
+    measure_rate() { TRIED="$TRIED $1"; [ "$1" -ge 20000 ] && echo "HARD-FAILURE" || echo "PASS"; }
+    RESULT="$(BISECT_RESOLUTION=1000 ramp 5000)"
+    check "ramp aborts on hard failure during doubling" "$RESULT" "HARD-FAILURE 20000"
+
+    # The bisection path is the one that would otherwise produce a
+    # plausible-looking wrong number: doubling finds a real FAIL-LOSS at
+    # 40000 same as "ramp finds ceiling" above, but the first bisection
+    # probe (30000) hard-fails instead of measuring loss. Without the
+    # HARD-FAILURE case in the bisection loop's case statement, this would
+    # print a confident CEILING instead of aborting.
+    measure_rate() {
+        TRIED="$TRIED $1"
+        if [ "$1" -eq 30000 ]; then echo "HARD-FAILURE"
+        elif [ "$1" -le 26000 ]; then echo "PASS"
+        else echo "FAIL-LOSS"; fi
+    }
+    RESULT="$(BISECT_RESOLUTION=1000 ramp 5000)"
+    check "ramp aborts on hard failure during bisection" "$RESULT" "HARD-FAILURE 30000"
 
     [ "$fail" -eq 0 ] && echo "SELFTEST PASS" || echo "SELFTEST FAIL"
     exit "$fail"
