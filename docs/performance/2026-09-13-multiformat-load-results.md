@@ -89,6 +89,20 @@ Two things to note honestly:
 - **The generator, not the server, is the limit above ~15k/s.** Asked for
   20,000/s it achieved 15,283/s. We did not find the server's TCP ceiling, so
   nothing on this page should be read as one.
+
+  > **⚠️ Corrected 2026-09-18.** This claim is **overturned**, not confirmed.
+  > `docs/performance/2026-09-16-generator-ceiling.md` (Task 0 of the
+  > max-ingest-rate plan) measured this exact generator at **164,698
+  > records/s single-process** — over 10x the ~15,283/s read here as its
+  > ceiling — and scaling to 743,793/s at 4 processes.
+  > `docs/performance/2026-09-18-max-ingest-rate.md` then sustained
+  > **55,000/s end-to-end with zero measured loss** (all 3 runs, every drop
+  > site at 0) and did not find a real server ceiling for Zeek at all. The
+  > 15,283/s figure was never a generator ceiling; it was a single generator
+  > process contending with the server for the same 12-vCPU host (see that
+  > document's §5). Do not read anything in this section as evidence of
+  > either a generator or a server TCP ceiling.
+
 - **Unbounded is *slower* than a 20k target** (12,796/s vs 15,283/s). Counter‑
   intuitive, and not investigated. Plausibly the unpaced loop blocks on socket
   writes, or generator and server contend for the same vCPUs. Flagged rather

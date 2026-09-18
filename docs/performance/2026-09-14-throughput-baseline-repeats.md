@@ -92,6 +92,21 @@ previously measured; it is reported here for completeness but is a
 *different* drop site from the kernel loss the median/min/max above
 describes, and the two must not be added together.
 
+> **⚠️ Stale as of 2026-09-18 — do not trust this section's writer-channel
+> figures going forward.** Commit `c103de3` ("Merge perf/ipfix-accumulator:
+> IPFIX 82% loss -> zero, ~18x throughput"), landed the day after this
+> baseline and confirmed an ancestor of the current `HEAD`
+> (`git merge-base --is-ancestor c103de3 HEAD`), eliminated the writer-channel
+> drop behavior described above. `docs/performance/2026-09-18-max-ingest-rate.md`
+> re-measured IPFIX real-shape loss under the same restart-per-run,
+> RcvbufReconciled harness and found `parquet_s3_dropped{source="ipfix"}` at
+> **0** on every run, at every rate tested, including the failing ones — all
+> loss at this campaign's ceiling is kernel-socket drop, not writer-channel.
+> The 3.6331% *kernel*-loss median above is not itself contradicted (that
+> drop site is unrelated to the accumulator fix), but do not use this
+> document's writer-channel numbers, or its "3-4x undercount" framing of
+> total loss, as current — see the newer document for the post-fix picture.
+
 ## 5,000/s — lower-rate sanity check (plan's own secondary rate)
 
 ### Trivial
