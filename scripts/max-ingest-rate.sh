@@ -1,7 +1,7 @@
 #!/bin/bash
 # Per-format maximum sustainable ingest rate. Supersedes
 # scripts/repeat-ipfix-loopback-loss.sh -- same restart-per-run, zeroed-counter,
-# RcvbufErrors-reconciling machinery, generalised across formats.
+# socket-drop-reconciling machinery, generalised across formats.
 #
 # Spec: docs/superpowers/specs/2026-09-16-max-ingest-rate-design.md
 set -u
@@ -32,6 +32,23 @@ classify_run() {
     fi
 }
 
+# Classifies an entire rate from the achieved-rate and loss series across
+# ALL of its runs (each a newline-separated list, one value per run) --
+# never from a single run. A lone scheduling hiccup on a shared host (one
+# run out of RUNS dipping under ACHIEVED_FLOOR_PCT while the rest comfortably
+# clear it) must not poison a rate the generator otherwise offered fine; see
+# the ACHIEVED_FLOOR_PCT comment above. Per-run verdicts are still computed
+# and printed by run_one -- that audit trail is unchanged. This is only the
+# gate, and the gate now looks at the median achieved rate and median loss,
+# both describing the same set of runs.
+classify_rate() {
+    local achieveds="$1" losses="$2" target="$3" budget="$4"
+    local med_ach med
+    med_ach="$(printf '%s' "$achieveds" | grep -v '^$' | median_of)"
+    med="$(printf '%s' "$losses" | grep -v '^$' | median_of)"
+    classify_run "$med_ach" "$target" "$med" "$budget"
+}
+
 BISECT_RESOLUTION="${BISECT_RESOLUTION:-1000}"
 RAMP_MAX="${RAMP_MAX:-500000}"
 
@@ -46,7 +63,7 @@ RAMP_MAX="${RAMP_MAX:-500000}"
 # conflation is a documented past mistake, not a hypothetical one).
 #
 # HARD-FAILURE gets the identical abort-and-report treatment, for the same
-# reason: an infrastructure failure (server wouldn't start, the RcvbufErrors
+# reason: an infrastructure failure (server wouldn't start, the socket-drop
 # reconciliation disagreed, the writer-liveness check fired) says nothing
 # about whether the rate itself is sustainable. Without this arm it falls
 # into the default `*)` branch below and gets bisected exactly like a real
@@ -197,10 +214,21 @@ metric_labeled() {
     fetch "http://127.0.0.1:$METRICS_PORT/metrics" 2>/dev/null \
         | awk -v m="^$1\\{" -v pat="$2" '$0 ~ m && $0 ~ pat {print $NF}'
 }
-snmp_rcvbuf_errors() {
-    awk '/^Udp:/ { n++
-        if (n == 1) { for (i = 1; i <= NF; i++) if ($i == "RcvbufErrors") col = i; next }
-        if (n == 2) { print $col; exit } }' /proc/net/snmp
+# Per-socket drop counter for our own listener's UDP socket, read straight
+# from the same /proc/net/udp field src/net.rs's SocketDropStats polls to
+# produce $DROP_METRIC. Deliberately NOT /proc/net/snmp's Udp: RcvbufErrors:
+# that figure is host-wide -- it sums every UDP socket on the machine,
+# including ones that open and close mid-window -- so on a shared host,
+# unrelated traffic (another tenant, a stray unrelated listener) can move it
+# while this listener itself drops nothing. Matching on local_address (bind
+# address + port in hex), not just port, for the same reason
+# parse_proc_net_udp in src/net.rs does: two sockets can share a port bound
+# to different addresses. Bind address is always 0.0.0.0 (write_config
+# above), so only /proc/net/udp is relevant -- this harness never binds v6.
+socket_rcvbuf_drops() {
+    local port_hex
+    port_hex="$(printf '%04X' "$PORT")"
+    awk -v needle="00000000:$port_hex" 'NR>1 && $2==needle {print $NF; exit}' /proc/net/udp
 }
 parse_sent()     { printf '%s\n' "$1" | sed -n 's/.*sent \([0-9]\{1,\}\) \(flows\|datagrams\|records\) in .*/\1/p' | tail -1; }
 parse_achieved() { printf '%s\n' "$1" | sed -n 's/.*achieved rate: \([0-9.]\{1,\}\).*/\1/p' | tail -1; }
@@ -495,7 +523,7 @@ echo "# format=$FORMAT shape=$SHAPE duration=${DURATION}s runs=$RUNS transport=$
 DROP_METRIC_DISPLAY="${DROP_METRIC:-n/a}"
 echo "# server restarted between every run; $RECV_METRIC/$DROP_METRIC_DISPLAY/parquet_s3_dropped are per-run values (fresh process), not deltas."
 if [ -n "$DROP_METRIC" ]; then
-    echo "# RcvbufErrors is host-wide and NOT reset by restart -- diffed before/after around each run's load."
+    echo "# $DROP_METRIC is reconciled against this run's own socket's /proc/net/udp drop counter (NOT host-wide RcvbufErrors), diffed before/after around each run's load."
 fi
 echo -e "run\tformat\tshape\toffered\tachieved\treceived\tkernel_drops\twriter_drops\tbuffer_drops\twritten\tkernel_loss_pct\ttotal_loss_pct\tgen_cores\tsrv_cores\tverdict"
 
@@ -505,7 +533,7 @@ echo -e "run\tformat\tshape\toffered\tachieved\treceived\tkernel_drops\twriter_d
 # "loss" on every short run since parquet_s3_records_written legitimately
 # still has rows buffered) and RUN_ACHIEVED for the caller, and returns
 # non-zero only on a hard failure (server wouldn't start, loadgen failed,
-# RcvbufErrors reconciliation disagreed, or the real-shape liveness check
+# the socket-drop reconciliation disagreed, or the real-shape liveness check
 # failed) -- never for a merely bad rate, which is a verdict, not a failure.
 run_one() {
     local run_id="$1" rate="$2"
@@ -516,7 +544,7 @@ run_one() {
     RUN_VERDICT=""
     start_server "$run_id"
 
-    SNMP_BEFORE="$(snmp_rcvbuf_errors)"
+    SOCK_DROPS_BEFORE="$(socket_rcvbuf_drops)"
 
     SRV_BEFORE="$(cpu_ticks "$SRV_PID")"
     LOADGEN_OUT="$(run_generator "$rate" "$DURATION")"
@@ -557,19 +585,19 @@ run_one() {
     WRITER_DROPS="$(printf '%s' "$SCRAPE" | cut -f3)"
     BUFFER_DROPS="$(printf '%s' "$SCRAPE" | cut -f4)"
     WRITTEN="$(printf '%s' "$SCRAPE" | cut -f5)"
-    SNMP_AFTER="$(snmp_rcvbuf_errors)"
-    SNMP_DELTA=$((SNMP_AFTER - SNMP_BEFORE))
+    SOCK_DROPS_AFTER="$(socket_rcvbuf_drops)"
+    SOCK_DROPS_DELTA=$((SOCK_DROPS_AFTER - SOCK_DROPS_BEFORE))
 
     stop_server
 
     # Guarded on DROP_METRIC being set: TCP and HTTP cannot lose datagrams
-    # in a socket buffer, so there is nothing here to reconcile against
-    # RcvbufErrors -- skipped, not reported as zero.
+    # in a socket buffer, so there is nothing here to reconcile -- skipped,
+    # not reported as zero.
     if [ -n "$DROP_METRIC" ]; then
         KERNEL_DROPS_INT="${KERNEL_DROPS%.*}"
-        DIFF=$(( KERNEL_DROPS_INT > SNMP_DELTA ? KERNEL_DROPS_INT - SNMP_DELTA : SNMP_DELTA - KERNEL_DROPS_INT ))
+        DIFF=$(( KERNEL_DROPS_INT > SOCK_DROPS_DELTA ? KERNEL_DROPS_INT - SOCK_DROPS_DELTA : SOCK_DROPS_DELTA - KERNEL_DROPS_INT ))
         if [ "$DIFF" -gt "$RECONCILE_TOLERANCE" ]; then
-            echo "FATAL: run $run_id: $DROP_METRIC ($KERNEL_DROPS_INT) and RcvbufErrors delta ($SNMP_DELTA) disagree by $DIFF (tolerance $RECONCILE_TOLERANCE)."
+            echo "FATAL: run $run_id: $DROP_METRIC ($KERNEL_DROPS_INT) and this run's own socket's /proc/net/udp drop delta ($SOCK_DROPS_DELTA) disagree by $DIFF (tolerance $RECONCILE_TOLERANCE)."
             echo "This has reconciled exactly on every prior run of this reproduction; a disagreement means something is wrong (stale process, wrong metrics port, etc.) and these numbers must not be trusted."
             RUN_VERDICT="HARD-FAILURE"
             return 1
@@ -582,7 +610,7 @@ run_one() {
     # measure -- e.g. flush_interval_secs/flush_threshold_bytes never
     # tripped inside DURATION. That is not "zero loss"; it means the run's
     # numbers are meaningless and must not be reported. Treated exactly as
-    # seriously as the RcvbufErrors reconciliation check above.
+    # seriously as the socket-drop reconciliation check above.
     if [ "$SHAPE" = "real" ]; then
         WRITTEN_INT="${WRITTEN%.*}"
         if [ "$WRITTEN_INT" -eq 0 ]; then
@@ -637,26 +665,26 @@ run_one() {
 # per-run table row and diagnostic below goes to stderr instead. In fixed-
 # rate mode the entry point below redirects this call's stdout to
 # /dev/null, so the stderr tables are what a fixed-rate run actually shows.
-# Any GENERATOR-LIMITED run poisons the whole rate: the remaining runs
-# cannot rescue a figure the generator could not offer.
-#
-# Uses the median of both the loss series AND the achieved-rate series
-# (not the last run's achieved rate) so classify_run's two arguments
-# describe the same underlying run.
+# The gate is evaluated ONCE, on the median achieved rate and median loss
+# across all RUNS (see classify_rate) -- a single run dipping under
+# ACHIEVED_FLOOR_PCT no longer poisons the whole rate by itself. Per-run
+# verdicts are still computed and printed by run_one on every row; that
+# audit trail is unchanged, only the gate moved from per-run to per-rate.
+# A HARD-FAILURE is not a statistic -- it means the numbers from that run
+# cannot be trusted at all -- so it keeps poisoning the rate immediately,
+# same as before.
 measure_rate() {
-    local rate="$1" i losses="" achieveds="" verdict
+    local rate="$1" i losses="" achieveds=""
     echo "# --- rate=$rate ---" >&2
     DROPS_LIST=""
     WRITER_DROPS_LIST=""
     for i in $(seq 1 "$RUNS"); do
-        # A hard run_one failure poisons the whole rate exactly like a
-        # GENERATOR-LIMITED run does -- the remaining runs' medians must
-        # not paper over it. run_one sets RUN_VERDICT itself on every
-        # failure path, so this never depends on inferring the reason from
-        # an empty/unset variable.
+        # A hard run_one failure poisons the whole rate: the remaining
+        # runs' medians must not paper over an infrastructure failure.
+        # run_one sets RUN_VERDICT itself on every failure path, so this
+        # never depends on inferring the reason from an empty/unset
+        # variable.
         run_one "$i" "$rate" >&2 || { echo "$RUN_VERDICT"; return 0; }
-        verdict="$(classify_run "$RUN_ACHIEVED" "$rate" "$RUN_LOSS" "$LOSS_BUDGET")"
-        if [ "$verdict" = "GENERATOR-LIMITED" ]; then echo "GENERATOR-LIMITED"; return 0; fi
         losses="$losses"$'\n'"$RUN_LOSS"
         achieveds="$achieveds"$'\n'"$RUN_ACHIEVED"
     done
@@ -681,7 +709,7 @@ measure_rate() {
             echo "# NOTE: zero kernel-socket loss ($DROP_METRIC == 0) on every run at rate=$rate -- rate/duration did not saturate the receive buffer on this host. This does not by itself mean total_loss_pct above is zero (writer_drops/buffer_drops can still be non-zero); if it is also zero, raise the rate or DURATION to produce a measurable baseline instead." >&2
         fi
     else
-        echo "# kernel-loss is not applicable for format=$FORMAT (transport=$TRANSPORT cannot lose datagrams in a socket buffer): kernel_loss_pct is n/a on every row above (not reported as zero) and the RcvbufErrors reconciliation is skipped. total_loss_pct above already reflects only the drop sites that apply to this format (writer/buffer, kernel contributing 0)." >&2
+        echo "# kernel-loss is not applicable for format=$FORMAT (transport=$TRANSPORT cannot lose datagrams in a socket buffer): kernel_loss_pct is n/a on every row above (not reported as zero) and the socket-drop reconciliation is skipped. total_loss_pct above already reflects only the drop sites that apply to this format (writer/buffer, kernel contributing 0)." >&2
     fi
 
     if [ "$SHAPE" = "real" ] && [ -n "$WRITER_DROPS_LIST" ]; then
@@ -695,7 +723,7 @@ measure_rate() {
     fi
 
     echo "# rate=$rate median_loss=${med}% median_achieved=${med_ach}" >&2
-    classify_run "$med_ach" "$rate" "$med" "$LOSS_BUDGET"
+    classify_rate "$achieveds" "$losses" "$rate" "$LOSS_BUDGET"
 }
 
 # RATE set -> fixed-rate mode (reproduces the old repeat-ipfix harness and
@@ -747,6 +775,23 @@ if [ "${SELFTEST:-0}" = "1" ]; then
     check "gen limit beats loss" "$(classify_run 15283 20000 9.90 0.1)" "GENERATOR-LIMITED"
     check "classify exact budget" "$(classify_run 20000 20000 0.10 0.1)" "PASS"
     check "unbounded target"     "$(classify_run 12796 0 0.00 0.1)"     "PASS"
+
+    # classify_rate is what measure_rate actually calls for its one verdict
+    # per rate: a lone GENERATOR-LIMITED run among RUNS must not poison the
+    # rate when the median achieved rate clears the floor. Target 20000,
+    # 99% floor = 19800; achieved medians of [15283,19999,19999] -> 19999
+    # (run_one's own per-run verdict for the 15283 run is still
+    # GENERATOR-LIMITED and still printed -- that audit trail is untouched;
+    # only the rate-level gate moved to the median).
+    check "rate median rescues minority gen-limited run" \
+        "$(classify_rate "$(printf '%s\n' 19999 19999 15283)" "$(printf '%s\n' 0.05 0.05 0.05)" 20000 0.1)" \
+        "PASS"
+    # A rate whose median achieved rate genuinely falls below the floor
+    # must still classify GENERATOR-LIMITED, loss aside -- the generator
+    # itself never offered the load, on most runs, not just a noisy one.
+    check "rate median below floor stays gen-limited" \
+        "$(classify_rate "$(printf '%s\n' 15000 15100 15200)" "$(printf '%s\n' 0.00 0.00 0.00)" 20000 0.1)" \
+        "GENERATOR-LIMITED"
 
     # Stub measure_rate with a known ceiling so the search itself is under
     # test, not the server. Records every rate tried, in order.
