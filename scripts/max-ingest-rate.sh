@@ -276,7 +276,12 @@ ADMIN_BACKUP=""
 HAD_ADMIN=0
 cleanup() {
     stop_server
-    [ -n "$CONFIG_BACKUP" ] && [ -f "$CONFIG_BACKUP" ] && cp "$CONFIG_BACKUP" "$REPO/logthing.toml" 2>/dev/null
+    if [ -n "$CONFIG_BACKUP" ] && [ -f "$CONFIG_BACKUP" ]; then
+        cp "$CONFIG_BACKUP" "$REPO/logthing.toml" 2>/dev/null
+        if ! cmp -s "$CONFIG_BACKUP" "$REPO/logthing.toml"; then
+            echo "FATAL: logthing.toml restore did not match backup checksum" >&2
+        fi
+    fi
     if [ "$HAD_ADMIN" -eq 1 ] && [ -n "$TMP_ROOT" ] && [ -f "$TMP_ROOT/logthing.admin.toml.aside" ]; then
         mv "$TMP_ROOT/logthing.admin.toml.aside" "$REPO/logthing.admin.toml" 2>/dev/null
         if ! cmp -s "$ADMIN_BACKUP" "$REPO/logthing.admin.toml"; then
@@ -660,11 +665,14 @@ run_one() {
 }
 
 # Runs `RUNS` full runs at `rate` and prints one verdict for the rate on
-# stdout (PASS/FAIL-LOSS/GENERATOR-LIMITED) and nothing else -- `ramp`'s
-# `$(measure_rate ...)` capture must get exactly that single token, so every
-# per-run table row and diagnostic below goes to stderr instead. In fixed-
-# rate mode the entry point below redirects this call's stdout to
-# /dev/null, so the stderr tables are what a fixed-rate run actually shows.
+# stdout (PASS/FAIL-LOSS/GENERATOR-LIMITED/HARD-FAILURE) and nothing else --
+# `ramp`'s `$(measure_rate ...)` capture must get exactly that single token,
+# so every per-run table row and diagnostic below goes to stderr instead. In
+# fixed-rate mode the entry point below redirects this call's stdout to
+# /dev/null, so the stderr tables are what a fixed-rate run actually shows
+# -- and the same verdict is *also* echoed to stderr (both exit paths below)
+# for exactly that reason: otherwise it would be discarded, not just
+# misrouted, since stdout is the only place it was ever written.
 # The gate is evaluated ONCE, on the median achieved rate and median loss
 # across all RUNS (see classify_rate) -- a single run dipping under
 # ACHIEVED_FLOOR_PCT no longer poisons the whole rate by itself. Per-run
@@ -684,7 +692,7 @@ measure_rate() {
         # run_one sets RUN_VERDICT itself on every failure path, so this
         # never depends on inferring the reason from an empty/unset
         # variable.
-        run_one "$i" "$rate" >&2 || { echo "$RUN_VERDICT"; return 0; }
+        run_one "$i" "$rate" >&2 || { echo "$RUN_VERDICT" >&2; echo "$RUN_VERDICT"; return 0; }
         losses="$losses"$'\n'"$RUN_LOSS"
         achieveds="$achieveds"$'\n'"$RUN_ACHIEVED"
     done
@@ -723,7 +731,15 @@ measure_rate() {
     fi
 
     echo "# rate=$rate median_loss=${med}% median_achieved=${med_ach}" >&2
-    classify_rate "$achieveds" "$losses" "$rate" "$LOSS_BUDGET"
+    local verdict
+    verdict="$(classify_rate "$achieveds" "$losses" "$rate" "$LOSS_BUDGET")"
+    # Echoed to stderr too, alongside the per-run rows and the summary line
+    # above, so fixed-rate mode -- which redirects this function's stdout to
+    # /dev/null below -- still shows the rate-level verdict somewhere. The
+    # stdout echo right after is unchanged: ramp's `$(measure_rate ...)`
+    # still needs exactly this single token on stdout and nothing else.
+    echo "$verdict" >&2
+    echo "$verdict"
 }
 
 # RATE set -> fixed-rate mode (reproduces the old repeat-ipfix harness and

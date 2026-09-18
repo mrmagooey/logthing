@@ -50,13 +50,18 @@ fn harness_selftest_passes() {
 /// before ever starting a server. 10s is the minimum that clears the guard.
 ///
 /// `RATE=1000` (fixed-rate mode, not a ramp) matters for a second, less
-/// obvious reason: in fixed-rate mode the harness intentionally sends
-/// `measure_rate`'s own stdout to `/dev/null` (per-run table rows go to
-/// stderr instead -- see the harness's own comment above `measure_rate`),
-/// so the verdict token appears only in stderr here, never in stdout. The
-/// check below therefore searches combined stdout+stderr; asserting on
-/// stdout alone would fail against every real fixed-rate run regardless of
-/// harness correctness.
+/// obvious reason: in fixed-rate mode the harness sends `measure_rate`'s
+/// own stdout to `/dev/null` (per-run table rows go to stderr instead --
+/// see the harness's own comment above `measure_rate`). `measure_rate`
+/// duplicates the rate-level aggregate verdict to stderr for exactly this
+/// reason, so it lands somewhere visible in fixed-rate mode instead of
+/// being silently discarded along with the rest of that redirected stdout.
+/// The aggregate verdict therefore appears only in stderr here, never in
+/// stdout -- the check below looks for it as a standalone line in stderr
+/// (see `find_aggregate_verdict` below), not merely for verdict vocabulary
+/// anywhere in the combined output, since per-run table rows also end in a
+/// verdict column and would otherwise make this assertion pass even if the
+/// aggregate line were swallowed again.
 #[test]
 fn short_run_emits_a_verdict_and_restores_tracked_configs() {
     let root = repo_root();
@@ -85,6 +90,28 @@ fn short_run_emits_a_verdict_and_restores_tracked_configs() {
     let combined = format!("{stdout}{stderr}");
     assert!(out.status.success(), "harness exited {:?}:\n{stdout}\n{stderr}", out.status.code());
 
+    // measure_rate prints the rate-level AGGREGATE verdict as a bare,
+    // standalone line on stderr (`echo "$verdict" >&2` in the harness) --
+    // unlike the per-run table rows, which are tab-separated and end in a
+    // verdict column but are never *just* the token on their own line.
+    // Matching on that shape verifies the aggregate verdict specifically:
+    // if the harness ever went back to only writing it to the stdout that
+    // fixed-rate mode redirects to /dev/null (the bug this test guards
+    // against), this line-shaped search would find nothing even though the
+    // per-run rows still carry the same PASS/FAIL-LOSS/etc vocabulary --
+    // whereas a plain substring search over combined output would keep
+    // passing "incidentally" on those per-run rows alone.
+    let verdict_tokens = ["PASS", "FAIL-LOSS", "GENERATOR-LIMITED", "HARD-FAILURE"];
+    let aggregate_verdict = stderr
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|&l| verdict_tokens.contains(&l));
+    assert!(
+        aggregate_verdict.is_some(),
+        "no standalone aggregate verdict line in stderr (only per-run table rows?):\n{combined}"
+    );
+
     // HARD-FAILURE is a real verdict token (server wouldn't start, the
     // /proc/net/snmp reconciliation disagreed, the writer-liveness check
     // fired) so it counts for "a verdict was emitted" -- but it is not an
@@ -93,13 +120,9 @@ fn short_run_emits_a_verdict_and_restores_tracked_configs() {
     // would hollow it out exactly where it matters most (this is the one
     // test that exercises the real server, so it is the one place that can
     // catch this class of failure). Fail loudly instead.
-    let verdict_tokens = ["PASS", "FAIL-LOSS", "GENERATOR-LIMITED", "HARD-FAILURE"];
-    assert!(
-        verdict_tokens.iter().any(|v| combined.contains(v)),
-        "no verdict in harness output:\n{combined}"
-    );
-    assert!(
-        !combined.contains("HARD-FAILURE"),
+    assert_ne!(
+        aggregate_verdict,
+        Some("HARD-FAILURE"),
         "harness reported HARD-FAILURE (an infrastructure failure, not a measurement) \
          on a run that was expected to succeed:\n{combined}"
     );
