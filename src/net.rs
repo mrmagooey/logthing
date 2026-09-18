@@ -111,28 +111,49 @@ fn proc_net_udp_needle(addr: SocketAddr) -> (String, &'static str) {
     }
 }
 
-/// Find the line in a `/proc/net/udp{,6}`-formatted file whose `local_address`
-/// field exactly matches `needle`, and extract its `rx_queue`/`drops` columns.
+/// Find every line in a `/proc/net/udp{,6}`-formatted file whose `local_address`
+/// field exactly matches `needle`, and sum their `rx_queue`/`drops` columns.
 ///
 /// Matching the full `local_address` (address *and* port), not just the port,
 /// is deliberate: two sockets can share a port bound to different addresses,
 /// and reading another socket's line would be a silent wrong answer.
+///
+/// Summing rather than taking the first match matters once a port has more
+/// than one socket on it: today that's one socket per address:port for
+/// every caller. But `SO_REUSEPORT` lets N sockets share one
+/// `local_address:port`, each with its own kernel rx_queue/drops line and
+/// distinct inode -- taking only the first would silently under-report
+/// N-1 sockets' worth of drops.
 fn parse_proc_net_udp(contents: &str, needle: &str) -> Option<ProcNetUdpEntry> {
-    contents.lines().skip(1).find_map(|line| {
+    let mut total = ProcNetUdpEntry {
+        rx_queue: 0,
+        drops: 0,
+    };
+    let mut matched = false;
+    for line in contents.lines().skip(1) {
         let fields: Vec<&str> = line.split_whitespace().collect();
         // sl local_address rem_address st tx_queue:rx_queue tr tm->when
         // retrnsmt uid timeout inode ref pointer drops -- 13 fields, drops last.
         if fields.len() < 13 {
-            return None;
+            continue;
         }
         if !fields[1].eq_ignore_ascii_case(needle) {
-            return None;
+            continue;
         }
-        let rx_hex = fields[4].split_once(':')?.1;
-        let rx_queue = u64::from_str_radix(rx_hex, 16).ok()?;
-        let drops = fields.last()?.parse::<u64>().ok()?;
-        Some(ProcNetUdpEntry { rx_queue, drops })
-    })
+        let Some(rx_hex) = fields[4].split_once(':').map(|(_, h)| h) else {
+            continue;
+        };
+        let Ok(rx_queue) = u64::from_str_radix(rx_hex, 16) else {
+            continue;
+        };
+        let Some(drops) = fields.last().and_then(|s| s.parse::<u64>().ok()) else {
+            continue;
+        };
+        total.rx_queue += rx_queue;
+        total.drops += drops;
+        matched = true;
+    }
+    matched.then_some(total)
 }
 
 /// Polls a single UDP listener socket's own `/proc/net/udp{,6}` line once per
@@ -347,6 +368,36 @@ mod tests {
     #[test]
     fn parse_proc_net_udp_returns_none_for_absent_port() {
         assert!(parse_proc_net_udp(FIXTURE_PROC_NET_UDP, "00000000:FFFF").is_none());
+    }
+
+    /// Two sockets on the same address:port -- the shape SO_REUSEPORT produces.
+    /// Differing inodes, same local_address. Both lines must be counted.
+    const FIXTURE_PROC_NET_UDP_REUSEPORT: &str = "\
+  sl  local_address rem_address   st tx_queue:rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+  100: 00000000:1F49 00000000:0000 07 00000000:00000100 00:00000000 00000000     0        0 12345 2 0000000000000000 11
+  101: 00000000:1F49 00000000:0000 07 00000000:00000200 00:00000000 00000000     0        0 12346 2 0000000000000000 31
+";
+
+    #[test]
+    fn parse_proc_net_udp_sums_all_matching_lines() {
+        let entry = parse_proc_net_udp(FIXTURE_PROC_NET_UDP_REUSEPORT, "00000000:1F49")
+            .expect("both reuseport lines must parse");
+        assert_eq!(entry.drops, 42, "drops must be summed across both sockets, not taken from the first");
+        assert_eq!(entry.rx_queue, 0x300, "rx_queue must be summed too");
+    }
+
+    /// The single-socket case -- every deployment today -- must be untouched by
+    /// the summing change.
+    #[test]
+    fn parse_proc_net_udp_single_match_unaffected_by_summing() {
+        let entry = parse_proc_net_udp(FIXTURE_PROC_NET_UDP, "00000000:1F49")
+            .expect("port 0x1F49 line must parse");
+        assert_eq!(entry.rx_queue, 0x100);
+    }
+
+    #[test]
+    fn parse_proc_net_udp_returns_none_when_no_line_matches() {
+        assert!(parse_proc_net_udp(FIXTURE_PROC_NET_UDP_REUSEPORT, "00000000:DEAD").is_none());
     }
 
     /// Integration: bind a real UDP socket, flood it without ever reading,
