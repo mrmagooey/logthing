@@ -219,14 +219,14 @@ hard-cap drops are 0 throughout. **Verdict: writer-limited.**
 Same shape as hec: all measured loss is writer-channel drop, landing in the
 same `source="hec"`-labelled counter (see §3). **Verdict: writer-limited.**
 
-#### zeek — ≥55,000/s, ceiling NOT found (`2026-09-18-max-ingest-rate-zeek-fixed-55000.log`)
+#### zeek — ≥55,000/s, ceiling NOT found (`2026-09-18-max-ingest-rate-zeek-ramp.log`, `2026-09-18-max-ingest-rate-zeek-fixed-50000.log`, `2026-09-18-max-ingest-rate-zeek-fixed-55000.log`)
 
 | rate | run | offered | achieved | writer_drops | buffer_drops | total_loss% | verdict |
 |---|---|---|---|---|---|---|---|
-| 40,000 (`zeek-run2.log`) | 1/2/3 | 599,970 / 599,980 / 599,980 | 39,996.2 / 39,997.3 / 39,997.0 | 0 / 0 / 0 | 0 / 0 / 0 | 0.0000 (all 3) | PASS |
-| 50,000 (`zeek-fixed-50000.log`) | 1/2/3 | 749,952 / 749,948 / 749,974 | 49,996.1 / 49,995.4 / 49,997.0 | 0 / 0 / 0 | 0 / 0 / 0 | 0.0000 (all 3) | PASS |
-| 55,000 (`zeek-fixed-55000.log`) | 1/2/3 | 824,972 / 824,997 / 824,966 | 54,995.1 / 54,997.5 / 54,995.5 | 0 / 0 / 0 | 0 / 0 / 0 | 0.0000 (all 3) | PASS |
-| 80,000 (`zeek-run2.log`) | 1/2/3 | 950,275 / 878,427 / 840,395 | 62,562.8 / 58,187.6 / 55,700.9 | 0 / 0 / 0 | 0 / 0 / 0 | 0.0000 (all 3) | GENERATOR-LIMITED (median achieved 58,187.6, 72.7% of target) |
+| 40,000 (`2026-09-18-max-ingest-rate-zeek-ramp.log`) | 1/2/3 | 599,970 / 599,980 / 599,980 | 39,996.2 / 39,997.3 / 39,997.0 | 0 / 0 / 0 | 0 / 0 / 0 | 0.0000 (all 3) | PASS |
+| 50,000 (`2026-09-18-max-ingest-rate-zeek-fixed-50000.log`) | 1/2/3 | 749,952 / 749,948 / 749,974 | 49,996.1 / 49,995.4 / 49,997.0 | 0 / 0 / 0 | 0 / 0 / 0 | 0.0000 (all 3) | PASS |
+| 55,000 (`2026-09-18-max-ingest-rate-zeek-fixed-55000.log`) | 1/2/3 | 824,972 / 824,997 / 824,966 | 54,995.1 / 54,997.5 / 54,995.5 | 0 / 0 / 0 | 0 / 0 / 0 | 0.0000 (all 3) | PASS |
+| 80,000 (`2026-09-18-max-ingest-rate-zeek-ramp.log`) | 1/2/3 | 950,275 / 878,427 / 840,395 | 62,562.8 / 58,187.6 / 55,700.9 | 0 / 0 / 0 | 0 / 0 / 0 | 0.0000 (all 3) | GENERATOR-LIMITED (median achieved 58,187.6, 72.7% of target) |
 
 No genuine loss was ever observed for zeek — every completed run, including
 the generator-limited ones, shows 0 writer/buffer drops. The search never
@@ -241,13 +241,13 @@ vCPUs (see §5) — Task 2's own trivial-shape, no-server-contention measurement
 put this same 4-process generator at 743,793/s, over 13x the generator-limited
 figure seen here.
 
-#### suricata — ≥40,000/s, ceiling NOT found (`2026-09-18-max-ingest-rate-suricata-fixed-50000.log`)
+#### suricata — ≥40,000/s, ceiling NOT found (`2026-09-18-max-ingest-rate-suricata-ramp.log`, `2026-09-18-max-ingest-rate-suricata-fixed-50000.log`)
 
 | rate | run | offered | achieved | writer_drops | buffer_drops | total_loss% | verdict |
 |---|---|---|---|---|---|---|---|
-| 40,000 (`suricata-run2.log`) | 1/2/3 | 599,984 / 599,981 / 599,973 | 39,998.9 / 39,996.5 / 39,996.5 | 0 / 0 / 0 | 0 / 0 / 0 | 0.0000 (all 3) | PASS |
-| 50,000 (`suricata-fixed-50000.log`) | 1/2/3 | 604,832 / 643,661 / 631,770 | 39,986.9 / 42,528.7 / 41,948.2 | 0 / 0 / 0 | 0 / 0 / 0 | 0.0000 (all 3) | GENERATOR-LIMITED (median achieved 41,948.2, 83.9% of target) |
-| 80,000 (`suricata-run2.log`) | 1/2/3 | 599,924 / 599,937 / 614,212 | 39,642.8 / 39,875.8 / 40,631.0 | 0 / 0 / 0 | 0 / 0 / 0 | 0.0000 (all 3) | GENERATOR-LIMITED (median achieved 39,875.8, 49.8% of target) |
+| 40,000 (`2026-09-18-max-ingest-rate-suricata-ramp.log`) | 1/2/3 | 599,984 / 599,981 / 599,973 | 39,998.9 / 39,996.5 / 39,996.5 | 0 / 0 / 0 | 0 / 0 / 0 | 0.0000 (all 3) | PASS |
+| 50,000 (`2026-09-18-max-ingest-rate-suricata-fixed-50000.log`) | 1/2/3 | 604,832 / 643,661 / 631,770 | 39,986.9 / 42,528.7 / 41,948.2 | 0 / 0 / 0 | 0 / 0 / 0 | 0.0000 (all 3) | GENERATOR-LIMITED (median achieved 41,948.2, 83.9% of target) |
+| 80,000 (`2026-09-18-max-ingest-rate-suricata-ramp.log`) | 1/2/3 | 599,924 / 599,937 / 614,212 | 39,642.8 / 39,875.8 / 40,631.0 | 0 / 0 / 0 | 0 / 0 / 0 | 0.0000 (all 3) | GENERATOR-LIMITED (median achieved 39,875.8, 49.8% of target) |
 
 Same pattern as zeek: zero writer/buffer drops on every run, including the
 generator-limited ones; the search never found a `FAIL-LOSS` rate. **Verdict:

@@ -1,0 +1,55 @@
+# format=suricata shape=real duration=15s runs=3 transport=tcp port=47761
+# server restarted between every run; suricata_records_received/n/a/parquet_s3_dropped are per-run values (fresh process), not deltas.
+run	format	shape	offered	achieved	received	kernel_drops	writer_drops	buffer_drops	written	kernel_loss_pct	total_loss_pct	gen_cores	srv_cores	verdict
+# --- rate=5000 ---
+1	suricata	real	74996	4999.4000	74996	n/a	0	0	74996	n/a	0.0000	0.00	0.18	PASS
+2	suricata	real	74998	4999.5000	74998	n/a	0	0	74998	n/a	0.0000	-0.00	0.18	PASS
+3	suricata	real	74994	4999.3000	74994	n/a	0	0	74994	n/a	0.0000	-0.00	0.18	PASS
+# --- summary: format=suricata shape=real rate=5000 runs=3 ---
+median	suricata	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+min	suricata	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+max	suricata	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+# kernel-loss is not applicable for format=suricata (transport=tcp cannot lose datagrams in a socket buffer): kernel_loss_pct is n/a on every row above (not reported as zero) and the socket-drop reconciliation is skipped. total_loss_pct above already reflects only the drop sites that apply to this format (writer/buffer, kernel contributing 0).
+# rate=5000 median_loss=0.0000% median_achieved=4999.4000
+# --- rate=10000 ---
+1	suricata	real	149994	9999.1000	149994	n/a	0	0	149970	n/a	0.0000	0.00	0.39	PASS
+2	suricata	real	149991	9999.1000	149991	n/a	0	0	149942	n/a	0.0000	-0.00	0.65	PASS
+3	suricata	real	149996	9999.5000	149996	n/a	0	0	149941	n/a	0.0000	-0.00	0.41	PASS
+# --- summary: format=suricata shape=real rate=10000 runs=3 ---
+median	suricata	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+min	suricata	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+max	suricata	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+# kernel-loss is not applicable for format=suricata (transport=tcp cannot lose datagrams in a socket buffer): kernel_loss_pct is n/a on every row above (not reported as zero) and the socket-drop reconciliation is skipped. total_loss_pct above already reflects only the drop sites that apply to this format (writer/buffer, kernel contributing 0).
+# rate=10000 median_loss=0.0000% median_achieved=9999.1000
+# --- rate=20000 ---
+1	suricata	real	299980	19998.4000	299980	n/a	0	0	299713	n/a	0.0000	-0.00	0.79	PASS
+2	suricata	real	299985	19998.0000	299985	n/a	0	0	299713	n/a	0.0000	0.00	0.75	PASS
+3	suricata	real	299980	19997.8000	299980	n/a	0	0	299713	n/a	0.0000	-0.00	0.77	PASS
+# --- summary: format=suricata shape=real rate=20000 runs=3 ---
+median	suricata	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+min	suricata	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+max	suricata	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+# kernel-loss is not applicable for format=suricata (transport=tcp cannot lose datagrams in a socket buffer): kernel_loss_pct is n/a on every row above (not reported as zero) and the socket-drop reconciliation is skipped. total_loss_pct above already reflects only the drop sites that apply to this format (writer/buffer, kernel contributing 0).
+# rate=20000 median_loss=0.0000% median_achieved=19998.0000
+# --- rate=40000 ---
+1	suricata	real	599984	39998.9000	599984	n/a	0	0	599984	n/a	0.0000	-0.00	1.76	PASS
+2	suricata	real	599981	39996.5000	599981	n/a	0	0	599981	n/a	0.0000	-0.00	1.58	PASS
+3	suricata	real	599973	39996.5000	599973	n/a	0	0	599973	n/a	0.0000	0.00	1.63	PASS
+# --- summary: format=suricata shape=real rate=40000 runs=3 ---
+median	suricata	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+min	suricata	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+max	suricata	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+# kernel-loss is not applicable for format=suricata (transport=tcp cannot lose datagrams in a socket buffer): kernel_loss_pct is n/a on every row above (not reported as zero) and the socket-drop reconciliation is skipped. total_loss_pct above already reflects only the drop sites that apply to this format (writer/buffer, kernel contributing 0).
+# rate=40000 median_loss=0.0000% median_achieved=39996.5000
+# --- rate=80000 ---
+1	suricata	real	599924	39642.8000	599924	n/a	0	0	599924	n/a	0.0000	-0.00	2.77	GENERATOR-LIMITED
+2	suricata	real	599937	39875.8000	599937	n/a	0	0	599937	n/a	0.0000	-0.00	2.81	GENERATOR-LIMITED
+3	suricata	real	614212	40631.0000	614212	n/a	0	0	600000	n/a	0.0000	-0.00	2.80	GENERATOR-LIMITED
+# --- summary: format=suricata shape=real rate=80000 runs=3 ---
+median	suricata	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+min	suricata	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+max	suricata	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+# kernel-loss is not applicable for format=suricata (transport=tcp cannot lose datagrams in a socket buffer): kernel_loss_pct is n/a on every row above (not reported as zero) and the socket-drop reconciliation is skipped. total_loss_pct above already reflects only the drop sites that apply to this format (writer/buffer, kernel contributing 0).
+# rate=80000 median_loss=0.0000% median_achieved=39875.8000
+GENERATOR-LIMITED 80000
+artifacts (server logs): /tmp/tmp.oHccfTnhPY (removed on exit; rerun with TMP_ROOT preserved manually if needed for debugging)
