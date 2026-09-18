@@ -23,6 +23,12 @@ figure is loss at a fixed, reproduced offered rate.
 
 ## Reproduce
 
+`scripts/repeat-ipfix-loopback-loss.sh` was renamed and generalised to
+`scripts/max-ingest-rate.sh` on 2026-09-16 (Task 6 of the max-ingest-rate
+plan). The old script's `pkill -f` (which could kill the invoking shell
+instead of the server) and its `rm logthing.admin.toml` (which deleted a
+tracked file) are both gone from the replacement.
+
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 export CC=/usr/bin/gcc CXX=/usr/bin/g++
@@ -30,10 +36,10 @@ export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc
 cargo build --release --bin logthing
 cargo build --release -p loadgen
 
-RATE=20000 DURATION=15 RUNS=5 SHAPE=trivial ./scripts/repeat-ipfix-loopback-loss.sh
-RATE=20000 DURATION=15 RUNS=5 SHAPE=real    ./scripts/repeat-ipfix-loopback-loss.sh
-RATE=5000  DURATION=15 RUNS=5 SHAPE=trivial ./scripts/repeat-ipfix-loopback-loss.sh
-RATE=5000  DURATION=15 RUNS=5 SHAPE=real    ./scripts/repeat-ipfix-loopback-loss.sh
+FORMAT=ipfix RATE=20000 DURATION=15 RUNS=5 SHAPE=trivial ./scripts/max-ingest-rate.sh
+FORMAT=ipfix RATE=20000 DURATION=15 RUNS=5 SHAPE=real    ./scripts/max-ingest-rate.sh
+FORMAT=ipfix RATE=5000  DURATION=15 RUNS=5 SHAPE=trivial ./scripts/max-ingest-rate.sh
+FORMAT=ipfix RATE=5000  DURATION=15 RUNS=5 SHAPE=real    ./scripts/max-ingest-rate.sh
 ```
 
 `SHAPE=trivial` runs `DefaultIpfixHandler` with no `[ipfix.*]` sink
