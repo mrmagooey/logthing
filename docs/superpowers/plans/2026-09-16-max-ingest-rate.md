@@ -190,10 +190,12 @@ LOADGEN="$REPO/target/release/loadgen"
 FORMAT="${FORMAT:-ipfix}"
 PROCS="${PROCS:-1 2 4}"
 DURATION="${DURATION:-10}"
-# BLACKHOLE=1 targets a port nothing is bound to. The kernel discards at the
-# socket layer, so the send syscall costs exactly what it normally costs and
-# no receiver can be the bottleneck -- a pure generator ceiling. UDP only: a
-# TCP or HTTP generator needs a peer to connect to.
+# BLACKHOLE=1 targets a port this script binds itself and never reads. The
+# kernel enqueues, the buffer fills, and it discards -- so the send syscall
+# costs what it normally costs and no userspace receiver can be the
+# bottleneck. The port must be BOUND: loadgen connect()s its UDP socket, so an
+# unbound port returns ICMP port-unreachable as ECONNREFUSED and the generator
+# aborts. UDP only: a TCP or HTTP generator needs a real peer.
 BLACKHOLE="${BLACKHOLE:-0}"
 BLACKHOLE_PORT="${BLACKHOLE_PORT:-39999}"
 GEN_CPUS="${GEN_CPUS:-0-3}"
@@ -216,8 +218,9 @@ if [ "$BLACKHOLE" = "1" ]; then
         echo "(scripts/max-ingest-rate.sh SHAPE=trivial) and label the number as such."
         exit 1
     fi
-    if ss -lun 2>/dev/null | awk '{print $5}' | grep -q ":$BLACKHOLE_PORT\$"; then
-        echo "FATAL: something is bound to UDP $BLACKHOLE_PORT; it must be unbound to act as a blackhole."
+    # $4 is LocalAddress:Port in `ss -lun` data rows; $5 is the PEER address.
+    if ss -lun 2>/dev/null | awk '{print $4}' | grep -q ":$BLACKHOLE_PORT\$"; then
+        echo "FATAL: something is bound to UDP $BLACKHOLE_PORT; this probe must bind it itself."
         exit 1
     fi
     PORT="$BLACKHOLE_PORT"
@@ -330,8 +333,9 @@ for f in syslog ipfix sflow; do
 done
 ```
 
-Record every row. Nothing is bound to UDP 39999 — the guard in Task 1 Step 5
-aborts if something is.
+Record every row. The probe binds UDP 39999 itself and frees it on exit; its
+guard aborts if something else already holds it. If a previous run leaked a
+listener, free the port before starting — never with `pkill`.
 
 - [ ] **Step 3: Run the multi-process probe for the four peer-requiring formats**
 

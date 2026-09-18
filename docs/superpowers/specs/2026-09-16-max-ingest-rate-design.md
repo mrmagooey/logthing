@@ -96,10 +96,21 @@ all of Phase 1.
 
 ### 4.2 Receiver-free reference rate
 
-For the three UDP formats, point the generator at an **unbound loopback
-port**. The kernel discards at the socket layer, the `send` syscall costs what
-it always costs, and no receiver exists to be the bottleneck. The achieved
-rate is then a pure generator ceiling, at zero code cost.
+For the three UDP formats, point the generator at a loopback port held by a
+**bound but never drained** UDP socket, which the probe starts itself. The
+kernel enqueues, the socket buffer fills, and the kernel then discards; the
+`send` syscall costs what it always costs, and because nothing in userspace
+ever calls `recv`, no receiver exists to be the bottleneck. The achieved rate
+is a generator ceiling.
+
+> **Corrected 2026-09-17.** This section originally said to aim the generator
+> at an **unbound** port and let the kernel discard. That does not work:
+> `loadgen`'s UDP subcommands `connect()` their socket, so an unbound port
+> returns ICMP port-unreachable, the send fails with `ECONNREFUSED`, and the
+> generator aborts before sending anything. A *bound* port emits no ICMP,
+> which is why the listener must exist — it just must never read. Measured
+> while correcting this: 351,856 sends in 5 s with 0 errors against such a
+> socket, whose `Recv-Q` sat pinned at its 213,120-byte ceiling throughout.
 
 For `zeek-tcp`, `suricata-tcp`, `hec-http` and `generic-http` a peer is
 required, so the nearest equivalent is the harness's existing `trivial` shape
