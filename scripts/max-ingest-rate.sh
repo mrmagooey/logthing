@@ -10,6 +10,57 @@ median_of() { sort -n | awk '{a[NR]=$1} END {n=NR; if(n==0){print "nan"; exit} i
 min_of() { sort -n | head -1; }
 max_of() { sort -n | tail -1; }
 
+# Sink `source` labels below are the sinks' own source() values
+# (src/forwarding/*_s3.rs). Note `generic` and `hec` share BOTH the received
+# counter (src/ingest/handlers.rs:219) and the sink label
+# (src/forwarding/generic_s3.rs:163) -- they are indistinguishable in the
+# metrics, which is why this harness runs exactly one format per invocation.
+#
+# PORT env var overrides the per-format default (e.g. binding syslog's
+# standard UDP 514 requires root/CAP_NET_BIND_SERVICE; without it, rerun with
+# PORT=<unprivileged port> and say so in any results reported).
+resolve_format() {
+    STRUCTURED="${STRUCTURED:-0}"
+    local port_override="${PORT:-}"
+    case "${FORMAT:-}" in
+        syslog)
+            SUB="syslog-udp"; PORT=514; TRANSPORT=udp
+            RECV_METRIC="syslog_messages_received"; DROP_METRIC="syslog_socket_drops"
+            CONFIG_SECTION="syslog"
+            if [ "$STRUCTURED" = "1" ]; then SOURCE_LABEL="structured_syslog"; else SOURCE_LABEL="syslog"; fi
+            ;;
+        ipfix)
+            SUB="ipfix-udp"; PORT=4739; TRANSPORT=udp
+            RECV_METRIC="ipfix_datagrams_received"; DROP_METRIC="ipfix_socket_drops"
+            SOURCE_LABEL="ipfix"; CONFIG_SECTION="ipfix" ;;
+        sflow)
+            SUB="sflow-udp"; PORT=6343; TRANSPORT=udp
+            RECV_METRIC="sflow_datagrams_received"; DROP_METRIC="sflow_socket_drops"
+            SOURCE_LABEL="sflow"; CONFIG_SECTION="sflow" ;;
+        zeek)
+            SUB="zeek-tcp"; PORT=47760; TRANSPORT=tcp
+            RECV_METRIC="zeek_records_received"; DROP_METRIC=""
+            SOURCE_LABEL="zeek"; CONFIG_SECTION="zeek" ;;
+        suricata)
+            SUB="suricata-tcp"; PORT=47761; TRANSPORT=tcp
+            RECV_METRIC="suricata_records_received"; DROP_METRIC=""
+            SOURCE_LABEL="suricata"; CONFIG_SECTION="suricata" ;;
+        hec)
+            SUB="hec-http"; PORT=5985; TRANSPORT=http
+            RECV_METRIC="hec_events_received"; DROP_METRIC=""
+            SOURCE_LABEL="hec"; CONFIG_SECTION="hec" ;;
+        generic)
+            SUB="generic-http"; PORT=5985; TRANSPORT=http
+            RECV_METRIC="hec_events_received"; DROP_METRIC=""
+            SOURCE_LABEL="hec"; CONFIG_SECTION="hec" ;;
+        *)
+            echo "FATAL: unknown FORMAT '${FORMAT:-}' (want one of: syslog ipfix sflow zeek suricata hec generic)" >&2
+            return 1 ;;
+    esac
+    [ -n "$port_override" ] && PORT="$port_override"
+    return 0
+}
+
 if [ "${SELFTEST:-0}" != "1" ]; then
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -22,6 +73,8 @@ DURATION="${DURATION:-15}"
 RUNS="${RUNS:-5}"
 METRICS_PORT="${METRICS_PORT:-9090}"
 RECONCILE_TOLERANCE=2
+
+resolve_format || exit 1
 
 [ -x "$BIN" ]     || { echo "FATAL: $BIN missing. cargo build --release --bin logthing"; exit 1; }
 [ -x "$LOADGEN" ] || { echo "FATAL: $LOADGEN missing. cargo build --release -p loadgen"; exit 1; }
@@ -108,9 +161,36 @@ write_config() {
         echo '[tls]'; echo 'enabled = false'
         echo '[metrics]'; echo 'enabled = true'; echo "port = $METRICS_PORT"
         echo '[logging]'; echo 'level = "error"'; echo 'format = "pretty"'
-        echo '[syslog]'; echo 'enabled = false'
-        echo '[ipfix]'; echo 'enabled = true'
-        echo "udp_port = 4739"; echo 'bind_address = "0.0.0.0"'
+        # Every listener off by default, so an unrelated one can never bind a
+        # port or consume CPU during another format's run. Skipped when the
+        # format under test IS syslog -- the enabled section is written once,
+        # below, instead of contradicting/duplicating this off line.
+        if [ "$CONFIG_SECTION" != "syslog" ]; then
+            echo '[syslog]'; echo 'enabled = false'
+        fi
+
+        case "$TRANSPORT" in
+            udp)
+                echo "[$CONFIG_SECTION]"; echo 'enabled = true'
+                echo "udp_port = $PORT"
+                if [ "$CONFIG_SECTION" = "syslog" ]; then
+                    # SyslogListener always binds tcp_port too (default 601,
+                    # itself a privileged port -- see src/config/mod.rs
+                    # default_syslog_tcp_port), even though this harness only
+                    # drives the UDP arm. Pin it next to PORT so overriding
+                    # PORT to an unprivileged value actually gets the server
+                    # to start, instead of leaving the privileged TCP default
+                    # in place to fail the bind on its own.
+                    echo "tcp_port = $((PORT + 1))"
+                fi
+                echo 'bind_address = "0.0.0.0"' ;;
+            tcp)
+                echo "[$CONFIG_SECTION]"; echo 'enabled = true'
+                echo "tcp_port = $PORT"; echo 'bind_address = "0.0.0.0"' ;;
+            http)
+                echo '[hec]'; echo 'enabled = true'; echo 'token = ""' ;;
+        esac
+
         if [ "$SHAPE" = "real" ]; then
             # flush_interval_secs defaults to 900s and flush_threshold_bytes
             # to 100 MiB; a short run reaches neither, so the writer buffers
@@ -118,7 +198,8 @@ write_config() {
             # would be absent from /metrics entirely (not zero: the counter
             # doesn't exist until the first flush). Force a flush well inside
             # DURATION so the real shape exercises the actual write path.
-            echo '[ipfix.local]'; echo "directory = \"$LOCAL_DIR\""
+            echo "[$CONFIG_SECTION.local]"
+            echo "directory = \"$LOCAL_DIR\""
             echo 'flush_interval_secs = 5'
         fi
     } > "$REPO/logthing.toml"
@@ -149,28 +230,49 @@ stop_server() {
     SRV_PID=""
 }
 
+run_generator() {
+    local rate="$1" secs="$2"
+    local extra=""
+    case "$FORMAT" in
+        hec|generic) extra="--events-per-request ${EVENTS_PER_REQUEST:-1} --concurrency ${CONCURRENCY:-64}" ;;
+        syslog)      [ "${STRUCTURED:-0}" = "1" ] && extra="--structured" ;;
+    esac
+    # shellcheck disable=SC2086
+    "$LOADGEN" "$SUB" --host 127.0.0.1 --port "$PORT" \
+        --target-rate "$rate" --duration-secs "$secs" $extra 2>&1
+}
+
+# Prints: received  kernel_drops  writer_drops  buffer_drops  written
+scrape_losses() {
+    local recv kd wd bd wr
+    recv="$(metric "$RECV_METRIC")"; recv="${recv:-0}"
+    if [ -n "$DROP_METRIC" ]; then kd="$(metric "$DROP_METRIC")"; kd="${kd:-0}"; else kd="n/a"; fi
+    wd="$(metric_labeled parquet_s3_dropped "source=\"$SOURCE_LABEL\"")";        wd="${wd:-0}"
+    bd="$(metric_labeled parquet_s3_buffer_dropped "source=\"$SOURCE_LABEL\"")"; bd="${bd:-0}"
+    wr="$(metric_labeled parquet_s3_records_written "source=\"$SOURCE_LABEL\"")"; wr="${wr:-0}"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$recv" "$kd" "$wd" "$bd" "$wr"
+}
+
 write_config
 
-echo "# format=$FORMAT shape=$SHAPE rate=$RATE duration=${DURATION}s runs=$RUNS"
-echo "# server restarted between every run; ipfix_datagrams_received/ipfix_socket_drops/parquet_s3_dropped are per-run values (fresh process), not deltas."
-echo "# RcvbufErrors is host-wide and NOT reset by restart -- diffed before/after around each run's load."
-if [ "$SHAPE" = "trivial" ]; then
-    echo -e "run\tshape\toffered\treceived\tsocket_drops\trcvbuf_errors_delta\tloss_pct"
-else
-    echo -e "run\tshape\toffered\treceived\tsocket_drops\trcvbuf_errors_delta\tparquet_s3_dropped_ipfix\tparquet_s3_written_ipfix\tloss_pct"
+echo "# format=$FORMAT shape=$SHAPE rate=$RATE duration=${DURATION}s runs=$RUNS transport=$TRANSPORT port=$PORT"
+DROP_METRIC_DISPLAY="${DROP_METRIC:-n/a}"
+echo "# server restarted between every run; $RECV_METRIC/$DROP_METRIC_DISPLAY/parquet_s3_dropped are per-run values (fresh process), not deltas."
+if [ -n "$DROP_METRIC" ]; then
+    echo "# RcvbufErrors is host-wide and NOT reset by restart -- diffed before/after around each run's load."
 fi
+echo -e "run\tformat\tshape\toffered\tachieved\treceived\tkernel_drops\twriter_drops\tbuffer_drops\twritten\tloss_pct"
 
 LOSS_LIST=""
 DROPS_LIST=""
-PARQUET_LIST=""
+WRITER_DROPS_LIST=""
 
 for i in $(seq 1 "$RUNS"); do
     start_server "$i"
 
     SNMP_BEFORE="$(snmp_rcvbuf_errors)"
 
-    LOADGEN_OUT="$("$LOADGEN" ipfix-udp --host 127.0.0.1 --port 4739 \
-        --target-rate "$RATE" --duration-secs "$DURATION" 2>&1)"
+    LOADGEN_OUT="$(run_generator "$RATE" "$DURATION")"
     LOADGEN_RC=$?
     if [ "$LOADGEN_RC" -ne 0 ]; then
         echo "FATAL: loadgen exited $LOADGEN_RC on run $i:"
@@ -184,33 +286,35 @@ for i in $(seq 1 "$RUNS"); do
         echo "$LOADGEN_OUT"
         exit 1
     fi
+    ACHIEVED="$(parse_achieved "$LOADGEN_OUT")"
+    ACHIEVED="${ACHIEVED:-n/a}"
 
     # Let the last 1s /proc/net/udp poll tick land, and any in-flight
     # decode+dispatch drain, before scraping final counters.
     sleep 2
 
-    RECEIVED="$(metric ipfix_datagrams_received)"
-    RECEIVED="${RECEIVED:-0}"
-    SOCKET_DROPS="$(metric ipfix_socket_drops)"
-    SOCKET_DROPS="${SOCKET_DROPS:-0}"
+    SCRAPE="$(scrape_losses)"
+    RECEIVED="$(printf '%s' "$SCRAPE" | cut -f1)"
+    KERNEL_DROPS="$(printf '%s' "$SCRAPE" | cut -f2)"
+    WRITER_DROPS="$(printf '%s' "$SCRAPE" | cut -f3)"
+    BUFFER_DROPS="$(printf '%s' "$SCRAPE" | cut -f4)"
+    WRITTEN="$(printf '%s' "$SCRAPE" | cut -f5)"
     SNMP_AFTER="$(snmp_rcvbuf_errors)"
     SNMP_DELTA=$((SNMP_AFTER - SNMP_BEFORE))
 
-    if [ "$SHAPE" = "real" ]; then
-        PARQUET_DROPPED="$(metric_labeled parquet_s3_dropped 'source="ipfix"')"
-        PARQUET_DROPPED="${PARQUET_DROPPED:-0}"
-        PARQUET_WRITTEN="$(metric_labeled parquet_s3_records_written 'source="ipfix"')"
-        PARQUET_WRITTEN="${PARQUET_WRITTEN:-0}"
-    fi
-
     stop_server
 
-    SOCKET_DROPS_INT="${SOCKET_DROPS%.*}"
-    DIFF=$(( SOCKET_DROPS_INT > SNMP_DELTA ? SOCKET_DROPS_INT - SNMP_DELTA : SNMP_DELTA - SOCKET_DROPS_INT ))
-    if [ "$DIFF" -gt "$RECONCILE_TOLERANCE" ]; then
-        echo "FATAL: run $i: ipfix_socket_drops ($SOCKET_DROPS_INT) and RcvbufErrors delta ($SNMP_DELTA) disagree by $DIFF (tolerance $RECONCILE_TOLERANCE)."
-        echo "This has reconciled exactly on every prior run of this reproduction; a disagreement means something is wrong (stale process, wrong metrics port, etc.) and these numbers must not be trusted."
-        exit 1
+    # Guarded on DROP_METRIC being set: TCP and HTTP cannot lose datagrams
+    # in a socket buffer, so there is nothing here to reconcile against
+    # RcvbufErrors -- skipped, not reported as zero.
+    if [ -n "$DROP_METRIC" ]; then
+        KERNEL_DROPS_INT="${KERNEL_DROPS%.*}"
+        DIFF=$(( KERNEL_DROPS_INT > SNMP_DELTA ? KERNEL_DROPS_INT - SNMP_DELTA : SNMP_DELTA - KERNEL_DROPS_INT ))
+        if [ "$DIFF" -gt "$RECONCILE_TOLERANCE" ]; then
+            echo "FATAL: run $i: $DROP_METRIC ($KERNEL_DROPS_INT) and RcvbufErrors delta ($SNMP_DELTA) disagree by $DIFF (tolerance $RECONCILE_TOLERANCE)."
+            echo "This has reconciled exactly on every prior run of this reproduction; a disagreement means something is wrong (stale process, wrong metrics port, etc.) and these numbers must not be trusted."
+            exit 1
+        fi
     fi
 
     # Liveness assertion: a real-shape sink that never durably wrote
@@ -221,50 +325,56 @@ for i in $(seq 1 "$RUNS"); do
     # numbers are meaningless and must not be reported. Treated exactly as
     # seriously as the RcvbufErrors reconciliation check above.
     if [ "$SHAPE" = "real" ]; then
-        PARQUET_WRITTEN_INT="${PARQUET_WRITTEN%.*}"
-        if [ "$PARQUET_WRITTEN_INT" -eq 0 ]; then
-            echo "FATAL: run $i: parquet_s3_records_written{source=\"ipfix\"} was 0 (or absent) -- the sink produced no durable writes this run. This run is invalid, not lossless; check flush_interval_secs/flush_threshold_bytes against DURATION."
+        WRITTEN_INT="${WRITTEN%.*}"
+        if [ "$WRITTEN_INT" -eq 0 ]; then
+            echo "FATAL: run $i: parquet_s3_records_written{source=\"$SOURCE_LABEL\"} was 0 (or absent) -- the sink produced no durable writes this run. This run is invalid, not lossless; check flush_interval_secs/flush_threshold_bytes against DURATION."
             exit 1
         fi
     fi
 
-    LOSS_PCT="$(awk -v d="$SOCKET_DROPS_INT" -v o="$OFFERED" 'BEGIN{ if (o==0) print "nan"; else printf "%.4f", (d/o)*100 }')"
-
-    if [ "$SHAPE" = "trivial" ]; then
-        echo -e "$i\t$SHAPE\t$OFFERED\t$RECEIVED\t$SOCKET_DROPS_INT\t$SNMP_DELTA\t$LOSS_PCT"
+    if [ -n "$DROP_METRIC" ]; then
+        LOSS_PCT="$(awk -v d="$KERNEL_DROPS_INT" -v o="$OFFERED" 'BEGIN{ if (o==0) print "nan"; else printf "%.4f", (d/o)*100 }')"
     else
-        echo -e "$i\t$SHAPE\t$OFFERED\t$RECEIVED\t$SOCKET_DROPS_INT\t$SNMP_DELTA\t$PARQUET_DROPPED\t$PARQUET_WRITTEN\t$LOSS_PCT"
-        PARQUET_LIST="$PARQUET_LIST"$'\n'"$PARQUET_DROPPED"
+        LOSS_PCT="n/a"
     fi
 
-    LOSS_LIST="$LOSS_LIST"$'\n'"$LOSS_PCT"
-    DROPS_LIST="$DROPS_LIST"$'\n'"$SOCKET_DROPS_INT"
+    echo -e "$i\t$FORMAT\t$SHAPE\t$OFFERED\t$ACHIEVED\t$RECEIVED\t$KERNEL_DROPS\t$WRITER_DROPS\t$BUFFER_DROPS\t$WRITTEN\t$LOSS_PCT"
+
+    if [ -n "$DROP_METRIC" ]; then
+        LOSS_LIST="$LOSS_LIST"$'\n'"$LOSS_PCT"
+        DROPS_LIST="$DROPS_LIST"$'\n'"$KERNEL_DROPS_INT"
+    fi
+    WRITER_DROPS_LIST="$WRITER_DROPS_LIST"$'\n'"$WRITER_DROPS"
 done
 
-MEDIAN="$(printf '%s\n' "$LOSS_LIST" | grep -v '^$' | median_of)"
-MIN="$(printf '%s\n' "$LOSS_LIST" | grep -v '^$' | min_of)"
-MAX="$(printf '%s\n' "$LOSS_LIST" | grep -v '^$' | max_of)"
+echo "# --- summary: format=$FORMAT shape=$SHAPE rate=$RATE runs=$RUNS ---"
+if [ -n "$DROP_METRIC" ]; then
+    MEDIAN="$(printf '%s\n' "$LOSS_LIST" | grep -v '^$' | median_of)"
+    MIN="$(printf '%s\n' "$LOSS_LIST" | grep -v '^$' | min_of)"
+    MAX="$(printf '%s\n' "$LOSS_LIST" | grep -v '^$' | max_of)"
 
-echo "# --- summary: shape=$SHAPE rate=$RATE runs=$RUNS ---"
-echo -e "median\t$SHAPE\t-\t-\t-\t-\t$MEDIAN"
-echo -e "min\t$SHAPE\t-\t-\t-\t-\t$MIN"
-echo -e "max\t$SHAPE\t-\t-\t-\t-\t$MAX"
+    echo -e "median\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t$MEDIAN"
+    echo -e "min\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t$MIN"
+    echo -e "max\t$FORMAT\t$SHAPE\t-\t-\t-\t-\t-\t-\t-\t$MAX"
 
-ALL_ZERO=1
-for d in $(printf '%s\n' "$DROPS_LIST" | grep -v '^$'); do
-    [ "$d" -ne 0 ] && ALL_ZERO=0
-done
-if [ "$ALL_ZERO" -eq 1 ]; then
-    echo "# NOTE: zero loss (ipfix_socket_drops == 0) on every run -- rate/duration did not saturate the receive buffer on this host. Do not report the median above as a meaningful loss figure; raise RATE or DURATION to produce a measurable baseline instead."
+    ALL_ZERO=1
+    for d in $(printf '%s\n' "$DROPS_LIST" | grep -v '^$'); do
+        [ "$d" -ne 0 ] && ALL_ZERO=0
+    done
+    if [ "$ALL_ZERO" -eq 1 ]; then
+        echo "# NOTE: zero loss ($DROP_METRIC == 0) on every run -- rate/duration did not saturate the receive buffer on this host. Do not report the median above as a meaningful loss figure; raise RATE or DURATION to produce a measurable baseline instead."
+    fi
+else
+    echo "# kernel-loss is not applicable for format=$FORMAT (transport=$TRANSPORT cannot lose datagrams in a socket buffer): loss_pct/median/min/max and the RcvbufErrors reconciliation are skipped above, not reported as zero."
 fi
 
-if [ "$SHAPE" = "real" ] && [ -n "$PARQUET_LIST" ]; then
+if [ "$SHAPE" = "real" ] && [ -n "$WRITER_DROPS_LIST" ]; then
     P_ALL_ZERO=1
-    for d in $(printf '%s\n' "$PARQUET_LIST" | grep -v '^$'); do
+    for d in $(printf '%s\n' "$WRITER_DROPS_LIST" | grep -v '^$'); do
         [ "$d" -ne 0 ] && P_ALL_ZERO=0
     done
     if [ "$P_ALL_ZERO" -eq 0 ]; then
-        echo "# NOTE: parquet_s3_dropped{source=\"ipfix\"} was non-zero on at least one run -- a second, distinct drop site downstream of the kernel socket. Report it separately; do not fold it into the kernel loss figure above."
+        echo "# NOTE: parquet_s3_dropped{source=\"$SOURCE_LABEL\"} was non-zero on at least one run -- a second, distinct drop site downstream of the kernel socket. Report it separately; do not fold it into the kernel loss figure above."
     fi
 fi
 
@@ -286,6 +396,17 @@ if [ "${SELFTEST:-0}" = "1" ]; then
     check "min"          "$(printf '%s\n' 3 1 2     | min_of)"    "1"
     check "max"          "$(printf '%s\n' 3 1 2     | max_of)"    "3"
     check "median decimals" "$(printf '%s\n' 0.0413 0.0000 0.0000 0.0000 0.0000 | median_of)" "0.0000"
+    check "resolve ipfix sub"     "$(FORMAT=ipfix    resolve_format && echo "$SUB")"          "ipfix-udp"
+    check "resolve ipfix drop"    "$(FORMAT=ipfix    resolve_format && echo "$DROP_METRIC")"  "ipfix_socket_drops"
+    check "resolve zeek drop"     "$(FORMAT=zeek     resolve_format && echo "$DROP_METRIC")"  ""
+    check "resolve zeek recv"     "$(FORMAT=zeek     resolve_format && echo "$RECV_METRIC")"  "zeek_records_received"
+    check "resolve generic label" "$(FORMAT=generic  resolve_format && echo "$SOURCE_LABEL")" "hec"
+    check "resolve hec label"     "$(FORMAT=hec      resolve_format && echo "$SOURCE_LABEL")" "hec"
+    check "resolve suricata port" "$(FORMAT=suricata resolve_format && echo "$PORT")"         "47761"
+    check "resolve sflow recv"    "$(FORMAT=sflow    resolve_format && echo "$RECV_METRIC")"  "sflow_datagrams_received"
+    check "resolve syslog struct" "$(FORMAT=syslog STRUCTURED=1 resolve_format && echo "$SOURCE_LABEL")" "structured_syslog"
+    check "resolve syslog plain"  "$(FORMAT=syslog STRUCTURED=0 resolve_format && echo "$SOURCE_LABEL")" "syslog"
+    check "resolve unknown rc"    "$(FORMAT=nope resolve_format >/dev/null 2>&1; echo $?)"    "1"
     [ "$fail" -eq 0 ] && echo "SELFTEST PASS" || echo "SELFTEST FAIL"
     exit "$fail"
 fi
