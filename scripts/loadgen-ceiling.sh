@@ -66,7 +66,13 @@ fi
 [ -x "$LOADGEN" ] || { echo "FATAL: $LOADGEN not found. cargo build --release -p loadgen"; exit 1; }
 
 TMP="$(mktemp -d)" || exit 1
-trap 'rm -rf "$TMP"; [ -n "${BLACKHOLE_PID:-}" ] && kill "$BLACKHOLE_PID" 2>/dev/null' EXIT
+
+cleanup() {
+    rm -rf "$TMP"
+    if [ -n "${BLACKHOLE_PID:-}" ]; then kill "$BLACKHOLE_PID" 2>/dev/null; fi
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
 
 if [ "$BLACKHOLE" = "1" ]; then
     # A bound-but-never-drained UDP socket is the blackhole: a bound port
@@ -89,6 +95,7 @@ echo "# format=$FORMAT sub=$SUB port=$PORT transport=$TRANSPORT blackhole=$BLACK
 printf 'procs\tper_proc_rates\taggregate_rate\ttotal_sent\n'
 
 for n in $PROCS; do
+    GEN_PIDS=()
     for i in $(seq 1 "$n"); do
         # --target-rate 0 is "unbounded" in every subcommand: send as fast as
         # the loop will go. That is the number we are after.
@@ -96,8 +103,11 @@ for n in $PROCS; do
             --host 127.0.0.1 --port "$PORT" \
             --target-rate 0 --duration-secs "$DURATION" \
             > "$TMP/p$i.out" 2>&1 &
+        GEN_PIDS+=($!)
     done
-    wait
+    # Wait only on the generators. A bare `wait` would also wait on the
+    # blackhole listener, which sleeps for an hour by design.
+    wait "${GEN_PIDS[@]}"
 
     RATES=""
     SENTS=""
