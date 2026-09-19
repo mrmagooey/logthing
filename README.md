@@ -52,10 +52,14 @@ ca_file = "/path/to/ca.pem"           # Optional: for client certificate verific
 require_client_cert = false           # Set to true to enforce mTLS
 
 [security]
-# Restricts both the HTTP endpoints (WEF, syslog-over-HTTP, HEC, OTLP, ...)
-# and the wire-protocol socket listeners (syslog UDP/TCP, IPFIX, sFlow,
-# Zeek, Suricata) to these sources. Empty (the default) allows all sources
-# on every listener.
+# Restricts the HTTP endpoints (WEF, syslog-over-HTTP, HEC, OTLP, ...), the
+# wire-protocol socket listeners (syslog UDP/TCP, IPFIX, sFlow, Zeek,
+# Suricata), AND the /metrics endpoint to these sources. Empty (the
+# default) allows all sources everywhere.
+#
+# This also gates Prometheus: if you set allowed_ips, your scraper's
+# address must be in the list too, or scraping /metrics starts returning
+# 403. See the "Bind address (breaking change)" note under ## Metrics.
 allowed_ips = ["192.168.1.0/24", "10.0.0.0/8"]
 max_connections = 10000
 connection_timeout_secs = 300
@@ -68,6 +72,10 @@ port = 9090
 # interface but scrape metrics from another host, set this explicitly to
 # restore the old behaviour:
 # bind_address = "0.0.0.0"
+#
+# /metrics is also gated by [security] allowed_ips above (there is no
+# separate metrics.allowed_ips) — make sure your scraper's address is on
+# that list, or it will get 403.
 
 [syslog]
 enabled = true
@@ -892,6 +900,15 @@ carried the whitelist and auth layers).
 If you bind the main server to a narrow interface but scrape metrics from a
 different host, set `metrics.bind_address = "0.0.0.0"` explicitly to restore
 the old behaviour (see the `[metrics]` block above).
+
+**`allowed_ips` now also gates `/metrics` (breaking change):** there is no
+separate `metrics.allowed_ips` — `security.allowed_ips` is a single list
+that applies to wire-ingest sources *and* metrics scrapers alike. If you set
+`allowed_ips`, add your Prometheus (or other scraper's) address to the same
+list, or scraping will start returning 403 instead of timing out or being
+refused. Metrics has no auth of its own, so widening `allowed_ips` to admit
+a scraper also admits that source to every other listener it covers —
+there's no way to allow a scraper without also trusting it as a log source.
 
 Per-source ingest counters:
 
