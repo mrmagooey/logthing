@@ -352,7 +352,7 @@ impl SyslogListener {
                                         warn!(
                                             "Failed to parse syslog message from {}: {}",
                                             src,
-                                            crate::truncate_for_log(&msg, 100)
+                                            crate::sanitize_for_log(&msg, 100)
                                         );
                                     }
                                 }
@@ -445,7 +445,7 @@ impl SyslogListener {
                                         warn!(
                                             "Failed to parse syslog message from {}: {}",
                                             src,
-                                            crate::truncate_for_log(&msg, 100)
+                                            crate::sanitize_for_log(&msg, 100)
                                         );
                                     }
                                 }
@@ -641,7 +641,7 @@ impl SyslogListener {
                                 warn!(
                                     "Failed to parse syslog message from {}: {}",
                                     src,
-                                    crate::truncate_for_log(&msg, 100)
+                                    crate::sanitize_for_log(&msg, 100)
                                 );
                             }
                         }
@@ -842,7 +842,7 @@ async fn syslog_udp_recv_loop(
                                 warn!(
                                     "Failed to parse syslog message from {}: {}",
                                     src,
-                                    crate::truncate_for_log(&msg, 100)
+                                    crate::sanitize_for_log(&msg, 100)
                                 );
                             }
                         }
@@ -895,7 +895,7 @@ async fn syslog_udp_recv_loop(
                                 warn!(
                                     "Failed to parse syslog message from {}: {}",
                                     src,
-                                    crate::truncate_for_log(&msg, 100)
+                                    crate::sanitize_for_log(&msg, 100)
                                 );
                             }
                         }
