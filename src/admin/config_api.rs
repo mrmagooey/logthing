@@ -157,6 +157,27 @@ pub fn redacted_config(cfg: &Config) -> Config {
     if let Some(ref mut s3) = out.zeek.s3 {
         s3.connection = redact_s3_connection(&s3.connection);
     }
+    if let Some(ref mut s3) = out.syslog.structured_s3 {
+        s3.connection = redact_s3_connection(&s3.connection);
+    }
+    if let Some(ref mut s3) = out.suricata.s3 {
+        s3.connection = redact_s3_connection(&s3.connection);
+    }
+    if let Some(ref mut s3) = out.wef.s3 {
+        s3.connection = redact_s3_connection(&s3.connection);
+    }
+    if let Some(ref mut s3) = out.hec.s3 {
+        s3.connection = redact_s3_connection(&s3.connection);
+    }
+    if let Some(ref mut s3) = out.sflow.s3 {
+        s3.connection = redact_s3_connection(&s3.connection);
+    }
+    if let Some(ref mut s3) = out.aggregate.s3 {
+        s3.connection = redact_s3_connection(&s3.connection);
+    }
+    if let Some(ref mut s3) = out.iceberg.s3 {
+        s3.connection = redact_s3_connection(&s3.connection);
+    }
 
     out
 }
@@ -730,6 +751,57 @@ mod tests {
             "secret_key must not appear in TOML export: {toml_str}"
         );
         assert!(toml_str.contains(REDACTED));
+    }
+
+    /// Sets every S3-bearing config section's `access_key`/`secret_key` to
+    /// the given sentinels. Each `*S3Config` struct flattens
+    /// `S3ConnectionConfig` and defaults every other field via
+    /// `#[serde(default)]`, so deserializing a bare connection JSON object
+    /// into it fills in real (non-secret) defaults for the rest — no need to
+    /// hand-list every struct's non-secret fields here, and it stays correct
+    /// if those structs grow more fields later.
+    fn populate_all_s3_sections(cfg: &mut Config, access_key: &str, secret_key: &str) {
+        let conn = serde_json::json!({
+            "endpoint": "http://minio:9000",
+            "bucket": "logs",
+            "region": "us-east-1",
+            "access_key": access_key,
+            "secret_key": secret_key,
+        });
+        cfg.syslog.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
+        cfg.syslog.structured_s3 = Some(serde_json::from_value(conn.clone()).unwrap());
+        cfg.ipfix.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
+        cfg.zeek.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
+        cfg.suricata.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
+        cfg.wef.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
+        cfg.hec.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
+        cfg.sflow.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
+        cfg.aggregate.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
+        cfg.iceberg.s3 = Some(serde_json::from_value(conn).unwrap());
+    }
+
+    /// Every S3-bearing config section must be redacted, not just the three that
+    /// were originally covered. This test enumerates all ten so that adding an
+    /// eleventh section without redacting it fails here.
+    #[test]
+    fn redacted_config_masks_every_s3_section() {
+        const SENTINEL_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+        const SENTINEL_SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+
+        let mut cfg = Config::default();
+        populate_all_s3_sections(&mut cfg, SENTINEL_KEY, SENTINEL_SECRET);
+
+        let redacted = redacted_config(&cfg);
+        let json = serde_json::to_string(&redacted).expect("serialize redacted config");
+
+        assert!(
+            !json.contains(SENTINEL_KEY),
+            "a plaintext access_key survived redaction: {json}"
+        );
+        assert!(
+            !json.contains(SENTINEL_SECRET),
+            "a plaintext secret_key survived redaction: {json}"
+        );
     }
 
     // H-7: validate_config_invariants rejects port 0.
