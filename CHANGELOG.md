@@ -8,6 +8,17 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ### Added
 
+- `recv_tasks` config option on the `[ipfix]`, `[sflow]`, and `[syslog]`
+  (UDP arm only) listeners — binds `N` `SO_REUSEPORT` sockets on the same
+  port, each drained by its own task, instead of one socket drained by one
+  task. Default `1` preserves today's exact behavior byte-for-byte. Raise
+  it when `<protocol>_socket_drops` is climbing while the process uses
+  roughly one core; measured recommendation is `4`, which roughly doubled
+  the sustained ingest ceiling for ipfix and sflow and raised syslog's by
+  ~38% (see `docs/performance/2026-09-18-udp-recv-fanout-results.md`).
+  Only helps deployments with many distinct senders on one listener —
+  `SO_REUSEPORT` distributes by 4-tuple hash, so a single high-rate sender
+  sees no benefit from raising this.
 - `scripts/max-ingest-rate.sh` — per-format maximum sustainable ingest rate
   harness: restarts `logthing` between runs, reconciles kernel-socket drops
   against `/proc/net/udp` (per-listener, not host-wide), and does a coarse
@@ -18,6 +29,14 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   emission rate (`BLACKHOLE=1`, no receiver) across 1/2/4 concurrent
   processes, independent of any server, so a generator ceiling is never
   mistaken for a server one.
+
+### Fixed
+
+- `parse_proc_net_udp` now sums kernel-socket drops across every socket
+  sharing a port, rather than reading only the first. This was latent
+  until `recv_tasks > 1` (above) made multiple sockets share one port via
+  `SO_REUSEPORT` — before the fix, the harness-side drop reconciliation
+  read one socket of `N` and disagreed with the in-process counter.
 
 ### Changed
 
