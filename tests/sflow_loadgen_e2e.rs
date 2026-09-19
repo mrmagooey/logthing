@@ -108,6 +108,7 @@ async fn sflow_datagrams_received_increments_on_real_metrics_endpoint() {
         metrics: MetricsConfig {
             enabled: true,
             port: metrics_port,
+            ..MetricsConfig::default()
         },
         ..Config::default()
     };

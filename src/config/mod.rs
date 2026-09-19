@@ -174,6 +174,16 @@ pub struct MetricsConfig {
 
     #[serde(default = "default_metrics_port")]
     pub port: u16,
+
+    /// Interface for the metrics listener. `None` (the default) inherits the
+    /// main server's `bind_address`.
+    ///
+    /// This listener has no authentication, so it previously binding
+    /// `0.0.0.0` unconditionally exposed it on every interface regardless of
+    /// `bind_address`. Set this explicitly to `"0.0.0.0"` to restore that
+    /// behaviour when scraping from another host.
+    #[serde(default)]
+    pub bind_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1480,6 +1490,7 @@ impl Default for MetricsConfig {
         Self {
             enabled: default_metrics_enabled(),
             port: default_metrics_port(),
+            bind_address: None,
         }
     }
 }
@@ -1605,6 +1616,19 @@ mod tests {
         assert!(cfg.tls.enabled);
         assert_eq!(cfg.metrics.port, 9090);
         assert!(cfg.syslog.enabled);
+    }
+
+    #[test]
+    fn metrics_bind_address_defaults_to_none_and_parses_from_toml() {
+        let cfg: Config = toml::from_str("").expect("empty config must parse");
+        assert_eq!(
+            cfg.metrics.bind_address, None,
+            "default must inherit bind_address"
+        );
+
+        let cfg: Config = toml::from_str("[metrics]\nbind_address = \"0.0.0.0\"\n")
+            .expect("explicit bind_address must parse");
+        assert_eq!(cfg.metrics.bind_address.as_deref(), Some("0.0.0.0"));
     }
 
     #[test]

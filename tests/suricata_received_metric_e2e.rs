@@ -100,6 +100,7 @@ async fn suricata_records_received_visible_on_real_metrics_endpoint_with_forward
         metrics: MetricsConfig {
             enabled: true,
             port: metrics_port,
+            ..MetricsConfig::default()
         },
         ..Config::default()
     };

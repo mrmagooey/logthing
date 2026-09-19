@@ -63,6 +63,11 @@ connection_timeout_secs = 300
 [metrics]
 enabled = true
 port = 9090
+# The metrics and TLS listeners bind the same interface as `bind_address`
+# above (here, all interfaces). If you narrow `bind_address` to a private
+# interface but scrape metrics from another host, set this explicitly to
+# restore the old behaviour:
+# bind_address = "0.0.0.0"
 
 [syslog]
 enabled = true
@@ -875,6 +880,18 @@ winrm set winrm/config/client '@{TrustedHosts="your-logthing-ip"}'
 ## Metrics
 
 The server exposes Prometheus metrics on port 9090:
+
+**Bind address (breaking change):** the metrics listener binds the same
+interface as the main server's `bind_address` (previously it always bound
+`0.0.0.0`, regardless of `bind_address`), and is gated by the same
+`security.allowed_ips` whitelist as the main HTTP router — it has no
+authentication of its own, so the whitelist is what restricts who can reach
+it. The TLS listener (`[tls]`) now follows `bind_address` the same way, for
+the same reason (it previously always bound `0.0.0.0` too, though it already
+carried the whitelist and auth layers).
+If you bind the main server to a narrow interface but scrape metrics from a
+different host, set `metrics.bind_address = "0.0.0.0"` explicitly to restore
+the old behaviour (see the `[metrics]` block above).
 
 Per-source ingest counters:
 

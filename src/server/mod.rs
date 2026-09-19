@@ -28,7 +28,7 @@ use axum::{
 use axum::{extract::Request, middleware::Next};
 
 use futures::stream::{self, StreamExt};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -372,6 +372,12 @@ impl Server {
             IpWhitelist::new(self.config.security.allowed_ips.clone())?
         };
 
+        // Clone the whitelist before it is moved into `create_router` below —
+        // the metrics router needs its own copy of the same
+        // `security.allowed_ips` gate, since a `metrics.bind_address` of
+        // `0.0.0.0` (or an inherited `0.0.0.0` `bind_address`) would
+        // otherwise expose it on every interface with no auth at all.
+        let metrics_whitelist = ip_whitelist.clone();
         let app = self.create_router(ip_whitelist)?;
 
         // Start HTTP server
@@ -382,9 +388,10 @@ impl Server {
 
         // Start metrics server if enabled
         if self.config.metrics.enabled {
-            let metrics_addr: SocketAddr =
-                format!("0.0.0.0:{}", self.config.metrics.port).parse()?;
-            tokio::spawn(start_metrics_server(metrics_addr));
+            let metrics_ip =
+                resolve_metrics_ip(&self.config.metrics.bind_address, &self.config.bind_address)?;
+            let metrics_addr = SocketAddr::new(metrics_ip, self.config.metrics.port);
+            tokio::spawn(start_metrics_server(metrics_addr, metrics_whitelist));
         }
 
         // Gap-b: wire graceful shutdown so the axum server stops on SIGTERM,
@@ -555,7 +562,7 @@ impl Server {
         let app = self.create_router(ip_whitelist)?;
 
         let tls_config = build_tls_config(&self.config.tls)?;
-        let tls_addr: SocketAddr = format!("0.0.0.0:{}", self.config.tls.port).parse()?;
+        let tls_addr = tls_bind_addr(&self.config.bind_address, self.config.tls.port);
 
         info!("Starting logthing server with TLS on https://{}", tls_addr);
 
@@ -1537,6 +1544,94 @@ mod tests {
     // ------------------------------------------------------------------ //
     // M-18: axum routing-layer handler tests (oneshot)                    //
     // ------------------------------------------------------------------ //
+
+    /// `resolve_metrics_ip` is the pure logic behind the metrics bind fix:
+    /// no `metrics.bind_address` inherits the main `bind_address` IP (not
+    /// `0.0.0.0`); an explicit override wins. Exercised directly here
+    /// rather than only through a live socket bind, so the exact resolved
+    /// address is asserted deterministically instead of inferred from OS
+    /// bind/connect behaviour (which depends on machine networking).
+    ///
+    /// Covers IPv4 and IPv6 for both the inherit and override paths — the
+    /// regression this guards against (`format!("{ip}:{port}")
+    /// .parse::<SocketAddr>()` silently failing for any IPv6 `ip`, because
+    /// `Ipv6Addr::to_string()` never emits the bracket notation
+    /// `SocketAddr`'s parser requires) only shows up for IPv6.
+    #[test]
+    fn resolve_metrics_ip_inherits_bind_address_when_unset_ipv4() {
+        let bind_address: SocketAddr = "127.0.0.1:5985".parse().unwrap();
+        assert_eq!(
+            resolve_metrics_ip(&None, &bind_address).unwrap(),
+            "127.0.0.1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_metrics_ip_inherits_bind_address_when_unset_ipv6() {
+        let bind_address: SocketAddr = "[::1]:5985".parse().unwrap();
+        assert_eq!(
+            resolve_metrics_ip(&None, &bind_address).unwrap(),
+            "::1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_metrics_ip_uses_explicit_override_when_set_ipv4() {
+        let bind_address: SocketAddr = "127.0.0.1:5985".parse().unwrap();
+        let override_host = Some("0.0.0.0".to_string());
+        assert_eq!(
+            resolve_metrics_ip(&override_host, &bind_address).unwrap(),
+            "0.0.0.0".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_metrics_ip_uses_explicit_override_when_set_ipv6_bare() {
+        let bind_address: SocketAddr = "127.0.0.1:5985".parse().unwrap();
+        let override_host = Some("::".to_string());
+        assert_eq!(
+            resolve_metrics_ip(&override_host, &bind_address).unwrap(),
+            "::".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_metrics_ip_uses_explicit_override_when_set_ipv6_bracketed() {
+        let bind_address: SocketAddr = "127.0.0.1:5985".parse().unwrap();
+        let override_host = Some("[2001:db8::1]".to_string());
+        assert_eq!(
+            resolve_metrics_ip(&override_host, &bind_address).unwrap(),
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_metrics_ip_rejects_unparseable_override() {
+        let bind_address: SocketAddr = "127.0.0.1:5985".parse().unwrap();
+        let override_host = Some("not-an-ip".to_string());
+        assert!(resolve_metrics_ip(&override_host, &bind_address).is_err());
+    }
+
+    /// `tls_bind_addr` is the equivalent pure logic for the TLS listener —
+    /// it has no override, only the inherit path, but must handle IPv6
+    /// `bind_address` for the same reason `resolve_metrics_ip` does.
+    #[test]
+    fn tls_bind_addr_supports_ipv4_bind_address() {
+        let bind_address: SocketAddr = "127.0.0.1:5985".parse().unwrap();
+        assert_eq!(
+            tls_bind_addr(&bind_address, 5986),
+            "127.0.0.1:5986".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn tls_bind_addr_supports_ipv6_bind_address() {
+        let bind_address: SocketAddr = "[::1]:5985".parse().unwrap();
+        assert_eq!(
+            tls_bind_addr(&bind_address, 5986),
+            "[::1]:5986".parse::<SocketAddr>().unwrap()
+        );
+    }
 
     /// `/health` endpoint returns 200 via the full router stack.
     #[tokio::test]
@@ -3233,7 +3328,54 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
-async fn start_metrics_server(addr: SocketAddr) {
+/// Resolve the interface the metrics listener binds to.
+///
+/// An explicit `metrics.bind_address` wins; otherwise the metrics listener
+/// inherits the main server's `bind_address` IP rather than defaulting to
+/// `0.0.0.0` — see `MetricsConfig::bind_address` for why the unconditional
+/// `0.0.0.0` bind was a finding.
+///
+/// Returns an `IpAddr`, not a formatted string: `Ipv6Addr::to_string()`
+/// never emits brackets, and `SocketAddr`'s `FromStr` requires bracket
+/// notation for IPv6, so `format!("{ip}:{port}").parse::<SocketAddr>()`
+/// silently fails for every IPv6 `bind_address` (`::`, `::1`,
+/// `2001:db8::1`, ...). Building the address with `SocketAddr::new`
+/// instead sidesteps that string round-trip entirely.
+///
+/// The `Some(override)` case accepts a bare IP such as `"::1"` or
+/// `"0.0.0.0"` — matching both `MetricsConfig::bind_address`'s own doc
+/// (a bare host, no port) and the convention every other
+/// `*_bind_address: String` field in this config already uses. An
+/// optional surrounding `[...]` (as in `"[::1]"`) is stripped first, so a
+/// bracketed IPv6 literal is tolerated too.
+fn resolve_metrics_ip(
+    metrics_bind_address: &Option<String>,
+    bind_address: &SocketAddr,
+) -> anyhow::Result<IpAddr> {
+    match metrics_bind_address {
+        Some(host) => {
+            let unbracketed = host
+                .strip_prefix('[')
+                .and_then(|rest| rest.strip_suffix(']'))
+                .unwrap_or(host);
+            unbracketed
+                .parse::<IpAddr>()
+                .map_err(|e| anyhow::anyhow!("invalid [metrics] bind_address {host:?}: {e}"))
+        }
+        None => Ok(bind_address.ip()),
+    }
+}
+
+/// Resolve the interface the TLS listener binds to: always inherits
+/// `bind_address` (there is no `tls.bind_address` override), built
+/// directly from the already-parsed `IpAddr` rather than through a
+/// formatted string — see `resolve_metrics_ip` for why that string
+/// round-trip breaks IPv6.
+fn tls_bind_addr(bind_address: &SocketAddr, port: u16) -> SocketAddr {
+    SocketAddr::new(bind_address.ip(), port)
+}
+
+async fn start_metrics_server(addr: SocketAddr, ip_whitelist: IpWhitelist) {
     use metrics_exporter_prometheus::PrometheusBuilder;
 
     let recorder = PrometheusBuilder::new().build_recorder();
@@ -3244,18 +3386,32 @@ async fn start_metrics_server(addr: SocketAddr) {
 
     metrics::set_global_recorder(recorder).expect("Failed to install Prometheus recorder");
 
-    let app = Router::new().route(
-        "/metrics",
-        axum::routing::get(move || {
-            let handle = handle.clone();
-            async move { handle.render() }
-        }),
-    );
+    // Gated by the same `security.allowed_ips` whitelist as the main router:
+    // inheriting `bind_address` does nothing when `bind_address` is itself
+    // `0.0.0.0` (a common production setting), so the whitelist is the
+    // control that actually restricts who can scrape /metrics in that case.
+    let whitelist_layer =
+        middleware::from_fn_with_state(ip_whitelist.clone(), ip_whitelist_middleware);
+    let app = Router::new()
+        .route(
+            "/metrics",
+            axum::routing::get(move || {
+                let handle = handle.clone();
+                async move { handle.render() }
+            }),
+        )
+        .layer(whitelist_layer)
+        .layer(axum::Extension(ip_whitelist));
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     info!("Metrics server started on http://{}", addr);
 
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 /// Handle syslog messages via HTTP POST
