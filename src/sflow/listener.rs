@@ -752,19 +752,46 @@ mod tests {
         (task, bound, shutdown_tx, handler)
     }
 
-    /// Datagrams from several source ports must all be handled when fanned out.
-    /// sFlow's decoder is stateless, so the only risk is a lost or misrouted
-    /// datagram, not a decode failure.
+    /// Guards that every socket in a `recv_tasks > 1` `SO_REUSEPORT` group is
+    /// actually drained — not just that the group binds. A task that binds
+    /// its socket but never reads from it (e.g. spawned and then leaked, or
+    /// wired to the wrong recv loop) would silently drop its entire hashed
+    /// share of traffic with the process otherwise looking healthy; this
+    /// test's only way to catch that is by getting datagrams to land on
+    /// every member of the group, which requires enough distinct source
+    /// ports for the kernel's 4-tuple hash to spread across all of them.
+    ///
+    /// sFlow's decoder is stateless, so the only risk here is a lost or
+    /// misrouted datagram, not a decode failure — unlike IPFIX, there is no
+    /// cache-sharing property to prove.
+    ///
+    /// Port count chosen empirically, not from the naive
+    /// `1 - (3/4)^n` binomial model: with a 4-member group and one socket
+    /// sabotaged to never drain (bound, receiving its hashed share, but its
+    /// task never calls `recv_from`), 4 source ports (the original version
+    /// of this test) caught the fault in only 2 of 6 measured runs —
+    /// sequential ephemeral source ports do not hash evenly across the
+    /// group, so the theoretical ~68% detection rate did not hold in
+    /// measurement. 32 source ports (320 datagrams total) was tried next
+    /// and caught the same sabotage in 10 out of 10 measured runs (see the
+    /// task-5 fix-round report for the exact procedure) — that is the
+    /// number this test now uses.
     #[tokio::test]
     async fn fanned_out_listener_receives_from_several_source_ports() {
+        const SOURCE_PORTS: u32 = 32;
+        const DATAGRAMS_PER_PORT: u64 = 10;
+
         let (listener, bound, shutdown_tx, handler) = start_test_listener(4).await;
 
-        for i in 0..4u32 {
+        for i in 0..SOURCE_PORTS {
             let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            for n in 0..10u64 {
-                sock.send_to(&build_datagram(i * 10 + n as u32 + 1, n), bound)
-                    .await
-                    .unwrap();
+            for n in 0..DATAGRAMS_PER_PORT {
+                sock.send_to(
+                    &build_datagram(i * DATAGRAMS_PER_PORT as u32 + n as u32 + 1, n),
+                    bound,
+                )
+                .await
+                .unwrap();
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -772,6 +799,10 @@ mod tests {
         let _ = shutdown_tx.send(true);
         let _ = listener.await;
 
-        assert_eq!(handler.record_count(), 40 * RECORDS_PER_DATAGRAM);
+        let total_datagrams = SOURCE_PORTS as usize * DATAGRAMS_PER_PORT as usize;
+        assert_eq!(
+            handler.record_count(),
+            total_datagrams * RECORDS_PER_DATAGRAM
+        );
     }
 }
