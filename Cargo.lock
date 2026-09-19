@@ -2661,6 +2661,7 @@ dependencies = [
  "headers",
  "hex",
  "ipnet",
+ "libc",
  "libgssapi",
  "metrics",
  "metrics-exporter-prometheus",

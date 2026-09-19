@@ -69,6 +69,11 @@ ipnet = "2.9"
 # SO_RCVBUF get/set on UDP listener sockets — already an indirect dependency
 # via tokio, pinned to the same 0.6 line so this doesn't add a second version.
 socket2 = "0.6"
+# Raw recvmmsg(2) for batched UDP receive (src/net.rs::RecvMmsgBatch).
+# Already resolved transitively at this version via tokio/mio/socket2 --
+# this makes it directly callable, it does not add a new dependency to the
+# tree.
+libc = "0.2"
 
 # Utilities
 uuid = { version = "1.7", features = ["v4", "serde"] }
