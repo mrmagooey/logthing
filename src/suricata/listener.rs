@@ -263,7 +263,7 @@ impl SuricataListener {
                         "Suricata: JSON parse error from {}: {} — line: {}",
                         src,
                         e,
-                        &line[..line.len().min(120)],
+                        crate::truncate_for_log(line, 120),
                     );
                     continue;
                 }
