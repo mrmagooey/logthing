@@ -60,7 +60,7 @@ pub struct SyslogListenerConfig {
     /// "disabled".
     pub recv_tasks: usize,
     /// Number of datagrams one `recvmmsg(2)` call may return per recv task
-    /// (default: 1, off). Applies to the UDP arm only -- the TCP listener
+    /// (default: 32). Applies to the UDP arm only -- the TCP listener
     /// on `tcp_port` has no batched-receive analogue and is unaffected. See
     /// `SyslogConfig::recv_batch_size` for the full explanation -- unlike
     /// `recv_tasks`, this helps a single high-rate sender.
@@ -76,7 +76,7 @@ impl Default for SyslogListenerConfig {
             parse_dns_logs: true,
             receive_buffer_bytes: Some(4 * 1024 * 1024),
             recv_tasks: 8,
-            recv_batch_size: 1,
+            recv_batch_size: 32,
         }
     }
 }

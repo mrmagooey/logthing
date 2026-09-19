@@ -1,10 +1,15 @@
 # Batched UDP receive (`recv_batch_size`) — measured results (2026-09-18)
 
-`recv_batch_size` (default `1`, off; maximum `256`) on the `ipfix`, `sflow`,
-and `syslog` (UDP arm only) listeners. Above `1`, a recv task drains up to
-`N` already-queued datagrams per `recvmmsg(2)` call instead of issuing one
+`recv_batch_size` (default `32` as of the change recorded in §6 below; `0`
+and `1` both mean off; maximum `256`) on the `ipfix`, `sflow`, and `syslog`
+(UDP arm only) listeners. Above `1`, a recv task drains up to `N`
+already-queued datagrams per `recvmmsg(2)` call instead of issuing one
 `recvfrom(2)` per datagram. Never waits to fill a batch — a partial batch is
-returned immediately once the socket has nothing more queued.
+returned immediately once the socket has nothing more queued. All
+measurements in §1-§5 below were taken against the listener defaulting to
+`recv_batch_size=1` (off), which was the shipped default at the time this
+document was written — the explicit `LOGTHING__IPFIX__RECV_BATCH_SIZE`
+overrides shown below make that explicit per run.
 
 ## Hardware caveat (carried forward verbatim from prior perf docs)
 
@@ -218,6 +223,43 @@ moderate rate → raise `recv_tasks`; one sender at high rate → raise
 combined multi-sender + batching measurement); this document does not
 re-report that combination and defers to the fan-out document plus this
 one's own single-sender numbers for each knob in isolation.
+
+## 6. Batch-size sweep and idle-RSS cost — the evidence behind the shipped default (`recv_batch_size=32`)
+
+The default was subsequently changed from `1` to `32`. This section records
+the sweep and idle-memory measurements that decision rests on.
+
+Single-sender IPFIX at 50,000/s (real shape, `RUNS=5`, `GEN_PROCS=1`,
+`recv_tasks` at its default `8`):
+
+| `recv_batch_size` | median loss | per-run kernel drops |
+|---|---|---|
+| 1 | 0.7206% | 4033, 7980, 2239, 5347, 23487 |
+| 4 | 0.0000% | 0, 0, 0, 180, 187 |
+| 8 | 0.0000% | 0, 0, 0, 0, 494 |
+| 16 | 0.0000% | 1341, 0, 0, 0, 0 |
+| 32 | 0.0000% | 0, 0, 0, 0, 0 |
+
+Idle RSS with all three listeners enabled at `recv_tasks=8`:
+
+| `recv_batch_size` | idle RSS |
+|---|---:|
+| 1 | 15,084 kB |
+| 8 | 16,284 kB |
+| 32 | 21,068 kB |
+| 64 | 27,264 kB |
+
+So `32` costs roughly **6 MB** resident over the off state (`1`).
+
+**What this does and does not show.** The whole measured win is `1 → ≥4`:
+every setting from `4` upward had a median loss of `0.0000%` in this sweep.
+The clean five-run result at `32` is **not** evidence that `32` outperforms
+`8` — both sit at the same `0.0000%` median, this host's run-to-run
+variance is large and documented in §3 above, and `n=5` per setting is not
+enough to resolve a difference between two settings that both already show
+zero loss. The default was raised to `32` for headroom (~6 MB resident, per
+the table above), not because `32` was shown to measurably outperform `8`
+or any other setting from `4` upward.
 
 ## Provenance — raw logs
 

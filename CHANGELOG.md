@@ -32,18 +32,29 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   4-tuple hash, so a single high-rate sender sees no benefit from raising
   this.
 - `recv_batch_size` config option on the `[ipfix]`, `[sflow]`, and
-  `[syslog]` (UDP arm only) listeners — above its default of `1` (off), a
-  recv task drains up to `N` already-queued datagrams per `recvmmsg(2)`
-  call instead of one `recvfrom(2)` call per datagram. **Default is `1`,
-  preserving existing behavior on upgrade** — unlike `recv_tasks` above,
-  nothing changes unless this is set explicitly. Complements `recv_tasks`
-  rather than replacing it: `recv_tasks` fans out across many distinct
-  senders and cannot help a single one (`SO_REUSEPORT` hashes by 4-tuple,
-  so one sender always lands on the same task); `recv_batch_size` helps
-  exactly that single-high-rate-sender case by amortizing the syscall.
-  Measured on ipfix at `GEN_PROCS=1` (one sender): `recv_batch_size=32`
-  took the 50,000/s single-sender kernel-loss median from 0.72% to 0.00%
-  with no added CPU (`srv_cores` 1.04-1.09 → 0.93-1.00) — see
+  `[syslog]` (UDP arm only) listeners — above `1` (off), a recv task
+  drains up to `N` already-queued datagrams per `recvmmsg(2)` call instead
+  of one `recvfrom(2)` call per datagram. **Default is `32`, not `1` —
+  this changes behavior on upgrade.** An existing deployment that has
+  never set `recv_batch_size` will, after restarting on this version,
+  allocate batch buffers it did not allocate before: roughly 6 MB of
+  additional resident memory with all three listeners enabled at the
+  default `recv_tasks` of `8` (idle RSS measured 15,084 kB at
+  `recv_batch_size=1` vs. 21,068 kB at `32`). Because `recv_tasks` also
+  defaults to `8`, both knobs are now on by default, and the memory cost
+  of batching scales with the number of recv tasks. Set `recv_batch_size
+  = 1` explicitly in `logthing.toml` before upgrading if byte-for-byte
+  unchanged socket behavior is required. Complements `recv_tasks` rather
+  than replacing it: `recv_tasks` fans out across many distinct senders
+  and cannot help a single one (`SO_REUSEPORT` hashes by 4-tuple, so one
+  sender always lands on the same task); `recv_batch_size` helps exactly
+  that single-high-rate-sender case by amortizing the syscall. Measured
+  on ipfix at `GEN_PROCS=1` (one sender, 50,000/s, `RUNS=5`): median
+  kernel-loss dropped from 0.72% at `recv_batch_size=1` to 0.00% at every
+  setting from `4` upward — the measured win is `1 → ≥4`. The sweep does
+  not show `32` outperforming `8`; this host's run-to-run variance is
+  large at `n=5`, so `32` was chosen for headroom (~6 MB, above) rather
+  than a demonstrated throughput edge over `8` — see
   `docs/performance/2026-09-18-recvmmsg-results.md`. Maximum `256`,
   rejected at config load above that as a likely typo, since each unit
   allocates a 65535-byte buffer per recv task at startup.
