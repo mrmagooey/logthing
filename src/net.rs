@@ -113,6 +113,13 @@ pub struct RecvMmsgBatch {
     // construction, or introduces a field that borrows from outside the
     // struct (rather than from `bufs`/`addrs` it owns), that impl becomes
     // unsound and must be revisited together with this comment.
+    // Never read from Rust -- `msgs[i]` holds the raw pointer into this
+    // storage that the kernel actually reads/writes via `recvmmsg`. The
+    // field's only job is to keep that allocation alive for the struct's
+    // lifetime; deleting it (or letting it drop early) turns every `msgs`
+    // pointer into a dangling one -- a use-after-free the next time
+    // `recvmmsg` writes through it. Do not remove.
+    #[allow(dead_code)]
     iovecs: Vec<libc::iovec>,
     msgs: Vec<libc::mmsghdr>,
 }
@@ -145,8 +152,9 @@ impl RecvMmsgBatch {
     pub fn new(batch_size: usize) -> Self {
         assert!(batch_size >= 1, "batch_size must be at least 1");
         let mut bufs: Vec<Vec<u8>> = (0..batch_size).map(|_| vec![0u8; 65535]).collect();
-        let addrs: Vec<libc::sockaddr_storage> =
-            (0..batch_size).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let addrs: Vec<libc::sockaddr_storage> = (0..batch_size)
+            .map(|_| unsafe { std::mem::zeroed() })
+            .collect();
         let mut iovecs: Vec<libc::iovec> = bufs
             .iter_mut()
             .map(|b| libc::iovec {
@@ -170,7 +178,13 @@ impl RecvMmsgBatch {
                 msg_len: 0,
             })
             .collect();
-        Self { batch_size, bufs, addrs, iovecs, msgs }
+        Self {
+            batch_size,
+            bufs,
+            addrs,
+            iovecs,
+            msgs,
+        }
     }
 
     /// Message `i`'s payload from the most recent successful `recv()` call.
@@ -213,7 +227,8 @@ impl RecvMmsgBatch {
         // shorter value left over from a previous call would truncate the
         // next message's address parse.
         for msg in &mut self.msgs {
-            msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            msg.msg_hdr.msg_namelen =
+                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
         }
         // The zero-latency guarantee (a lone queued datagram returns
         // immediately, never waits to fill the batch) actually comes from
@@ -264,8 +279,9 @@ impl RecvMmsgBatch {
         loop {
             socket.readable().await?;
             let fd = socket.as_raw_fd();
-            let result =
-                socket.try_io(tokio::io::Interest::READABLE, || unsafe { self.recv_mmsg_once(fd) });
+            let result = socket.try_io(tokio::io::Interest::READABLE, || unsafe {
+                self.recv_mmsg_once(fd)
+            });
             match result {
                 Ok(0) => continue,
                 Ok(n) => return Ok(n),
@@ -542,7 +558,9 @@ mod tests {
     #[tokio::test]
     async fn reuseport_allows_two_sockets_on_one_port() {
         let first = bind_udp_reuseport_with_recv_buffer(
-            &"127.0.0.1:0".parse().unwrap(), None, "test_proto",
+            &"127.0.0.1:0".parse().unwrap(),
+            None,
+            "test_proto",
         )
         .await
         .expect("first reuseport bind");
@@ -565,7 +583,9 @@ mod tests {
         let addr = first.local_addr().expect("local addr");
 
         assert!(
-            bind_udp_with_recv_buffer(&addr, None, "test_proto").await.is_err(),
+            bind_udp_with_recv_buffer(&addr, None, "test_proto")
+                .await
+                .is_err(),
             "a second plain bind on the same port must fail"
         );
     }
@@ -643,7 +663,10 @@ mod tests {
     fn parse_proc_net_udp_sums_all_matching_lines() {
         let entry = parse_proc_net_udp(FIXTURE_PROC_NET_UDP_REUSEPORT, "00000000:1F49")
             .expect("both reuseport lines must parse");
-        assert_eq!(entry.drops, 42, "drops must be summed across both sockets, not taken from the first");
+        assert_eq!(
+            entry.drops, 42,
+            "drops must be summed across both sockets, not taken from the first"
+        );
         assert_eq!(entry.rx_queue, 0x300, "rx_queue must be summed too");
     }
 
@@ -755,17 +778,28 @@ mod tests {
         let mut batch = RecvMmsgBatch::new(32);
         let received = batch.recv(&listen_sock).await.unwrap();
 
-        assert_eq!(received, n, "all {n} already-queued datagrams must come back in one call");
-        let mut got_payloads: Vec<Vec<u8>> = (0..received).map(|i| batch.payload(i).to_vec()).collect();
+        assert_eq!(
+            received, n,
+            "all {n} already-queued datagrams must come back in one call"
+        );
+        let mut got_payloads: Vec<Vec<u8>> =
+            (0..received).map(|i| batch.payload(i).to_vec()).collect();
         got_payloads.sort();
         let mut want_payloads = expected_payloads;
         want_payloads.sort();
-        assert_eq!(got_payloads, want_payloads, "every payload must be received intact");
+        assert_eq!(
+            got_payloads, want_payloads,
+            "every payload must be received intact"
+        );
 
         let mut srcs: Vec<SocketAddr> = (0..received).map(|i| batch.src(i).unwrap()).collect();
         srcs.sort();
         srcs.dedup();
-        assert_eq!(srcs.len(), n, "each message's source address must be distinct and correctly parsed");
+        assert_eq!(
+            srcs.len(),
+            n,
+            "each message's source address must be distinct and correctly parsed"
+        );
     }
 
     /// A lone datagram must come back immediately -- `recv()` must NOT wait to
@@ -780,7 +814,11 @@ mod tests {
         client.send_to(b"lonely datagram", addr).await.unwrap();
 
         let mut batch = RecvMmsgBatch::new(32);
-        let result = tokio::time::timeout(std::time::Duration::from_millis(30), batch.recv(&listen_sock)).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(30),
+            batch.recv(&listen_sock),
+        )
+        .await;
 
         let received = result
             .expect("recv() must return well within 30ms for one already-queued datagram, not wait to fill a 32-message batch")

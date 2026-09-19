@@ -1714,7 +1714,11 @@ mod tests {
         let _ = shutdown_tx.send(true);
         let _ = task.await;
 
-        assert_eq!(handler.message_count(), 0, "every datagram must be rejected");
+        assert_eq!(
+            handler.message_count(),
+            0,
+            "every datagram must be rejected"
+        );
 
         let map = snapshotter.snapshot().into_hashmap();
         let rejected = map
@@ -1837,7 +1841,11 @@ mod tests {
         let _ = shutdown_tx.send(true);
         let _ = task.await;
 
-        assert_eq!(handler.message_count(), 0, "every datagram must be rejected");
+        assert_eq!(
+            handler.message_count(),
+            0,
+            "every datagram must be rejected"
+        );
 
         let map = snapshotter.snapshot().into_hashmap();
         let rejected = map
@@ -1854,8 +1862,7 @@ mod tests {
             })
             .unwrap_or(0);
         assert_eq!(
-            rejected,
-            n as u64,
+            rejected, n as u64,
             "listener_source_rejected must count every datagram through the recv_tasks=4 + recv_batch_size=16 combined path, not one per batch"
         );
     }

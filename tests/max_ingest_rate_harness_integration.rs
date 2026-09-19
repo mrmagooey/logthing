@@ -65,7 +65,8 @@ fn harness_selftest_passes() {
 #[test]
 fn short_run_emits_a_verdict_and_restores_tracked_configs() {
     let root = repo_root();
-    if !root.join("target/release/logthing").exists() || !root.join("target/release/loadgen").exists()
+    if !root.join("target/release/logthing").exists()
+        || !root.join("target/release/loadgen").exists()
     {
         eprintln!("skipping: release binaries not built");
         return;
@@ -88,7 +89,11 @@ fn short_run_emits_a_verdict_and_restores_tracked_configs() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let combined = format!("{stdout}{stderr}");
-    assert!(out.status.success(), "harness exited {:?}:\n{stdout}\n{stderr}", out.status.code());
+    assert!(
+        out.status.success(),
+        "harness exited {:?}:\n{stdout}\n{stderr}",
+        out.status.code()
+    );
 
     // measure_rate prints the rate-level AGGREGATE verdict as a bare,
     // standalone line on stderr (`echo "$verdict" >&2` in the harness) --

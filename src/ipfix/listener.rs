@@ -1003,14 +1003,20 @@ mod tests {
         sock.send_to(&template_datagram(1), bound).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         for n in 0..10u64 {
-            sock.send_to(&data_datagram(n as u32 + 2, n), bound).await.unwrap();
+            sock.send_to(&data_datagram(n as u32 + 2, n), bound)
+                .await
+                .unwrap();
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         let _ = shutdown_tx.send(true);
         let _ = listener.await;
 
-        assert_eq!(handler.flow_count(), 10, "every data record in the batch must decode");
+        assert_eq!(
+            handler.flow_count(),
+            10,
+            "every data record in the batch must decode"
+        );
     }
 
     /// The `allowed_ips` and per-datagram-counter invariant, tested together:
@@ -1049,7 +1055,8 @@ mod tests {
             ..IpfixListenerConfig::default()
         };
         let handler = CountingHandler::new();
-        let listener = IpfixListener::new(config, handler.clone()).with_allowed_ips(disallowing_whitelist);
+        let listener =
+            IpfixListener::new(config, handler.clone()).with_allowed_ips(disallowing_whitelist);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move { listener.start_with_shutdown(shutdown_rx).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1057,7 +1064,9 @@ mod tests {
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let n = 10u32;
         for i in 0..n {
-            sock.send_to(&template_datagram(i + 1), bound).await.unwrap();
+            sock.send_to(&template_datagram(i + 1), bound)
+                .await
+                .unwrap();
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
@@ -1070,14 +1079,20 @@ mod tests {
         let rejected = map
             .get(&CompositeKey::new(
                 MetricKind::Counter,
-                metrics::Key::from_parts("listener_source_rejected", vec![metrics::Label::new("protocol", "ipfix")]),
+                metrics::Key::from_parts(
+                    "listener_source_rejected",
+                    vec![metrics::Label::new("protocol", "ipfix")],
+                ),
             ))
             .map(|(_, _, v)| match v {
                 DebugValue::Counter(c) => *c,
                 _ => 0,
             })
             .unwrap_or(0);
-        assert_eq!(rejected, n as u64, "listener_source_rejected must count every datagram in the batch, not one per batch");
+        assert_eq!(
+            rejected, n as u64,
+            "listener_source_rejected must count every datagram in the batch, not one per batch"
+        );
     }
 
     /// The gap Finding 1 of the plan review named directly: the two tests above
@@ -1107,7 +1122,9 @@ mod tests {
             // the socket, so this test actually exercises n > 1 in the
             // `for i in 0..n` loop of the fan-out batched arm, not n == 1 every
             // time.
-            sock.send_to(&data_datagram(n as u32 + 2, n), bound).await.unwrap();
+            sock.send_to(&data_datagram(n as u32 + 2, n), bound)
+                .await
+                .unwrap();
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
@@ -1176,7 +1193,8 @@ mod tests {
             ..IpfixListenerConfig::default()
         };
         let handler = CountingHandler::new();
-        let listener = IpfixListener::new(config, handler.clone()).with_allowed_ips(disallowing_whitelist);
+        let listener =
+            IpfixListener::new(config, handler.clone()).with_allowed_ips(disallowing_whitelist);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move { listener.start_with_shutdown(shutdown_rx).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1184,7 +1202,9 @@ mod tests {
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let n = 10u32;
         for i in 0..n {
-            sock.send_to(&template_datagram(i + 1), bound).await.unwrap();
+            sock.send_to(&template_datagram(i + 1), bound)
+                .await
+                .unwrap();
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
@@ -1197,7 +1217,10 @@ mod tests {
         let rejected = map
             .get(&CompositeKey::new(
                 MetricKind::Counter,
-                metrics::Key::from_parts("listener_source_rejected", vec![metrics::Label::new("protocol", "ipfix")]),
+                metrics::Key::from_parts(
+                    "listener_source_rejected",
+                    vec![metrics::Label::new("protocol", "ipfix")],
+                ),
             ))
             .map(|(_, _, v)| match v {
                 DebugValue::Counter(c) => *c,
@@ -1205,8 +1228,7 @@ mod tests {
             })
             .unwrap_or(0);
         assert_eq!(
-            rejected,
-            n as u64,
+            rejected, n as u64,
             "listener_source_rejected must count every datagram through the recv_tasks=4 + recv_batch_size=16 combined path, not one per batch"
         );
     }
