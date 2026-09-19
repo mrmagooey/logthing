@@ -76,6 +76,7 @@ pub fn ie_info(id: u16) -> Option<(&'static str, IeType)> {
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Identifies a template within a specific exporter and observation domain.
@@ -99,13 +100,36 @@ pub struct FieldSpecifier {
 /// keys are always allowed to be updated (templates are periodically re-sent).
 pub const MAX_CACHED_TEMPLATES: usize = 100_000;
 
+/// How long a template survives without being re-sent or used before it
+/// becomes eligible for eviction. Only consulted when the cache is full, so
+/// a healthy deployment never evicts anything.
+const TEMPLATE_TTL_SECS: u64 = 3600;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A cached template plus its last-use timestamp.
+#[derive(Debug)]
+pub(crate) struct TemplateEntry {
+    fields: Vec<FieldSpecifier>,
+    /// Unix seconds. Refreshed on insert and on every successful lookup via a
+    /// `Relaxed` store through a shared reference, so the read-mostly
+    /// invariant documented on `IpfixDecoder` is preserved — no write lock on
+    /// the decode hot path.
+    last_seen: AtomicU64,
+}
+
 /// The template map plus the one-shot warning flag, together under a single
 /// lock. They are one unit of state: the flag describes whether we have
 /// already warned about *this* map being full, so splitting them would let
 /// the warning and the capacity check disagree.
 #[derive(Debug, Default)]
 pub(crate) struct TemplateCache {
-    map: HashMap<TemplateKey, Vec<FieldSpecifier>>,
+    map: HashMap<TemplateKey, TemplateEntry>,
     limit_warned: bool,
 }
 
@@ -114,6 +138,14 @@ pub(crate) struct TemplateCache {
 /// data. Read-mostly: a template is written once per exporter re-send
 /// interval and read once per data set, so an `RwLock` read is the common
 /// path and it is cheap against a syscall-bound receive loop.
+///
+/// The cache key includes the UDP source address, which is trivially
+/// spoofable, and an insert overwrites its key unconditionally — so one
+/// exporter (or an off-path attacker spoofing its address) can poison
+/// another exporter's templates. This is inherent to unauthenticated UDP
+/// IPFIX; the real fix is transport security (RFC 7011 §11), which is out of
+/// scope here. The available mitigation today is a tight per-exporter
+/// `security.allowed_ips`, not a broad CIDR.
 #[derive(Debug, Clone, Default)]
 pub struct IpfixDecoder {
     cache: Arc<RwLock<TemplateCache>>,
@@ -125,12 +157,11 @@ impl IpfixDecoder {
     }
 
     pub(crate) fn cache_get(&self, key: &TemplateKey) -> Option<Vec<FieldSpecifier>> {
-        self.cache
-            .read()
-            .expect("template cache lock poisoned")
-            .map
-            .get(key)
-            .cloned()
+        let guard = self.cache.read().expect("template cache lock poisoned");
+        let entry = guard.map.get(key)?;
+        // AtomicU64::store takes &self, so this needs no write lock.
+        entry.last_seen.store(now_secs(), Ordering::Relaxed);
+        Some(entry.fields.clone())
     }
 
     #[cfg(test)]
@@ -163,11 +194,29 @@ impl IpfixDecoder {
     /// Insert `fields` for `key` into the template cache, enforcing the capacity bound.
     ///
     /// - If `key` already exists the entry is updated unconditionally.
-    /// - If `key` is new and the cache is at `MAX_CACHED_TEMPLATES` capacity,
-    ///   the insert is refused, `ipfix_templates_dropped` is incremented, and a
-    ///   warning is logged (at most once until capacity drops below the limit).
+    /// - If `key` is new and the cache is at `MAX_CACHED_TEMPLATES` capacity, a
+    ///   TTL sweep runs first to reclaim space from templates that have not
+    ///   been re-sent or looked up in `TEMPLATE_TTL_SECS`. If the sweep still
+    ///   leaves the cache full, the insert is refused,
+    ///   `ipfix_templates_dropped` is incremented, and a warning is logged (at
+    ///   most once until capacity drops below the limit).
     pub(crate) fn try_insert_template(&self, key: TemplateKey, fields: Vec<FieldSpecifier>) {
         let mut guard = self.cache.write().expect("template cache lock poisoned");
+
+        if !guard.map.contains_key(&key) && guard.map.len() >= MAX_CACHED_TEMPLATES {
+            // Only sweep when full: a healthy deployment never reaches this
+            // branch, so templates are never evicted in normal operation.
+            let cutoff = now_secs().saturating_sub(TEMPLATE_TTL_SECS);
+            let before = guard.map.len();
+            guard
+                .map
+                .retain(|_, e| e.last_seen.load(Ordering::Relaxed) > cutoff);
+            let evicted = before - guard.map.len();
+            if evicted > 0 {
+                metrics::counter!("ipfix_templates_evicted").increment(evicted as u64);
+            }
+        }
+
         if !guard.map.contains_key(&key) && guard.map.len() >= MAX_CACHED_TEMPLATES {
             metrics::counter!("ipfix_templates_dropped").increment(1);
             if !guard.limit_warned {
@@ -184,11 +233,28 @@ impl IpfixDecoder {
             return;
         }
         // Reset the warned flag once we're back below capacity (key already existed
-        // and was updated, so cache size did not grow).
+        // and was updated, or a sweep reclaimed space, so a later genuine fill warns
+        // again either way).
         if guard.map.len() < MAX_CACHED_TEMPLATES {
             guard.limit_warned = false;
         }
-        guard.map.insert(key, fields);
+        guard.map.insert(
+            key,
+            TemplateEntry {
+                fields,
+                last_seen: AtomicU64::new(now_secs()),
+            },
+        );
+    }
+
+    /// Test-only: forces every cached entry to look already-expired, so tests
+    /// can exercise the TTL sweep without sleeping for `TEMPLATE_TTL_SECS`.
+    #[cfg(test)]
+    pub(crate) fn force_expire_all_for_test(&self) {
+        let guard = self.cache.read().expect("template cache lock poisoned");
+        for entry in guard.map.values() {
+            entry.last_seen.store(0, Ordering::Relaxed);
+        }
     }
 }
 
@@ -2585,6 +2651,62 @@ mod tests {
             "capacity bound must keep rejecting new keys after the warning was emitted"
         );
         assert_eq!(dec.cache_len(), MAX_CACHED_TEMPLATES);
+    }
+
+    // ---- try_insert_template: TTL sweep (Task 5) ----
+
+    fn test_field() -> FieldSpecifier {
+        FieldSpecifier {
+            ie_id: 8,
+            length: 4,
+            enterprise_number: None,
+        }
+    }
+
+    /// A full cache must self-heal. Before the fix there was no eviction path at
+    /// all, so once an attacker filled the cache with 100k spoofed templates,
+    /// every new legitimate exporter template was refused until process restart.
+    #[test]
+    fn full_cache_evicts_expired_entries_and_admits_a_new_template() {
+        let dec = IpfixDecoder::new();
+
+        // Fill to capacity with entries stamped as already expired.
+        for i in 0u32..MAX_CACHED_TEMPLATES as u32 {
+            let key = (IpAddr::V4(Ipv4Addr::from(i)), i, 256u16);
+            dec.try_insert_template(key, vec![test_field()]);
+        }
+        assert_eq!(dec.cache_len(), MAX_CACHED_TEMPLATES);
+        dec.force_expire_all_for_test();
+
+        // A new template from a legitimate exporter must now be admitted.
+        let fresh = (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7, 999);
+        dec.try_insert_template(fresh, vec![test_field()]);
+        assert!(
+            dec.cache_contains_key(&fresh),
+            "a full cache of expired entries must evict to admit a new template"
+        );
+    }
+
+    /// An exporter that is still sending data keeps its template alive
+    /// indefinitely, even if it never re-sends the template itself.
+    #[test]
+    fn lookup_refreshes_last_seen() {
+        let dec = IpfixDecoder::new();
+        let key = (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 1, 256);
+        dec.try_insert_template(key, vec![test_field()]);
+
+        dec.force_expire_all_for_test();
+        let _ = dec.cache_get(&key); // refreshes last_seen
+
+        // Fill the rest of the cache and trigger a sweep; the refreshed entry
+        // must survive it.
+        for i in 0u32..MAX_CACHED_TEMPLATES as u32 {
+            dec.try_insert_template((IpAddr::V4(Ipv4Addr::from(i)), i, 512), vec![test_field()]);
+        }
+        assert!(
+            dec.cache_contains_key(&key),
+            "an entry refreshed by a successful lookup must not be evicted"
+        );
     }
 
     // ---- parse_ipfix_options_template_set: enterprise field in options template ----
