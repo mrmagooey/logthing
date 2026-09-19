@@ -22,10 +22,11 @@ pub const MAX_SYSLOG_TCP_CONNECTIONS: usize = 1024;
 /// so 1024 silent sockets exhaust the listener. This is also the default for
 /// `SyslogListenerConfig::tcp_idle_timeout`; tests override that field with
 /// a short value rather than this constant, since a `tests/` integration
-/// crate does not see `#[cfg(test)]` from this crate. `pub` (not
-/// `pub(crate)`) because `main.rs` is a separate binary crate that depends
-/// on this one and needs it to populate the config field.
-pub const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// crate does not see `#[cfg(test)]` from this crate. `main.rs` (a separate
+/// binary crate) gets this value via `SyslogListenerConfig::default()`
+/// (`..Default::default()` in its config literal), not by naming this
+/// constant directly, so it stays `pub(crate)`.
+pub(crate) const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Maximum accepted line length in bytes for TCP syslog connections.
 ///

@@ -27,10 +27,23 @@ pub const ZEEK_MAX_LINE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 /// caller of `ZeekListenerConfig` — production and tests alike — builds it
 /// as a bare 2-field literal with no `..Default::default()`, so a new
 /// required field would ripple through all of them for no production
-/// benefit. The idle-timeout behaviour itself is covered by an in-crate
-/// unit test that calls `handle_tcp_connection` directly with a short
-/// `Duration`, which needs no external visibility into this constant.
+/// benefit.
+///
+/// The `#[cfg(test)]` override below is visible to every test in this file,
+/// including ones that drive the real accept loop via `run_with_listener`
+/// (unlike syslog's external `tests/` integration test, these are in-crate
+/// `#[cfg(test)]` tests compiled as part of this same crate, so they DO see
+/// this cfg-gated value) — that lets a test exercise the production
+/// `let idle_timeout = TCP_IDLE_TIMEOUT;` wiring at the accept-loop call
+/// sites directly, not just `handle_tcp_connection` in isolation with a
+/// hand-passed `Duration`. 500ms is short enough to keep that test fast but
+/// comfortably longer than the connect-then-write latency every other test
+/// in this file relies on, so it does not introduce flakiness in tests that
+/// were not written with an idle timeout in mind.
+#[cfg(not(test))]
 pub(crate) const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(test)]
+pub(crate) const TCP_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Configuration for the Zeek TCP NDJSON listener.
 #[derive(Debug, Clone)]
@@ -980,5 +993,76 @@ mod tests {
             })
             .unwrap_or(0);
         assert_eq!(count, 1, "zeek_tcp_idle_timeouts must be 1; got {count}");
+    }
+
+    /// The accept-loop wiring itself: `run_with_listener` (the same code
+    /// path `start`/`start_with_shutdown` use) must pass the real
+    /// `TCP_IDLE_TIMEOUT` constant down to `handle_tcp_connection`, not just
+    /// some hand-passed test value. Unlike
+    /// `idle_connection_is_closed_and_increments_metric` above (which calls
+    /// `handle_tcp_connection` directly and only proves the function itself
+    /// honours whatever `Duration` it's given), this test proves the
+    /// constant actually reaches that call site through the production
+    /// accept loop — `let idle_timeout = TCP_IDLE_TIMEOUT;` in
+    /// `run_with_listener` could be swapped for the wrong constant, or
+    /// `Duration::MAX`, and this test would catch it while the other would
+    /// not. Relies on the `#[cfg(test)]` override of `TCP_IDLE_TIMEOUT`
+    /// above (500ms) — see that constant's doc comment for why this is safe
+    /// alongside the other `run_with_listener` tests in this file.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn accept_loop_closes_idle_connection_and_increments_metric() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+
+        let handler = CapturingHandler::new();
+        let handler_clone = handler.clone();
+        let listener = ZeekListener::new(ZeekListenerConfig::default(), handler_clone);
+        let task = tokio::spawn(async move {
+            listener.run_with_listener(tcp_listener).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        // Client connects and sends nothing.
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
+        assert!(
+            matches!(result, Ok(Ok(0))),
+            "expected the accept loop's real TCP_IDLE_TIMEOUT wiring to \
+             close the idle connection, got {result:?}"
+        );
+
+        task.abort();
+
+        assert!(
+            handler.take_records().is_empty(),
+            "idle connection must not dispatch a record"
+        );
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let count = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("zeek_tcp_idle_timeouts"),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            count, 1,
+            "zeek_tcp_idle_timeouts must be 1 when the accept loop's own \
+             wiring times out the connection; got {count}"
+        );
     }
 }
