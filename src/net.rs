@@ -93,8 +93,10 @@ use std::os::fd::AsRawFd;
 /// Fixed-capacity storage for one `recvmmsg(2)` call, built once per recv
 /// task and reused for its lifetime. Allocating `mmsghdr`/`iovec`/buffer/
 /// address storage per call would trade one syscall for `batch_size` heap
-/// allocations -- exactly the cost batching exists to avoid. Not `Send` in
-/// any way that matters here: each recv task owns one and never shares it.
+/// allocations -- exactly the cost batching exists to avoid. Not auto-`Send`
+/// (see the field comment on `iovecs`/`msgs` below and the `unsafe impl
+/// Send` just after this struct) -- each recv task owns one and never
+/// shares it.
 pub struct RecvMmsgBatch {
     batch_size: usize,
     bufs: Vec<Vec<u8>>,
@@ -105,9 +107,35 @@ pub struct RecvMmsgBatch {
     // `new()` returns, so these raw pointers stay valid for the struct's
     // whole lifetime regardless of how the struct itself is moved (moving a
     // `Vec` moves its 3-word header, never its heap-allocated contents).
+    //
+    // This is also the invariant the `unsafe impl Send` just below depends
+    // on -- if a future change ever resizes any of these four fields after
+    // construction, or introduces a field that borrows from outside the
+    // struct (rather than from `bufs`/`addrs` it owns), that impl becomes
+    // unsound and must be revisited together with this comment.
     iovecs: Vec<libc::iovec>,
     msgs: Vec<libc::mmsghdr>,
 }
+
+// SAFETY: `RecvMmsgBatch` is not auto-`Send` because `iovecs`/`msgs` hold
+// raw pointers (`*mut c_void`/`*mut iovec`). Those pointers reference only
+// this struct's own `bufs`/`addrs` heap allocations -- never another
+// instance's, and never anything external -- and per the field-invariant
+// comment above, neither `bufs`, `addrs`, `iovecs` nor `msgs` is ever
+// resized after `new()` returns. Moving the whole struct (its four `Vec`
+// headers, 3 words apiece) therefore leaves every pointed-to heap byte in
+// place and every raw pointer still valid, a thread boundary included.
+// Every construction site holds a single owned local, never wrapped in
+// `Arc` or cloned; `recv()` takes `&mut self` and `src()`/`payload()` are
+// only ever called sequentially by the task that owns it -- so this is
+// *exclusive-ownership* Send, not concurrent access, and no `Sync` impl
+// exists or is needed. Required because `RecvMmsgBatch::recv()` is
+// `.await`ed while the struct is held live inside two `tokio::spawn`-ed
+// futures in `src/ipfix/listener.rs` (`start_with_shutdown`'s inline
+// `recv_batch_size > 1` arm and `ipfix_recv_loop`'s) -- without this,
+// the compiler infers `!Send` for both and they fail to compile with
+// "future cannot be sent between threads safely".
+unsafe impl Send for RecvMmsgBatch {}
 
 impl RecvMmsgBatch {
     /// `batch_size` message slots, each with a `65535`-byte buffer -- the

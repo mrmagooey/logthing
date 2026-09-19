@@ -364,25 +364,6 @@ impl IpfixListener {
     }
 }
 
-// SAFETY: `crate::net::RecvMmsgBatch` is not auto-`Send` -- its `iovecs`/
-// `msgs` fields hold raw pointers (`*mut c_void`/`*mut iovec`) into buffers
-// it owns itself (`bufs`/`addrs`). That struct's own field comment already
-// establishes the invariant this relies on: "moving a `Vec` moves its
-// 3-word header, never its heap-allocated contents", so every raw pointer
-// stays valid wherever the whole struct is relocated to, a thread boundary
-// included -- nothing here is borrowed from, or shared with, another
-// instance. This impl is *exclusive-ownership* Send, not `Sync`: no `Sync`
-// impl exists or is needed, since exactly one recv task ever owns a given
-// `RecvMmsgBatch`. Required because `RecvMmsgBatch::recv()` is `.await`ed
-// both inline in `start_with_shutdown` (which main.rs wraps in
-// `tokio::spawn`) and inside `ipfix_recv_loop` below (itself `tokio::spawn`ed
-// per `SO_REUSEPORT` member) -- without this, the compiler infers `!Send`
-// for the whole future and both call sites fail to compile with "future
-// cannot be sent between threads safely". Placed here rather than in
-// `src/net.rs` because this crate's orphan-rule allows an impl for a local
-// type from any module, and `src/net.rs` is out of scope for this change.
-unsafe impl Send for crate::net::RecvMmsgBatch {}
-
 /// The recv loop run by each task in the `recv_tasks > 1` fan-out. Same
 /// body as the `recv_tasks <= 1` path in `start_with_shutdown`, parameterized
 /// so it can be spawned once per `SO_REUSEPORT` socket. `socket_stats` is
