@@ -790,7 +790,7 @@ mod tests {
 
     /// Build one sFlow v5 datagram: header + one flow sample (sampled_ipv4)
     /// + one counter sample (generic_if_counters) — byte-for-byte the same
-    /// layout as `tools/loadgen/src/sflow_udp.rs`'s `build_datagram`.
+    ///   layout as `tools/loadgen/src/sflow_udp.rs`'s `build_datagram`.
     fn build_datagram(seq: u32, n: u64) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
 

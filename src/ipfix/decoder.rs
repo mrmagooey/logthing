@@ -133,10 +133,16 @@ impl IpfixDecoder {
             .cloned()
     }
 
+    #[cfg(test)]
     pub(crate) fn cache_len(&self) -> usize {
-        self.cache.read().expect("template cache lock poisoned").map.len()
+        self.cache
+            .read()
+            .expect("template cache lock poisoned")
+            .map
+            .len()
     }
 
+    #[cfg(test)]
     pub(crate) fn cache_contains_key(&self, key: &TemplateKey) -> bool {
         self.cache
             .read()
@@ -145,8 +151,13 @@ impl IpfixDecoder {
             .contains_key(key)
     }
 
+    #[cfg(test)]
     pub(crate) fn cache_is_empty(&self) -> bool {
-        self.cache.read().expect("template cache lock poisoned").map.is_empty()
+        self.cache
+            .read()
+            .expect("template cache lock poisoned")
+            .map
+            .is_empty()
     }
 
     /// Insert `fields` for `key` into the template cache, enforcing the capacity bound.
