@@ -169,8 +169,8 @@ own note rather than folded into the kernel figure).
 | format | `recv_tasks=1` @ old ceiling | `recv_tasks=4` @ old ceiling | `recv_tasks=4` @ new ceiling |
 |---|---|---|---|
 | ipfix @ 37,500/s  | median **0.0000%** (1 of 3 runs FAIL-LOSS, run 2 lost 4.90% before restart-noise recovered) | median **0.0000%**, all 3 PASS | @ 60,000/s: median **0.0000%**, all 3 PASS |
-| sflow @ 40,000/s  | median **0.1380%** | median **0.1828%** | @ 60,000/s: median **0.0007%**, per-run kernel drops 0 / 6 / 38, `srv_cores` 2.20-2.30 (vs. ~1.14-1.19 at 40,000/s) |
-| syslog @ 20,000/s | median **0.0460%** | median **0.0000%** | @ 40,000/s: median **0.4470%**, all 3 FAIL-LOSS |
+| sflow @ 40,000/s  | median **0.1380%** | median **0.1828%** | @ 60,000/s: median **0.0007%**, per-run kernel drops 0 / 6 / 38, `srv_cores` 2.20-2.30 |
+| syslog @ 20,000/s (RUNS=5, re-measured — see methodology note below) | median **0.0310%** (losses 0.0213, 5.3181, 0.0310, 0.0130, 0.7374) | median **0.0000%** (losses 0.0000 x5) | @ 40,000/s: median **0.4470%**, all 3 FAIL-LOSS |
 
 Notes:
 - ipfix at `recv_tasks=4`/37,500/s and syslog at `recv_tasks=4`/40,000/s
@@ -183,6 +183,22 @@ Notes:
   16,819 datagrams (2.80%) while its two neighbours lost under 0.19%
   combined. See §4's variance finding for the full picture, including a
   5-run repeat of exactly this rate that landed at median 0.0000%.
+- **`srv_cores` at sflow's `recv_tasks=4`/60,000/s (2.20-2.30) is not
+  directly comparable to `recv_tasks=1`/40,000/s (1.14-1.19)** — that
+  conflates the CPU cost of more recv tasks with the cost of a higher
+  offered rate, two variables moving at once. The like-for-like,
+  fixed-rate comparison is `recv_tasks=4`/40,000/s: `srv_cores`
+  **1.14-1.19 → 1.37-1.50** (`docs/performance/2026-09-18-udp-recv-fanout-sflow-rt1-40000.log`
+  vs. `docs/performance/2026-09-18-udp-recv-fanout-sflow-rt4-40000.log`),
+  i.e. fan-out alone costs roughly a fifth of a core more at the same
+  rate. The 60,000/s figure is retained in the table above because it is
+  the new ceiling, not because it is comparable to the 40,000/s row.
+- **The syslog `recv_tasks=1`/`recv_tasks=4` @ 20,000/s cells were
+  re-measured at `RUNS=5`**, replacing an earlier `RUNS=3` pair whose
+  `recv_tasks=4` median rested on a `GENERATOR-LIMITED` run. See "A note
+  on `GENERATOR-LIMITED` runs and loss medians" below for why, and for the
+  other three committed logs with the same defect that were **not**
+  re-measured.
 
 Source logs (committed verbatim beside this document):
 `docs/performance/2026-09-18-udp-recv-fanout-ipfix-rt1-37500.log`,
@@ -191,9 +207,61 @@ Source logs (committed verbatim beside this document):
 `docs/performance/2026-09-18-udp-recv-fanout-sflow-rt1-40000.log`,
 `docs/performance/2026-09-18-udp-recv-fanout-sflow-rt4-40000.log`,
 `docs/performance/2026-09-18-udp-recv-fanout-sflow-rt4-60000.log`,
-`docs/performance/2026-09-18-udp-recv-fanout-syslog-rt1-20000.log`,
-`docs/performance/2026-09-18-udp-recv-fanout-syslog-rt4-20000.log`,
+`docs/performance/2026-09-18-udp-recv-fanout-syslog-rt1-20000-clean5.log`,
+`docs/performance/2026-09-18-udp-recv-fanout-syslog-rt4-20000-clean5.log`,
 `docs/performance/2026-09-18-udp-recv-fanout-syslog-rt4-40000.log`.
+
+### A note on `GENERATOR-LIMITED` runs and loss medians
+
+The harness correctly refuses to report a `GENERATOR-LIMITED` **rate** as a
+ceiling during a ramp — the ramps in this document honour that. But a
+`GENERATOR-LIMITED` **individual run** inside an otherwise-fixed-rate,
+`RUNS=N` set is not excluded from that rate's loss statistics: it still
+contributes a loss figure, and because the run under-offered the target
+rate, that figure is often near-zero for the wrong reason — the run never
+sent the traffic that would have been lost, not because nothing was lost.
+This is a gap in the measurement method, not in this document's arithmetic.
+
+**Four committed logs in this document contain at least one
+`GENERATOR-LIMITED` run:**
+
+- `docs/performance/2026-09-18-udp-recv-fanout-syslog-rt4-20000.log` — run 2
+  of 3 achieved only 15,482.5/s against a 20,000/s target (77%) and
+  reported 0.0000% loss, sitting at the median position alongside run 1's
+  genuine 0.0000%. **This one distorted a published cell**: the original
+  `recv_tasks=4` @ 20,000/s median of 0.0000% rested in part on a run that
+  never offered full load. It has been replaced above by a clean `RUNS=5`
+  re-measurement (`syslog-rt1-20000-clean5.log` /
+  `syslog-rt4-20000-clean5.log`) with no `GENERATOR-LIMITED` run in either
+  set — the re-measured data supports the same conclusion more strongly
+  (`recv_tasks=4` is zero-loss across all 5 runs; `recv_tasks=1` has two
+  bad runs, one at 5.32%).
+- `docs/performance/2026-09-18-udp-recv-fanout-sflow-rt1-40000.log` — run 3
+  of 3 achieved 36,563/s against 40,000/s (91%) and reported 1.2937% loss.
+  This run is the **maximum**, not the median, of that 3-run set — the
+  published median (0.1380%) is run 2's genuine value and is not affected.
+  Left as measured.
+- `docs/performance/2026-09-18-udp-recv-fanout-sweep-ipfix-rt1.log` — run 1
+  of 5 achieved 50,771/s against 60,000/s (85%) and reported 15.8659%
+  loss. This run is the **maximum**, not the median, of that 5-run set —
+  the published median (7.8068%) is run 3's genuine value and is not
+  affected. Left as measured.
+- `docs/performance/2026-09-18-udp-recv-fanout-sflow-ramp-rt4.log` — one run
+  at the 160,000/s ramp step was `GENERATOR-LIMITED`. That rate is well
+  above sflow's actual 82,500/s ceiling and the other two runs at that
+  step already failed on loss, so the ramp's verdict at that step
+  (`FAIL-LOSS`) was unaffected and the ramp correctly continued down to
+  find the ceiling. Left as measured; this is the case the harness's
+  ramp-level `GENERATOR-LIMITED` handling was designed for and handled
+  correctly.
+
+**Follow-up (not fixed here):** the harness should exclude
+`GENERATOR-LIMITED` runs from a fixed-rate set's loss statistics
+(min/median/max), not only from ramp ceiling verdicts. The syslog case
+above shows this is not merely theoretical — it silently produced a
+misleadingly optimistic published number once in this campaign. Recorded
+as a durable fix for `scripts/max-ingest-rate.sh`; out of scope for this
+document.
 
 ### The `recv_tasks` sweep — IPFIX @ 60,000/s, RUNS=5
 
