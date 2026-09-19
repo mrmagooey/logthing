@@ -36,14 +36,22 @@ pub const SURICATA_MAX_LINE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 /// this cfg-gated value) — that lets a test exercise the production
 /// `let idle_timeout = TCP_IDLE_TIMEOUT;` wiring at the accept-loop call
 /// sites directly, not just `handle_tcp_connection` in isolation with a
-/// hand-passed `Duration`. 500ms is short enough to keep that test fast but
-/// comfortably longer than the connect-then-write latency every other test
-/// in this file relies on, so it does not introduce flakiness in tests that
-/// were not written with an idle timeout in mind.
+/// hand-passed `Duration`.
+///
+/// This override is FILE-WIDE — every test in this file compiled under
+/// `cfg(test)` gets this value, not just the idle-timeout tests. In
+/// particular, `oversized_line_closes_connection_and_increments_metric`
+/// pushes `SURICATA_MAX_LINE_BYTES + 1` (16 MiB + 1) of un-newlined data
+/// through a single `read_until` call that this same timeout wraps; that
+/// call must finish within this window or the test fails for the wrong
+/// reason (idle-timeout counter instead of oversized-lines counter). 5s
+/// gives that a ~3.3 MB/s floor, comfortable even on a loaded/throttled CI
+/// runner. If you're tempted to tune this down further for faster
+/// idle-timeout tests, check that test still has headroom first.
 #[cfg(not(test))]
 pub(crate) const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 #[cfg(test)]
-pub(crate) const TCP_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
+pub(crate) const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Configuration for the Suricata TCP EVE JSON listener.
 #[derive(Debug, Clone)]
@@ -993,10 +1001,11 @@ mod tests {
         });
         sleep(Duration::from_millis(20)).await;
 
-        // Client connects and sends nothing.
+        // Client connects and sends nothing. Outer bound (8s) must exceed
+        // the #[cfg(test)] TCP_IDLE_TIMEOUT (5s) with margin.
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut buf = [0u8; 1];
-        let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
+        let result = tokio::time::timeout(Duration::from_secs(8), stream.read(&mut buf)).await;
         assert!(
             matches!(result, Ok(Ok(0))),
             "expected the accept loop's real TCP_IDLE_TIMEOUT wiring to \
