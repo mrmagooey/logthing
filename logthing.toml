@@ -29,16 +29,19 @@ udp_port = 514      # Standard syslog UDP port (env: LOGTHING__SYSLOG__UDP_PORT)
 tcp_port = 601      # Standard syslog TCP port (RFC 6587) (env: LOGTHING__SYSLOG__TCP_PORT)
 parse_dns = true    # Enable DNS log parsing
 
-# Number of UDP receive tasks draining udp_port (default: 1; the TCP listener
+# Number of UDP receive tasks draining udp_port (default: 8; the TCP listener
 # on tcp_port is unaffected). Raise when syslog_udp_socket_drops climbs while
 # the process is using roughly one core. Measured recommendation: 4
 # (docs/performance/2026-09-18-udp-recv-fanout-results.md) — 8 bought no
-# further median improvement. Only helps when there are many distinct
+# further median improvement over 4 on throughput; the default is set to 8
+# anyway for headroom, since idle-cost measurement showed the knob is nearly
+# free (~19 KB RSS and one file descriptor per extra socket, zero receive
+# buffer memory actually charged). Only helps when there are many distinct
 # senders (e.g. a fleet of hosts): SO_REUSEPORT hashes by 4-tuple, so a
 # single sender always lands on the same task regardless of this value.
 # Capped at 64 at config load — anything above that is rejected as a
 # likely typo, since it would bind that many sockets at startup.
-# recv_tasks = 1   # env: LOGTHING__SYSLOG__RECV_TASKS
+# recv_tasks = 8   # env: LOGTHING__SYSLOG__RECV_TASKS
 
 # Optional: persist syslog messages to S3 as Parquet files.
 # Remove or comment out this block to disable syslog S3 persistence.
@@ -83,13 +86,17 @@ bind_address = "0.0.0.0"   # env: LOGTHING__IPFIX__BIND_ADDRESS
 
 # Number of UDP receive tasks draining udp_port (default: 1). Raise when
 # ipfix_socket_drops climbs while the process is using roughly one core.
-# Measured recommendation: 4 (docs/performance/2026-09-18-udp-recv-fanout-results.md)
-# — 8 bought no further median improvement. Only helps when there are many
+# Default: 8. Measured recommendation: 4
+# (docs/performance/2026-09-18-udp-recv-fanout-results.md) — 8 bought no
+# further median improvement over 4 on throughput; the default is set to 8
+# anyway for headroom, since idle-cost measurement showed the knob is nearly
+# free (~19 KB RSS and one file descriptor per extra socket, zero receive
+# buffer memory actually charged). Only helps when there are many
 # distinct exporters: SO_REUSEPORT hashes by 4-tuple, so a single exporter
 # always lands on the same task regardless of this value.
 # Capped at 64 at config load — anything above that is rejected as a
 # likely typo, since it would bind that many sockets at startup.
-# recv_tasks = 1   # env: LOGTHING__IPFIX__RECV_TASKS
+# recv_tasks = 8   # env: LOGTHING__IPFIX__RECV_TASKS
 
 # Optional: persist IPFIX/NetFlow flows to S3 as Parquet files.
 # Remove or comment out this block to disable IPFIX S3 persistence.
@@ -112,15 +119,18 @@ enabled      = false
 udp_port     = 6343        # Standard sFlow UDP port (env: LOGTHING__SFLOW__UDP_PORT)
 bind_address = "0.0.0.0"   # env: LOGTHING__SFLOW__BIND_ADDRESS
 
-# Number of UDP receive tasks draining udp_port (default: 1). Raise when
+# Number of UDP receive tasks draining udp_port (default: 8). Raise when
 # sflow_socket_drops climbs while the process is using roughly one core.
 # Measured recommendation: 4 (docs/performance/2026-09-18-udp-recv-fanout-results.md)
-# — 8 bought no further median improvement. Only helps when there are many
-# distinct agents: SO_REUSEPORT hashes by 4-tuple, so a single agent always
-# lands on the same task regardless of this value.
+# — 8 bought no further median improvement over 4 on throughput; the default
+# is set to 8 anyway for headroom, since idle-cost measurement showed the
+# knob is nearly free (~19 KB RSS and one file descriptor per extra socket,
+# zero receive buffer memory actually charged). Only helps when there are
+# many distinct agents: SO_REUSEPORT hashes by 4-tuple, so a single agent
+# always lands on the same task regardless of this value.
 # Capped at 64 at config load — anything above that is rejected as a
 # likely typo, since it would bind that many sockets at startup.
-# recv_tasks = 1   # env: LOGTHING__SFLOW__RECV_TASKS
+# recv_tasks = 8   # env: LOGTHING__SFLOW__RECV_TASKS
 
 # Optional: persist sFlow samples to S3 as Parquet files.
 # Remove or comment out this block to disable sFlow S3 persistence.

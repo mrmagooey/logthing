@@ -197,7 +197,7 @@ pub struct SyslogConfig {
     #[serde(default = "default_syslog_parse_dns")]
     pub parse_dns: bool,
 
-    /// Number of UDP receive tasks (default: 1). Applies to the UDP arm
+    /// Number of UDP receive tasks (default: 8). Applies to the UDP arm
     /// only — the TCP listener on `tcp_port` is unaffected. Raise to spread
     /// socket draining across cores when the kernel is dropping datagrams
     /// while CPU sits idle. See docs/performance/2026-09-18-udp-recv-fanout-results.md.
@@ -211,8 +211,12 @@ pub struct SyslogConfig {
     /// hashes to the same socket. Syslog is the format most likely to
     /// genuinely benefit here, since a deployment ingesting from a fleet of
     /// hosts has many distinct senders. `0` is treated the same as `1`, not
-    /// as "disabled". Rejected above `MAX_RECV_TASKS` at config load — see
-    /// `validate_recv_tasks_config`.
+    /// as "disabled". The default of `8` costs roughly 19 KB RSS and one
+    /// file descriptor per extra socket at idle (measured with zero traffic
+    /// — see the idle-cost table in the perf doc above); the measured
+    /// throughput saturation point is `4`, so `8` is headroom, not a claim
+    /// that it outperforms `4`. Rejected above `MAX_RECV_TASKS` at config
+    /// load — see `validate_recv_tasks_config`.
     #[serde(default = "default_syslog_recv_tasks")]
     pub recv_tasks: usize,
 
@@ -278,7 +282,7 @@ pub struct IpfixConfig {
     #[serde(default = "default_udp_receive_buffer_bytes")]
     pub receive_buffer_bytes: Option<usize>,
 
-    /// Number of UDP receive tasks (default: 1). Raise to spread socket
+    /// Number of UDP receive tasks (default: 8). Raise to spread socket
     /// draining across cores when the kernel is dropping datagrams while CPU
     /// sits idle. See docs/performance/2026-09-18-udp-recv-fanout-results.md.
     ///
@@ -289,7 +293,11 @@ pub struct IpfixConfig {
     /// deployment with a single exporter sending from one fixed source port
     /// will see no benefit from raising it, because every datagram still
     /// hashes to the same socket. `0` is treated the same as `1`, not as
-    /// "disabled". Rejected above `MAX_RECV_TASKS` at config load — see
+    /// "disabled". The default of `8` costs roughly 19 KB RSS and one file
+    /// descriptor per extra socket at idle (measured with zero traffic — see
+    /// the idle-cost table in the perf doc above); the measured throughput
+    /// saturation point is `4`, so `8` is headroom, not a claim that it
+    /// outperforms `4`. Rejected above `MAX_RECV_TASKS` at config load — see
     /// `validate_recv_tasks_config`.
     #[serde(default = "default_ipfix_recv_tasks")]
     pub recv_tasks: usize,
@@ -327,7 +335,7 @@ fn default_ipfix_udp_port() -> u16 {
     4739
 }
 fn default_ipfix_recv_tasks() -> usize {
-    1
+    8
 }
 fn default_ipfix_bind_address() -> String {
     "0.0.0.0".to_string()
@@ -839,9 +847,10 @@ pub struct IcebergDescriptorLocalConfig {
 const MAX_RECV_TASKS: usize = 64;
 
 /// Rejects a `recv_tasks` value above `MAX_RECV_TASKS` for any of the three
-/// UDP fan-out listeners. `0` and `1` (the default) are always accepted —
-/// `0` is documented as being treated the same as `1`. See `MAX_RECV_TASKS`
-/// for why the upper bound exists and how it was chosen.
+/// UDP fan-out listeners. `0` and `1` are always accepted — `0` is
+/// documented as being treated the same as `1` — and so is `8`, the
+/// default. See `MAX_RECV_TASKS` for why the upper bound exists and how it
+/// was chosen.
 pub fn validate_recv_tasks_config(cfg: &Config) -> anyhow::Result<()> {
     for (section, value) in [
         ("ipfix.recv_tasks", cfg.ipfix.recv_tasks),
@@ -1064,7 +1073,7 @@ pub struct SflowConfig {
     #[serde(default = "default_udp_receive_buffer_bytes")]
     pub receive_buffer_bytes: Option<usize>,
 
-    /// Number of UDP receive tasks (default: 1). Raise to spread socket
+    /// Number of UDP receive tasks (default: 8). Raise to spread socket
     /// draining across cores when the kernel is dropping datagrams while CPU
     /// sits idle. See docs/performance/2026-09-18-udp-recv-fanout-results.md.
     ///
@@ -1075,7 +1084,11 @@ pub struct SflowConfig {
     /// deployment with a single exporter sending from one fixed source port
     /// will see no benefit from raising it, because every datagram still
     /// hashes to the same socket. `0` is treated the same as `1`, not as
-    /// "disabled". Rejected above `MAX_RECV_TASKS` at config load — see
+    /// "disabled". The default of `8` costs roughly 19 KB RSS and one file
+    /// descriptor per extra socket at idle (measured with zero traffic — see
+    /// the idle-cost table in the perf doc above); the measured throughput
+    /// saturation point is `4`, so `8` is headroom, not a claim that it
+    /// outperforms `4`. Rejected above `MAX_RECV_TASKS` at config load — see
     /// `validate_recv_tasks_config`.
     #[serde(default = "default_sflow_recv_tasks")]
     pub recv_tasks: usize,
@@ -1112,7 +1125,7 @@ fn default_sflow_udp_port() -> u16 {
     6343
 }
 fn default_sflow_recv_tasks() -> usize {
-    1
+    8
 }
 fn default_sflow_bind_address() -> String {
     "0.0.0.0".to_string()
@@ -1413,7 +1426,7 @@ fn default_syslog_parse_dns() -> bool {
 }
 
 fn default_syslog_recv_tasks() -> usize {
-    1
+    8
 }
 
 impl Config {

@@ -11,14 +11,26 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 - `recv_tasks` config option on the `[ipfix]`, `[sflow]`, and `[syslog]`
   (UDP arm only) listeners — binds `N` `SO_REUSEPORT` sockets on the same
   port, each drained by its own task, instead of one socket drained by one
-  task. Default `1` preserves today's exact behavior byte-for-byte. Raise
-  it when `<protocol>_socket_drops` is climbing while the process uses
-  roughly one core; measured recommendation is `4`, which roughly doubled
-  the sustained ingest ceiling for ipfix and sflow and raised syslog's by
-  ~38% (see `docs/performance/2026-09-18-udp-recv-fanout-results.md`).
-  Only helps deployments with many distinct senders on one listener —
-  `SO_REUSEPORT` distributes by 4-tuple hash, so a single high-rate sender
-  sees no benefit from raising this.
+  task. **Default is `8`, not `1` — this changes behavior on upgrade.** An
+  existing deployment that has never set `recv_tasks` will, after
+  restarting on this version, bind 8 `SO_REUSEPORT` sockets per UDP
+  listener instead of the single socket it bound before. Set `recv_tasks =
+  1` explicitly in `logthing.toml` before upgrading if byte-for-byte
+  unchanged socket behavior is required. The default was raised because an
+  idle-cost measurement with no traffic found the knob nearly free at any
+  setting from `1` to `16` — about 19 KB RSS and one extra file descriptor
+  per additional socket, idle CPU rising from 0.090s to 0.130s per 30s, and
+  zero receive-buffer memory actually charged at any setting (`SO_RCVBUF`
+  is a cap, not a reservation) — while the measured throughput saturation
+  point remains `4`; see the idle-cost section of
+  `docs/performance/2026-09-18-udp-recv-fanout-results.md`. Raise it
+  further when `<protocol>_socket_drops` is climbing while the process
+  uses roughly one core; measured recommendation is `4`, which roughly
+  doubled the sustained ingest ceiling for ipfix and sflow and raised
+  syslog's by ~38% (see the same document). Only helps deployments with
+  many distinct senders on one listener — `SO_REUSEPORT` distributes by
+  4-tuple hash, so a single high-rate sender sees no benefit from raising
+  this.
 - `scripts/max-ingest-rate.sh` — per-format maximum sustainable ingest rate
   harness: restarts `logthing` between runs, reconciles kernel-socket drops
   against `/proc/net/udp` (per-listener, not host-wide), and does a coarse

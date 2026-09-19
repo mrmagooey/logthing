@@ -39,10 +39,10 @@ pub struct SyslogListenerConfig {
     /// datagram-drop failure mode this addresses. See
     /// `crate::net::bind_udp_with_recv_buffer`.
     pub receive_buffer_bytes: Option<usize>,
-    /// Number of `SO_REUSEPORT` sockets, each drained by its own task.
-    /// Applies to the UDP arm only — the TCP listener on `tcp_port` is
-    /// unaffected. `1` (the default) uses a single plain socket and is
-    /// byte-for-byte today's behaviour. Above 1, the kernel fans datagrams
+    /// Number of `SO_REUSEPORT` sockets, each drained by its own task
+    /// (default: 8). Applies to the UDP arm only — the TCP listener on
+    /// `tcp_port` is unaffected. `1` uses a single plain socket and is
+    /// byte-for-byte the original pre-fan-out behaviour. Above 1, the kernel fans datagrams
     /// across the group; syslog's parser is stateless (each datagram is
     /// parsed independently), so unlike IPFIX no cache needs to be shared
     /// across tasks.
@@ -69,7 +69,7 @@ impl Default for SyslogListenerConfig {
             bind_address: "0.0.0.0".to_string(),
             parse_dns_logs: true,
             receive_buffer_bytes: Some(4 * 1024 * 1024),
-            recv_tasks: 1,
+            recv_tasks: 8,
         }
     }
 }
@@ -263,7 +263,7 @@ impl SyslogListener {
     /// The listener exits cleanly when `shutdown_rx` receives `true` (or is closed).
     /// Used from `main.rs`; tests continue to use `start()` or `run_with_listener()`.
     ///
-    /// `recv_tasks <= 1` (the default) is this exact combined UDP+TCP loop,
+    /// `recv_tasks <= 1` is this exact combined UDP+TCP loop,
     /// unchanged — that is the property that makes the fan-out below safe
     /// to deploy. Above 1, N `SO_REUSEPORT` UDP sockets are bound and each
     /// drained by its own task; the TCP listener is unaffected (`recv_tasks`

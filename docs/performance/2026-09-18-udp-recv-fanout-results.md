@@ -1,9 +1,18 @@
 # UDP receive fan-out (`recv_tasks`) — measured results (2026-09-18)
 
-`recv_tasks` (default `1`) makes the `ipfix`, `sflow`, and `syslog` (UDP arm
+`recv_tasks` (default `8`) makes the `ipfix`, `sflow`, and `syslog` (UDP arm
 only) UDP listeners bind `N` `SO_REUSEPORT` sockets on the same port, each
 drained by its own tokio task, instead of one socket drained by one task. At
-`recv_tasks=1` every listener runs today's exact code path, unchanged.
+`recv_tasks=1` every listener runs the original, pre-fan-out code path,
+unchanged.
+
+The default was `1` (i.e. the feature was off by default) when the
+throughput measurements below were taken; every `recv_tasks=1` figure in
+this document reflects that pre-change default, not a hand-picked test
+value. It was changed to `8` after the idle-cost measurement in §6 below
+showed the knob is nearly free even at rest — the throughput saturation
+point found here (§4) is still `4`, and `8` is a headroom choice on top of
+that finding, not a claim that `8` outperforms `4`.
 
 ## Hardware caveat (carried forward verbatim from prior perf docs)
 
@@ -340,3 +349,60 @@ limitation is stated here explicitly rather than left implicit.
   formats.
 - **No figure in this document is accurate beyond two significant
   figures** — see the variance finding, §4.
+
+## 6. Idle-cost measurement (evidence for the `recv_tasks=8` default)
+
+Everything above measures throughput under load. This section measures the
+opposite: what `recv_tasks` costs with **no traffic at all**, across all
+three listeners, at `recv_tasks` ∈ {1, 4, 8, 16}. This is the basis for
+changing the shipped default from `1` to `8` — the throughput saturation
+point found in §4 is unchanged and remains `4`; `8` is a headroom choice on
+top of that finding, justified by this section, not a claim that `8`
+outperforms `4` on throughput. The sweep in §4 (`recv_tasks` ∈ {1, 2, 4, 8})
+showed 4 and 8 at the same median 0.00% loss.
+
+| `recv_tasks` | RSS (kB) | file descriptors | idle CPU (s / 30 s) | threads | `skmem` recv-queue bytes |
+|---:|---:|---:|---:|---:|---:|
+| 1  | 14,080 | 16 | 0.090 | 12    | 0 |
+| 4  | ~14,248 | 25 | ~0.098 | ~12   | 0 |
+| 8  | ~14,472 | 37 | ~0.109 | ~12-13 | 0 |
+| 16 | 14,920 | 61 | 0.130 | 13    | 0 |
+
+The `1` and `16` rows are the directly measured endpoints. The `4` and `8`
+rows' file-descriptor counts are exact, derived from the mechanism below;
+their RSS and idle-CPU figures are linear interpolations between the `1`
+and `16` endpoints (not independently sampled) and are marked `~`
+accordingly — consistent with the near-linear, essentially-flat trend the
+endpoints themselves show.
+
+Findings:
+
+- **RSS grows by about 19 KB per additional socket** (14,080 kB → 14,920 kB
+  from `recv_tasks=1` to `16`, i.e. 840 kB over 15 increments of 3 sockets
+  each — see the file-descriptor note below — which is ~19 KB/socket).
+- **File descriptors grow by 3 per increment of `recv_tasks`, one per
+  listener** (ipfix, sflow, syslog each bind one more `SO_REUSEPORT` socket
+  per increment): 16 → 61 from `recv_tasks=1` to `16` is exactly `16 + 15
+  increments × 3 sockets = 61`. The raw capture's own per-socket `sockets`
+  column was **defective** — an `ss` field-index error miscounted it — so
+  the socket count used here is inferred from this file-descriptor growth
+  rather than from that column.
+- **Idle CPU rises only slightly**, 0.090s → 0.130s of CPU time per 30s
+  wall-clock window, from `recv_tasks=1` to `16`.
+- **Thread count is essentially constant**, 12 → 13, because recv tasks are
+  tokio async tasks sharing the existing runtime's worker-thread pool, not
+  one OS thread each.
+- **`skmem` shows zero receive-buffer memory charged at every setting
+  measured.** `SO_RCVBUF` (see `default_udp_receive_buffer_bytes`, 4 MiB
+  per socket) is a **cap that bounds worst-case memory under overload**,
+  not a reservation — the kernel does not pre-allocate or hold that memory
+  against an idle socket, so raising `recv_tasks` does not multiply actual
+  resident receive-buffer memory the way the 4 MiB figure alone might
+  suggest.
+
+Taken together, the idle cost of raising the default from `1` to `8` is
+about 19 KB × 21 extra sockets (3 listeners × 7 extra tasks) ≈ 400 KB of
+RSS, 21 extra file descriptors, and no measurable receive-buffer memory —
+small enough that the shipped default was moved to `8` for headroom above
+the measured `4` saturation point, rather than staying at the historical
+`1`.
