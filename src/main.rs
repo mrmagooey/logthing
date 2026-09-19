@@ -352,6 +352,7 @@ async fn async_main() -> anyhow::Result<()> {
             receive_buffer_bytes: config_clone.syslog.receive_buffer_bytes,
             recv_tasks: config_clone.syslog.recv_tasks,
             recv_batch_size: config_clone.syslog.recv_batch_size,
+            ..syslog::listener::SyslogListenerConfig::default()
         };
         let syslog_ip_whitelist = ip_whitelist.clone();
         let handle = tokio::spawn(async move {
