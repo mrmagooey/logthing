@@ -230,7 +230,8 @@ pub struct SyslogConfig {
     /// socket rather than spreading datagrams across sockets, so it is the
     /// lever for exactly the deployment shape `recv_tasks` cannot help (see
     /// `recv_tasks`'s own doc comment). The two knobs are independent and
-    /// may be combined. Never waits to fill a batch — a lone datagram is
+    /// may be combined. `0` is treated the same as `1` (batching off), not
+    /// as "disabled". Never waits to fill a batch — a lone datagram is
     /// still returned immediately. Rejected above `MAX_RECV_BATCH_SIZE` at
     /// config load — see `validate_recv_batch_size_config`.
     #[serde(default = "default_syslog_recv_batch_size")]
@@ -327,7 +328,8 @@ pub struct IpfixConfig {
     /// socket rather than spreading datagrams across sockets, so it is the
     /// lever for exactly the deployment shape `recv_tasks` cannot help (see
     /// `recv_tasks`'s own doc comment). The two knobs are independent and
-    /// may be combined. Never waits to fill a batch — a lone datagram is
+    /// may be combined. `0` is treated the same as `1` (batching off), not
+    /// as "disabled". Never waits to fill a batch — a lone datagram is
     /// still returned immediately. Rejected above `MAX_RECV_BATCH_SIZE` at
     /// config load — see `validate_recv_batch_size_config`.
     #[serde(default = "default_ipfix_recv_batch_size")]
@@ -910,13 +912,13 @@ pub fn validate_recv_tasks_config(cfg: &Config) -> anyhow::Result<()> {
 /// same per-datagram size the existing single-recv path already allocates),
 /// so an unbounded value multiplies startup memory per task rather than
 /// failing fast with a clear error. `256` is `256 * 65535` ≈ 16.8 MiB per
-/// task -- already generous; nothing in this plan's own measurements
+/// task — already generous; nothing in this plan's own measurements
 /// recommends anywhere near that value, this is a typo guard, not a tuning
 /// ceiling.
 const MAX_RECV_BATCH_SIZE: usize = 256;
 
 /// Rejects a `recv_batch_size` value above `MAX_RECV_BATCH_SIZE` for any of
-/// the three UDP fan-out listeners. `0` and `1` are always accepted -- `0`
+/// the three UDP fan-out listeners. `0` and `1` are always accepted — `0`
 /// is treated the same as `1` (batching off), matching `recv_tasks`'s own
 /// `0`-means-`1` convention. See `MAX_RECV_BATCH_SIZE` for why the bound
 /// exists.
@@ -929,7 +931,7 @@ pub fn validate_recv_batch_size_config(cfg: &Config) -> anyhow::Result<()> {
         if value > MAX_RECV_BATCH_SIZE {
             anyhow::bail!(
                 "{section} = {value} exceeds the maximum of {MAX_RECV_BATCH_SIZE}; this almost \
-                 certainly means a typo rather than an intentional value -- each unit allocates a \
+                 certainly means a typo rather than an intentional value — each unit allocates a \
                  65535-byte buffer per recv task at startup. Lower {section} to \
                  {MAX_RECV_BATCH_SIZE} or below."
             );
@@ -1170,7 +1172,8 @@ pub struct SflowConfig {
     /// socket rather than spreading datagrams across sockets, so it is the
     /// lever for exactly the deployment shape `recv_tasks` cannot help (see
     /// `recv_tasks`'s own doc comment). The two knobs are independent and
-    /// may be combined. Never waits to fill a batch — a lone datagram is
+    /// may be combined. `0` is treated the same as `1` (batching off), not
+    /// as "disabled". Never waits to fill a batch — a lone datagram is
     /// still returned immediately. Rejected above `MAX_RECV_BATCH_SIZE` at
     /// config load — see `validate_recv_batch_size_config`.
     #[serde(default = "default_sflow_recv_batch_size")]
@@ -2719,9 +2722,14 @@ prefix    = "_iceberg_descriptors"
         cfg.ipfix.recv_batch_size = 100_000;
         let err = validate_recv_batch_size_config(&cfg)
             .expect_err("must reject an oversized recv_batch_size");
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("ipfix.recv_batch_size"),
-            "error must name the offending field: {err}"
+            msg.contains("100000") || msg.contains("100_000"),
+            "error must name the offending value: {msg}"
+        );
+        assert!(
+            msg.contains("ipfix.recv_batch_size"),
+            "error must name the offending section: {msg}"
         );
     }
 
