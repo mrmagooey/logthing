@@ -5,6 +5,7 @@ use crate::zeek::ZeekRecord;
 use chrono::Utc;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -17,6 +18,19 @@ pub const MAX_ZEEK_TCP_CONNECTIONS: usize = 1024;
 /// Maximum accepted line length in bytes. Lines exceeding this are skipped
 /// and counted via `zeek_oversized_lines`.
 pub const ZEEK_MAX_LINE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
+/// Maximum time a TCP connection may sit without delivering a complete line
+/// before it is closed. Without this, a client that connects and sends
+/// nothing holds a connection-semaphore permit for the process's lifetime,
+/// so 1024 silent sockets exhaust the listener. Not exposed via
+/// `ZeekListenerConfig` (unlike syslog's `tcp_idle_timeout`): every existing
+/// caller of `ZeekListenerConfig` — production and tests alike — builds it
+/// as a bare 2-field literal with no `..Default::default()`, so a new
+/// required field would ripple through all of them for no production
+/// benefit. The idle-timeout behaviour itself is covered by an in-crate
+/// unit test that calls `handle_tcp_connection` directly with a short
+/// `Duration`, which needs no external visibility into this constant.
+pub(crate) const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Configuration for the Zeek TCP NDJSON listener.
 #[derive(Debug, Clone)]
@@ -123,9 +137,10 @@ impl ZeekListener {
                             match semaphore.clone().try_acquire_owned() {
                                 Ok(permit) => {
                                     let handler = self.handler.clone();
+                                    let idle_timeout = TCP_IDLE_TIMEOUT;
                                     tokio::spawn(async move {
                                         let _permit = permit; // held for connection lifetime
-                                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler).await {
+                                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler, idle_timeout).await {
                                             error!("Zeek TCP connection error from {}: {}", src, e);
                                         }
                                     });
@@ -176,10 +191,12 @@ impl ZeekListener {
                     match semaphore.clone().try_acquire_owned() {
                         Ok(permit) => {
                             let handler = self.handler.clone();
+                            let idle_timeout = TCP_IDLE_TIMEOUT;
                             tokio::spawn(async move {
                                 let _permit = permit; // held for connection lifetime
                                 if let Err(e) =
-                                    Self::handle_tcp_connection(stream, src, handler).await
+                                    Self::handle_tcp_connection(stream, src, handler, idle_timeout)
+                                        .await
                                 {
                                     error!("Zeek TCP connection error from {}: {}", src, e);
                                 }
@@ -206,6 +223,7 @@ impl ZeekListener {
         stream: TcpStream,
         src: SocketAddr,
         handler: Arc<dyn ZeekHandler>,
+        idle_timeout: Duration,
     ) -> anyhow::Result<()> {
         let mut reader = BufReader::new(stream);
         let mut buf: Vec<u8> = Vec::new();
@@ -213,9 +231,19 @@ impl ZeekListener {
         loop {
             buf.clear();
             let mut limited = (&mut reader).take((ZEEK_MAX_LINE_BYTES as u64) + 1);
-            let n = match limited.read_until(b'\n', &mut buf).await {
-                Ok(n) => n,
-                Err(e) => {
+            let n = match tokio::time::timeout(idle_timeout, limited.read_until(b'\n', &mut buf))
+                .await
+            {
+                Err(_elapsed) => {
+                    metrics::counter!("zeek_tcp_idle_timeouts").increment(1);
+                    debug!(
+                        "Zeek TCP connection from {} idle past timeout; closing",
+                        src
+                    );
+                    break;
+                }
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => {
                     error!("Zeek TCP read error from {}: {}", src, e);
                     break;
                 }
@@ -391,7 +419,7 @@ mod tests {
         });
 
         let (stream, src) = listener.accept().await.unwrap();
-        ZeekListener::handle_tcp_connection(stream, src, CapturingHandler::new())
+        ZeekListener::handle_tcp_connection(stream, src, CapturingHandler::new(), TCP_IDLE_TIMEOUT)
             .await
             .unwrap();
         client.await.unwrap();
@@ -454,7 +482,7 @@ mod tests {
 
         let (stream, src) = listener.accept().await.unwrap();
         let handler = CapturingHandler::new();
-        ZeekListener::handle_tcp_connection(stream, src, handler.clone())
+        ZeekListener::handle_tcp_connection(stream, src, handler.clone(), TCP_IDLE_TIMEOUT)
             .await
             .unwrap();
         client.await.unwrap();
@@ -892,5 +920,65 @@ mod tests {
             "allowed source must reach the handler; got {}",
             records.len()
         );
+    }
+
+    /// A connection that sends nothing must be closed once `idle_timeout`
+    /// elapses, incrementing `zeek_tcp_idle_timeouts` and dispatching no
+    /// record. Drives `handle_tcp_connection` directly with a short
+    /// `Duration` — the production constant is 300s, far too long to sleep
+    /// through in a test — so this exercises the exact same timeout-wrapped
+    /// `read_until` production code runs, just parameterized with a small
+    /// value.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn idle_connection_is_closed_and_increments_metric() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+        use tokio::time::timeout;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Client connects and sends nothing.
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut buf = [0u8; 1];
+            // The server must close its half once the short idle timeout
+            // elapses; read() then returns Ok(0).
+            let result = timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
+            assert!(
+                matches!(result, Ok(Ok(0))),
+                "expected the server to close the idle connection, got {result:?}"
+            );
+        });
+
+        let (stream, src) = listener.accept().await.unwrap();
+        ZeekListener::handle_tcp_connection(
+            stream,
+            src,
+            CapturingHandler::new(),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        client.await.unwrap();
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let count = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("zeek_tcp_idle_timeouts"),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert_eq!(count, 1, "zeek_tcp_idle_timeouts must be 1; got {count}");
     }
 }

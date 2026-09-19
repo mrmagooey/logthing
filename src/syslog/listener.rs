@@ -6,6 +6,7 @@ use crate::middleware::IpWhitelist;
 use crate::syslog::{SyslogMessage, dns::DnsLogEntry, payload};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -14,6 +15,17 @@ use tracing::{debug, error, info, warn};
 /// Maximum number of concurrent TCP connections accepted by the syslog listener.
 /// Prevents resource exhaustion from connection floods.
 pub const MAX_SYSLOG_TCP_CONNECTIONS: usize = 1024;
+
+/// Maximum time a TCP connection may sit without delivering a complete line
+/// before it is closed. Without this, a client that connects and sends
+/// nothing holds a connection-semaphore permit for the process's lifetime,
+/// so 1024 silent sockets exhaust the listener. This is also the default for
+/// `SyslogListenerConfig::tcp_idle_timeout`; tests override that field with
+/// a short value rather than this constant, since a `tests/` integration
+/// crate does not see `#[cfg(test)]` from this crate. `pub` (not
+/// `pub(crate)`) because `main.rs` is a separate binary crate that depends
+/// on this one and needs it to populate the config field.
+pub const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Maximum accepted line length in bytes for TCP syslog connections.
 ///
@@ -65,6 +77,12 @@ pub struct SyslogListenerConfig {
     /// `SyslogConfig::recv_batch_size` for the full explanation -- unlike
     /// `recv_tasks`, this helps a single high-rate sender.
     pub recv_batch_size: usize,
+    /// Maximum time a TCP connection may sit without delivering a complete
+    /// line before it is closed (default: [`TCP_IDLE_TIMEOUT`], 300s). Exists
+    /// as a config field (rather than reading the constant directly) so
+    /// tests can inject a short value and exercise the real timeout codepath
+    /// through the public `start_with_shutdown` entry point.
+    pub tcp_idle_timeout: Duration,
 }
 
 impl Default for SyslogListenerConfig {
@@ -77,6 +95,7 @@ impl Default for SyslogListenerConfig {
             receive_buffer_bytes: Some(4 * 1024 * 1024),
             recv_tasks: 8,
             recv_batch_size: 32,
+            tcp_idle_timeout: TCP_IDLE_TIMEOUT,
         }
     }
 }
@@ -303,6 +322,7 @@ impl SyslogListener {
 
             let handler_udp = self.handler.clone();
             let handler_tcp = self.handler.clone();
+            let tcp_idle_timeout = self.config.tcp_idle_timeout;
             let mut socket_stats = crate::net::SocketDropStats::new(&udp_socket, "syslog_udp");
             let mut socket_stats_ticker =
                 tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
@@ -355,7 +375,7 @@ impl SyslogListener {
                                             let handler = handler_tcp.clone();
                                             tokio::spawn(async move {
                                                 let _permit = permit; // held for connection lifetime
-                                                if let Err(e) = Self::handle_tcp_connection(stream, src, handler).await {
+                                                if let Err(e) = Self::handle_tcp_connection(stream, src, handler, tcp_idle_timeout).await {
                                                     error!("TCP connection error from {}: {}", src, e);
                                                 }
                                             });
@@ -459,7 +479,14 @@ impl SyslogListener {
                                         let handler = handler_tcp.clone();
                                         tokio::spawn(async move {
                                             let _permit = permit; // held for connection lifetime
-                                            if let Err(e) = Self::handle_tcp_connection(stream, src, handler).await {
+                                            if let Err(e) = Self::handle_tcp_connection(
+                                                stream,
+                                                src,
+                                                handler,
+                                                tcp_idle_timeout,
+                                            )
+                                            .await
+                                            {
                                                 error!("TCP connection error from {}: {}", src, e);
                                             }
                                         });
@@ -547,12 +574,14 @@ impl SyslogListener {
         let tcp_handler = self.handler.clone();
         let tcp_allowed_ips = self.allowed_ips.clone();
         let tcp_shutdown_rx = shutdown_rx.clone();
+        let tcp_idle_timeout = self.config.tcp_idle_timeout;
         tasks.push(tokio::spawn(syslog_tcp_accept_loop(
             tcp_listener,
             tcp_handler,
             tcp_allowed_ips,
             semaphore,
             tcp_shutdown_rx,
+            tcp_idle_timeout,
         )));
 
         for task in tasks {
@@ -662,10 +691,16 @@ impl SyslogListener {
                     match semaphore.clone().try_acquire_owned() {
                         Ok(permit) => {
                             let handler = self.handler.clone();
+                            let tcp_idle_timeout = self.config.tcp_idle_timeout;
                             tokio::spawn(async move {
                                 let _permit = permit; // held for connection lifetime
-                                if let Err(e) =
-                                    Self::handle_tcp_connection(stream, src, handler).await
+                                if let Err(e) = Self::handle_tcp_connection(
+                                    stream,
+                                    src,
+                                    handler,
+                                    tcp_idle_timeout,
+                                )
+                                .await
                                 {
                                     error!("TCP connection error from {}: {}", src, e);
                                 }
@@ -698,6 +733,7 @@ impl SyslogListener {
         stream: TcpStream,
         src: SocketAddr,
         handler: Arc<dyn SyslogHandler>,
+        idle_timeout: Duration,
     ) -> anyhow::Result<()> {
         let mut reader = BufReader::new(stream);
         let mut buf: Vec<u8> = Vec::new();
@@ -705,9 +741,16 @@ impl SyslogListener {
         loop {
             buf.clear();
             let mut limited = (&mut reader).take((SYSLOG_MAX_LINE_BYTES as u64) + 1);
-            let n = match limited.read_until(b'\n', &mut buf).await {
-                Ok(n) => n,
-                Err(e) => {
+            let n = match tokio::time::timeout(idle_timeout, limited.read_until(b'\n', &mut buf))
+                .await
+            {
+                Err(_elapsed) => {
+                    metrics::counter!("syslog_tcp_idle_timeouts").increment(1);
+                    debug!("TCP connection from {} idle past timeout; closing", src);
+                    break;
+                }
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => {
                     error!("TCP read error from {}: {}", src, e);
                     break;
                 }
@@ -891,6 +934,7 @@ async fn syslog_tcp_accept_loop(
     allowed_ips: IpWhitelist,
     semaphore: Arc<Semaphore>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    idle_timeout: Duration,
 ) {
     loop {
         tokio::select! {
@@ -908,7 +952,14 @@ async fn syslog_tcp_accept_loop(
                                 let handler = handler.clone();
                                 tokio::spawn(async move {
                                     let _permit = permit; // held for connection lifetime
-                                    if let Err(e) = SyslogListener::handle_tcp_connection(stream, src, handler).await {
+                                    if let Err(e) = SyslogListener::handle_tcp_connection(
+                                        stream,
+                                        src,
+                                        handler,
+                                        idle_timeout,
+                                    )
+                                    .await
+                                    {
                                         error!("TCP connection error from {}: {}", src, e);
                                     }
                                 });
