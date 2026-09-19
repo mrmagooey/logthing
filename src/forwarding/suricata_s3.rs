@@ -1,7 +1,6 @@
 //! Suricata → S3 Parquet persistence.
 //!
 //! Provides:
-//! - `sanitize_event_type()` — safe path segment for S3 keys
 //! - `SuricataSink` — `ParquetSink` adapter for the generic writer (single envelope schema)
 //! - `SuricataS3Handler` — type alias for `ParquetWriterHandle<SuricataSink>`
 //! - `suricata_start()` — convenience constructor wiring `SuricataS3Config` → `ParquetWriterHandle`
@@ -9,49 +8,24 @@
 //! Unlike Zeek (which has per-stream typed schemas), Suricata uses a single envelope schema
 //! for all event types.  The generic `PartitionedParquetWriter` handles all buffering, flush,
 //! cap, encode, and upload machinery.  `SuricataSink` is the thin adapter that provides:
-//! - `partition()` → `sanitize_event_type(record.event_type)` (per-event-type buffer key)
+//! - `partition()` → `sanitize_log_path(record.event_type)` (per-event-type buffer key)
 //! - `schema(partition)` → always returns `envelope_schema()` (no typed registry)
 //! - `to_record_batch()` → calls `map_envelope(record)` directly
 //!
 //! S3 key layout:  `suricata/<sanitized_event_type>/year={Y}/month={MM}/day={DD}/{uuid}.parquet`
 //! Partition cap:  `DEFAULT_MAX_SURICATA_PARTITIONS = 256`; excess → `"_overflow"` buffer.
 //! Metrics:        `parquet_s3_*{source="suricata"}` (generic labels).
+//!
+//! `sanitize_log_path()` (the safe path segment for S3 keys) lives in
+//! `buffered_writer` — it is shared with Zeek and HEC, which also embed
+//! wire-supplied strings in S3 keys.
 
 use crate::config::SuricataS3Config;
-use crate::forwarding::buffered_writer::ParquetSink;
+use crate::forwarding::buffered_writer::{ParquetSink, sanitize_log_path};
 use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::suricata::SuricataRecord;
 use crate::suricata::schema::{envelope_schema, map_envelope};
 use std::sync::Arc;
-
-// ---------------------------------------------------------------------------
-// sanitize_event_type — public helper reused by tests + generic partition()
-// ---------------------------------------------------------------------------
-
-/// Sanitise an attacker-supplied `event_type` value so it is safe to embed in an S3 key.
-/// - Lowercases the input
-/// - Keeps `[a-z0-9_]`, replaces anything else with `_`
-/// - Truncates to 64 chars
-/// - Empty result → `"unknown"`
-pub(crate) fn sanitize_event_type(raw: &str) -> String {
-    let s: String = raw
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(64)
-        .collect();
-    if s.is_empty() {
-        "unknown".to_string()
-    } else {
-        s
-    }
-}
 
 // ---------------------------------------------------------------------------
 // SuricataSink — ParquetSink adapter
@@ -72,11 +46,11 @@ impl ParquetSink for SuricataSink {
         "suricata"
     }
 
-    /// Partition segment = `sanitize_event_type(record.event_type)`.
+    /// Partition segment = `sanitize_log_path(record.event_type)`.
     /// This is used as both the buffer-map key and the S3 path component,
     /// producing keys of the form `suricata/<event_type>/year=…/…parquet`.
     fn partition(&self, record: &SuricataRecord) -> Option<String> {
-        Some(sanitize_event_type(&record.event_type))
+        Some(sanitize_log_path(&record.event_type))
     }
 
     /// Schema for `partition`: always returns `envelope_schema()`.
@@ -318,20 +292,6 @@ mod tests {
             }),
             received_at: Utc::now(),
         }
-    }
-
-    // -- sanitize_event_type --
-
-    #[test]
-    fn event_type_sanitizer_handles_traversal_and_length() {
-        assert_eq!(sanitize_event_type("alert"), "alert");
-        assert_eq!(sanitize_event_type("../etc"), "___etc");
-        let out = sanitize_event_type("../../etc/passwd");
-        assert!(!out.contains('/'));
-        assert!(!out.contains('.'));
-        assert_eq!(sanitize_event_type(""), "unknown");
-        let long_input = "a".repeat(100);
-        assert_eq!(sanitize_event_type(&long_input).len(), 64);
     }
 
     // -- SuricataSink unit --

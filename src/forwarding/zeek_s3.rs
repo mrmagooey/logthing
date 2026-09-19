@@ -1,7 +1,6 @@
 //! Zeek → S3 Parquet persistence.
 //!
 //! Provides:
-//! - `sanitize_log_path()` — safe path segment for S3 keys
 //! - `ZeekSink` — `ParquetSink` adapter for the generic writer (multi-partition)
 //! - `ZeekS3Handler` — type alias for `ParquetWriterHandle<ZeekSink>`
 //! - `zeek_start()` — convenience constructor wiring `ZeekS3Config` → `ParquetWriterHandle`
@@ -15,42 +14,17 @@
 //! S3 key layout:  `zeek/<sanitized_log_path>/year={Y}/month={MM}/day={DD}/{uuid}.parquet`
 //! Partition cap:  `max_partitions` (replaces `MAX_ZEEK_STREAMS`); excess → `"_overflow"` buffer.
 //! Metrics:        `parquet_s3_*{source="zeek"}` (generic labels).
+//!
+//! `sanitize_log_path()` (the safe path segment for S3 keys) lives in
+//! `buffered_writer` — it is shared with Suricata and HEC, which also embed
+//! wire-supplied strings in S3 keys.
 
 use crate::config::ZeekS3Config;
-use crate::forwarding::buffered_writer::ParquetSink;
+use crate::forwarding::buffered_writer::{ParquetSink, sanitize_log_path};
 use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::zeek::ZeekRecord;
 use crate::zeek::schema::{envelope_schema, get_schema_entry};
 use std::sync::Arc;
-
-// ---------------------------------------------------------------------------
-// sanitize_log_path — public helper reused by tests + generic partition()
-// ---------------------------------------------------------------------------
-
-/// Sanitise an attacker-supplied `_path` value so it is safe to embed in an S3 key.
-/// - Lowercases the input
-/// - Keeps `[a-z0-9_]`, replaces anything else with `_`
-/// - Truncates to 64 chars
-/// - Empty result → `"unknown"`
-pub(crate) fn sanitize_log_path(raw: &str) -> String {
-    let s: String = raw
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(64)
-        .collect();
-    if s.is_empty() {
-        "unknown".to_string()
-    } else {
-        s
-    }
-}
 
 // ---------------------------------------------------------------------------
 // ZeekSink — ParquetSink adapter
@@ -447,23 +421,6 @@ mod tests {
             }),
             received_at: Utc::now(),
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // sanitize_log_path tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn log_path_sanitizer_handles_traversal() {
-        assert_eq!(sanitize_log_path("../weird path"), "___weird_path");
-        assert_eq!(sanitize_log_path("conn"), "conn");
-        assert_eq!(sanitize_log_path("../foo"), "___foo");
-        let out = sanitize_log_path("../../etc/passwd");
-        assert!(!out.contains('/'), "sanitized path must not contain /");
-        assert!(!out.contains('.'), "sanitized path must not contain .");
-        assert_eq!(sanitize_log_path(""), "unknown");
-        let long_input = "a".repeat(100);
-        assert_eq!(sanitize_log_path(&long_input).len(), 64);
     }
 
     // -----------------------------------------------------------------------

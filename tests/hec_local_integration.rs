@@ -7,7 +7,7 @@ use logthing::forwarding::generic_s3::hec_local_start;
 use logthing::forwarding::local_sink::LocalDiskSink;
 use logthing::ingest::GenericRecord;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use std::path::Path;
+use std::path::{Component, Path};
 
 fn walk_all_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap() {
@@ -347,4 +347,127 @@ async fn hec_local_burst_crossing_builder_batch_rows_across_multiple_partitions(
          still land every row exactly once"
     );
     assert_eq!(nulls_b, 0, "no type_b record had a null host");
+}
+
+/// Posts a HEC event with `sourcetype = "../escape"` through the *real*
+/// `/services/collector/event` route (`handle_hec_event`, the same handler
+/// `create_router` mounts) and proves the object key `GenericSink::partition`
+/// produces for it -- and that `hec_local_start`'s `LocalDiskSink` actually
+/// writes to -- contains no `..` path segment and lands in the sanitized
+/// `___escape` partition. Regression test for F4 (sourcetype path injection):
+/// before the fix, `GenericSink::partition` returned `sourcetype` verbatim,
+/// so `build_key` produced a key containing `../escape`, which
+/// `LocalDiskSink::upload`'s traversal guard (unrelated, unmodified by this
+/// fix) rejects outright -- meaning the hostile record was silently lost
+/// (zero Parquet files written) rather than filed under a forged partition.
+/// Against an S3 sink (no such guard) the same unsanitized key would instead
+/// have silently succeeded under a forged prefix; this test only has a local
+/// sink available, so it demonstrates the fix via "record is preserved and
+/// correctly partitioned" rather than "record forges another source's keys".
+#[tokio::test]
+async fn hec_route_sanitizes_traversal_sourcetype_before_it_reaches_the_object_key() {
+    use axum::{
+        Extension, Router,
+        body::Body,
+        http::{Request, StatusCode},
+        routing::post,
+    };
+    use logthing::ingest::{IngestState, handlers::handle_hec_event};
+    use tower::ServiceExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = std::sync::Arc::new(
+        LocalDiskSink::new(tmp.path().to_path_buf())
+            .await
+            .expect("LocalDiskSink constructs"),
+    );
+
+    let cfg = GenericLocalConfig {
+        directory: tmp.path().to_path_buf(),
+        prefix: "hec".to_string(),
+        flush_threshold_bytes: usize::MAX,
+        flush_interval_secs: 3600,
+        channel_capacity: 256,
+        max_buffer_rows: 100_000,
+    };
+
+    let (handler, join_handle) = hec_local_start(
+        &cfg,
+        sink,
+        64,
+        std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+
+    let cfg_token = std::sync::Arc::new("tok".to_string());
+    let ingest_state = IngestState {
+        generic_s3: None,
+        generic_local: Some(handler.clone()),
+    };
+
+    let app: Router = Router::new()
+        .route("/services/collector/event", post(handle_hec_event))
+        .layer(Extension(cfg_token))
+        .layer(Extension(ingest_state));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/services/collector/event")
+        .header("Authorization", "Splunk tok")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "event": {"msg": "hostile sourcetype"},
+                "sourcetype": "../escape",
+                "host": "attacker"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    // `app` (and the `GenericS3Handler` clone it holds via `ingest_state`) is
+    // moved into this statement and dropped as soon as the temporary
+    // `Oneshot` future resolves, so only our own `handler` binding remains
+    // afterward.
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the real HEC route must accept a hostile-but-well-formed sourcetype"
+    );
+
+    // Drop our own handle too so the channel closes and the shutdown flush
+    // (which writes the buffered record to disk) runs.
+    drop(handler);
+    tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
+        .await
+        .expect("writer task must exit within 5s")
+        .expect("writer task must not panic");
+
+    let mut all_files = Vec::new();
+    walk_all_files(tmp.path(), &mut all_files);
+    let parquet_files: Vec<_> = all_files
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+        .collect();
+    assert_eq!(
+        parquet_files.len(),
+        1,
+        "expected exactly 1 Parquet file for the hostile sourcetype -- pre-fix, \
+         LocalDiskSink's traversal guard rejects the unsanitized '../escape' key \
+         outright and no file is written at all; found {parquet_files:?}"
+    );
+
+    let rel = parquet_files[0]
+        .strip_prefix(tmp.path())
+        .expect("file must be under the tempdir");
+    assert!(
+        !rel.components().any(|c| c == Component::ParentDir),
+        "written object key must not contain a '..' path segment: {rel:?}"
+    );
+    assert!(
+        rel.starts_with("hec/___escape"),
+        "sourcetype '../escape' must be sanitized into the 'hec/___escape' \
+         partition, matching sanitize_log_path's semantics; got {rel:?}"
+    );
 }

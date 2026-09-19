@@ -665,6 +665,36 @@ impl<R> PartitionBuffer<R> {
 }
 
 // ---------------------------------------------------------------------------
+// sanitize_log_path — shared partition-key sanitizer
+// ---------------------------------------------------------------------------
+
+/// Sanitise a wire-supplied partition-key candidate (Zeek `_path`, Suricata
+/// `event_type`, HEC `sourcetype`) so it is safe to embed in an S3 object key.
+/// - Lowercases the input
+/// - Keeps `[a-z0-9_]`, replaces anything else with `_`
+/// - Truncates to 64 chars
+/// - Empty result → `"unknown"`
+pub(crate) fn sanitize_log_path(raw: &str) -> String {
+    let s: String = raw
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    if s.is_empty() {
+        "unknown".to_string()
+    } else {
+        s
+    }
+}
+
+// ---------------------------------------------------------------------------
 // S3 key builder
 // ---------------------------------------------------------------------------
 
@@ -2178,6 +2208,26 @@ max_partitions = 128
         assert_eq!(p.max_rows, 10_000);
         assert_eq!(p.max_bytes, 100 * 1024 * 1024);
         assert_eq!(p.interval.get().as_secs(), 900);
+    }
+
+    // -----------------------------------------------------------------------
+    // sanitize_log_path tests
+    //
+    // Canonical unit test for the shared partition-key sanitizer, used by
+    // Zeek (`_path`), Suricata (`event_type`), and HEC (`sourcetype`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_log_path_handles_traversal_and_length() {
+        assert_eq!(sanitize_log_path("../weird path"), "___weird_path");
+        assert_eq!(sanitize_log_path("conn"), "conn");
+        assert_eq!(sanitize_log_path("../foo"), "___foo");
+        let out = sanitize_log_path("../../etc/passwd");
+        assert!(!out.contains('/'), "sanitized path must not contain /");
+        assert!(!out.contains('.'), "sanitized path must not contain .");
+        assert_eq!(sanitize_log_path(""), "unknown");
+        let long_input = "a".repeat(100);
+        assert_eq!(sanitize_log_path(&long_input).len(), 64);
     }
 
     // -----------------------------------------------------------------------
