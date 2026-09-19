@@ -197,6 +197,24 @@ pub struct SyslogConfig {
     #[serde(default = "default_syslog_parse_dns")]
     pub parse_dns: bool,
 
+    /// Number of UDP receive tasks (default: 1). Applies to the UDP arm
+    /// only — the TCP listener on `tcp_port` is unaffected. Raise to spread
+    /// socket draining across cores when the kernel is dropping datagrams
+    /// while CPU sits idle. See docs/performance/2026-09-18-udp-recv-fanout-results.md.
+    ///
+    /// The kernel distributes datagrams across the group by hashing each
+    /// packet's source/destination address-port 4-tuple, so throughput
+    /// scales with the number of distinct senders (or, for one sender,
+    /// distinct source ports) — not with the value of this knob. A
+    /// deployment with a single exporter sending from one fixed source port
+    /// will see no benefit from raising it, because every datagram still
+    /// hashes to the same socket. Syslog is the format most likely to
+    /// genuinely benefit here, since a deployment ingesting from a fleet of
+    /// hosts has many distinct senders. `0` is treated the same as `1`, not
+    /// as "disabled".
+    #[serde(default = "default_syslog_recv_tasks")]
+    pub recv_tasks: usize,
+
     /// Enable syslog payload sub-parsing (CEF, LEEF, auditd, DHCP, RADIUS,
     /// web_access, DNS).  Default false (backward compatible).
     #[serde(default)]
@@ -1132,6 +1150,7 @@ impl Default for SyslogConfig {
             tcp_port: default_syslog_tcp_port(),
             receive_buffer_bytes: default_udp_receive_buffer_bytes(),
             parse_dns: default_syslog_parse_dns(),
+            recv_tasks: default_syslog_recv_tasks(),
             parse_payloads: false,
             s3: None,
             structured_s3: None,
@@ -1351,6 +1370,10 @@ fn default_syslog_tcp_port() -> u16 {
 
 fn default_syslog_parse_dns() -> bool {
     true
+}
+
+fn default_syslog_recv_tasks() -> usize {
+    1
 }
 
 impl Config {
