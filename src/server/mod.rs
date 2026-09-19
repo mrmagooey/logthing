@@ -442,6 +442,13 @@ impl Server {
 
         let cfg_token = Arc::new(self.config.hec.token.clone());
 
+        if self.config.hec.enabled && self.config.hec.token.is_empty() {
+            warn!(
+                "[hec] enabled with an empty token — all HEC ingest endpoints accept \
+                 unauthenticated writes. Set hec.token to require a bearer token."
+            );
+        }
+
         // Protected routes (require authentication).
         let mut protected_router = Router::new()
             .route("/wsman", post(handle_wef_request))

@@ -163,10 +163,18 @@ impl ParquetSink for GenericSink {
         "hec"
     }
 
-    /// Partition key = `sourcetype`.  Invalid characters are preserved as-is
-    /// because sourcetypes are operator-controlled (admin-set token required).
+    /// Partition key = sanitized `sourcetype`.
+    ///
+    /// `sourcetype` is wire-supplied (an HTTP query parameter or a JSON body
+    /// field) and becomes a path segment in the S3 object key, so it is
+    /// sanitized exactly as the zeek and suricata sinks sanitize theirs. The
+    /// previous comment claimed it was operator-controlled; that does not
+    /// hold — the HEC token is optional, and even when set, any token holder
+    /// controls the string.
     fn partition(&self, record: &GenericRecord) -> Option<String> {
-        Some(record.sourcetype.clone())
+        Some(crate::forwarding::buffered_writer::sanitize_log_path(
+            &record.sourcetype,
+        ))
     }
 
     /// All partitions — including `_overflow` and `None` — use the same fixed
@@ -343,6 +351,33 @@ mod tests {
     fn generic_sink_partition_uses_sourcetype() {
         let rec = make_record("access_log");
         assert_eq!(GenericSink.partition(&rec), Some("access_log".to_string()));
+    }
+
+    /// `sourcetype` arrives from an HTTP query parameter or JSON body field and
+    /// becomes an S3 object-key path segment. It must be sanitized exactly as the
+    /// zeek and suricata sinks sanitize their wire-derived partition keys.
+    #[test]
+    fn partition_key_sanitizes_traversal_and_control_characters() {
+        for (raw, expected) in [
+            ("../zeek/conn", "___zeek_conn"),
+            ("/absolute", "_absolute"),
+            ("normal_type", "normal_type"),
+            ("UPPER", "upper"),
+            ("", "unknown"),
+        ] {
+            let record = make_record(raw);
+            assert_eq!(
+                GenericSink.partition(&record).as_deref(),
+                Some(expected),
+                "sourcetype {raw:?} was not sanitized"
+            );
+        }
+    }
+
+    #[test]
+    fn partition_key_is_length_capped() {
+        let record = make_record(&"a".repeat(500));
+        assert_eq!(GenericSink.partition(&record).map(|p| p.len()), Some(64));
     }
 
     #[test]
