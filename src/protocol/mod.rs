@@ -55,11 +55,7 @@ impl WefParser {
 
         // Fast single-pass detection using first meaningful element
         // Check first 2000 chars for type detection (avoids scanning entire large bodies)
-        let mut check_len = body.len().min(2000);
-        while check_len > 0 && !body.is_char_boundary(check_len) {
-            check_len -= 1;
-        }
-        let check_body = &body[..check_len];
+        let check_body = crate::truncate_for_log(body, 2000);
 
         if check_body.contains("Subscribe") && check_body.contains("SubscriptionId") {
             return self.parse_subscription(body, source_host);

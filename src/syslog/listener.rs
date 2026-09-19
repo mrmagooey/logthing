@@ -331,7 +331,7 @@ impl SyslogListener {
                                         warn!(
                                             "Failed to parse syslog message from {}: {}",
                                             src,
-                                            &msg[..100.min(msg.len())]
+                                            crate::truncate_for_log(&msg, 100)
                                         );
                                     }
                                 }
@@ -424,7 +424,7 @@ impl SyslogListener {
                                         warn!(
                                             "Failed to parse syslog message from {}: {}",
                                             src,
-                                            &msg[..100.min(msg.len())]
+                                            crate::truncate_for_log(&msg, 100)
                                         );
                                     }
                                 }
@@ -556,7 +556,14 @@ impl SyslogListener {
         )));
 
         for task in tasks {
-            let _ = task.await;
+            if let Err(e) = task.await {
+                // A receive task that panics stops draining its socket for the
+                // lifetime of the process. Discarding this JoinError made that
+                // failure completely silent: the parent handle stays alive, so
+                // main.rs's `supervise_listener_handles` never fires either.
+                metrics::counter!("syslog_recv_task_failed").increment(1);
+                error!("syslog: a receive task terminated abnormally: {e}");
+            }
         }
 
         Ok(())
@@ -604,7 +611,7 @@ impl SyslogListener {
                                 warn!(
                                     "Failed to parse syslog message from {}: {}",
                                     src,
-                                    &msg[..100.min(msg.len())]
+                                    crate::truncate_for_log(&msg, 100)
                                 );
                             }
                         }
@@ -744,7 +751,7 @@ impl SyslogListener {
                 warn!(
                     "Failed to parse TCP syslog message from {}: {}",
                     src,
-                    &line[..100.min(line.len())]
+                    crate::truncate_for_log(&line, 100)
                 );
             }
         }
@@ -791,7 +798,7 @@ async fn syslog_udp_recv_loop(
                                 warn!(
                                     "Failed to parse syslog message from {}: {}",
                                     src,
-                                    &msg[..100.min(msg.len())]
+                                    crate::truncate_for_log(&msg, 100)
                                 );
                             }
                         }
@@ -844,7 +851,7 @@ async fn syslog_udp_recv_loop(
                                 warn!(
                                     "Failed to parse syslog message from {}: {}",
                                     src,
-                                    &msg[..100.min(msg.len())]
+                                    crate::truncate_for_log(&msg, 100)
                                 );
                             }
                         }

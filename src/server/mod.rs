@@ -886,7 +886,7 @@ async fn handle_wef_request(
             warn!(
                 "Unknown message type from {}: {}",
                 addr,
-                &content[..100.min(content.len())]
+                crate::truncate_for_log(&content, 100)
             );
             Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
