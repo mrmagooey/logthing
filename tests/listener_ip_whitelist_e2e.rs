@@ -20,17 +20,46 @@
 //! set to a range that excludes 127.0.0.1, so every probe sent from
 //! 127.0.0.1 below must be rejected.
 //!
-//! The metrics server (`start_metrics_server`, `src/server/mod.rs`) is a
-//! separate axum `Router` with no `IpWhitelist` layer attached, so it stays
-//! scrapable from 127.0.0.1 even though the listeners block 127.0.0.1 —
-//! that asymmetry is exactly what lets this test observe the rejection
-//! counters from outside.
+//! The metrics server (`start_metrics_server`, `src/server/mod.rs`) now has
+//! the same `IpWhitelist` layer attached as the main router (fixed
+//! alongside the `bind_address` hardcoding — see the "Bind address" note in
+//! the README's `## Metrics` section), so it is gated by the exact same
+//! `allowed_ips` as the five listeners above. That means the harness cannot
+//! scrape `/metrics` from 127.0.0.1 once 127.0.0.1 is excluded, which would
+//! otherwise leave this test unable to observe the rejection counters at
+//! all. To keep both properties true at once — listeners still reject
+//! 127.0.0.1, *and* the harness can still read the counters back —
+//! `allowed_ips` here allowlists a second, distinct loopback address
+//! (127.0.0.2/32), and the metrics scrapes below bind their outgoing
+//! connection to that address via `reqwest::ClientBuilder::local_address`,
+//! while every listener probe still originates from the default 127.0.0.1
+//! and stays excluded. Linux treats all of 127.0.0.0/8 as local to the
+//! `lo` interface, so binding a client socket to 127.0.0.2 works without
+//! any extra interface configuration.
 
 use std::fs::File;
+use std::net::{IpAddr, Ipv4Addr};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::sleep;
+
+/// A loopback address distinct from 127.0.0.1, used only for the metrics
+/// scrapes below. Listed in the test's `allowed_ips` so `/metrics` stays
+/// reachable even though 127.0.0.1 — the address every listener probe
+/// below comes from — is excluded. See the module doc comment for why.
+const METRICS_CLIENT_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+
+/// A `reqwest::Client` whose outgoing connections originate from
+/// `METRICS_CLIENT_ADDR` instead of the OS-chosen default (127.0.0.1),
+/// so the `IpWhitelist` layer on the metrics router sees a source address
+/// that is actually in `allowed_ips`.
+fn metrics_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .local_address(METRICS_CLIENT_ADDR)
+        .build()
+        .expect("build metrics client bound to 127.0.0.2")
+}
 
 /// Overall budget for "wait until the process is ready" polling loops.
 /// The binary binds five listeners plus an HTTP router plus a metrics
@@ -124,10 +153,12 @@ async fn wait_for_udp(port: u16, deadline: Instant, what: &str) {
 }
 
 /// Poll the metrics endpoint until it answers with HTTP 200, or panic once
-/// `deadline` passes.
-async fn wait_for_metrics(url: &str, deadline: Instant) {
+/// `deadline` passes. Scrapes via `client` so the source address seen by
+/// the metrics router's `IpWhitelist` layer is `METRICS_CLIENT_ADDR`, not
+/// the default 127.0.0.1 (see the module doc comment).
+async fn wait_for_metrics(client: &reqwest::Client, url: &str, deadline: Instant) {
     loop {
-        if let Ok(resp) = reqwest::get(url).await
+        if let Ok(resp) = client.get(url).send().await
             && resp.status().is_success()
         {
             return;
@@ -181,7 +212,10 @@ bind_address = "127.0.0.1:{http}"
 enabled = false
 
 [security]
-allowed_ips = ["10.99.99.0/24"]
+# 10.99.99.0/24 excludes 127.0.0.1, the address every listener probe below
+# comes from. 127.0.0.2/32 is added only so the test harness itself can
+# still scrape /metrics (see METRICS_CLIENT_ADDR / the module doc comment).
+allowed_ips = ["10.99.99.0/24", "127.0.0.2/32"]
 
 [metrics]
 enabled = true
@@ -236,12 +270,13 @@ tcp_port = {suricata_tcp}
 
     let deadline = Instant::now() + READY_TIMEOUT;
     let metrics_url = format!("http://127.0.0.1:{}/metrics", ports.metrics);
+    let metrics_client = metrics_client();
 
     // Wait for every listener plus the metrics server to actually be bound
     // before probing — no fixed sleep, since bind order across the five
     // listener tasks, the HTTP router and the metrics server is not
     // deterministic.
-    wait_for_metrics(&metrics_url, deadline).await;
+    wait_for_metrics(&metrics_client, &metrics_url, deadline).await;
     wait_for_udp(ports.syslog_udp, deadline, "syslog UDP").await;
     wait_for_tcp(ports.syslog_tcp, deadline, "syslog TCP").await;
     wait_for_udp(ports.ipfix_udp, deadline, "IPFIX").await;
@@ -311,7 +346,9 @@ tcp_port = {suricata_tcp}
     let scrape_deadline = Instant::now() + READY_TIMEOUT;
     let last_rendered;
     loop {
-        let rendered = reqwest::get(&metrics_url)
+        let rendered = metrics_client
+            .get(&metrics_url)
+            .send()
             .await
             .expect("scrape metrics")
             .text()
