@@ -712,6 +712,7 @@ async fn async_main() -> anyhow::Result<()> {
             bind_address: sflow_config_clone.sflow.bind_address.clone(),
             receive_buffer_bytes: sflow_config_clone.sflow.receive_buffer_bytes,
             recv_tasks: sflow_config_clone.sflow.recv_tasks,
+            recv_batch_size: sflow_config_clone.sflow.recv_batch_size,
         };
         let sflow_ip_whitelist = ip_whitelist.clone();
         let handle = tokio::spawn(async move {
