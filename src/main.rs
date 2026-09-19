@@ -351,6 +351,7 @@ async fn async_main() -> anyhow::Result<()> {
             parse_dns_logs: config_clone.syslog.parse_dns,
             receive_buffer_bytes: config_clone.syslog.receive_buffer_bytes,
             recv_tasks: config_clone.syslog.recv_tasks,
+            recv_batch_size: config_clone.syslog.recv_batch_size,
         };
         let syslog_ip_whitelist = ip_whitelist.clone();
         let handle = tokio::spawn(async move {
@@ -441,6 +442,7 @@ async fn async_main() -> anyhow::Result<()> {
             bind_address: ipfix_config_clone.ipfix.bind_address.clone(),
             receive_buffer_bytes: ipfix_config_clone.ipfix.receive_buffer_bytes,
             recv_tasks: ipfix_config_clone.ipfix.recv_tasks,
+            recv_batch_size: ipfix_config_clone.ipfix.recv_batch_size,
         };
         let ipfix_ip_whitelist = ip_whitelist.clone();
         let handle = tokio::spawn(async move {
@@ -711,6 +713,7 @@ async fn async_main() -> anyhow::Result<()> {
             bind_address: sflow_config_clone.sflow.bind_address.clone(),
             receive_buffer_bytes: sflow_config_clone.sflow.receive_buffer_bytes,
             recv_tasks: sflow_config_clone.sflow.recv_tasks,
+            recv_batch_size: sflow_config_clone.sflow.recv_batch_size,
         };
         let sflow_ip_whitelist = ip_whitelist.clone();
         let handle = tokio::spawn(async move {

@@ -46,6 +46,14 @@ multi-sender workload and nothing else.
   datagram on one flow) is not implemented. This is the more valuable
   follow-up for that deployment shape; `recv_tasks` is not it.
 
+  > **Update, 2026-09-18 (later the same day):** this follow-up is now
+  > implemented and measured, as `recv_batch_size`. See
+  > `docs/performance/2026-09-18-recvmmsg-results.md` — at `GEN_PROCS=1`
+  > (the single-sender case this note describes), `recv_batch_size=32`
+  > took ipfix's 50,000/s kernel-loss median from 0.72% to 0.00% with no
+  > added CPU. The figures in this document are unchanged and still stand
+  > for the multi-sender, `recv_tasks` case they measure.
+
 This finding came out of Task 4's review (see `progress.md`) and is now
 carried in the `recv_tasks` doc comments on all three listener configs
 (`src/config/mod.rs`).

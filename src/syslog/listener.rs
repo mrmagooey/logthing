@@ -59,6 +59,12 @@ pub struct SyslogListenerConfig {
     /// senders. `0` is treated the same as `1` (single-socket path), not as
     /// "disabled".
     pub recv_tasks: usize,
+    /// Number of datagrams one `recvmmsg(2)` call may return per recv task
+    /// (default: 1, off). Applies to the UDP arm only -- the TCP listener
+    /// on `tcp_port` has no batched-receive analogue and is unaffected. See
+    /// `SyslogConfig::recv_batch_size` for the full explanation -- unlike
+    /// `recv_tasks`, this helps a single high-rate sender.
+    pub recv_batch_size: usize,
 }
 
 impl Default for SyslogListenerConfig {
@@ -70,6 +76,7 @@ impl Default for SyslogListenerConfig {
             parse_dns_logs: true,
             receive_buffer_bytes: Some(4 * 1024 * 1024),
             recv_tasks: 8,
+            recv_batch_size: 1,
         }
     }
 }
@@ -294,41 +301,146 @@ impl SyslogListener {
             let tcp_listener = TcpListener::bind(&tcp_addr).await?;
             info!("Syslog TCP listener started on {}", tcp_addr);
 
-            let mut buf = vec![0u8; 65535];
             let handler_udp = self.handler.clone();
             let handler_tcp = self.handler.clone();
             let mut socket_stats = crate::net::SocketDropStats::new(&udp_socket, "syslog_udp");
             let mut socket_stats_ticker =
                 tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
+            if self.config.recv_batch_size <= 1 {
+                let mut buf = vec![0u8; 65535];
+                loop {
+                    tokio::select! {
+                        // UDP receive arm
+                        result = udp_socket.recv_from(&mut buf) => {
+                            match result {
+                                Ok((len, src)) => {
+                                    // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                                    if !self.allowed_ips.is_allowed(&src) {
+                                        metrics::counter!("listener_source_rejected", "protocol" => "syslog_udp").increment(1);
+                                        debug!("Rejected syslog_udp datagram from {} — not in allowed_ips", src);
+                                        continue;
+                                    }
+                                    let msg = String::from_utf8_lossy(&buf[..len]);
+                                    debug!("Received UDP syslog message from {}: {} bytes", src, len);
+                                    metrics::counter!("syslog_messages_received").increment(1);
+                                    if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
+                                        handler_udp.handle_message(syslog_msg, src).await;
+                                    } else {
+                                        metrics::counter!("syslog_parse_errors").increment(1);
+                                        warn!(
+                                            "Failed to parse syslog message from {}: {}",
+                                            src,
+                                            &msg[..100.min(msg.len())]
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("UDP receive error: {}", e);
+                                }
+                            }
+                        }
+                        // TCP accept arm
+                        result = tcp_listener.accept() => {
+                            match result {
+                                Ok((stream, src)) => {
+                                    if !self.allowed_ips.is_allowed(&src) {
+                                        metrics::counter!("listener_source_rejected", "protocol" => "syslog_tcp").increment(1);
+                                        warn!("Rejected syslog_tcp connection from {} — not in allowed_ips", src);
+                                        continue;
+                                    }
+                                    // Acquire semaphore permit before spawning — bounds concurrent connections
+                                    match semaphore.clone().try_acquire_owned() {
+                                        Ok(permit) => {
+                                            let handler = handler_tcp.clone();
+                                            tokio::spawn(async move {
+                                                let _permit = permit; // held for connection lifetime
+                                                if let Err(e) = Self::handle_tcp_connection(stream, src, handler).await {
+                                                    error!("TCP connection error from {}: {}", src, e);
+                                                }
+                                            });
+                                        }
+                                        Err(_) => {
+                                            // Semaphore exhausted — too many connections; drop this one
+                                            metrics::counter!("syslog_tcp_connections_rejected").increment(1);
+                                            warn!(
+                                                "Syslog: TCP connection limit ({}) reached; rejecting {}",
+                                                MAX_SYSLOG_TCP_CONNECTIONS, src
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("TCP accept error: {}", e);
+                                }
+                            }
+                        }
+                        // Socket-drop/rx-queue metrics arm (UDP socket only; TCP has no analogous kernel drop counter here)
+                        _ = socket_stats_ticker.tick() => {
+                            socket_stats.poll().await;
+                        }
+                        // Shutdown arm
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                info!("Syslog listener: shutdown signal received");
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                return Ok(());
+            }
+
+            // Batched-recv path: recv_batch_size > 1. UDP arm only; the TCP
+            // accept arm, stats arm and shutdown arm are byte-for-byte the
+            // same as the recv_batch_size <= 1 loop above.
+            let mut batch = crate::net::RecvMmsgBatch::new(self.config.recv_batch_size);
             loop {
                 tokio::select! {
-                    // UDP receive arm
-                    result = udp_socket.recv_from(&mut buf) => {
+                    // UDP receive arm (batched)
+                    result = batch.recv(&udp_socket) => {
                         match result {
-                            Ok((len, src)) => {
-                                // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
-                                if !self.allowed_ips.is_allowed(&src) {
-                                    metrics::counter!("listener_source_rejected", "protocol" => "syslog_udp").increment(1);
-                                    debug!("Rejected syslog_udp datagram from {} — not in allowed_ips", src);
-                                    continue;
-                                }
-                                let msg = String::from_utf8_lossy(&buf[..len]);
-                                debug!("Received UDP syslog message from {}: {} bytes", src, len);
-                                metrics::counter!("syslog_messages_received").increment(1);
-                                if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
-                                    handler_udp.handle_message(syslog_msg, src).await;
-                                } else {
-                                    metrics::counter!("syslog_parse_errors").increment(1);
-                                    warn!(
-                                        "Failed to parse syslog message from {}: {}",
-                                        src,
-                                        &msg[..100.min(msg.len())]
-                                    );
+                            Ok(n) => {
+                                for i in 0..n {
+                                    let Some(src) = batch.src(i) else {
+                                        warn!("syslog: batch message with unparseable source address, skipping");
+                                        continue;
+                                    };
+                                    // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                                    if !self.allowed_ips.is_allowed(&src) {
+                                        metrics::counter!("listener_source_rejected", "protocol" => "syslog_udp").increment(1);
+                                        debug!("Rejected syslog_udp datagram from {} — not in allowed_ips", src);
+                                        continue;
+                                    }
+                                    let payload = batch.payload(i);
+                                    let msg = String::from_utf8_lossy(payload);
+                                    debug!("Received UDP syslog message from {}: {} bytes", src, payload.len());
+                                    metrics::counter!("syslog_messages_received").increment(1);
+                                    if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
+                                        handler_udp.handle_message(syslog_msg, src).await;
+                                    } else {
+                                        metrics::counter!("syslog_parse_errors").increment(1);
+                                        warn!(
+                                            "Failed to parse syslog message from {}: {}",
+                                            src,
+                                            &msg[..100.min(msg.len())]
+                                        );
+                                    }
                                 }
                             }
                             Err(e) => {
-                                error!("UDP receive error: {}", e);
+                                // ponytail: EINTR (and every other transient
+                                // errno recvmmsg can return) is not special-
+                                // cased -- it surfaces here as a generic
+                                // error and gets retried on the next loop
+                                // iteration via batch.recv()'s own readable()
+                                // await. Exact parity with the existing
+                                // single-recv_from error arm this batched arm
+                                // sits beside (this file's `Err(e) => {
+                                // error!("UDP receive error: {}", e); }`
+                                // above) -- not a gap introduced by batching.
+                                error!("Syslog UDP batched receive error: {}", e);
                             }
                         }
                     }
@@ -428,6 +540,7 @@ impl SyslogListener {
                 allowed_ips,
                 task_shutdown_rx,
                 stats,
+                self.config.recv_batch_size,
             )));
         }
 
@@ -651,37 +764,97 @@ async fn syslog_udp_recv_loop(
     allowed_ips: IpWhitelist,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mut socket_stats: Option<crate::net::SocketDropStats>,
+    recv_batch_size: usize,
 ) {
-    let mut buf = vec![0u8; 65535];
     let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
+    if recv_batch_size <= 1 {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            tokio::select! {
+                result = socket.recv_from(&mut buf) => {
+                    match result {
+                        Ok((len, src)) => {
+                            // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                            if !allowed_ips.is_allowed(&src) {
+                                metrics::counter!("listener_source_rejected", "protocol" => "syslog_udp").increment(1);
+                                debug!("Rejected syslog_udp datagram from {} — not in allowed_ips", src);
+                                continue;
+                            }
+                            let msg = String::from_utf8_lossy(&buf[..len]);
+                            debug!("Received UDP syslog message from {}: {} bytes", src, len);
+                            metrics::counter!("syslog_messages_received").increment(1);
+                            if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
+                                handler.handle_message(syslog_msg, src).await;
+                            } else {
+                                metrics::counter!("syslog_parse_errors").increment(1);
+                                warn!(
+                                    "Failed to parse syslog message from {}: {}",
+                                    src,
+                                    &msg[..100.min(msg.len())]
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!("UDP receive error: {}", e);
+                        }
+                    }
+                }
+                _ = socket_stats_ticker.tick(), if socket_stats.is_some() => {
+                    if let Some(stats) = socket_stats.as_mut() {
+                        stats.poll().await;
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("Syslog UDP listener: shutdown signal received");
+                        break;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    let mut batch = crate::net::RecvMmsgBatch::new(recv_batch_size);
     loop {
         tokio::select! {
-            result = socket.recv_from(&mut buf) => {
+            result = batch.recv(&socket) => {
                 match result {
-                    Ok((len, src)) => {
-                        // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
-                        if !allowed_ips.is_allowed(&src) {
-                            metrics::counter!("listener_source_rejected", "protocol" => "syslog_udp").increment(1);
-                            debug!("Rejected syslog_udp datagram from {} — not in allowed_ips", src);
-                            continue;
-                        }
-                        let msg = String::from_utf8_lossy(&buf[..len]);
-                        debug!("Received UDP syslog message from {}: {} bytes", src, len);
-                        metrics::counter!("syslog_messages_received").increment(1);
-                        if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
-                            handler.handle_message(syslog_msg, src).await;
-                        } else {
-                            metrics::counter!("syslog_parse_errors").increment(1);
-                            warn!(
-                                "Failed to parse syslog message from {}: {}",
-                                src,
-                                &msg[..100.min(msg.len())]
-                            );
+                    Ok(n) => {
+                        for i in 0..n {
+                            let Some(src) = batch.src(i) else {
+                                warn!("syslog: batch message with unparseable source address, skipping");
+                                continue;
+                            };
+                            // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                            if !allowed_ips.is_allowed(&src) {
+                                metrics::counter!("listener_source_rejected", "protocol" => "syslog_udp").increment(1);
+                                debug!("Rejected syslog_udp datagram from {} — not in allowed_ips", src);
+                                continue;
+                            }
+                            let payload = batch.payload(i);
+                            let msg = String::from_utf8_lossy(payload);
+                            debug!("Received UDP syslog message from {}: {} bytes", src, payload.len());
+                            metrics::counter!("syslog_messages_received").increment(1);
+                            if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
+                                handler.handle_message(syslog_msg, src).await;
+                            } else {
+                                metrics::counter!("syslog_parse_errors").increment(1);
+                                warn!(
+                                    "Failed to parse syslog message from {}: {}",
+                                    src,
+                                    &msg[..100.min(msg.len())]
+                                );
+                            }
                         }
                     }
                     Err(e) => {
-                        error!("UDP receive error: {}", e);
+                        // ponytail: EINTR is not special-cased here either --
+                        // same parity note as the inline loop's batched arm
+                        // in start_with_shutdown. Retried on the next loop
+                        // iteration via batch.recv()'s own readable() await.
+                        error!("Syslog UDP batched receive error: {}", e);
                     }
                 }
             }
@@ -1332,27 +1505,40 @@ mod tests {
         );
     }
 
-    /// Test handler that just counts messages — used by the fan-out test,
-    /// which only cares whether every message arrived, not its content.
+    /// Test handler that counts messages and also records each parsed
+    /// message body — the fan-out test only cares whether every message
+    /// arrived, but the combined recv_tasks+recv_batch_size tests need to
+    /// tell distinct messages apart from a batching bug that decodes the
+    /// same message repeatedly (see `distinct_message_count`).
     struct CountingHandler {
         count: std::sync::atomic::AtomicUsize,
+        bodies: Mutex<std::collections::HashSet<String>>,
     }
 
     impl CountingHandler {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 count: std::sync::atomic::AtomicUsize::new(0),
+                bodies: Mutex::new(std::collections::HashSet::new()),
             })
         }
         fn message_count(&self) -> usize {
             self.count.load(std::sync::atomic::Ordering::SeqCst)
         }
+        /// Number of distinct parsed message bodies seen. An index-reuse
+        /// bug that decodes the same batch slot `n` times still increments
+        /// `message_count()` to `n`, but every decode carries the same
+        /// body text, so this stays at 1.
+        fn distinct_message_count(&self) -> usize {
+            self.bodies.lock().unwrap().len()
+        }
     }
 
     #[async_trait::async_trait]
     impl SyslogHandler for CountingHandler {
-        async fn handle_message(&self, _message: SyslogMessage, _source: SocketAddr) {
+        async fn handle_message(&self, message: SyslogMessage, _source: SocketAddr) {
             self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.bodies.lock().unwrap().insert(message.message.clone());
         }
     }
 
@@ -1363,6 +1549,7 @@ mod tests {
     /// messages.
     async fn start_test_listener(
         recv_tasks: usize,
+        recv_batch_size: usize,
     ) -> (
         tokio::task::JoinHandle<anyhow::Result<()>>,
         SocketAddr,
@@ -1386,6 +1573,7 @@ mod tests {
             bind_address: "127.0.0.1".to_string(),
             parse_dns_logs: false,
             recv_tasks,
+            recv_batch_size,
             ..SyslogListenerConfig::default()
         };
         let handler = CountingHandler::new();
@@ -1425,7 +1613,7 @@ mod tests {
         const SOURCE_PORTS: u32 = 32;
         const DATAGRAMS_PER_PORT: u32 = 10;
 
-        let (listener, bound, shutdown_tx, handler) = start_test_listener(4).await;
+        let (listener, bound, shutdown_tx, handler) = start_test_listener(4, 1).await;
 
         for i in 0..SOURCE_PORTS {
             let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1442,6 +1630,233 @@ mod tests {
         assert_eq!(
             handler.message_count(),
             (SOURCE_PORTS * DATAGRAMS_PER_PORT) as usize
+        );
+    }
+
+    /// The end-to-end regression this task exists to prevent: a batch of many
+    /// datagrams arriving before the listener's next recv must parse every one
+    /// of them, not just the first. A buggy implementation that reads a batch
+    /// but only processes message 0 (the classic "forgot the loop" bug) would
+    /// pass a single-datagram smoke test and fail this one.
+    #[tokio::test]
+    async fn batched_recv_parses_every_message_in_a_batch() {
+        let (listener, bound, shutdown_tx, handler) = start_test_listener(1, 16).await;
+
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for i in 0..10 {
+            let msg = format!("<34>Oct 11 22:14:15 host app: batch {i}");
+            sock.send_to(msg.as_bytes(), bound).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let _ = shutdown_tx.send(true);
+        let _ = listener.await;
+
+        assert_eq!(handler.message_count(), 10);
+    }
+
+    /// The `allowed_ips` and per-datagram-counter invariant: with allowed_ips
+    /// restricted to exclude 127.0.0.1 entirely, every message in a
+    /// multi-message batch must be independently rejected and independently
+    /// counted -- `listener_source_rejected` (label `"syslog_udp"`) must read
+    /// N after N rejected datagrams, not 1. A batch-level check (verify the
+    /// first message's source, apply the verdict to the whole batch,
+    /// `continue` the outer loop) would still reject everything on this
+    /// all-loopback test -- the counter is what distinguishes "checked once"
+    /// from "checked N times", not the pass/fail outcome, which loopback
+    /// can't vary by source IP.
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    #[tokio::test]
+    async fn batched_recv_checks_and_counts_allowed_ips_per_datagram() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let tmp_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = tmp_udp.local_addr().unwrap().port();
+        drop(tmp_udp);
+        let tmp_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tmp_tcp.local_addr().unwrap().port();
+        drop(tmp_tcp);
+        let bound: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
+
+        // Whitelist a network that does NOT include 127.0.0.1 -- every
+        // datagram in this test must be rejected.
+        let disallowing_whitelist = IpWhitelist::new(vec!["10.0.0.0/8".to_string()]).unwrap();
+        let config = SyslogListenerConfig {
+            udp_port,
+            tcp_port,
+            bind_address: "127.0.0.1".to_string(),
+            parse_dns_logs: false,
+            recv_tasks: 1,
+            recv_batch_size: 16,
+            ..SyslogListenerConfig::default()
+        };
+        let handler = CountingHandler::new();
+        let listener =
+            SyslogListener::new(config, handler.clone()).with_allowed_ips(disallowing_whitelist);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { listener.start_with_shutdown(shutdown_rx).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let n = 10u32;
+        for i in 0..n {
+            let msg = format!("<34>Oct 11 22:14:15 host app: rejected {i}");
+            sock.send_to(msg.as_bytes(), bound).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let _ = shutdown_tx.send(true);
+        let _ = task.await;
+
+        assert_eq!(handler.message_count(), 0, "every datagram must be rejected");
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let rejected = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_parts(
+                    "listener_source_rejected",
+                    vec![metrics::Label::new("protocol", "syslog_udp")],
+                ),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            rejected, n as u64,
+            "listener_source_rejected must count every datagram in the batch, not one per batch"
+        );
+    }
+
+    /// The combined `recv_tasks > 1` AND `recv_batch_size > 1` shape: `recv_tasks
+    /// = 4` forces every datagram through the SO_REUSEPORT group and
+    /// `syslog_udp_recv_loop`'s own batched arm, not the inline loop inside
+    /// `start_with_shutdown`. All sends come from one client socket,
+    /// back-to-back with no `.await` between them, so they consistently hash
+    /// to the same group member and have a real chance to queue together
+    /// before that task's next `batch.recv()` drains them -- exercising an
+    /// actual multi-message batch inside the fan-out path.
+    ///
+    /// `message_count()` alone cannot tell "10 distinct messages parsed"
+    /// apart from "10 duplicate parses of whichever message landed in one
+    /// fixed batch slot" -- an index-reuse bug inside the `for i in 0..n`
+    /// loop (using a fixed index instead of `i`) still runs the loop to
+    /// completion and still produces one message per iteration, so the count
+    /// alone stays 10. Each of the 10 sends embeds a distinct index in its
+    /// message body, so distinct sends must parse to distinct message
+    /// bodies -- `distinct_message_count()` is what actually catches that
+    /// bug.
+    #[tokio::test]
+    async fn fanout_batched_recv_parses_every_message_across_batches() {
+        let (listener, bound, shutdown_tx, handler) = start_test_listener(4, 16).await;
+
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for i in 0..10 {
+            // No sleep between sends -- give the kernel a chance to queue
+            // several before syslog_udp_recv_loop's next batch.recv() call
+            // drains the socket, so this test actually exercises n > 1 in
+            // the `for i in 0..n` loop of the fan-out batched arm, not
+            // n == 1 every time.
+            let msg = format!("<34>Oct 11 22:14:15 host app: batch {i}");
+            sock.send_to(msg.as_bytes(), bound).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let _ = shutdown_tx.send(true);
+        let _ = listener.await;
+
+        assert_eq!(
+            handler.message_count(),
+            10,
+            "every message sent through the recv_tasks=4 + recv_batch_size=16 combined path must parse"
+        );
+        assert_eq!(
+            handler.distinct_message_count(),
+            10,
+            "each of the 10 distinct messages must parse with its own body, not one message's content duplicated across a batch"
+        );
+    }
+
+    /// The `allowed_ips`/counter invariant from
+    /// `batched_recv_checks_and_counts_allowed_ips_per_datagram` above, re-run
+    /// through `syslog_udp_recv_loop`'s batched arm (`recv_tasks = 4`)
+    /// instead of the inline loop's -- the combined-path gap Finding 1 named
+    /// for ipfix and sFlow applies here identically.
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    #[tokio::test]
+    async fn fanout_batched_recv_checks_and_counts_allowed_ips_per_datagram() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let tmp_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = tmp_udp.local_addr().unwrap().port();
+        drop(tmp_udp);
+        let tmp_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tmp_tcp.local_addr().unwrap().port();
+        drop(tmp_tcp);
+        let bound: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
+
+        let disallowing_whitelist = IpWhitelist::new(vec!["10.0.0.0/8".to_string()]).unwrap();
+        let config = SyslogListenerConfig {
+            udp_port,
+            tcp_port,
+            bind_address: "127.0.0.1".to_string(),
+            parse_dns_logs: false,
+            recv_tasks: 4,
+            recv_batch_size: 16,
+            ..SyslogListenerConfig::default()
+        };
+        let handler = CountingHandler::new();
+        let listener =
+            SyslogListener::new(config, handler.clone()).with_allowed_ips(disallowing_whitelist);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { listener.start_with_shutdown(shutdown_rx).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let n = 10u32;
+        for i in 0..n {
+            let msg = format!("<34>Oct 11 22:14:15 host app: rejected {i}");
+            sock.send_to(msg.as_bytes(), bound).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let _ = shutdown_tx.send(true);
+        let _ = task.await;
+
+        assert_eq!(handler.message_count(), 0, "every datagram must be rejected");
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let rejected = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_parts(
+                    "listener_source_rejected",
+                    vec![metrics::Label::new("protocol", "syslog_udp")],
+                ),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            rejected,
+            n as u64,
+            "listener_source_rejected must count every datagram through the recv_tasks=4 + recv_batch_size=16 combined path, not one per batch"
         );
     }
 }

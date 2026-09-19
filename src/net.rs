@@ -87,6 +87,195 @@ pub async fn bind_udp_reuseport_with_recv_buffer(
     UdpSocket::from_std(sock.into())
 }
 
+use std::io;
+use std::os::fd::AsRawFd;
+
+/// Fixed-capacity storage for one `recvmmsg(2)` call, built once per recv
+/// task and reused for its lifetime. Allocating `mmsghdr`/`iovec`/buffer/
+/// address storage per call would trade one syscall for `batch_size` heap
+/// allocations -- exactly the cost batching exists to avoid. Not auto-`Send`
+/// (see the field comment on `iovecs`/`msgs` below and the `unsafe impl
+/// Send` just after this struct) -- each recv task owns one and never
+/// shares it.
+pub struct RecvMmsgBatch {
+    batch_size: usize,
+    bufs: Vec<Vec<u8>>,
+    addrs: Vec<libc::sockaddr_storage>,
+    // SAFETY invariant: `iovecs[i].iov_base` points into `bufs[i]`'s own
+    // heap buffer and `msgs[i].msg_hdr.msg_name` points at `addrs[i]`.
+    // Neither `bufs`, `addrs`, `iovecs` nor `msgs` is ever resized after
+    // `new()` returns, so these raw pointers stay valid for the struct's
+    // whole lifetime regardless of how the struct itself is moved (moving a
+    // `Vec` moves its 3-word header, never its heap-allocated contents).
+    //
+    // This is also the invariant the `unsafe impl Send` just below depends
+    // on -- if a future change ever resizes any of these four fields after
+    // construction, or introduces a field that borrows from outside the
+    // struct (rather than from `bufs`/`addrs` it owns), that impl becomes
+    // unsound and must be revisited together with this comment.
+    iovecs: Vec<libc::iovec>,
+    msgs: Vec<libc::mmsghdr>,
+}
+
+// SAFETY: `RecvMmsgBatch` is not auto-`Send` because `iovecs`/`msgs` hold
+// raw pointers (`*mut c_void`/`*mut iovec`). Those pointers reference only
+// this struct's own `bufs`/`addrs` heap allocations -- never another
+// instance's, and never anything external -- and per the field-invariant
+// comment above, neither `bufs`, `addrs`, `iovecs` nor `msgs` is ever
+// resized after `new()` returns. Moving the whole struct (its four `Vec`
+// headers, 3 words apiece) therefore leaves every pointed-to heap byte in
+// place and every raw pointer still valid, a thread boundary included.
+// Every construction site holds a single owned local, never wrapped in
+// `Arc` or cloned; `recv()` takes `&mut self` and `src()`/`payload()` are
+// only ever called sequentially by the task that owns it -- so this is
+// *exclusive-ownership* Send, not concurrent access, and no `Sync` impl
+// exists or is needed. Required because `RecvMmsgBatch::recv()` is
+// `.await`ed while the struct is held live inside two `tokio::spawn`-ed
+// futures in `src/ipfix/listener.rs` (`start_with_shutdown`'s inline
+// `recv_batch_size > 1` arm and `ipfix_recv_loop`'s) -- without this,
+// the compiler infers `!Send` for both and they fail to compile with
+// "future cannot be sent between threads safely".
+unsafe impl Send for RecvMmsgBatch {}
+
+impl RecvMmsgBatch {
+    /// `batch_size` message slots, each with a `65535`-byte buffer -- the
+    /// same per-datagram size every existing single-recv loop already
+    /// allocates (`vec![0u8; 65535]`), so switching a task from
+    /// single-datagram to batched recv does not change per-message memory.
+    pub fn new(batch_size: usize) -> Self {
+        assert!(batch_size >= 1, "batch_size must be at least 1");
+        let mut bufs: Vec<Vec<u8>> = (0..batch_size).map(|_| vec![0u8; 65535]).collect();
+        let addrs: Vec<libc::sockaddr_storage> =
+            (0..batch_size).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let mut iovecs: Vec<libc::iovec> = bufs
+            .iter_mut()
+            .map(|b| libc::iovec {
+                iov_base: b.as_mut_ptr() as *mut libc::c_void,
+                iov_len: b.len(),
+            })
+            .collect();
+        let msgs: Vec<libc::mmsghdr> = iovecs
+            .iter_mut()
+            .zip(addrs.iter())
+            .map(|(iov, addr)| libc::mmsghdr {
+                msg_hdr: libc::msghdr {
+                    msg_name: addr as *const libc::sockaddr_storage as *mut libc::c_void,
+                    msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+                    msg_iov: iov as *mut libc::iovec,
+                    msg_iovlen: 1,
+                    msg_control: std::ptr::null_mut(),
+                    msg_controllen: 0,
+                    msg_flags: 0,
+                },
+                msg_len: 0,
+            })
+            .collect();
+        Self { batch_size, bufs, addrs, iovecs, msgs }
+    }
+
+    /// Message `i`'s payload from the most recent successful `recv()` call.
+    pub fn payload(&self, i: usize) -> &[u8] {
+        &self.bufs[i][..self.msgs[i].msg_len as usize]
+    }
+
+    /// Message `i`'s source address from the most recent successful
+    /// `recv()` call. Reuses `socket2::SockAddr::as_socket()` for the
+    /// AF_INET/AF_INET6 parsing rather than hand-rolling it -- socket2 is
+    /// already a dependency and this is exactly what it exists to do
+    /// safely.
+    pub fn src(&self, i: usize) -> Option<SocketAddr> {
+        let mut storage = socket2::SockAddrStorage::zeroed();
+        // SAFETY: `addrs[i]` was filled by the kernel during `recvmmsg` with
+        // whatever address family it actually delivered; copying those
+        // exact bytes into a freshly zeroed, correctly sized storage and
+        // handing the kernel-reported length to `SockAddr::new` satisfies
+        // its safety contract (family and length matching the storage's
+        // content).
+        unsafe {
+            *storage.view_as::<libc::sockaddr_storage>() = self.addrs[i];
+        }
+        let len = self.msgs[i].msg_hdr.msg_namelen;
+        unsafe { socket2::SockAddr::new(storage, len) }.as_socket()
+    }
+
+    /// One non-blocking `recvmmsg(2)` call, returning as many datagrams as
+    /// are already queued on `socket`, up to `batch_size` -- WITHOUT
+    /// waiting to fill the batch. `MSG_DONTWAIT` forces non-blocking
+    /// behaviour on this call regardless of the socket's own `O_NONBLOCK`
+    /// state.
+    ///
+    /// # Safety
+    /// `fd` must be an open, valid UDP socket file descriptor, live for the
+    /// duration of the call.
+    unsafe fn recv_mmsg_once(&mut self, fd: std::os::fd::RawFd) -> io::Result<usize> {
+        // Reset msg_namelen before every call: the kernel overwrites it per
+        // message with the actual address length used, and a stale
+        // shorter value left over from a previous call would truncate the
+        // next message's address parse.
+        for msg in &mut self.msgs {
+            msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        }
+        // The zero-latency guarantee (a lone queued datagram returns
+        // immediately, never waits to fill the batch) actually comes from
+        // `fd` already being O_NONBLOCK -- every UdpSocket this crate binds
+        // is (mio sets SOCK_NONBLOCK at creation; bind_udp_reuseport_with_
+        // recv_buffer also calls set_nonblocking(true) explicitly; tokio's
+        // own check_socket_for_blocking refuses a blocking socket outright).
+        // MSG_DONTWAIT is still correct to pass -- it's an independent,
+        // correct belt-and-braces guarantee if this fn is ever reached with
+        // a blocking fd -- but do not remove it as "redundant" with
+        // O_NONBLOCK, and do not add a `timeout` here believing it bounds
+        // the wait: measured against the real syscall, flags=0 with a
+        // populated timespec either returns instantly (O_NONBLOCK fd, same
+        // as now) or hangs forever (blocking fd, per recvmmsg(2)'s own BUGS
+        // section) -- there is no bounded-wait behaviour to rely on either
+        // way.
+        let n = unsafe {
+            libc::recvmmsg(
+                fd,
+                self.msgs.as_mut_ptr(),
+                self.batch_size as libc::c_uint,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // ponytail: msg_hdr.msg_flags is not inspected for MSG_TRUNC here.
+        // Deliberate, not an oversight -- it's the same blind spot the
+        // existing single-datagram `recv_from` path already has (it trusts
+        // the returned length too), and every buffer here is 65535 bytes,
+        // the maximum possible UDP payload, so a real truncation is not
+        // reachable over UDP regardless. Revisit only if a buffer size
+        // smaller than 65535 is ever introduced.
+        Ok(n as usize)
+    }
+
+    /// Await readiness, then attempt one batched read -- the same
+    /// `try_io` pattern `tokio::net::UdpSocket::try_io`'s own docs
+    /// recommend for raw syscalls on a tokio socket: a `WouldBlock` from
+    /// the syscall clears the readiness flag and the loop awaits it again,
+    /// rather than spinning. Returns the number of datagrams received,
+    /// always `>= 1` on `Ok` -- UDP has no "0 means closed" case the way a
+    /// stream socket does, so a `0` from the syscall is treated as
+    /// "nothing arrived yet, try again" rather than surfaced to the caller.
+    pub async fn recv(&mut self, socket: &tokio::net::UdpSocket) -> io::Result<usize> {
+        loop {
+            socket.readable().await?;
+            let fd = socket.as_raw_fd();
+            let result =
+                socket.try_io(tokio::io::Interest::READABLE, || unsafe { self.recv_mmsg_once(fd) });
+            match result {
+                Ok(0) => continue,
+                Ok(n) => return Ok(n),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Socket-level drop counter / rx-queue gauge (Task 0.0)
 // ---------------------------------------------------------------------------
@@ -539,5 +728,64 @@ mod tests {
             drops > 0,
             "expected test_proto_socket_drops > 0 after flooding an unread socket"
         );
+    }
+
+    /// The core batching property: N datagrams sent to one socket from N
+    /// different client sockets, all queued before `recv()` is called, must
+    /// come back in ONE `recv()` call -- proving the syscall is actually
+    /// batching, not silently falling back to one-at-a-time.
+    #[tokio::test]
+    async fn recv_returns_multiple_queued_datagrams_in_one_call() {
+        let listen_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = listen_sock.local_addr().unwrap();
+
+        let n = 10;
+        let mut expected_payloads = Vec::new();
+        for i in 0..n {
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let payload = format!("msg-{i}").into_bytes();
+            client.send_to(&payload, addr).await.unwrap();
+            expected_payloads.push(payload);
+        }
+        // Give the kernel a moment to queue all n sends before the batched
+        // recv is attempted -- this test is about batching behaviour, not
+        // about racing delivery.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut batch = RecvMmsgBatch::new(32);
+        let received = batch.recv(&listen_sock).await.unwrap();
+
+        assert_eq!(received, n, "all {n} already-queued datagrams must come back in one call");
+        let mut got_payloads: Vec<Vec<u8>> = (0..received).map(|i| batch.payload(i).to_vec()).collect();
+        got_payloads.sort();
+        let mut want_payloads = expected_payloads;
+        want_payloads.sort();
+        assert_eq!(got_payloads, want_payloads, "every payload must be received intact");
+
+        let mut srcs: Vec<SocketAddr> = (0..received).map(|i| batch.src(i).unwrap()).collect();
+        srcs.sort();
+        srcs.dedup();
+        assert_eq!(srcs.len(), n, "each message's source address must be distinct and correctly parsed");
+    }
+
+    /// A lone datagram must come back immediately -- `recv()` must NOT wait to
+    /// fill the batch. This is the latency property a log-ingest server cannot
+    /// regress on: a single low-rate syslog line delayed to fill a batch would
+    /// be worse than the single-datagram path it replaces.
+    #[tokio::test]
+    async fn recv_returns_a_single_datagram_without_waiting_to_fill_the_batch() {
+        let listen_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = listen_sock.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(b"lonely datagram", addr).await.unwrap();
+
+        let mut batch = RecvMmsgBatch::new(32);
+        let result = tokio::time::timeout(std::time::Duration::from_millis(30), batch.recv(&listen_sock)).await;
+
+        let received = result
+            .expect("recv() must return well within 30ms for one already-queued datagram, not wait to fill a 32-message batch")
+            .unwrap();
+        assert_eq!(received, 1);
+        assert_eq!(batch.payload(0), b"lonely datagram");
     }
 }

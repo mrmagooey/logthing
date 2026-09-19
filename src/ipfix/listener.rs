@@ -30,6 +30,11 @@ pub struct IpfixListenerConfig {
     /// benefit, because every datagram still hashes to the same socket.
     /// `0` is treated the same as `1` (single-socket path), not as "disabled".
     pub recv_tasks: usize,
+    /// Number of datagrams one `recvmmsg(2)` call may return per recv task
+    /// (default: 1, off). See `IpfixConfig::recv_batch_size` for the full
+    /// explanation -- unlike `recv_tasks`, this helps a single high-rate
+    /// exporter.
+    pub recv_batch_size: usize,
 }
 
 impl Default for IpfixListenerConfig {
@@ -39,6 +44,7 @@ impl Default for IpfixListenerConfig {
             bind_address: "0.0.0.0".to_string(),
             receive_buffer_bytes: Some(4 * 1024 * 1024),
             recv_tasks: 8,
+            recv_batch_size: 1,
         }
     }
 }
@@ -128,42 +134,106 @@ impl IpfixListener {
             let bound_addr = socket.local_addr()?;
             info!("IPFIX UDP listener started on {}", bound_addr);
 
-            let mut buf = vec![0u8; 65535];
             let mut decoder = IpfixDecoder::new();
             let mut socket_stats = crate::net::SocketDropStats::new(&socket, "ipfix");
             let mut socket_stats_ticker =
                 tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
+            if self.config.recv_batch_size <= 1 {
+                let mut buf = vec![0u8; 65535];
+                loop {
+                    tokio::select! {
+                        result = socket.recv_from(&mut buf) => {
+                            match result {
+                                Ok((len, src)) => {
+                                    // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                                    if !self.allowed_ips.is_allowed(&src) {
+                                        metrics::counter!("listener_source_rejected", "protocol" => "ipfix").increment(1);
+                                        debug!("Rejected ipfix datagram from {} — not in allowed_ips", src);
+                                        continue;
+                                    }
+                                    debug!("IPFIX datagram from {}: {} bytes", src, len);
+                                    match decode_datagram(&mut decoder, &buf[..len], src.ip()) {
+                                        Ok(flows) if flows.is_empty() => {
+                                            debug!(
+                                                "IPFIX datagram from {} produced no flows (template-only or empty)",
+                                                src
+                                            );
+                                        }
+                                        Ok(flows) => {
+                                            self.handler.handle_flows(flows, src).await;
+                                        }
+                                        Err(e) => {
+                                            metrics::counter!("ipfix_decode_errors").increment(1);
+                                            warn!("IPFIX decode error from {}: {}", src, e);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("IPFIX UDP receive error: {}", e);
+                                }
+                            }
+                        }
+                        _ = socket_stats_ticker.tick() => {
+                            socket_stats.poll().await;
+                        }
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                info!("IPFIX listener: shutdown signal received");
+                                break;
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+
+            // Batched-recv path: recv_batch_size > 1.
+            let mut batch = crate::net::RecvMmsgBatch::new(self.config.recv_batch_size);
             loop {
                 tokio::select! {
-                    result = socket.recv_from(&mut buf) => {
+                    result = batch.recv(&socket) => {
                         match result {
-                            Ok((len, src)) => {
-                                // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
-                                if !self.allowed_ips.is_allowed(&src) {
-                                    metrics::counter!("listener_source_rejected", "protocol" => "ipfix").increment(1);
-                                    debug!("Rejected ipfix datagram from {} — not in allowed_ips", src);
-                                    continue;
-                                }
-                                debug!("IPFIX datagram from {}: {} bytes", src, len);
-                                match decode_datagram(&mut decoder, &buf[..len], src.ip()) {
-                                    Ok(flows) if flows.is_empty() => {
-                                        debug!(
-                                            "IPFIX datagram from {} produced no flows (template-only or empty)",
-                                            src
-                                        );
+                            Ok(n) => {
+                                for i in 0..n {
+                                    let Some(src) = batch.src(i) else {
+                                        warn!("ipfix: batch message with unparseable source address, skipping");
+                                        continue;
+                                    };
+                                    // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                                    if !self.allowed_ips.is_allowed(&src) {
+                                        metrics::counter!("listener_source_rejected", "protocol" => "ipfix").increment(1);
+                                        debug!("Rejected ipfix datagram from {} — not in allowed_ips", src);
+                                        continue;
                                     }
-                                    Ok(flows) => {
-                                        self.handler.handle_flows(flows, src).await;
-                                    }
-                                    Err(e) => {
-                                        metrics::counter!("ipfix_decode_errors").increment(1);
-                                        warn!("IPFIX decode error from {}: {}", src, e);
+                                    let payload = batch.payload(i);
+                                    debug!("IPFIX datagram from {}: {} bytes", src, payload.len());
+                                    match decode_datagram(&mut decoder, payload, src.ip()) {
+                                        Ok(flows) if flows.is_empty() => {
+                                            debug!("IPFIX datagram from {} produced no flows (template-only or empty)", src);
+                                        }
+                                        Ok(flows) => {
+                                            self.handler.handle_flows(flows, src).await;
+                                        }
+                                        Err(e) => {
+                                            metrics::counter!("ipfix_decode_errors").increment(1);
+                                            warn!("IPFIX decode error from {}: {}", src, e);
+                                        }
                                     }
                                 }
                             }
                             Err(e) => {
-                                error!("IPFIX UDP receive error: {}", e);
+                                // ponytail: EINTR (and every other transient
+                                // errno recvmmsg can return) is not special-
+                                // cased -- it surfaces here as a generic
+                                // error and gets retried on the next loop
+                                // iteration via batch.recv()'s own readable()
+                                // await. Exact parity with the existing
+                                // single-recv_from error arm this batched arm
+                                // sits beside (this file's `Err(e) => {
+                                // error!("IPFIX UDP receive error: {}", e); }`
+                                // above) -- not a gap introduced by batching.
+                                error!("IPFIX UDP batched receive error: {}", e);
                             }
                         }
                     }
@@ -228,6 +298,7 @@ impl IpfixListener {
                 allowed_ips,
                 shutdown_rx,
                 stats,
+                self.config.recv_batch_size,
             )));
         }
 
@@ -305,40 +376,100 @@ async fn ipfix_recv_loop(
     allowed_ips: IpWhitelist,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mut socket_stats: Option<crate::net::SocketDropStats>,
+    recv_batch_size: usize,
 ) {
-    let mut buf = vec![0u8; 65535];
     let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
+    if recv_batch_size <= 1 {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            tokio::select! {
+                result = socket.recv_from(&mut buf) => {
+                    match result {
+                        Ok((len, src)) => {
+                            // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                            if !allowed_ips.is_allowed(&src) {
+                                metrics::counter!("listener_source_rejected", "protocol" => "ipfix").increment(1);
+                                debug!("Rejected ipfix datagram from {} — not in allowed_ips", src);
+                                continue;
+                            }
+                            debug!("IPFIX datagram from {}: {} bytes", src, len);
+                            match decode_datagram(&mut decoder, &buf[..len], src.ip()) {
+                                Ok(flows) if flows.is_empty() => {
+                                    debug!(
+                                        "IPFIX datagram from {} produced no flows (template-only or empty)",
+                                        src
+                                    );
+                                }
+                                Ok(flows) => {
+                                    handler.handle_flows(flows, src).await;
+                                }
+                                Err(e) => {
+                                    metrics::counter!("ipfix_decode_errors").increment(1);
+                                    warn!("IPFIX decode error from {}: {}", src, e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("IPFIX UDP receive error: {}", e);
+                        }
+                    }
+                }
+                _ = socket_stats_ticker.tick(), if socket_stats.is_some() => {
+                    if let Some(stats) = socket_stats.as_mut() {
+                        stats.poll().await;
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("IPFIX listener: shutdown signal received");
+                        break;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    let mut batch = crate::net::RecvMmsgBatch::new(recv_batch_size);
     loop {
         tokio::select! {
-            result = socket.recv_from(&mut buf) => {
+            result = batch.recv(&socket) => {
                 match result {
-                    Ok((len, src)) => {
-                        // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
-                        if !allowed_ips.is_allowed(&src) {
-                            metrics::counter!("listener_source_rejected", "protocol" => "ipfix").increment(1);
-                            debug!("Rejected ipfix datagram from {} — not in allowed_ips", src);
-                            continue;
-                        }
-                        debug!("IPFIX datagram from {}: {} bytes", src, len);
-                        match decode_datagram(&mut decoder, &buf[..len], src.ip()) {
-                            Ok(flows) if flows.is_empty() => {
-                                debug!(
-                                    "IPFIX datagram from {} produced no flows (template-only or empty)",
-                                    src
-                                );
+                    Ok(n) => {
+                        for i in 0..n {
+                            let Some(src) = batch.src(i) else {
+                                warn!("ipfix: batch message with unparseable source address, skipping");
+                                continue;
+                            };
+                            // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                            if !allowed_ips.is_allowed(&src) {
+                                metrics::counter!("listener_source_rejected", "protocol" => "ipfix").increment(1);
+                                debug!("Rejected ipfix datagram from {} — not in allowed_ips", src);
+                                continue;
                             }
-                            Ok(flows) => {
-                                handler.handle_flows(flows, src).await;
-                            }
-                            Err(e) => {
-                                metrics::counter!("ipfix_decode_errors").increment(1);
-                                warn!("IPFIX decode error from {}: {}", src, e);
+                            let payload = batch.payload(i);
+                            debug!("IPFIX datagram from {}: {} bytes", src, payload.len());
+                            match decode_datagram(&mut decoder, payload, src.ip()) {
+                                Ok(flows) if flows.is_empty() => {
+                                    debug!("IPFIX datagram from {} produced no flows (template-only or empty)", src);
+                                }
+                                Ok(flows) => {
+                                    handler.handle_flows(flows, src).await;
+                                }
+                                Err(e) => {
+                                    metrics::counter!("ipfix_decode_errors").increment(1);
+                                    warn!("IPFIX decode error from {}: {}", src, e);
+                                }
                             }
                         }
                     }
                     Err(e) => {
-                        error!("IPFIX UDP receive error: {}", e);
+                        // ponytail: EINTR is not special-cased here either --
+                        // same parity note as the inline loop's batched arm
+                        // in start_with_shutdown. Retried on the next loop
+                        // iteration via batch.recv()'s own readable() await.
+                        error!("IPFIX UDP batched receive error: {}", e);
                     }
                 }
             }
@@ -600,19 +731,42 @@ mod tests {
 
     /// A handler that counts total flows across all received batches —
     /// used by the fan-out tests where flows may arrive interleaved across
-    /// several tasks and only the total matters.
+    /// several tasks and only the total matters. Also records each decoded
+    /// flow's `src_addr` (`data_datagram` embeds its `n` argument into the
+    /// low octets of that address, so `n` distinct sends must decode to `n`
+    /// distinct addresses): the flow *count* alone cannot tell "N distinct
+    /// records decoded" apart from "N duplicate decodes of whichever record
+    /// landed in one fixed batch slot" — a real gap found while running this
+    /// task's Step 6 sabotage, where an index-reuse bug (`batch.src(0)`/
+    /// `batch.payload(0)` instead of `batch.src(i)`/`batch.payload(i)`) left
+    /// `flow_count()` at the expected total because the `for i in 0..n` loop
+    /// still ran to completion and still produced one flow per iteration —
+    /// just the same duplicated content every time.
     struct CountingHandler {
         count: std::sync::atomic::AtomicUsize,
+        src_addrs: Mutex<Vec<std::net::IpAddr>>,
     }
 
     impl CountingHandler {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 count: std::sync::atomic::AtomicUsize::new(0),
+                src_addrs: Mutex::new(Vec::new()),
             })
         }
         fn flow_count(&self) -> usize {
             self.count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        /// Number of distinct `src_addr` values seen across all decoded
+        /// flows so far -- see the struct doc comment for why this catches
+        /// what `flow_count()` alone cannot.
+        fn distinct_src_addr_count(&self) -> usize {
+            self.src_addrs
+                .lock()
+                .unwrap()
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
         }
     }
 
@@ -621,6 +775,12 @@ mod tests {
         async fn handle_flows(&self, flows: Vec<FlowRecord>, _source: SocketAddr) {
             self.count
                 .fetch_add(flows.len(), std::sync::atomic::Ordering::SeqCst);
+            let mut src_addrs = self.src_addrs.lock().unwrap();
+            for flow in &flows {
+                if let Some(addr) = flow.src_addr {
+                    src_addrs.push(addr);
+                }
+            }
         }
     }
 
@@ -678,6 +838,7 @@ mod tests {
     /// address, the shutdown sender, and a handler that counts total flows.
     async fn start_test_listener(
         recv_tasks: usize,
+        recv_batch_size: usize,
     ) -> (
         tokio::task::JoinHandle<anyhow::Result<()>>,
         SocketAddr,
@@ -696,6 +857,7 @@ mod tests {
             udp_port,
             bind_address: "127.0.0.1".to_string(),
             recv_tasks,
+            recv_batch_size,
             ..IpfixListenerConfig::default()
         };
         let handler = CountingHandler::new();
@@ -739,7 +901,7 @@ mod tests {
         // OS thread, so the thread-local recorder sees them all.
         let _guard = set_default_local_recorder(&recorder);
 
-        let (listener, bound, shutdown_tx, handler) = start_test_listener(4).await;
+        let (listener, bound, shutdown_tx, handler) = start_test_listener(4, 1).await;
 
         let template_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut data_socks = Vec::new();
@@ -825,6 +987,227 @@ mod tests {
             1,
             "allowed source must reach the handler; got {}",
             batches.len()
+        );
+    }
+
+    /// The end-to-end regression this task exists to prevent: a batch of many
+    /// datagrams arriving before the listener's next recv must decode every one
+    /// of them, not just the first. A buggy implementation that reads a batch
+    /// but only processes message 0 (the classic "forgot the loop" bug) would
+    /// pass a single-datagram smoke test and fail this one.
+    #[tokio::test]
+    async fn batched_recv_decodes_every_datagram_in_a_batch() {
+        let (listener, bound, shutdown_tx, handler) = start_test_listener(1, 16).await;
+
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.send_to(&template_datagram(1), bound).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        for n in 0..10u64 {
+            sock.send_to(&data_datagram(n as u32 + 2, n), bound).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let _ = shutdown_tx.send(true);
+        let _ = listener.await;
+
+        assert_eq!(handler.flow_count(), 10, "every data record in the batch must decode");
+    }
+
+    /// The `allowed_ips` and per-datagram-counter invariant, tested together:
+    /// with allowed_ips restricted to exclude 127.0.0.1 entirely, every message
+    /// in a multi-message batch must be independently rejected and independently
+    /// counted -- `listener_source_rejected` must read N after N rejected
+    /// datagrams, not 1. A batch-level check (verify the first message's source,
+    /// apply the verdict to the whole batch, `continue` the outer loop) would
+    /// still reject everything on this all-loopback test -- the counter is what
+    /// distinguishes "checked once" from "checked N times", not the pass/fail
+    /// outcome, which loopback can't vary by source IP.
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    #[tokio::test]
+    async fn batched_recv_checks_and_counts_allowed_ips_per_datagram() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = tmp.local_addr().unwrap().port();
+        drop(tmp);
+        let bound: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
+
+        // Whitelist a network that does NOT include 127.0.0.1 -- every datagram
+        // in this test must be rejected.
+        let disallowing_whitelist = IpWhitelist::new(vec!["10.0.0.0/8".to_string()]).unwrap();
+        let config = IpfixListenerConfig {
+            udp_port,
+            bind_address: "127.0.0.1".to_string(),
+            recv_tasks: 1,
+            recv_batch_size: 16,
+            ..IpfixListenerConfig::default()
+        };
+        let handler = CountingHandler::new();
+        let listener = IpfixListener::new(config, handler.clone()).with_allowed_ips(disallowing_whitelist);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { listener.start_with_shutdown(shutdown_rx).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let n = 10u32;
+        for i in 0..n {
+            sock.send_to(&template_datagram(i + 1), bound).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let _ = shutdown_tx.send(true);
+        let _ = task.await;
+
+        assert_eq!(handler.flow_count(), 0, "every datagram must be rejected");
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let rejected = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_parts("listener_source_rejected", vec![metrics::Label::new("protocol", "ipfix")]),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert_eq!(rejected, n as u64, "listener_source_rejected must count every datagram in the batch, not one per batch");
+    }
+
+    /// The gap Finding 1 of the plan review named directly: the two tests above
+    /// both pin `recv_tasks = 1`, so they only ever exercise the batched arm
+    /// inside `start_with_shutdown`'s inline loop, never `ipfix_recv_loop` (the
+    /// `recv_tasks > 1` fan-out function) -- the combined `recv_tasks > 1` AND
+    /// `recv_batch_size > 1` shape had no automated coverage at all before this
+    /// test. `recv_tasks = 4` forces every datagram through the SO_REUSEPORT
+    /// group and `ipfix_recv_loop`'s own batched arm (Step 5); all sends come
+    /// from one client socket, back-to-back with no `.await` between them, so
+    /// they consistently hash to the same group member (SO_REUSEPORT hashes by
+    /// the full 4-tuple, and one client socket keeps its source port fixed) and
+    /// have a real chance to queue together before that task's next `recv()`
+    /// drains them -- exercising an actual multi-message batch inside the
+    /// fan-out path, not just a fan-out path that happens to only ever see one
+    /// message per call.
+    #[tokio::test]
+    async fn fanout_batched_recv_decodes_every_datagram_across_batches() {
+        let (listener, bound, shutdown_tx, handler) = start_test_listener(4, 16).await;
+
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.send_to(&template_datagram(1), bound).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        for n in 0..10u64 {
+            // No sleep between sends -- give the kernel a chance to queue
+            // several before ipfix_recv_loop's next batch.recv() call drains
+            // the socket, so this test actually exercises n > 1 in the
+            // `for i in 0..n` loop of the fan-out batched arm, not n == 1 every
+            // time.
+            sock.send_to(&data_datagram(n as u32 + 2, n), bound).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let _ = shutdown_tx.send(true);
+        let _ = listener.await;
+
+        assert_eq!(
+            handler.flow_count(),
+            10,
+            "every data record sent through the recv_tasks=4 + recv_batch_size=16 combined path must decode"
+        );
+        // flow_count() alone cannot tell "10 distinct records decoded" apart
+        // from "10 duplicate decodes of whichever record landed in one fixed
+        // batch slot" -- an index-reuse bug inside the `for i in 0..n` loop
+        // (using a fixed index instead of `i`) still runs the loop to
+        // completion and still produces one flow per iteration, so the count
+        // alone stays 10. Each of the 10 sends embeds a distinct low IP
+        // octet via `data_datagram`'s `n` argument, so distinct sends must
+        // decode to distinct `src_addr`s.
+        assert_eq!(
+            handler.distinct_src_addr_count(),
+            10,
+            "each of the 10 distinct data records must decode with its own address, not one record's content duplicated across a batch"
+        );
+    }
+
+    /// The `allowed_ips`/counter invariant from
+    /// `batched_recv_checks_and_counts_allowed_ips_per_datagram` above, re-run
+    /// through `ipfix_recv_loop`'s batched arm (`recv_tasks = 4`) instead of the
+    /// inline loop's. Like that test, every send here comes from one source
+    /// address (loopback can't vary by source IP within one process any more in
+    /// the fan-out path than it could in the inline one), so this cannot
+    /// distinguish "checked using the right per-message address" from "checked
+    /// using a fixed wrong address" on its own -- what it adds on top of the
+    /// non-fan-out version is coverage of the `self.x` → loop-local-param
+    /// translation in Step 5 itself: a build that left a stray `self.` in
+    /// `ipfix_recv_loop` fails to compile (there is no `self` in a free
+    /// function), and a build that substituted the wrong loop-local (e.g. an
+    /// out-of-scope `IpfixListenerConfig::default()`'s allowed_ips instead of
+    /// the `allowed_ips` parameter actually passed in) is caught here because
+    /// this test constructs the disallowing whitelist and threads it through
+    /// `with_allowed_ips` exactly as the non-fan-out version does, on the
+    /// `recv_tasks = 4` path.
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    #[tokio::test]
+    async fn fanout_batched_recv_checks_and_counts_allowed_ips_per_datagram() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = tmp.local_addr().unwrap().port();
+        drop(tmp);
+        let bound: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
+
+        let disallowing_whitelist = IpWhitelist::new(vec!["10.0.0.0/8".to_string()]).unwrap();
+        let config = IpfixListenerConfig {
+            udp_port,
+            bind_address: "127.0.0.1".to_string(),
+            recv_tasks: 4,
+            recv_batch_size: 16,
+            ..IpfixListenerConfig::default()
+        };
+        let handler = CountingHandler::new();
+        let listener = IpfixListener::new(config, handler.clone()).with_allowed_ips(disallowing_whitelist);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { listener.start_with_shutdown(shutdown_rx).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let n = 10u32;
+        for i in 0..n {
+            sock.send_to(&template_datagram(i + 1), bound).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let _ = shutdown_tx.send(true);
+        let _ = task.await;
+
+        assert_eq!(handler.flow_count(), 0, "every datagram must be rejected");
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let rejected = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_parts("listener_source_rejected", vec![metrics::Label::new("protocol", "ipfix")]),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            rejected,
+            n as u64,
+            "listener_source_rejected must count every datagram through the recv_tasks=4 + recv_batch_size=16 combined path, not one per batch"
         );
     }
 }

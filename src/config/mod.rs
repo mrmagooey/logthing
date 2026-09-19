@@ -220,6 +220,23 @@ pub struct SyslogConfig {
     #[serde(default = "default_syslog_recv_tasks")]
     pub recv_tasks: usize,
 
+    /// Number of datagrams one `recvmmsg(2)` call may return per receive
+    /// task (default: 1, meaning off — every call still returns at most one
+    /// datagram, via the original `recv_from` path). Applies to the UDP arm
+    /// only, same caveat as `recv_tasks` above. Above 1, each recv task
+    /// batches up to this many already-queued datagrams into one syscall
+    /// instead of one syscall per datagram. Unlike `recv_tasks`, this helps
+    /// a SINGLE high-rate sender: it reduces syscalls per datagram on one
+    /// socket rather than spreading datagrams across sockets, so it is the
+    /// lever for exactly the deployment shape `recv_tasks` cannot help (see
+    /// `recv_tasks`'s own doc comment). The two knobs are independent and
+    /// may be combined. `0` is treated the same as `1` (batching off), not
+    /// as "disabled". Never waits to fill a batch — a lone datagram is
+    /// still returned immediately. Rejected above `MAX_RECV_BATCH_SIZE` at
+    /// config load — see `validate_recv_batch_size_config`.
+    #[serde(default = "default_syslog_recv_batch_size")]
+    pub recv_batch_size: usize,
+
     /// Enable syslog payload sub-parsing (CEF, LEEF, auditd, DHCP, RADIUS,
     /// web_access, DNS).  Default false (backward compatible).
     #[serde(default)]
@@ -302,6 +319,22 @@ pub struct IpfixConfig {
     #[serde(default = "default_ipfix_recv_tasks")]
     pub recv_tasks: usize,
 
+    /// Number of datagrams one `recvmmsg(2)` call may return per receive
+    /// task (default: 1, meaning off — every call still returns at most one
+    /// datagram, via the original `recv_from` path). Above 1, each recv task
+    /// batches up to this many already-queued datagrams into one syscall
+    /// instead of one syscall per datagram. Unlike `recv_tasks`, this helps
+    /// a SINGLE high-rate sender: it reduces syscalls per datagram on one
+    /// socket rather than spreading datagrams across sockets, so it is the
+    /// lever for exactly the deployment shape `recv_tasks` cannot help (see
+    /// `recv_tasks`'s own doc comment). The two knobs are independent and
+    /// may be combined. `0` is treated the same as `1` (batching off), not
+    /// as "disabled". Never waits to fill a batch — a lone datagram is
+    /// still returned immediately. Rejected above `MAX_RECV_BATCH_SIZE` at
+    /// config load — see `validate_recv_batch_size_config`.
+    #[serde(default = "default_ipfix_recv_batch_size")]
+    pub recv_batch_size: usize,
+
     /// Optional S3 persistence for IPFIX flows.
     /// Absent from TOML → `None` → no S3 persistence (backward compatible).
     #[serde(default)]
@@ -322,6 +355,7 @@ impl Default for IpfixConfig {
             bind_address: default_ipfix_bind_address(),
             receive_buffer_bytes: default_udp_receive_buffer_bytes(),
             recv_tasks: default_ipfix_recv_tasks(),
+            recv_batch_size: default_ipfix_recv_batch_size(),
             s3: None,
             local: None,
         }
@@ -336,6 +370,9 @@ fn default_ipfix_udp_port() -> u16 {
 }
 fn default_ipfix_recv_tasks() -> usize {
     8
+}
+fn default_ipfix_recv_batch_size() -> usize {
+    1
 }
 fn default_ipfix_bind_address() -> String {
     "0.0.0.0".to_string()
@@ -870,6 +907,39 @@ pub fn validate_recv_tasks_config(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Upper bound on `recv_batch_size` for each UDP fan-out listener. Each unit
+/// is a `65535`-byte buffer allocated once per recv task at startup (the
+/// same per-datagram size the existing single-recv path already allocates),
+/// so an unbounded value multiplies startup memory per task rather than
+/// failing fast with a clear error. `256` is `256 * 65535` ≈ 16.8 MiB per
+/// task — already generous; nothing in this plan's own measurements
+/// recommends anywhere near that value, this is a typo guard, not a tuning
+/// ceiling.
+const MAX_RECV_BATCH_SIZE: usize = 256;
+
+/// Rejects a `recv_batch_size` value above `MAX_RECV_BATCH_SIZE` for any of
+/// the three UDP fan-out listeners. `0` and `1` are always accepted — `0`
+/// is treated the same as `1` (batching off), matching `recv_tasks`'s own
+/// `0`-means-`1` convention. See `MAX_RECV_BATCH_SIZE` for why the bound
+/// exists.
+pub fn validate_recv_batch_size_config(cfg: &Config) -> anyhow::Result<()> {
+    for (section, value) in [
+        ("ipfix.recv_batch_size", cfg.ipfix.recv_batch_size),
+        ("sflow.recv_batch_size", cfg.sflow.recv_batch_size),
+        ("syslog.recv_batch_size", cfg.syslog.recv_batch_size),
+    ] {
+        if value > MAX_RECV_BATCH_SIZE {
+            anyhow::bail!(
+                "{section} = {value} exceeds the maximum of {MAX_RECV_BATCH_SIZE}; this almost \
+                 certainly means a typo rather than an intentional value — each unit allocates a \
+                 65535-byte buffer per recv task at startup. Lower {section} to \
+                 {MAX_RECV_BATCH_SIZE} or below."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Rejects a config where both `iceberg.s3` and `iceberg.local` are
 /// configured simultaneously. Because `config::Config::builder()` merges
 /// all layers (file → admin-override-file → env vars) before
@@ -1093,6 +1163,22 @@ pub struct SflowConfig {
     #[serde(default = "default_sflow_recv_tasks")]
     pub recv_tasks: usize,
 
+    /// Number of datagrams one `recvmmsg(2)` call may return per receive
+    /// task (default: 1, meaning off — every call still returns at most one
+    /// datagram, via the original `recv_from` path). Above 1, each recv task
+    /// batches up to this many already-queued datagrams into one syscall
+    /// instead of one syscall per datagram. Unlike `recv_tasks`, this helps
+    /// a SINGLE high-rate sender: it reduces syscalls per datagram on one
+    /// socket rather than spreading datagrams across sockets, so it is the
+    /// lever for exactly the deployment shape `recv_tasks` cannot help (see
+    /// `recv_tasks`'s own doc comment). The two knobs are independent and
+    /// may be combined. `0` is treated the same as `1` (batching off), not
+    /// as "disabled". Never waits to fill a batch — a lone datagram is
+    /// still returned immediately. Rejected above `MAX_RECV_BATCH_SIZE` at
+    /// config load — see `validate_recv_batch_size_config`.
+    #[serde(default = "default_sflow_recv_batch_size")]
+    pub recv_batch_size: usize,
+
     /// Optional S3 persistence. Absent from TOML → `None` (backward compatible).
     #[serde(default)]
     pub s3: Option<SflowS3Config>,
@@ -1112,6 +1198,7 @@ impl Default for SflowConfig {
             bind_address: default_sflow_bind_address(),
             receive_buffer_bytes: default_udp_receive_buffer_bytes(),
             recv_tasks: default_sflow_recv_tasks(),
+            recv_batch_size: default_sflow_recv_batch_size(),
             s3: None,
             local: None,
         }
@@ -1126,6 +1213,9 @@ fn default_sflow_udp_port() -> u16 {
 }
 fn default_sflow_recv_tasks() -> usize {
     8
+}
+fn default_sflow_recv_batch_size() -> usize {
+    1
 }
 fn default_sflow_bind_address() -> String {
     "0.0.0.0".to_string()
@@ -1204,6 +1294,7 @@ impl Default for SyslogConfig {
             receive_buffer_bytes: default_udp_receive_buffer_bytes(),
             parse_dns: default_syslog_parse_dns(),
             recv_tasks: default_syslog_recv_tasks(),
+            recv_batch_size: default_syslog_recv_batch_size(),
             parse_payloads: false,
             s3: None,
             structured_s3: None,
@@ -1429,6 +1520,10 @@ fn default_syslog_recv_tasks() -> usize {
     8
 }
 
+fn default_syslog_recv_batch_size() -> usize {
+    1
+}
+
 impl Config {
     /// Load configuration from files and environment variables.
     ///
@@ -1469,6 +1564,7 @@ impl Config {
         let config: Config = config.try_deserialize()?;
         validate_iceberg_config(&config.iceberg)?;
         validate_recv_tasks_config(&config)?;
+        validate_recv_batch_size_config(&config)?;
         Ok(config)
     }
 }
@@ -2618,6 +2714,38 @@ prefix    = "_iceberg_descriptors"
         cfg.sflow.recv_tasks = 4;
         cfg.syslog.recv_tasks = 4;
         assert!(validate_recv_tasks_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_recv_batch_size_config_rejects_oversized_value() {
+        let mut cfg = Config::default();
+        cfg.ipfix.recv_batch_size = 100_000;
+        let err = validate_recv_batch_size_config(&cfg)
+            .expect_err("must reject an oversized recv_batch_size");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("100000") || msg.contains("100_000"),
+            "error must name the offending value: {msg}"
+        );
+        assert!(
+            msg.contains("ipfix.recv_batch_size"),
+            "error must name the offending section: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_recv_batch_size_config_ok_for_default_and_sane_values() {
+        assert!(validate_recv_batch_size_config(&Config::default()).is_ok());
+        let mut cfg = Config::default();
+        cfg.ipfix.recv_batch_size = 32;
+        cfg.sflow.recv_batch_size = 32;
+        cfg.syslog.recv_batch_size = 32;
+        assert!(validate_recv_batch_size_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn ipfix_config_recv_batch_size_defaults_to_one() {
+        assert_eq!(IpfixConfig::default().recv_batch_size, 1);
     }
 
     #[test]
