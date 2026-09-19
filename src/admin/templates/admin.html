@@ -592,14 +592,31 @@
                 if (!res.ok) throw new Error('Failed to load audit log');
                 const entries = await res.json();
                 
-                auditEntries.innerHTML = entries.map(entry => `
-                    <div class="audit-entry">
-                        <span class="timestamp">${new Date(entry.timestamp).toLocaleString()}</span>
-                        <strong>${entry.action}</strong> by ${entry.username} from ${entry.client_ip}
-                        ${entry.details ? `<br/><span>${entry.details}</span>` : ''}
-                    </div>
-                `).join('');
-                
+                auditEntries.replaceChildren(...entries.map(entry => {
+                    const div = document.createElement('div');
+                    div.className = 'audit-entry';
+
+                    const ts = document.createElement('span');
+                    ts.className = 'timestamp';
+                    ts.textContent = new Date(entry.timestamp).toLocaleString();
+                    div.append(ts, ' ');
+
+                    const action = document.createElement('strong');
+                    action.textContent = entry.action;
+                    div.append(action, ' by ');
+                    div.append(document.createTextNode(entry.username));
+                    div.append(' from ');
+                    div.append(document.createTextNode(entry.client_ip));
+
+                    if (entry.details) {
+                        div.append(document.createElement('br'));
+                        const details = document.createElement('span');
+                        details.textContent = entry.details;
+                        div.append(details);
+                    }
+                    return div;
+                }));
+
                 auditSection.style.display = 'block';
             } catch (err) {
                 setStatus('Failed to load audit log: ' + err.message);

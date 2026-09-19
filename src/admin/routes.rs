@@ -1745,4 +1745,44 @@ mod tests {
             );
         }
     }
+
+    /// The audit-log viewer must not interpolate attacker-controlled fields into
+    /// innerHTML. An unauthenticated attacker can write an audit entry by failing
+    /// a Basic-Auth login with a payload as the username; it then executes in the
+    /// admin's browser, same-origin, with cached credentials.
+    #[test]
+    fn admin_template_does_not_interpolate_audit_fields_into_inner_html() {
+        let template = include_str!("templates/admin.html");
+        for field in [
+            "${entry.username}",
+            "${entry.action}",
+            "${entry.details}",
+            "${entry.client_ip}",
+        ] {
+            assert!(
+                !template.contains(field),
+                "admin.html still interpolates {field} into a template literal; \
+                 audit entries must be rendered with textContent"
+            );
+        }
+    }
+
+    /// The API contract is deliberately unchanged: /audit-log serves the raw
+    /// stored string. Escaping is a render-time concern, so the JSON must NOT be
+    /// pre-escaped (that would corrupt the data for any other consumer).
+    #[tokio::test]
+    async fn audit_log_api_still_serves_the_payload_verbatim() {
+        let payload = "<img src=x onerror=alert(1)>";
+        let state = test_state().await;
+        state
+            .audit_logger
+            .log("AUTH_FAILED", payload, "127.0.0.1", None)
+            .await;
+
+        let entries = state.audit_logger.get_entries(100).await;
+        assert!(
+            entries.iter().any(|e| e.username == payload),
+            "the audit API must store and serve the raw username unescaped"
+        );
+    }
 }
