@@ -1,0 +1,80 @@
+# format=ipfix shape=real duration=15s runs=3 transport=udp port=4739
+# server restarted between every run; ipfix_datagrams_received/ipfix_socket_drops/parquet_s3_dropped are per-run values (fresh process), not deltas.
+# ipfix_socket_drops is reconciled against this run's own socket's /proc/net/udp drop counter (NOT host-wide RcvbufErrors), diffed before/after around each run's load.
+run	format	shape	offered	achieved	received	kernel_drops	writer_drops	buffer_drops	written	kernel_loss_pct	total_loss_pct	gen_cores	srv_cores	verdict
+# --- rate=20000 ---
+1	ipfix	real	299987	19998.5000	299991	0	0	0	299861	0.0000	0.0000	-0.00	0.72	PASS
+2	ipfix	real	299995	19998.8000	299999	0	0	0	299881	0.0000	0.0000	-0.00	0.69	PASS
+3	ipfix	real	299990	19998.6000	299994	0	0	0	299852	0.0000	0.0000	-0.00	0.66	PASS
+# --- summary: format=ipfix shape=real rate=20000 runs=3 ---
+median	ipfix	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+min	ipfix	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+max	ipfix	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+# NOTE: zero kernel-socket loss (ipfix_socket_drops == 0) on every run at rate=20000 -- rate/duration did not saturate the receive buffer on this host. This does not by itself mean total_loss_pct above is zero (writer_drops/buffer_drops can still be non-zero); if it is also zero, raise the rate or DURATION to produce a measurable baseline instead.
+# rate=20000 median_loss=0.0000% median_achieved=19998.6000
+PASS
+# --- rate=40000 ---
+1	ipfix	real	599978	39997.7000	599982	0	0	0	599978	0.0000	0.0000	-0.00	1.26	PASS
+2	ipfix	real	599965	39995.8000	599969	0	0	0	599965	0.0000	0.0000	-0.00	1.23	PASS
+3	ipfix	real	599957	39995.6000	599961	0	0	0	599957	0.0000	0.0000	-0.00	1.25	PASS
+# --- summary: format=ipfix shape=real rate=40000 runs=3 ---
+median	ipfix	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+min	ipfix	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+max	ipfix	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+# NOTE: zero kernel-socket loss (ipfix_socket_drops == 0) on every run at rate=40000 -- rate/duration did not saturate the receive buffer on this host. This does not by itself mean total_loss_pct above is zero (writer_drops/buffer_drops can still be non-zero); if it is also zero, raise the rate or DURATION to produce a measurable baseline instead.
+# rate=40000 median_loss=0.0000% median_achieved=39995.8000
+PASS
+# --- rate=80000 ---
+1	ipfix	real	1199937	79994.8000	1196035	3906	0	0	1196031	0.3255	0.3255	-0.00	2.22	FAIL-LOSS
+2	ipfix	real	1199869	79989.7000	1197035	2838	0	0	1197031	0.2365	0.2365	-0.00	2.11	FAIL-LOSS
+3	ipfix	real	1199927	79993.9000	1197791	2140	0	0	1197787	0.1783	0.1783	-0.00	2.16	FAIL-LOSS
+# --- summary: format=ipfix shape=real rate=80000 runs=3 ---
+median	ipfix	real	-	-	-	-	-	-	-	-	0.2365	-	-	-
+min	ipfix	real	-	-	-	-	-	-	-	-	0.1783	-	-	-
+max	ipfix	real	-	-	-	-	-	-	-	-	0.3255	-	-	-
+# rate=80000 median_loss=0.2365% median_achieved=79993.9000
+FAIL-LOSS
+# --- rate=60000 ---
+1	ipfix	real	899801	59984.4000	899805	0	0	0	899801	0.0000	0.0000	0.00	1.75	PASS
+2	ipfix	real	899935	59995.6000	891555	8384	0	0	891551	0.9316	0.9316	-0.00	1.73	FAIL-LOSS
+3	ipfix	real	899950	59995.0000	899954	0	0	0	899950	0.0000	0.0000	-0.00	1.69	PASS
+# --- summary: format=ipfix shape=real rate=60000 runs=3 ---
+median	ipfix	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+min	ipfix	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+max	ipfix	real	-	-	-	-	-	-	-	-	0.9316	-	-	-
+# rate=60000 median_loss=0.0000% median_achieved=59995.0000
+PASS
+# --- rate=70000 ---
+1	ipfix	real	1049964	69993.0000	1009209	40759	0	0	1000000	3.8819	3.8819	-0.00	1.77	FAIL-LOSS
+2	ipfix	real	1049919	69994.4000	1048929	994	0	0	1000000	0.0947	0.0947	-0.00	1.98	PASS
+3	ipfix	real	1049929	69992.2000	1048456	1477	0	0	1000000	0.1407	0.1407	-0.00	1.88	FAIL-LOSS
+# --- summary: format=ipfix shape=real rate=70000 runs=3 ---
+median	ipfix	real	-	-	-	-	-	-	-	-	0.1407	-	-	-
+min	ipfix	real	-	-	-	-	-	-	-	-	0.0947	-	-	-
+max	ipfix	real	-	-	-	-	-	-	-	-	3.8819	-	-	-
+# rate=70000 median_loss=0.1407% median_achieved=69993.0000
+FAIL-LOSS
+# --- rate=65000 ---
+1	ipfix	real	974956	64995.0000	974960	0	0	0	974956	0.0000	0.0000	-0.00	1.83	PASS
+2	ipfix	real	974921	64992.7000	974925	0	0	0	974921	0.0000	0.0000	0.00	1.79	PASS
+3	ipfix	real	974884	64992.0000	974888	0	0	0	974884	0.0000	0.0000	-0.00	1.82	PASS
+# --- summary: format=ipfix shape=real rate=65000 runs=3 ---
+median	ipfix	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+min	ipfix	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+max	ipfix	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+# NOTE: zero kernel-socket loss (ipfix_socket_drops == 0) on every run at rate=65000 -- rate/duration did not saturate the receive buffer on this host. This does not by itself mean total_loss_pct above is zero (writer_drops/buffer_drops can still be non-zero); if it is also zero, raise the rate or DURATION to produce a measurable baseline instead.
+# rate=65000 median_loss=0.0000% median_achieved=64992.7000
+PASS
+# --- rate=67500 ---
+1	ipfix	real	1012412	67493.3000	1005896	6520	0	0	1000000	0.6440	0.6440	-0.00	1.99	FAIL-LOSS
+2	ipfix	real	1012444	67495.0000	1012437	11	0	0	1000000	0.0011	0.0011	-0.00	1.88	PASS
+3	ipfix	real	1012483	67496.5000	942121	70366	956	0	900000	6.9498	7.0443	-0.00	1.91	FAIL-LOSS
+# --- summary: format=ipfix shape=real rate=67500 runs=3 ---
+median	ipfix	real	-	-	-	-	-	-	-	-	0.6440	-	-	-
+min	ipfix	real	-	-	-	-	-	-	-	-	0.0011	-	-	-
+max	ipfix	real	-	-	-	-	-	-	-	-	7.0443	-	-	-
+# NOTE: parquet_s3_dropped{source="ipfix"} was non-zero on at least one run at rate=67500 -- a second, distinct drop site downstream of the kernel socket. Report it separately; do not fold it into the kernel loss figure above.
+# rate=67500 median_loss=0.6440% median_achieved=67495.0000
+FAIL-LOSS
+CEILING 65000
+artifacts (server logs): /tmp/tmp.VLzXtvkpc6 (removed on exit; rerun with TMP_ROOT preserved manually if needed for debugging)

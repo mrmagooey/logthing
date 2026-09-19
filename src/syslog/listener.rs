@@ -39,6 +39,26 @@ pub struct SyslogListenerConfig {
     /// datagram-drop failure mode this addresses. See
     /// `crate::net::bind_udp_with_recv_buffer`.
     pub receive_buffer_bytes: Option<usize>,
+    /// Number of `SO_REUSEPORT` sockets, each drained by its own task
+    /// (default: 8). Applies to the UDP arm only — the TCP listener on
+    /// `tcp_port` is unaffected. `1` uses a single plain socket and is
+    /// byte-for-byte the original pre-fan-out behaviour. Above 1, the kernel fans datagrams
+    /// across the group; syslog's parser is stateless (each datagram is
+    /// parsed independently), so unlike IPFIX no cache needs to be shared
+    /// across tasks.
+    ///
+    /// The kernel picks a socket by hashing each datagram's source/
+    /// destination address-port 4-tuple, so a given source port always
+    /// lands on the same socket. Throughput therefore scales with the
+    /// number of *distinct senders* (or, for one sender, distinct source
+    /// ports), not with this value: raising it for a deployment with a
+    /// single syslog sender sending from one fixed source port yields zero
+    /// benefit, because every datagram still hashes to the same socket.
+    /// Syslog is the format most likely to genuinely benefit here, since a
+    /// deployment ingesting from a fleet of hosts has many distinct
+    /// senders. `0` is treated the same as `1` (single-socket path), not as
+    /// "disabled".
+    pub recv_tasks: usize,
 }
 
 impl Default for SyslogListenerConfig {
@@ -49,6 +69,7 @@ impl Default for SyslogListenerConfig {
             bind_address: "0.0.0.0".to_string(),
             parse_dns_logs: true,
             receive_buffer_bytes: Some(4 * 1024 * 1024),
+            recv_tasks: 8,
         }
     }
 }
@@ -241,111 +262,188 @@ impl SyslogListener {
     ///
     /// The listener exits cleanly when `shutdown_rx` receives `true` (or is closed).
     /// Used from `main.rs`; tests continue to use `start()` or `run_with_listener()`.
+    ///
+    /// `recv_tasks <= 1` is this exact combined UDP+TCP loop,
+    /// unchanged — that is the property that makes the fan-out below safe
+    /// to deploy. Above 1, N `SO_REUSEPORT` UDP sockets are bound and each
+    /// drained by its own task; the TCP listener is unaffected (`recv_tasks`
+    /// applies to the UDP arm only) and runs as one more task. Syslog's
+    /// parser is stateless, so unlike IPFIX no state needs to be shared
+    /// across UDP tasks — only the drop-stats tracker is shared, since all
+    /// N sockets share one address:port and `/proc/net/udp` already sums
+    /// their lines (see `syslog_udp_recv_loop` and its call site below).
     pub async fn start_with_shutdown(
         &self,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let semaphore = Arc::new(Semaphore::new(MAX_SYSLOG_TCP_CONNECTIONS));
-
         let udp_addr: SocketAddr =
             format!("{}:{}", self.config.bind_address, self.config.udp_port).parse()?;
         let tcp_addr: SocketAddr =
             format!("{}:{}", self.config.bind_address, self.config.tcp_port).parse()?;
 
-        let udp_socket = crate::net::bind_udp_with_recv_buffer(
-            &udp_addr,
-            self.config.receive_buffer_bytes,
-            "syslog_udp",
-        )
-        .await?;
-        info!("Syslog UDP listener started on {}", udp_addr);
-        let tcp_listener = TcpListener::bind(&tcp_addr).await?;
-        info!("Syslog TCP listener started on {}", tcp_addr);
+        if self.config.recv_tasks <= 1 {
+            let semaphore = Arc::new(Semaphore::new(MAX_SYSLOG_TCP_CONNECTIONS));
 
-        let mut buf = vec![0u8; 65535];
-        let handler_udp = self.handler.clone();
-        let handler_tcp = self.handler.clone();
-        let mut socket_stats = crate::net::SocketDropStats::new(&udp_socket, "syslog_udp");
-        let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
+            let udp_socket = crate::net::bind_udp_with_recv_buffer(
+                &udp_addr,
+                self.config.receive_buffer_bytes,
+                "syslog_udp",
+            )
+            .await?;
+            info!("Syslog UDP listener started on {}", udp_addr);
+            let tcp_listener = TcpListener::bind(&tcp_addr).await?;
+            info!("Syslog TCP listener started on {}", tcp_addr);
 
-        loop {
-            tokio::select! {
-                // UDP receive arm
-                result = udp_socket.recv_from(&mut buf) => {
-                    match result {
-                        Ok((len, src)) => {
-                            // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
-                            if !self.allowed_ips.is_allowed(&src) {
-                                metrics::counter!("listener_source_rejected", "protocol" => "syslog_udp").increment(1);
-                                debug!("Rejected syslog_udp datagram from {} — not in allowed_ips", src);
-                                continue;
-                            }
-                            let msg = String::from_utf8_lossy(&buf[..len]);
-                            debug!("Received UDP syslog message from {}: {} bytes", src, len);
-                            metrics::counter!("syslog_messages_received").increment(1);
-                            if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
-                                handler_udp.handle_message(syslog_msg, src).await;
-                            } else {
-                                metrics::counter!("syslog_parse_errors").increment(1);
-                                warn!(
-                                    "Failed to parse syslog message from {}: {}",
-                                    src,
-                                    &msg[..100.min(msg.len())]
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            error!("UDP receive error: {}", e);
-                        }
-                    }
-                }
-                // TCP accept arm
-                result = tcp_listener.accept() => {
-                    match result {
-                        Ok((stream, src)) => {
-                            if !self.allowed_ips.is_allowed(&src) {
-                                metrics::counter!("listener_source_rejected", "protocol" => "syslog_tcp").increment(1);
-                                warn!("Rejected syslog_tcp connection from {} — not in allowed_ips", src);
-                                continue;
-                            }
-                            // Acquire semaphore permit before spawning — bounds concurrent connections
-                            match semaphore.clone().try_acquire_owned() {
-                                Ok(permit) => {
-                                    let handler = handler_tcp.clone();
-                                    tokio::spawn(async move {
-                                        let _permit = permit; // held for connection lifetime
-                                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler).await {
-                                            error!("TCP connection error from {}: {}", src, e);
-                                        }
-                                    });
+            let mut buf = vec![0u8; 65535];
+            let handler_udp = self.handler.clone();
+            let handler_tcp = self.handler.clone();
+            let mut socket_stats = crate::net::SocketDropStats::new(&udp_socket, "syslog_udp");
+            let mut socket_stats_ticker =
+                tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
+
+            loop {
+                tokio::select! {
+                    // UDP receive arm
+                    result = udp_socket.recv_from(&mut buf) => {
+                        match result {
+                            Ok((len, src)) => {
+                                // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                                if !self.allowed_ips.is_allowed(&src) {
+                                    metrics::counter!("listener_source_rejected", "protocol" => "syslog_udp").increment(1);
+                                    debug!("Rejected syslog_udp datagram from {} — not in allowed_ips", src);
+                                    continue;
                                 }
-                                Err(_) => {
-                                    // Semaphore exhausted — too many connections; drop this one
-                                    metrics::counter!("syslog_tcp_connections_rejected").increment(1);
+                                let msg = String::from_utf8_lossy(&buf[..len]);
+                                debug!("Received UDP syslog message from {}: {} bytes", src, len);
+                                metrics::counter!("syslog_messages_received").increment(1);
+                                if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
+                                    handler_udp.handle_message(syslog_msg, src).await;
+                                } else {
+                                    metrics::counter!("syslog_parse_errors").increment(1);
                                     warn!(
-                                        "Syslog: TCP connection limit ({}) reached; rejecting {}",
-                                        MAX_SYSLOG_TCP_CONNECTIONS, src
+                                        "Failed to parse syslog message from {}: {}",
+                                        src,
+                                        &msg[..100.min(msg.len())]
                                     );
                                 }
                             }
-                        }
-                        Err(e) => {
-                            error!("TCP accept error: {}", e);
+                            Err(e) => {
+                                error!("UDP receive error: {}", e);
+                            }
                         }
                     }
-                }
-                // Socket-drop/rx-queue metrics arm (UDP socket only; TCP has no analogous kernel drop counter here)
-                _ = socket_stats_ticker.tick() => {
-                    socket_stats.poll().await;
-                }
-                // Shutdown arm
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        info!("Syslog listener: shutdown signal received");
-                        break;
+                    // TCP accept arm
+                    result = tcp_listener.accept() => {
+                        match result {
+                            Ok((stream, src)) => {
+                                if !self.allowed_ips.is_allowed(&src) {
+                                    metrics::counter!("listener_source_rejected", "protocol" => "syslog_tcp").increment(1);
+                                    warn!("Rejected syslog_tcp connection from {} — not in allowed_ips", src);
+                                    continue;
+                                }
+                                // Acquire semaphore permit before spawning — bounds concurrent connections
+                                match semaphore.clone().try_acquire_owned() {
+                                    Ok(permit) => {
+                                        let handler = handler_tcp.clone();
+                                        tokio::spawn(async move {
+                                            let _permit = permit; // held for connection lifetime
+                                            if let Err(e) = Self::handle_tcp_connection(stream, src, handler).await {
+                                                error!("TCP connection error from {}: {}", src, e);
+                                            }
+                                        });
+                                    }
+                                    Err(_) => {
+                                        // Semaphore exhausted — too many connections; drop this one
+                                        metrics::counter!("syslog_tcp_connections_rejected").increment(1);
+                                        warn!(
+                                            "Syslog: TCP connection limit ({}) reached; rejecting {}",
+                                            MAX_SYSLOG_TCP_CONNECTIONS, src
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("TCP accept error: {}", e);
+                            }
+                        }
+                    }
+                    // Socket-drop/rx-queue metrics arm (UDP socket only; TCP has no analogous kernel drop counter here)
+                    _ = socket_stats_ticker.tick() => {
+                        socket_stats.poll().await;
+                    }
+                    // Shutdown arm
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            info!("Syslog listener: shutdown signal received");
+                            break;
+                        }
                     }
                 }
             }
+
+            return Ok(());
+        }
+
+        // Fan-out path: recv_tasks > 1. Bind N SO_REUSEPORT UDP sockets on
+        // the same address:port and drain each from its own task. The TCP
+        // listener is unaffected by recv_tasks and runs as one more task.
+        let mut sockets = Vec::with_capacity(self.config.recv_tasks);
+        for _ in 0..self.config.recv_tasks {
+            sockets.push(
+                crate::net::bind_udp_reuseport_with_recv_buffer(
+                    &udp_addr,
+                    self.config.receive_buffer_bytes,
+                    "syslog_udp",
+                )
+                .await?,
+            );
+        }
+        let bound_udp_addr = sockets[0].local_addr()?;
+        info!(
+            "Syslog UDP listener started on {} ({} recv tasks)",
+            bound_udp_addr,
+            sockets.len()
+        );
+
+        let tcp_listener = TcpListener::bind(&tcp_addr).await?;
+        info!("Syslog TCP listener started on {}", tcp_addr);
+        let semaphore = Arc::new(Semaphore::new(MAX_SYSLOG_TCP_CONNECTIONS));
+
+        // All N sockets share one address:port, so /proc/net/udp already
+        // sums their lines (see `parse_proc_net_udp`) — one tracker polled
+        // once per group; one per task would multiply-count the same total.
+        let mut socket_stats = Some(crate::net::SocketDropStats::new(&sockets[0], "syslog_udp"));
+
+        let mut tasks = Vec::with_capacity(sockets.len() + 1);
+        for (i, socket) in sockets.into_iter().enumerate() {
+            let handler = self.handler.clone();
+            let allowed_ips = self.allowed_ips.clone();
+            let task_shutdown_rx = shutdown_rx.clone();
+            // Only the first task takes the shared drop-stats tracker, so it
+            // is polled exactly once per SO_REUSEPORT group.
+            let stats = if i == 0 { socket_stats.take() } else { None };
+            tasks.push(tokio::spawn(syslog_udp_recv_loop(
+                socket,
+                handler,
+                allowed_ips,
+                task_shutdown_rx,
+                stats,
+            )));
+        }
+
+        let tcp_handler = self.handler.clone();
+        let tcp_allowed_ips = self.allowed_ips.clone();
+        let tcp_shutdown_rx = shutdown_rx.clone();
+        tasks.push(tokio::spawn(syslog_tcp_accept_loop(
+            tcp_listener,
+            tcp_handler,
+            tcp_allowed_ips,
+            semaphore,
+            tcp_shutdown_rx,
+        )));
+
+        for task in tasks {
+            let _ = task.await;
         }
 
         Ok(())
@@ -539,6 +637,124 @@ impl SyslogListener {
         }
 
         Ok(())
+    }
+}
+
+/// The UDP recv loop run by each task in the `recv_tasks > 1` fan-out. Same
+/// body as the `recv_tasks <= 1` UDP arm in `start_with_shutdown`,
+/// parameterized so it can be spawned once per `SO_REUSEPORT` socket.
+/// `socket_stats` is `Some` for exactly one task per group (see the call
+/// site) so the shared drop counter is polled once, not once per task.
+async fn syslog_udp_recv_loop(
+    socket: tokio::net::UdpSocket,
+    handler: Arc<dyn SyslogHandler>,
+    allowed_ips: IpWhitelist,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut socket_stats: Option<crate::net::SocketDropStats>,
+) {
+    let mut buf = vec![0u8; 65535];
+    let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
+
+    loop {
+        tokio::select! {
+            result = socket.recv_from(&mut buf) => {
+                match result {
+                    Ok((len, src)) => {
+                        // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                        if !allowed_ips.is_allowed(&src) {
+                            metrics::counter!("listener_source_rejected", "protocol" => "syslog_udp").increment(1);
+                            debug!("Rejected syslog_udp datagram from {} — not in allowed_ips", src);
+                            continue;
+                        }
+                        let msg = String::from_utf8_lossy(&buf[..len]);
+                        debug!("Received UDP syslog message from {}: {} bytes", src, len);
+                        metrics::counter!("syslog_messages_received").increment(1);
+                        if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
+                            handler.handle_message(syslog_msg, src).await;
+                        } else {
+                            metrics::counter!("syslog_parse_errors").increment(1);
+                            warn!(
+                                "Failed to parse syslog message from {}: {}",
+                                src,
+                                &msg[..100.min(msg.len())]
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!("UDP receive error: {}", e);
+                    }
+                }
+            }
+            _ = socket_stats_ticker.tick(), if socket_stats.is_some() => {
+                if let Some(stats) = socket_stats.as_mut() {
+                    stats.poll().await;
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("Syslog UDP listener: shutdown signal received");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// The TCP accept loop used by the `recv_tasks > 1` fan-out path. Identical
+/// behaviour to the TCP arm of the combined `recv_tasks <= 1` loop in
+/// `start_with_shutdown`, extracted so it can run as its own task alongside
+/// the N UDP recv tasks — `recv_tasks` does not apply to TCP, so there is
+/// always exactly one of these regardless of the knob's value.
+async fn syslog_tcp_accept_loop(
+    listener: TcpListener,
+    handler: Arc<dyn SyslogHandler>,
+    allowed_ips: IpWhitelist,
+    semaphore: Arc<Semaphore>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, src)) => {
+                        if !allowed_ips.is_allowed(&src) {
+                            metrics::counter!("listener_source_rejected", "protocol" => "syslog_tcp").increment(1);
+                            warn!("Rejected syslog_tcp connection from {} — not in allowed_ips", src);
+                            continue;
+                        }
+                        // Acquire semaphore permit before spawning — bounds concurrent connections
+                        match semaphore.clone().try_acquire_owned() {
+                            Ok(permit) => {
+                                let handler = handler.clone();
+                                tokio::spawn(async move {
+                                    let _permit = permit; // held for connection lifetime
+                                    if let Err(e) = SyslogListener::handle_tcp_connection(stream, src, handler).await {
+                                        error!("TCP connection error from {}: {}", src, e);
+                                    }
+                                });
+                            }
+                            Err(_) => {
+                                // Semaphore exhausted — too many connections; drop this one
+                                metrics::counter!("syslog_tcp_connections_rejected").increment(1);
+                                warn!(
+                                    "Syslog: TCP connection limit ({}) reached; rejecting {}",
+                                    MAX_SYSLOG_TCP_CONNECTIONS, src
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("TCP accept error: {}", e);
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("Syslog TCP listener: shutdown signal received");
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -895,6 +1111,7 @@ mod tests {
             bind_address: "127.0.0.1".to_string(),
             parse_dns_logs: false,
             receive_buffer_bytes: Some(1024 * 1024),
+            ..SyslogListenerConfig::default()
         };
         let handler = CapturingHandler::new();
         let listener = SyslogListener::new(config, handler.clone());
@@ -1112,6 +1329,119 @@ mod tests {
             1,
             "allowed source must reach the handler; got {}",
             messages.len()
+        );
+    }
+
+    /// Test handler that just counts messages — used by the fan-out test,
+    /// which only cares whether every message arrived, not its content.
+    struct CountingHandler {
+        count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                count: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn message_count(&self) -> usize {
+            self.count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SyslogHandler for CountingHandler {
+        async fn handle_message(&self, _message: SyslogMessage, _source: SocketAddr) {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Starts a real `SyslogListener` via `start_with_shutdown` (the
+    /// production path) bound to ephemeral UDP/TCP ports, with `recv_tasks`
+    /// configured as given. Returns the listener's join handle, its bound
+    /// UDP address, the shutdown sender, and a handler that counts total
+    /// messages.
+    async fn start_test_listener(
+        recv_tasks: usize,
+    ) -> (
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        Arc<CountingHandler>,
+    ) {
+        // Bind briefly to obtain ephemeral ports, then drop so the listener
+        // (and, for recv_tasks > 1, its SO_REUSEPORT group) can bind the
+        // same UDP address — same pattern as this module's other tests.
+        let tmp_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = tmp_udp.local_addr().unwrap().port();
+        drop(tmp_udp);
+        let tmp_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tmp_tcp.local_addr().unwrap().port();
+        drop(tmp_tcp);
+        let bound: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
+
+        let config = SyslogListenerConfig {
+            udp_port,
+            tcp_port,
+            bind_address: "127.0.0.1".to_string(),
+            parse_dns_logs: false,
+            recv_tasks,
+            ..SyslogListenerConfig::default()
+        };
+        let handler = CountingHandler::new();
+        let listener = SyslogListener::new(config, handler.clone());
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { listener.start_with_shutdown(shutdown_rx).await });
+
+        // Give every recv task time to bind and enter its recv loop.
+        sleep(Duration::from_millis(50)).await;
+
+        (task, bound, shutdown_tx, handler)
+    }
+
+    /// Guards that every socket in a `recv_tasks > 1` `SO_REUSEPORT` group is
+    /// actually drained — not just that the group binds. A task that binds
+    /// its socket but never reads from it (e.g. spawned and then leaked, or
+    /// wired to the wrong recv loop) would silently drop its entire hashed
+    /// share of traffic with the process otherwise looking healthy; this
+    /// test's only way to catch that is by getting datagrams to land on
+    /// every member of the group, which requires enough distinct source
+    /// ports for the kernel's 4-tuple hash to spread across all of them.
+    ///
+    /// Syslog UDP parses each datagram independently — no cross-datagram
+    /// state — so the only risk here is a lost datagram, not a decode
+    /// failure.
+    ///
+    /// Port count chosen empirically, not from the naive `1 - (3/4)^n`
+    /// binomial model, mirroring the sFlow/IPFIX fan-out tests: with a
+    /// 4-member group and one socket sabotaged to never drain (bound,
+    /// receiving its hashed share, but its task never calls `recv_from`),
+    /// 32 source ports (320 datagrams total) caught the sabotage in 10 of
+    /// 10 measured runs here (see the task-6 report for the exact
+    /// procedure) — that is the number this test uses.
+    #[tokio::test]
+    async fn fanned_out_udp_receives_from_several_source_ports() {
+        const SOURCE_PORTS: u32 = 32;
+        const DATAGRAMS_PER_PORT: u32 = 10;
+
+        let (listener, bound, shutdown_tx, handler) = start_test_listener(4).await;
+
+        for i in 0..SOURCE_PORTS {
+            let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            for n in 0..DATAGRAMS_PER_PORT {
+                let msg = format!("<34>Oct 11 22:14:15 host app: fanout {i}-{n}");
+                sock.send_to(msg.as_bytes(), bound).await.unwrap();
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let _ = shutdown_tx.send(true);
+        let _ = listener.await;
+
+        assert_eq!(
+            handler.message_count(),
+            (SOURCE_PORTS * DATAGRAMS_PER_PORT) as usize
         );
     }
 }

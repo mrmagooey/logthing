@@ -197,6 +197,29 @@ pub struct SyslogConfig {
     #[serde(default = "default_syslog_parse_dns")]
     pub parse_dns: bool,
 
+    /// Number of UDP receive tasks (default: 8). Applies to the UDP arm
+    /// only — the TCP listener on `tcp_port` is unaffected. Raise to spread
+    /// socket draining across cores when the kernel is dropping datagrams
+    /// while CPU sits idle. See docs/performance/2026-09-18-udp-recv-fanout-results.md.
+    ///
+    /// The kernel distributes datagrams across the group by hashing each
+    /// packet's source/destination address-port 4-tuple, so throughput
+    /// scales with the number of distinct senders (or, for one sender,
+    /// distinct source ports) — not with the value of this knob. A
+    /// deployment with a single exporter sending from one fixed source port
+    /// will see no benefit from raising it, because every datagram still
+    /// hashes to the same socket. Syslog is the format most likely to
+    /// genuinely benefit here, since a deployment ingesting from a fleet of
+    /// hosts has many distinct senders. `0` is treated the same as `1`, not
+    /// as "disabled". The default of `8` costs roughly 19 KB RSS and one
+    /// file descriptor per extra socket at idle (measured with zero traffic
+    /// — see the idle-cost table in the perf doc above); the measured
+    /// throughput saturation point is `4`, so `8` is headroom, not a claim
+    /// that it outperforms `4`. Rejected above `MAX_RECV_TASKS` at config
+    /// load — see `validate_recv_tasks_config`.
+    #[serde(default = "default_syslog_recv_tasks")]
+    pub recv_tasks: usize,
+
     /// Enable syslog payload sub-parsing (CEF, LEEF, auditd, DHCP, RADIUS,
     /// web_access, DNS).  Default false (backward compatible).
     #[serde(default)]
@@ -259,6 +282,26 @@ pub struct IpfixConfig {
     #[serde(default = "default_udp_receive_buffer_bytes")]
     pub receive_buffer_bytes: Option<usize>,
 
+    /// Number of UDP receive tasks (default: 8). Raise to spread socket
+    /// draining across cores when the kernel is dropping datagrams while CPU
+    /// sits idle. See docs/performance/2026-09-18-udp-recv-fanout-results.md.
+    ///
+    /// The kernel distributes datagrams across the group by hashing each
+    /// packet's source/destination address-port 4-tuple, so throughput
+    /// scales with the number of distinct senders (or, for one sender,
+    /// distinct source ports) — not with the value of this knob. A
+    /// deployment with a single exporter sending from one fixed source port
+    /// will see no benefit from raising it, because every datagram still
+    /// hashes to the same socket. `0` is treated the same as `1`, not as
+    /// "disabled". The default of `8` costs roughly 19 KB RSS and one file
+    /// descriptor per extra socket at idle (measured with zero traffic — see
+    /// the idle-cost table in the perf doc above); the measured throughput
+    /// saturation point is `4`, so `8` is headroom, not a claim that it
+    /// outperforms `4`. Rejected above `MAX_RECV_TASKS` at config load — see
+    /// `validate_recv_tasks_config`.
+    #[serde(default = "default_ipfix_recv_tasks")]
+    pub recv_tasks: usize,
+
     /// Optional S3 persistence for IPFIX flows.
     /// Absent from TOML → `None` → no S3 persistence (backward compatible).
     #[serde(default)]
@@ -278,6 +321,7 @@ impl Default for IpfixConfig {
             udp_port: default_ipfix_udp_port(),
             bind_address: default_ipfix_bind_address(),
             receive_buffer_bytes: default_udp_receive_buffer_bytes(),
+            recv_tasks: default_ipfix_recv_tasks(),
             s3: None,
             local: None,
         }
@@ -289,6 +333,9 @@ fn default_ipfix_enabled() -> bool {
 }
 fn default_ipfix_udp_port() -> u16 {
     4739
+}
+fn default_ipfix_recv_tasks() -> usize {
+    8
 }
 fn default_ipfix_bind_address() -> String {
     "0.0.0.0".to_string()
@@ -785,6 +832,44 @@ pub struct IcebergDescriptorLocalConfig {
     pub prefix: String,
 }
 
+/// Upper bound on `recv_tasks` for each UDP fan-out listener (ipfix, sflow,
+/// syslog). The measured sweep in
+/// docs/performance/2026-09-18-udp-recv-fanout-results.md found
+/// `recv_tasks = 4` already saturating throughput on a 12-CPU host, with `8`
+/// buying no further median improvement — so anything much larger than a
+/// small multiple of that is not a real tuning choice, it's a typo or a
+/// mis-scaled template. Each unit above 1 binds its own `SO_REUSEPORT`
+/// socket and requests its own `receive_buffer_bytes` (4 MiB by default), so
+/// an unbounded value fails startup part-way through with `EMFILE` or an
+/// OOM-adjacent condition instead of a clear error. A fixed cap (rather than
+/// deriving from `available_parallelism()`) keeps the check deterministic
+/// across hosts and in CI.
+const MAX_RECV_TASKS: usize = 64;
+
+/// Rejects a `recv_tasks` value above `MAX_RECV_TASKS` for any of the three
+/// UDP fan-out listeners. `0` and `1` are always accepted — `0` is
+/// documented as being treated the same as `1` — and so is `8`, the
+/// default. See `MAX_RECV_TASKS` for why the upper bound exists and how it
+/// was chosen.
+pub fn validate_recv_tasks_config(cfg: &Config) -> anyhow::Result<()> {
+    for (section, value) in [
+        ("ipfix.recv_tasks", cfg.ipfix.recv_tasks),
+        ("sflow.recv_tasks", cfg.sflow.recv_tasks),
+        ("syslog.recv_tasks", cfg.syslog.recv_tasks),
+    ] {
+        if value > MAX_RECV_TASKS {
+            anyhow::bail!(
+                "{section} = {value} exceeds the maximum of {MAX_RECV_TASKS}; this almost \
+                 certainly means a typo or a mis-scaled config template rather than an \
+                 intentional value — each unit binds its own SO_REUSEPORT socket and requests \
+                 its own receive buffer, so a large value can exhaust file descriptors or \
+                 memory before startup finishes. Lower {section} to {MAX_RECV_TASKS} or below."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Rejects a config where both `iceberg.s3` and `iceberg.local` are
 /// configured simultaneously. Because `config::Config::builder()` merges
 /// all layers (file → admin-override-file → env vars) before
@@ -988,6 +1073,26 @@ pub struct SflowConfig {
     #[serde(default = "default_udp_receive_buffer_bytes")]
     pub receive_buffer_bytes: Option<usize>,
 
+    /// Number of UDP receive tasks (default: 8). Raise to spread socket
+    /// draining across cores when the kernel is dropping datagrams while CPU
+    /// sits idle. See docs/performance/2026-09-18-udp-recv-fanout-results.md.
+    ///
+    /// The kernel distributes datagrams across the group by hashing each
+    /// packet's source/destination address-port 4-tuple, so throughput
+    /// scales with the number of distinct senders (or, for one sender,
+    /// distinct source ports) — not with the value of this knob. A
+    /// deployment with a single exporter sending from one fixed source port
+    /// will see no benefit from raising it, because every datagram still
+    /// hashes to the same socket. `0` is treated the same as `1`, not as
+    /// "disabled". The default of `8` costs roughly 19 KB RSS and one file
+    /// descriptor per extra socket at idle (measured with zero traffic — see
+    /// the idle-cost table in the perf doc above); the measured throughput
+    /// saturation point is `4`, so `8` is headroom, not a claim that it
+    /// outperforms `4`. Rejected above `MAX_RECV_TASKS` at config load — see
+    /// `validate_recv_tasks_config`.
+    #[serde(default = "default_sflow_recv_tasks")]
+    pub recv_tasks: usize,
+
     /// Optional S3 persistence. Absent from TOML → `None` (backward compatible).
     #[serde(default)]
     pub s3: Option<SflowS3Config>,
@@ -1006,6 +1111,7 @@ impl Default for SflowConfig {
             udp_port: default_sflow_udp_port(),
             bind_address: default_sflow_bind_address(),
             receive_buffer_bytes: default_udp_receive_buffer_bytes(),
+            recv_tasks: default_sflow_recv_tasks(),
             s3: None,
             local: None,
         }
@@ -1017,6 +1123,9 @@ fn default_sflow_enabled() -> bool {
 }
 fn default_sflow_udp_port() -> u16 {
     6343
+}
+fn default_sflow_recv_tasks() -> usize {
+    8
 }
 fn default_sflow_bind_address() -> String {
     "0.0.0.0".to_string()
@@ -1094,6 +1203,7 @@ impl Default for SyslogConfig {
             tcp_port: default_syslog_tcp_port(),
             receive_buffer_bytes: default_udp_receive_buffer_bytes(),
             parse_dns: default_syslog_parse_dns(),
+            recv_tasks: default_syslog_recv_tasks(),
             parse_payloads: false,
             s3: None,
             structured_s3: None,
@@ -1315,6 +1425,10 @@ fn default_syslog_parse_dns() -> bool {
     true
 }
 
+fn default_syslog_recv_tasks() -> usize {
+    8
+}
+
 impl Config {
     /// Load configuration from files and environment variables.
     ///
@@ -1354,6 +1468,7 @@ impl Config {
         let config = builder.build()?;
         let config: Config = config.try_deserialize()?;
         validate_iceberg_config(&config.iceberg)?;
+        validate_recv_tasks_config(&config)?;
         Ok(config)
     }
 }
@@ -2475,6 +2590,34 @@ prefix    = "_iceberg_descriptors"
             msg.contains("/data/iceberg"),
             "error must name the local directory: {msg}"
         );
+    }
+
+    #[test]
+    fn validate_recv_tasks_config_rejects_oversized_value() {
+        let mut cfg = Config::default();
+        cfg.ipfix.recv_tasks = 100_000;
+        let err =
+            validate_recv_tasks_config(&cfg).expect_err("must reject an oversized recv_tasks");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("100000") || msg.contains("100_000"),
+            "error must name the offending value: {msg}"
+        );
+        assert!(
+            msg.contains("ipfix.recv_tasks"),
+            "error must name the offending section: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_recv_tasks_config_ok_for_default_and_sane_values() {
+        assert!(validate_recv_tasks_config(&Config::default()).is_ok());
+
+        let mut cfg = Config::default();
+        cfg.ipfix.recv_tasks = 4;
+        cfg.sflow.recv_tasks = 4;
+        cfg.syslog.recv_tasks = 4;
+        assert!(validate_recv_tasks_config(&cfg).is_ok());
     }
 
     #[test]

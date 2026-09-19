@@ -175,6 +175,17 @@ against the listener's own `/proc/net/udp` counter); writer- and buffer-drop
 columns are 0 at every rate in this log, including the failing ones.
 **Verdict: kernel-limited.**
 
+> **📈 Update, 2026-09-18 (later same day):** a `recv_tasks` knob (UDP receive
+> fan-out, `N` `SO_REUSEPORT` sockets each drained by its own task) was added
+> and measured against this exact ceiling. At `recv_tasks=4` the syslog
+> ceiling rose to **27,500/s** (1.38x). The default remains `recv_tasks=1`,
+> so the **20,000/s figure above is still correct and unchanged** for a
+> default-configuration deployment. The fan-out only helps when there are
+> many distinct senders (a syslog fleet) — `SO_REUSEPORT` hashes by 4-tuple,
+> so a single sender sees no benefit from raising it. Full results, the
+> variance caveat, and the single-sender limitation:
+> `docs/performance/2026-09-18-udp-recv-fanout-results.md`.
+
 #### ipfix — CEILING 37,500/s (`2026-09-18-max-ingest-rate-ipfix.log`)
 
 | rate | run | offered | kernel_drops | writer_drops | buffer_drops | total_loss% | verdict |
@@ -188,6 +199,19 @@ different picture from the stale 2026-09-14 baseline, where writer-channel
 drops dominated IPFIX loss — that was fixed by commit `c103de3` before this
 campaign ran.)
 
+> **📈 Update, 2026-09-18 (later same day):** a `recv_tasks` knob (UDP receive
+> fan-out, `N` `SO_REUSEPORT` sockets each drained by its own task) was added
+> and measured against this exact ceiling. At `recv_tasks=4` the ipfix
+> ceiling rose to **65,000/s** (1.73x). The default remains `recv_tasks=1`,
+> so the **37,500/s figure above is still correct and unchanged** for a
+> default-configuration deployment. A `recv_tasks` sweep at 60,000/s (RUNS=5)
+> found the effect saturates at `recv_tasks=4` (median loss 7.81% → 1.56% →
+> 0% → 0% for 1/2/4/8) at modest CPU cost. The fan-out only helps when there
+> are many distinct exporters — `SO_REUSEPORT` hashes by 4-tuple, so a single
+> exporter sees no benefit from raising it. Full results, the variance
+> caveat, and the single-sender limitation:
+> `docs/performance/2026-09-18-udp-recv-fanout-results.md`.
+
 #### sflow — CEILING 40,000/s (`2026-09-18-max-ingest-rate-sflow.log`)
 
 | rate | run | offered | kernel_drops | writer_drops | buffer_drops | total_loss% | verdict |
@@ -197,6 +221,20 @@ campaign ran.)
 
 All loss is kernel-socket drop; writer/buffer are 0 throughout. **Verdict:
 kernel-limited.**
+
+> **📈 Update, 2026-09-18 (later same day):** a `recv_tasks` knob (UDP receive
+> fan-out, `N` `SO_REUSEPORT` sockets each drained by its own task) was added
+> and measured against this exact ceiling. At `recv_tasks=4` the sflow
+> ceiling rose to **82,500/s** (2.06x). The default remains `recv_tasks=1`,
+> so the **40,000/s figure above is still correct and unchanged** for a
+> default-configuration deployment. The fan-out only helps when there are
+> many distinct agents — `SO_REUSEPORT` hashes by 4-tuple, so a single agent
+> sees no benefit from raising it. This ceiling also exposed real
+> run-to-run variance near the loss knee (a 40,000/s run lost 2.80% while
+> its neighbours lost under 0.2%, refuted as neither warm-up nor
+> progressive degradation) — treat the 82,500/s figure as accurate to two
+> significant figures, not more. Full results:
+> `docs/performance/2026-09-18-udp-recv-fanout-results.md`.
 
 #### hec — CEILING 173,750/s (`2026-09-18-max-ingest-rate-hec.log`, `EVENTS_PER_REQUEST=100`)
 

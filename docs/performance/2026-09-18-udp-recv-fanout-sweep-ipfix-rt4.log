@@ -1,0 +1,17 @@
+# format=ipfix shape=real duration=15s runs=5 transport=udp port=4739
+# server restarted between every run; ipfix_datagrams_received/ipfix_socket_drops/parquet_s3_dropped are per-run values (fresh process), not deltas.
+# ipfix_socket_drops is reconciled against this run's own socket's /proc/net/udp drop counter (NOT host-wide RcvbufErrors), diffed before/after around each run's load.
+run	format	shape	offered	achieved	received	kernel_drops	writer_drops	buffer_drops	written	kernel_loss_pct	total_loss_pct	gen_cores	srv_cores	verdict
+# --- rate=60000 ---
+1	ipfix	real	899918	59993.6000	899922	0	0	0	899918	0.0000	0.0000	-0.00	1.79	PASS
+2	ipfix	real	899941	59994.5000	882710	17235	0	0	882706	1.9151	1.9151	-0.00	1.62	FAIL-LOSS
+3	ipfix	real	899949	59994.2000	899953	0	0	0	899949	0.0000	0.0000	-0.00	1.82	PASS
+4	ipfix	real	899946	59995.8000	899950	0	0	0	899946	0.0000	0.0000	-0.00	1.62	PASS
+5	ipfix	real	899970	59994.7000	899974	0	0	0	899970	0.0000	0.0000	-0.00	1.72	PASS
+# --- summary: format=ipfix shape=real rate=60000 runs=5 ---
+median	ipfix	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+min	ipfix	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+max	ipfix	real	-	-	-	-	-	-	-	-	1.9151	-	-	-
+# rate=60000 median_loss=0.0000% median_achieved=59994.5000
+PASS
+artifacts (server logs): /tmp/tmp.lEaaziB3PB (removed on exit; rerun with TMP_ROOT preserved manually if needed for debugging)

@@ -1,0 +1,98 @@
+# format=sflow shape=real duration=15s runs=3 transport=udp port=6343
+# server restarted between every run; sflow_datagrams_received/sflow_socket_drops/parquet_s3_dropped are per-run values (fresh process), not deltas.
+# sflow_socket_drops is reconciled against this run's own socket's /proc/net/udp drop counter (NOT host-wide RcvbufErrors), diffed before/after around each run's load.
+run	format	shape	offered	achieved	received	kernel_drops	writer_drops	buffer_drops	written	kernel_loss_pct	total_loss_pct	gen_cores	srv_cores	verdict
+# --- rate=20000 ---
+1	sflow	real	299980	19998.1000	294502	5478	0	0	588826	1.8261	1.8261	-0.00	0.78	FAIL-LOSS
+2	sflow	real	299987	19998.3000	299987	0	0	0	599832	0.0000	0.0000	-0.00	0.81	PASS
+3	sflow	real	299983	19998.4000	299983	0	0	0	599672	0.0000	0.0000	0.00	0.85	PASS
+# --- summary: format=sflow shape=real rate=20000 runs=3 ---
+median	sflow	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+min	sflow	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+max	sflow	real	-	-	-	-	-	-	-	-	1.8261	-	-	-
+# rate=20000 median_loss=0.0000% median_achieved=19998.3000
+PASS
+# --- rate=40000 ---
+1	sflow	real	599960	39996.1000	599960	0	0	0	1199920	0.0000	0.0000	-0.00	1.48	PASS
+2	sflow	real	599976	39997.4000	599976	0	0	0	1199952	0.0000	0.0000	-0.00	1.26	PASS
+3	sflow	real	599980	39996.8000	599980	0	0	0	1199960	0.0000	0.0000	-0.00	1.41	PASS
+# --- summary: format=sflow shape=real rate=40000 runs=3 ---
+median	sflow	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+min	sflow	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+max	sflow	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+# NOTE: zero kernel-socket loss (sflow_socket_drops == 0) on every run at rate=40000 -- rate/duration did not saturate the receive buffer on this host. This does not by itself mean total_loss_pct above is zero (writer_drops/buffer_drops can still be non-zero); if it is also zero, raise the rate or DURATION to produce a measurable baseline instead.
+# rate=40000 median_loss=0.0000% median_achieved=39996.8000
+PASS
+# --- rate=80000 ---
+1	sflow	real	1199937	79994.1000	1199937	0	0	0	2399874	0.0000	0.0000	-0.00	2.80	PASS
+2	sflow	real	1199925	79993.9000	1199195	730	0	0	2398390	0.0608	0.0608	-0.00	2.37	PASS
+3	sflow	real	1199960	79995.4000	1197596	2364	0	0	2395192	0.1970	0.1970	-0.00	2.66	FAIL-LOSS
+# --- summary: format=sflow shape=real rate=80000 runs=3 ---
+median	sflow	real	-	-	-	-	-	-	-	-	0.0608	-	-	-
+min	sflow	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+max	sflow	real	-	-	-	-	-	-	-	-	0.1970	-	-	-
+# rate=80000 median_loss=0.0608% median_achieved=79994.1000
+PASS
+# --- rate=160000 ---
+1	sflow	real	2387884	159191.9000	2381860	6024	15539	0	4600000	0.2523	0.9030	-0.01	3.68	FAIL-LOSS
+2	sflow	real	2394590	159639.2000	2313846	80744	0	0	4600000	3.3719	3.3719	-0.00	3.46	FAIL-LOSS
+3	sflow	real	2315646	154376.2000	2083124	232522	33727	0	4000000	10.0413	11.4978	-0.00	3.50	GENERATOR-LIMITED
+# --- summary: format=sflow shape=real rate=160000 runs=3 ---
+median	sflow	real	-	-	-	-	-	-	-	-	3.3719	-	-	-
+min	sflow	real	-	-	-	-	-	-	-	-	0.9030	-	-	-
+max	sflow	real	-	-	-	-	-	-	-	-	11.4978	-	-	-
+# NOTE: parquet_s3_dropped{source="sflow"} was non-zero on at least one run at rate=160000 -- a second, distinct drop site downstream of the kernel socket. Report it separately; do not fold it into the kernel loss figure above.
+# rate=160000 median_loss=3.3719% median_achieved=159191.9000
+FAIL-LOSS
+# --- rate=120000 ---
+1	sflow	real	1799554	119968.9000	1672997	126557	0	0	3200000	7.0327	7.0327	0.00	3.03	FAIL-LOSS
+2	sflow	real	1799895	119988.1000	1737072	62823	0	0	3400000	3.4904	3.4904	-0.00	3.27	FAIL-LOSS
+3	sflow	real	1794426	119628.3000	1764250	30176	0	0	3400000	1.6817	1.6817	0.00	3.02	FAIL-LOSS
+# --- summary: format=sflow shape=real rate=120000 runs=3 ---
+median	sflow	real	-	-	-	-	-	-	-	-	3.4904	-	-	-
+min	sflow	real	-	-	-	-	-	-	-	-	1.6817	-	-	-
+max	sflow	real	-	-	-	-	-	-	-	-	7.0327	-	-	-
+# rate=120000 median_loss=3.4904% median_achieved=119968.9000
+FAIL-LOSS
+# --- rate=100000 ---
+1	sflow	real	1492882	99525.5000	1487603	5279	0	0	2800000	0.3536	0.3536	-0.00	2.92	FAIL-LOSS
+2	sflow	real	1499825	99985.0000	1493389	6436	0	0	2800000	0.4291	0.4291	-0.00	2.84	FAIL-LOSS
+3	sflow	real	1499900	99993.3000	1491132	8768	0	0	2800000	0.5846	0.5846	-0.00	2.74	FAIL-LOSS
+# --- summary: format=sflow shape=real rate=100000 runs=3 ---
+median	sflow	real	-	-	-	-	-	-	-	-	0.4291	-	-	-
+min	sflow	real	-	-	-	-	-	-	-	-	0.3536	-	-	-
+max	sflow	real	-	-	-	-	-	-	-	-	0.5846	-	-	-
+# rate=100000 median_loss=0.4291% median_achieved=99985.0000
+FAIL-LOSS
+# --- rate=90000 ---
+1	sflow	real	1349915	89993.8000	1349168	747	0	0	2600000	0.0553	0.0553	-0.00	2.97	PASS
+2	sflow	real	1349107	89940.2000	1276213	72894	0	0	2400000	5.4031	5.4031	-0.00	2.64	FAIL-LOSS
+3	sflow	real	1349929	89993.6000	1230103	119826	0	0	2400000	8.8765	8.8765	-0.00	2.94	FAIL-LOSS
+# --- summary: format=sflow shape=real rate=90000 runs=3 ---
+median	sflow	real	-	-	-	-	-	-	-	-	5.4031	-	-	-
+min	sflow	real	-	-	-	-	-	-	-	-	0.0553	-	-	-
+max	sflow	real	-	-	-	-	-	-	-	-	8.8765	-	-	-
+# rate=90000 median_loss=5.4031% median_achieved=89993.6000
+FAIL-LOSS
+# --- rate=85000 ---
+1	sflow	real	1274951	84996.6000	1273809	1142	0	0	2400000	0.0896	0.0896	-0.00	2.82	PASS
+2	sflow	real	1274745	84982.0000	1269670	5075	0	0	2400000	0.3981	0.3981	-0.00	2.85	FAIL-LOSS
+3	sflow	real	1274883	84992.1000	1273274	1609	0	0	2400000	0.1262	0.1262	-0.00	2.62	FAIL-LOSS
+# --- summary: format=sflow shape=real rate=85000 runs=3 ---
+median	sflow	real	-	-	-	-	-	-	-	-	0.1262	-	-	-
+min	sflow	real	-	-	-	-	-	-	-	-	0.0896	-	-	-
+max	sflow	real	-	-	-	-	-	-	-	-	0.3981	-	-	-
+# rate=85000 median_loss=0.1262% median_achieved=84992.1000
+FAIL-LOSS
+# --- rate=82500 ---
+1	sflow	real	1237437	82492.6000	1236269	1168	0	0	2400000	0.0944	0.0944	-0.00	2.64	PASS
+2	sflow	real	1237415	82492.8000	1236391	1024	0	0	2400000	0.0828	0.0828	-0.00	2.84	PASS
+3	sflow	real	1237426	82493.8000	1237426	0	0	0	2400000	0.0000	0.0000	-0.00	2.85	PASS
+# --- summary: format=sflow shape=real rate=82500 runs=3 ---
+median	sflow	real	-	-	-	-	-	-	-	-	0.0828	-	-	-
+min	sflow	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+max	sflow	real	-	-	-	-	-	-	-	-	0.0944	-	-	-
+# rate=82500 median_loss=0.0828% median_achieved=82492.8000
+PASS
+CEILING 82500
+artifacts (server logs): /tmp/tmp.bX6Bl0srrj (removed on exit; rerun with TMP_ROOT preserved manually if needed for debugging)
