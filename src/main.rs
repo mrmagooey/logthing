@@ -441,6 +441,7 @@ async fn async_main() -> anyhow::Result<()> {
             bind_address: ipfix_config_clone.ipfix.bind_address.clone(),
             receive_buffer_bytes: ipfix_config_clone.ipfix.receive_buffer_bytes,
             recv_tasks: ipfix_config_clone.ipfix.recv_tasks,
+            recv_batch_size: ipfix_config_clone.ipfix.recv_batch_size,
         };
         let ipfix_ip_whitelist = ip_whitelist.clone();
         let handle = tokio::spawn(async move {
