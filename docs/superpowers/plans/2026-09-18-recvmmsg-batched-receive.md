@@ -321,9 +321,39 @@ cargo build --lib 2>&1 | tail -20
 git diff Cargo.lock | grep -E '^\+name|^-name'
 ```
 
-Expected: build succeeds (compile error until Step 4 adds the struct is fine to ignore here — this step is only checking the lockfile diff); `libc` gains an entry (or its version pin is confirmed) and no other crate's version line changes. If anything else moves, stop and say so before continuing — a version bump elsewhere is not what this step should do.
+Expected: build succeeds (compile error until Step 6 adds the struct is fine to ignore here — this step is only checking the lockfile diff); `libc` gains an entry (or its version pin is confirmed) and no other crate's version line changes. If anything else moves, stop and say so before continuing — a version bump elsewhere is not what this step should do.
 
-- [ ] **Step 3: Write the failing tests**
+- [ ] **Step 3: Cross-compilation risk check — does `libc::recvmmsg`/`mmsghdr` bind on the musl release targets?**
+
+`.github/workflows/binaries.yml` builds two release targets via `cargo-zigbuild` (`build-tool: cargo-zigbuild`, comment there: "supplies a zig-based cross C toolchain so the native C dependencies... cross-compile cleanly to the musl/arm64 targets"):
+
+```yaml
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+```
+
+`libc::recvmmsg`/`libc::mmsghdr` are new direct calls this task introduces (everything else `src/net.rs` does today, e.g. `SocketDropStats` reading `/proc/net/udp`, is plain file I/O with no musl-specific struct layout involved). musl's libc headers do not always agree with glibc's on struct layout and syscall plumbing for less-common calls, and nothing measured so far in this plan confirms `recvmmsg`/`mmsghdr` bind cleanly cross-compiled to `aarch64-unknown-linux-musl` specifically — `x86_64-unknown-linux-musl` is the more common cross target and lower risk, but is still unverified locally.
+
+```bash
+command -v rustup; command -v zig
+```
+
+On this host, both are absent (checked while amending this plan: `rustup` → command not found, no `zig` binary), so neither target can be added nor cross-built here — do not fake this check by only compiling for the host's own glibc target, which proves nothing about musl.
+
+- **If `rustup`/`zig` (or `cargo-zigbuild`) are available in whatever environment executes this step**, do the real check and treat a failure as a genuine finding to report, not a flake:
+
+  ```bash
+  rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
+  cargo zigbuild --target aarch64-unknown-linux-musl --lib 2>&1 | tail -30
+  cargo zigbuild --target x86_64-unknown-linux-musl --lib 2>&1 | tail -30
+  ```
+
+  Expected: both compile cleanly once Step 6 has added `RecvMmsgBatch` (re-run this after Step 6 if run before it). A struct-layout or missing-symbol error here is a real blocker — stop and report it rather than working around it with `#[cfg]` guesses.
+
+- **If neither tool is available (the case on this host today):** do not attempt a local substitute. Record the risk explicitly in this task's final commit message (Step 10): "cross-compilation to aarch64-unknown-linux-musl/x86_64-unknown-linux-musl not verified locally (no rustup/zig on this host) — verify in CI before merge." Before `perf/recvmmsg-batched-receive` merges, a maintainer must confirm `binaries.yml` builds green on both matrix targets with this branch's changes — a manual `workflow_dispatch` run (no tag) builds and archives both targets without publishing a release (per the workflow's own `dry-run` comment), which is the safe way to check this pre-merge without cutting a release.
+
+- [ ] **Step 4: Write the failing tests**
 
 Add to `src/net.rs`'s test module:
 
@@ -390,7 +420,7 @@ async fn recv_returns_a_single_datagram_without_waiting_to_fill_the_batch() {
 
 Add `use super::*; use tokio::net::UdpSocket; use std::net::SocketAddr;` as needed at the top of the test module (some of these may already be imported).
 
-- [ ] **Step 4: Run to verify they fail**
+- [ ] **Step 5: Run to verify they fail**
 
 ```bash
 cargo test --lib net::tests::recv_returns -- --nocapture
@@ -398,7 +428,7 @@ cargo test --lib net::tests::recv_returns -- --nocapture
 
 Expected: FAIL to compile — `RecvMmsgBatch` does not exist yet.
 
-- [ ] **Step 5: Implement `RecvMmsgBatch`**
+- [ ] **Step 6: Implement `RecvMmsgBatch`**
 
 Add to `src/net.rs`, after `bind_udp_reuseport_with_recv_buffer`:
 
@@ -515,6 +545,13 @@ impl RecvMmsgBatch {
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
+        // ponytail: msg_hdr.msg_flags is not inspected for MSG_TRUNC here.
+        // Deliberate, not an oversight -- it's the same blind spot the
+        // existing single-datagram `recv_from` path already has (it trusts
+        // the returned length too), and every buffer here is 65535 bytes,
+        // the maximum possible UDP payload, so a real truncation is not
+        // reachable over UDP regardless. Revisit only if a buffer size
+        // smaller than 65535 is ever introduced.
         Ok(n as usize)
     }
 
@@ -543,7 +580,7 @@ impl RecvMmsgBatch {
 }
 ```
 
-- [ ] **Step 6: Run to verify they pass**
+- [ ] **Step 7: Run to verify they pass**
 
 ```bash
 cargo test --lib net::tests::recv_returns -- --nocapture
@@ -551,7 +588,7 @@ cargo test --lib net::tests::recv_returns -- --nocapture
 
 Expected: PASS both.
 
-- [ ] **Step 7: Demonstrate the latency test actually catches a regression**
+- [ ] **Step 8: Demonstrate the latency test actually catches a regression**
 
 This is the sabotage the brief requires: a plausible but wrong "improvement" someone might make — waiting a little to let more messages accumulate before returning, on the theory that a fuller batch is more efficient — must make the latency test fail, not pass by luck.
 
@@ -561,9 +598,9 @@ Temporarily change the `recv_mmsg_once` call's last two arguments from `libc::MS
 cargo test --lib net::tests::recv_returns_a_single_datagram -- --nocapture
 ```
 
-Expected: FAIL — with only one datagram ever sent, `recvmmsg` without `MSG_DONTWAIT` and with a 50ms timeout blocks for the full 50ms waiting for a second message that never arrives before returning the one it has, which the test's 30ms budget does not tolerate. Run it twice to confirm the failure isn't a one-off scheduling artifact of this host's documented variance — both runs must fail for this to count as demonstrating the regression. Revert the temporary change (back to `MSG_DONTWAIT` / `null_mut()`) and re-run Step 6 to confirm both tests pass again before continuing.
+Expected: FAIL — with only one datagram ever sent, `recvmmsg` without `MSG_DONTWAIT` and with a 50ms timeout blocks for the full 50ms waiting for a second message that never arrives before returning the one it has, which the test's 30ms budget does not tolerate. Run it twice to confirm the failure isn't a one-off scheduling artifact of this host's documented variance — both runs must fail for this to count as demonstrating the regression. Revert the temporary change (back to `MSG_DONTWAIT` / `null_mut()`) and re-run Step 7 to confirm both tests pass again before continuing.
 
-- [ ] **Step 8: Run the whole suite**
+- [ ] **Step 9: Run the whole suite**
 
 ```bash
 cargo test --workspace
@@ -571,7 +608,7 @@ cargo test --workspace
 
 Expected: PASS. Nothing outside `net::` calls `RecvMmsgBatch` yet.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock src/net.rs
@@ -692,7 +729,7 @@ async fn batched_recv_checks_and_counts_allowed_ips_per_datagram() {
 
     // Whitelist a network that does NOT include 127.0.0.1 -- every datagram
     // in this test must be rejected.
-    let disallowing_whitelist = IpWhitelist::from_cidrs(&["10.0.0.0/8".to_string()]).unwrap();
+    let disallowing_whitelist = IpWhitelist::new(vec!["10.0.0.0/8".to_string()]).unwrap();
     let config = IpfixListenerConfig {
         udp_port,
         bind_address: "127.0.0.1".to_string(),
@@ -731,17 +768,136 @@ async fn batched_recv_checks_and_counts_allowed_ips_per_datagram() {
         .unwrap_or(0);
     assert_eq!(rejected, n as u64, "listener_source_rejected must count every datagram in the batch, not one per batch");
 }
+
+/// The gap Finding 1 of the plan review named directly: the two tests above
+/// both pin `recv_tasks = 1`, so they only ever exercise the batched arm
+/// inside `start_with_shutdown`'s inline loop, never `ipfix_recv_loop` (the
+/// `recv_tasks > 1` fan-out function) -- the combined `recv_tasks > 1` AND
+/// `recv_batch_size > 1` shape had no automated coverage at all before this
+/// test. `recv_tasks = 4` forces every datagram through the SO_REUSEPORT
+/// group and `ipfix_recv_loop`'s own batched arm (Step 5); all sends come
+/// from one client socket, back-to-back with no `.await` between them, so
+/// they consistently hash to the same group member (SO_REUSEPORT hashes by
+/// the full 4-tuple, and one client socket keeps its source port fixed) and
+/// have a real chance to queue together before that task's next `recv()`
+/// drains them -- exercising an actual multi-message batch inside the
+/// fan-out path, not just a fan-out path that happens to only ever see one
+/// message per call.
+#[tokio::test]
+async fn fanout_batched_recv_decodes_every_datagram_across_batches() {
+    let (listener, bound, shutdown_tx, handler) = start_test_listener(4, 16).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.send_to(&template_datagram(1), bound).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    for n in 0..10u64 {
+        // No sleep between sends -- give the kernel a chance to queue
+        // several before ipfix_recv_loop's next batch.recv() call drains
+        // the socket, so this test actually exercises n > 1 in the
+        // `for i in 0..n` loop of the fan-out batched arm, not n == 1 every
+        // time.
+        sock.send_to(&data_datagram(n as u32 + 2, n), bound).await.unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let _ = shutdown_tx.send(true);
+    let _ = listener.await;
+
+    assert_eq!(
+        handler.flow_count(),
+        10,
+        "every data record sent through the recv_tasks=4 + recv_batch_size=16 combined path must decode"
+    );
+}
+
+/// The `allowed_ips`/counter invariant from
+/// `batched_recv_checks_and_counts_allowed_ips_per_datagram` above, re-run
+/// through `ipfix_recv_loop`'s batched arm (`recv_tasks = 4`) instead of the
+/// inline loop's. Like that test, every send here comes from one source
+/// address (loopback can't vary by source IP within one process any more in
+/// the fan-out path than it could in the inline one), so this cannot
+/// distinguish "checked using the right per-message address" from "checked
+/// using a fixed wrong address" on its own -- what it adds on top of the
+/// non-fan-out version is coverage of the `self.x` → loop-local-param
+/// translation in Step 5 itself: a build that left a stray `self.` in
+/// `ipfix_recv_loop` fails to compile (there is no `self` in a free
+/// function), and a build that substituted the wrong loop-local (e.g. an
+/// out-of-scope `IpfixListenerConfig::default()`'s allowed_ips instead of
+/// the `allowed_ips` parameter actually passed in) is caught here because
+/// this test constructs the disallowing whitelist and threads it through
+/// `with_allowed_ips` exactly as the non-fan-out version does, on the
+/// `recv_tasks = 4` path.
+#[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+#[tokio::test]
+async fn fanout_batched_recv_checks_and_counts_allowed_ips_per_datagram() {
+    use metrics::set_default_local_recorder;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use metrics_util::{CompositeKey, MetricKind};
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = set_default_local_recorder(&recorder);
+
+    let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp_port = tmp.local_addr().unwrap().port();
+    drop(tmp);
+    let bound: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
+
+    let disallowing_whitelist = IpWhitelist::new(vec!["10.0.0.0/8".to_string()]).unwrap();
+    let config = IpfixListenerConfig {
+        udp_port,
+        bind_address: "127.0.0.1".to_string(),
+        recv_tasks: 4,
+        recv_batch_size: 16,
+        ..IpfixListenerConfig::default()
+    };
+    let handler = CountingHandler::new();
+    let listener = IpfixListener::new(config, handler.clone()).with_allowed_ips(disallowing_whitelist);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move { listener.start_with_shutdown(shutdown_rx).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let n = 10u32;
+    for i in 0..n {
+        sock.send_to(&template_datagram(i + 1), bound).await.unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let _ = shutdown_tx.send(true);
+    let _ = task.await;
+
+    assert_eq!(handler.flow_count(), 0, "every datagram must be rejected");
+
+    let map = snapshotter.snapshot().into_hashmap();
+    let rejected = map
+        .get(&CompositeKey::new(
+            MetricKind::Counter,
+            metrics::Key::from_parts("listener_source_rejected", vec![metrics::Label::new("protocol", "ipfix")]),
+        ))
+        .map(|(_, _, v)| match v {
+            DebugValue::Counter(c) => *c,
+            _ => 0,
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        rejected,
+        n as u64,
+        "listener_source_rejected must count every datagram through the recv_tasks=4 + recv_batch_size=16 combined path, not one per batch"
+    );
+}
 ```
 
-Check `IpWhitelist`'s actual constructor name in `src/middleware/mod.rs` before writing `IpWhitelist::from_cidrs` — use whatever the real constructor is called, and check `metrics::Key::from_parts` is the right way to build a labeled key for a `DebuggingRecorder` snapshot lookup by reading how an existing test in this codebase already does it (`src/net.rs`'s `socket_drop_stats_observes_real_kernel_drops` uses an unlabeled key; find a labeled-metric example elsewhere in the test suite, e.g. wherever `listener_source_rejected` is itself asserted on already, and match its exact pattern rather than guessing at the API).
+The snippet above uses the real constructor, verified against `src/middleware/mod.rs:37` — `pub fn new(allowed_ips: Vec<String>) -> anyhow::Result<Self>` (there is no `from_cidrs`; despite the name, `new` already accepts both CIDR ranges and bare IPs, see its doc comment). Do not reintroduce a guessed name if refactoring this test later. Also check `metrics::Key::from_parts` is the right way to build a labeled key for a `DebuggingRecorder` snapshot lookup by reading how an existing test in this codebase already does it (`src/net.rs`'s `socket_drop_stats_observes_real_kernel_drops` uses an unlabeled key; find a labeled-metric example elsewhere in the test suite, e.g. wherever `listener_source_rejected` is itself asserted on already, and match its exact pattern rather than guessing at the API).
 
 - [ ] **Step 2: Run to verify they fail**
 
 ```bash
 cargo test --lib ipfix::listener::tests::batched_recv -- --nocapture
+cargo test --lib ipfix::listener::tests::fanout_batched_recv -- --nocapture
 ```
 
-Expected: FAIL to compile — `recv_batch_size` does not exist on `IpfixListenerConfig` yet.
+Expected: FAIL to compile — `recv_batch_size` does not exist on `IpfixListenerConfig` yet. (`batched_recv` alone as a filter also matches the two `fanout_batched_recv_*` tests added below since `cargo test`'s filter is a substring match, not an anchor — the second invocation above is just to make that explicit, either filter run alone already runs all four.)
 
 - [ ] **Step 3: Add the config field**
 
@@ -833,6 +989,17 @@ In `start_with_shutdown`'s `if self.config.recv_tasks <= 1` branch, gate on `rec
                                 }
                             }
                             Err(e) => {
+                                // ponytail: EINTR (and every other transient
+                                // errno recvmmsg can return) is not special-
+                                // cased -- it surfaces here as a generic
+                                // error and gets retried on the next loop
+                                // iteration via batch.recv()'s own readable()
+                                // await. Exact parity with the existing
+                                // single-recv_from error arm this batched arm
+                                // sits beside (src/ipfix/listener.rs's
+                                // `Err(e) => { error!("IPFIX UDP receive
+                                // error: {}", e); }`, ~line 165) -- not a gap
+                                // introduced by batching.
                                 error!("IPFIX UDP batched receive error: {}", e);
                             }
                         }
@@ -857,7 +1024,7 @@ The `// ... unchanged ...` marker above is not literal — copy the existing rec
 
 - [ ] **Step 5: Add the same arm to `ipfix_recv_loop` (the `recv_tasks > 1` fan-out path)**
 
-`ipfix_recv_loop` takes the same gate, parameterized identically:
+`ipfix_recv_loop` takes the same gate, parameterized identically. Written out literally below, not as "same as Step 4's" — this is the code path Finding 1 of the plan review flagged as having the least coverage, precisely because it had been the least literally shown; the translation from `self.allowed_ips`/`self.handler` to the loop-local `allowed_ips`/`handler` params is exactly where a copy-paste mistake (e.g. leaving `self.handler` in when `self` is not in scope here, which would fail to compile — or the more dangerous version, reusing the wrong loop-local variable) would land:
 
 ```rust
 async fn ipfix_recv_loop(
@@ -878,15 +1045,50 @@ async fn ipfix_recv_loop(
                 // ... unchanged from today's ipfix_recv_loop body ...
             }
         }
+        return;
     }
 
     let mut batch = crate::net::RecvMmsgBatch::new(recv_batch_size);
     loop {
         tokio::select! {
             result = batch.recv(&socket) => {
-                // ... same per-message body as Step 4's batched arm, using
-                // `allowed_ips`/`handler`/`decoder` (the loop-local params,
-                // not `self`) ...
+                match result {
+                    Ok(n) => {
+                        for i in 0..n {
+                            let Some(src) = batch.src(i) else {
+                                warn!("ipfix: batch message with unparseable source address, skipping");
+                                continue;
+                            };
+                            // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
+                            if !allowed_ips.is_allowed(&src) {
+                                metrics::counter!("listener_source_rejected", "protocol" => "ipfix").increment(1);
+                                debug!("Rejected ipfix datagram from {} — not in allowed_ips", src);
+                                continue;
+                            }
+                            let payload = batch.payload(i);
+                            debug!("IPFIX datagram from {}: {} bytes", src, payload.len());
+                            match decode_datagram(&mut decoder, payload, src.ip()) {
+                                Ok(flows) if flows.is_empty() => {
+                                    debug!("IPFIX datagram from {} produced no flows (template-only or empty)", src);
+                                }
+                                Ok(flows) => {
+                                    handler.handle_flows(flows, src).await;
+                                }
+                                Err(e) => {
+                                    metrics::counter!("ipfix_decode_errors").increment(1);
+                                    warn!("IPFIX decode error from {}: {}", src, e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // ponytail: EINTR is not special-cased here either --
+                        // same parity note as the inline loop's batched arm
+                        // in Step 4. Retried on the next loop iteration via
+                        // batch.recv()'s own readable() await.
+                        error!("IPFIX UDP batched receive error: {}", e);
+                    }
+                }
             }
             _ = socket_stats_ticker.tick() => {
                 if let Some(stats) = socket_stats.as_mut() {
@@ -903,17 +1105,44 @@ async fn ipfix_recv_loop(
 }
 ```
 
+Note every use of `self.` from Step 4's inline-loop arm becomes a bare loop-local identifier here (`allowed_ips`, `handler`) — there is no `self` in a free function. `decoder` was already loop-local in both arms, unchanged.
+
 Update its call site in `start_with_shutdown`'s fan-out branch to pass `self.config.recv_batch_size`.
 
-- [ ] **Step 6: Run to verify they pass**
+- [ ] **Step 6: Demonstrate the combined-path tests actually catch a fan-out batching bug**
+
+This is the sabotage the review requires for the code path Finding 1 identified as uncovered: `recv_tasks > 1` **and** `recv_batch_size > 1` together, exercised only by `ipfix_recv_loop`'s batched arm just written in Step 5. The combined-path tests added in Step 1 (`fanout_batched_recv_decodes_every_datagram_across_batches` and `fanout_batched_recv_checks_and_counts_allowed_ips_per_datagram`) must both go red under this sabotage, proving they actually exercise the translated `self.x` → loop-local-param arm rather than passing vacuously.
+
+Temporarily change the `for i in 0..n` loop body in Step 5's batched arm to reuse index `0` for the source-address and payload lookups instead of `i`:
+
+```rust
+for i in 0..n {
+    let Some(src) = batch.src(0) else {   // sabotage: was batch.src(i)
+        ...
+    };
+    ...
+    let payload = batch.payload(0);        // sabotage: was batch.payload(i)
+    ...
+}
+```
+
+```bash
+cargo test --lib ipfix::listener::tests::fanout_batched_recv -- --nocapture
+```
+
+Expected: FAIL — `fanout_batched_recv_decodes_every_datagram_across_batches` fails because every message in a multi-message batch decodes datagram 0's payload N times over instead of each of the N distinct payloads, so the decoded flow count/content no longer matches what was sent. Run it twice to rule out a scheduling fluke, same as Task 3 Step 8's sabotage check. Revert the temporary change back to `batch.src(i)`/`batch.payload(i)` and re-run Step 7 to confirm both tests pass again before continuing.
+
+If the combined-path tests do NOT fail under this sabotage, they are not exercising `ipfix_recv_loop`'s batched arm and must be fixed before proceeding — a green combined-path test that survives this sabotage is worse than no test, because it would hide exactly the bug class Finding 1 named.
+
+- [ ] **Step 7: Run to verify they pass**
 
 ```bash
 cargo test --lib ipfix::
 ```
 
-Expected: PASS, including both new tests and every pre-existing one — the eight-source-port fan-out test included, now called with an explicit `1` for `recv_batch_size`.
+Expected: PASS, including all four new tests (the two single-task batching tests from before this amendment, plus the two combined-path `recv_tasks > 1` + `recv_batch_size > 1` tests) and every pre-existing one — the eight-source-port fan-out test included, now called with an explicit `1` for `recv_batch_size`.
 
-- [ ] **Step 7: Verify `recv_batch_size=1` and `recv_tasks=1` together are unchanged**
+- [ ] **Step 8: Verify `recv_batch_size=1` and `recv_tasks=1` together are unchanged**
 
 ```bash
 cargo test --workspace
@@ -921,7 +1150,7 @@ cargo test --workspace
 
 Expected: PASS. Every pre-existing test in the whole workspace runs the default (`recv_tasks=1`, batching off via whatever default `IpfixListenerConfig::default()` sets, which must be `1`) — a failure here means the default path changed, which this task must not do.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add src/ipfix/listener.rs src/config/mod.rs src/main.rs
@@ -931,8 +1160,11 @@ recv_batch_size (default 1, off) makes each recv task pull up to that many
 already-queued datagrams per recvmmsg(2) call instead of one recv_from per
 datagram. Orthogonal to recv_tasks: applies inside both the single-socket
 and SO_REUSEPORT fan-out paths. allowed_ips and per-datagram counters run
-once per message in the batch, verified by a test asserting
-listener_source_rejected counts N rejections for N rejected datagrams, not 1.
+once per message in the batch, verified by tests asserting
+listener_source_rejected counts N rejections for N rejected datagrams, not 1
+-- including the combined recv_tasks>1 + recv_batch_size>1 path inside
+ipfix_recv_loop, which a src/payload index-reuse sabotage confirms these
+tests actually catch.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
@@ -949,7 +1181,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 - Consumes: Task 2's `SflowConfig.recv_batch_size`; Task 3's `RecvMmsgBatch`.
 - Produces: `SflowListenerConfig.recv_batch_size: usize` (default `1`); the same batched-recv arm in both `start_with_shutdown`'s inline loop and `sflow_recv_loop`.
 
-sFlow's decoder is stateless (confirmed already in the fan-out plan's Task 5 and unchanged since), so this is a direct structural mirror of Task 4 with no decoder-sharing concern — `decode_datagram(&buf[..len], src.ip())` takes no `&mut` decoder at all.
+sFlow's decoder is stateless (confirmed already in the fan-out plan's Task 5 and unchanged since), so this is a direct structural mirror of Task 4 with no decoder-sharing concern — `decode_datagram(&buf[..len], src.ip())` takes no `&mut` decoder at all. Because it is a near-copy of Task 4, it inherits Task 4's Finding-1 fix too: **write `sflow_recv_loop`'s batched arm out literally**, translating `self.allowed_ips`/`self.handler` to the loop-local `allowed_ips`/`handler` params exactly as Task 4 Step 5 does — do not write "same as the inline loop's arm" as a placeholder, for the same reason Task 4's plan text was corrected: it is the code path with the least coverage, and describing it instead of writing it is how that happens.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -976,28 +1208,41 @@ async fn batched_recv_decodes_every_datagram_in_a_batch() {
 
 Add the same `listener_source_rejected`-counts-per-datagram test as Task 4's `batched_recv_checks_and_counts_allowed_ips_per_datagram`, adapted to sFlow's `build_datagram`/`CountingHandler` and the `"sflow"` protocol label.
 
+**Also add the combined-path pair** — the same `recv_tasks = 4` + `recv_batch_size = 16` tests Task 4 added (`fanout_batched_recv_decodes_every_datagram_across_batches` and `fanout_batched_recv_checks_and_counts_allowed_ips_per_datagram`), adapted to sFlow exactly as the two single-task tests above already are: `start_test_listener(4, 16)`, one client socket sending `n = 10` datagrams back-to-back via `build_datagram`, asserting `handler.record_count() == n as usize * RECORDS_PER_DATAGRAM` for the decode test and `listener_source_rejected` (label `"sflow"`) `== n as u64` for the rejection test. These are what exercise `sflow_recv_loop`'s batched arm — the combined `recv_tasks > 1` + `recv_batch_size > 1` path had no coverage at all before this amendment, for sFlow same as ipfix.
+
 - [ ] **Step 2: Run to verify they fail**
 
 ```bash
 cargo test --lib sflow::listener::tests::batched_recv -- --nocapture
+cargo test --lib sflow::listener::tests::fanout_batched_recv -- --nocapture
 ```
 
 Expected: FAIL to compile.
 
 - [ ] **Step 3: Implement**
 
-Mirror Task 4 exactly: `recv_batch_size` field + default on `SflowListenerConfig`, wired through `main.rs`; batched arm added to both `start_with_shutdown`'s `recv_tasks <= 1` branch and `sflow_recv_loop`, gated on `recv_batch_size > 1`; `allowed_ips` check and `sflow_datagrams_received`/`listener_source_rejected` counters run once per message inside the batch loop, exactly as the existing per-datagram body already does — no decoder to share, so `decode_datagram(batch.payload(i), src.ip())` replaces `decode_datagram(&buf[..len], src.ip())` directly.
+Mirror Task 4 exactly: `recv_batch_size` field + default on `SflowListenerConfig`, wired through `main.rs`; batched arm added to both `start_with_shutdown`'s `recv_tasks <= 1` branch and `sflow_recv_loop`, gated on `recv_batch_size > 1`; `allowed_ips` check and `sflow_datagrams_received`/`listener_source_rejected` counters run once per message inside the batch loop, exactly as the existing per-datagram body already does — no decoder to share, so `decode_datagram(batch.payload(i), src.ip())` replaces `decode_datagram(&buf[..len], src.ip())` directly. Write `sflow_recv_loop`'s batched arm out in full in the actual `src/sflow/listener.rs` edit (per this task's header note above) — the EINTR-parity comment on the generic `Err(e)` arm and the `is_allowed`-per-message `ponytail:` comment both carry over from Task 4's literal version unchanged in spirit.
 
-- [ ] **Step 4: Run to verify they pass**
+- [ ] **Step 4: Demonstrate the combined-path tests actually catch a fan-out batching bug**
+
+Same sabotage as Task 4 Step 6, sFlow-flavored: in `sflow_recv_loop`'s batched arm, temporarily change the `for i in 0..n` loop to use `batch.src(0)`/`batch.payload(0)` instead of `batch.src(i)`/`batch.payload(i)`.
+
+```bash
+cargo test --lib sflow::listener::tests::fanout_batched_recv -- --nocapture
+```
+
+Expected: FAIL — `fanout_batched_recv_decodes_every_datagram_across_batches` fails because every message decodes datagram 0's payload repeatedly instead of each distinct payload, so `record_count()` no longer matches `n * RECORDS_PER_DATAGRAM`. Run twice to rule out a scheduling fluke. Revert the temporary change and re-run Step 5 to confirm both tests pass again before continuing.
+
+- [ ] **Step 5: Run to verify they pass**
 
 ```bash
 cargo test --lib sflow::
 cargo test --workspace
 ```
 
-Expected: PASS both.
+Expected: PASS both, including the two combined-path tests.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/sflow/listener.rs src/main.rs
@@ -1005,7 +1250,8 @@ git commit -m "feat(sflow): batched receive via recv_batch_size
 
 Same recv_batch_size knob as ipfix, default 1. Stateless decoder, so no
 cross-message sharing concern -- straight structural port of the ipfix
-integration.
+integration, including the combined recv_tasks>1 + recv_batch_size>1 test
+coverage and its src/payload index-reuse sabotage check.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
@@ -1021,6 +1267,8 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: Task 2's `SyslogConfig.recv_batch_size`; Task 3's `RecvMmsgBatch`.
 - Produces: `SyslogListenerConfig.recv_batch_size: usize` (default `1`), applying to the UDP arm only — same caveat as `recv_tasks` already carries for this listener: the TCP arm is a separate `tokio::select!` branch entirely and is untouched by this knob.
+
+Also a near-copy of Task 4, so it inherits the same Finding-1 fix: write `syslog_udp_recv_loop`'s batched UDP arm out literally in the actual code edit, translating `self.x` to loop-local params exactly as Task 4 Step 5 does — not "same as the inline loop's arm".
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1047,35 +1295,50 @@ async fn batched_recv_parses_every_message_in_a_batch() {
 
 Add the `listener_source_rejected`-counts-per-datagram test, adapted to syslog's `"syslog_udp"` protocol label (per its existing convention — see Global Constraints in the fan-out plan's Task 6, carried forward here: this listener's label is `"syslog_udp"`, not `"syslog"`).
 
+**Also add the combined-path pair**, same shape as Task 4/5: `start_test_listener(4, 16)` (recv_tasks=4 forces `syslog_udp_recv_loop`, the fan-out UDP path), one client socket sending 10 syslog lines back-to-back, asserting `handler.message_count() == 10` for the decode test and `listener_source_rejected` (label `"syslog_udp"`) `== 10` for the rejection test (disallowing whitelist, mirroring Task 4's `fanout_batched_recv_checks_and_counts_allowed_ips_per_datagram`). These exercise `syslog_udp_recv_loop`'s batched arm, the code path this task's header note above requires be written literally — same combined-path gap Finding 1 named for ipfix and sFlow applies here identically.
+
 - [ ] **Step 2: Run to verify they fail**
 
 ```bash
 cargo test --lib syslog::listener::tests::batched_recv -- --nocapture
+cargo test --lib syslog::listener::tests::fanout_batched_recv -- --nocapture
 ```
 
 Expected: FAIL to compile.
 
 - [ ] **Step 3: Implement**
 
-Mirror Task 4/5 on the UDP arm only. The `recv_tasks <= 1` combined UDP+TCP loop and the fan-out `syslog_udp_recv_loop` both need the same `recv_batch_size` gate on their UDP handling; the TCP accept arm in each is untouched. `syslog_messages_received`/`syslog_parse_errors`/`listener_source_rejected` (label `"syslog_udp"`) run once per message inside the batch loop.
+Mirror Task 4/5 on the UDP arm only. The `recv_tasks <= 1` combined UDP+TCP loop and the fan-out `syslog_udp_recv_loop` both need the same `recv_batch_size` gate on their UDP handling; the TCP accept arm in each is untouched. `syslog_messages_received`/`syslog_parse_errors`/`listener_source_rejected` (label `"syslog_udp"`) run once per message inside the batch loop. Write `syslog_udp_recv_loop`'s batched arm out in full, with the same EINTR-parity comment on its generic `Err(e)` arm and the same per-message `is_allowed` `ponytail:` comment as Task 4/5's literal versions.
 
-- [ ] **Step 4: Run to verify they pass**
+- [ ] **Step 4: Demonstrate the combined-path tests actually catch a fan-out batching bug**
+
+Same sabotage as Task 4 Step 6 / Task 5 Step 4: in `syslog_udp_recv_loop`'s batched arm, temporarily change the `for i in 0..n` loop to use `batch.src(0)`/`batch.payload(0)` instead of `batch.src(i)`/`batch.payload(i)`.
+
+```bash
+cargo test --lib syslog::listener::tests::fanout_batched_recv -- --nocapture
+```
+
+Expected: FAIL — `fanout_batched_recv_parses_every_message_across_batches` (or whatever name Step 1 gave the decode test) fails because every message parses line 0's text repeatedly instead of each distinct line, so `message_count()` no longer reads 10 distinct messages received. Run twice. Revert and re-run Step 5 to confirm both tests pass again before continuing.
+
+- [ ] **Step 5: Run to verify they pass**
 
 ```bash
 cargo test --lib syslog::
 cargo test --workspace
 ```
 
-Expected: PASS both. Some syslog tests bind privileged ports and silently pass when run as root — if anything here looks suspiciously easy, check which port it actually bound before trusting the result.
+Expected: PASS both, including the two combined-path tests. Some syslog tests bind privileged ports and silently pass when run as root — if anything here looks suspiciously easy, check which port it actually bound before trusting the result.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/syslog/listener.rs src/main.rs
 git commit -m "feat(syslog): batched receive via recv_batch_size on the UDP arm
 
 Same recv_batch_size knob, default 1, UDP only -- the TCP listener is
-unchanged.
+unchanged. Includes the combined recv_tasks>1 + recv_batch_size>1 test
+coverage and its src/payload index-reuse sabotage check on
+syslog_udp_recv_loop.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
@@ -1228,7 +1491,10 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 - **Task 1 is a gate, not a formality.** If the premise doesn't hold, the right outcome is stopping and saying so — not quietly building `recvmmsg` support anyway because the plan says to.
 - **`recv_batch_size <= 1` must stay byte-identical to today**, in both the single-socket and `recv_tasks > 1` fan-out paths, at every step — this is what makes the change deployable, and the whole workspace suite exercises it.
 - **`allowed_ips` and every per-datagram counter run once per message inside a batch, never once per batch.** Tasks 4-6 each carry a test that would catch a batch-level shortcut via the rejection counter, since loopback testing can't vary source IP within one batch to distinguish it any other way.
+- **`recv_tasks > 1` AND `recv_batch_size > 1` together is a real, separately-tested code path, not just a manual Task 7 measurement.** Tasks 4-6 each carry a `fanout_batched_recv_*` pair (`recv_tasks=4`, `recv_batch_size=16`) exercising `ipfix_recv_loop`/`sflow_recv_loop`/`syslog_udp_recv_loop`'s batched arm specifically — the arm most likely to carry a `self.x` → loop-local-param translation bug, since it's a free function with no `self`. Each of those arms must be written out literally in the actual source edit, not described as "same as the inline loop's arm" — and each task's plan text now does this itself, so an executor copying code out of this plan is copying real code, not filling in a placeholder.
 - **Never delete or weaken a pre-existing test.** The three `start_test_listener` helpers each gain a second parameter; their one existing call site each needs updating to pass `1`, not removing.
+- **Cross-compilation to `aarch64-unknown-linux-musl`/`x86_64-unknown-linux-musl` (Task 3 Step 3) is unverified on a host with no `rustup`/`zig`.** Don't skip that step silently — if the tools genuinely aren't available, its own instructions say to note the risk in the commit message and defer to a pre-merge CI check (`binaries.yml`, `workflow_dispatch`, `dry-run`) rather than pretending a glibc-only local build proves anything about musl.
+- **Two blind spots in `RecvMmsgBatch`/the batched arms are intentional, not bugs to fix if noticed later:** `recv_mmsg_once` never inspects `msg_hdr.msg_flags` for `MSG_TRUNC` (same blind spot the existing `recv_from` path already has, and moot at a 65535-byte buffer anyway), and `EINTR` from `recvmmsg`/`batch.recv()` surfaces as a generic logged error and gets retried next loop iteration, exact parity with the existing single-`recv_from` error arm. Both are marked with `ponytail:` comments in the code for exactly this reason — don't "fix" them without re-reading why they're there.
 - **`GENERATOR-LIMITED` is not a ceiling** — if a batched server outruns a single generator process, say so rather than reporting the generator's limit as the server's, and be explicit that raising `GEN_PROCS` to work around it reopens the multi-source-port confound Task 1 exists to rule out.
 - **One harness invocation at a time**, always. They share fixed ports and one metrics endpoint.
 - **No figure in this plan's results doc deserves more than two significant figures of trust** — same variance finding as the fan-out plan before it, same host, same measurement method.
