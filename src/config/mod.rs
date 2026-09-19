@@ -211,7 +211,8 @@ pub struct SyslogConfig {
     /// hashes to the same socket. Syslog is the format most likely to
     /// genuinely benefit here, since a deployment ingesting from a fleet of
     /// hosts has many distinct senders. `0` is treated the same as `1`, not
-    /// as "disabled".
+    /// as "disabled". Rejected above `MAX_RECV_TASKS` at config load — see
+    /// `validate_recv_tasks_config`.
     #[serde(default = "default_syslog_recv_tasks")]
     pub recv_tasks: usize,
 
@@ -288,7 +289,8 @@ pub struct IpfixConfig {
     /// deployment with a single exporter sending from one fixed source port
     /// will see no benefit from raising it, because every datagram still
     /// hashes to the same socket. `0` is treated the same as `1`, not as
-    /// "disabled".
+    /// "disabled". Rejected above `MAX_RECV_TASKS` at config load — see
+    /// `validate_recv_tasks_config`.
     #[serde(default = "default_ipfix_recv_tasks")]
     pub recv_tasks: usize,
 
@@ -822,6 +824,43 @@ pub struct IcebergDescriptorLocalConfig {
     pub prefix: String,
 }
 
+/// Upper bound on `recv_tasks` for each UDP fan-out listener (ipfix, sflow,
+/// syslog). The measured sweep in
+/// docs/performance/2026-09-18-udp-recv-fanout-results.md found
+/// `recv_tasks = 4` already saturating throughput on a 12-CPU host, with `8`
+/// buying no further median improvement — so anything much larger than a
+/// small multiple of that is not a real tuning choice, it's a typo or a
+/// mis-scaled template. Each unit above 1 binds its own `SO_REUSEPORT`
+/// socket and requests its own `receive_buffer_bytes` (4 MiB by default), so
+/// an unbounded value fails startup part-way through with `EMFILE` or an
+/// OOM-adjacent condition instead of a clear error. A fixed cap (rather than
+/// deriving from `available_parallelism()`) keeps the check deterministic
+/// across hosts and in CI.
+const MAX_RECV_TASKS: usize = 64;
+
+/// Rejects a `recv_tasks` value above `MAX_RECV_TASKS` for any of the three
+/// UDP fan-out listeners. `0` and `1` (the default) are always accepted —
+/// `0` is documented as being treated the same as `1`. See `MAX_RECV_TASKS`
+/// for why the upper bound exists and how it was chosen.
+pub fn validate_recv_tasks_config(cfg: &Config) -> anyhow::Result<()> {
+    for (section, value) in [
+        ("ipfix.recv_tasks", cfg.ipfix.recv_tasks),
+        ("sflow.recv_tasks", cfg.sflow.recv_tasks),
+        ("syslog.recv_tasks", cfg.syslog.recv_tasks),
+    ] {
+        if value > MAX_RECV_TASKS {
+            anyhow::bail!(
+                "{section} = {value} exceeds the maximum of {MAX_RECV_TASKS}; this almost \
+                 certainly means a typo or a mis-scaled config template rather than an \
+                 intentional value — each unit binds its own SO_REUSEPORT socket and requests \
+                 its own receive buffer, so a large value can exhaust file descriptors or \
+                 memory before startup finishes. Lower {section} to {MAX_RECV_TASKS} or below."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Rejects a config where both `iceberg.s3` and `iceberg.local` are
 /// configured simultaneously. Because `config::Config::builder()` merges
 /// all layers (file → admin-override-file → env vars) before
@@ -1036,7 +1075,8 @@ pub struct SflowConfig {
     /// deployment with a single exporter sending from one fixed source port
     /// will see no benefit from raising it, because every datagram still
     /// hashes to the same socket. `0` is treated the same as `1`, not as
-    /// "disabled".
+    /// "disabled". Rejected above `MAX_RECV_TASKS` at config load — see
+    /// `validate_recv_tasks_config`.
     #[serde(default = "default_sflow_recv_tasks")]
     pub recv_tasks: usize,
 
@@ -1415,6 +1455,7 @@ impl Config {
         let config = builder.build()?;
         let config: Config = config.try_deserialize()?;
         validate_iceberg_config(&config.iceberg)?;
+        validate_recv_tasks_config(&config)?;
         Ok(config)
     }
 }
@@ -2536,6 +2577,34 @@ prefix    = "_iceberg_descriptors"
             msg.contains("/data/iceberg"),
             "error must name the local directory: {msg}"
         );
+    }
+
+    #[test]
+    fn validate_recv_tasks_config_rejects_oversized_value() {
+        let mut cfg = Config::default();
+        cfg.ipfix.recv_tasks = 100_000;
+        let err =
+            validate_recv_tasks_config(&cfg).expect_err("must reject an oversized recv_tasks");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("100000") || msg.contains("100_000"),
+            "error must name the offending value: {msg}"
+        );
+        assert!(
+            msg.contains("ipfix.recv_tasks"),
+            "error must name the offending section: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_recv_tasks_config_ok_for_default_and_sane_values() {
+        assert!(validate_recv_tasks_config(&Config::default()).is_ok());
+
+        let mut cfg = Config::default();
+        cfg.ipfix.recv_tasks = 4;
+        cfg.sflow.recv_tasks = 4;
+        cfg.syslog.recv_tasks = 4;
+        assert!(validate_recv_tasks_config(&cfg).is_ok());
     }
 
     #[test]

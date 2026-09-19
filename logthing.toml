@@ -36,6 +36,8 @@ parse_dns = true    # Enable DNS log parsing
 # further median improvement. Only helps when there are many distinct
 # senders (e.g. a fleet of hosts): SO_REUSEPORT hashes by 4-tuple, so a
 # single sender always lands on the same task regardless of this value.
+# Capped at 64 at config load — anything above that is rejected as a
+# likely typo, since it would bind that many sockets at startup.
 # recv_tasks = 1   # env: LOGTHING__SYSLOG__RECV_TASKS
 
 # Optional: persist syslog messages to S3 as Parquet files.
@@ -85,6 +87,8 @@ bind_address = "0.0.0.0"   # env: LOGTHING__IPFIX__BIND_ADDRESS
 # — 8 bought no further median improvement. Only helps when there are many
 # distinct exporters: SO_REUSEPORT hashes by 4-tuple, so a single exporter
 # always lands on the same task regardless of this value.
+# Capped at 64 at config load — anything above that is rejected as a
+# likely typo, since it would bind that many sockets at startup.
 # recv_tasks = 1   # env: LOGTHING__IPFIX__RECV_TASKS
 
 # Optional: persist IPFIX/NetFlow flows to S3 as Parquet files.
@@ -114,6 +118,8 @@ bind_address = "0.0.0.0"   # env: LOGTHING__SFLOW__BIND_ADDRESS
 # — 8 bought no further median improvement. Only helps when there are many
 # distinct agents: SO_REUSEPORT hashes by 4-tuple, so a single agent always
 # lands on the same task regardless of this value.
+# Capped at 64 at config load — anything above that is rejected as a
+# likely typo, since it would bind that many sockets at startup.
 # recv_tasks = 1   # env: LOGTHING__SFLOW__RECV_TASKS
 
 # Optional: persist sFlow samples to S3 as Parquet files.
