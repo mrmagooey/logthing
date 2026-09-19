@@ -111,6 +111,7 @@ async fn zeek_records_received_visible_on_real_metrics_endpoint_with_forwarding_
         metrics: MetricsConfig {
             enabled: true,
             port: metrics_port,
+            ..MetricsConfig::default()
         },
         ..Config::default()
     };

@@ -69,6 +69,7 @@ async fn ipfix_socket_drop_metrics_visible_on_real_metrics_endpoint() {
         metrics: MetricsConfig {
             enabled: true,
             port: metrics_port,
+            ..MetricsConfig::default()
         },
         ..Config::default()
     };

@@ -372,6 +372,12 @@ impl Server {
             IpWhitelist::new(self.config.security.allowed_ips.clone())?
         };
 
+        // Clone the whitelist before it is moved into `create_router` below —
+        // the metrics router needs its own copy of the same
+        // `security.allowed_ips` gate, since a `metrics.bind_address` of
+        // `0.0.0.0` (or an inherited `0.0.0.0` `bind_address`) would
+        // otherwise expose it on every interface with no auth at all.
+        let metrics_whitelist = ip_whitelist.clone();
         let app = self.create_router(ip_whitelist)?;
 
         // Start HTTP server
@@ -382,9 +388,11 @@ impl Server {
 
         // Start metrics server if enabled
         if self.config.metrics.enabled {
+            let metrics_host =
+                resolve_metrics_host(&self.config.metrics.bind_address, &self.config.bind_address);
             let metrics_addr: SocketAddr =
-                format!("0.0.0.0:{}", self.config.metrics.port).parse()?;
-            tokio::spawn(start_metrics_server(metrics_addr));
+                format!("{}:{}", metrics_host, self.config.metrics.port).parse()?;
+            tokio::spawn(start_metrics_server(metrics_addr, metrics_whitelist));
         }
 
         // Gap-b: wire graceful shutdown so the axum server stops on SIGTERM,
@@ -555,7 +563,8 @@ impl Server {
         let app = self.create_router(ip_whitelist)?;
 
         let tls_config = build_tls_config(&self.config.tls)?;
-        let tls_addr: SocketAddr = format!("0.0.0.0:{}", self.config.tls.port).parse()?;
+        let tls_addr: SocketAddr =
+            format!("{}:{}", self.config.bind_address.ip(), self.config.tls.port).parse()?;
 
         info!("Starting logthing server with TLS on https://{}", tls_addr);
 
@@ -1537,6 +1546,28 @@ mod tests {
     // ------------------------------------------------------------------ //
     // M-18: axum routing-layer handler tests (oneshot)                    //
     // ------------------------------------------------------------------ //
+
+    /// `resolve_metrics_host` is the pure logic behind the metrics bind
+    /// fix: no `metrics.bind_address` inherits the main `bind_address` IP
+    /// (not `0.0.0.0`); an explicit override wins. Exercised directly here
+    /// rather than only through a live socket bind, so the exact resolved
+    /// address is asserted deterministically instead of inferred from OS
+    /// bind/connect behaviour (which depends on machine networking).
+    #[test]
+    fn resolve_metrics_host_inherits_bind_address_when_unset() {
+        let bind_address: SocketAddr = "127.0.0.1:5985".parse().unwrap();
+        assert_eq!(resolve_metrics_host(&None, &bind_address), "127.0.0.1");
+    }
+
+    #[test]
+    fn resolve_metrics_host_uses_explicit_override_when_set() {
+        let bind_address: SocketAddr = "127.0.0.1:5985".parse().unwrap();
+        let override_host = Some("0.0.0.0".to_string());
+        assert_eq!(
+            resolve_metrics_host(&override_host, &bind_address),
+            "0.0.0.0"
+        );
+    }
 
     /// `/health` endpoint returns 200 via the full router stack.
     #[tokio::test]
@@ -3233,7 +3264,22 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
-async fn start_metrics_server(addr: SocketAddr) {
+/// Resolve the interface the metrics listener binds to.
+///
+/// An explicit `metrics.bind_address` wins; otherwise the metrics listener
+/// inherits the main server's `bind_address` IP rather than defaulting to
+/// `0.0.0.0` — see `MetricsConfig::bind_address` for why the unconditional
+/// `0.0.0.0` bind was a finding.
+fn resolve_metrics_host(
+    metrics_bind_address: &Option<String>,
+    bind_address: &SocketAddr,
+) -> String {
+    metrics_bind_address
+        .clone()
+        .unwrap_or_else(|| bind_address.ip().to_string())
+}
+
+async fn start_metrics_server(addr: SocketAddr, ip_whitelist: IpWhitelist) {
     use metrics_exporter_prometheus::PrometheusBuilder;
 
     let recorder = PrometheusBuilder::new().build_recorder();
@@ -3244,18 +3290,32 @@ async fn start_metrics_server(addr: SocketAddr) {
 
     metrics::set_global_recorder(recorder).expect("Failed to install Prometheus recorder");
 
-    let app = Router::new().route(
-        "/metrics",
-        axum::routing::get(move || {
-            let handle = handle.clone();
-            async move { handle.render() }
-        }),
-    );
+    // Gated by the same `security.allowed_ips` whitelist as the main router:
+    // inheriting `bind_address` does nothing when `bind_address` is itself
+    // `0.0.0.0` (a common production setting), so the whitelist is the
+    // control that actually restricts who can scrape /metrics in that case.
+    let whitelist_layer =
+        middleware::from_fn_with_state(ip_whitelist.clone(), ip_whitelist_middleware);
+    let app = Router::new()
+        .route(
+            "/metrics",
+            axum::routing::get(move || {
+                let handle = handle.clone();
+                async move { handle.render() }
+            }),
+        )
+        .layer(whitelist_layer)
+        .layer(axum::Extension(ip_whitelist));
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     info!("Metrics server started on http://{}", addr);
 
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 /// Handle syslog messages via HTTP POST
