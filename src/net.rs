@@ -187,6 +187,21 @@ impl RecvMmsgBatch {
         for msg in &mut self.msgs {
             msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
         }
+        // The zero-latency guarantee (a lone queued datagram returns
+        // immediately, never waits to fill the batch) actually comes from
+        // `fd` already being O_NONBLOCK -- every UdpSocket this crate binds
+        // is (mio sets SOCK_NONBLOCK at creation; bind_udp_reuseport_with_
+        // recv_buffer also calls set_nonblocking(true) explicitly; tokio's
+        // own check_socket_for_blocking refuses a blocking socket outright).
+        // MSG_DONTWAIT is still correct to pass -- it's an independent,
+        // correct belt-and-braces guarantee if this fn is ever reached with
+        // a blocking fd -- but do not remove it as "redundant" with
+        // O_NONBLOCK, and do not add a `timeout` here believing it bounds
+        // the wait: measured against the real syscall, flags=0 with a
+        // populated timespec either returns instantly (O_NONBLOCK fd, same
+        // as now) or hangs forever (blocking fd, per recvmmsg(2)'s own BUGS
+        // section) -- there is no bounded-wait behaviour to rely on either
+        // way.
         let n = unsafe {
             libc::recvmmsg(
                 fd,

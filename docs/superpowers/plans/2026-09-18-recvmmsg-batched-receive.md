@@ -598,7 +598,19 @@ Temporarily change the `recv_mmsg_once` call's last two arguments from `libc::MS
 cargo test --lib net::tests::recv_returns_a_single_datagram -- --nocapture
 ```
 
-Expected: FAIL — with only one datagram ever sent, `recvmmsg` without `MSG_DONTWAIT` and with a 50ms timeout blocks for the full 50ms waiting for a second message that never arrives before returning the one it has, which the test's 30ms budget does not tolerate. Run it twice to confirm the failure isn't a one-off scheduling artifact of this host's documented variance — both runs must fail for this to count as demonstrating the regression. Revert the temporary change (back to `MSG_DONTWAIT` / `null_mut()`) and re-run Step 7 to confirm both tests pass again before continuing.
+**Erratum (confirmed by a standalone C repro against the real syscall, both outcomes measured):** this sabotage does NOT produce a 50ms-bounded failure, on either kind of fd — do not use it. `recvmmsg`'s `timeout` argument only gates the wait for the *first* message of a batch, not for `vlen`-1 further messages after the first has already arrived — see `man 2 recvmmsg`'s own BUGS section ("the call will block forever" once at least one datagram is received and no more arrive). Measured:
+- **blocking fd**, `flags=0`, 50ms `timespec`, one datagram pre-queued, `VLEN=32` → the call **hung indefinitely** (observed >150s, killed by hand) — matches the BUGS section exactly; there is no 50ms bound.
+- **`O_NONBLOCK` fd**, identical flags and timeout → returned in **0.02ms** with the one datagram, because the socket's own non-blocking flag short-circuits the wait regardless of the timeout argument passed.
+
+Every `tokio::net::UdpSocket` in this crate is `O_NONBLOCK` already (mio sets `SOCK_NONBLOCK` at socket creation; `bind_udp_reuseport_with_recv_buffer` also calls `set_nonblocking(true)` explicitly; tokio's own `check_socket_for_blocking` refuses a blocking socket outright), so this sabotage against `RecvMmsgBatch::recv` will simply keep passing — it never exercises the regression it's meant to catch. **Use this substitute instead**: temporarily add `tokio::time::sleep(std::time::Duration::from_millis(50)).await;` as the first line of `RecvMmsgBatch::recv`, before the `loop`. This is a Rust-level "wait to accumulate" sabotage matching this step's actual intent, and reliably fails the latency test's 30ms budget.
+
+```bash
+cargo test --lib net::tests::recv_returns_a_single_datagram -- --nocapture
+```
+
+Expected: FAIL, both runs — the `sleep(50ms)` pushes `recv()` past the test's 30ms timeout budget deterministically, not as a scheduling artifact. Run it twice to confirm. Revert the temporary `sleep` (the `MSG_DONTWAIT`/`null_mut()` call was never the problem and should be left exactly as written) and re-run Step 7 to confirm both tests pass again before continuing.
+
+Note: `MSG_DONTWAIT` in the shipped code is still correct to keep — it is an independent, correct belt-and-braces guarantee against a hypothetical blocking fd reaching this code path. It is `O_NONBLOCK`, not `MSG_DONTWAIT`, that provides the zero-latency guarantee for every socket this crate actually constructs.
 
 - [ ] **Step 9: Run the whole suite**
 
