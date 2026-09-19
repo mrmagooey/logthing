@@ -1,0 +1,15 @@
+# format=syslog shape=real duration=15s runs=3 transport=udp port=15140
+# server restarted between every run; syslog_messages_received/syslog_udp_socket_drops/parquet_s3_dropped are per-run values (fresh process), not deltas.
+# syslog_udp_socket_drops is reconciled against this run's own socket's /proc/net/udp drop counter (NOT host-wide RcvbufErrors), diffed before/after around each run's load.
+run	format	shape	offered	achieved	received	kernel_drops	writer_drops	buffer_drops	written	kernel_loss_pct	total_loss_pct	gen_cores	srv_cores	verdict
+# --- rate=20000 ---
+1	syslog	real	299986	19998.9000	299986	0	0	0	290000	0.0000	0.0000	-0.00	0.98	PASS
+2	syslog	real	235142	15482.5000	235142	0	0	0	235142	0.0000	0.0000	-0.00	0.79	GENERATOR-LIMITED
+3	syslog	real	299983	19998.3000	298606	1377	0	0	290000	0.4590	0.4590	-0.00	1.00	FAIL-LOSS
+# --- summary: format=syslog shape=real rate=20000 runs=3 ---
+median	syslog	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+min	syslog	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+max	syslog	real	-	-	-	-	-	-	-	-	0.4590	-	-	-
+# rate=20000 median_loss=0.0000% median_achieved=19998.3000
+PASS
+artifacts (server logs): /tmp/tmp.qNSRKBrdmZ (removed on exit; rerun with TMP_ROOT preserved manually if needed for debugging)

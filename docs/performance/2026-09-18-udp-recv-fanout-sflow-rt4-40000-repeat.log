@@ -1,0 +1,17 @@
+# format=sflow shape=real duration=15s runs=5 transport=udp port=6343
+# server restarted between every run; sflow_datagrams_received/sflow_socket_drops/parquet_s3_dropped are per-run values (fresh process), not deltas.
+# sflow_socket_drops is reconciled against this run's own socket's /proc/net/udp drop counter (NOT host-wide RcvbufErrors), diffed before/after around each run's load.
+run	format	shape	offered	achieved	received	kernel_drops	writer_drops	buffer_drops	written	kernel_loss_pct	total_loss_pct	gen_cores	srv_cores	verdict
+# --- rate=40000 ---
+1	sflow	real	599970	39995.7000	599970	0	0	0	1199940	0.0000	0.0000	-0.00	1.39	PASS
+2	sflow	real	599965	39996.7000	599965	0	0	0	1199930	0.0000	0.0000	-0.00	1.38	PASS
+3	sflow	real	599966	39997.5000	599966	0	0	0	1199932	0.0000	0.0000	-0.00	1.36	PASS
+4	sflow	real	599980	39997.6000	593946	6034	0	0	1187892	1.0057	1.0057	-0.00	1.34	FAIL-LOSS
+5	sflow	real	599973	39997.8000	560452	39521	0	0	1000000	6.5871	6.5871	-0.00	1.38	FAIL-LOSS
+# --- summary: format=sflow shape=real rate=40000 runs=5 ---
+median	sflow	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+min	sflow	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+max	sflow	real	-	-	-	-	-	-	-	-	6.5871	-	-	-
+# rate=40000 median_loss=0.0000% median_achieved=39997.5000
+PASS
+artifacts (server logs): /tmp/tmp.uItAcwTmIM (removed on exit; rerun with TMP_ROOT preserved manually if needed for debugging)

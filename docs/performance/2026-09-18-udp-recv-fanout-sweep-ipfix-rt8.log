@@ -1,0 +1,18 @@
+# format=ipfix shape=real duration=15s runs=5 transport=udp port=4739
+# server restarted between every run; ipfix_datagrams_received/ipfix_socket_drops/parquet_s3_dropped are per-run values (fresh process), not deltas.
+# ipfix_socket_drops is reconciled against this run's own socket's /proc/net/udp drop counter (NOT host-wide RcvbufErrors), diffed before/after around each run's load.
+run	format	shape	offered	achieved	received	kernel_drops	writer_drops	buffer_drops	written	kernel_loss_pct	total_loss_pct	gen_cores	srv_cores	verdict
+# --- rate=60000 ---
+1	ipfix	real	899940	59995.1000	899944	0	0	0	899940	0.0000	0.0000	-0.00	1.81	PASS
+2	ipfix	real	899928	59993.2000	899932	0	0	0	899928	0.0000	0.0000	-0.00	1.66	PASS
+3	ipfix	real	899910	59992.2000	899914	0	0	0	899910	0.0000	0.0000	-0.00	1.82	PASS
+4	ipfix	real	899921	59992.5000	899925	0	0	0	899921	0.0000	0.0000	-0.00	1.94	PASS
+5	ipfix	real	899948	59994.2000	899952	0	0	0	899948	0.0000	0.0000	-0.00	1.87	PASS
+# --- summary: format=ipfix shape=real rate=60000 runs=5 ---
+median	ipfix	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+min	ipfix	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+max	ipfix	real	-	-	-	-	-	-	-	-	0.0000	-	-	-
+# NOTE: zero kernel-socket loss (ipfix_socket_drops == 0) on every run at rate=60000 -- rate/duration did not saturate the receive buffer on this host. This does not by itself mean total_loss_pct above is zero (writer_drops/buffer_drops can still be non-zero); if it is also zero, raise the rate or DURATION to produce a measurable baseline instead.
+# rate=60000 median_loss=0.0000% median_achieved=59993.2000
+PASS
+artifacts (server logs): /tmp/tmp.iPab0CJKi8 (removed on exit; rerun with TMP_ROOT preserved manually if needed for debugging)

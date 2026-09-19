@@ -155,8 +155,9 @@ producing a silently wrong number.
 | sflow  | 40,000/s | **82,500/s** | 2.06x |
 | syslog | 20,000/s | **27,500/s** | 1.38x |
 
-Source logs: `.superpowers/sdd/2026-09-18-udp-recv-fanout/measure/ipfix-ramp-rt4.log`,
-`sflow-ramp-rt4.log`, `syslog-ramp-rt4.log`. Each ramp found its ceiling by
+Source logs (committed verbatim beside this document): `docs/performance/2026-09-18-udp-recv-fanout-ipfix-ramp-rt4.log`,
+`docs/performance/2026-09-18-udp-recv-fanout-sflow-ramp-rt4.log`,
+`docs/performance/2026-09-18-udp-recv-fanout-syslog-ramp-rt4.log`. Each ramp found its ceiling by
 bisection: the last `PASS` rate before the first sustained `FAIL-LOSS`
 (e.g. ipfix passed cleanly at 65,000/s — three runs, 0.0000% loss each —
 and failed at 67,500/s with a median of 0.6440%, one run showing a
@@ -183,10 +184,16 @@ Notes:
   combined. See §4's variance finding for the full picture, including a
   5-run repeat of exactly this rate that landed at median 0.0000%.
 
-Source logs: `ipfix-rt1-37500.log`, `ipfix-rt4-37500.log`,
-`ipfix-rt4-60000.log`, `sflow-rt1-40000.log`, `sflow-rt4-40000.log`,
-`sflow-rt4-60000.log`, `syslog-rt1-20000.log`, `syslog-rt4-20000.log`,
-`syslog-rt4-40000.log` (all in `.superpowers/sdd/2026-09-18-udp-recv-fanout/measure/`).
+Source logs (committed verbatim beside this document):
+`docs/performance/2026-09-18-udp-recv-fanout-ipfix-rt1-37500.log`,
+`docs/performance/2026-09-18-udp-recv-fanout-ipfix-rt4-37500.log`,
+`docs/performance/2026-09-18-udp-recv-fanout-ipfix-rt4-60000.log`,
+`docs/performance/2026-09-18-udp-recv-fanout-sflow-rt1-40000.log`,
+`docs/performance/2026-09-18-udp-recv-fanout-sflow-rt4-40000.log`,
+`docs/performance/2026-09-18-udp-recv-fanout-sflow-rt4-60000.log`,
+`docs/performance/2026-09-18-udp-recv-fanout-syslog-rt1-20000.log`,
+`docs/performance/2026-09-18-udp-recv-fanout-syslog-rt4-20000.log`,
+`docs/performance/2026-09-18-udp-recv-fanout-syslog-rt4-40000.log`.
 
 ### The `recv_tasks` sweep — IPFIX @ 60,000/s, RUNS=5
 
@@ -201,8 +208,11 @@ Source logs: `ipfix-rt1-37500.log`, `ipfix-rt4-37500.log`,
 | 4 | 0.0000% | 0, 17235, 0, 0, 0 | 1.62-1.82 |
 | 8 | 0.0000% | 0, 0, 0, 0, 0 | 1.66-1.94 |
 
-Source logs: `sweep-ipfix-rt1.log`, `sweep-ipfix-rt2.log`,
-`sweep-ipfix-rt4.log`, `sweep-ipfix-rt8.log`.
+Source logs (committed verbatim beside this document):
+`docs/performance/2026-09-18-udp-recv-fanout-sweep-ipfix-rt1.log`,
+`docs/performance/2026-09-18-udp-recv-fanout-sweep-ipfix-rt2.log`,
+`docs/performance/2026-09-18-udp-recv-fanout-sweep-ipfix-rt4.log`,
+`docs/performance/2026-09-18-udp-recv-fanout-sweep-ipfix-rt8.log`.
 
 Monotonic and saturating at `recv_tasks=4`: 7.81% → 1.56% → 0% → 0%.
 `recv_tasks=8` was the only setting with no outlier run at all across 5
@@ -218,17 +228,18 @@ are cheap — they do not each consume a dedicated core.
 
 An sFlow run at `recv_tasks=4`, 40,000/s lost 16,819 datagrams (2.80%)
 while its two neighbouring runs in the same 3-run set lost 1,097 and 170
-(`sflow-rt4-40000.log`). Two explanations were tested and **both were
-refuted**:
+(`docs/performance/2026-09-18-udp-recv-fanout-sflow-rt4-40000.log`). Two
+explanations were tested and **both were refuted**:
 
 - **Hypothesis 1 — warm-up (first run spikes):** REFUTED. A 5-run repeat at
   the same rate gave kernel drops of 0, 0, 0, 6034, 39521
-  (`sflow-rt4-40000-repeat.log`) — the spike came **last**, not first.
+  (`docs/performance/2026-09-18-udp-recv-fanout-sflow-rt4-40000-repeat.log`)
+  — the spike came **last**, not first.
 - **Hypothesis 2 — progressive degradation across a run sequence:**
-  REFUTED. A separate 6-run repeat gave 7829, 8244, 0, 84, 0, 0 — the bad
-  runs came **first**, not last. (This 6-run repeat is not preserved as a
-  separate log file; it is recorded in `progress.md`'s Task 7 entry and in
-  the measurement brief for this document.)
+  REFUTED. A separate 6-run repeat gave kernel drops of 7829, 8244, 0, 84,
+  0, 0
+  (`docs/performance/2026-09-18-udp-recv-fanout-sflow-rt4-40000-repeat6.log`)
+  — the bad runs came **first**, not last.
 
 Conclusion: this is random run-to-run variance, not ordered. Host load
 average was 3.2-4.4 on this 12-vCPU guest during the campaign — consistent
