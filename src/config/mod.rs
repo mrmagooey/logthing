@@ -221,19 +221,26 @@ pub struct SyslogConfig {
     pub recv_tasks: usize,
 
     /// Number of datagrams one `recvmmsg(2)` call may return per receive
-    /// task (default: 1, meaning off — every call still returns at most one
-    /// datagram, via the original `recv_from` path). Applies to the UDP arm
-    /// only, same caveat as `recv_tasks` above. Above 1, each recv task
-    /// batches up to this many already-queued datagrams into one syscall
-    /// instead of one syscall per datagram. Unlike `recv_tasks`, this helps
-    /// a SINGLE high-rate sender: it reduces syscalls per datagram on one
-    /// socket rather than spreading datagrams across sockets, so it is the
-    /// lever for exactly the deployment shape `recv_tasks` cannot help (see
-    /// `recv_tasks`'s own doc comment). The two knobs are independent and
-    /// may be combined. `0` is treated the same as `1` (batching off), not
-    /// as "disabled". Never waits to fill a batch — a lone datagram is
-    /// still returned immediately. Rejected above `MAX_RECV_BATCH_SIZE` at
-    /// config load — see `validate_recv_batch_size_config`.
+    /// task (default: 32). Applies to the UDP arm only, same caveat as
+    /// `recv_tasks` above. Above 1, each recv task batches up to this many
+    /// already-queued datagrams into one syscall instead of one syscall per
+    /// datagram. Unlike `recv_tasks`, this helps a SINGLE high-rate sender:
+    /// it reduces syscalls per datagram on one socket rather than spreading
+    /// datagrams across sockets, so it is the lever for exactly the
+    /// deployment shape `recv_tasks` cannot help (see `recv_tasks`'s own doc
+    /// comment). The two knobs are independent and may be combined; since
+    /// `recv_tasks` also defaults to 8, both are on by default, and the
+    /// memory cost of batching scales with the number of recv tasks. `0` is
+    /// treated the same as `1` (batching off), not as "disabled". Never
+    /// waits to fill a batch — a lone datagram is still returned
+    /// immediately. Measured loss went to zero once the batch size reached 4
+    /// or above for a single-sender IPFIX stream at 50k/s; the default of
+    /// `32` is a headroom choice (not shown to measurably beat `8`) costing
+    /// roughly 6 MB resident with all three UDP listeners enabled at the
+    /// default `recv_tasks` — see
+    /// docs/performance/2026-09-18-recvmmsg-results.md. Rejected above
+    /// `MAX_RECV_BATCH_SIZE` at config load — see
+    /// `validate_recv_batch_size_config`.
     #[serde(default = "default_syslog_recv_batch_size")]
     pub recv_batch_size: usize,
 
@@ -320,18 +327,25 @@ pub struct IpfixConfig {
     pub recv_tasks: usize,
 
     /// Number of datagrams one `recvmmsg(2)` call may return per receive
-    /// task (default: 1, meaning off — every call still returns at most one
-    /// datagram, via the original `recv_from` path). Above 1, each recv task
-    /// batches up to this many already-queued datagrams into one syscall
-    /// instead of one syscall per datagram. Unlike `recv_tasks`, this helps
-    /// a SINGLE high-rate sender: it reduces syscalls per datagram on one
-    /// socket rather than spreading datagrams across sockets, so it is the
-    /// lever for exactly the deployment shape `recv_tasks` cannot help (see
-    /// `recv_tasks`'s own doc comment). The two knobs are independent and
-    /// may be combined. `0` is treated the same as `1` (batching off), not
-    /// as "disabled". Never waits to fill a batch — a lone datagram is
-    /// still returned immediately. Rejected above `MAX_RECV_BATCH_SIZE` at
-    /// config load — see `validate_recv_batch_size_config`.
+    /// task (default: 32). Above 1, each recv task batches up to this many
+    /// already-queued datagrams into one syscall instead of one syscall per
+    /// datagram. Unlike `recv_tasks`, this helps a SINGLE high-rate sender:
+    /// it reduces syscalls per datagram on one socket rather than spreading
+    /// datagrams across sockets, so it is the lever for exactly the
+    /// deployment shape `recv_tasks` cannot help (see `recv_tasks`'s own doc
+    /// comment). The two knobs are independent and may be combined; since
+    /// `recv_tasks` also defaults to 8, both are on by default, and the
+    /// memory cost of batching scales with the number of recv tasks. `0` is
+    /// treated the same as `1` (batching off), not as "disabled". Never
+    /// waits to fill a batch — a lone datagram is still returned
+    /// immediately. Measured loss went to zero once the batch size reached 4
+    /// or above for a single-sender IPFIX stream at 50k/s; the default of
+    /// `32` is a headroom choice (not shown to measurably beat `8`) costing
+    /// roughly 6 MB resident with all three UDP listeners enabled at the
+    /// default `recv_tasks` — see
+    /// docs/performance/2026-09-18-recvmmsg-results.md. Rejected above
+    /// `MAX_RECV_BATCH_SIZE` at config load — see
+    /// `validate_recv_batch_size_config`.
     #[serde(default = "default_ipfix_recv_batch_size")]
     pub recv_batch_size: usize,
 
@@ -372,7 +386,7 @@ fn default_ipfix_recv_tasks() -> usize {
     8
 }
 fn default_ipfix_recv_batch_size() -> usize {
-    1
+    32
 }
 fn default_ipfix_bind_address() -> String {
     "0.0.0.0".to_string()
@@ -1164,18 +1178,25 @@ pub struct SflowConfig {
     pub recv_tasks: usize,
 
     /// Number of datagrams one `recvmmsg(2)` call may return per receive
-    /// task (default: 1, meaning off — every call still returns at most one
-    /// datagram, via the original `recv_from` path). Above 1, each recv task
-    /// batches up to this many already-queued datagrams into one syscall
-    /// instead of one syscall per datagram. Unlike `recv_tasks`, this helps
-    /// a SINGLE high-rate sender: it reduces syscalls per datagram on one
-    /// socket rather than spreading datagrams across sockets, so it is the
-    /// lever for exactly the deployment shape `recv_tasks` cannot help (see
-    /// `recv_tasks`'s own doc comment). The two knobs are independent and
-    /// may be combined. `0` is treated the same as `1` (batching off), not
-    /// as "disabled". Never waits to fill a batch — a lone datagram is
-    /// still returned immediately. Rejected above `MAX_RECV_BATCH_SIZE` at
-    /// config load — see `validate_recv_batch_size_config`.
+    /// task (default: 32). Above 1, each recv task batches up to this many
+    /// already-queued datagrams into one syscall instead of one syscall per
+    /// datagram. Unlike `recv_tasks`, this helps a SINGLE high-rate sender:
+    /// it reduces syscalls per datagram on one socket rather than spreading
+    /// datagrams across sockets, so it is the lever for exactly the
+    /// deployment shape `recv_tasks` cannot help (see `recv_tasks`'s own doc
+    /// comment). The two knobs are independent and may be combined; since
+    /// `recv_tasks` also defaults to 8, both are on by default, and the
+    /// memory cost of batching scales with the number of recv tasks. `0` is
+    /// treated the same as `1` (batching off), not as "disabled". Never
+    /// waits to fill a batch — a lone datagram is still returned
+    /// immediately. Measured loss went to zero once the batch size reached 4
+    /// or above for a single-sender IPFIX stream at 50k/s; the default of
+    /// `32` is a headroom choice (not shown to measurably beat `8`) costing
+    /// roughly 6 MB resident with all three UDP listeners enabled at the
+    /// default `recv_tasks` — see
+    /// docs/performance/2026-09-18-recvmmsg-results.md. Rejected above
+    /// `MAX_RECV_BATCH_SIZE` at config load — see
+    /// `validate_recv_batch_size_config`.
     #[serde(default = "default_sflow_recv_batch_size")]
     pub recv_batch_size: usize,
 
@@ -1215,7 +1236,7 @@ fn default_sflow_recv_tasks() -> usize {
     8
 }
 fn default_sflow_recv_batch_size() -> usize {
-    1
+    32
 }
 fn default_sflow_bind_address() -> String {
     "0.0.0.0".to_string()
@@ -1521,7 +1542,7 @@ fn default_syslog_recv_tasks() -> usize {
 }
 
 fn default_syslog_recv_batch_size() -> usize {
-    1
+    32
 }
 
 impl Config {
@@ -2744,8 +2765,8 @@ prefix    = "_iceberg_descriptors"
     }
 
     #[test]
-    fn ipfix_config_recv_batch_size_defaults_to_one() {
-        assert_eq!(IpfixConfig::default().recv_batch_size, 1);
+    fn ipfix_config_recv_batch_size_defaults_to_32() {
+        assert_eq!(IpfixConfig::default().recv_batch_size, 32);
     }
 
     #[test]

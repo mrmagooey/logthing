@@ -43,20 +43,24 @@ parse_dns = true    # Enable DNS log parsing
 # likely typo, since it would bind that many sockets at startup.
 # recv_tasks = 8   # env: LOGTHING__SYSLOG__RECV_TASKS
 
-# Number of datagrams one recvmmsg(2) call may return per recv task (default:
-# 1, meaning off). Applies to the UDP arm only. Unlike recv_tasks, this helps
+# Number of datagrams one recvmmsg(2) call may return per recv task
+# (default: 32). Applies to the UDP arm only. Unlike recv_tasks, this helps
 # a SINGLE high-rate sender by batching already-queued datagrams into one
 # syscall instead of one per datagram; the two knobs are independent and may
-# be combined. Never waits to fill a batch. Raise when a single high-rate
-# sender is losing datagrams (socket_drops climbing) while the process sits
-# at roughly one core of CPU — that combination is the signature recv_tasks
-# cannot address. Measured value: 32, which took ipfix's single-sender
-# 50,000/s kernel loss from a median 0.72% to 0.00% at no added CPU
+# be combined (recv_tasks also defaults to 8, so both are on by default). 0
+# and 1 both mean batching off. Never waits to fill a batch. Raise when a
+# single high-rate sender is losing datagrams (socket_drops climbing) while
+# the process sits at roughly one core of CPU — that combination is the
+# signature recv_tasks cannot address. Measured on ipfix, single-sender
+# 50,000/s (RUNS=5): median kernel loss went from 0.72% at 1 to 0.00% at
+# every setting from 4 upward — the measured win is 1 -> >=4; 32 was not
+# shown to outperform 8 and is a headroom choice, costing roughly 6 MB
+# resident with all three UDP listeners enabled at the default recv_tasks
 # (docs/performance/2026-09-18-recvmmsg-results.md; measured for ipfix, not
 # independently re-measured for sflow/syslog, same code path). Maximum 256,
 # capped at config load — anything above that is rejected as a likely typo,
 # since each unit allocates a 65535-byte buffer per recv task at startup.
-# recv_batch_size = 1   # env: LOGTHING__SYSLOG__RECV_BATCH_SIZE
+# recv_batch_size = 32   # env: LOGTHING__SYSLOG__RECV_BATCH_SIZE
 
 # Optional: persist syslog messages to S3 as Parquet files.
 # Remove or comment out this block to disable syslog S3 persistence.
@@ -113,19 +117,23 @@ bind_address = "0.0.0.0"   # env: LOGTHING__IPFIX__BIND_ADDRESS
 # likely typo, since it would bind that many sockets at startup.
 # recv_tasks = 8   # env: LOGTHING__IPFIX__RECV_TASKS
 
-# Number of datagrams one recvmmsg(2) call may return per recv task (default:
-# 1, meaning off). Unlike recv_tasks, this helps a SINGLE high-rate exporter
+# Number of datagrams one recvmmsg(2) call may return per recv task
+# (default: 32). Unlike recv_tasks, this helps a SINGLE high-rate exporter
 # by batching already-queued datagrams into one syscall instead of one per
-# datagram; the two knobs are independent and may be combined. Never waits
-# to fill a batch. Raise when a single high-rate exporter is losing
-# datagrams (ipfix_socket_drops climbing) while the process sits at roughly
-# one core of CPU — that combination is the signature recv_tasks cannot
-# address. Measured value: 32, which took the single-sender 50,000/s kernel
-# loss from a median 0.72% to 0.00% at no added CPU
+# datagram; the two knobs are independent and may be combined (recv_tasks
+# also defaults to 8, so both are on by default). 0 and 1 both mean
+# batching off. Never waits to fill a batch. Raise when a single high-rate
+# exporter is losing datagrams (ipfix_socket_drops climbing) while the
+# process sits at roughly one core of CPU — that combination is the
+# signature recv_tasks cannot address. Measured single-sender 50,000/s
+# (RUNS=5): median kernel loss went from 0.72% at 1 to 0.00% at every
+# setting from 4 upward — the measured win is 1 -> >=4; 32 was not shown to
+# outperform 8 and is a headroom choice, costing roughly 6 MB resident with
+# all three UDP listeners enabled at the default recv_tasks
 # (docs/performance/2026-09-18-recvmmsg-results.md). Maximum 256, capped at
 # config load — anything above that is rejected as a likely typo, since
 # each unit allocates a 65535-byte buffer per recv task at startup.
-# recv_batch_size = 1   # env: LOGTHING__IPFIX__RECV_BATCH_SIZE
+# recv_batch_size = 32   # env: LOGTHING__IPFIX__RECV_BATCH_SIZE
 
 # Optional: persist IPFIX/NetFlow flows to S3 as Parquet files.
 # Remove or comment out this block to disable IPFIX S3 persistence.
@@ -161,20 +169,24 @@ bind_address = "0.0.0.0"   # env: LOGTHING__SFLOW__BIND_ADDRESS
 # likely typo, since it would bind that many sockets at startup.
 # recv_tasks = 8   # env: LOGTHING__SFLOW__RECV_TASKS
 
-# Number of datagrams one recvmmsg(2) call may return per recv task (default:
-# 1, meaning off). Unlike recv_tasks, this helps a SINGLE high-rate agent by
+# Number of datagrams one recvmmsg(2) call may return per recv task
+# (default: 32). Unlike recv_tasks, this helps a SINGLE high-rate agent by
 # batching already-queued datagrams into one syscall instead of one per
-# datagram; the two knobs are independent and may be combined. Never waits
-# to fill a batch. Raise when a single high-rate agent is losing datagrams
-# (sflow_socket_drops climbing) while the process sits at roughly one core
-# of CPU — that combination is the signature recv_tasks cannot address.
-# Measured value: 32, which took ipfix's single-sender 50,000/s kernel loss
-# from a median 0.72% to 0.00% at no added CPU
+# datagram; the two knobs are independent and may be combined (recv_tasks
+# also defaults to 8, so both are on by default). 0 and 1 both mean
+# batching off. Never waits to fill a batch. Raise when a single high-rate
+# agent is losing datagrams (sflow_socket_drops climbing) while the process
+# sits at roughly one core of CPU — that combination is the signature
+# recv_tasks cannot address. Measured on ipfix, single-sender 50,000/s
+# (RUNS=5): median kernel loss went from 0.72% at 1 to 0.00% at every
+# setting from 4 upward — the measured win is 1 -> >=4; 32 was not shown to
+# outperform 8 and is a headroom choice, costing roughly 6 MB resident with
+# all three UDP listeners enabled at the default recv_tasks
 # (docs/performance/2026-09-18-recvmmsg-results.md; measured for ipfix, not
 # independently re-measured for sflow, same code path). Maximum 256, capped
 # at config load — anything above that is rejected as a likely typo, since
 # each unit allocates a 65535-byte buffer per recv task at startup.
-# recv_batch_size = 1   # env: LOGTHING__SFLOW__RECV_BATCH_SIZE
+# recv_batch_size = 32   # env: LOGTHING__SFLOW__RECV_BATCH_SIZE
 
 # Optional: persist sFlow samples to S3 as Parquet files.
 # Remove or comment out this block to disable sFlow S3 persistence.

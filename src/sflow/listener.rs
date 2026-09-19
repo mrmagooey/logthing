@@ -33,7 +33,7 @@ pub struct SflowListenerConfig {
     /// `0` is treated the same as `1` (single-socket path), not as "disabled".
     pub recv_tasks: usize,
     /// Number of datagrams one `recvmmsg(2)` call may return per recv task
-    /// (default: 1, off). See `SflowConfig::recv_batch_size` for the full
+    /// (default: 32). See `SflowConfig::recv_batch_size` for the full
     /// explanation -- unlike `recv_tasks`, this helps a single high-rate
     /// sender.
     pub recv_batch_size: usize,
@@ -46,7 +46,7 @@ impl Default for SflowListenerConfig {
             bind_address: "0.0.0.0".to_string(),
             receive_buffer_bytes: Some(4 * 1024 * 1024),
             recv_tasks: 8,
-            recv_batch_size: 1,
+            recv_batch_size: 32,
         }
     }
 }
