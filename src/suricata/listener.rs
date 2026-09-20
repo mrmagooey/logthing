@@ -308,11 +308,17 @@ impl SuricataListener {
                 Ok(p) => p,
                 Err(e) => {
                     metrics::counter!("suricata_parse_errors").increment(1);
+                    // `read_until(b'\n', ...)` above only guarantees no *trailing*
+                    // newline reaches here (it's popped a few lines up) — a bare
+                    // `\r` or an ANSI escape (`\x1b`) mid-line is untouched by
+                    // that framing and would still reach an operator's terminal
+                    // unsanitized. Use `sanitize_for_log`, not `truncate_for_log`,
+                    // here too; do not "restore" this to `truncate_for_log`.
                     warn!(
                         "Suricata: JSON parse error from {}: {} — line: {}",
                         src,
                         e,
-                        crate::truncate_for_log(line, 120),
+                        crate::sanitize_for_log(line, 120),
                     );
                     continue;
                 }
@@ -1034,6 +1040,65 @@ mod tests {
             count, 1,
             "suricata_tcp_idle_timeouts must be 1 when the accept loop's \
              own wiring times out the connection; got {count}"
+        );
+    }
+
+    /// F8 regression, mirroring syslog's
+    /// `tcp_parse_error_log_sanitizes_mid_line_cr_and_ansi_escape`: a TCP
+    /// line that fails to parse as JSON and contains a *mid-line* `\r` and a
+    /// mid-line ANSI escape (`\x1b`) must not carry either raw into the
+    /// resulting `warn!` log line. `handle_tcp_connection`'s
+    /// `read_until(b'\n', ...)` framing (plus the trailing-`\r`/`\n` pop just
+    /// above the log call) only guarantees no *trailing* newline survives —
+    /// it does nothing for control characters earlier in the line. Fails if
+    /// the JSON-parse-error log site is reverted from `sanitize_for_log`
+    /// back to `truncate_for_log`.
+    ///
+    /// Capture subscriber lives in `crate::test_support`, shared with the
+    /// equivalent syslog/zeek tests — see that module's doc comment for why.
+    #[tokio::test]
+    async fn tcp_parse_error_log_sanitizes_mid_line_cr_and_ansi_escape() {
+        crate::test_support::install_and_clear();
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server_stream, src) = tcp_listener.accept().await.unwrap();
+
+        // Not valid JSON, so it reaches the JSON-parse-error warn! site. The
+        // `\r` and `\x1b[31m` are both mid-line, not trailing, so the TCP
+        // reader's newline framing does not touch them.
+        let msg = b"not valid json\rsuricata \x1b[31mline\n";
+        client.write_all(msg).await.unwrap();
+        drop(client); // close so the next read_until sees a clean EOF and returns
+
+        let handler = CapturingHandler::new();
+        SuricataListener::handle_tcp_connection(
+            server_stream,
+            src,
+            handler,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        let events = crate::test_support::captured_events();
+        let warn_line = events
+            .iter()
+            .find(|m| m.contains("Suricata: JSON parse error"))
+            .unwrap_or_else(|| panic!("no matching warn! event captured; got: {events:?}"));
+
+        assert!(
+            !warn_line.contains('\r'),
+            "raw CR leaked into the log line: {warn_line:?}"
+        );
+        assert!(
+            !warn_line.contains('\u{1b}'),
+            "raw ESC leaked into the log line: {warn_line:?}"
+        );
+        assert!(
+            warn_line.contains('\u{fffd}'),
+            "expected U+FFFD replacement characters in the log line: {warn_line:?}"
         );
     }
 }

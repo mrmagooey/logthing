@@ -1936,78 +1936,12 @@ mod tests {
     // F8 regression: TCP parse-error site must sanitize mid-line control
     // characters too (in-test tracing capture).
     //
-    // Not `forwarding::buffered_writer`'s `TestTracingCapture` pattern
-    // (per-test `tracing::subscriber::set_default`): that technique was
-    // empirically flaky here. `tracing-core` caches each callsite's
-    // `Interest` -- and, more importantly, a single **global** max-level
-    // threshold -- across *every* thread in the process (see
-    // `tracing_core::callsite::{register_dispatch, rebuild_interest_cache}`,
-    // which fold `max_level_hint()`/`Interest` over every currently-live
-    // `Dispatch` process-wide). Each `set_default` call creates a fresh
-    // `Dispatch`, which forces a global rebuild of that fold; under this
-    // suite's full parallelism the rebuild can transiently land on a
-    // restrictive value, silently dropping this test's event before
-    // `Subscriber::enabled`/`event` are even called (confirmed by
-    // instrumenting both with `eprintln!`: in failing runs neither fired at
-    // all). A subscriber installed exactly **once**, globally
-    // (`set_global_default`, gated by a `OnceLock` so only the first caller
-    // installs it), never triggers that rebuild again, so this cache
-    // instability doesn't apply. Per-test isolation instead comes from
-    // routing captured messages through a `thread_local!` buffer that each
-    // test clears before use -- safe because the default (current-thread)
-    // `#[tokio::test]` flavor runs a given test's whole body, including any
-    // `tokio::spawn`ed subtasks, on one OS thread, and libtest never runs two
-    // tests concurrently on the same thread.
+    // The capture subscriber + thread-local buffer live in
+    // `crate::test_support` and are shared with the equivalent zeek/suricata
+    // regression tests -- see that module's doc comment for why a bespoke
+    // per-test `set_default` doesn't work here, and why the subscriber must
+    // be shared rather than one-per-module.
     // -----------------------------------------------------------------------
-
-    struct MessageOnlyVisitor(String);
-    impl tracing::field::Visit for MessageOnlyVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.0 = format!("{value:?}");
-            }
-        }
-    }
-
-    thread_local! {
-        static CAPTURED_EVENTS: std::cell::RefCell<Vec<String>> =
-            const { std::cell::RefCell::new(Vec::new()) };
-    }
-
-    struct GlobalCaptureSubscriber;
-    impl tracing::Subscriber for GlobalCaptureSubscriber {
-        fn register_callsite(
-            &self,
-            _metadata: &'static tracing::Metadata<'static>,
-        ) -> tracing::subscriber::Interest {
-            tracing::subscriber::Interest::always()
-        }
-        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            let mut visitor = MessageOnlyVisitor(String::new());
-            event.record(&mut visitor);
-            CAPTURED_EVENTS.with(|events| events.borrow_mut().push(visitor.0));
-        }
-        fn enter(&self, _span: &tracing::span::Id) {}
-        fn exit(&self, _span: &tracing::span::Id) {}
-    }
-
-    /// Installs [`GlobalCaptureSubscriber`] as the process's global default
-    /// tracing subscriber, exactly once (later calls are no-ops -- including
-    /// from other tests in this binary that run before or after this one).
-    fn ensure_global_capture_subscriber_installed() {
-        static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        INIT.get_or_init(|| {
-            let _ = tracing::subscriber::set_global_default(GlobalCaptureSubscriber);
-        });
-    }
 
     /// A TCP syslog line that fails to parse and contains a *mid-line* `\r`
     /// and a mid-line ANSI escape (`\x1b`) must not carry either raw into the
@@ -2024,8 +1958,7 @@ mod tests {
     /// has no dependency on executor scheduling fairness either.
     #[tokio::test]
     async fn tcp_parse_error_log_sanitizes_mid_line_cr_and_ansi_escape() {
-        ensure_global_capture_subscriber_installed();
-        CAPTURED_EVENTS.with(|events| events.borrow_mut().clear());
+        crate::test_support::install_and_clear();
 
         let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = tcp_listener.local_addr().unwrap();
@@ -2045,7 +1978,7 @@ mod tests {
             .await
             .unwrap();
 
-        let events = CAPTURED_EVENTS.with(|events| events.borrow().clone());
+        let events = crate::test_support::captured_events();
         let warn_line = events
             .iter()
             .find(|m| m.contains("Failed to parse TCP syslog message"))
