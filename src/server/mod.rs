@@ -17,20 +17,23 @@ use crate::syslog::SyslogMessage;
 use anyhow::anyhow;
 use axum::{
     Json, Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{ConnectInfo, Request, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     middleware,
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use http_body::{Body as HttpBody, Frame, SizeHint};
 
 use futures::stream::{self, StreamExt};
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tracing::{debug, error, info, warn};
@@ -63,92 +66,187 @@ const MAX_CONCURRENT_EVENT_PROCESSING: usize = 16;
 ///
 /// 1 GiB permits roughly sixteen concurrent maximum-size (64 MiB) requests
 /// in flight at once — generous for real bursty ingest, since legitimate
-/// traffic is rarely dominated by many simultaneous max-size batches — while
-/// capping the worst case at ~1 GiB of buffered-body memory regardless of
-/// how many of the 10,000 connection slots an attacker fills. The permit is
-/// held for the life of the whole request (see `body_budget_middleware`),
-/// so it also caps, at that same ~1 GiB input-side scale, how much
-/// concurrently-buffered body can be feeding downstream amplification (e.g.
-/// HEC's NDJSON-to-records parsing) at once.
+/// traffic is rarely dominated by many simultaneous max-size batches.
+///
+/// Two worst-case numbers, not one — read both, they answer different
+/// questions:
+///
+/// - **Input-side / attacker ceiling: ~1 GiB.** `BudgetedBody` (below)
+///   charges every request's ACTUAL streamed bytes as they arrive, so this
+///   is a hard ceiling on raw buffered-body bytes regardless of how many of
+///   the 10,000 connection slots an attacker fills, what protocol version
+///   they use, or what headers they send (or omit). Payloads that are
+///   never valid, parseable records — the attacker case — stay at this
+///   scale, since they never reach the amplification below.
+/// - **Realistic legitimate peak: ~14 GiB, not 1 GiB.** The permit is held
+///   for the whole handler (deliberately — see `body_budget_middleware`),
+///   and HEC's NDJSON-to-records parsing turns a 64 MiB raw body into
+///   roughly 840 MB of parsed `GenericRecord`s (~13x) while the raw
+///   `Bytes` is still alive. Sixteen concurrent, honestly-declared 64 MiB
+///   HEC requests — exactly what this budget permits at once — can
+///   therefore peak around 16 * (64 MiB + 840 MB) ≈ 14 GiB during parsing.
+///   That is still roughly 46x smaller than the unbounded ~640 GiB this
+///   finding started from, but the 1 GiB figure must not be read as an
+///   overall process-memory ceiling; downstream parse amplification is not
+///   separately budgeted by this change.
 const BODY_BYTE_BUDGET: usize = 1024 * 1024 * 1024; // 1 GiB
 
-/// How many bytes of `BODY_BYTE_BUDGET` a request must reserve before its
-/// body is read.
+/// Body wrapper charging `BODY_BYTE_BUDGET` per ACTUAL byte, as each frame
+/// streams through — never against a client-supplied header. This is what
+/// makes the budget correct regardless of protocol version or header
+/// honesty, closing two gaps a declared-length charge cannot:
 ///
-/// Two bad options and why this avoids both: charging strictly by the
-/// client-controlled `Content-Length` header would let an attacker lie
-/// their way past the budget; charging only after the body is fully
-/// buffered charges *after* the memory is already spent, which is too late
-/// to prevent the exhaustion this budget exists to stop. Instead this
-/// reserves an amount that is always >= what the body can actually
-/// deliver, decided *before* a single body byte is read:
+/// - **HTTP/2** has no `Transfer-Encoding`, and hyper does not enforce a
+///   declared `Content-Length` against real DATA-frame bytes (an
+///   under-declaring or absent-`Content-Length` h2 client is not caught by
+///   framing the way HTTP/1.1's is — see hyper's `body::incoming` `Kind::H2`
+///   arm, which subtracts unchecked and never errors on mismatch). This
+///   server negotiates h2 on both listeners (plaintext h2c via
+///   `axum::serve`'s `hyper_util::auto` builder, and TLS via ALPN
+///   advertising `"h2"`), so this is default-reachable, not an edge case.
+/// - **HTTP/1.1 chunked** bodies send no `Content-Length` at all, so a
+///   declared-length charge had to assume the worst case (`MAX_BODY_SIZE`)
+///   for every chunked request — meaning as few as
+///   `BODY_BYTE_BUDGET / MAX_BODY_SIZE` (16) concurrent chunked requests of
+///   ANY real size would 503 the rest. Charging real bytes removes that
+///   over-charge entirely: a small chunked request charges only its real
+///   small size.
 ///
-/// - `Content-Length` present: HTTP framing means the server will not
-///   deliver more than this many body bytes for the request (a client
-///   claiming fewer than it sends is simply truncated at that length by
-///   the framing, not an over-charge risk), so it is already a valid upper
-///   bound. Capped to `MAX_BODY_SIZE`, since `DefaultBodyLimit` would
-///   reject anything larger anyway.
-/// - No `Content-Length` but `Transfer-Encoding: chunked`: the real size
-///   is unknown ahead of time (this is the loophole an attacker would use
-///   to dodge a `Content-Length`-only charge), so the full `MAX_BODY_SIZE`
-///   ceiling is charged — `DefaultBodyLimit` will not let more than that
-///   through regardless.
-/// - Neither header: per HTTP semantics the request has no body, so
-///   nothing is reserved. This keeps GET-only routes on the same router
-///   (`/syslog/udp`, `/syslog/examples`) unaffected.
-fn declared_body_budget(headers: &HeaderMap) -> usize {
-    if let Some(len) = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        return len.min(MAX_BODY_SIZE);
-    }
-    let chunked = headers
-        .get(header::TRANSFER_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| s.to_ascii_lowercase().contains("chunked"));
-    if chunked { MAX_BODY_SIZE } else { 0 }
+/// Permits are pushed into `held` as each frame is charged, but `held` is
+/// NOT owned solely by this wrapper — it is an `Arc<Mutex<..>>` shared with
+/// `body_budget_middleware`'s own stack frame (see its doc comment for why):
+/// extractors like `Bytes` fully drain and DROP the request body as soon as
+/// collection finishes, which happens well before the handler runs, so a
+/// permit store owned only by the body would release on extraction, not on
+/// handler completion. Sharing the store lets charging stay tied to real
+/// bytes as they stream (this struct's job) while release stays tied to the
+/// whole request (the middleware's job) — both released together the same
+/// way regardless: ordinary `Arc`/`Drop`, whichever side drops last (end of
+/// stream, an extractor/handler error, `TimeoutLayer` firing, a mid-body
+/// disconnect, or a panic unwind). Same "owned permits released by scope"
+/// pattern as `ZeekListener`'s byte budget, just with two owners racing to
+/// be the last one out instead of one.
+struct BudgetedBody {
+    inner: Body,
+    budget: Arc<Semaphore>,
+    held: Arc<std::sync::Mutex<Vec<OwnedSemaphorePermit>>>,
 }
 
-/// `axum::middleware::from_fn_with_state` handler enforcing `BODY_BYTE_BUDGET`.
+impl HttpBody for BudgetedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    /// Charges the real length of each data frame against the shared budget
+    /// as it arrives. A frame that cannot be charged fails the body stream
+    /// right here instead of being passed through — the bytes are never
+    /// handed to whatever is collecting this body (e.g. the `Bytes`
+    /// extractor), so exhaustion mid-body still prevents the memory it
+    /// exists to prevent, not just detects it after the fact.
+    ///
+    /// The caller sees a body-read error (axum's `Bytes` extractor turns an
+    /// unrecognized body error into `UnknownBodyError`, HTTP 400) rather
+    /// than a 503: a fresh, deliberately-chosen status is only possible
+    /// before the handler has been dispatched to at all, which
+    /// `body_budget_middleware`'s upfront `available_permits() == 0` check
+    /// covers for the common already-exhausted case. Once streaming has
+    /// begun there is no clean way to retroactively swap in a 503, so this
+    /// takes the next best outcome: fail fast and stop buffering.
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                let len = frame.data_ref().map_or(0, |data| data.len());
+                if len == 0 {
+                    return Poll::Ready(Some(Ok(frame)));
+                }
+                let units = u32::try_from(len).unwrap_or(u32::MAX);
+                match self.budget.clone().try_acquire_many_owned(units) {
+                    Ok(permit) => {
+                        self.held
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(permit);
+                        Poll::Ready(Some(Ok(frame)))
+                    }
+                    Err(_) => {
+                        metrics::counter!("body_budget_exhausted").increment(1);
+                        warn!(
+                            "body byte budget exhausted mid-body ({len} more bytes \
+                             requested); failing the body stream"
+                        );
+                        Poll::Ready(Some(Err(axum::Error::new(std::io::Error::other(
+                            "body byte budget exhausted",
+                        )))))
+                    }
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// `axum::middleware::from_fn_with_state` handler enforcing `BODY_BYTE_BUDGET`
+/// via `BudgetedBody`.
 ///
-/// The permit is a plain local binding held across the `next.run(request)`
-/// await, so it is released by ordinary drop semantics on every exit path:
-/// normal completion, a handler/extractor error, `TimeoutLayer` firing, the
-/// client disconnecting mid-body (which drops this future), or a panic
-/// unwinding through the task — the same "owned permit released by scope"
-/// pattern `ZeekListener::handle_tcp_connection` uses for its byte budget.
+/// The upfront `available_permits() == 0` check is a best-effort fast path
+/// (racy against concurrent requests, not the real enforcement) that lets
+/// the already-fully-exhausted case — the common one, an attacker who has
+/// filled the budget — get a clean, immediate 503 without engaging the
+/// extractor machinery at all. The real enforcement is `BudgetedBody`,
+/// which charges per real byte regardless of this check's outcome; a
+/// request that slips past it because of the race still gets charged (and
+/// potentially rejected mid-body) once its body is actually read.
 ///
-/// Exhaustion is checked with `try_acquire_many_owned` (non-blocking): a
-/// request that cannot get budget is rejected immediately with 503, not
-/// queued, so one attacker filling the budget cannot make legitimate
-/// requests hang.
+/// `held` is created here and a clone handed to `BudgetedBody`, but THIS
+/// binding — not the body's — is what determines when charged permits are
+/// released: it is kept alive across the whole `next.run(request).await`,
+/// so capacity charged while reading the body stays reserved for the
+/// entire handler (deliberately — a HEC request's parsed-record
+/// representation stays alive well after its raw body is fully read; see
+/// `BODY_BYTE_BUDGET`'s doc comment). Whichever of the two `Arc` clones
+/// (the body's or this one) is dropped last is what actually releases the
+/// permits, by ordinary `Drop` — covering normal completion, a
+/// handler/extractor error, `TimeoutLayer` firing, a mid-body disconnect,
+/// or a panic unwinding through this `async fn`.
 async fn body_budget_middleware(
     State(budget): State<Arc<Semaphore>>,
     request: Request,
     next: Next,
 ) -> Response {
-    let wanted = declared_body_budget(request.headers());
-    if wanted == 0 {
-        return next.run(request).await;
+    if budget.available_permits() == 0 {
+        metrics::counter!("body_budget_exhausted").increment(1);
+        warn!(
+            "body byte budget already exhausted; rejecting {} with 503",
+            request.uri()
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server body-byte budget exhausted, retry shortly",
+        )
+            .into_response();
     }
-    match budget.try_acquire_many_owned(wanted as u32) {
-        Ok(_permit) => next.run(request).await,
-        Err(_) => {
-            metrics::counter!("body_budget_exhausted").increment(1);
-            warn!(
-                "body byte budget exhausted ({wanted} bytes requested of {BODY_BYTE_BUDGET} \
-                 total); rejecting with 503"
-            );
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server body-byte budget exhausted, retry shortly",
-            )
-                .into_response()
-        }
-    }
+
+    let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (parts, body) = request.into_parts();
+    let budgeted = BudgetedBody {
+        inner: body,
+        budget,
+        held: held.clone(),
+    };
+    let request = Request::from_parts(parts, Body::new(budgeted));
+    let response = next.run(request).await;
+    drop(held);
+    response
 }
 
 pub struct AppState {
@@ -1885,59 +1983,82 @@ event_parsers:
     // protected router, independent of MAX_BODY_SIZE * max_connections.   //
     // ------------------------------------------------------------------ //
 
-    #[test]
-    fn declared_body_budget_uses_content_length_capped_to_max() {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_LENGTH, "123".parse().unwrap());
-        assert_eq!(declared_body_budget(&headers), 123);
+    /// Unit-level proof of the core fix: charging happens against the REAL
+    /// frame length, not any header. There is no `content-length` header at
+    /// all on this hand-built body, and it is charged anyway (as it must be,
+    /// since HTTP/2 does not always give one and does not enforce
+    /// `Content-Length` against real DATA-frame bytes even when a client
+    /// sends one). Also proves the held permits are released as soon as
+    /// `BudgetedBody` itself is dropped, independent of any router/handler.
+    #[tokio::test]
+    async fn budgeted_body_charges_real_bytes_and_releases_on_drop() {
+        let budget = Arc::new(Semaphore::new(10));
+        let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut budgeted = BudgetedBody {
+            inner: Body::from(vec![0u8; 6]),
+            budget: budget.clone(),
+            held: held.clone(),
+        };
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::CONTENT_LENGTH,
-            (MAX_BODY_SIZE * 4).to_string().parse().unwrap(),
-        );
+        assert_eq!(budget.available_permits(), 10);
+        let frame = std::future::poll_fn(|cx| Pin::new(&mut budgeted).poll_frame(cx))
+            .await
+            .expect("one frame")
+            .expect("charged successfully");
+        assert_eq!(frame.data_ref().map(|d| d.len()), Some(6));
         assert_eq!(
-            declared_body_budget(&headers),
-            MAX_BODY_SIZE,
-            "an oversized declared Content-Length must be capped, not trusted verbatim"
+            budget.available_permits(),
+            4,
+            "must charge the real 6-byte frame length -- there is no header to trust here"
         );
-    }
 
-    #[test]
-    fn declared_body_budget_assumes_worst_case_for_chunked_without_content_length() {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        // Dropping the body alone must NOT release the charge: `held` is
+        // shared with whatever is keeping the wider request alive (in
+        // production, `body_budget_middleware`'s own stack frame). This is
+        // the mechanism that keeps capacity reserved for the whole handler,
+        // not just the body read -- extractors like `Bytes` drop the body
+        // as soon as they finish collecting it, well before the handler
+        // that receives the extracted `Bytes` returns.
+        drop(budgeted);
         assert_eq!(
-            declared_body_budget(&headers),
-            MAX_BODY_SIZE,
-            "omitting Content-Length via chunked encoding must not dodge the charge"
+            budget.available_permits(),
+            4,
+            "a surviving `held` clone must keep the charge alive after the body is dropped"
         );
-    }
 
-    #[test]
-    fn declared_body_budget_is_zero_for_bodyless_requests() {
-        let headers = HeaderMap::new();
+        drop(held);
         assert_eq!(
-            declared_body_budget(&headers),
-            0,
-            "a request with neither Content-Length nor chunked Transfer-Encoding has no \
-             body, so GET-only routes like /syslog/udp must not be charged"
+            budget.available_permits(),
+            10,
+            "dropping the last `held` clone must release every charged permit"
         );
     }
 
     /// Proves the budget is genuinely SHARED across concurrent requests, not a
-    /// per-request allowance in disguise. 6 requests each declare 100 KiB --
+    /// per-request allowance in disguise. 6 requests each send 100 KiB --
     /// comfortably under the 300 KiB budget on its own, so a per-request budget
     /// of this size would let every one of them through untouched. Only the
-    /// SUM across all 6 (600 KiB) exceeds the shared 300 KiB budget, so seeing
-    /// at least one 503 here is proof the budget is shared, not private.
+    /// SUM across all 6 (600 KiB) exceeds the shared 300 KiB budget, so the
+    /// `body_budget_exhausted` metric firing at least once here is proof the
+    /// budget is shared, not private. (Checked via the metric, not the HTTP
+    /// status, since a rejection can legitimately surface as either the
+    /// upfront 503 or a mid-body body-read error depending on the race --
+    /// see `body_budget_middleware`'s doc comment.)
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
     #[tokio::test]
     async fn body_budget_caps_aggregate_memory_across_concurrent_requests() {
-        use axum::body::Body;
+        use axum::body::Body as AxumBody;
         use axum::http::Request as HttpRequest;
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
         use tower::ServiceExt;
 
-        const DECLARED_BYTES: usize = 100 * 1024;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        const SENT_BYTES: usize = 100 * 1024;
         const REQUESTS: usize = 6;
 
         let budget = Arc::new(Semaphore::new(300 * 1024));
@@ -1961,31 +2082,42 @@ event_parsers:
         for _ in 0..REQUESTS {
             let router = router.clone();
             tasks.push(tokio::spawn(async move {
+                // Deliberately no content-length header: charging must not
+                // depend on one.
                 let request = HttpRequest::builder()
                     .method("POST")
                     .uri("/ingest-like")
-                    .header("content-length", DECLARED_BYTES.to_string())
-                    .body(Body::from(vec![0u8; DECLARED_BYTES]))
+                    .body(AxumBody::from(vec![0u8; SENT_BYTES]))
                     .unwrap();
                 router.oneshot(request).await.unwrap().status()
             }));
         }
 
-        let (mut accepted, mut rejected) = (0, 0);
+        let mut accepted = 0;
         for t in tasks {
-            match t.await.unwrap() {
-                StatusCode::OK => accepted += 1,
-                StatusCode::SERVICE_UNAVAILABLE => rejected += 1,
-                other => panic!("unexpected status: {other}"),
+            if t.await.unwrap() == StatusCode::OK {
+                accepted += 1;
             }
         }
 
+        let map = snapshotter.snapshot().into_hashmap();
+        let exhausted = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("body_budget_exhausted"),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+
         assert!(
-            rejected >= 1,
+            exhausted >= 1,
             "shared budget must reject at least one request once aggregate demand \
-             ({REQUESTS} * {DECLARED_BYTES} bytes) exceeds the 300 KiB budget -- a \
-             per-request budget would let every one of them through (accepted={accepted}, \
-             rejected={rejected})"
+             ({REQUESTS} * {SENT_BYTES} bytes) exceeds the 300 KiB budget -- a per-request \
+             budget would let every one of them through untouched (accepted={accepted}, \
+             exhausted counter={exhausted})"
         );
         assert!(
             accepted >= 1,
@@ -1994,10 +2126,11 @@ event_parsers:
     }
 
     /// A normal-sized request against the real, generous `BODY_BYTE_BUDGET` is
-    /// entirely unaffected.
+    /// entirely unaffected. No `content-length` header is sent, so this also
+    /// proves the budget does not depend on one being present.
     #[tokio::test]
     async fn body_budget_does_not_affect_normal_sized_request() {
-        use axum::body::Body;
+        use axum::body::Body as AxumBody;
         use axum::http::Request as HttpRequest;
         use tower::ServiceExt;
 
@@ -2016,8 +2149,7 @@ event_parsers:
         let request = HttpRequest::builder()
             .method("POST")
             .uri("/ingest-like")
-            .header("content-length", payload.len().to_string())
-            .body(Body::from(payload))
+            .body(AxumBody::from(payload))
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
@@ -2028,14 +2160,75 @@ event_parsers:
         );
     }
 
-    /// Exhaustion must be rejected immediately (503), never queued/hung: the
-    /// budget here is smaller than even one request's declared size.
+    /// The upfront, clean-503 path: when the budget is already fully spoken
+    /// for at request arrival (`available_permits() == 0`), the request is
+    /// rejected immediately, before the handler/extractor is ever engaged --
+    /// so this never touches `BudgetedBody` at all. Promptness is checked
+    /// with a short timeout: this must never queue.
     #[tokio::test]
-    async fn body_budget_exhaustion_returns_503_promptly() {
-        use axum::body::Body;
+    async fn body_budget_exhaustion_returns_503_promptly_before_handoff() {
+        use axum::body::Body as AxumBody;
         use axum::http::Request as HttpRequest;
         use tower::ServiceExt;
 
+        // Zero capacity from the start -- available_permits() == 0 for every
+        // request, guaranteeing the upfront fast path fires deterministically
+        // rather than racing a mid-body charge.
+        let budget = Arc::new(Semaphore::new(0));
+        let router: Router = Router::new()
+            .route(
+                "/ingest-like",
+                post(|_body: Bytes| async { (StatusCode::OK, "ok") }),
+            )
+            .layer(middleware::from_fn_with_state(
+                budget,
+                body_budget_middleware,
+            ));
+
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/ingest-like")
+            .body(AxumBody::from(vec![0u8; 4096]))
+            .unwrap();
+
+        let response = tokio::time::timeout(Duration::from_millis(500), router.oneshot(request))
+            .await
+            .expect("exhaustion must be rejected promptly, never hang")
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an already-exhausted budget must be rejected with 503 before handoff"
+        );
+    }
+
+    /// The mid-body path: the budget has SOME room (so the upfront check
+    /// passes and the request is handed to the handler), but the real body
+    /// is larger than what remains. Per FINDING 1's ruling, there is no way
+    /// to retroactively send a fresh 503 once streaming has begun, so this
+    /// fails the body stream instead -- axum's `Bytes` extractor turns that
+    /// into its generic body-read rejection (400 Bad Request), not 503. What
+    /// matters here: it is NOT 200 (the oversized body must not be silently
+    /// accepted), it does NOT hang, and the exhaustion metric fires --
+    /// proving the real bytes were actually charged, not the (absent, in
+    /// this request) declared length.
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    #[tokio::test]
+    async fn body_budget_mid_body_exhaustion_fails_the_stream_promptly() {
+        use axum::body::Body as AxumBody;
+        use axum::http::Request as HttpRequest;
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+        use tower::ServiceExt;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        // 10 bytes of room -- enough to pass the upfront check, nowhere near
+        // enough for the 4096-byte body below.
         let budget = Arc::new(Semaphore::new(10));
         let router: Router = Router::new()
             .route(
@@ -2047,23 +2240,37 @@ event_parsers:
                 body_budget_middleware,
             ));
 
-        let payload = vec![0u8; 4096];
         let request = HttpRequest::builder()
             .method("POST")
             .uri("/ingest-like")
-            .header("content-length", payload.len().to_string())
-            .body(Body::from(payload))
+            .body(AxumBody::from(vec![0u8; 4096]))
             .unwrap();
 
         let response = tokio::time::timeout(Duration::from_millis(500), router.oneshot(request))
             .await
-            .expect("exhaustion must be rejected promptly, never hang")
+            .expect("mid-body exhaustion must be rejected promptly, never hang")
             .unwrap();
 
-        assert_eq!(
+        assert_ne!(
             response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "exhaustion must be rejected with 503, not silently accepted or queued"
+            StatusCode::OK,
+            "an oversized body must not be silently accepted once it exceeds the budget"
+        );
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let exhausted = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("body_budget_exhausted"),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert!(
+            exhausted >= 1,
+            "the real (undeclared) body bytes must have been charged and rejected"
         );
     }
 
@@ -2071,12 +2278,12 @@ event_parsers:
     /// for the next one -- a leak here would permanently shrink capacity.
     #[tokio::test]
     async fn body_budget_permit_released_after_request_completes() {
-        use axum::body::Body;
+        use axum::body::Body as AxumBody;
         use axum::http::Request as HttpRequest;
         use tower::ServiceExt;
 
-        const DECLARED_BYTES: usize = 4096;
-        let budget = Arc::new(Semaphore::new(DECLARED_BYTES));
+        const SENT_BYTES: usize = 4096;
+        let budget = Arc::new(Semaphore::new(SENT_BYTES));
         let router: Router = Router::new()
             .route(
                 "/ingest-like",
@@ -2091,8 +2298,7 @@ event_parsers:
             HttpRequest::builder()
                 .method("POST")
                 .uri("/ingest-like")
-                .header("content-length", DECLARED_BYTES.to_string())
-                .body(Body::from(vec![0u8; DECLARED_BYTES]))
+                .body(AxumBody::from(vec![0u8; SENT_BYTES]))
                 .unwrap()
         };
 
@@ -2104,13 +2310,261 @@ event_parsers:
         );
 
         // If the first request's permit were not released on completion, this
-        // second, identically-sized request would be rejected (503) instead.
+        // second, identically-sized request would be rejected instead.
         let second = router.oneshot(build_request()).await.unwrap();
         assert_eq!(
             second.status(),
             StatusCode::OK,
             "capacity must recover once the prior request's permit is released"
         );
+    }
+
+    // ------------------------------------------------------------------ //
+    // Real-wire h2 tests (FINDING 1): `Router::oneshot` never touches real //
+    // HTTP/1.1 or HTTP/2 wire framing, so the declared-Content-Length      //
+    // design's h2 gap was untestable through it "by construction, not     //
+    // merely untested" -- these bind a real `TcpListener`, serve the      //
+    // router through `axum::serve` exactly as production does (same h2c   //
+    // auto-negotiation via `hyper_util::auto::Builder`), and drive it     //
+    // with a real `reqwest` client forced onto h2 via                     //
+    // `http2_prior_knowledge()`.                                          //
+    // ------------------------------------------------------------------ //
+
+    /// Starts a real server on an ephemeral port with `body_budget_middleware`
+    /// as the only layer, and returns its address plus a handle to abort it.
+    async fn spawn_real_body_budget_server(
+        budget_bytes: usize,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let budget = Arc::new(Semaphore::new(budget_bytes));
+        let router: Router = Router::new()
+            .route(
+                "/ingest-like",
+                post(|_body: Bytes| async { (StatusCode::OK, "ok") }),
+            )
+            .layer(middleware::from_fn_with_state(
+                budget,
+                body_budget_middleware,
+            ));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router.into_make_service()).await;
+        });
+        (addr, handle)
+    }
+
+    /// A `reqwest::Body` streamed from frames with an INDETERMINATE size
+    /// hint, so reqwest sends no `content-length` header at all -- the
+    /// absent-Content-Length h2 case (FINDING 1(b)).
+    fn unsized_stream_body(total_bytes: usize) -> reqwest::Body {
+        use http_body_util::StreamBody;
+
+        let chunk = Bytes::from(vec![0u8; total_bytes]);
+        let stream = stream::iter(vec![Ok::<_, std::io::Error>(Frame::data(chunk))]);
+        reqwest::Body::wrap(StreamBody::new(stream))
+    }
+
+    /// FINDING 1(b): an h2 client that omits `Content-Length` entirely (legal
+    /// and common over h2, which has no `Transfer-Encoding` to fall back to
+    /// either) must still be charged by its real bytes and rejected once
+    /// those exceed the budget -- under the old declared-length design this
+    /// charged 0 and sailed straight through the `wanted == 0` fast path.
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    #[tokio::test]
+    async fn real_h2_request_without_content_length_is_charged_and_rejected() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        // Budget far smaller than the 4096-byte body below, but well above 0
+        // -- a per-header (rather than per-byte) charge of an absent
+        // Content-Length (0, per the old design) would sail through this.
+        let (addr, server) = spawn_real_body_budget_server(10).await;
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .build()
+            .expect("h2 client");
+
+        let url = format!("http://{addr}/ingest-like");
+        let result = client
+            .post(&url)
+            .body(unsized_stream_body(4096))
+            .send()
+            .await;
+
+        server.abort();
+
+        match result {
+            Ok(response) => {
+                assert_eq!(
+                    response.version(),
+                    reqwest::Version::HTTP_2,
+                    "must have actually negotiated h2, not fallen back to h1.1"
+                );
+                assert_ne!(
+                    response.status().as_u16(),
+                    200,
+                    "a 4096-byte h2 body with no Content-Length against a 10-byte budget must \
+                     not be silently accepted"
+                );
+            }
+            Err(e) => {
+                // A stream-level rejection (e.g. the connection or h2 stream
+                // closing once the server fails the body read) is also a
+                // valid rejection outcome, not silent acceptance -- see
+                // BudgetedBody::poll_frame's doc comment on why there is no
+                // clean 503 available once streaming has begun.
+                debug!("h2 request rejected at the transport level (also acceptable): {e}");
+            }
+        }
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let exhausted = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("body_budget_exhausted"),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert!(
+            exhausted >= 1,
+            "the real body bytes must have been charged (and rejected) even with no \
+             Content-Length header at all"
+        );
+    }
+
+    /// FINDING 1(a): an h2 client that sends `Content-Length: 1` but streams
+    /// far more real DATA-frame bytes.
+    ///
+    /// EMPIRICAL RESULT, worth recording rather than assuming: with a
+    /// *conformant* client (reqwest's `h2` backend), this case never reaches
+    /// `BudgetedBody` at all. The `h2` crate itself enforces RFC 9113 8.1.1
+    /// ("a request ... is malformed if the value of a content-length header
+    /// field does not equal the sum of the DATA frame payload lengths") on
+    /// the wire and resets the stream with `PROTOCOL_ERROR` as soon as the
+    /// declared length is exceeded -- confirmed by this test's own output
+    /// (`hyper::Error(Http2, Error { kind: Reset(_, PROTOCOL_ERROR, Remote)
+    /// })`). That is a real, independent closure of 1(a) for any client
+    /// built on a standards-conformant h2 stack, sitting below and in
+    /// addition to this change.
+    ///
+    /// What this test does NOT (and, with the crates already in this
+    /// dependency tree, practically cannot) prove: a non-conformant or
+    /// hand-rolled h2 client that skips the sending stack's own bookkeeping
+    /// and emits DATA frames the h2 layer itself would refuse to send.
+    /// Constructing that needs a raw h2 frame injector below the `h2`
+    /// crate's send-side validation, which is not available here without a
+    /// new, low-level dependency -- so per FINDING 1's ruling, this is
+    /// recorded as a documented gap rather than silently treated as covered.
+    /// `BudgetedBody` still charges real bytes regardless of the declared
+    /// header (proved directly by `budgeted_body_charges_real_bytes_and_releases_on_drop`,
+    /// which never looks at a header at all), so a frame that DID arrive
+    /// mismatched would still be charged correctly; this test only confirms
+    /// that reaching that code path via a real, compliant h2 client is not
+    /// possible, not that the app-level charge is untested.
+    ///
+    /// The assertion accepts either outcome as a valid rejection: the
+    /// `body_budget_exhausted` metric firing (app-level charge caught it)
+    /// or a transport-level failure (the `h2` layer caught it first) --
+    /// what must NOT happen is a silent 200.
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    #[tokio::test]
+    async fn real_h2_request_with_under_declared_content_length_is_rejected() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let (addr, server) = spawn_real_body_budget_server(10).await;
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .build()
+            .expect("h2 client");
+
+        let url = format!("http://{addr}/ingest-like");
+        let result = client
+            .post(&url)
+            .header(reqwest::header::CONTENT_LENGTH, "1")
+            .body(unsized_stream_body(4096))
+            .send()
+            .await;
+
+        server.abort();
+
+        let mut transport_level_rejection = false;
+        match result {
+            Ok(response) => {
+                assert_eq!(response.version(), reqwest::Version::HTTP_2);
+                assert_ne!(
+                    response.status().as_u16(),
+                    200,
+                    "a body that lies about its own length (1) while sending 4096 real bytes \
+                     must not be silently accepted"
+                );
+            }
+            Err(e) => {
+                // Observed in practice: the h2 crate itself resets the stream
+                // with PROTOCOL_ERROR before this ever reaches the app.
+                transport_level_rejection = true;
+                debug!("h2 request rejected at the transport level (see doc comment): {e}");
+            }
+        }
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let exhausted = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("body_budget_exhausted"),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert!(
+            exhausted >= 1 || transport_level_rejection,
+            "the mismatched body must be rejected either by app-level charging or by the h2 \
+             layer itself -- neither happened"
+        );
+    }
+
+    /// Sanity check alongside the two adversarial cases above: a genuinely
+    /// small h2 request with no `Content-Length` succeeds normally against a
+    /// generous budget -- the fix does not collaterally break legitimate h2
+    /// clients that simply don't send the header.
+    #[tokio::test]
+    async fn real_h2_small_request_without_content_length_succeeds() {
+        let (addr, server) = spawn_real_body_budget_server(BODY_BYTE_BUDGET).await;
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .build()
+            .expect("h2 client");
+
+        let url = format!("http://{addr}/ingest-like");
+        let response = client
+            .post(&url)
+            .body(unsized_stream_body(64))
+            .send()
+            .await
+            .expect("small h2 request must succeed");
+
+        server.abort();
+
+        assert_eq!(response.version(), reqwest::Version::HTTP_2);
+        assert_eq!(response.status().as_u16(), 200);
     }
 
     #[test]
