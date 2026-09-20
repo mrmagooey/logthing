@@ -10,6 +10,37 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::sflow::{SampleType, SflowRecord};
 
+/// Maximum number of non-curated (unknown-format / vendor-specific) records
+/// accumulated into a single sample's `extra` array.
+///
+/// `num_flow_records` / `num_counter_records` are attacker-controlled: a
+/// single sFlow v5 sample can declare thousands of 8-byte-envelope unknown
+/// records, and each one is promoted to a `serde_json::Map` (~632 bytes of
+/// heap for a handful of keys) — roughly 80x the wire size per record before
+/// this cap, and unbounded in the number of records. A real exporter emits a
+/// handful of records per sample (curated raw_packet_header / sampled_ipv4 /
+/// generic_if_counters, plus maybe one or two vendor extensions), so 32 is
+/// generous headroom for any legitimate sample while bounding the
+/// attacker-controlled multiplier to a small, fixed worst case per sample.
+const MAX_UNKNOWN_RECORDS_PER_SAMPLE: usize = 32;
+
+/// Push an unknown/vendor-specific record into `unknown_records`, unless the
+/// per-sample cap has already been reached — in which case the record is
+/// dropped and counted in `dropped` so a single truncation marker can be
+/// emitted once the sample is fully parsed. Parsing of the rest of the
+/// sample (and datagram) continues unaffected either way.
+fn push_unknown_record(
+    unknown_records: &mut Vec<serde_json::Value>,
+    dropped: &mut u64,
+    value: serde_json::Value,
+) {
+    if unknown_records.len() < MAX_UNKNOWN_RECORDS_PER_SAMPLE {
+        unknown_records.push(value);
+    } else {
+        *dropped += 1;
+    }
+}
+
 // ── Bounds-checked read helpers ───────────────────────────────────────────────
 
 fn read_u32(buf: &[u8], off: usize) -> anyhow::Result<u32> {
@@ -237,6 +268,7 @@ fn decode_flow_sample(
     };
 
     let mut unknown_records: Vec<serde_json::Value> = Vec::new();
+    let mut dropped_unknown_records: u64 = 0;
 
     for _ in 0..num_records {
         if pos + 8 > body.len() {
@@ -262,14 +294,18 @@ fn decode_flow_sample(
         let rec_format = flow_data_format & 0xFFF;
 
         if rec_enterprise != 0 {
-            // Enterprise-specific — store raw in extra.
+            // Enterprise-specific — store raw in extra, up to the per-sample cap.
             let data_hex = hex::encode(rec_body);
-            unknown_records.push(serde_json::json!({
-                "enterprise": rec_enterprise,
-                "format": rec_format,
-                "length": flow_data_length,
-                "data_hex": data_hex,
-            }));
+            push_unknown_record(
+                &mut unknown_records,
+                &mut dropped_unknown_records,
+                serde_json::json!({
+                    "enterprise": rec_enterprise,
+                    "format": rec_format,
+                    "length": flow_data_length,
+                    "data_hex": data_hex,
+                }),
+            );
             continue;
         }
 
@@ -299,15 +335,22 @@ fn decode_flow_sample(
             }
             other => {
                 let data_hex = hex::encode(rec_body);
-                unknown_records.push(serde_json::json!({
-                    "format": other,
-                    "length": flow_data_length,
-                    "data_hex": data_hex,
-                }));
+                push_unknown_record(
+                    &mut unknown_records,
+                    &mut dropped_unknown_records,
+                    serde_json::json!({
+                        "format": other,
+                        "length": flow_data_length,
+                        "data_hex": data_hex,
+                    }),
+                );
             }
         }
     }
 
+    if dropped_unknown_records > 0 {
+        unknown_records.push(serde_json::json!({ "truncated": dropped_unknown_records }));
+    }
     if !unknown_records.is_empty() {
         rec.extra = serde_json::Value::Array(unknown_records);
     }
@@ -520,6 +563,7 @@ fn decode_counter_sample(
     };
 
     let mut unknown_records: Vec<serde_json::Value> = Vec::new();
+    let mut dropped_unknown_records: u64 = 0;
 
     for _ in 0..num_records {
         if pos + 8 > body.len() {
@@ -545,14 +589,18 @@ fn decode_counter_sample(
         let rec_format = counter_data_format & 0xFFF;
 
         if rec_enterprise != 0 || rec_format != 1 {
-            // Non-generic counter record — store raw in extra.
+            // Non-generic counter record — store raw in extra, up to the per-sample cap.
             let data_hex = hex::encode(rec_body);
-            unknown_records.push(serde_json::json!({
-                "enterprise": rec_enterprise,
-                "format": rec_format,
-                "length": counter_data_length,
-                "data_hex": data_hex,
-            }));
+            push_unknown_record(
+                &mut unknown_records,
+                &mut dropped_unknown_records,
+                serde_json::json!({
+                    "enterprise": rec_enterprise,
+                    "format": rec_format,
+                    "length": counter_data_length,
+                    "data_hex": data_hex,
+                }),
+            );
             continue;
         }
 
@@ -602,6 +650,9 @@ fn decode_counter_sample(
         // ifPromiscuousMode  @ 84 — not separately curated
     }
 
+    if dropped_unknown_records > 0 {
+        unknown_records.push(serde_json::json!({ "truncated": dropped_unknown_records }));
+    }
     if !unknown_records.is_empty() {
         rec.extra = serde_json::Value::Array(unknown_records);
     }
@@ -993,5 +1044,194 @@ pub(crate) mod tests {
         assert_eq!(r.sampling_rate, Some(1000));
         assert_eq!(r.input_ifindex, Some(3));
         assert_eq!(r.output_ifindex, Some(4));
+    }
+
+    // ── FIX (sflow extra amplification): cap + truncation marker ────────────
+
+    #[test]
+    fn hostile_flow_sample_caps_unknown_records_and_emits_truncation_marker() {
+        // Regression for the sFlow extra amplification bug: a single
+        // flow_sample declaring thousands of 8-byte-envelope unknown records
+        // (format 1001, enterprise 0, zero-length body) must not balloon
+        // `extra` 1:1 with the attacker-declared record count.
+        const NUM_RECORDS: u32 = 8177;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&5u32.to_be_bytes()); // version = 5
+        buf.extend_from_slice(&1u32.to_be_bytes()); // agent_addr_type = IPv4
+        buf.extend_from_slice(&[10, 0, 0, 1]); // agent_addr
+        buf.extend_from_slice(&0u32.to_be_bytes()); // sub_agent_id
+        buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
+        buf.extend_from_slice(&1u32.to_be_bytes()); // uptime_ms
+        buf.extend_from_slice(&1u32.to_be_bytes()); // num_samples = 1
+
+        let sample_body_len = 32 + (NUM_RECORDS as usize) * 8;
+        buf.extend_from_slice(&1u32.to_be_bytes()); // data_format = flow_sample
+        buf.extend_from_slice(&(sample_body_len as u32).to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
+        buf.extend_from_slice(&1u32.to_be_bytes()); // source_id
+        buf.extend_from_slice(&512u32.to_be_bytes()); // sampling_rate
+        buf.extend_from_slice(&512u32.to_be_bytes()); // sample_pool
+        buf.extend_from_slice(&0u32.to_be_bytes()); // drops
+        buf.extend_from_slice(&7u32.to_be_bytes()); // input_ifindex
+        buf.extend_from_slice(&9u32.to_be_bytes()); // output_ifindex
+        buf.extend_from_slice(&NUM_RECORDS.to_be_bytes()); // num_flow_records
+        for _ in 0..NUM_RECORDS {
+            buf.extend_from_slice(&1001u32.to_be_bytes()); // enterprise 0, format 1001
+            buf.extend_from_slice(&0u32.to_be_bytes()); // flow_data_length = 0
+        }
+
+        let records =
+            decode_datagram(&buf, exporter()).expect("must decode despite hostile record count");
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        // Sample metadata still comes through -- the cap doesn't abort the sample.
+        assert_eq!(r.sampling_rate, Some(512));
+        assert_eq!(r.input_ifindex, Some(7));
+        assert_eq!(r.output_ifindex, Some(9));
+
+        let extra = r.extra.as_array().expect("extra must be an array");
+        assert_eq!(
+            extra.len(),
+            MAX_UNKNOWN_RECORDS_PER_SAMPLE + 1,
+            "extra must hold at most the cap, plus one truncation marker; got {extra:?}"
+        );
+        let dropped = NUM_RECORDS as u64 - MAX_UNKNOWN_RECORDS_PER_SAMPLE as u64;
+        assert_eq!(
+            extra.last().unwrap(),
+            &serde_json::json!({ "truncated": dropped }),
+            "last element must be a single truncation marker with the dropped count"
+        );
+    }
+
+    #[test]
+    fn normal_flow_sample_unknown_records_under_cap_unaffected() {
+        // A handful of vendor-specific records (well under the cap) must all
+        // survive into `extra`, untouched, with no truncation marker.
+        const NUM_RECORDS: u32 = 3;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&5u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&[10, 0, 0, 1]);
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+
+        let sample_body_len = 32 + (NUM_RECORDS as usize) * 8;
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&(sample_body_len as u32).to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&512u32.to_be_bytes());
+        buf.extend_from_slice(&512u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&2u32.to_be_bytes());
+        buf.extend_from_slice(&NUM_RECORDS.to_be_bytes());
+        for _ in 0..NUM_RECORDS {
+            buf.extend_from_slice(&1001u32.to_be_bytes());
+            buf.extend_from_slice(&0u32.to_be_bytes());
+        }
+
+        let records = decode_datagram(&buf, exporter()).unwrap();
+        let extra = records[0].extra.as_array().expect("extra must be an array");
+        assert_eq!(
+            extra.len(),
+            NUM_RECORDS as usize,
+            "all records under the cap must survive"
+        );
+        assert!(
+            extra.iter().all(|v| v.get("truncated").is_none()),
+            "no truncation marker expected below the cap; got {extra:?}"
+        );
+    }
+
+    #[test]
+    fn decoding_continues_after_a_capped_sample() {
+        // Two samples in one datagram: the first is hostile and hits the cap,
+        // the second is a normal sampled_ipv4 flow. Both must decode --
+        // hitting the cap must not abort the rest of the datagram.
+        const NUM_RECORDS: u32 = 500;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&5u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&[10, 0, 0, 1]);
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&2u32.to_be_bytes()); // num_samples = 2
+
+        // ── Sample 1: hostile flow_sample ──
+        let sample1_body_len = 32 + (NUM_RECORDS as usize) * 8;
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&(sample1_body_len as u32).to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&512u32.to_be_bytes());
+        buf.extend_from_slice(&512u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&2u32.to_be_bytes());
+        buf.extend_from_slice(&NUM_RECORDS.to_be_bytes());
+        for _ in 0..NUM_RECORDS {
+            buf.extend_from_slice(&1001u32.to_be_bytes());
+            buf.extend_from_slice(&0u32.to_be_bytes());
+        }
+
+        // ── Sample 2: sampled_ipv4, reusing the fixture's sample envelope+body ──
+        buf.extend_from_slice(&FIXTURE_SFLOW_SAMPLED_IPV4[28..]);
+
+        let records = decode_datagram(&buf, exporter()).unwrap();
+        assert_eq!(records.len(), 2, "both samples must decode");
+
+        let capped = &records[0];
+        let extra = capped.extra.as_array().expect("extra must be an array");
+        assert_eq!(extra.len(), MAX_UNKNOWN_RECORDS_PER_SAMPLE + 1);
+
+        let normal = &records[1];
+        assert_eq!(
+            normal.src_addr,
+            Some(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)))
+        );
+        assert_eq!(normal.dst_addr, Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert_eq!(normal.src_port, Some(49210));
+        assert_eq!(normal.dst_port, Some(53));
+    }
+
+    #[test]
+    fn hostile_counter_sample_caps_unknown_records_and_emits_truncation_marker() {
+        // Same amplification shape as the flow-sample case, but through
+        // decode_counter_sample's push site.
+        const NUM_RECORDS: u32 = 5000;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&5u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&[10, 0, 0, 1]);
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes()); // num_samples = 1
+
+        let sample_body_len = 12 + (NUM_RECORDS as usize) * 8;
+        buf.extend_from_slice(&2u32.to_be_bytes()); // data_format = counter_sample
+        buf.extend_from_slice(&(sample_body_len as u32).to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
+        buf.extend_from_slice(&1u32.to_be_bytes()); // source_id
+        buf.extend_from_slice(&NUM_RECORDS.to_be_bytes()); // num_counter_records
+        for _ in 0..NUM_RECORDS {
+            buf.extend_from_slice(&1001u32.to_be_bytes()); // enterprise 0, format 1001 (non-generic)
+            buf.extend_from_slice(&0u32.to_be_bytes()); // counter_data_length = 0
+        }
+
+        let records =
+            decode_datagram(&buf, exporter()).expect("must decode despite hostile record count");
+        assert_eq!(records.len(), 1);
+        let extra = records[0].extra.as_array().expect("extra must be an array");
+        assert_eq!(extra.len(), MAX_UNKNOWN_RECORDS_PER_SAMPLE + 1);
+        let dropped = NUM_RECORDS as u64 - MAX_UNKNOWN_RECORDS_PER_SAMPLE as u64;
+        assert_eq!(
+            extra.last().unwrap(),
+            &serde_json::json!({ "truncated": dropped })
+        );
     }
 }

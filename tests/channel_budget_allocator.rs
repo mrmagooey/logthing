@@ -246,3 +246,64 @@ fn json_heap_bytes_matches_real_allocation_for_a_populated_sflow_extra() {
     let estimated = logthing::forwarding::channel_budget::json_heap_bytes(&extra);
     assert_within_10pct(real, estimated, "sflow populated extra");
 }
+
+/// The core regression test for the sFlow `extra` amplification bug
+/// (`MAX_UNKNOWN_RECORDS_PER_SAMPLE` in `src/sflow/decoder.rs`): a hostile
+/// sample that declares thousands of unknown records must not retain heap
+/// proportional to the attacker-declared record count.
+///
+/// Before the cap, this exact fixture (8,177 unknown records, matching the
+/// demonstrated exploit) retained several MiB. The cap bounds retention to
+/// a small, fixed footprint -- at most `MAX_UNKNOWN_RECORDS_PER_SAMPLE`
+/// `serde_json` records plus one truncation marker -- regardless of how many
+/// records the sample claims.
+#[test]
+fn hostile_sflow_sample_heap_retention_is_bounded_by_the_cap_not_the_record_count() {
+    use logthing::sflow::decoder::decode_datagram;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    const NUM_RECORDS: u32 = 8177; // matches the demonstrated exploit shape
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&5u32.to_be_bytes()); // version = 5
+    buf.extend_from_slice(&1u32.to_be_bytes()); // agent_addr_type = IPv4
+    buf.extend_from_slice(&[10, 0, 0, 1]); // agent_addr
+    buf.extend_from_slice(&0u32.to_be_bytes()); // sub_agent_id
+    buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
+    buf.extend_from_slice(&1u32.to_be_bytes()); // uptime_ms
+    buf.extend_from_slice(&1u32.to_be_bytes()); // num_samples = 1
+
+    let sample_body_len = 32 + (NUM_RECORDS as usize) * 8;
+    buf.extend_from_slice(&1u32.to_be_bytes()); // data_format = flow_sample
+    buf.extend_from_slice(&(sample_body_len as u32).to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
+    buf.extend_from_slice(&1u32.to_be_bytes()); // source_id
+    buf.extend_from_slice(&1000u32.to_be_bytes()); // sampling_rate
+    buf.extend_from_slice(&1000u32.to_be_bytes()); // sample_pool
+    buf.extend_from_slice(&0u32.to_be_bytes()); // drops
+    buf.extend_from_slice(&1u32.to_be_bytes()); // input ifindex
+    buf.extend_from_slice(&2u32.to_be_bytes()); // output ifindex
+    buf.extend_from_slice(&NUM_RECORDS.to_be_bytes()); // num_flow_records
+    for _ in 0..NUM_RECORDS {
+        buf.extend_from_slice(&1001u32.to_be_bytes()); // enterprise 0, format 1001 (unknown)
+        buf.extend_from_slice(&0u32.to_be_bytes()); // flow_data_length = 0
+    }
+
+    let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let (extra, real) = live_heap_of(|| {
+        let mut records = decode_datagram(&buf, exporter).expect("must decode");
+        records.pop().expect("one record").extra
+    });
+
+    let array = extra.as_array().expect("extra must be an array");
+    assert!(
+        array.len() <= 33,
+        "extra must be capped, not proportional to the declared {NUM_RECORDS} records; \
+         got {} entries",
+        array.len()
+    );
+    assert!(
+        real < 50_000,
+        "hostile sflow sample retained {real} bytes -- expected the cap to bound this \
+         to a small, fixed footprint regardless of the attacker-declared record count"
+    );
+}
