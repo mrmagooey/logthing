@@ -792,10 +792,16 @@ impl SyslogListener {
                 handler.handle_message(syslog_msg, src).await;
             } else {
                 metrics::counter!("syslog_parse_errors").increment(1);
+                // `read_until(b'\n', ...)` above only guarantees no *trailing*
+                // newline reaches here (it's popped a few lines up) — a bare
+                // `\r` or an ANSI escape (`\x1b`) mid-line is untouched by
+                // that framing and would still reach an operator's terminal
+                // unsanitized. Use `sanitize_for_log`, not `truncate_for_log`,
+                // here too; do not "restore" this to `truncate_for_log`.
                 warn!(
                     "Failed to parse TCP syslog message from {}: {}",
                     src,
-                    crate::truncate_for_log(&line, 100)
+                    crate::sanitize_for_log(&line, 100)
                 );
             }
         }
@@ -1923,6 +1929,139 @@ mod tests {
         assert_eq!(
             rejected, n as u64,
             "listener_source_rejected must count every datagram through the recv_tasks=4 + recv_batch_size=16 combined path, not one per batch"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F8 regression: TCP parse-error site must sanitize mid-line control
+    // characters too (in-test tracing capture).
+    //
+    // Not `forwarding::buffered_writer`'s `TestTracingCapture` pattern
+    // (per-test `tracing::subscriber::set_default`): that technique was
+    // empirically flaky here. `tracing-core` caches each callsite's
+    // `Interest` -- and, more importantly, a single **global** max-level
+    // threshold -- across *every* thread in the process (see
+    // `tracing_core::callsite::{register_dispatch, rebuild_interest_cache}`,
+    // which fold `max_level_hint()`/`Interest` over every currently-live
+    // `Dispatch` process-wide). Each `set_default` call creates a fresh
+    // `Dispatch`, which forces a global rebuild of that fold; under this
+    // suite's full parallelism the rebuild can transiently land on a
+    // restrictive value, silently dropping this test's event before
+    // `Subscriber::enabled`/`event` are even called (confirmed by
+    // instrumenting both with `eprintln!`: in failing runs neither fired at
+    // all). A subscriber installed exactly **once**, globally
+    // (`set_global_default`, gated by a `OnceLock` so only the first caller
+    // installs it), never triggers that rebuild again, so this cache
+    // instability doesn't apply. Per-test isolation instead comes from
+    // routing captured messages through a `thread_local!` buffer that each
+    // test clears before use -- safe because the default (current-thread)
+    // `#[tokio::test]` flavor runs a given test's whole body, including any
+    // `tokio::spawn`ed subtasks, on one OS thread, and libtest never runs two
+    // tests concurrently on the same thread.
+    // -----------------------------------------------------------------------
+
+    struct MessageOnlyVisitor(String);
+    impl tracing::field::Visit for MessageOnlyVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    thread_local! {
+        static CAPTURED_EVENTS: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    struct GlobalCaptureSubscriber;
+    impl tracing::Subscriber for GlobalCaptureSubscriber {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = MessageOnlyVisitor(String::new());
+            event.record(&mut visitor);
+            CAPTURED_EVENTS.with(|events| events.borrow_mut().push(visitor.0));
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Installs [`GlobalCaptureSubscriber`] as the process's global default
+    /// tracing subscriber, exactly once (later calls are no-ops -- including
+    /// from other tests in this binary that run before or after this one).
+    fn ensure_global_capture_subscriber_installed() {
+        static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INIT.get_or_init(|| {
+            let _ = tracing::subscriber::set_global_default(GlobalCaptureSubscriber);
+        });
+    }
+
+    /// A TCP syslog line that fails to parse and contains a *mid-line* `\r`
+    /// and a mid-line ANSI escape (`\x1b`) must not carry either raw into the
+    /// resulting `warn!` log line. `handle_tcp_connection`'s `read_until(b'\n',
+    /// ...)` framing (plus the trailing-`\r`/`\n` pop just above the log
+    /// call) only guarantees no *trailing* newline survives -- it does
+    /// nothing for control characters that appear earlier in the line. This
+    /// is a genuine regression test for the TCP call site specifically: it
+    /// fails if that site is reverted from `sanitize_for_log` back to
+    /// `truncate_for_log` (verified manually -- see task-8-report.md).
+    ///
+    /// Drives `SyslogListener::handle_tcp_connection` directly (no
+    /// `tokio::spawn` + accept loop + `sleep` in between) so the assertion
+    /// has no dependency on executor scheduling fairness either.
+    #[tokio::test]
+    async fn tcp_parse_error_log_sanitizes_mid_line_cr_and_ansi_escape() {
+        ensure_global_capture_subscriber_installed();
+        CAPTURED_EVENTS.with(|events| events.borrow_mut().clear());
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server_stream, src) = tcp_listener.accept().await.unwrap();
+
+        // Fails all three parse tiers (RFC 5424 / RFC 3164 / no-PRI), so it
+        // reaches the parse-error warn! site. The `\r` and `\x1b[31m` are
+        // both mid-line, not trailing, so the TCP reader's newline framing
+        // does not touch them.
+        let msg = b"not a valid\rsyslog \x1b[31mmessage\n";
+        client.write_all(msg).await.unwrap();
+        drop(client); // close so the next read_until sees a clean EOF and returns
+
+        let handler = CapturingHandler::new();
+        SyslogListener::handle_tcp_connection(server_stream, src, handler, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let events = CAPTURED_EVENTS.with(|events| events.borrow().clone());
+        let warn_line = events
+            .iter()
+            .find(|m| m.contains("Failed to parse TCP syslog message"))
+            .unwrap_or_else(|| panic!("no matching warn! event captured; got: {events:?}"));
+
+        assert!(
+            !warn_line.contains('\r'),
+            "raw CR leaked into the log line: {warn_line:?}"
+        );
+        assert!(
+            !warn_line.contains('\u{1b}'),
+            "raw ESC leaked into the log line: {warn_line:?}"
+        );
+        assert!(
+            warn_line.contains('\u{fffd}'),
+            "expected U+FFFD replacement characters in the log line: {warn_line:?}"
         );
     }
 }
