@@ -182,6 +182,96 @@ pub fn redacted_config(cfg: &Config) -> Config {
     out
 }
 
+/// Merge S3 credential fields from `current` into `incoming` wherever `incoming`
+/// carries the `REDACTED` sentinel.
+///
+/// Every config write path accepts a client-submitted `Config`. The admin UI
+/// builds that body by cloning whatever `GET /config` returned — which is
+/// always `redacted_config()`'s output, i.e. `access_key`/`secret_key` are
+/// `***REDACTED***`, not the real values. Without this merge, saving any
+/// change through the UI (or replaying an exported/redacted config) overwrites
+/// every live S3 credential with the literal string `***REDACTED***`, in
+/// memory and on disk, with no way to recover it short of re-entering the
+/// secrets by hand.
+///
+/// Restoration is per-field, not per-section: if an operator rotates just
+/// `access_key` and leaves `secret_key` as the redacted placeholder shown by
+/// the UI, the new `access_key` is kept and only `secret_key` is restored
+/// from `current`.
+///
+/// Must be called on every config write path, BEFORE `validate_config_invariants`
+/// runs, so validation sees real values and the sentinel is never persisted in
+/// place of a live credential.
+///
+/// Covers the same ten S3-bearing sections as `redacted_config`, listed in the
+/// same order, so the two are easy to diff by eye — if a future section grows
+/// credential fields, add it to both.
+///
+/// NOTE: this intentionally does NOT cover `hec.token`, `otlp.bearer_token`, or
+/// `syslog.http_token` — a separate finding covers redacting those and is
+/// being triaged independently. If/when redaction is added for any of them,
+/// add a matching one-line merge for that field here in the SAME change —
+/// redacting a secret without a merge-back here reproduces this exact
+/// "save destroys the secret" bug for that field.
+pub fn merge_redacted_secrets(incoming: &mut Config, current: &Config) {
+    fn merge(incoming: Option<&mut S3ConnectionConfig>, current: Option<&S3ConnectionConfig>) {
+        let (Some(incoming), Some(current)) = (incoming, current) else {
+            return;
+        };
+        if incoming.access_key == REDACTED {
+            incoming.access_key = current.access_key.clone();
+        }
+        if incoming.secret_key == REDACTED {
+            incoming.secret_key = current.secret_key.clone();
+        }
+    }
+
+    merge(
+        incoming.syslog.s3.as_mut().map(|s| &mut s.connection),
+        current.syslog.s3.as_ref().map(|s| &s.connection),
+    );
+    merge(
+        incoming.ipfix.s3.as_mut().map(|s| &mut s.connection),
+        current.ipfix.s3.as_ref().map(|s| &s.connection),
+    );
+    merge(
+        incoming.zeek.s3.as_mut().map(|s| &mut s.connection),
+        current.zeek.s3.as_ref().map(|s| &s.connection),
+    );
+    merge(
+        incoming
+            .syslog
+            .structured_s3
+            .as_mut()
+            .map(|s| &mut s.connection),
+        current.syslog.structured_s3.as_ref().map(|s| &s.connection),
+    );
+    merge(
+        incoming.suricata.s3.as_mut().map(|s| &mut s.connection),
+        current.suricata.s3.as_ref().map(|s| &s.connection),
+    );
+    merge(
+        incoming.wef.s3.as_mut().map(|s| &mut s.connection),
+        current.wef.s3.as_ref().map(|s| &s.connection),
+    );
+    merge(
+        incoming.hec.s3.as_mut().map(|s| &mut s.connection),
+        current.hec.s3.as_ref().map(|s| &s.connection),
+    );
+    merge(
+        incoming.sflow.s3.as_mut().map(|s| &mut s.connection),
+        current.sflow.s3.as_ref().map(|s| &s.connection),
+    );
+    merge(
+        incoming.aggregate.s3.as_mut().map(|s| &mut s.connection),
+        current.aggregate.s3.as_ref().map(|s| &s.connection),
+    );
+    merge(
+        incoming.iceberg.s3.as_mut().map(|s| &mut s.connection),
+        current.iceberg.s3.as_ref().map(|s| &s.connection),
+    );
+}
+
 /// Structural validation of a candidate `Config` that must hold before the
 /// config is accepted by any write path (update / import / reload).
 ///
@@ -497,7 +587,7 @@ pub async fn import_config(
     }
 
     // Try to parse as TOML first, then JSON
-    let imported_config: Config = if let Ok(content_str) = std::str::from_utf8(&body) {
+    let mut imported_config: Config = if let Ok(content_str) = std::str::from_utf8(&body) {
         if let Ok(config) = toml::from_str(content_str) {
             config
         } else if let Ok(config) = serde_json::from_str(content_str) {
@@ -512,6 +602,14 @@ pub async fn import_config(
     } else {
         return Err((StatusCode::BAD_REQUEST, "Invalid UTF-8 content").into_response());
     };
+
+    // A1: an import of a previously-exported (redacted) config must not
+    // overwrite live S3 credentials with the `***REDACTED***` sentinel.
+    // Merge BEFORE validation so validation sees real values.
+    {
+        let current = state.config.read().await;
+        merge_redacted_secrets(&mut imported_config, &current);
+    }
 
     // H-7: validate before touching shared state.
     if let Err(msg) = validate_config_invariants(&imported_config) {
@@ -549,6 +647,10 @@ pub async fn import_config(
 }
 
 /// Reload configuration endpoint (re-read from disk)
+///
+/// A1: does NOT need `merge_redacted_secrets`. This reads `Config::load()`
+/// straight from the on-disk file — there is no client-submitted body that
+/// could carry the `***REDACTED***` sentinel through this path.
 pub async fn reload_config(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
@@ -802,6 +904,128 @@ mod tests {
             !json.contains(SENTINEL_SECRET),
             "a plaintext secret_key survived redaction: {json}"
         );
+    }
+
+    /// Collects `(section name, connection)` for every S3-bearing section that
+    /// is currently `Some` — same ten sections, same order, as `redacted_config`
+    /// / `merge_redacted_secrets`.
+    fn all_s3_connections(cfg: &Config) -> Vec<(&'static str, S3ConnectionConfig)> {
+        let mut out = Vec::new();
+        if let Some(ref s3) = cfg.syslog.s3 {
+            out.push(("syslog.s3", s3.connection.clone()));
+        }
+        if let Some(ref s3) = cfg.ipfix.s3 {
+            out.push(("ipfix.s3", s3.connection.clone()));
+        }
+        if let Some(ref s3) = cfg.zeek.s3 {
+            out.push(("zeek.s3", s3.connection.clone()));
+        }
+        if let Some(ref s3) = cfg.syslog.structured_s3 {
+            out.push(("syslog.structured_s3", s3.connection.clone()));
+        }
+        if let Some(ref s3) = cfg.suricata.s3 {
+            out.push(("suricata.s3", s3.connection.clone()));
+        }
+        if let Some(ref s3) = cfg.wef.s3 {
+            out.push(("wef.s3", s3.connection.clone()));
+        }
+        if let Some(ref s3) = cfg.hec.s3 {
+            out.push(("hec.s3", s3.connection.clone()));
+        }
+        if let Some(ref s3) = cfg.sflow.s3 {
+            out.push(("sflow.s3", s3.connection.clone()));
+        }
+        if let Some(ref s3) = cfg.aggregate.s3 {
+            out.push(("aggregate.s3", s3.connection.clone()));
+        }
+        if let Some(ref s3) = cfg.iceberg.s3 {
+            out.push(("iceberg.s3", s3.connection.clone()));
+        }
+        out
+    }
+
+    // A1: merge_redacted_secrets must restore every one of the ten S3
+    // sections' real credentials when the incoming config carries the
+    // REDACTED sentinel — this is the exact shape the admin UI submits on
+    // every save (it round-trips GET /config's redacted output).
+    #[test]
+    fn merge_redacted_secrets_restores_all_ten_sections() {
+        let mut current = Config::default();
+        populate_all_s3_sections(&mut current, "REAL_ACCESS_KEY", "REAL_SECRET_KEY");
+
+        let mut incoming = Config::default();
+        populate_all_s3_sections(&mut incoming, REDACTED, REDACTED);
+
+        merge_redacted_secrets(&mut incoming, &current);
+
+        let restored = all_s3_connections(&incoming);
+        assert_eq!(restored.len(), 10, "expected all ten S3 sections present");
+        for (name, conn) in restored {
+            assert_eq!(
+                conn.access_key, "REAL_ACCESS_KEY",
+                "{name}: access_key not restored"
+            );
+            assert_eq!(
+                conn.secret_key, "REAL_SECRET_KEY",
+                "{name}: secret_key not restored"
+            );
+        }
+    }
+
+    // A1: partial redaction (rotating one field of the pair through the API)
+    // must keep the new value and restore only the sentinel field, per-field
+    // not per-section.
+    #[test]
+    fn merge_redacted_secrets_restores_per_field_not_per_section() {
+        let mut current = Config::default();
+        populate_all_s3_sections(&mut current, "OLD_ACCESS_KEY", "OLD_SECRET_KEY");
+
+        // Operator rotated access_key via the UI/API but secret_key still
+        // shows the redacted placeholder.
+        let mut incoming = Config::default();
+        populate_all_s3_sections(&mut incoming, "NEW_ACCESS_KEY", REDACTED);
+
+        merge_redacted_secrets(&mut incoming, &current);
+
+        for (name, conn) in all_s3_connections(&incoming) {
+            assert_eq!(
+                conn.access_key, "NEW_ACCESS_KEY",
+                "{name}: new access_key must survive"
+            );
+            assert_eq!(
+                conn.secret_key, "OLD_SECRET_KEY",
+                "{name}: secret_key must be restored"
+            );
+        }
+    }
+
+    // A1 regression test: this is the exact bug. Take a config with real
+    // credentials, run it through redacted_config (what GET /config returns
+    // and what the admin UI clones and resubmits on PUT /config), then merge
+    // it back against the still-live config (what every write path must now
+    // do before validating/persisting) — the real credentials must survive.
+    // Without merge_redacted_secrets in the write path, this exact sequence
+    // is what silently destroyed every S3 credential on save.
+    #[test]
+    fn round_trip_through_redacted_config_and_merge_restores_real_credentials() {
+        let mut cfg = Config::default();
+        populate_all_s3_sections(&mut cfg, "REAL_ACCESS_KEY", "REAL_SECRET_KEY");
+
+        let mut resubmitted = redacted_config(&cfg);
+        merge_redacted_secrets(&mut resubmitted, &cfg);
+
+        let restored = all_s3_connections(&resubmitted);
+        assert_eq!(restored.len(), 10, "expected all ten S3 sections present");
+        for (name, conn) in restored {
+            assert_eq!(
+                conn.access_key, "REAL_ACCESS_KEY",
+                "{name}: access_key destroyed by redact+merge round trip"
+            );
+            assert_eq!(
+                conn.secret_key, "REAL_SECRET_KEY",
+                "{name}: secret_key destroyed by redact+merge round trip"
+            );
+        }
     }
 
     // H-7: validate_config_invariants rejects port 0.

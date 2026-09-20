@@ -303,7 +303,14 @@ impl IpfixListener {
         }
 
         for task in tasks {
-            let _ = task.await;
+            if let Err(e) = task.await {
+                // A receive task that panics stops draining its socket for the
+                // lifetime of the process. Discarding this JoinError made that
+                // failure completely silent: the parent handle stays alive, so
+                // main.rs's `supervise_listener_handles` never fires either.
+                metrics::counter!("ipfix_recv_task_failed").increment(1);
+                error!("ipfix: a receive task terminated abnormally: {e}");
+            }
         }
 
         Ok(())
@@ -1230,6 +1237,114 @@ mod tests {
         assert_eq!(
             rejected, n as u64,
             "listener_source_rejected must count every datagram through the recv_tasks=4 + recv_batch_size=16 combined path, not one per batch"
+        );
+    }
+
+    /// A2 regression: the `SO_REUSEPORT` fan-out join loop in
+    /// `start_with_shutdown` must not silently discard a receive task's
+    /// `JoinError`. Drives a real panic through a deliberately-panicking
+    /// handler (no production handler ever panics here -- this exists
+    /// solely to exercise the fix, same as `tests/syslog_panic_resilience_e2e
+    /// .rs`'s equivalent `a_panicking_receive_task_increments_the_failure_
+    /// counter_and_is_logged` for syslog) and asserts both the
+    /// `ipfix_recv_task_failed` counter and the accompanying error log fire.
+    ///
+    /// Uses the shared `crate::test_support` tracing capture rather than
+    /// installing its own subscriber -- see that module's doc comment for why
+    /// multiple independent `set_global_default` calls across listener test
+    /// modules would race for the single process-wide slot.
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    #[tokio::test]
+    async fn a_panicking_receive_task_increments_the_failure_counter_and_is_logged() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        crate::test_support::install_and_clear();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // Current-thread `#[tokio::test]` runtime: every task this test
+        // spawns (the listener's own recv tasks included) runs on this same
+        // OS thread, so the thread-local recorder sees them all.
+        let _guard = set_default_local_recorder(&recorder);
+
+        struct PanickingHandler;
+        #[async_trait::async_trait]
+        impl IpfixHandler for PanickingHandler {
+            async fn handle_flows(&self, _flows: Vec<FlowRecord>, _source: SocketAddr) {
+                panic!("test-injected panic to exercise JoinError handling");
+            }
+        }
+
+        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = tmp.local_addr().unwrap().port();
+        drop(tmp);
+        let bound: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
+
+        let config = IpfixListenerConfig {
+            udp_port,
+            bind_address: "127.0.0.1".to_string(),
+            recv_tasks: 2,
+            recv_batch_size: 1,
+            ..IpfixListenerConfig::default()
+        };
+        let handler: Arc<dyn IpfixHandler> = Arc::new(PanickingHandler);
+        let listener = IpfixListener::new(config, handler);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { listener.start_with_shutdown(shutdown_rx).await });
+        sleep(Duration::from_millis(50)).await;
+
+        // Template then data from the SAME client socket, so both hash to the
+        // same SO_REUSEPORT member (kernel hashes by 4-tuple) and the data
+        // record actually decodes to a non-empty flow batch -- an empty batch
+        // never reaches the handler at all (see `run_with_socket`), so a
+        // template-only datagram wouldn't trigger the panic.
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.send_to(&template_datagram(1), bound).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        sock.send_to(&data_datagram(2, 0), bound).await.unwrap();
+
+        // Give the panicking task time to unwind and be caught by tokio.
+        sleep(Duration::from_millis(200)).await;
+
+        // The sequential `for task in tasks { task.await }` join loop can't
+        // observe the panicked task's `JoinError` until every task *before*
+        // it in the vec has resolved -- shut down the survivor(s) so the
+        // loop drains through to it, regardless of which SO_REUSEPORT member
+        // the datagrams happened to hash onto.
+        let _ = shutdown_tx.send(true);
+        let outer_result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("start_with_shutdown did not return after shutdown")
+            .expect("outer task panicked or was cancelled");
+        assert!(
+            outer_result.is_ok(),
+            "start_with_shutdown itself returned an error: {outer_result:?}"
+        );
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let failed = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("ipfix_recv_task_failed"),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            failed, 1,
+            "expected ipfix_recv_task_failed == 1 after a receive task panicked"
+        );
+
+        let events = crate::test_support::captured_events();
+        assert!(
+            events
+                .iter()
+                .any(|m| m.contains("a receive task terminated abnormally")),
+            "expected an error log containing 'a receive task terminated abnormally', got: {events:?}"
         );
     }
 }

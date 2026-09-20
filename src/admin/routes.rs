@@ -11,8 +11,8 @@ use tracing::{error, info};
 
 use crate::admin::auth::{ensure_authorized, generate_csrf_token};
 use crate::admin::config_api::{
-    PartialConfigUpdate, apply_flush_intervals, persist_config, redacted_config,
-    validate_config_invariants,
+    PartialConfigUpdate, apply_flush_intervals, merge_redacted_secrets, persist_config,
+    redacted_config, validate_config_invariants,
 };
 use crate::admin::middleware::security_middleware;
 use crate::admin::state::{
@@ -271,13 +271,22 @@ async fn update_config(
     trusted: Option<Extension<TrustedIdentity>>,
     resolved_ip: Option<Extension<ResolvedClientIp>>,
     auth: Option<TypedHeader<Authorization<Basic>>>,
-    Json(new_config): Json<Config>,
+    Json(mut new_config): Json<Config>,
 ) -> Result<Json<Config>, Response> {
     let client_ip = resolved_ip
         .map(|Extension(ResolvedClientIp(ip))| ip.to_string())
         .unwrap_or_else(|| addr.ip().to_string());
     let username =
         ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
+
+    // A1: the admin UI round-trips whatever GET /config returned (always
+    // redacted), so a save with no credential change would otherwise
+    // overwrite every live S3 access_key/secret_key with the literal
+    // `***REDACTED***` sentinel. Merge real values back in BEFORE validation.
+    {
+        let current = state.config.read().await;
+        merge_redacted_secrets(&mut new_config, &current);
+    }
 
     // H-7: validate before touching shared state.
     if let Err(msg) = validate_config_invariants(&new_config) {
@@ -333,6 +342,13 @@ async fn update_config(
 }
 
 /// Patch configuration endpoint (partial updates)
+///
+/// A1: does NOT need `merge_redacted_secrets`. `PartialConfigUpdate` has no
+/// S3 credential fields (bind_address, tls_enabled/port, logging_level,
+/// metrics_enabled/port, syslog_enabled/udp_port/tcp_port only), and the
+/// candidate below starts as a clone of the live in-memory config — so an
+/// S3 `access_key`/`secret_key` can never be overwritten with the
+/// `***REDACTED***` sentinel via this endpoint.
 async fn patch_config(
     State(state): State<AdminState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
@@ -1550,6 +1566,105 @@ mod tests {
             "PUT /config must push the new flush_interval_secs into the \
              already-registered live writer handle — this is the actual bug \
              fix, exercised end-to-end through the HTTP path"
+        );
+    }
+
+    /// A1 HTTP-level regression test: GET /config then PUT /config with the
+    /// exact body it returned — this is precisely what the admin UI does on
+    /// every save (`buildPayload()` deep-clones `currentConfig`, which was
+    /// populated from a prior `GET /config` response, and PUTs that clone
+    /// back). Drives the real router (both routes registered exactly as in
+    /// production), not the handler function directly.
+    #[tokio::test]
+    async fn get_then_put_round_trip_through_router_preserves_real_s3_credentials() {
+        use crate::config::{S3ConnectionConfig, SyslogS3Config, TlsConfig};
+
+        let _sandbox = sandbox_persist_config_path().await;
+        let state = test_state().await;
+
+        let real_access_key = "AKIAIOSFODNN7EXAMPLE";
+        let real_secret_key = "super-secret-should-survive-a-save";
+        {
+            let mut cfg = state.config.write().await;
+            cfg.tls = TlsConfig {
+                enabled: false,
+                ..TlsConfig::default()
+            };
+            cfg.syslog.s3 = Some(SyslogS3Config {
+                connection: S3ConnectionConfig {
+                    endpoint: "https://s3.example.com".to_string(),
+                    bucket: "test-bucket".to_string(),
+                    region: "us-east-1".to_string(),
+                    access_key: real_access_key.to_string(),
+                    secret_key: real_secret_key.to_string(),
+                },
+                prefix: "syslog".to_string(),
+                max_buffer_rows: 1000,
+                flush_interval_secs: 60,
+                channel_capacity: 100,
+            });
+        }
+
+        let app = axum::Router::new()
+            .route(
+                "/config",
+                axum::routing::get(get_config)
+                    .put(update_config)
+                    .patch(patch_config),
+            )
+            .with_state(state.clone());
+
+        // GET /config — this is what the admin UI stores as `currentConfig`.
+        let mut get_request =
+            create_request_with_auth(Method::GET, "/config", "admin", "admin", None);
+        inject_connect_info(&mut get_request, "127.0.0.1:12345".parse().unwrap());
+        let get_response = app.clone().oneshot(get_request).await.unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let get_body = axum::body::to_bytes(get_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let get_body_str = String::from_utf8_lossy(&get_body);
+        assert!(
+            get_body_str.contains("***REDACTED***"),
+            "GET /config must return the redacted sentinel, not the real secret: {get_body_str}"
+        );
+
+        // PUT /config with exactly that (redacted) body — no edits, same as an
+        // operator who changed an unrelated field elsewhere in the form.
+        let mut put_request = axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri("/config")
+            .header("content-type", "application/json")
+            .header(
+                "Authorization",
+                format!("Basic {}", encode_base64("admin:admin")),
+            )
+            .body(Body::from(get_body))
+            .unwrap();
+        inject_connect_info(&mut put_request, "127.0.0.1:12345".parse().unwrap());
+
+        let put_response = app.oneshot(put_request).await.unwrap();
+        assert_eq!(
+            put_response.status(),
+            StatusCode::OK,
+            "PUT /config with the GET-returned (redacted) body must succeed"
+        );
+
+        // The live in-memory config must still hold the REAL credentials, not
+        // the `***REDACTED***` sentinel the client just submitted.
+        let live_cfg = state.config.read().await;
+        let s3 = live_cfg
+            .syslog
+            .s3
+            .as_ref()
+            .expect("syslog.s3 still present");
+        assert_eq!(
+            s3.connection.access_key, real_access_key,
+            "save destroyed the real access_key"
+        );
+        assert_eq!(
+            s3.connection.secret_key, real_secret_key,
+            "save destroyed the real secret_key"
         );
     }
 
