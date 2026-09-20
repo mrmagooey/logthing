@@ -122,6 +122,10 @@ mod tests {
 
     #[tokio::test]
     async fn audit_logger_records_entries() {
+        // LOGTHING_ADMIN_AUDIT_LOG is process-global; serialize against every
+        // other test that touches it crate-wide (see config_api::test_support).
+        let _lock = config_api::test_support::lock_audit_log_env().await;
+
         // Use a temp directory to avoid loading existing entries
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("test-audit.log");
@@ -156,6 +160,10 @@ mod tests {
     /// its doc comment for why a bespoke `set_default` doesn't work here).
     #[tokio::test]
     async fn audit_log_sanitizes_control_characters_in_username() {
+        // LOGTHING_ADMIN_AUDIT_LOG is process-global; serialize against every
+        // other test that touches it crate-wide (see config_api::test_support).
+        let _lock = config_api::test_support::lock_audit_log_env().await;
+
         crate::test_support::install_and_clear();
 
         let dir = tempdir().unwrap();
@@ -207,6 +215,10 @@ mod tests {
 
     #[tokio::test]
     async fn audit_logger_respects_max_entries() {
+        // LOGTHING_ADMIN_AUDIT_LOG is process-global; serialize against every
+        // other test that touches it crate-wide (see config_api::test_support).
+        let _lock = config_api::test_support::lock_audit_log_env().await;
+
         // Use a temp directory to avoid loading existing entries
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("test-audit.log");
@@ -443,6 +455,10 @@ mod tests {
 
         #[tokio::test]
         async fn audit_logger_persists_to_json_lines() {
+            // LOGTHING_ADMIN_AUDIT_LOG is process-global; serialize against every
+            // other test that touches it crate-wide (see config_api::test_support).
+            let _lock = config_api::test_support::lock_audit_log_env().await;
+
             let dir = tempdir().unwrap();
             let log_path = dir.path().join("test-persist.log");
             unsafe {
@@ -470,6 +486,10 @@ mod tests {
 
         #[tokio::test]
         async fn audit_logger_loads_from_file_on_init() {
+            // LOGTHING_ADMIN_AUDIT_LOG is process-global; serialize against every
+            // other test that touches it crate-wide (see config_api::test_support).
+            let _lock = config_api::test_support::lock_audit_log_env().await;
+
             let dir = tempdir().unwrap();
             let log_path = dir.path().join("test-load.log");
 

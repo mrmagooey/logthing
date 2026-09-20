@@ -9,12 +9,14 @@
 //! MinIO or any other service.
 
 use axum::{Extension, Router, extract::DefaultBodyLimit, routing::post};
+use logthing::config::Config;
 use logthing::ingest::{
     IngestState,
     handlers::{handle_hec_event, handle_hec_raw, handle_ndjson},
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tokio::time::{Duration, sleep};
 
 /// Mirror of server::MAX_BODY_SIZE (pub(crate) there, so we use the literal).
@@ -25,7 +27,9 @@ const BODY_LIMIT: usize = 64 * 1024 * 1024;
 /// Returns `(base_url, join_handle)`.  The caller should hold the join-handle
 /// alive for the duration of the test; dropping it aborts the server task.
 async fn spawn_hec_server(token: &str) -> (String, tokio::task::JoinHandle<()>) {
-    let cfg_token = Arc::new(token.to_string());
+    let mut cfg = Config::default();
+    cfg.hec.token = token.to_string();
+    let shared_config = Arc::new(RwLock::new(cfg));
     let ingest_state = IngestState {
         generic_s3: None,
         generic_local: None,
@@ -36,7 +40,7 @@ async fn spawn_hec_server(token: &str) -> (String, tokio::task::JoinHandle<()>) 
         .route("/services/collector/raw", post(handle_hec_raw))
         .route("/ingest", post(handle_ndjson))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
-        .layer(Extension(cfg_token))
+        .layer(Extension(shared_config))
         .layer(Extension(ingest_state));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

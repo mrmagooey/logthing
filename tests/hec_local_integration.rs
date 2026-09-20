@@ -372,7 +372,9 @@ async fn hec_route_sanitizes_traversal_sourcetype_before_it_reaches_the_object_k
         http::{Request, StatusCode},
         routing::post,
     };
+    use logthing::config::Config;
     use logthing::ingest::{IngestState, handlers::handle_hec_event};
+    use tokio::sync::RwLock;
     use tower::ServiceExt;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -399,7 +401,9 @@ async fn hec_route_sanitizes_traversal_sourcetype_before_it_reaches_the_object_k
         None,
     );
 
-    let cfg_token = std::sync::Arc::new("tok".to_string());
+    let mut hec_cfg = Config::default();
+    hec_cfg.hec.token = "tok".to_string();
+    let shared_config = std::sync::Arc::new(RwLock::new(hec_cfg));
     let ingest_state = IngestState {
         generic_s3: None,
         generic_local: Some(handler.clone()),
@@ -407,7 +411,7 @@ async fn hec_route_sanitizes_traversal_sourcetype_before_it_reaches_the_object_k
 
     let app: Router = Router::new()
         .route("/services/collector/event", post(handle_hec_event))
-        .layer(Extension(cfg_token))
+        .layer(Extension(shared_config))
         .layer(Extension(ingest_state));
 
     let req = Request::builder()
