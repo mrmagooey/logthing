@@ -91,6 +91,78 @@ const MAX_UNKNOWN_RECORDS_PER_SAMPLE: usize = 8;
 /// to the last decoded record's `extra`.
 const MAX_UNKNOWN_RECORDS_PER_DATAGRAM: usize = 512;
 
+/// Maximum body bytes hex-encoded into `extra` for one non-curated
+/// (unknown/vendor-specific) record.
+///
+/// `MAX_UNKNOWN_RECORDS_PER_SAMPLE`/`MAX_UNKNOWN_RECORDS_PER_DATAGRAM` bound
+/// how many unknown records land in `extra` -- they say nothing about how
+/// big any one of them is. `flow_data_length`/`counter_data_length` are
+/// attacker-controlled `u32`s checked only against the remaining sample-body
+/// length, which itself is bounded only by the UDP receive buffer
+/// (`src/sflow/listener.rs`'s 65535-byte buffer). Before this cap, one
+/// record with `flow_data_length` near 60,000 -- one of only
+/// `MAX_UNKNOWN_RECORDS_PER_SAMPLE` (8) needed to stay under the per-sample
+/// cap -- got `hex::encode`d whole: ~800 bytes of BTreeMap node plus 2 bytes
+/// of hex string per input byte, roughly 800 + 2*60,000 = ~120,800 bytes for
+/// one record, ~17x `channel_budget::SFLOW_RECORD_BYTES`'s prior ceiling.
+/// Neither the per-sample count cap nor the per-datagram budget catches
+/// this: both count records, not the bytes inside one.
+///
+/// `extra` exists so an operator can diagnose an unmodelled record. The
+/// record's format is *by definition* unknown at decode time, so there is no
+/// internal structure to preserve past its opening bytes -- a vendor TLV's
+/// type/subtype/length fields and the start of its payload are almost always
+/// in the first few dozen bytes. 128 is comfortably enough for that
+/// diagnostic purpose while bounding the worst-case per-record body cost to
+/// a small, fixed 256-hex-character string regardless of how large the
+/// attacker claims (or actually sends) the record to be.
+const MAX_UNKNOWN_RECORD_BODY_BYTES: usize = 128;
+
+/// Hex-encode `body` for storage in `extra`, capped at
+/// `MAX_UNKNOWN_RECORD_BODY_BYTES` regardless of `body`'s real length -- see
+/// that constant's doc comment. Returns the (possibly truncated) hex string
+/// and whether truncation happened, so callers can flag it in the record
+/// rather than silently showing a partial body as if it were the whole one.
+fn hex_encode_capped(body: &[u8]) -> (String, bool) {
+    let cap = body.len().min(MAX_UNKNOWN_RECORD_BODY_BYTES);
+    (
+        hex::encode(&body[..cap]),
+        body.len() > MAX_UNKNOWN_RECORD_BODY_BYTES,
+    )
+}
+
+/// Build the `extra` JSON object for one non-curated (unknown or
+/// vendor-specific) flow/counter record, with its hex-encoded body capped at
+/// `MAX_UNKNOWN_RECORD_BODY_BYTES`.
+///
+/// `length` is the record's full declared length on the wire and is
+/// reported as-is regardless of truncation, so a diagnostician always sees
+/// the true original size; `body_truncated: true` is added only when the
+/// hex-encoded body itself was cut short, so a normal small record's shape
+/// is unchanged. `enterprise` is included only when the caller has one to
+/// report -- `decode_flow_sample`'s two call sites differ on this (see their
+/// call sites for why).
+fn unknown_record_json(
+    enterprise: Option<u32>,
+    format: u32,
+    length: usize,
+    body: &[u8],
+) -> serde_json::Value {
+    let (data_hex, body_truncated) = hex_encode_capped(body);
+    let mut obj = serde_json::json!({
+        "format": format,
+        "length": length,
+        "data_hex": data_hex,
+    });
+    if let Some(enterprise) = enterprise {
+        obj["enterprise"] = serde_json::json!(enterprise);
+    }
+    if body_truncated {
+        obj["body_truncated"] = serde_json::json!(true);
+    }
+    obj
+}
+
 /// Per-datagram state for `UnknownRecordSink`, shared (via `&mut`) across
 /// every sample decoded from one `decode_datagram` call.
 struct DatagramUnknownBudget {
@@ -461,14 +533,14 @@ fn decode_flow_sample(
 
         if rec_enterprise != 0 {
             // Enterprise-specific — store raw in extra, up to the per-sample/
-            // per-datagram budget.
-            let data_hex = hex::encode(rec_body);
-            unknown.push(serde_json::json!({
-                "enterprise": rec_enterprise,
-                "format": rec_format,
-                "length": flow_data_length,
-                "data_hex": data_hex,
-            }));
+            // per-datagram budget, with the body hex-capped (see
+            // MAX_UNKNOWN_RECORD_BODY_BYTES).
+            unknown.push(unknown_record_json(
+                Some(rec_enterprise),
+                rec_format,
+                flow_data_length,
+                rec_body,
+            ));
             continue;
         }
 
@@ -497,12 +569,7 @@ fn decode_flow_sample(
                 }
             }
             other => {
-                let data_hex = hex::encode(rec_body);
-                unknown.push(serde_json::json!({
-                    "format": other,
-                    "length": flow_data_length,
-                    "data_hex": data_hex,
-                }));
+                unknown.push(unknown_record_json(None, other, flow_data_length, rec_body));
             }
         }
     }
@@ -747,14 +814,14 @@ fn decode_counter_sample(
 
         if rec_enterprise != 0 || rec_format != 1 {
             // Non-generic counter record — store raw in extra, up to the
-            // per-sample/per-datagram budget.
-            let data_hex = hex::encode(rec_body);
-            unknown.push(serde_json::json!({
-                "enterprise": rec_enterprise,
-                "format": rec_format,
-                "length": counter_data_length,
-                "data_hex": data_hex,
-            }));
+            // per-sample/per-datagram budget, with the body hex-capped (see
+            // MAX_UNKNOWN_RECORD_BODY_BYTES).
+            unknown.push(unknown_record_json(
+                Some(rec_enterprise),
+                rec_format,
+                counter_data_length,
+                rec_body,
+            ));
             continue;
         }
 

@@ -207,25 +207,38 @@ pub const SYSLOG_MESSAGE_BYTES: usize = 768;
 /// therefore exactly that: the per-sample cap's worth of records, packed into
 /// one sample.
 ///
+/// **The count cap alone is not the whole story either.** An individual
+/// record's body (`flow_data_length`/`counter_data_length`, an
+/// attacker-controlled `u32` bounded only by the remaining sample length, up
+/// to the ~65 KB UDP receive buffer) used to be `hex::encode`d whole into
+/// `data_hex`. `decoder::MAX_UNKNOWN_RECORD_BODY_BYTES` (128) now caps that
+/// per-record, so this measurement uses records with bodies far larger than
+/// the cap (7000 bytes -- an attacker-realistic size, comfortably clearing
+/// 128 while still fitting the full worst-case record count in one
+/// datagram), not the 16-byte `extended_switch` shape used elsewhere in this
+/// file for the *typical* case. See that constant's doc comment for why 128
+/// is enough for diagnosis and for the ~120 KB single-record cost this caps.
+///
 /// Measured (not estimated -- via the counting allocator in
 /// `tests/channel_budget_allocator.rs`'s
 /// `measured_worst_case_single_sflow_record_bytes`, which is the source of
 /// truth for this constant): `size_of::<SflowRecord>()` (256) plus the real
-/// heap of `extra` holding 8 accepted `extended_switch`-shaped records
-/// (enterprise 0, 16-byte body -- the same representative shape used
-/// throughout this file) plus one `sample_cap` truncation marker for the 9th
-/// declared record that tips the sample over the cap: 256 + 6641 = 6897
-/// bytes, rounded up to 6912. See `measured_sflow_record_bytes_matches_constant`.
+/// heap of `extra` holding 8 accepted records (enterprise 0, format 1001,
+/// each with a 7000-byte body truncated to 128 bytes / 256 hex chars) plus
+/// one `sample_cap` truncation marker for the 9th declared record that tips
+/// the sample over the cap: 256 + 8545 = 8801 bytes, rounded up to 8960. See
+/// `measured_sflow_record_bytes_matches_constant`.
 ///
-/// At 6912 bytes, `capacity_for` gives a channel depth of 15,170 records
-/// (100 MiB / 6912), versus 81,920 at the old (unsound) 1280-byte average --
-/// a ~5.4x depth cut, the tradeoff `decoder::MAX_UNKNOWN_RECORDS_PER_SAMPLE`'s
-/// doc comment explains for choosing 8 over absorbing the full pre-round-2
-/// cap of 32 into this constant (which would have cut depth ~19x instead).
-/// 15,170 x 6912 = 104,855,040 bytes, genuinely under `CHANNEL_BUDGET_BYTES`
-/// (104,857,600) -- the model this constant feeds is now sound for the
-/// worst case, not just the common case.
-pub const SFLOW_RECORD_BYTES: usize = 6912;
+/// At 8960 bytes, `capacity_for` gives a channel depth of 11,702 records
+/// (100 MiB / 8960), versus 15,170 at the prior (count-cap-only) 6912-byte
+/// figure -- a further ~1.3x cut -- and versus 81,920 at the original
+/// (unsound) 1280-byte average, a ~7x cut overall. 11,702 x 8960 =
+/// 104,849,920 bytes, genuinely under `CHANNEL_BUDGET_BYTES` (104,857,600).
+/// 11,702 in-flight records is still a healthy depth for a UDP-sourced
+/// firehose; the model this constant feeds is now sound against both axes an
+/// attacker controls (record count and record size), not just the common
+/// case.
+pub const SFLOW_RECORD_BYTES: usize = 8960;
 
 /// Measured footprint of one IPFIX channel message, which is a `Vec<FlowRecord>`
 /// holding **all flows from one UDP datagram**: 8904 bytes measured for the
@@ -476,20 +489,21 @@ mod tests {
 
     /// Builds a minimal sFlow v5 datagram: header plus one flow_sample
     /// carrying `records` flow records in a format this decoder does not
-    /// curate, each modelling a real switch's `extended_switch` record
-    /// (VLAN tag/priority, enterprise 0, 16-byte body) — see
-    /// `SFLOW_RECORD_BYTES`'s doc comment for why that per-record shape is
-    /// representative, not an edge case, for switch-sourced sFlow, and for
-    /// why `records` = `MAX_UNKNOWN_RECORDS_PER_SAMPLE_MIRROR + 1` (one over
-    /// the cap, so the fixture also exercises the `sample_cap` truncation
-    /// marker) is the worst case that actually bounds one channel slot.
+    /// curate, each with a `body_len`-byte body (enterprise 0, format 1001)
+    /// — see `SFLOW_RECORD_BYTES`'s doc comment for why `records` =
+    /// `MAX_UNKNOWN_RECORDS_PER_SAMPLE_MIRROR + 1` (one over the cap, so the
+    /// fixture also exercises the `sample_cap` truncation marker) and
+    /// `body_len` far larger than `decoder::MAX_UNKNOWN_RECORD_BODY_BYTES`
+    /// together are the true worst case that bounds one channel slot: large
+    /// enough to trip the body cap on every accepted record, not just the
+    /// count cap.
     ///
     /// Hand-built rather than reusing `crate::sflow::decoder::tests`'s
-    /// fixtures: none of them exercise the non-curated path with a
-    /// representative (non-trivial) body size, and driving the real decoder
-    /// — rather than hand-writing the resulting `serde_json::Value` — is what
-    /// makes this measurement trustworthy (see the doc comment above).
-    fn build_sflow_flow_sample_with_n_extension_records(records: u32) -> Vec<u8> {
+    /// fixtures: none of them exercise the non-curated path with an
+    /// attacker-realistic body size, and driving the real decoder — rather
+    /// than hand-writing the resulting `serde_json::Value` — is what makes
+    /// this measurement trustworthy (see the doc comment above).
+    fn build_sflow_flow_sample_with_n_extension_records(records: u32, body_len: u32) -> Vec<u8> {
         let mut buf = Vec::new();
         // ── Datagram header (28 bytes) ──
         buf.extend_from_slice(&5u32.to_be_bytes()); // version = 5
@@ -501,7 +515,7 @@ mod tests {
         buf.extend_from_slice(&1u32.to_be_bytes()); // num_samples = 1
 
         // ── flow_sample envelope ──
-        let sample_body_len = 32 + (records as usize) * (8 + 16);
+        let sample_body_len = 32 + (records as usize) * (8 + body_len as usize);
         buf.extend_from_slice(&1u32.to_be_bytes()); // data_format = flow_sample
         buf.extend_from_slice(&(sample_body_len as u32).to_be_bytes());
 
@@ -515,14 +529,15 @@ mod tests {
         buf.extend_from_slice(&2u32.to_be_bytes()); // output ifindex
         buf.extend_from_slice(&records.to_be_bytes()); // num_flow_records
 
-        // ── flow records: extended_switch-shaped, enterprise=0 format=1001 ──
+        // ── flow records: enterprise=0 format=1001, oversized body ──
         // Not one of the three curated formats (1, 3, 4), so
         // `decode_flow_sample` stores each verbatim in `extra` (up to the
-        // per-sample cap; any excess trips the `sample_cap` marker instead).
+        // per-sample cap and the per-record body cap; any excess trips a
+        // truncation marker/flag instead).
         for _ in 0..records {
             buf.extend_from_slice(&1001u32.to_be_bytes()); // flow_data_format
-            buf.extend_from_slice(&16u32.to_be_bytes()); // flow_data_length
-            buf.extend_from_slice(&[0u8; 16]); // in_vlan, in_pri, out_vlan, out_pri
+            buf.extend_from_slice(&body_len.to_be_bytes()); // flow_data_length
+            buf.extend_from_slice(&vec![0xABu8; body_len as usize]);
         }
 
         buf
@@ -539,12 +554,18 @@ mod tests {
         // convention `tests/channel_budget_allocator.rs` uses for the same
         // reason. One more than the cap so the fixture also exercises the
         // `sample_cap` truncation marker -- see `SFLOW_RECORD_BYTES`'s doc
-        // comment for why 8 accepted + 1 marker is the worst case that
-        // actually bounds a single channel slot.
+        // comment for why 8 accepted + 1 marker, each with an oversized
+        // body, is the worst case that actually bounds a single channel
+        // slot.
         const MAX_UNKNOWN_RECORDS_PER_SAMPLE_MIRROR: u32 = 8;
+        // Mirrors the private `decoder::MAX_UNKNOWN_RECORD_BODY_BYTES` (128):
+        // far larger than that cap so every accepted record actually trips
+        // the body-truncation path, not just the count cap.
+        const BODY_LEN: u32 = 7000;
 
         let buf = build_sflow_flow_sample_with_n_extension_records(
             MAX_UNKNOWN_RECORDS_PER_SAMPLE_MIRROR + 1,
+            BODY_LEN,
         );
         let mut records = decode_datagram(&buf, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
             .expect("representative datagram must decode");

@@ -411,17 +411,23 @@ fn multi_sample_hostile_sflow_datagram_heap_retention_is_bounded_by_the_datagram
 /// is what actually bounds one channel slot, so it is what
 /// `channel_budget::SFLOW_RECORD_BYTES` must measure and ceiling.
 ///
-/// This measures the genuine worst-case-but-legitimate single record: the
-/// curated (flat, no-heap) `SflowRecord` fields plus
-/// `MAX_UNKNOWN_RECORDS_PER_SAMPLE` (8) accepted non-curated records (the
-/// same 16-byte `extended_switch`-shaped body used by
-/// `json_heap_bytes_matches_real_allocation_for_a_populated_sflow_extra`
-/// above and by `channel_budget.rs`'s own `SFLOW_RECORD_BYTES` fixture,
-/// representative of a real switch's non-curated record) plus one
-/// `sample_cap` truncation marker (a 9th record in the sample tips it over
-/// the cap, which is exactly the worst case a real attacker produces: pack
-/// the per-sample cap's worth of records into the first sample of a
-/// datagram, before the datagram-wide budget can bite at all).
+/// Round-3 review finding: the count cap alone still understated the true
+/// worst case, because it says nothing about how large each *individual*
+/// record's body is. `flow_data_length` is an attacker-controlled `u32`
+/// bounded only by the remaining sample body (i.e. up to the ~65 KB UDP
+/// receive buffer), and the whole body used to be `hex::encode`d verbatim --
+/// so one oversized record could cost ~120 KB on its own, regardless of the
+/// per-sample/per-datagram count caps. `decoder::MAX_UNKNOWN_RECORD_BODY_
+/// BYTES` (128) now caps the hex-encoded body length per record; this test
+/// measures the TRUE worst case with that fix in place: `MAX_UNKNOWN_
+/// RECORDS_PER_SAMPLE` (8) accepted records, each with a body far larger
+/// than the 128-byte cap (7000 bytes -- comfortably larger than the cap
+/// while still letting 9 such records fit in one UDP datagram, matching how
+/// an attacker would actually pack this shape on the wire), plus one
+/// `sample_cap` truncation marker (a 9th declared record tips the sample
+/// over the cap -- pack the per-sample cap's worth of records into the
+/// first sample of a datagram, before the datagram-wide budget can bite at
+/// all).
 ///
 /// `std::mem::size_of::<SflowRecord>()` is added because that fixed part of
 /// the struct is what actually occupies the channel slot alongside the
@@ -438,6 +444,7 @@ fn measured_worst_case_single_sflow_record_bytes() {
 
     const MAX_UNKNOWN_RECORDS_PER_SAMPLE_MIRROR: u32 = 8; // == decoder::MAX_UNKNOWN_RECORDS_PER_SAMPLE (private)
     const RECORDS_IN_SAMPLE: u32 = MAX_UNKNOWN_RECORDS_PER_SAMPLE_MIRROR + 1; // 9: 8 accepted, 1 dropped
+    const BODY_LEN: u32 = 7000; // far larger than MAX_UNKNOWN_RECORD_BODY_BYTES (128)
 
     let mut buf = Vec::new();
     buf.extend_from_slice(&5u32.to_be_bytes()); // version = 5
@@ -448,7 +455,7 @@ fn measured_worst_case_single_sflow_record_bytes() {
     buf.extend_from_slice(&1u32.to_be_bytes()); // uptime_ms
     buf.extend_from_slice(&1u32.to_be_bytes()); // num_samples = 1
 
-    let sample_body_len = 32 + (RECORDS_IN_SAMPLE as usize) * (8 + 16);
+    let sample_body_len = 32 + (RECORDS_IN_SAMPLE as usize) * (8 + BODY_LEN as usize);
     buf.extend_from_slice(&1u32.to_be_bytes()); // data_format = flow_sample
     buf.extend_from_slice(&(sample_body_len as u32).to_be_bytes());
     buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
@@ -461,9 +468,14 @@ fn measured_worst_case_single_sflow_record_bytes() {
     buf.extend_from_slice(&RECORDS_IN_SAMPLE.to_be_bytes()); // num_flow_records
     for _ in 0..RECORDS_IN_SAMPLE {
         buf.extend_from_slice(&1001u32.to_be_bytes()); // enterprise 0, format 1001
-        buf.extend_from_slice(&16u32.to_be_bytes()); // flow_data_length = 16
-        buf.extend_from_slice(&[0u8; 16]); // extended_switch-shaped body
+        buf.extend_from_slice(&BODY_LEN.to_be_bytes()); // flow_data_length = 7000
+        buf.extend_from_slice(&vec![0xABu8; BODY_LEN as usize]); // oversized body
     }
+    assert!(
+        buf.len() <= 65_535,
+        "fixture must fit one UDP datagram; got {} bytes",
+        buf.len()
+    );
 
     let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
     let (extra, real_extra_heap) = live_heap_of(|| {
@@ -482,6 +494,20 @@ fn measured_worst_case_single_sflow_record_bytes() {
         Some(&serde_json::json!("sample_cap")),
         "the 9th declared record must trip the per-sample cap, not the datagram budget"
     );
+    assert!(
+        array[..8]
+            .iter()
+            .all(|v| v.get("body_truncated") == Some(&serde_json::json!(true))),
+        "every accepted 7000-byte-body record must be flagged as body_truncated; got {array:?}"
+    );
+    assert!(
+        array[..8].iter().all(|v| v
+            .get("data_hex")
+            .and_then(|h| h.as_str())
+            .is_some_and(|h| h.len() == 128 * 2)),
+        "every accepted record's data_hex must be capped at MAX_UNKNOWN_RECORD_BODY_BYTES \
+         (128 bytes = 256 hex chars) regardless of the 7000-byte declared body; got {array:?}"
+    );
 
     let total = std::mem::size_of::<SflowRecord>() + real_extra_heap;
     eprintln!(
@@ -497,5 +523,133 @@ fn measured_worst_case_single_sflow_record_bytes() {
         "measured worst-case single record is {total} bytes, which exceeds \
          SFLOW_RECORD_BYTES={}; re-measure and raise the constant",
         logthing::forwarding::channel_budget::SFLOW_RECORD_BYTES
+    );
+}
+
+/// Round-3 review regression: a single record with a near-maximum body (the
+/// shape that used to cost ~120 KB on its own, per `MAX_UNKNOWN_RECORD_BODY_
+/// BYTES`'s doc comment) must have its hex-encoded body capped and its real
+/// retained heap bounded to a small, fixed footprint -- nowhere near
+/// proportional to the ~60,000-byte body an attacker actually sent.
+#[test]
+fn near_max_body_unknown_record_is_truncated_and_bounded() {
+    use logthing::sflow::decoder::decode_datagram;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    const BODY_LEN: u32 = 60_000; // near the largest that fits one UDP datagram
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&5u32.to_be_bytes()); // version = 5
+    buf.extend_from_slice(&1u32.to_be_bytes()); // agent_addr_type = IPv4
+    buf.extend_from_slice(&[10, 0, 0, 1]); // agent_addr
+    buf.extend_from_slice(&0u32.to_be_bytes()); // sub_agent_id
+    buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
+    buf.extend_from_slice(&1u32.to_be_bytes()); // uptime_ms
+    buf.extend_from_slice(&1u32.to_be_bytes()); // num_samples = 1
+
+    let sample_body_len = 32 + 8 + BODY_LEN as usize;
+    buf.extend_from_slice(&1u32.to_be_bytes()); // data_format = flow_sample
+    buf.extend_from_slice(&(sample_body_len as u32).to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
+    buf.extend_from_slice(&1u32.to_be_bytes()); // source_id
+    buf.extend_from_slice(&1000u32.to_be_bytes()); // sampling_rate
+    buf.extend_from_slice(&1000u32.to_be_bytes()); // sample_pool
+    buf.extend_from_slice(&0u32.to_be_bytes()); // drops
+    buf.extend_from_slice(&1u32.to_be_bytes()); // input ifindex
+    buf.extend_from_slice(&2u32.to_be_bytes()); // output ifindex
+    buf.extend_from_slice(&1u32.to_be_bytes()); // num_flow_records = 1
+    buf.extend_from_slice(&1001u32.to_be_bytes()); // enterprise 0, format 1001
+    buf.extend_from_slice(&BODY_LEN.to_be_bytes()); // flow_data_length = 60000
+    buf.extend_from_slice(&vec![0xCDu8; BODY_LEN as usize]);
+    assert!(
+        buf.len() <= 65_535,
+        "fixture must fit one UDP datagram; got {} bytes",
+        buf.len()
+    );
+
+    let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let (extra, real) = live_heap_of(|| {
+        let mut records = decode_datagram(&buf, exporter).expect("must decode");
+        records.pop().expect("one record").extra
+    });
+
+    let array = extra.as_array().expect("extra must be an array");
+    assert_eq!(array.len(), 1, "the single record must survive, capped");
+    let record = &array[0];
+    assert_eq!(
+        record.get("length"),
+        Some(&serde_json::json!(BODY_LEN)),
+        "the original declared length must still be reported, uncapped"
+    );
+    assert_eq!(record.get("body_truncated"), Some(&serde_json::json!(true)));
+    assert_eq!(
+        record
+            .get("data_hex")
+            .and_then(|h| h.as_str())
+            .map(str::len),
+        Some(128 * 2),
+        "data_hex must be capped at 256 hex chars regardless of the 60,000-byte body"
+    );
+
+    // Before the cap: ~800 bytes of BTreeMap node + 2 bytes of hex per input
+    // byte =~ 800 + 2*60,000 =~ 120,800 bytes for this one record. After the
+    // cap, retention must be a small, fixed footprint unrelated to BODY_LEN.
+    assert!(
+        real < 5_000,
+        "near-max-body unknown record retained {real} bytes -- expected the body cap to \
+         bound this regardless of the attacker-declared body length"
+    );
+}
+
+/// Round-3 review requirement: confirm the body cap does not touch a normal,
+/// small unknown record -- no truncation flag, full hex content preserved.
+#[test]
+fn normal_small_unknown_record_body_is_not_truncated() {
+    use logthing::sflow::decoder::decode_datagram;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    // Same fixture shape as `json_heap_bytes_matches_real_allocation_for_a_
+    // populated_sflow_extra` above: a 16-byte extended_switch-shaped body,
+    // comfortably under MAX_UNKNOWN_RECORD_BODY_BYTES (128).
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&5u32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf.extend_from_slice(&[10, 0, 0, 1]);
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf.extend_from_slice(&56u32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf.extend_from_slice(&1000u32.to_be_bytes());
+    buf.extend_from_slice(&1000u32.to_be_bytes());
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf.extend_from_slice(&2u32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf.extend_from_slice(&1001u32.to_be_bytes());
+    buf.extend_from_slice(&16u32.to_be_bytes());
+    buf.extend_from_slice(&[0xEFu8; 16]);
+
+    let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let mut records = decode_datagram(&buf, exporter).expect("must decode");
+    let extra = records.pop().unwrap().extra;
+    let array = extra.as_array().expect("extra must be an array");
+    assert_eq!(array.len(), 1);
+    let record = &array[0];
+    assert_eq!(
+        record.get("body_truncated"),
+        None,
+        "a normal 16-byte body must not be flagged"
+    );
+    assert_eq!(
+        record
+            .get("data_hex")
+            .and_then(|h| h.as_str())
+            .map(str::len),
+        Some(16 * 2),
+        "a normal 16-byte body's hex must be preserved in full"
     );
 }
