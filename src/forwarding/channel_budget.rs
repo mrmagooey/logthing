@@ -219,14 +219,26 @@ pub const SYSLOG_MESSAGE_BYTES: usize = 768;
 /// file for the *typical* case. See that constant's doc comment for why 128
 /// is enough for diagnosis and for the ~120 KB single-record cost this caps.
 ///
+/// **`unknown_record_json` (`src/sflow/decoder.rs`) is not one shape.** The
+/// enterprise-specific push sites (`rec_enterprise != 0`, in both
+/// `decode_flow_sample` and `decode_counter_sample`) add one extra
+/// `"enterprise"` key per record that the "other unknown format" site
+/// (enterprise 0, an unrecognised format) does not. The enterprise-specific
+/// shape is therefore the more expensive of the two reachable shapes, and is
+/// the one this constant must ceiling -- an earlier version of this
+/// measurement used only the cheaper (enterprise-absent) shape.
+///
 /// Measured (not estimated -- via the counting allocator in
 /// `tests/channel_budget_allocator.rs`'s
-/// `measured_worst_case_single_sflow_record_bytes`, which is the source of
-/// truth for this constant): `size_of::<SflowRecord>()` (256) plus the real
-/// heap of `extra` holding 8 accepted records (enterprise 0, format 1001,
-/// each with a 7000-byte body truncated to 128 bytes / 256 hex chars) plus
-/// one `sample_cap` truncation marker for the 9th declared record that tips
-/// the sample over the cap: 256 + 8545 = 8801 bytes, rounded up to 8960. See
+/// `measured_worst_case_single_sflow_record_bytes`, which measures BOTH
+/// shapes and is the source of truth for this constant):
+/// `size_of::<SflowRecord>()` (256) plus the real heap of `extra` holding 8
+/// accepted enterprise-specific records (enterprise 4991, format 1001, each
+/// with a 7000-byte body truncated to 128 bytes / 256 hex chars) plus one
+/// `sample_cap` truncation marker for the 9th declared record that tips the
+/// sample over the cap: 256 + 8625 = 8881 bytes, rounded up to 8960 -- a
+/// margin of 79 bytes (0.9%). The cheaper enterprise-absent shape measures
+/// 8801 bytes and also clears the same 8960 ceiling. See
 /// `measured_sflow_record_bytes_matches_constant`.
 ///
 /// At 8960 bytes, `capacity_for` gives a channel depth of 11,702 records
@@ -237,7 +249,10 @@ pub const SYSLOG_MESSAGE_BYTES: usize = 768;
 /// 11,702 in-flight records is still a healthy depth for a UDP-sourced
 /// firehose; the model this constant feeds is now sound against both axes an
 /// attacker controls (record count and record size), not just the common
-/// case.
+/// case. The 0.9% margin is tight enough that adding a key to either JSON
+/// shape (or lowering `CHANNEL_BUDGET_BYTES`'s rounding granularity) should
+/// prompt re-running `measured_worst_case_single_sflow_record_bytes` before
+/// assuming the ceiling still holds.
 pub const SFLOW_RECORD_BYTES: usize = 8960;
 
 /// Measured footprint of one IPFIX channel message, which is a `Vec<FlowRecord>`
@@ -488,22 +503,27 @@ mod tests {
     }
 
     /// Builds a minimal sFlow v5 datagram: header plus one flow_sample
-    /// carrying `records` flow records in a format this decoder does not
-    /// curate, each with a `body_len`-byte body (enterprise 0, format 1001)
-    /// — see `SFLOW_RECORD_BYTES`'s doc comment for why `records` =
+    /// carrying `records` flow records with the given `flow_data_format`
+    /// (a format this decoder does not curate), each with a `body_len`-byte
+    /// body — see `SFLOW_RECORD_BYTES`'s doc comment for why `records` =
     /// `MAX_UNKNOWN_RECORDS_PER_SAMPLE_MIRROR + 1` (one over the cap, so the
-    /// fixture also exercises the `sample_cap` truncation marker) and
-    /// `body_len` far larger than `decoder::MAX_UNKNOWN_RECORD_BODY_BYTES`
-    /// together are the true worst case that bounds one channel slot: large
-    /// enough to trip the body cap on every accepted record, not just the
-    /// count cap.
+    /// fixture also exercises the `sample_cap` truncation marker), `body_len`
+    /// far larger than `decoder::MAX_UNKNOWN_RECORD_BODY_BYTES`, and an
+    /// enterprise-nonzero `flow_data_format` together are the true worst
+    /// case that bounds one channel slot: large enough to trip the body cap
+    /// on every accepted record (not just the count cap), and shaped to hit
+    /// the more expensive of `unknown_record_json`'s two call sites.
     ///
     /// Hand-built rather than reusing `crate::sflow::decoder::tests`'s
     /// fixtures: none of them exercise the non-curated path with an
     /// attacker-realistic body size, and driving the real decoder — rather
     /// than hand-writing the resulting `serde_json::Value` — is what makes
     /// this measurement trustworthy (see the doc comment above).
-    fn build_sflow_flow_sample_with_n_extension_records(records: u32, body_len: u32) -> Vec<u8> {
+    fn build_sflow_flow_sample_with_n_extension_records(
+        records: u32,
+        flow_data_format: u32,
+        body_len: u32,
+    ) -> Vec<u8> {
         let mut buf = Vec::new();
         // ── Datagram header (28 bytes) ──
         buf.extend_from_slice(&5u32.to_be_bytes()); // version = 5
@@ -529,13 +549,12 @@ mod tests {
         buf.extend_from_slice(&2u32.to_be_bytes()); // output ifindex
         buf.extend_from_slice(&records.to_be_bytes()); // num_flow_records
 
-        // ── flow records: enterprise=0 format=1001, oversized body ──
-        // Not one of the three curated formats (1, 3, 4), so
-        // `decode_flow_sample` stores each verbatim in `extra` (up to the
+        // ── flow records: not one of the three curated formats (1, 3, 4), ──
+        // so `decode_flow_sample` stores each verbatim in `extra` (up to the
         // per-sample cap and the per-record body cap; any excess trips a
         // truncation marker/flag instead).
         for _ in 0..records {
-            buf.extend_from_slice(&1001u32.to_be_bytes()); // flow_data_format
+            buf.extend_from_slice(&flow_data_format.to_be_bytes());
             buf.extend_from_slice(&body_len.to_be_bytes()); // flow_data_length
             buf.extend_from_slice(&vec![0xABu8; body_len as usize]);
         }
@@ -562,9 +581,16 @@ mod tests {
         // far larger than that cap so every accepted record actually trips
         // the body-truncation path, not just the count cap.
         const BODY_LEN: u32 = 7000;
+        // Enterprise 4991 (nonzero), format 1001: hits the enterprise-specific
+        // push site (`unknown_record_json(Some(rec_enterprise), ...)`), the
+        // more expensive of the two reachable shapes -- see
+        // `SFLOW_RECORD_BYTES`'s doc comment for why that is the real worst
+        // case, not the enterprise-absent shape a prior version measured.
+        const FLOW_DATA_FORMAT: u32 = (4991 << 12) | 1001;
 
         let buf = build_sflow_flow_sample_with_n_extension_records(
             MAX_UNKNOWN_RECORDS_PER_SAMPLE_MIRROR + 1,
+            FLOW_DATA_FORMAT,
             BODY_LEN,
         );
         let mut records = decode_datagram(&buf, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))

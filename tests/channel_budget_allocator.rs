@@ -418,16 +418,28 @@ fn multi_sample_hostile_sflow_datagram_heap_retention_is_bounded_by_the_datagram
 /// receive buffer), and the whole body used to be `hex::encode`d verbatim --
 /// so one oversized record could cost ~120 KB on its own, regardless of the
 /// per-sample/per-datagram count caps. `decoder::MAX_UNKNOWN_RECORD_BODY_
-/// BYTES` (128) now caps the hex-encoded body length per record; this test
-/// measures the TRUE worst case with that fix in place: `MAX_UNKNOWN_
-/// RECORDS_PER_SAMPLE` (8) accepted records, each with a body far larger
-/// than the 128-byte cap (7000 bytes -- comfortably larger than the cap
-/// while still letting 9 such records fit in one UDP datagram, matching how
-/// an attacker would actually pack this shape on the wire), plus one
-/// `sample_cap` truncation marker (a 9th declared record tips the sample
-/// over the cap -- pack the per-sample cap's worth of records into the
-/// first sample of a datagram, before the datagram-wide budget can bite at
-/// all).
+/// BYTES` (128) now caps the hex-encoded body length per record.
+///
+/// Round-4 review finding: `decoder::unknown_record_json` produces two
+/// different shapes depending on the call site -- the enterprise-specific
+/// sites (`rec_enterprise != 0`, in both `decode_flow_sample` and
+/// `decode_counter_sample`) pass `Some(rec_enterprise)` and get one extra
+/// `"enterprise"` key per record; the "other unknown format" site
+/// (enterprise 0, an unrecognised format) passes `None` and does not. A
+/// prior version of this test only measured the cheaper (enterprise-absent)
+/// shape despite claiming to measure the true worst case. This measures
+/// BOTH shapes and asserts the enterprise-specific one -- the genuinely more
+/// expensive of the two -- is what `channel_budget::SFLOW_RECORD_BYTES`
+/// ceilings.
+///
+/// Both shapes use `MAX_UNKNOWN_RECORDS_PER_SAMPLE` (8) accepted records,
+/// each with a body far larger than `MAX_UNKNOWN_RECORD_BODY_BYTES` (7000
+/// bytes -- comfortably larger than the 128-byte cap while still letting 9
+/// such records fit in one UDP datagram, matching how an attacker would
+/// actually pack this shape on the wire), plus one `sample_cap` truncation
+/// marker (a 9th declared record tips the sample over the cap -- pack the
+/// per-sample cap's worth of records into the first sample of a datagram,
+/// before the datagram-wide budget can bite at all).
 ///
 /// `std::mem::size_of::<SflowRecord>()` is added because that fixed part of
 /// the struct is what actually occupies the channel slot alongside the
@@ -446,84 +458,129 @@ fn measured_worst_case_single_sflow_record_bytes() {
     const RECORDS_IN_SAMPLE: u32 = MAX_UNKNOWN_RECORDS_PER_SAMPLE_MIRROR + 1; // 9: 8 accepted, 1 dropped
     const BODY_LEN: u32 = 7000; // far larger than MAX_UNKNOWN_RECORD_BODY_BYTES (128)
 
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&5u32.to_be_bytes()); // version = 5
-    buf.extend_from_slice(&1u32.to_be_bytes()); // agent_addr_type = IPv4
-    buf.extend_from_slice(&[10, 0, 0, 1]); // agent_addr
-    buf.extend_from_slice(&0u32.to_be_bytes()); // sub_agent_id
-    buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
-    buf.extend_from_slice(&1u32.to_be_bytes()); // uptime_ms
-    buf.extend_from_slice(&1u32.to_be_bytes()); // num_samples = 1
+    // Builds a datagram with one flow_sample carrying `RECORDS_IN_SAMPLE`
+    // flow records, all with `flow_data_format`, each with a `BODY_LEN`-byte
+    // body.
+    fn build(flow_data_format: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&5u32.to_be_bytes()); // version = 5
+        buf.extend_from_slice(&1u32.to_be_bytes()); // agent_addr_type = IPv4
+        buf.extend_from_slice(&[10, 0, 0, 1]); // agent_addr
+        buf.extend_from_slice(&0u32.to_be_bytes()); // sub_agent_id
+        buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
+        buf.extend_from_slice(&1u32.to_be_bytes()); // uptime_ms
+        buf.extend_from_slice(&1u32.to_be_bytes()); // num_samples = 1
 
-    let sample_body_len = 32 + (RECORDS_IN_SAMPLE as usize) * (8 + BODY_LEN as usize);
-    buf.extend_from_slice(&1u32.to_be_bytes()); // data_format = flow_sample
-    buf.extend_from_slice(&(sample_body_len as u32).to_be_bytes());
-    buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
-    buf.extend_from_slice(&1u32.to_be_bytes()); // source_id
-    buf.extend_from_slice(&1000u32.to_be_bytes()); // sampling_rate
-    buf.extend_from_slice(&1000u32.to_be_bytes()); // sample_pool
-    buf.extend_from_slice(&0u32.to_be_bytes()); // drops
-    buf.extend_from_slice(&1u32.to_be_bytes()); // input ifindex
-    buf.extend_from_slice(&2u32.to_be_bytes()); // output ifindex
-    buf.extend_from_slice(&RECORDS_IN_SAMPLE.to_be_bytes()); // num_flow_records
-    for _ in 0..RECORDS_IN_SAMPLE {
-        buf.extend_from_slice(&1001u32.to_be_bytes()); // enterprise 0, format 1001
-        buf.extend_from_slice(&BODY_LEN.to_be_bytes()); // flow_data_length = 7000
-        buf.extend_from_slice(&vec![0xABu8; BODY_LEN as usize]); // oversized body
+        let sample_body_len = 32 + (RECORDS_IN_SAMPLE as usize) * (8 + BODY_LEN as usize);
+        buf.extend_from_slice(&1u32.to_be_bytes()); // data_format = flow_sample
+        buf.extend_from_slice(&(sample_body_len as u32).to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
+        buf.extend_from_slice(&1u32.to_be_bytes()); // source_id
+        buf.extend_from_slice(&1000u32.to_be_bytes()); // sampling_rate
+        buf.extend_from_slice(&1000u32.to_be_bytes()); // sample_pool
+        buf.extend_from_slice(&0u32.to_be_bytes()); // drops
+        buf.extend_from_slice(&1u32.to_be_bytes()); // input ifindex
+        buf.extend_from_slice(&2u32.to_be_bytes()); // output ifindex
+        buf.extend_from_slice(&RECORDS_IN_SAMPLE.to_be_bytes()); // num_flow_records
+        for _ in 0..RECORDS_IN_SAMPLE {
+            buf.extend_from_slice(&flow_data_format.to_be_bytes());
+            buf.extend_from_slice(&BODY_LEN.to_be_bytes());
+            buf.extend_from_slice(&vec![0xABu8; BODY_LEN as usize]); // oversized body
+        }
+        assert!(
+            buf.len() <= 65_535,
+            "fixture must fit one UDP datagram; got {} bytes",
+            buf.len()
+        );
+        buf
     }
-    assert!(
-        buf.len() <= 65_535,
-        "fixture must fit one UDP datagram; got {} bytes",
-        buf.len()
-    );
 
-    let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-    let (extra, real_extra_heap) = live_heap_of(|| {
-        let mut records = decode_datagram(&buf, exporter).expect("must decode");
-        records.pop().expect("one record").extra
-    });
+    // Decodes `flow_data_format`'s fixture, asserts the common shape
+    // (8 accepted + 1 sample_cap marker, each accepted record's body
+    // truncated to the cap, "enterprise" key presence matching
+    // `expect_enterprise_key`), and returns the measured total bytes for
+    // one queued `SflowRecord`.
+    fn measure(flow_data_format: u32, expect_enterprise_key: bool) -> usize {
+        let buf = build(flow_data_format);
+        let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let (extra, real_extra_heap) = live_heap_of(|| {
+            let mut records = decode_datagram(&buf, exporter).expect("must decode");
+            records.pop().expect("one record").extra
+        });
 
-    let array = extra.as_array().expect("extra must be an array");
-    assert_eq!(
-        array.len(),
-        9,
-        "fixture must land exactly 8 accepted records plus 1 sample_cap marker; got {array:?}"
-    );
-    assert_eq!(
-        array.last().and_then(|v| v.get("reason")),
-        Some(&serde_json::json!("sample_cap")),
-        "the 9th declared record must trip the per-sample cap, not the datagram budget"
-    );
-    assert!(
-        array[..8]
-            .iter()
-            .all(|v| v.get("body_truncated") == Some(&serde_json::json!(true))),
-        "every accepted 7000-byte-body record must be flagged as body_truncated; got {array:?}"
-    );
-    assert!(
-        array[..8].iter().all(|v| v
-            .get("data_hex")
-            .and_then(|h| h.as_str())
-            .is_some_and(|h| h.len() == 128 * 2)),
-        "every accepted record's data_hex must be capped at MAX_UNKNOWN_RECORD_BODY_BYTES \
-         (128 bytes = 256 hex chars) regardless of the 7000-byte declared body; got {array:?}"
-    );
+        let array = extra.as_array().expect("extra must be an array");
+        assert_eq!(
+            array.len(),
+            9,
+            "fixture must land exactly 8 accepted records plus 1 sample_cap marker; \
+             got {array:?}"
+        );
+        assert_eq!(
+            array.last().and_then(|v| v.get("reason")),
+            Some(&serde_json::json!("sample_cap")),
+            "the 9th declared record must trip the per-sample cap, not the datagram budget"
+        );
+        assert!(
+            array[..8]
+                .iter()
+                .all(|v| v.get("body_truncated") == Some(&serde_json::json!(true))),
+            "every accepted 7000-byte-body record must be flagged as body_truncated; \
+             got {array:?}"
+        );
+        assert!(
+            array[..8].iter().all(|v| v
+                .get("data_hex")
+                .and_then(|h| h.as_str())
+                .is_some_and(|h| h.len() == 128 * 2)),
+            "every accepted record's data_hex must be capped at MAX_UNKNOWN_RECORD_BODY_BYTES \
+             (128 bytes = 256 hex chars) regardless of the 7000-byte declared body; got {array:?}"
+        );
+        assert_eq!(
+            array[..8].iter().all(|v| v.get("enterprise").is_some()),
+            expect_enterprise_key,
+            "\"enterprise\" key presence must match the call site exercised; got {array:?}"
+        );
 
-    let total = std::mem::size_of::<SflowRecord>() + real_extra_heap;
+        std::mem::size_of::<SflowRecord>() + real_extra_heap
+    }
+
+    // Enterprise-absent: the "other unknown format" push site
+    // (`unknown_record_json(None, ...)`) -- enterprise 0, an unrecognised
+    // format.
+    let enterprise_absent = measure(1001, false);
+    // Enterprise-specific: `rec_enterprise != 0` push site
+    // (`unknown_record_json(Some(rec_enterprise), ...)`) -- an arbitrary
+    // nonzero SMI-private-enterprise-shaped value (4991), format 1001.
+    let enterprise_specific = measure((4991u32 << 12) | 1001, true);
+
     eprintln!(
-        "measured worst-case single SflowRecord: size_of::<SflowRecord>()={} + \
-         real extra heap={real_extra_heap} = {total} bytes",
-        std::mem::size_of::<SflowRecord>()
+        "measured worst-case single SflowRecord: enterprise-absent={enterprise_absent} bytes, \
+         enterprise-specific={enterprise_specific} bytes"
     );
 
-    // This is the number that must feed `channel_budget::SFLOW_RECORD_BYTES`
-    // as a ceiling (>=), not an average -- see that constant's doc comment.
     assert!(
-        total <= logthing::forwarding::channel_budget::SFLOW_RECORD_BYTES,
-        "measured worst-case single record is {total} bytes, which exceeds \
-         SFLOW_RECORD_BYTES={}; re-measure and raise the constant",
-        logthing::forwarding::channel_budget::SFLOW_RECORD_BYTES
+        enterprise_specific > enterprise_absent,
+        "the enterprise-specific shape (one extra JSON key per accepted record) must be the \
+         more expensive of the two reachable shapes -- got \
+         enterprise_absent={enterprise_absent}, enterprise_specific={enterprise_specific}; \
+         if this no longer holds, `channel_budget::SFLOW_RECORD_BYTES` must be re-derived \
+         from whichever shape is now more expensive"
     );
+
+    // Both reachable shapes must clear the ceiling (>=, not an average) --
+    // see `channel_budget::SFLOW_RECORD_BYTES`'s doc comment. The
+    // enterprise-specific shape is expected to be the tighter of the two.
+    for (label, total) in [
+        ("enterprise-absent", enterprise_absent),
+        ("enterprise-specific", enterprise_specific),
+    ] {
+        assert!(
+            total <= logthing::forwarding::channel_budget::SFLOW_RECORD_BYTES,
+            "{label} worst-case single record is {total} bytes, which exceeds \
+             SFLOW_RECORD_BYTES={}; re-measure and raise the constant",
+            logthing::forwarding::channel_budget::SFLOW_RECORD_BYTES
+        );
+    }
 }
 
 /// Round-3 review regression: a single record with a near-maximum body (the

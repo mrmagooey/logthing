@@ -20,7 +20,8 @@ pub enum SampleType {
 ///
 /// Flow records carry 5-tuple + sampling metadata.
 /// Counter records carry generic interface counter fields (RFC 3176 §5.4.1).
-/// Non-curated record types land in `extra` as `{ "format": N, "length": N, "data_base64": "..." }`.
+/// Non-curated record types land in `extra` -- see that field's doc comment
+/// for the exact shape and caps.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SflowRecord {
     // identity / provenance
@@ -47,8 +48,30 @@ pub struct SflowRecord {
     pub if_out_ucast_pkts: Option<u64>,
     pub if_in_errors: Option<u32>,
     pub if_out_errors: Option<u32>,
-    /// Non-curated or vendor-specific records land here as JSON objects:
-    /// `[{ "format": N, "length": N, "data_base64": "..." }, ...]`
+    /// Non-curated or vendor-specific records land here as a JSON array of
+    /// objects, one per accepted record: `{ "format": N, "length": N,
+    /// "data_hex": "...", "enterprise": N, "body_truncated": true }`.
+    /// `enterprise` is present only for enterprise-specific records
+    /// (`decoder::unknown_record_json`'s `Some(rec_enterprise)` call sites);
+    /// `body_truncated` is present only when `data_hex` was cut short.
+    ///
+    /// `length` is always the record's FULL declared wire length, even when
+    /// `data_hex` is truncated -- a consumer must check `body_truncated`
+    /// rather than assuming `data_hex.len() / 2 == length` (see
+    /// `decoder::MAX_UNKNOWN_RECORD_BODY_BYTES`).
+    ///
+    /// The array may also carry one or both of two truncation markers, each
+    /// a separate object of the form `{ "truncated": N, "reason":
+    /// "sample_cap" | "datagram_budget" }`: a `"sample_cap"` marker when
+    /// this sample alone exceeded `decoder::MAX_UNKNOWN_RECORDS_PER_SAMPLE`,
+    /// and/or a `"datagram_budget"` marker (appended only to the last record
+    /// decoded from the datagram, with the true datagram-wide total) when
+    /// `decoder::MAX_UNKNOWN_RECORDS_PER_DATAGRAM` was exhausted anywhere in
+    /// the datagram -- see the `decoder` module's docs. The two are not
+    /// mutually exclusive on the same record (the last record in a datagram
+    /// can also be the one sample that hit its own per-sample cap), but a
+    /// record can never itself be responsible for both drop counts: reaching
+    /// the sample cap requires the datagram budget to still have been open.
     pub extra: JsonValue,
 }
 
