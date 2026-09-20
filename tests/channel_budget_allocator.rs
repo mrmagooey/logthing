@@ -254,7 +254,7 @@ fn json_heap_bytes_matches_real_allocation_for_a_populated_sflow_extra() {
 ///
 /// Before the cap, this exact fixture (8,177 unknown records, matching the
 /// demonstrated exploit) retained several MiB. The cap bounds retention to
-/// a small, fixed footprint -- at most `MAX_UNKNOWN_RECORDS_PER_SAMPLE`
+/// a small, fixed footprint -- at most `MAX_UNKNOWN_RECORDS_PER_SAMPLE` (8)
 /// `serde_json` records plus one truncation marker -- regardless of how many
 /// records the sample claims.
 #[test]
@@ -296,7 +296,7 @@ fn hostile_sflow_sample_heap_retention_is_bounded_by_the_cap_not_the_record_coun
 
     let array = extra.as_array().expect("extra must be an array");
     assert!(
-        array.len() <= 33,
+        array.len() <= 9,
         "extra must be capped, not proportional to the declared {NUM_RECORDS} records; \
          got {} entries",
         array.len()
@@ -317,9 +317,9 @@ fn hostile_sflow_sample_heap_retention_is_bounded_by_the_cap_not_the_record_coun
 ///
 /// Fixture: the maximum-density packing of capped samples into one
 /// 65,535-byte UDP datagram. Each sample costs 8 (envelope) + 32
-/// (flow-sample header) + 32*8 (32 unknown-record envelopes, zero-length
-/// bodies) = 296 bytes on the wire, so (65535 - 28) / 296 ~= 221 samples fit
-/// -- 221 * 32 ~= 7,072 unknown records *declared*, matching the worst-case
+/// (flow-sample header) + 8*8 (8 unknown-record envelopes, zero-length
+/// bodies) = 104 bytes on the wire, so (65535 - 28) / 104 = 629 samples fit
+/// -- 629 * 8 = 5,032 unknown records *declared*, matching the worst-case
 /// arithmetic in `MAX_UNKNOWN_RECORDS_PER_DATAGRAM`'s doc comment. Before
 /// the datagram-wide budget, this shape retained ~5 MB (matching the
 /// single-sample exploit, since the per-sample cap alone barely bit).
@@ -328,8 +328,8 @@ fn multi_sample_hostile_sflow_datagram_heap_retention_is_bounded_by_the_datagram
     use logthing::sflow::decoder::decode_datagram;
     use std::net::{IpAddr, Ipv4Addr};
 
-    const NUM_SAMPLES: u32 = 221;
-    const RECORDS_PER_SAMPLE: u32 = 32; // == MAX_UNKNOWN_RECORDS_PER_SAMPLE
+    const NUM_SAMPLES: u32 = 629;
+    const RECORDS_PER_SAMPLE: u32 = 8; // == MAX_UNKNOWN_RECORDS_PER_SAMPLE
 
     let mut buf = Vec::new();
     buf.extend_from_slice(&5u32.to_be_bytes()); // version = 5
@@ -363,15 +363,17 @@ fn multi_sample_hostile_sflow_datagram_heap_retention_is_bounded_by_the_datagram
         buf.len()
     );
 
+    // Measures the whole `Vec<SflowRecord>` decode_datagram returns, not just
+    // the `extra` fields: each record's fixed struct fields are exactly what
+    // occupies a channel slot alongside its heap (see `channel_budget.rs`'s
+    // module doc on block-array slot cost), so this is the faithful proxy
+    // for what queueing every one of these records would actually cost.
     let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-    let (extras, real) = live_heap_of(|| {
-        let records = decode_datagram(&buf, exporter).expect("must decode");
-        records.into_iter().map(|r| r.extra).collect::<Vec<_>>()
-    });
+    let (records, real) = live_heap_of(|| decode_datagram(&buf, exporter).expect("must decode"));
 
-    let total_accepted_records: usize = extras
+    let total_accepted_records: usize = records
         .iter()
-        .filter_map(|e| e.as_array())
+        .filter_map(|r| r.extra.as_array())
         .flat_map(|a| a.iter())
         .filter(|v| v.get("data_hex").is_some())
         .count();
@@ -384,16 +386,116 @@ fn multi_sample_hostile_sflow_datagram_heap_retention_is_bounded_by_the_datagram
         NUM_SAMPLES * RECORDS_PER_SAMPLE
     );
 
-    // Before the datagram-wide budget, this exact shape retained ~4.9 MB (the
+    // Before the datagram-wide budget, this shape retained several MB (the
     // per-sample cap alone barely reduced the single-sample exploit's ~5.34
-    // MB). Measured post-fix: ~416,534 bytes for 512 accepted records plus
-    // one truncation marker -- the datagram budget plus "notify once"
-    // truncation-marker dedup (see MAX_UNKNOWN_RECORDS_PER_DATAGRAM's doc
-    // comment) bounds this to a small, fixed footprint regardless of how
-    // records are spread across samples.
+    // MB). Measured post-fix: ~613,142 bytes total for 629 queued records --
+    // 629 * 256 = 161,024 bytes of struct overhead (every sample still
+    // produces one `SflowRecord`, whether or not its `extra` holds
+    // anything) plus ~452,118 bytes of heap for the 512 accepted records
+    // and one aggregate marker (see `decode_datagram`'s post-loop handling
+    // and `MAX_UNKNOWN_RECORDS_PER_DATAGRAM`'s doc comment) -- a small,
+    // fixed footprint regardless of how records are spread across samples,
+    // and nowhere near the original ~5.34 MB.
     assert!(
-        real < 500_000,
+        real < 700_000,
         "multi-sample hostile datagram retained {real} bytes -- expected the datagram \
          budget to bound this regardless of how records are spread across samples"
+    );
+}
+
+/// Round-2 review finding: `MAX_UNKNOWN_RECORDS_PER_DATAGRAM` bounds a
+/// *datagram's* total retention, but it resets on every `decode_datagram`
+/// call and so does not bound the cost of any *one* queued `SflowRecord` --
+/// the very first sample in a fresh datagram can still accept a full
+/// `MAX_UNKNOWN_RECORDS_PER_SAMPLE` worth of records. That per-record figure
+/// is what actually bounds one channel slot, so it is what
+/// `channel_budget::SFLOW_RECORD_BYTES` must measure and ceiling.
+///
+/// This measures the genuine worst-case-but-legitimate single record: the
+/// curated (flat, no-heap) `SflowRecord` fields plus
+/// `MAX_UNKNOWN_RECORDS_PER_SAMPLE` (8) accepted non-curated records (the
+/// same 16-byte `extended_switch`-shaped body used by
+/// `json_heap_bytes_matches_real_allocation_for_a_populated_sflow_extra`
+/// above and by `channel_budget.rs`'s own `SFLOW_RECORD_BYTES` fixture,
+/// representative of a real switch's non-curated record) plus one
+/// `sample_cap` truncation marker (a 9th record in the sample tips it over
+/// the cap, which is exactly the worst case a real attacker produces: pack
+/// the per-sample cap's worth of records into the first sample of a
+/// datagram, before the datagram-wide budget can bite at all).
+///
+/// `std::mem::size_of::<SflowRecord>()` is added because that fixed part of
+/// the struct is what actually occupies the channel slot alongside the
+/// heap-allocated `extra` -- same methodology as
+/// `measured_sflow_record_bytes_matches_constant` in `channel_budget.rs`,
+/// except here the heap portion is the real counting-allocator measurement,
+/// not the `json_heap_bytes` estimator, per the round-2 review's explicit
+/// "measure it, do not estimate it" instruction.
+#[test]
+fn measured_worst_case_single_sflow_record_bytes() {
+    use logthing::sflow::SflowRecord;
+    use logthing::sflow::decoder::decode_datagram;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    const MAX_UNKNOWN_RECORDS_PER_SAMPLE_MIRROR: u32 = 8; // == decoder::MAX_UNKNOWN_RECORDS_PER_SAMPLE (private)
+    const RECORDS_IN_SAMPLE: u32 = MAX_UNKNOWN_RECORDS_PER_SAMPLE_MIRROR + 1; // 9: 8 accepted, 1 dropped
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&5u32.to_be_bytes()); // version = 5
+    buf.extend_from_slice(&1u32.to_be_bytes()); // agent_addr_type = IPv4
+    buf.extend_from_slice(&[10, 0, 0, 1]); // agent_addr
+    buf.extend_from_slice(&0u32.to_be_bytes()); // sub_agent_id
+    buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
+    buf.extend_from_slice(&1u32.to_be_bytes()); // uptime_ms
+    buf.extend_from_slice(&1u32.to_be_bytes()); // num_samples = 1
+
+    let sample_body_len = 32 + (RECORDS_IN_SAMPLE as usize) * (8 + 16);
+    buf.extend_from_slice(&1u32.to_be_bytes()); // data_format = flow_sample
+    buf.extend_from_slice(&(sample_body_len as u32).to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
+    buf.extend_from_slice(&1u32.to_be_bytes()); // source_id
+    buf.extend_from_slice(&1000u32.to_be_bytes()); // sampling_rate
+    buf.extend_from_slice(&1000u32.to_be_bytes()); // sample_pool
+    buf.extend_from_slice(&0u32.to_be_bytes()); // drops
+    buf.extend_from_slice(&1u32.to_be_bytes()); // input ifindex
+    buf.extend_from_slice(&2u32.to_be_bytes()); // output ifindex
+    buf.extend_from_slice(&RECORDS_IN_SAMPLE.to_be_bytes()); // num_flow_records
+    for _ in 0..RECORDS_IN_SAMPLE {
+        buf.extend_from_slice(&1001u32.to_be_bytes()); // enterprise 0, format 1001
+        buf.extend_from_slice(&16u32.to_be_bytes()); // flow_data_length = 16
+        buf.extend_from_slice(&[0u8; 16]); // extended_switch-shaped body
+    }
+
+    let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let (extra, real_extra_heap) = live_heap_of(|| {
+        let mut records = decode_datagram(&buf, exporter).expect("must decode");
+        records.pop().expect("one record").extra
+    });
+
+    let array = extra.as_array().expect("extra must be an array");
+    assert_eq!(
+        array.len(),
+        9,
+        "fixture must land exactly 8 accepted records plus 1 sample_cap marker; got {array:?}"
+    );
+    assert_eq!(
+        array.last().and_then(|v| v.get("reason")),
+        Some(&serde_json::json!("sample_cap")),
+        "the 9th declared record must trip the per-sample cap, not the datagram budget"
+    );
+
+    let total = std::mem::size_of::<SflowRecord>() + real_extra_heap;
+    eprintln!(
+        "measured worst-case single SflowRecord: size_of::<SflowRecord>()={} + \
+         real extra heap={real_extra_heap} = {total} bytes",
+        std::mem::size_of::<SflowRecord>()
+    );
+
+    // This is the number that must feed `channel_budget::SFLOW_RECORD_BYTES`
+    // as a ceiling (>=), not an average -- see that constant's doc comment.
+    assert!(
+        total <= logthing::forwarding::channel_budget::SFLOW_RECORD_BYTES,
+        "measured worst-case single record is {total} bytes, which exceeds \
+         SFLOW_RECORD_BYTES={}; re-measure and raise the constant",
+        logthing::forwarding::channel_budget::SFLOW_RECORD_BYTES
     );
 }
