@@ -143,10 +143,18 @@ pub struct DefaultZeekHandler;
 #[async_trait::async_trait]
 impl ZeekHandler for DefaultZeekHandler {
     async fn handle_record(&self, record: ZeekRecord, source: SocketAddr) {
+        // `log_path` comes straight from the wire (`_path` in the NDJSON
+        // record, run through `normalize_log_path` but not length- or
+        // control-character-bounded) and this handler is wired in whenever
+        // no forwarding destination is configured (`main.rs`), i.e. reachable
+        // in production without auth. `fields` doesn't need the same
+        // treatment: `serde_json::Value::to_string()` always JSON-escapes
+        // control characters in string values, so it can't carry a raw
+        // newline or ANSI escape even though it's also wire-derived.
         info!(
             "[{}] zeek record: path={} fields={}",
             source,
-            record.log_path,
+            crate::sanitize_for_log(&record.log_path, 100),
             record
                 .fields
                 .to_string()
@@ -1482,6 +1490,48 @@ mod tests {
             buf.capacity(),
             cap_before,
             "capacity below the threshold must not be touched"
+        );
+    }
+
+    /// `DefaultZeekHandler` is wired in whenever no forwarding destination is
+    /// configured (`main.rs`), so its `info!` line is reachable in production
+    /// without auth. `log_path` comes straight from the wire (`_path`) and
+    /// was never bounded or sanitized before reaching that line. Uses the
+    /// shared `test_support` capture subscriber (see its doc comment).
+    #[tokio::test]
+    async fn default_handler_log_sanitizes_log_path() {
+        crate::test_support::install_and_clear();
+
+        let record = ZeekRecord {
+            log_path: "conn\rFAKE\n\u{1b}[31minjected\u{1b}[0m".to_string(),
+            fields: serde_json::json!({"_path": "conn"}),
+            received_at: chrono::Utc::now(),
+        };
+        let source: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        DefaultZeekHandler.handle_record(record, source).await;
+
+        let events = crate::test_support::captured_events();
+        let line = events
+            .iter()
+            .find(|m| m.contains("zeek record"))
+            .unwrap_or_else(|| panic!("no matching info! event captured; got: {events:?}"));
+
+        assert!(
+            !line.contains('\r'),
+            "raw CR leaked into the log line: {line:?}"
+        );
+        assert!(
+            !line.contains('\n'),
+            "raw LF leaked into the log line: {line:?}"
+        );
+        assert!(
+            !line.contains('\u{1b}'),
+            "raw ESC leaked into the log line: {line:?}"
+        );
+        assert!(
+            line.contains('\u{fffd}'),
+            "expected U+FFFD replacement characters in the log line: {line:?}"
         );
     }
 }

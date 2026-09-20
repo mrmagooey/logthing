@@ -143,10 +143,18 @@ pub struct DefaultSuricataHandler;
 #[async_trait::async_trait]
 impl SuricataHandler for DefaultSuricataHandler {
     async fn handle_record(&self, record: SuricataRecord, source: SocketAddr) {
+        // `event_type` is used verbatim from the wire (`event_type` in the
+        // EVE JSON record — unlike Zeek's `_path` it isn't even normalized)
+        // and this handler is wired in whenever no forwarding destination is
+        // configured (`main.rs`), i.e. reachable in production without auth.
+        // `fields` doesn't need the same treatment: `serde_json::Value::
+        // to_string()` always JSON-escapes control characters in string
+        // values, so it can't carry a raw newline or ANSI escape even though
+        // it's also wire-derived.
         info!(
             "[{}] suricata record: event_type={} fields={}",
             source,
-            record.event_type,
+            crate::sanitize_for_log(&record.event_type, 100),
             record
                 .fields
                 .to_string()
@@ -1444,6 +1452,48 @@ mod tests {
             buf.capacity(),
             cap_before,
             "capacity below the threshold must not be touched"
+        );
+    }
+
+    /// `DefaultSuricataHandler` is wired in whenever no forwarding destination
+    /// is configured (`main.rs`), so its `info!` line is reachable in
+    /// production without auth. `event_type` is used verbatim from the wire
+    /// and was never bounded or sanitized before reaching that line. Uses
+    /// the shared `test_support` capture subscriber (see its doc comment).
+    #[tokio::test]
+    async fn default_handler_log_sanitizes_event_type() {
+        crate::test_support::install_and_clear();
+
+        let record = SuricataRecord {
+            event_type: "alert\rFAKE\n\u{1b}[31minjected\u{1b}[0m".to_string(),
+            fields: serde_json::json!({"event_type": "alert"}),
+            received_at: chrono::Utc::now(),
+        };
+        let source: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+        DefaultSuricataHandler.handle_record(record, source).await;
+
+        let events = crate::test_support::captured_events();
+        let line = events
+            .iter()
+            .find(|m| m.contains("suricata record"))
+            .unwrap_or_else(|| panic!("no matching info! event captured; got: {events:?}"));
+
+        assert!(
+            !line.contains('\r'),
+            "raw CR leaked into the log line: {line:?}"
+        );
+        assert!(
+            !line.contains('\n'),
+            "raw LF leaked into the log line: {line:?}"
+        );
+        assert!(
+            !line.contains('\u{1b}'),
+            "raw ESC leaked into the log line: {line:?}"
+        );
+        assert!(
+            line.contains('\u{fffd}'),
+            "expected U+FFFD replacement characters in the log line: {line:?}"
         );
     }
 }

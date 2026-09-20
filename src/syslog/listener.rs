@@ -131,23 +131,43 @@ impl DefaultSyslogHandler {
 #[async_trait::async_trait]
 impl SyslogHandler for DefaultSyslogHandler {
     async fn handle_message(&self, message: SyslogMessage, source: SocketAddr) {
+        // This is the default, unauthenticated-reachable rendering of every
+        // successfully-parsed message (wired in main.rs whenever no
+        // forwarding destination is configured) — unlike the parse-error
+        // sites elsewhere in this file, `app_name` and `message` here had
+        // never been run through `sanitize_for_log` at all. `app_name` is a
+        // short RFC 3164/5424 tag, 100 bytes is ample; `message` is the
+        // actual log body operators read, so it gets more room (200 bytes)
+        // while still being far below a disk-fill amplifier.
         info!(
             "[{}] {} {} - {}: {}",
             source,
             message.facility_str(),
             message.severity_str(),
-            message.app_name.as_deref().unwrap_or("unknown"),
-            message.message
+            message
+                .app_name
+                .as_deref()
+                .map(|a| crate::sanitize_for_log(a, 100))
+                .unwrap_or(std::borrow::Cow::Borrowed("unknown")),
+            crate::sanitize_for_log(&message.message, 200)
         );
 
         if self.parse_dns_logs
             && let Some(dns_entry) = DnsLogEntry::from_syslog(&message)
         {
+            // `query_name`/`query_type` are regex captures off the same raw
+            // message (`DNS_BIND_RE`/`DNS_UNBOUND_RE`/`DNS_POWERDNS_RE` in
+            // `syslog::mod`); the PowerDNS pattern in particular captures
+            // `[^|]+`/`[^']+`, which (unlike `\S+`) does not exclude
+            // newlines, so control characters can reach here too.
+            // `client_ip` is digits-and-dots only by its own regex group and
+            // `response_ips` is `{:?}`-formatted (Vec<String>'s Debug impl
+            // escapes control characters), so neither needs sanitizing.
             info!(
                 "DNS Query: {} asked for {} ({}) -> {:?}",
                 dns_entry.client_ip,
-                dns_entry.query_name,
-                dns_entry.query_type,
+                crate::sanitize_for_log(&dns_entry.query_name, 100),
+                crate::sanitize_for_log(&dns_entry.query_type, 30),
                 dns_entry.response_ips
             );
         }
@@ -1995,6 +2015,60 @@ mod tests {
         assert!(
             warn_line.contains('\u{fffd}'),
             "expected U+FFFD replacement characters in the log line: {warn_line:?}"
+        );
+    }
+
+    /// `DefaultSyslogHandler` is wired in whenever no forwarding destination
+    /// is configured (`main.rs`), so its `info!` line is reachable in
+    /// production without auth. `app_name` and `message` come straight from
+    /// the wire and, unlike the parse-error sites elsewhere in this file, had
+    /// never been run through `sanitize_for_log` at all. Uses the shared
+    /// `test_support` capture subscriber (see its doc comment).
+    #[tokio::test]
+    async fn default_handler_log_sanitizes_app_name_and_message() {
+        use crate::syslog::SyslogProtocol;
+
+        crate::test_support::install_and_clear();
+
+        let message = SyslogMessage {
+            priority: 134,
+            severity: 6,
+            facility: 16,
+            timestamp: None,
+            hostname: None,
+            app_name: Some("evil-app\rFAKE\n\u{1b}[31minjected\u{1b}[0m".to_string()),
+            proc_id: None,
+            msg_id: None,
+            message: "payload\rFAKE\n\u{1b}[31minjected\u{1b}[0m".to_string(),
+            structured_data: None,
+            protocol: SyslogProtocol::Rfc3164,
+        };
+        let source: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let handler = DefaultSyslogHandler::new(false, false, None);
+
+        handler.handle_message(message, source).await;
+
+        let events = crate::test_support::captured_events();
+        let line = events
+            .iter()
+            .find(|m| m.contains("evil-app") || m.contains("payload"))
+            .unwrap_or_else(|| panic!("no matching info! event captured; got: {events:?}"));
+
+        assert!(
+            !line.contains('\r'),
+            "raw CR leaked into the log line: {line:?}"
+        );
+        assert!(
+            !line.contains('\n'),
+            "raw LF leaked into the log line: {line:?}"
+        );
+        assert!(
+            !line.contains('\u{1b}'),
+            "raw ESC leaked into the log line: {line:?}"
+        );
+        assert!(
+            line.contains('\u{fffd}'),
+            "expected U+FFFD replacement characters in the log line: {line:?}"
         );
     }
 }

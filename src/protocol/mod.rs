@@ -231,9 +231,15 @@ impl WefParser {
                     let text = match e.unescape() {
                         Ok(t) => t,
                         Err(err) => {
+                            // `current_tag` is the raw wire tag name (quick-xml
+                            // is non-validating, so it isn't restricted to
+                            // well-formed XML Name characters) and unbounded —
+                            // sanitize before it reaches this Display-formatted
+                            // debug! line.
                             debug!(
                                 "Failed to unescape XML text in tag <{}>: {}",
-                                current_tag, err
+                                crate::sanitize_for_log(&current_tag, 100),
+                                err
                             );
                             std::borrow::Cow::Borrowed("")
                         }
@@ -1000,5 +1006,41 @@ mod tests {
             }
             other => panic!("expected Events but got {:?}", other),
         }
+    }
+
+    /// `current_tag` is the raw wire tag name (quick-xml is non-validating,
+    /// so an ANSI escape isn't rejected as an illegal XML Name character —
+    /// unlike `\r`/`\n`, which quick-xml's tokenizer treats as a name
+    /// terminator and so can't reach `current_tag` this way). It must not
+    /// carry that escape raw into the "Failed to unescape XML text" debug!
+    /// line when the tag's text content fails to unescape (an unrecognized
+    /// entity reference). Uses the shared `test_support` capture subscriber
+    /// (see its doc comment).
+    #[tokio::test]
+    async fn unescape_error_log_sanitizes_tag_name() {
+        crate::test_support::install_and_clear();
+
+        let evil_tag = "Ev\u{1b}[31mil";
+        let xml = format!("<{evil_tag}>&badentity;</{evil_tag}>");
+        let parser = WefParser::new();
+
+        // Doesn't need to succeed -- the debug! site fires during the failed
+        // unescape regardless of the overall parse outcome.
+        let _ = parser.parse_event_data(&xml);
+
+        let events = crate::test_support::captured_events();
+        let line = events
+            .iter()
+            .find(|m| m.contains("Failed to unescape XML text"))
+            .unwrap_or_else(|| panic!("no matching debug! event captured; got: {events:?}"));
+
+        assert!(
+            !line.contains('\u{1b}'),
+            "raw ESC leaked into the log line: {line:?}"
+        );
+        assert!(
+            line.contains('\u{fffd}'),
+            "expected U+FFFD replacement characters in the log line: {line:?}"
+        );
     }
 }
