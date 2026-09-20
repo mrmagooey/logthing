@@ -19,7 +19,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{ConnectInfo, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     middleware,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -207,6 +207,22 @@ impl HttpBody for BudgetedBody {
 /// request that slips past it because of the race still gets charged (and
 /// potentially rejected mid-body) once its body is actually read.
 ///
+/// The fast path only applies to non-`GET` requests. `protected_router`
+/// mounts two bodyless GET informational routes alongside the
+/// `Bytes`-extracting POST ones (`/syslog/udp`, `/syslog/examples`) — they
+/// never consume budget, so gating them on `available_permits` would 503
+/// them whenever bursty or attacker POST traffic has drained the budget,
+/// for a reason that has nothing to do with anything a GET request touches.
+/// The method is not a value being trusted for charging (that would
+/// reintroduce exactly the header-trust mistake round 1 fixed) — it only
+/// decides whether this cheap pre-check is worth running at all. A client
+/// cannot use it to escape charging: `BudgetedBody` below still wraps and
+/// charges the body of every request regardless of method, so a
+/// hypothetical GET-with-body would simply lose the clean-503 fast path and
+/// fall through to the same real per-byte charging (and possible mid-body
+/// rejection) as everything else, exactly like the POST case where the
+/// budget is not yet fully drained at the time of this check.
+///
 /// `held` is created here and a clone handed to `BudgetedBody`, but THIS
 /// binding — not the body's — is what determines when charged permits are
 /// released: it is kept alive across the whole `next.run(request).await`,
@@ -223,7 +239,7 @@ async fn body_budget_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    if budget.available_permits() == 0 {
+    if request.method() != Method::GET && budget.available_permits() == 0 {
         metrics::counter!("body_budget_exhausted").increment(1);
         warn!(
             "body byte budget already exhausted; rejecting {} with 503",
@@ -2200,6 +2216,48 @@ event_parsers:
             response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "an already-exhausted budget must be rejected with 503 before handoff"
+        );
+    }
+
+    /// Regression for the fast-path-503-ing-bodyless-GETs finding: a fully
+    /// exhausted budget must NOT reject a bodyless GET. `/syslog/udp` and
+    /// `/syslog/examples` are real routes of exactly this shape on
+    /// `protected_router` -- they never extract `Bytes` and so never consume
+    /// budget, but sat behind the same `available_permits() == 0` fast path
+    /// as every POST route until this fix. Replaces the coverage lost when
+    /// `declared_body_budget_is_zero_for_bodyless_requests` was deleted as
+    /// part of round 1 (that test covered the now-gone declared-length
+    /// function; this one covers the behavioural property directly against
+    /// `body_budget_middleware` itself, which is what actually matters and
+    /// what outlived the mechanism it was originally attached to).
+    #[tokio::test]
+    async fn body_budget_does_not_503_bodyless_get_when_exhausted() {
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        // Zero capacity -- the same fully-exhausted setup as the POST case
+        // above, which DOES 503 here. A GET must sail through regardless.
+        let budget = Arc::new(Semaphore::new(0));
+        let router: Router = Router::new()
+            .route("/syslog/udp", get(|| async { (StatusCode::OK, "info") }))
+            .layer(middleware::from_fn_with_state(
+                budget,
+                body_budget_middleware,
+            ));
+
+        let request = HttpRequest::builder()
+            .method("GET")
+            .uri("/syslog/udp")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a bodyless GET must not be rejected by a budget gate that exists to bound \
+             body-buffering memory -- it buffers none"
         );
     }
 
