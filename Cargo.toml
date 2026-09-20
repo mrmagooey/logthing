@@ -29,6 +29,16 @@ axum-extra = { version = "0.9", features = ["typed-header"] }
 headers = "0.4"
 tower = { version = "0.4", features = ["limit", "util"] }
 tower-http = { version = "0.5", features = ["trace", "cors", "timeout"] }
+# Already compiled in transitively as the axum 0.7 / hyper 1.x body types --
+# named directly (pinned to the exact versions already in Cargo.lock) so
+# `src/server/mod.rs`'s body-byte-budget middleware can implement
+# `http_body::Body` itself and charge each request's ACTUAL streamed bytes,
+# rather than a client-supplied `Content-Length` (which HTTP/2 does not let
+# the server verify against real DATA-frame bytes, and which chunked
+# HTTP/1.1 bodies never send at all). No new code or supply-chain surface --
+# only makes an already-present crate nameable.
+http-body = "=1.0.1"
+http-body-util = "=0.1.3"
 
 # TLS/SSL
 rustls = "0.23"
@@ -81,8 +91,11 @@ chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
 futures = "0.3"
 
-# HTTP client for tests / admin proxy
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# HTTP client for tests / admin proxy. "http2" is needed so tests can drive
+# the server's h2c auto-negotiation (`axum::serve`'s `hyper_util::auto`
+# builder accepts both HTTP/1.1 and h2c with no `http1_only` restriction) --
+# see the real-wire body-byte-budget tests in `src/server/mod.rs`.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
 
 # Parquet file handling
 parquet = { version = "53.0", features = ["async", "arrow"] }
