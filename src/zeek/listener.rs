@@ -99,9 +99,11 @@ fn shrink_oversized_buffer(buf: &mut Vec<u8>) {
 /// `cfg(test)` gets this value, not just the idle-timeout tests. In
 /// particular, `oversized_line_closes_connection_and_increments_metric` and
 /// `valid_connection_after_oversized_still_works` each push
-/// `ZEEK_MAX_LINE_BYTES + 1` (16 MiB + 1) of un-newlined data through a
-/// single `read_until` call that this same timeout wraps; that call must
-/// finish within this window or those tests fail for the wrong reason
+/// `ZEEK_MAX_LINE_BYTES + 1` (16 MiB + 1) of un-newlined data through the
+/// `fill_buf`/`consume` line-assembly loop in `handle_tcp_connection` — one
+/// `tokio::time::timeout` still wraps the whole loop, not each individual
+/// `fill_buf` call, so the loop must finish assembling (or overflowing) the
+/// line within this window or those tests fail for the wrong reason
 /// (idle-timeout counter instead of oversized-lines counter). 5s gives that
 /// a ~3.3 MB/s floor, comfortable even on a loaded/throttled CI runner. If
 /// you're tempted to tune this down further for faster idle-timeout tests,
@@ -339,7 +341,17 @@ impl ZeekListener {
                     loop {
                         let available = reader.fill_buf().await?;
                         if available.is_empty() {
-                            return Ok(LineReadOutcome::Eof);
+                            // True EOF. `read_until`'s original contract returns `Ok(n)` with
+                            // whatever was accumulated (n > 0) on a mid-line EOF, not `Ok(0)` —
+                            // an ordinary client that writes its final record with no trailing
+                            // newline and then closes must still have it parsed and dispatched.
+                            // Only a clean EOF with nothing accumulated ends the connection
+                            // silently.
+                            return Ok(if buf.is_empty() {
+                                LineReadOutcome::Eof
+                            } else {
+                                LineReadOutcome::Line
+                            });
                         }
                         let remaining_cap = ZEEK_MAX_LINE_BYTES + 1 - buf.len();
                         let take_len = available.len().min(remaining_cap);
@@ -1294,11 +1306,14 @@ mod tests {
     // -- Byte budget: bounds aggregate memory, not just per-connection --
 
     /// Proves the shared byte budget bounds AGGREGATE in-flight line-buffer memory across many
-    /// connections, not just the per-connection `ZEEK_MAX_LINE_BYTES` cap. Six connections share
-    /// a deliberately small 4-permit (256 KiB) budget and each try to accumulate 1 MiB of
-    /// un-newlined data — far more than the shared budget can support even for one connection.
-    /// With the fix, connections that can't get budget are closed via
-    /// `zeek_tcp_budget_exhausted` instead of growing without limit.
+    /// connections — not merely that *some* cap exists.
+    ///
+    /// Sizing is deliberate: the 256 KiB (4-permit) budget is bigger than any single
+    /// connection's 100 KiB payload, so no one connection can exhaust the budget alone — a
+    /// regression to a *private per-connection* budget of this same size would send every
+    /// connection through untouched and `zeek_tcp_budget_exhausted` would stay at 0, failing
+    /// the assertion below. Only the SUM across all 6 connections (600 KiB) exceeds the 256 KiB
+    /// budget, so exhaustion firing here is proof the budget is genuinely shared.
     #[tokio::test]
     #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
     async fn byte_budget_caps_aggregate_memory_across_connections() {
@@ -1312,18 +1327,22 @@ mod tests {
         let _guard = set_default_local_recorder(&recorder);
 
         // 4 permits * ZEEK_BUDGET_CHUNK_BYTES (64 KiB) = 256 KiB, shared by every connection
-        // spawned below — far below what 6 connections each sending 1 MiB would need.
+        // spawned below.
         let byte_budget = Arc::new(Semaphore::new(4));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         const CONNS: usize = 6;
+        // 100 KiB per connection: comfortably under the 256 KiB budget on its own (so a
+        // per-connection-budget regression would NOT trip this), but 6 * 100 KiB = 600 KiB
+        // comfortably over it (so the shared budget must).
+        const PAYLOAD_BYTES: usize = 100 * 1024;
         let mut clients = Vec::new();
         for _ in 0..CONNS {
             clients.push(tokio::spawn(async move {
                 let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-                let payload = vec![b'x'; 1024 * 1024]; // 1 MiB, no newline
+                let payload = vec![b'x'; PAYLOAD_BYTES]; // no newline
                 let _ = stream.write_all(&payload).await;
                 let mut sink = Vec::new();
                 let _ = timeout(Duration::from_secs(5), stream.read_to_end(&mut sink)).await;
@@ -1393,6 +1412,45 @@ mod tests {
 
         let records = handler.take_records();
         assert_eq!(records.len(), 1, "normal line must still be dispatched");
+        assert_eq!(records[0].log_path, "conn");
+    }
+
+    /// F6-adjacent regression: a client that writes its final record WITHOUT a trailing
+    /// newline and then closes (an entirely ordinary TCP close, or a killed process) must
+    /// still have that record parsed and dispatched — matching `read_until`'s original
+    /// contract, where EOF mid-line returns `Ok(n)` with the accumulated bytes rather than
+    /// `Ok(0)`. The fill_buf/consume rewrite must preserve that: only a *clean* EOF (nothing
+    /// accumulated yet) should silently end the connection.
+    #[tokio::test]
+    async fn unterminated_final_line_is_dispatched_on_eof() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+
+        let handler = CapturingHandler::new();
+        let handler_clone = handler.clone();
+        let listener = ZeekListener::new(ZeekListenerConfig::default(), handler_clone);
+        let task = tokio::spawn(async move {
+            listener.run_with_listener(tcp_listener).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // No trailing '\n' — the record is complete but the stream simply ends here.
+        stream
+            .write_all(b"{\"_path\":\"conn\",\"uid\":\"NoTrailingNewline\"}")
+            .await
+            .unwrap();
+        drop(stream); // close write half -> EOF with a non-empty partial line buffered
+
+        sleep(Duration::from_millis(150)).await;
+        task.abort();
+
+        let records = handler.take_records();
+        assert_eq!(
+            records.len(),
+            1,
+            "a final record with no trailing newline must still be parsed and dispatched on EOF"
+        );
         assert_eq!(records[0].log_path, "conn");
     }
 
