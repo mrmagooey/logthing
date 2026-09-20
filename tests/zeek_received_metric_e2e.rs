@@ -33,6 +33,7 @@ use logthing::config::{Config, MetricsConfig, TlsConfig, ZeekLocalConfig};
 use logthing::forwarding::flush_registry::FlushIntervalRegistry;
 use logthing::forwarding::local_sink::LocalDiskSink;
 use logthing::forwarding::zeek_s3::{MultiZeekHandler, zeek_local_start};
+use logthing::middleware::IpWhitelist;
 use logthing::server::Server;
 use logthing::stats::{SourceHourlyStats, ThroughputStats};
 use logthing::zeek::listener::{ZeekListener, ZeekListenerConfig};
@@ -123,6 +124,7 @@ async fn zeek_records_received_visible_on_real_metrics_endpoint_with_forwarding_
         Arc::new(ThroughputStats::new()),
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
+        IpWhitelist::empty(),
     )
     .await
     .expect("Server::new must succeed with no S3/local targets configured");

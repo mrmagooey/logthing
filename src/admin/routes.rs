@@ -11,8 +11,8 @@ use tracing::{error, info};
 
 use crate::admin::auth::{ensure_authorized, generate_csrf_token};
 use crate::admin::config_api::{
-    PartialConfigUpdate, apply_flush_intervals, merge_redacted_secrets, persist_config,
-    redacted_config, validate_config_invariants,
+    PartialConfigUpdate, apply_flush_intervals, apply_live_security_settings,
+    merge_redacted_secrets, persist_config, redacted_config, validate_config_invariants,
 };
 use crate::admin::middleware::security_middleware;
 use crate::admin::state::{
@@ -26,12 +26,19 @@ pub fn spawn_admin_server(
     config: Arc<RwLock<Config>>,
     source_stats: Arc<crate::stats::SourceHourlyStats>,
     flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry,
+    ip_whitelist: crate::middleware::IpWhitelist,
 ) {
     tokio::spawn(async move {
         match load_admin_config() {
             Ok(server_config) => {
-                if let Err(err) =
-                    run_admin_server(config, server_config, source_stats, flush_registry).await
+                if let Err(err) = run_admin_server(
+                    config,
+                    server_config,
+                    source_stats,
+                    flush_registry,
+                    ip_whitelist,
+                )
+                .await
                 {
                     error!("Admin server error: {}", err);
                 }
@@ -49,6 +56,7 @@ async fn run_admin_server(
     server_config: AdminServerConfig,
     source_stats: Arc<crate::stats::SourceHourlyStats>,
     flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry,
+    ip_whitelist: crate::middleware::IpWhitelist,
 ) -> anyhow::Result<()> {
     let audit_logger = AuditLogger::new(1000).await;
     let csrf_tokens: Arc<RwLock<Vec<(String, std::time::Instant)>>> =
@@ -64,6 +72,7 @@ async fn run_admin_server(
         request_counts: request_counts.clone(),
         source_stats,
         flush_registry,
+        ip_whitelist,
     };
 
     let app = axum::Router::new()
@@ -329,6 +338,7 @@ async fn update_config(
     };
 
     apply_flush_intervals(&state.flush_registry, &updated_config);
+    apply_live_security_settings(&state, &updated_config);
 
     // Log the change
     state
@@ -590,6 +600,7 @@ mod tests {
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
             flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
+            ip_whitelist: crate::middleware::IpWhitelist::empty(),
         }
     }
 
@@ -942,6 +953,7 @@ mod tests {
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: source_stats.clone(),
             flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
+            ip_whitelist: crate::middleware::IpWhitelist::empty(),
         };
         let app = axum::Router::new()
             .route("/stats.json", axum::routing::get(get_stats_json))
@@ -1007,6 +1019,7 @@ mod tests {
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
             flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
+            ip_whitelist: crate::middleware::IpWhitelist::empty(),
         };
 
         let app = axum::Router::new()
@@ -1221,6 +1234,7 @@ mod tests {
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
             flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
+            ip_whitelist: crate::middleware::IpWhitelist::empty(),
         };
 
         let mut request = create_request_with_auth(Method::GET, "/", "admin", "admin", None);
@@ -1491,6 +1505,74 @@ mod tests {
         }
     }
 
+    /// End-to-end regression test for the live-reload `security.allowed_ips`
+    /// fix, exercised through the actual HTTP `PUT /config` path (not just
+    /// unit-level `IpWhitelist::set_networks` plumbing): a config change
+    /// must push the new allowlist into the SAME `IpWhitelist` instance the
+    /// main HTTP router and every wire-protocol listener hold a `Clone` of
+    /// — proven here by asserting `state.ip_whitelist.is_allowed` flips for
+    /// a fixed source address, before vs. after the PUT.
+    #[tokio::test]
+    async fn put_config_pushes_allowed_ips_change_into_shared_ip_whitelist() {
+        use crate::config::TlsConfig;
+        use crate::middleware::IpWhitelist;
+
+        let _sandbox = sandbox_persist_config_path().await;
+        let mut state = test_state().await;
+
+        // Start with a whitelist that excludes 203.0.113.5 — the SAME
+        // instance `state.ip_whitelist` is set to, standing in for the one
+        // instance shared with `main.rs`'s Server and wire listeners.
+        let ip_whitelist = IpWhitelist::new(vec!["10.0.0.0/8".to_string()]).unwrap();
+        state.ip_whitelist = ip_whitelist.clone();
+
+        let probe_addr: std::net::SocketAddr = "203.0.113.5:12345".parse().unwrap();
+        assert!(
+            !ip_whitelist.is_allowed(&probe_addr),
+            "test premise: 203.0.113.5 must start out blocked"
+        );
+
+        let mut new_config = Config {
+            tls: TlsConfig {
+                enabled: false,
+                ..TlsConfig::default()
+            },
+            ..Config::default()
+        };
+        new_config.security.allowed_ips = vec!["203.0.113.0/24".to_string()];
+
+        let json_body = serde_json::to_string(&new_config).unwrap();
+        let mut request = axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri("/config")
+            .header("content-type", "application/json")
+            .header(
+                "Authorization",
+                format!("Basic {}", encode_base64("admin:admin")),
+            )
+            .body(Body::from(json_body))
+            .unwrap();
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+        let app = axum::Router::new()
+            .route("/config", axum::routing::put(update_config))
+            .with_state(state);
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "PUT /config must succeed for a valid config"
+        );
+
+        assert!(
+            ip_whitelist.is_allowed(&probe_addr),
+            "PUT /config must push the new allowed_ips into the shared IpWhitelist \
+             instance — this is the actual bug fix, exercised end-to-end through the \
+             HTTP path, no restart"
+        );
+    }
+
     /// End-to-end regression test for the live-reload flush-interval fix,
     /// exercised through the actual HTTP path (not just unit-level plumbing):
     /// a `PUT /config` request whose `syslog.s3.flush_interval_secs` differs
@@ -1722,6 +1804,7 @@ mod tests {
                 request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
                 source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
                 flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
+                ip_whitelist: crate::middleware::IpWhitelist::empty(),
             }
         }
 

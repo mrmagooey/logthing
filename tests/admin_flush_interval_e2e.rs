@@ -22,6 +22,7 @@ use logthing::config::{Config, SyslogLocalConfig, TlsConfig};
 use logthing::forwarding::flush_registry::FlushIntervalRegistry;
 use logthing::forwarding::local_sink::LocalDiskSink;
 use logthing::forwarding::syslog_s3::syslog_local_start;
+use logthing::middleware::IpWhitelist;
 use logthing::stats::SourceHourlyStats;
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,6 +124,7 @@ async fn put_config_over_real_http_updates_already_running_writers_live_flush_in
         shared_config,
         Arc::new(SourceHourlyStats::new()),
         flush_registry,
+        IpWhitelist::empty(),
     );
 
     // ---------------------------------------------------------------------

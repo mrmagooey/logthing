@@ -269,6 +269,7 @@ mod tests {
                 request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
                 source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
                 flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
+                ip_whitelist: crate::middleware::IpWhitelist::empty(),
             }
         }
 
@@ -425,6 +426,7 @@ mod tests {
                 request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
                 source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
                 flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
+                ip_whitelist: crate::middleware::IpWhitelist::empty(),
             }
         }
 

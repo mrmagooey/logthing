@@ -17,6 +17,7 @@
 
 use logthing::config::{Config, MetricsConfig, TlsConfig};
 use logthing::forwarding::flush_registry::FlushIntervalRegistry;
+use logthing::middleware::IpWhitelist;
 use logthing::server::Server;
 use logthing::stats::{SourceHourlyStats, ThroughputStats};
 use std::sync::Arc;
@@ -85,6 +86,7 @@ async fn throughput_endpoint_stays_bounded_under_a_flood_of_distinct_event_types
         throughput,
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
+        IpWhitelist::empty(),
     )
     .await
     .expect("Server::new must succeed with no S3/local targets configured");

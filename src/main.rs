@@ -84,6 +84,7 @@ async fn async_main() -> anyhow::Result<()> {
         shared_config.clone(),
         source_stats.clone(),
         flush_registry.clone(),
+        ip_whitelist.clone(),
     );
     let throughput = Arc::new(stats::ThroughputStats::new());
 
@@ -743,6 +744,7 @@ async fn async_main() -> anyhow::Result<()> {
         throughput,
         source_stats,
         flush_registry,
+        ip_whitelist,
     )
     .await?;
 

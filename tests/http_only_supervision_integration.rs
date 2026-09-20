@@ -15,6 +15,7 @@
 
 use logthing::config::{Config, MetricsConfig, TlsConfig};
 use logthing::forwarding::flush_registry::FlushIntervalRegistry;
+use logthing::middleware::IpWhitelist;
 use logthing::server::Server;
 use logthing::shutdown::supervise_listener_handles;
 use logthing::stats::{SourceHourlyStats, ThroughputStats};
@@ -51,6 +52,7 @@ async fn http_only_deployment_stays_up_then_shuts_down_cleanly() {
         throughput,
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
+        IpWhitelist::empty(),
     )
     .await
     .expect("Server::new must succeed with no S3/local targets configured");

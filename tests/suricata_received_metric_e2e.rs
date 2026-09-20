@@ -33,6 +33,7 @@ use logthing::config::{Config, MetricsConfig, SuricataLocalConfig, TlsConfig};
 use logthing::forwarding::flush_registry::FlushIntervalRegistry;
 use logthing::forwarding::local_sink::LocalDiskSink;
 use logthing::forwarding::suricata_s3::{MultiSuricataHandler, suricata_local_start};
+use logthing::middleware::IpWhitelist;
 use logthing::server::Server;
 use logthing::stats::{SourceHourlyStats, ThroughputStats};
 use logthing::suricata::listener::{SuricataListener, SuricataListenerConfig};
@@ -112,6 +113,7 @@ async fn suricata_records_received_visible_on_real_metrics_endpoint_with_forward
         Arc::new(ThroughputStats::new()),
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
+        IpWhitelist::empty(),
     )
     .await
     .expect("Server::new must succeed with no S3/local targets configured");

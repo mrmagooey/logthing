@@ -34,6 +34,7 @@
 
 use logthing::config::{Config, MetricsConfig, SecurityConfig, TlsConfig};
 use logthing::forwarding::flush_registry::FlushIntervalRegistry;
+use logthing::middleware::IpWhitelist;
 use logthing::server::Server;
 use logthing::stats::{SourceHourlyStats, ThroughputStats};
 use std::net::{IpAddr, Ipv4Addr};
@@ -82,12 +83,14 @@ async fn allowed_ips_gates_metrics_in_both_directions() {
     };
 
     let shared_config = Arc::new(RwLock::new(config.clone()));
+    let ip_whitelist = IpWhitelist::new(config.security.allowed_ips.clone()).unwrap();
     let server = Server::new(
         config,
         shared_config,
         Arc::new(ThroughputStats::new()),
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
+        ip_whitelist,
     )
     .await
     .expect("Server::new must succeed with no S3/local targets configured");

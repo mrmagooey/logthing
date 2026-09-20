@@ -299,6 +299,14 @@ pub struct Server {
     /// present depending on how many of `[hec.s3]` / `[hec.local]` are configured
     /// and construct successfully). Awaited during graceful shutdown.
     hec_worker_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// The SAME `IpWhitelist` instance shared with `main.rs`'s five
+    /// wire-protocol listeners and the admin API (via `AdminState::ip_whitelist`).
+    /// `run`/`run_tls` clone this into `create_router` and the metrics server
+    /// instead of building their own from `config.security.allowed_ips`, so a
+    /// live `security.allowed_ips` update (see
+    /// `crate::admin::config_api::apply_live_security_settings`) reaches every
+    /// consumer — not just the ones constructed after the update.
+    ip_whitelist: IpWhitelist,
 }
 
 impl Server {
@@ -311,6 +319,7 @@ impl Server {
     ///
     /// ```no_run
     /// use logthing::config::Config;
+    /// use logthing::middleware::IpWhitelist;
     /// use logthing::server::Server;
     /// use logthing::stats::{SourceHourlyStats, ThroughputStats};
     /// use std::sync::Arc;
@@ -321,9 +330,18 @@ impl Server {
     ///     let shared_config = Arc::new(RwLock::new(config.clone()));
     ///     let throughput = Arc::new(ThroughputStats::new());
     ///     let source_stats = Arc::new(SourceHourlyStats::new());
+    ///     let ip_whitelist = IpWhitelist::empty();
     ///
     ///     let flush_registry = logthing::forwarding::flush_registry::FlushIntervalRegistry::new();
-    ///     let server = Server::new(config, shared_config, throughput, source_stats, flush_registry).await?;
+    ///     let server = Server::new(
+    ///         config,
+    ///         shared_config,
+    ///         throughput,
+    ///         source_stats,
+    ///         flush_registry,
+    ///         ip_whitelist,
+    ///     )
+    ///     .await?;
     ///     // server.run().await?;
     ///     Ok(())
     /// }
@@ -334,6 +352,7 @@ impl Server {
         throughput: Arc<ThroughputStats>,
         source_stats: Arc<crate::stats::SourceHourlyStats>,
         flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry,
+        ip_whitelist: IpWhitelist,
     ) -> anyhow::Result<Self> {
         #[cfg(feature = "kerberos-auth")]
         {
@@ -548,6 +567,7 @@ impl Server {
             wef_worker_handles,
             ingest_state,
             hec_worker_handles,
+            ip_whitelist,
         })
     }
 
@@ -581,11 +601,12 @@ impl Server {
         self,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let ip_whitelist = if self.config.security.allowed_ips.is_empty() {
-            IpWhitelist::empty()
-        } else {
-            IpWhitelist::new(self.config.security.allowed_ips.clone())?
-        };
+        // `self.ip_whitelist` (not a fresh build from `self.config.security.allowed_ips`,
+        // which is a startup snapshot) — this is the SAME instance shared with
+        // main.rs's five wire-protocol listeners and the admin API, so a live
+        // `security.allowed_ips` update reaches this router too. See the
+        // `ip_whitelist` field doc comment on `Server`.
+        let ip_whitelist = self.ip_whitelist.clone();
 
         // Clone the whitelist before it is moved into `create_router` below —
         // the metrics router needs its own copy of the same
@@ -662,8 +683,6 @@ impl Server {
             .layer(axum::Extension(ip_whitelist.clone()))
             .with_state(self.state.clone());
 
-        let cfg_token = Arc::new(self.config.hec.token.clone());
-
         if self.config.hec.enabled && self.config.hec.token.is_empty() {
             warn!(
                 "[hec] enabled with an empty token — all HEC ingest endpoints accept \
@@ -714,10 +733,14 @@ impl Server {
 
         // Extensions for HEC handlers are harmless to the existing WEF/syslog
         // handlers and are always layered so the extractors resolve when the
-        // routes are mounted.
+        // routes are mounted. The config extension is the SAME
+        // `Arc<RwLock<Config>>` as `AppState.config`, so `hec.token` is read
+        // LIVE on every request (see `handle_hec_event` and siblings in
+        // `src/ingest/handlers.rs`) instead of the pre-fix snapshot-at-startup
+        // `Extension<Arc<String>>`.
         let protected_router = protected_router
             .layer(axum::Extension(self.ingest_state.clone()))
-            .layer(axum::Extension(cfg_token))
+            .layer(axum::Extension(self.state.config.clone()))
             .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE))
             .layer(middleware::from_fn_with_state(
                 body_budget,
@@ -779,11 +802,9 @@ impl Server {
             return self.run(shutdown_rx).await;
         }
 
-        let ip_whitelist = if self.config.security.allowed_ips.is_empty() {
-            IpWhitelist::empty()
-        } else {
-            IpWhitelist::new(self.config.security.allowed_ips.clone())?
-        };
+        // Same shared instance as `run` — see the `ip_whitelist` field doc
+        // comment on `Server`.
+        let ip_whitelist = self.ip_whitelist.clone();
 
         let app = self.create_router(ip_whitelist)?;
 
@@ -3336,7 +3357,9 @@ event_parsers:
         use axum::{Extension, Router, routing::post};
         use std::sync::Arc;
 
-        let cfg_token = Arc::new(token.to_string());
+        let mut cfg = Config::default();
+        cfg.hec.token = token.to_string();
+        let shared_config = Arc::new(RwLock::new(cfg));
         let ingest_state = IngestState {
             generic_s3: None,
             generic_local: None,
@@ -3347,7 +3370,7 @@ event_parsers:
             .route("/services/collector/raw", post(handle_hec_raw))
             .route("/ingest", post(handle_ndjson))
             .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE))
-            .layer(Extension(cfg_token))
+            .layer(Extension(shared_config))
             .layer(Extension(ingest_state))
     }
 
@@ -3459,6 +3482,7 @@ event_parsers:
             throughput,
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
             crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
+            IpWhitelist::empty(),
         )
         .await
         .expect("Server::new must succeed")
@@ -3692,6 +3716,7 @@ event_parsers:
             Arc::new(ThroughputStats::new()),
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
             crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
+            IpWhitelist::empty(),
         )
         .await
         .unwrap();

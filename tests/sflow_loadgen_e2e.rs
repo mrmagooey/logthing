@@ -26,6 +26,7 @@
 
 use logthing::config::{Config, MetricsConfig, TlsConfig};
 use logthing::forwarding::flush_registry::FlushIntervalRegistry;
+use logthing::middleware::IpWhitelist;
 use logthing::server::Server;
 use logthing::sflow::listener::{DefaultSflowHandler, SflowListener, SflowListenerConfig};
 use logthing::stats::{SourceHourlyStats, ThroughputStats};
@@ -120,6 +121,7 @@ async fn sflow_datagrams_received_increments_on_real_metrics_endpoint() {
         Arc::new(ThroughputStats::new()),
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
+        IpWhitelist::empty(),
     )
     .await
     .expect("Server::new must succeed with no S3/local targets configured");
