@@ -154,6 +154,21 @@ pub(crate) mod test_support {
     pub(crate) async fn lock_persist_config_env() -> tokio::sync::MutexGuard<'static, ()> {
         PERSIST_CONFIG_ENV_LOCK.lock().await
     }
+
+    /// Same hazard as `PERSIST_CONFIG_ENV_LOCK`, for `LOGTHING_ADMIN_AUDIT_LOG`:
+    /// `#[tokio::test]` functions in `admin::tests` point it at a temp path and
+    /// clear it afterward, and cargo runs those tests concurrently within one
+    /// process, so two tests racing on set/clear can make one test's
+    /// `AuditLogger::new()` read another test's temp path (or the removed
+    /// value) mid-flight.
+    static AUDIT_LOG_ENV_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    /// Locks the shared mutex serializing every test that points
+    /// `LOGTHING_ADMIN_AUDIT_LOG` at a temp path.
+    pub(crate) async fn lock_audit_log_env() -> tokio::sync::MutexGuard<'static, ()> {
+        AUDIT_LOG_ENV_LOCK.lock().await
+    }
 }
 
 /// Return a copy of an `S3ConnectionConfig` with credentials replaced by a
