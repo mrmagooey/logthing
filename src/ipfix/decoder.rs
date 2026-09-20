@@ -596,7 +596,12 @@ fn parse_ipfix_template_set(
             });
         }
 
-        let mut fields = Vec::with_capacity(field_count);
+        // Each field specifier is at least 4 bytes on the wire, so the remaining
+        // body can hold at most `remaining / 4` of them — clamp the declared
+        // (attacker-controlled) field_count against that before allocating.
+        let remaining = body.len().saturating_sub(pos);
+        let cap = field_count.min(remaining / 4);
+        let mut fields = Vec::with_capacity(cap);
         for _ in 0..field_count {
             if pos + 4 > body.len() {
                 return Err(DecodeError::Truncated {
@@ -651,7 +656,12 @@ fn parse_ipfix_options_template_set(
         let _scope_count = read_u16_be(body, pos + 4)?;
         pos += 6;
 
-        let mut fields = Vec::with_capacity(field_count);
+        // Each field specifier is at least 4 bytes on the wire, so the remaining
+        // body can hold at most `remaining / 4` of them — clamp the declared
+        // (attacker-controlled) field_count against that before allocating.
+        let remaining = body.len().saturating_sub(pos);
+        let cap = field_count.min(remaining / 4);
+        let mut fields = Vec::with_capacity(cap);
         for _ in 0..field_count {
             if pos + 4 > body.len() {
                 break;
@@ -676,6 +686,11 @@ fn parse_ipfix_options_template_set(
             });
         }
         if template_id >= 256 {
+            // The loop above can `break` before filling `cap` (e.g. an
+            // enterprise-numbered field pushes consumption past what the
+            // upper-bound estimate assumed), which would otherwise leave a
+            // vec with capacity > length sitting in the cache indefinitely.
+            fields.shrink_to_fit();
             decoder.try_insert_template((exporter, obs_domain_id, template_id), fields);
         }
     }
@@ -1010,7 +1025,12 @@ fn parse_v9_template_flowset(
             break;
         }
 
-        let mut fields = Vec::with_capacity(field_count);
+        // Each field specifier is 4 bytes on the wire (v9 has no enterprise bit),
+        // so the remaining body can hold at most `remaining / 4` of them —
+        // clamp the declared (attacker-controlled) field_count before allocating.
+        let remaining = body.len().saturating_sub(pos);
+        let cap = field_count.min(remaining / 4);
+        let mut fields = Vec::with_capacity(cap);
         for _ in 0..field_count {
             if pos + 4 > body.len() {
                 return Err(DecodeError::Truncated {
@@ -2772,6 +2792,54 @@ mod tests {
         assert!(
             !dec.cache_contains_key(&key),
             "template_id<256 must not be cached"
+        );
+    }
+
+    // ---- parse_ipfix_options_template_set: field_count is clamped to the body ----
+
+    #[test]
+    fn options_template_truncated_field_count_does_not_over_allocate() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut dec = IpfixDecoder::new();
+
+        // Options Template Set (set_id=3) declaring field_count=0xFFFF with a
+        // 6-byte body (template_id + field_count + scope_count, no room for
+        // even one 4-byte field specifier). Before the fix this allocated
+        // Vec::with_capacity(0xFFFF) -- ~786 KB -- and cached it anyway; the
+        // field loop breaks on its first iteration either way, so the cached
+        // template must end up with zero fields and (near-)zero capacity.
+        // set: 4 header + 6 body = 10; msg: 16 + 10 = 26 bytes
+        let buf: &[u8] = &[
+            0x00, 0x0A, 0x00, 0x1A, // version=10, total_len=26
+            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Options Template Set header: set_id=3, len=10
+            0x00, 0x03, 0x00, 0x0A, // body (6 bytes):
+            0x01, 0x40, // template_id=320 (>= 256)
+            0xFF, 0xFF, // field_count=65535 (attacker-controlled)
+            0x00, 0x01, // scope_count=1
+        ];
+        let records = decode_ipfix(&mut dec, buf, exporter)
+            .expect("truncated options template must not error, only truncate the field list");
+        assert_eq!(records.len(), 0);
+
+        let key: TemplateKey = (exporter, 0, 320);
+        let fields = dec
+            .cache_get(&key)
+            .expect("truncated options template is still cached with what it got");
+        assert_eq!(fields.len(), 0, "no field specifier fit in the 6-byte body");
+
+        // Inspect the capacity of the vec actually sitting in the cache
+        // (cache_get clones, and Vec::clone allocates exactly at `len`, so
+        // this must read the cached entry directly to catch a stale
+        // capacity that shrink_to_fit failed to trim).
+        let guard = dec.cache.read().expect("template cache lock poisoned");
+        let entry = guard.map.get(&key).expect("template 320 must be cached");
+        assert!(
+            entry.fields.capacity() < 16,
+            "cached template retained an over-sized capacity of {} for 0 fields \
+             (field_count=0xFFFF should have been clamped to the 0 bytes remaining)",
+            entry.fields.capacity()
         );
     }
 
