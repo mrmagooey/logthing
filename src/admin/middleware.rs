@@ -55,6 +55,13 @@ pub async fn security_middleware(
 
         let should_block = {
             let mut counts = state.request_counts.write().await;
+            // Entries are reset in place when their window expires but were
+            // never removed, so a client rotating source IPs grew this map
+            // without bound. Sweeping every request keeps the map bounded by
+            // the number of distinct clients active within the last window;
+            // see task-9-report.md for why an O(n) retain per request is
+            // acceptable at admin-API request volumes.
+            counts.retain(|_, (started, _)| now.duration_since(*started) <= rate_limit_window);
             let entry = counts.entry(client_ip.clone()).or_insert((now, 0));
 
             // Reset if window has passed
@@ -393,6 +400,47 @@ mod tests {
         let response: axum::http::Response<axum::body::Body> = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_map_evicts_entries_outside_the_window() {
+        let state = test_state_with_config(vec![], false, true).await;
+        {
+            let mut counts = state.request_counts.write().await;
+            let stale = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+            for i in 0..1000u32 {
+                counts.insert(format!("10.0.{}.{}", i / 256, i % 256), (stale, 1));
+            }
+        }
+
+        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let mut request = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/test")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+
+        let app = axum::Router::new()
+            .route("/test", axum::routing::get(|| async { "OK" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                security_middleware,
+            ))
+            .with_state(state.clone());
+
+        // One fresh request must sweep the stale entries.
+        let response: axum::http::Response<axum::body::Body> = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let counts = state.request_counts.read().await;
+        assert!(
+            counts.len() < 100,
+            "stale rate-limit entries were never evicted: {} remain",
+            counts.len()
+        );
     }
 
     mod trusted_header_middleware_tests {

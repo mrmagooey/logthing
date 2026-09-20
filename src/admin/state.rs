@@ -416,6 +416,50 @@ fn build_trusted_header_config(
     }))
 }
 
+/// Parses `LOGTHING_ADMIN_ALLOWED_IPS` into a list of allowed networks.
+///
+/// `None` (the env var unset) yields an empty list — the deliberate
+/// "empty means allow all" semantics, unchanged. A value that is empty or
+/// whitespace-only after splitting also yields an empty list: there is no
+/// realistic typo that produces a blank string (as opposed to a garbled
+/// one), so it is treated the same as "unset" rather than as a failure.
+///
+/// A value where at least one entry was provided but *all* of them failed to
+/// parse is refused outright — falling back to an empty list there would be
+/// indistinguishable from "no restriction configured" and would silently
+/// leave the admin interface open. A partially malformed list still starts,
+/// with a loud warning naming the count that failed to parse.
+fn parse_admin_allowed_ips(allowed_ips_str: Option<&str>) -> anyhow::Result<Vec<IpNet>> {
+    let provided: Vec<&str> = match allowed_ips_str {
+        Some(s) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .collect(),
+        None => vec![],
+    };
+
+    let parsed: Vec<IpNet> = provided.iter().filter_map(|ip| ip.parse().ok()).collect();
+
+    if !provided.is_empty() && parsed.is_empty() {
+        anyhow::bail!(
+            "LOGTHING_ADMIN_ALLOWED_IPS was set but none of its {} entries parsed as an IP or \
+             CIDR; refusing to start with what would silently be an allow-all admin interface",
+            provided.len()
+        );
+    }
+
+    if parsed.len() < provided.len() {
+        tracing::warn!(
+            "LOGTHING_ADMIN_ALLOWED_IPS: {} of {} entries failed to parse and were ignored",
+            provided.len() - parsed.len(),
+            provided.len()
+        );
+    }
+
+    Ok(parsed)
+}
+
 /// Pure, testable core of admin config construction.  All values that would normally be
 /// read from `std::env` are accepted as parameters here; `load_admin_config` is the thin
 /// env-reading wrapper that calls this.
@@ -488,13 +532,7 @@ pub fn build_admin_config_from_parts(
     };
 
     // IP whitelist
-    let allowed_ips: Vec<IpNet> = match allowed_ips_str {
-        Some(s) => s
-            .split(',')
-            .filter_map(|ip| ip.trim().parse().ok())
-            .collect(),
-        None => vec![],
-    };
+    let allowed_ips = parse_admin_allowed_ips(allowed_ips_str)?;
 
     if allowed_ips.is_empty() {
         tracing::warn!(
@@ -910,6 +948,65 @@ mod tests {
     fn build_config_whitelist_absent_yields_empty() {
         let cfg = default_parts().unwrap();
         assert!(cfg.allowed_ips.is_empty());
+    }
+
+    #[test]
+    fn all_allowlist_entries_failing_to_parse_is_distinguished_from_unset() {
+        let parsed = parse_admin_allowed_ips(Some("not-an-ip,also-bad"));
+        assert!(
+            parsed.is_err(),
+            "an allowlist where every entry is malformed must not silently \
+             degrade to the allow-all empty list"
+        );
+        assert!(
+            parse_admin_allowed_ips(None)
+                .expect("unset is valid")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn allowlist_empty_or_whitespace_only_string_is_treated_as_unset() {
+        // An empty or whitespace-only value has no entries to fail parsing, so it
+        // is not distinguished from "unset" — both yield allow-all, not an error.
+        assert!(
+            parse_admin_allowed_ips(Some(""))
+                .expect("empty is valid")
+                .is_empty()
+        );
+        assert!(
+            parse_admin_allowed_ips(Some("   , ,  "))
+                .expect("whitespace-only is valid")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn allowlist_partially_malformed_starts_with_valid_entries_kept() {
+        let parsed = parse_admin_allowed_ips(Some("10.0.0.0/8, not-a-valid-cidr, 192.168.0.0/16"))
+            .expect("a partially malformed list should still start");
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn build_config_whitelist_all_entries_malformed_refuses_to_start() {
+        let result = build_admin_config_from_parts(
+            None,
+            "admin",
+            "admin",
+            None,
+            Some("not-an-ip,also-bad"),
+            None,
+            None,
+            true,
+            true,
+            TrustedHeaderEnvArgs::default(),
+        );
+        assert!(
+            result.is_err(),
+            "a fully malformed LOGTHING_ADMIN_ALLOWED_IPS must refuse to start rather than \
+             silently become allow-all"
+        );
     }
 
     #[test]
