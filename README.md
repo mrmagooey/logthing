@@ -222,6 +222,17 @@ tcp_port = 601      # Standard syslog TCP port (RFC 6587)
 parse_dns = true    # Enable DNS log parsing
 ```
 
+**TCP idle timeout:** a TCP connection to the syslog listener (and, the same
+way, to the Zeek and Suricata TCP listeners below) is closed if it goes 300
+seconds (5 minutes) without delivering a complete line. This is not
+configurable via `logthing.toml`/env. A forwarder that holds a connection
+open but sends complete lines less often than every 5 minutes will see that
+connection closed and must reconnect — if you notice a forwarder reconnecting
+periodically for no obvious reason, this timeout is a likely cause. Unlike
+the metrics bind-address change below, this is not a breaking change in the
+sense of altering delivery semantics: a well-behaved forwarder simply
+reconnects and resumes sending.
+
 **Supported Formats**:
 - **RFC 3164** (BSD syslog): `<priority>timestamp hostname tag[pid]: message`
 - **RFC 5424**: `<priority>version timestamp hostname app-name procid msgid [structured-data] message`
@@ -379,6 +390,7 @@ Records with a `_path` value that does not match one of the six curated stream n
 - Non-UTF-8 and invalid JSON lines are skipped (per-line, not per-connection); `zeek_parse_errors` is incremented.
 - The per-process stream map is bounded at 256 distinct `_path` values (`MAX_ZEEK_STREAMS`). Records whose sanitised path would create a 257th stream are routed to the `"unknown"` envelope stream and counted by `parquet_s3_partitions_capped{source="zeek"}`.
 - `_path` values are sanitised before use in S3 keys (lowercased, `[a-z0-9_]` only, truncated to 64 characters; empty result → `"unknown"`).
+- **TCP idle timeout**: same 300-second (5 minute) idle timeout as syslog's TCP listener — see "TCP idle timeout" under Syslog Listener above. Applies to the Suricata TCP listener too.
 
 ### IPFIX S3 Persistence
 
