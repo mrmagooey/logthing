@@ -6,7 +6,7 @@ use chrono::Utc;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
@@ -18,6 +18,63 @@ pub const MAX_SURICATA_TCP_CONNECTIONS: usize = 1024;
 /// Maximum accepted line length in bytes. Lines exceeding this are skipped
 /// and counted via `suricata_oversized_lines`.
 pub const SURICATA_MAX_LINE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
+/// Bytes represented by a single byte-budget permit (see
+/// `SURICATA_TCP_BYTE_BUDGET`). A connection accumulating a line near
+/// `SURICATA_MAX_LINE_BYTES` needs ~256 permits at this size — granular
+/// enough accounting without acquiring on every few-byte read.
+const SURICATA_BUDGET_CHUNK_BYTES: usize = 64 * 1024; // 64 KiB
+
+/// Global memory budget for in-flight (not yet newline-terminated) Suricata
+/// TCP line buffers, shared across every connection on this listener.
+///
+/// `MAX_SURICATA_TCP_CONNECTIONS` (1024) and `SURICATA_MAX_LINE_BYTES`
+/// (16 MiB) are each individually reasonable, but their product never was:
+/// 1024 connections each holding a 16 MiB unterminated line is ~15 GiB of
+/// attacker-controlled heap. This budget bounds the *aggregate* instead of
+/// changing what a single valid record may be. 512 MiB caps that at roughly
+/// 32 concurrent maximum-size lines — generous for legitimate bursty
+/// senders (real Suricata EVE JSON lines are nowhere near 16 MiB),
+/// survivable for the process. A connection that cannot get budget is
+/// closed immediately (see `suricata_tcp_budget_exhausted`) rather than
+/// left to hang or grow without limit.
+const SURICATA_TCP_BYTE_BUDGET: usize = 512 * 1024 * 1024; // 512 MiB
+
+/// Total byte-budget permits available, derived from the budget and chunk
+/// size above.
+const SURICATA_BYTE_BUDGET_PERMITS: usize = SURICATA_TCP_BYTE_BUDGET / SURICATA_BUDGET_CHUNK_BYTES;
+
+/// Capacity threshold above which a cleared line buffer's heap allocation is
+/// released instead of retained for reuse.
+///
+/// `Vec::clear()` drops contents but keeps capacity, so a connection that
+/// once sent a legitimate near-`SURICATA_MAX_LINE_BYTES` line would
+/// otherwise keep that ~16 MiB allocation for the rest of the connection's
+/// life — including a client that sends one huge line and then heartbeats
+/// forever, which never trips the oversize guard or the idle timeout again.
+const SURICATA_BUF_SHRINK_THRESHOLD_BYTES: usize = 256 * 1024; // 256 KiB
+
+/// Outcome of accumulating one line from the socket, bounded by the idle
+/// timeout, `SURICATA_MAX_LINE_BYTES`, and the shared byte budget.
+enum LineReadOutcome {
+    /// Peer closed the connection (read returned 0 bytes with no partial line).
+    Eof,
+    /// A complete line (including trailing `\n`) is in `buf`.
+    Line,
+    /// The line exceeded `SURICATA_MAX_LINE_BYTES` with no newline seen.
+    Oversized,
+    /// The shared byte budget was exhausted before a newline was seen.
+    BudgetExhausted,
+}
+
+/// Shrinks `buf`'s heap allocation once its retained capacity exceeds
+/// `SURICATA_BUF_SHRINK_THRESHOLD_BYTES`. Intended to be called right after
+/// `buf.clear()`, which drops contents but not capacity.
+fn shrink_oversized_buffer(buf: &mut Vec<u8>) {
+    if buf.capacity() > SURICATA_BUF_SHRINK_THRESHOLD_BYTES {
+        buf.shrink_to_fit();
+    }
+}
 
 /// Maximum time a TCP connection may sit without delivering a complete line
 /// before it is closed. Without this, a client that connects and sends
@@ -143,6 +200,7 @@ impl SuricataListener {
         info!("Suricata TCP listener started on {}", bound);
 
         let semaphore = Arc::new(Semaphore::new(MAX_SURICATA_TCP_CONNECTIONS));
+        let byte_budget = Arc::new(Semaphore::new(SURICATA_BYTE_BUDGET_PERMITS));
 
         loop {
             tokio::select! {
@@ -159,9 +217,10 @@ impl SuricataListener {
                                 Ok(permit) => {
                                     let handler = self.handler.clone();
                                     let idle_timeout = TCP_IDLE_TIMEOUT;
+                                    let byte_budget = byte_budget.clone();
                                     tokio::spawn(async move {
                                         let _permit = permit; // held for connection lifetime
-                                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler, idle_timeout).await {
+                                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler, idle_timeout, byte_budget).await {
                                             error!("Suricata TCP connection error from {}: {}", src, e);
                                         }
                                     });
@@ -199,6 +258,7 @@ impl SuricataListener {
         info!("Suricata TCP listener started on {}", bound);
 
         let semaphore = Arc::new(Semaphore::new(MAX_SURICATA_TCP_CONNECTIONS));
+        let byte_budget = Arc::new(Semaphore::new(SURICATA_BYTE_BUDGET_PERMITS));
 
         loop {
             match listener.accept().await {
@@ -216,11 +276,17 @@ impl SuricataListener {
                         Ok(permit) => {
                             let handler = self.handler.clone();
                             let idle_timeout = TCP_IDLE_TIMEOUT;
+                            let byte_budget = byte_budget.clone();
                             tokio::spawn(async move {
                                 let _permit = permit; // held for connection lifetime
-                                if let Err(e) =
-                                    Self::handle_tcp_connection(stream, src, handler, idle_timeout)
-                                        .await
+                                if let Err(e) = Self::handle_tcp_connection(
+                                    stream,
+                                    src,
+                                    handler,
+                                    idle_timeout,
+                                    byte_budget,
+                                )
+                                .await
                                 {
                                     error!("Suricata TCP connection error from {}: {}", src, e);
                                 }
@@ -242,22 +308,73 @@ impl SuricataListener {
         }
     }
 
-    /// Handle one TCP connection: BufReader + bounded read_until loop, one EVE JSON record per line.
+    /// Handle one TCP connection: BufReader + bounded read loop, one EVE JSON record per line.
+    ///
+    /// `byte_budget` is a per-listener budget shared across every connection (see
+    /// `SURICATA_TCP_BYTE_BUDGET`): permits are acquired as this connection's line buffer grows
+    /// past each `SURICATA_BUDGET_CHUNK_BYTES` boundary and released when the buffer is cleared
+    /// or the connection ends, so `SURICATA_MAX_LINE_BYTES` can stay generous per line without
+    /// letting `MAX_SURICATA_TCP_CONNECTIONS` concurrent maxed-out lines multiply into unbounded
+    /// memory.
     async fn handle_tcp_connection(
         stream: TcpStream,
         src: SocketAddr,
         handler: Arc<dyn SuricataHandler>,
         idle_timeout: Duration,
+        byte_budget: Arc<Semaphore>,
     ) -> anyhow::Result<()> {
         let mut reader = BufReader::new(stream);
         let mut buf: Vec<u8> = Vec::new();
+        // Byte-budget permits held for `buf`'s current contents; `held_units *
+        // SURICATA_BUDGET_CHUNK_BYTES` bytes of headroom. Dropped (releasing the permits)
+        // whenever `buf` is cleared.
+        let mut permits: Vec<tokio::sync::OwnedSemaphorePermit> = Vec::new();
+        let mut held_units: usize;
 
         loop {
             buf.clear();
-            let mut limited = (&mut reader).take((SURICATA_MAX_LINE_BYTES as u64) + 1);
-            let n = match tokio::time::timeout(idle_timeout, limited.read_until(b'\n', &mut buf))
-                .await
-            {
+            shrink_oversized_buffer(&mut buf);
+            permits.clear();
+            held_units = 0;
+
+            let outcome: Result<std::io::Result<LineReadOutcome>, _> =
+                tokio::time::timeout(idle_timeout, async {
+                    loop {
+                        let available = reader.fill_buf().await?;
+                        if available.is_empty() {
+                            return Ok(LineReadOutcome::Eof);
+                        }
+                        let remaining_cap = SURICATA_MAX_LINE_BYTES + 1 - buf.len();
+                        let take_len = available.len().min(remaining_cap);
+                        let newline_pos = available[..take_len].iter().position(|&b| b == b'\n');
+                        let consume_len = newline_pos.map_or(take_len, |pos| pos + 1);
+
+                        buf.extend_from_slice(&available[..consume_len]);
+                        reader.consume(consume_len);
+
+                        let needed_units = buf.len().div_ceil(SURICATA_BUDGET_CHUNK_BYTES);
+                        if needed_units > held_units {
+                            let extra = (needed_units - held_units) as u32;
+                            match byte_budget.clone().try_acquire_many_owned(extra) {
+                                Ok(permit) => {
+                                    permits.push(permit);
+                                    held_units = needed_units;
+                                }
+                                Err(_) => return Ok(LineReadOutcome::BudgetExhausted),
+                            }
+                        }
+
+                        if newline_pos.is_some() {
+                            return Ok(LineReadOutcome::Line);
+                        }
+                        if buf.len() > SURICATA_MAX_LINE_BYTES {
+                            return Ok(LineReadOutcome::Oversized);
+                        }
+                    }
+                })
+                .await;
+
+            let outcome = match outcome {
                 Err(_elapsed) => {
                     metrics::counter!("suricata_tcp_idle_timeouts").increment(1);
                     debug!(
@@ -266,25 +383,38 @@ impl SuricataListener {
                     );
                     break;
                 }
-                Ok(Ok(n)) => n,
                 Ok(Err(e)) => {
                     error!("Suricata TCP read error from {}: {}", src, e);
                     break;
                 }
+                Ok(Ok(outcome)) => outcome,
             };
-            if n == 0 {
-                debug!("Suricata TCP connection from {} closed", src);
-                break;
-            }
-            // If we read SURICATA_MAX_LINE_BYTES+1 bytes and the last byte is NOT a newline,
-            // the line exceeded the cap — close the connection (resyncing is itself unbounded).
-            if buf.len() > SURICATA_MAX_LINE_BYTES && buf.last() != Some(&b'\n') {
-                metrics::counter!("suricata_oversized_lines").increment(1);
-                warn!(
-                    "Suricata: line from {} exceeded {} bytes; closing connection",
-                    src, SURICATA_MAX_LINE_BYTES
-                );
-                break;
+
+            match outcome {
+                LineReadOutcome::Eof => {
+                    debug!("Suricata TCP connection from {} closed", src);
+                    break;
+                }
+                LineReadOutcome::Oversized => {
+                    // The line exceeded the cap — close the connection (resyncing is itself
+                    // unbounded).
+                    metrics::counter!("suricata_oversized_lines").increment(1);
+                    warn!(
+                        "Suricata: line from {} exceeded {} bytes; closing connection",
+                        src, SURICATA_MAX_LINE_BYTES
+                    );
+                    break;
+                }
+                LineReadOutcome::BudgetExhausted => {
+                    metrics::counter!("suricata_tcp_budget_exhausted").increment(1);
+                    warn!(
+                        "Suricata: shared TCP byte budget exhausted while reading from {}; \
+                         closing connection",
+                        src
+                    );
+                    break;
+                }
+                LineReadOutcome::Line => {}
             }
             // Trim trailing \r\n / \n.
             if buf.last() == Some(&b'\n') {
@@ -308,7 +438,7 @@ impl SuricataListener {
                 Ok(p) => p,
                 Err(e) => {
                     metrics::counter!("suricata_parse_errors").increment(1);
-                    // `read_until(b'\n', ...)` above only guarantees no *trailing*
+                    // The line-framing loop above only guarantees no *trailing*
                     // newline reaches here (it's popped a few lines up) — a bare
                     // `\r` or an ANSI escape (`\x1b`) mid-line is untouched by
                     // that framing and would still reach an operator's terminal
@@ -349,6 +479,12 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
     use tokio::time::sleep;
+
+    /// A byte budget with the same total capacity `run_with_listener` grants
+    /// production connections — ample for any single-connection test below.
+    fn full_byte_budget() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(SURICATA_BYTE_BUDGET_PERMITS))
+    }
 
     struct CapturingHandler {
         records: Mutex<Vec<SuricataRecord>>,
@@ -768,6 +904,7 @@ mod tests {
             src,
             CapturingHandler::new(),
             TCP_IDLE_TIMEOUT,
+            full_byte_budget(),
         )
         .await
         .unwrap();
@@ -834,9 +971,15 @@ mod tests {
 
         let (stream, src) = listener.accept().await.unwrap();
         let handler = CapturingHandler::new();
-        SuricataListener::handle_tcp_connection(stream, src, handler.clone(), TCP_IDLE_TIMEOUT)
-            .await
-            .unwrap();
+        SuricataListener::handle_tcp_connection(
+            stream,
+            src,
+            handler.clone(),
+            TCP_IDLE_TIMEOUT,
+            full_byte_budget(),
+        )
+        .await
+        .unwrap();
         client.await.unwrap();
 
         assert_eq!(handler.take_records().len(), 2, "both records parsed");
@@ -949,6 +1092,7 @@ mod tests {
             src,
             CapturingHandler::new(),
             Duration::from_millis(100),
+            full_byte_budget(),
         )
         .await
         .unwrap();
@@ -1078,6 +1222,7 @@ mod tests {
             src,
             handler,
             Duration::from_secs(5),
+            full_byte_budget(),
         )
         .await
         .unwrap();
@@ -1099,6 +1244,148 @@ mod tests {
         assert!(
             warn_line.contains('\u{fffd}'),
             "expected U+FFFD replacement characters in the log line: {warn_line:?}"
+        );
+    }
+
+    // -- Byte budget: bounds aggregate memory, not just per-connection --
+
+    /// Proves the shared byte budget bounds AGGREGATE in-flight line-buffer memory across many
+    /// connections, not just the per-connection `SURICATA_MAX_LINE_BYTES` cap. Six connections
+    /// share a deliberately small 4-permit (256 KiB) budget and each try to accumulate 1 MiB of
+    /// un-newlined data — far more than the shared budget can support even for one connection.
+    /// With the fix, connections that can't get budget are closed via
+    /// `suricata_tcp_budget_exhausted` instead of growing without limit.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn byte_budget_caps_aggregate_memory_across_connections() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+        use tokio::io::AsyncReadExt;
+        use tokio::time::timeout;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        // 4 permits * SURICATA_BUDGET_CHUNK_BYTES (64 KiB) = 256 KiB, shared by every connection
+        // spawned below — far below what 6 connections each sending 1 MiB would need.
+        let byte_budget = Arc::new(Semaphore::new(4));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        const CONNS: usize = 6;
+        let mut clients = Vec::new();
+        for _ in 0..CONNS {
+            clients.push(tokio::spawn(async move {
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let payload = vec![b'x'; 1024 * 1024]; // 1 MiB, no newline
+                let _ = stream.write_all(&payload).await;
+                let mut sink = Vec::new();
+                let _ = timeout(Duration::from_secs(5), stream.read_to_end(&mut sink)).await;
+            }));
+        }
+
+        let mut servers = Vec::new();
+        for _ in 0..CONNS {
+            let (stream, src) = listener.accept().await.unwrap();
+            let handler = CapturingHandler::new();
+            let budget = byte_budget.clone();
+            servers.push(tokio::spawn(async move {
+                SuricataListener::handle_tcp_connection(
+                    stream,
+                    src,
+                    handler,
+                    TCP_IDLE_TIMEOUT,
+                    budget,
+                )
+                .await
+            }));
+        }
+
+        for s in servers {
+            let _ = timeout(Duration::from_secs(5), s).await;
+        }
+        for c in clients {
+            let _ = c.await;
+        }
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let exhausted = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("suricata_tcp_budget_exhausted"),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert!(
+            exhausted >= 1,
+            "shared budget must reject at least one connection once aggregate demand exceeds \
+             the budget; got {exhausted} (unbounded-growth regression if 0)"
+        );
+    }
+
+    /// A normal-sized line is entirely unaffected by the byte-budget machinery: a single small
+    /// connection sharing a budget with plenty of headroom still gets its record dispatched.
+    #[tokio::test]
+    async fn byte_budget_does_not_affect_normal_sized_lines() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+
+        let handler = CapturingHandler::new();
+        let listener = SuricataListener::new(SuricataListenerConfig::default(), handler.clone());
+        let task = tokio::spawn(async move {
+            listener.run_with_listener(tcp_listener).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"{\"event_type\":\"alert\",\"src_ip\":\"1.2.3.4\"}\n")
+            .await
+            .unwrap();
+        drop(stream);
+
+        sleep(Duration::from_millis(150)).await;
+        task.abort();
+
+        let records = handler.take_records();
+        assert_eq!(records.len(), 1, "normal line must still be dispatched");
+        assert_eq!(records[0].event_type, "alert");
+    }
+
+    // -- Capacity retention: a huge line must not hold its allocation forever --
+
+    #[test]
+    fn shrink_oversized_buffer_releases_large_capacity() {
+        let mut buf: Vec<u8> = Vec::with_capacity(SURICATA_MAX_LINE_BYTES);
+        buf.extend(std::iter::repeat_n(0u8, 1024));
+        buf.clear();
+        assert!(buf.capacity() > SURICATA_BUF_SHRINK_THRESHOLD_BYTES);
+
+        shrink_oversized_buffer(&mut buf);
+
+        assert!(
+            buf.capacity() <= SURICATA_BUF_SHRINK_THRESHOLD_BYTES,
+            "a cleared buffer that once held a huge line must have its capacity released; \
+             got {}",
+            buf.capacity()
+        );
+    }
+
+    #[test]
+    fn shrink_oversized_buffer_leaves_small_capacity_alone() {
+        let mut buf: Vec<u8> = Vec::with_capacity(1024);
+        let cap_before = buf.capacity();
+        shrink_oversized_buffer(&mut buf);
+        assert_eq!(
+            buf.capacity(),
+            cap_before,
+            "capacity below the threshold must not be touched"
         );
     }
 }
