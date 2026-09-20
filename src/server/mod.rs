@@ -18,20 +18,19 @@ use anyhow::anyhow;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{ConnectInfo, State},
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, Request, State},
+    http::{HeaderMap, StatusCode, header},
     middleware,
+    middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-#[cfg(feature = "kerberos-auth")]
-use axum::{extract::Request, middleware::Next};
 
 use futures::stream::{self, StreamExt};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tracing::{debug, error, info, warn};
@@ -49,6 +48,108 @@ const MAX_BODY_SIZE: usize = 64 * 1024 * 1024;
 /// Maximum number of Windows events processed concurrently per batch.
 /// Bounds CPU and memory use while still exploiting multi-core parallelism.
 const MAX_CONCURRENT_EVENT_PROCESSING: usize = 16;
+
+/// Global in-flight body-byte budget shared by every route on
+/// `protected_router` that buffers its request body into memory (extracts
+/// `axum::body::Bytes`): `/wsman*`, `/syslog`, the HEC routes, `/ingest`,
+/// and (when compiled in) `/v1/logs`.
+///
+/// `MAX_BODY_SIZE` (64 MiB) and `security.max_connections` (default 10,000)
+/// are each individually reasonable, but their product never was: 10,000
+/// connections each holding a 64 MiB buffered body is ~640 GiB of
+/// attacker-controlled heap. This budget bounds the *aggregate* instead of
+/// changing what a single legitimate request may send — a large HEC batch
+/// stays exactly as large as it is today.
+///
+/// 1 GiB permits roughly sixteen concurrent maximum-size (64 MiB) requests
+/// in flight at once — generous for real bursty ingest, since legitimate
+/// traffic is rarely dominated by many simultaneous max-size batches — while
+/// capping the worst case at ~1 GiB of buffered-body memory regardless of
+/// how many of the 10,000 connection slots an attacker fills. The permit is
+/// held for the life of the whole request (see `body_budget_middleware`),
+/// so it also caps, at that same ~1 GiB input-side scale, how much
+/// concurrently-buffered body can be feeding downstream amplification (e.g.
+/// HEC's NDJSON-to-records parsing) at once.
+const BODY_BYTE_BUDGET: usize = 1024 * 1024 * 1024; // 1 GiB
+
+/// How many bytes of `BODY_BYTE_BUDGET` a request must reserve before its
+/// body is read.
+///
+/// Two bad options and why this avoids both: charging strictly by the
+/// client-controlled `Content-Length` header would let an attacker lie
+/// their way past the budget; charging only after the body is fully
+/// buffered charges *after* the memory is already spent, which is too late
+/// to prevent the exhaustion this budget exists to stop. Instead this
+/// reserves an amount that is always >= what the body can actually
+/// deliver, decided *before* a single body byte is read:
+///
+/// - `Content-Length` present: HTTP framing means the server will not
+///   deliver more than this many body bytes for the request (a client
+///   claiming fewer than it sends is simply truncated at that length by
+///   the framing, not an over-charge risk), so it is already a valid upper
+///   bound. Capped to `MAX_BODY_SIZE`, since `DefaultBodyLimit` would
+///   reject anything larger anyway.
+/// - No `Content-Length` but `Transfer-Encoding: chunked`: the real size
+///   is unknown ahead of time (this is the loophole an attacker would use
+///   to dodge a `Content-Length`-only charge), so the full `MAX_BODY_SIZE`
+///   ceiling is charged — `DefaultBodyLimit` will not let more than that
+///   through regardless.
+/// - Neither header: per HTTP semantics the request has no body, so
+///   nothing is reserved. This keeps GET-only routes on the same router
+///   (`/syslog/udp`, `/syslog/examples`) unaffected.
+fn declared_body_budget(headers: &HeaderMap) -> usize {
+    if let Some(len) = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        return len.min(MAX_BODY_SIZE);
+    }
+    let chunked = headers
+        .get(header::TRANSFER_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.to_ascii_lowercase().contains("chunked"));
+    if chunked { MAX_BODY_SIZE } else { 0 }
+}
+
+/// `axum::middleware::from_fn_with_state` handler enforcing `BODY_BYTE_BUDGET`.
+///
+/// The permit is a plain local binding held across the `next.run(request)`
+/// await, so it is released by ordinary drop semantics on every exit path:
+/// normal completion, a handler/extractor error, `TimeoutLayer` firing, the
+/// client disconnecting mid-body (which drops this future), or a panic
+/// unwinding through the task — the same "owned permit released by scope"
+/// pattern `ZeekListener::handle_tcp_connection` uses for its byte budget.
+///
+/// Exhaustion is checked with `try_acquire_many_owned` (non-blocking): a
+/// request that cannot get budget is rejected immediately with 503, not
+/// queued, so one attacker filling the budget cannot make legitimate
+/// requests hang.
+async fn body_budget_middleware(
+    State(budget): State<Arc<Semaphore>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let wanted = declared_body_budget(request.headers());
+    if wanted == 0 {
+        return next.run(request).await;
+    }
+    match budget.try_acquire_many_owned(wanted as u32) {
+        Ok(_permit) => next.run(request).await,
+        Err(_) => {
+            metrics::counter!("body_budget_exhausted").increment(1);
+            warn!(
+                "body byte budget exhausted ({wanted} bytes requested of {BODY_BYTE_BUDGET} \
+                 total); rejecting with 503"
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server body-byte budget exhausted, retry shortly",
+            )
+                .into_response()
+        }
+    }
+}
 
 pub struct AppState {
     pub config: Arc<RwLock<Config>>,
@@ -490,6 +591,13 @@ impl Server {
             protected_router = protected_router.route("/v1/logs", post(handle_otlp_logs));
         }
 
+        // Shared in-flight body-byte budget (see `BODY_BYTE_BUDGET`), constructed
+        // fresh here: `create_router` is called at most once per `Server` (`run`
+        // and `run_tls` both consume `self`), so there is exactly one process-wide
+        // instance of this semaphore, shared by every protected route via the
+        // `Arc` clone captured in the middleware layer below.
+        let body_budget = Arc::new(Semaphore::new(BODY_BYTE_BUDGET));
+
         // Extensions for HEC handlers are harmless to the existing WEF/syslog
         // handlers and are always layered so the extractors resolve when the
         // routes are mounted.
@@ -497,6 +605,10 @@ impl Server {
             .layer(axum::Extension(self.ingest_state.clone()))
             .layer(axum::Extension(cfg_token))
             .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE))
+            .layer(middleware::from_fn_with_state(
+                body_budget,
+                body_budget_middleware,
+            ))
             .layer(shared_layers)
             .layer(axum::Extension(ip_whitelist))
             .with_state(self.state.clone());
@@ -1764,6 +1876,240 @@ event_parsers:
             response.status(),
             StatusCode::PAYLOAD_TOO_LARGE,
             "over-limit body must be rejected with 413"
+        );
+    }
+
+    // ------------------------------------------------------------------ //
+    // Body-byte budget (BODY_BYTE_BUDGET / body_budget_middleware): bounds //
+    // aggregate in-flight buffered-body memory across every route on the  //
+    // protected router, independent of MAX_BODY_SIZE * max_connections.   //
+    // ------------------------------------------------------------------ //
+
+    #[test]
+    fn declared_body_budget_uses_content_length_capped_to_max() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, "123".parse().unwrap());
+        assert_eq!(declared_body_budget(&headers), 123);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_LENGTH,
+            (MAX_BODY_SIZE * 4).to_string().parse().unwrap(),
+        );
+        assert_eq!(
+            declared_body_budget(&headers),
+            MAX_BODY_SIZE,
+            "an oversized declared Content-Length must be capped, not trusted verbatim"
+        );
+    }
+
+    #[test]
+    fn declared_body_budget_assumes_worst_case_for_chunked_without_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        assert_eq!(
+            declared_body_budget(&headers),
+            MAX_BODY_SIZE,
+            "omitting Content-Length via chunked encoding must not dodge the charge"
+        );
+    }
+
+    #[test]
+    fn declared_body_budget_is_zero_for_bodyless_requests() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            declared_body_budget(&headers),
+            0,
+            "a request with neither Content-Length nor chunked Transfer-Encoding has no \
+             body, so GET-only routes like /syslog/udp must not be charged"
+        );
+    }
+
+    /// Proves the budget is genuinely SHARED across concurrent requests, not a
+    /// per-request allowance in disguise. 6 requests each declare 100 KiB --
+    /// comfortably under the 300 KiB budget on its own, so a per-request budget
+    /// of this size would let every one of them through untouched. Only the
+    /// SUM across all 6 (600 KiB) exceeds the shared 300 KiB budget, so seeing
+    /// at least one 503 here is proof the budget is shared, not private.
+    #[tokio::test]
+    async fn body_budget_caps_aggregate_memory_across_concurrent_requests() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        const DECLARED_BYTES: usize = 100 * 1024;
+        const REQUESTS: usize = 6;
+
+        let budget = Arc::new(Semaphore::new(300 * 1024));
+        let router: Router = Router::new()
+            .route(
+                "/ingest-like",
+                post(|_body: Bytes| async {
+                    // Hold the permit long enough that all admission attempts
+                    // below race each other while the earlier ones are still
+                    // in flight, so the concurrency is not a scheduling fluke.
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    (StatusCode::OK, "ok")
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                budget,
+                body_budget_middleware,
+            ));
+
+        let mut tasks = Vec::new();
+        for _ in 0..REQUESTS {
+            let router = router.clone();
+            tasks.push(tokio::spawn(async move {
+                let request = HttpRequest::builder()
+                    .method("POST")
+                    .uri("/ingest-like")
+                    .header("content-length", DECLARED_BYTES.to_string())
+                    .body(Body::from(vec![0u8; DECLARED_BYTES]))
+                    .unwrap();
+                router.oneshot(request).await.unwrap().status()
+            }));
+        }
+
+        let (mut accepted, mut rejected) = (0, 0);
+        for t in tasks {
+            match t.await.unwrap() {
+                StatusCode::OK => accepted += 1,
+                StatusCode::SERVICE_UNAVAILABLE => rejected += 1,
+                other => panic!("unexpected status: {other}"),
+            }
+        }
+
+        assert!(
+            rejected >= 1,
+            "shared budget must reject at least one request once aggregate demand \
+             ({REQUESTS} * {DECLARED_BYTES} bytes) exceeds the 300 KiB budget -- a \
+             per-request budget would let every one of them through (accepted={accepted}, \
+             rejected={rejected})"
+        );
+        assert!(
+            accepted >= 1,
+            "at least some of the {REQUESTS} requests should still be admitted"
+        );
+    }
+
+    /// A normal-sized request against the real, generous `BODY_BYTE_BUDGET` is
+    /// entirely unaffected.
+    #[tokio::test]
+    async fn body_budget_does_not_affect_normal_sized_request() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let budget = Arc::new(Semaphore::new(BODY_BYTE_BUDGET));
+        let router: Router = Router::new()
+            .route(
+                "/ingest-like",
+                post(|_body: Bytes| async { (StatusCode::OK, "ok") }),
+            )
+            .layer(middleware::from_fn_with_state(
+                budget,
+                body_budget_middleware,
+            ));
+
+        let payload = vec![0u8; 4096];
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/ingest-like")
+            .header("content-length", payload.len().to_string())
+            .body(Body::from(payload))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a normal-sized request must be unaffected by the byte budget"
+        );
+    }
+
+    /// Exhaustion must be rejected immediately (503), never queued/hung: the
+    /// budget here is smaller than even one request's declared size.
+    #[tokio::test]
+    async fn body_budget_exhaustion_returns_503_promptly() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let budget = Arc::new(Semaphore::new(10));
+        let router: Router = Router::new()
+            .route(
+                "/ingest-like",
+                post(|_body: Bytes| async { (StatusCode::OK, "ok") }),
+            )
+            .layer(middleware::from_fn_with_state(
+                budget,
+                body_budget_middleware,
+            ));
+
+        let payload = vec![0u8; 4096];
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/ingest-like")
+            .header("content-length", payload.len().to_string())
+            .body(Body::from(payload))
+            .unwrap();
+
+        let response = tokio::time::timeout(Duration::from_millis(500), router.oneshot(request))
+            .await
+            .expect("exhaustion must be rejected promptly, never hang")
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "exhaustion must be rejected with 503, not silently accepted or queued"
+        );
+    }
+
+    /// Permits are released once a request completes, so capacity recovers
+    /// for the next one -- a leak here would permanently shrink capacity.
+    #[tokio::test]
+    async fn body_budget_permit_released_after_request_completes() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        const DECLARED_BYTES: usize = 4096;
+        let budget = Arc::new(Semaphore::new(DECLARED_BYTES));
+        let router: Router = Router::new()
+            .route(
+                "/ingest-like",
+                post(|_body: Bytes| async { (StatusCode::OK, "ok") }),
+            )
+            .layer(middleware::from_fn_with_state(
+                budget,
+                body_budget_middleware,
+            ));
+
+        let build_request = || {
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/ingest-like")
+                .header("content-length", DECLARED_BYTES.to_string())
+                .body(Body::from(vec![0u8; DECLARED_BYTES]))
+                .unwrap()
+        };
+
+        let first = router.clone().oneshot(build_request()).await.unwrap();
+        assert_eq!(
+            first.status(),
+            StatusCode::OK,
+            "first request must be admitted"
+        );
+
+        // If the first request's permit were not released on completion, this
+        // second, identically-sized request would be rejected (503) instead.
+        let second = router.oneshot(build_request()).await.unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::OK,
+            "capacity must recover once the prior request's permit is released"
         );
     }
 
