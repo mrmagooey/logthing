@@ -93,11 +93,27 @@ impl AuditLogger {
             entries.remove(0);
         }
 
-        // Also log to the standard logging framework
+        // Also log to the standard logging framework.
+        //
+        // `username` reaches this shared sink un-authenticated in two cases:
+        // the Basic-Auth username on a FAILED login (`auth::ensure_authorized`
+        // logs the credential exactly as submitted, before any verification
+        // succeeds), and the `X-authentik-username` header on a rejected
+        // trusted-header request (`admin::middleware::trusted_header_middleware`
+        // only requires the secret *header key* to be present to reach this
+        // call, not a matching secret value, so the username there is fully
+        // attacker-chosen too). It is the SAME string F2
+        // (`1f23979 fix: render admin audit entries with textContent, not
+        // innerHTML`) already had to defend against on the HTML-rendering
+        // side of the admin UI — do not "simplify" this sanitizing away on
+        // the log-sink side while leaving the HTML side fixed; both read
+        // from this one attacker-controlled value. Fixing it once here (the
+        // single sink every `AuditLogger::log` caller funnels through)
+        // covers both call sites instead of patching each separately.
         info!(
             "[ADMIN AUDIT] {} by {} from {} - {}",
             action,
-            username,
+            crate::sanitize_for_log(username, 100),
             client_ip,
             details.unwrap_or("no details")
         );

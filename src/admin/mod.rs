@@ -146,6 +146,64 @@ mod tests {
         }
     }
 
+    /// Regression test for the ADMIN AUDIT log sink: a failed-login username
+    /// containing a mid-line `\r`, a `\n`, and an ANSI escape must not carry
+    /// any of them raw into the `info!` line `AuditLogger::log` emits. This
+    /// is the same attacker-controlled string F2 already had to defend
+    /// against on the HTML-rendering side (`1f23979`); this test covers the
+    /// log-sink side. Uses the shared `test_support` capture subscriber (see
+    /// its doc comment for why a bespoke `set_default` doesn't work here).
+    #[tokio::test]
+    async fn audit_log_sanitizes_control_characters_in_username() {
+        crate::test_support::install_and_clear();
+
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("test-audit-sanitize.log");
+        unsafe {
+            std::env::set_var("LOGTHING_ADMIN_AUDIT_LOG", &log_path);
+        }
+
+        let logger = AuditLogger::new(10).await;
+        let forged_username = "admin\rERROR fake entry\n\u{1b}[31minjected\u{1b}[0m";
+
+        logger
+            .log("AUTH_FAILED", forged_username, "127.0.0.1", None)
+            .await;
+
+        let events = crate::test_support::captured_events();
+        let audit_line = events
+            .iter()
+            .find(|m| m.contains("[ADMIN AUDIT]"))
+            .unwrap_or_else(|| panic!("no [ADMIN AUDIT] event captured; got: {events:?}"));
+
+        assert!(
+            !audit_line.contains('\r'),
+            "raw CR leaked into the log line: {audit_line:?}"
+        );
+        assert!(
+            !audit_line.contains('\n'),
+            "raw LF leaked into the log line (forged a second log entry): {audit_line:?}"
+        );
+        assert!(
+            !audit_line.contains('\u{1b}'),
+            "raw ESC leaked into the log line: {audit_line:?}"
+        );
+        assert!(
+            audit_line.contains('\u{fffd}'),
+            "expected U+FFFD replacement characters in the log line: {audit_line:?}"
+        );
+
+        // The stored/rendered-in-UI copy (fixed separately by F2, via
+        // textContent rather than sanitizing the string itself) must still
+        // carry the raw username — only the log sink truncates/replaces.
+        let entries = logger.get_entries(10).await;
+        assert_eq!(entries[0].username, forged_username);
+
+        unsafe {
+            std::env::remove_var("LOGTHING_ADMIN_AUDIT_LOG");
+        }
+    }
+
     #[tokio::test]
     async fn audit_logger_respects_max_entries() {
         // Use a temp directory to avoid loading existing entries

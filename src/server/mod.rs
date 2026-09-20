@@ -862,9 +862,16 @@ async fn handle_wef_request(
 
     match state.parser.parse_message(&body_str, source_host) {
         Ok(WefMessage::Subscription(sub)) => {
+            // `subscription_id` is the raw text between `<SubscriptionId>` and
+            // `</SubscriptionId>` in the POST body (`extract_xml_value`,
+            // `protocol::mod`), reachable unauthenticated whenever Kerberos is
+            // not configured, and unbounded — a multi-MiB element would log a
+            // single multi-MiB line per request. 128 bytes comfortably covers
+            // any real subscription name while bounding that amplification.
             info!(
                 "New subscription from {}: {}",
-                sub.source_host, sub.subscription_id
+                sub.source_host,
+                crate::sanitize_for_log(&sub.subscription_id, 128)
             );
 
             let response = create_subscription_response(&sub.subscription_id);
@@ -884,9 +891,12 @@ async fn handle_wef_request(
                 .unwrap())
         }
         Ok(WefMessage::Heartbeat(hb)) => {
+            // Same unbounded, unauthenticated-reachable `subscription_id` as
+            // the Subscription arm above — same 128-byte budget.
             debug!(
                 "Heartbeat from {} for subscription {}",
-                hb.source_host, hb.subscription_id
+                hb.source_host,
+                crate::sanitize_for_log(&hb.subscription_id, 128)
             );
 
             let response = create_heartbeat_response();
@@ -897,10 +907,14 @@ async fn handle_wef_request(
                 .unwrap())
         }
         Ok(WefMessage::Unknown(content)) => {
+            // Was `truncate_for_log` — bounded but not sanitized, so control
+            // characters (embedded newline, ANSI escape) in the unrecognized
+            // body survived into this warn! line. Switch to `sanitize_for_log`,
+            // keeping the existing 100-byte budget.
             warn!(
                 "Unknown message type from {}: {}",
                 addr,
-                crate::truncate_for_log(&content, 100)
+                crate::sanitize_for_log(&content, 100)
             );
             Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
@@ -960,11 +974,24 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
     if let (Some(event_parser), Some(parsed)) = (&state.event_parser, &event.parsed)
         && let Some(generic_parsed) = event_parser.parse_event(parsed.event_id, &event.raw_xml)
     {
+        // `formatted_message` is built by substituting fields extracted from
+        // the attacker-supplied event XML into an operator-configured output
+        // template (`GenericEventParser::parse_event` -> `format_message`),
+        // so the substituted portions are wire-derived even though the
+        // template itself is not. `event_id` is a `u32` (not interpolated
+        // from a string) and `parser_name` comes from the parser config, not
+        // the wire, so neither needs sanitizing. 200 bytes gives enough of
+        // the rendered message to be useful for triage while still bounding
+        // it well below a disk-fill amplifier.
         info!(
             "Event {} parsed with generic parser '{}': {}",
             parsed.event_id,
             generic_parsed.parser_name,
-            generic_parsed.formatted_message.as_deref().unwrap_or("N/A")
+            generic_parsed
+                .formatted_message
+                .as_deref()
+                .map(|m| crate::sanitize_for_log(m, 200))
+                .unwrap_or(std::borrow::Cow::Borrowed("N/A"))
         );
     }
 
@@ -1277,6 +1304,214 @@ mod tests {
             .await
             .expect("unknown message handled");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -------------------------------------------------------------------
+    // Log-injection regressions: wire-derived `subscription_id` / `content`
+    // / `formatted_message` must reach their `info!`/`debug!`/`warn!` sites
+    // sanitized, not raw. Uses the shared `test_support` capture subscriber
+    // (see its doc comment for why a bespoke `set_default` doesn't work).
+    // -------------------------------------------------------------------
+
+    /// A `<SubscriptionId>` containing a mid-line `\r`, a `\n`, and an ANSI
+    /// escape must not carry any of them raw into the "New subscription"
+    /// `info!` line, and an oversized id must be truncated rather than
+    /// logged whole (`extract_xml_value` returns the raw slice with no
+    /// length cap of its own).
+    #[tokio::test]
+    async fn handle_wef_subscription_log_sanitizes_and_truncates_subscription_id() {
+        crate::test_support::install_and_clear();
+
+        let state = default_state().await;
+        let forged_id = format!("sub\rFAKE\n\u{1b}[31minjected\u{1b}[0m{}", "y".repeat(200));
+        let body = Bytes::from(format!(
+            r#"
+        <Envelope>
+          <Body>
+            <Subscribe>
+              <SubscriptionId>{forged_id}</SubscriptionId>
+              <Query>*</Query>
+            </Subscribe>
+          </Body>
+        </Envelope>
+        "#
+        ));
+        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
+
+        let response = handle_wef_request(State(state), ConnectInfo(addr), HeaderMap::new(), body)
+            .await
+            .expect("subscription handled");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let events = crate::test_support::captured_events();
+        let line = events
+            .iter()
+            .find(|m| m.contains("New subscription"))
+            .unwrap_or_else(|| panic!("no matching info! event captured; got: {events:?}"));
+
+        assert!(
+            !line.contains('\r'),
+            "raw CR leaked into the log line: {line:?}"
+        );
+        assert!(
+            !line.contains('\u{1b}'),
+            "raw ESC leaked into the log line: {line:?}"
+        );
+        assert!(
+            line.contains('\u{fffd}'),
+            "expected U+FFFD replacement characters in the log line: {line:?}"
+        );
+        assert!(
+            line.len() < forged_id.len(),
+            "oversized subscription_id must be truncated, not logged whole: {line:?}"
+        );
+    }
+
+    /// Same regression as above, for the Heartbeat arm's `debug!` site.
+    #[tokio::test]
+    async fn handle_wef_heartbeat_log_sanitizes_subscription_id() {
+        crate::test_support::install_and_clear();
+
+        let state = default_state().await;
+        let body = Bytes::from(
+            "\n        <Envelope>\n          <Body>\n            <Heartbeat>\n              \
+             <SubscriptionId>hb\rFAKE\n\u{1b}[31minjected</SubscriptionId>\n            \
+             </Heartbeat>\n          </Body>\n        </Envelope>\n        ",
+        );
+        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
+
+        let response = handle_wef_request(State(state), ConnectInfo(addr), HeaderMap::new(), body)
+            .await
+            .expect("heartbeat handled");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let events = crate::test_support::captured_events();
+        let line = events
+            .iter()
+            .find(|m| m.contains("Heartbeat from"))
+            .unwrap_or_else(|| panic!("no matching debug! event captured; got: {events:?}"));
+
+        assert!(
+            !line.contains('\r'),
+            "raw CR leaked into the log line: {line:?}"
+        );
+        assert!(
+            !line.contains('\n'),
+            "raw LF leaked into the log line: {line:?}"
+        );
+        assert!(
+            !line.contains('\u{1b}'),
+            "raw ESC leaked into the log line: {line:?}"
+        );
+        assert!(
+            line.contains('\u{fffd}'),
+            "expected U+FFFD replacement characters in the log line: {line:?}"
+        );
+    }
+
+    /// The Unknown-message-type `warn!` site was `truncate_for_log`, not
+    /// `sanitize_for_log` -- bounded but not sanitized. Fails if that site is
+    /// reverted.
+    #[tokio::test]
+    async fn handle_wef_unknown_message_log_sanitizes_content() {
+        crate::test_support::install_and_clear();
+
+        let state = default_state().await;
+        let body = Bytes::from("weird\rcontent\n\u{1b}[31mFAKE\u{1b}[0m not xml at all");
+        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
+
+        let response = handle_wef_request(State(state), ConnectInfo(addr), HeaderMap::new(), body)
+            .await
+            .expect("unknown message handled");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let events = crate::test_support::captured_events();
+        let line = events
+            .iter()
+            .find(|m| m.contains("Unknown message type"))
+            .unwrap_or_else(|| panic!("no matching warn! event captured; got: {events:?}"));
+
+        assert!(
+            !line.contains('\r'),
+            "raw CR leaked into the log line: {line:?}"
+        );
+        assert!(
+            !line.contains('\n'),
+            "raw LF leaked into the log line: {line:?}"
+        );
+        assert!(
+            !line.contains('\u{1b}'),
+            "raw ESC leaked into the log line: {line:?}"
+        );
+        assert!(
+            line.contains('\u{fffd}'),
+            "expected U+FFFD replacement characters in the log line: {line:?}"
+        );
+    }
+
+    /// `formatted_message` is built by substituting attacker-supplied event
+    /// XML field values into an operator-configured output template; a
+    /// mid-message `\r`/`\n`/ANSI escape in the substituted field must not
+    /// reach the "Event ... parsed with generic parser" `info!` line raw.
+    #[tokio::test]
+    async fn process_single_event_log_sanitizes_formatted_message() {
+        use std::io::Write;
+
+        crate::test_support::install_and_clear();
+
+        let yaml = r#"
+event_parsers:
+  9999:
+    name: "test_parser"
+    description: "test"
+    fields:
+      - name: "Msg"
+        source: EventData
+        xpath: "Data[@Name='Msg']"
+    output_format: "MSG: {Msg} END"
+"#;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "{yaml}").unwrap();
+        let event_parser = GenericEventParser::from_file(file.path()).unwrap();
+
+        let state = Arc::new(AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            throughput: Arc::new(ThroughputStats::new()),
+            parser: WefParser::new(),
+            event_parser: Some(event_parser),
+            parquet_s3_sender: None,
+            parquet_local_sender: None,
+        });
+
+        let mut parsed = sample_parsed_event();
+        parsed.event_id = 9999;
+        let raw_xml = "<Event><EventData><Data Name=\"Msg\">before\rmid\nafter\u{1b}[31mred</Data></EventData></Event>";
+        let event = WindowsEvent::new("host".into(), raw_xml.into()).with_parsed(parsed);
+
+        process_single_event(&state, event).await;
+
+        let events = crate::test_support::captured_events();
+        let line = events
+            .iter()
+            .find(|m| m.contains("parsed with generic parser"))
+            .unwrap_or_else(|| panic!("no matching info! event captured; got: {events:?}"));
+
+        assert!(
+            !line.contains('\r'),
+            "raw CR leaked into the log line: {line:?}"
+        );
+        assert!(
+            !line.contains('\n'),
+            "raw LF leaked into the log line: {line:?}"
+        );
+        assert!(
+            !line.contains('\u{1b}'),
+            "raw ESC leaked into the log line: {line:?}"
+        );
+        assert!(
+            line.contains('\u{fffd}'),
+            "expected U+FFFD replacement characters in the log line: {line:?}"
+        );
     }
 
     #[tokio::test]
