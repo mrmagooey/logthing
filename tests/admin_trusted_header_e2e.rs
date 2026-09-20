@@ -23,6 +23,7 @@
 use logthing::admin::spawn_admin_server;
 use logthing::config::{Config, TlsConfig};
 use logthing::forwarding::flush_registry::FlushIntervalRegistry;
+use logthing::middleware::IpWhitelist;
 use logthing::stats::SourceHourlyStats;
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,6 +88,7 @@ async fn get_config_over_real_http_succeeds_with_trusted_headers_alone_no_basic_
         shared_config,
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
+        IpWhitelist::empty(),
     );
 
     // ---------------------------------------------------------------------

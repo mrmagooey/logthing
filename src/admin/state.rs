@@ -311,6 +311,13 @@ pub struct AdminState {
     /// `/config/import`) can push updated `flush_interval_secs` values into
     /// already-running writer tasks without a process restart.
     pub flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry,
+    /// The SAME `IpWhitelist` instance shared by the main HTTP router, the
+    /// metrics server, and all five wire-protocol listeners (constructed
+    /// once in `main.rs`). A full config replace via the admin API pushes
+    /// updated `security.allowed_ips` into it via `IpWhitelist::set_networks`,
+    /// so the change reaches every consumer on their next request/datagram
+    /// without a process restart. See `crate::middleware::IpWhitelist`.
+    pub ip_whitelist: crate::middleware::IpWhitelist,
 }
 
 /// Rate limit error response

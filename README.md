@@ -60,6 +60,10 @@ require_client_cert = false           # Set to true to enforce mTLS
 # This also gates Prometheus: if you set allowed_ips, your scraper's
 # address must be in the list too, or scraping /metrics starts returning
 # 403. See the "Bind address (breaking change)" note under ## Metrics.
+#
+# LIVE: a change via the admin API (PUT /config, /config/reload,
+# /config/import) applies immediately to every consumer above — no restart.
+# See "Live vs. restart-required config changes" below.
 allowed_ips = ["192.168.1.0/24", "10.0.0.0/8"]
 max_connections = 10000
 connection_timeout_secs = 300
@@ -250,6 +254,10 @@ default it accepts requests with no authentication. Set `syslog.http_token` to r
 [syslog]
 http_token = "shared-secret"   # optional; empty (default) = no auth required
 ```
+
+`http_token` is LIVE: an update via the admin API (`PUT /config`, `/config/reload`,
+`/config/import`) is enforced on the very next request, no restart needed — same as
+`hec.token` and `otlp.bearer_token`. See "Live vs. restart-required config changes" below.
 
 **DNS Log Parsing**:
 The server automatically parses DNS query logs from:
@@ -976,6 +984,28 @@ Counters are exported with a `_total` suffix by the Prometheus exporter.
 3. **Client Certificates**: Configure mTLS for additional security
 4. **Firewall**: Open only port 5985/5986 between hosts
 5. **Least Privilege**: Run server with minimal permissions
+
+### Live vs. restart-required config changes
+
+The admin API (`PUT /config`, `POST /config/reload`, `POST /config/import` — see
+`docs/admin-security.md`) validates, persists, and audits every change it accepts. Most
+fields — bind addresses, TLS, ports, Kerberos settings, and so on — only take effect on
+the next process restart, same as before. The authentication and access-control fields an
+operator is most likely to change during an incident are the exception: they are applied
+LIVE, with no restart needed.
+
+| Field | Live? | Applied to |
+|---|---|---|
+| `hec.token` | Yes | `/services/collector/event`, `/services/collector/raw`, `/ingest` |
+| `syslog.http_token` | Yes | `POST /syslog` |
+| `otlp.bearer_token` | Yes | `POST /v1/logs` |
+| `security.allowed_ips` | Yes | Main HTTP router, `/metrics`, and all five wire-protocol listeners (syslog, IPFIX, sFlow, Zeek, Suricata) |
+| `*.flush_interval_secs` | Yes | Already-running Parquet writers |
+| Everything else (`bind_address`, `tls.*`, ports, `security.kerberos.*`, ...) | No — restart required | — |
+
+This table covers every field the admin API can change; if a field isn't listed above,
+treat it as restart-required. If in doubt, `POST /config/reload` (which re-reads
+`logthing.toml` from disk) followed by a restart is always safe.
 
 ## License
 

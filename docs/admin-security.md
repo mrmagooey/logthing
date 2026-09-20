@@ -147,7 +147,18 @@ is proxy-authored, not attacker-authored.
 - `GET /health` - Health check endpoint (no authentication required)
 - `GET /config` - Get current configuration (requires authentication)
 - `PUT /config` - Update configuration (requires authentication)
+- `POST /config/reload` - Re-read configuration from disk (requires authentication)
+- `POST /config/import` - Import a full configuration file (requires authentication)
 - `GET /audit-log` - Get audit log entries (requires authentication)
+
+**Not every accepted change takes effect immediately.** `PUT /config`, `/config/reload`,
+and `/config/import` all validate, persist to disk, swap the in-memory config, and audit
+the change (`CONFIG_UPDATED` / `CONFIG_RELOADED` / `CONFIG_IMPORTED`) — but most fields
+(bind addresses, TLS, ports, Kerberos, ...) only take effect on the next process restart.
+`hec.token`, `syslog.http_token`, `otlp.bearer_token`, `security.allowed_ips`, and every
+`flush_interval_secs` are the exception: those are applied LIVE, with no restart, to every
+consumer (including the five wire-protocol listeners for `allowed_ips`). See "Live vs.
+restart-required config changes" in the main README for the full field list.
 
 ## Environment Variables Summary
 

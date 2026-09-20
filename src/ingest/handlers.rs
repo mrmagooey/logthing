@@ -1,7 +1,11 @@
 //! Axum handler functions for the three HEC / NDJSON ingest routes.
 //!
 //! All three handlers share the same auth + dispatch pattern:
-//! 1. Extract and validate `Authorization: Splunk <token>` header.
+//! 1. Extract and validate `Authorization: Splunk <token>` header against
+//!    `hec.token`, read LIVE from the shared config on every request (same
+//!    pattern as `syslog.http_token` / `otlp.bearer_token` in
+//!    `src/server/mod.rs`) — an admin-updated token takes effect on the very
+//!    next request, no restart needed.
 //!    NOTE: If the configured token is empty, auth is skipped entirely
 //!    (dev-only mode). See [hec] config docs.
 //! 2. Parse the body with the appropriate helper.
@@ -9,6 +13,7 @@
 //! 4. If `ingest.generic_s3` is `Some`, call `try_send` for each record.
 //! 5. Return the HEC canonical success envelope or an error response.
 
+use crate::config::Config;
 use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::ingest::{
     IngestState, check_hec_token,
@@ -24,6 +29,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Query parameters accepted by all three ingest routes.
 #[derive(Debug, Deserialize)]
@@ -124,18 +130,23 @@ fn dispatch_generic_record(
 ///
 /// Each line: `{"event": <any>, "time": <epoch_float>, "host": "h", "sourcetype": "t"}`
 ///
-/// DEVIATION FROM BRIEF: if `cfg_token` is empty, auth check is skipped entirely
-/// (dev-only no-auth mode; see [hec] config docs).
+/// DEVIATION FROM BRIEF: if `hec.token` is empty, auth check is skipped
+/// entirely (dev-only no-auth mode; see [hec] config docs). The token is
+/// read LIVE from `config` on every request, so an admin-updated
+/// `hec.token` takes effect on the very next request — no restart needed.
 pub async fn handle_hec_event(
     headers: HeaderMap,
     Query(params): Query<HecQueryParams>,
-    Extension(cfg_token): Extension<Arc<String>>,
+    Extension(config): Extension<Arc<RwLock<Config>>>,
     Extension(ingest): Extension<IngestState>,
     body: Bytes,
 ) -> impl IntoResponse {
     let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
-    if !cfg_token.is_empty() && !check_hec_token(auth, &cfg_token) {
-        return hec_auth_error();
+    {
+        let cfg = config.read().await;
+        if !cfg.hec.token.is_empty() && !check_hec_token(auth, &cfg.hec.token) {
+            return hec_auth_error();
+        }
     }
 
     let default_st = params.sourcetype.as_deref().unwrap_or(DEFAULT_SOURCETYPE);
@@ -161,18 +172,23 @@ pub async fn handle_hec_event(
 ///
 /// Sourcetype is taken from `?sourcetype=` query param; falls back to `DEFAULT_SOURCETYPE`.
 ///
-/// DEVIATION FROM BRIEF: if `cfg_token` is empty, auth check is skipped entirely
-/// (dev-only no-auth mode; see [hec] config docs).
+/// DEVIATION FROM BRIEF: if `hec.token` is empty, auth check is skipped
+/// entirely (dev-only no-auth mode; see [hec] config docs). The token is
+/// read LIVE from `config` on every request, so an admin-updated
+/// `hec.token` takes effect on the very next request — no restart needed.
 pub async fn handle_hec_raw(
     headers: HeaderMap,
     Query(params): Query<HecQueryParams>,
-    Extension(cfg_token): Extension<Arc<String>>,
+    Extension(config): Extension<Arc<RwLock<Config>>>,
     Extension(ingest): Extension<IngestState>,
     body: Bytes,
 ) -> impl IntoResponse {
     let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
-    if !cfg_token.is_empty() && !check_hec_token(auth, &cfg_token) {
-        return hec_auth_error();
+    {
+        let cfg = config.read().await;
+        if !cfg.hec.token.is_empty() && !check_hec_token(auth, &cfg.hec.token) {
+            return hec_auth_error();
+        }
     }
 
     let st = params.sourcetype.as_deref().unwrap_or(DEFAULT_SOURCETYPE);
@@ -196,18 +212,23 @@ pub async fn handle_hec_raw(
 ///
 /// Sourcetype is taken from `?sourcetype=` query param; falls back to `DEFAULT_SOURCETYPE`.
 ///
-/// DEVIATION FROM BRIEF: if `cfg_token` is empty, auth check is skipped entirely
-/// (dev-only no-auth mode; see [hec] config docs).
+/// DEVIATION FROM BRIEF: if `hec.token` is empty, auth check is skipped
+/// entirely (dev-only no-auth mode; see [hec] config docs). The token is
+/// read LIVE from `config` on every request, so an admin-updated
+/// `hec.token` takes effect on the very next request — no restart needed.
 pub async fn handle_ndjson(
     headers: HeaderMap,
     Query(params): Query<HecQueryParams>,
-    Extension(cfg_token): Extension<Arc<String>>,
+    Extension(config): Extension<Arc<RwLock<Config>>>,
     Extension(ingest): Extension<IngestState>,
     body: Bytes,
 ) -> impl IntoResponse {
     let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
-    if !cfg_token.is_empty() && !check_hec_token(auth, &cfg_token) {
-        return hec_auth_error();
+    {
+        let cfg = config.read().await;
+        if !cfg.hec.token.is_empty() && !check_hec_token(auth, &cfg.hec.token) {
+            return hec_auth_error();
+        }
     }
 
     let st = params.sourcetype.as_deref().unwrap_or(DEFAULT_SOURCETYPE);
@@ -235,8 +256,17 @@ mod tests {
     use tower::ServiceExt;
 
     fn make_router(token: &str) -> axum::Router {
+        let mut cfg = Config::default();
+        cfg.hec.token = token.to_string();
+        make_router_with_config(Arc::new(RwLock::new(cfg)))
+    }
+
+    /// Like `make_router`, but the caller keeps the `Arc<RwLock<Config>>` so
+    /// it can mutate `hec.token` mid-test and prove the change is picked up
+    /// live — no router rebuild, matching the live-reload contract in
+    /// `handle_hec_event`/`handle_hec_raw`/`handle_ndjson`'s doc comments.
+    fn make_router_with_config(config: Arc<RwLock<Config>>) -> axum::Router {
         use axum::{Extension, Router, routing::post};
-        let cfg_token = Arc::new(token.to_string());
         let ingest_state = IngestState {
             generic_s3: None,
             generic_local: None,
@@ -245,7 +275,7 @@ mod tests {
             .route("/services/collector/event", post(handle_hec_event))
             .route("/services/collector/raw", post(handle_hec_raw))
             .route("/ingest", post(handle_ndjson))
-            .layer(Extension(cfg_token))
+            .layer(Extension(config))
             .layer(Extension(ingest_state))
     }
 
@@ -540,5 +570,69 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         assert_eq!(body["code"], 0);
+    }
+
+    // --- Live hec.token reload (no restart) ---
+
+    /// An admin-changed `hec.token` must take effect on the very next
+    /// request — no router rebuild, no restart. Mirrors the finding this
+    /// fixes: before it, `hec.token` was snapshotted into an
+    /// `Extension<Arc<String>>` at router-construction time, so a changed
+    /// token was accepted, persisted, and audited but never actually
+    /// enforced until the process restarted.
+    #[tokio::test]
+    async fn hec_token_change_takes_effect_on_next_request_without_restart() {
+        let mut cfg = Config::default();
+        cfg.hec.token = "old-token".to_string();
+        let shared_config = Arc::new(RwLock::new(cfg));
+        let app = make_router_with_config(shared_config.clone());
+
+        let request_with = |token: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/services/collector/event")
+                .header("Authorization", format!("Splunk {token}"))
+                .body(Body::from(
+                    br#"{"event":{"k":1},"sourcetype":"t"}"#.as_ref(),
+                ))
+                .unwrap()
+        };
+
+        // Old token works before the change.
+        let resp = app
+            .clone()
+            .oneshot(request_with("old-token"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Simulate the admin API's `PUT /config` swap: write straight
+        // through the SAME `Arc<RwLock<Config>>` the router's `Extension`
+        // holds — exactly what `update_config`/`reload_config` do via
+        // `*state.config.write().await = new_config`.
+        {
+            let mut cfg = shared_config.write().await;
+            cfg.hec.token = "new-token".to_string();
+        }
+
+        // Old (leaked) token is now rejected — no restart needed.
+        let resp = app
+            .clone()
+            .oneshot(request_with("old-token"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "the old token must stop working immediately after an admin rotates it"
+        );
+
+        // New token is accepted on the very next request.
+        let resp = app.oneshot(request_with("new-token")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the new token must work immediately, without a process restart"
+        );
     }
 }

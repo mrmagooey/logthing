@@ -76,6 +76,34 @@ pub(crate) fn apply_flush_intervals(
     }
 }
 
+/// Push `security.allowed_ips` into the shared `IpWhitelist`, so a full
+/// config replace (`PUT /config`, `/config/reload`, `/config/import`)
+/// reaches the main HTTP router, the metrics server, and all five
+/// wire-protocol listeners without a process restart — they all hold a
+/// `Clone` of this same `AdminState::ip_whitelist` instance.
+///
+/// `hec.token` needs no equivalent push: the ingest handlers read
+/// `state.config` live on every request (see `handle_hec_event` and
+/// siblings in `src/ingest/handlers.rs`), matching `syslog.http_token` and
+/// `otlp.bearer_token`.
+///
+/// `set_networks` is expected to succeed here — `validate_config_invariants`
+/// already parsed the same strings with the same parser
+/// (`crate::middleware::parse_allowed_ips`) before persist. An error at this
+/// point would mean the two parsers disagree, which is a bug; it is logged
+/// rather than un-doing the already-persisted-and-swapped config, since a
+/// half-applied revert would be worse than a live whitelist that is one
+/// update cycle stale (still enforcing the previous, deliberately-set list).
+pub(crate) fn apply_live_security_settings(state: &AdminState, cfg: &Config) {
+    if let Err(err) = state.ip_whitelist.set_networks(&cfg.security.allowed_ips) {
+        tracing::error!(
+            "BUG: security.allowed_ips passed validate_config_invariants but failed \
+             set_networks; live IP whitelist NOT updated (still enforcing the \
+             previous list): {err}"
+        );
+    }
+}
+
 /// Test-only helpers for sandboxing `persist_config()`'s write path.
 ///
 /// `LOGTHING_ADMIN_OVERRIDE_FILE` is a process-global env var, but cargo runs
@@ -345,6 +373,14 @@ pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
     }
     if cfg.security.connection_timeout_secs == 0 {
         errors.push("security.connection_timeout_secs must be greater than 0".to_string());
+    }
+
+    // security.allowed_ips is applied LIVE (see `apply_live_security_settings`)
+    // via `IpWhitelist::set_networks`, which uses the same parser as this
+    // check. Reject a bad entry here, before persist, so the on-disk config
+    // and the live whitelist can never disagree.
+    if let Err(err) = crate::middleware::parse_allowed_ips(&cfg.security.allowed_ips) {
+        errors.push(format!("security.allowed_ips: {err}"));
     }
 
     if errors.is_empty() {
@@ -673,6 +709,7 @@ pub async fn import_config(
     };
 
     apply_flush_intervals(&state.flush_registry, &updated_config);
+    apply_live_security_settings(&state, &updated_config);
 
     state
         .audit_logger
@@ -733,6 +770,7 @@ pub async fn reload_config(
     };
 
     apply_flush_intervals(&state.flush_registry, &updated_config);
+    apply_live_security_settings(&state, &updated_config);
 
     state
         .audit_logger
@@ -837,6 +875,7 @@ mod tests {
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
             flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
+            ip_whitelist: crate::middleware::IpWhitelist::empty(),
         }
     }
 

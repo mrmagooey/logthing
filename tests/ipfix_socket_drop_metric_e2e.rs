@@ -33,6 +33,7 @@
 use logthing::config::{Config, MetricsConfig, TlsConfig};
 use logthing::forwarding::flush_registry::FlushIntervalRegistry;
 use logthing::ipfix::listener::{DefaultIpfixHandler, IpfixListener, IpfixListenerConfig};
+use logthing::middleware::IpWhitelist;
 use logthing::server::Server;
 use logthing::stats::{SourceHourlyStats, ThroughputStats};
 use std::sync::Arc;
@@ -81,6 +82,7 @@ async fn ipfix_socket_drop_metrics_visible_on_real_metrics_endpoint() {
         Arc::new(ThroughputStats::new()),
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
+        IpWhitelist::empty(),
     )
     .await
     .expect("Server::new must succeed with no S3/local targets configured");
