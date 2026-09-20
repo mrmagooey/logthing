@@ -1584,6 +1584,9 @@ mod tests {
 
         let real_access_key = "AKIAIOSFODNN7EXAMPLE";
         let real_secret_key = "super-secret-should-survive-a-save";
+        let real_hec_token = "super-secret-hec-token";
+        let real_otlp_token = "super-secret-otlp-token";
+        let real_syslog_http_token = "super-secret-syslog-http-token";
         {
             let mut cfg = state.config.write().await;
             cfg.tls = TlsConfig {
@@ -1603,6 +1606,9 @@ mod tests {
                 flush_interval_secs: 60,
                 channel_capacity: 100,
             });
+            cfg.hec.token = real_hec_token.to_string();
+            cfg.otlp.bearer_token = Some(real_otlp_token.to_string());
+            cfg.syslog.http_token = real_syslog_http_token.to_string();
         }
 
         let app = axum::Router::new()
@@ -1627,6 +1633,12 @@ mod tests {
         assert!(
             get_body_str.contains("***REDACTED***"),
             "GET /config must return the redacted sentinel, not the real secret: {get_body_str}"
+        );
+        assert!(
+            !get_body_str.contains(real_hec_token)
+                && !get_body_str.contains(real_otlp_token)
+                && !get_body_str.contains(real_syslog_http_token),
+            "GET /config must not return live ingest tokens: {get_body_str}"
         );
 
         // PUT /config with exactly that (redacted) body — no edits, same as an
@@ -1665,6 +1677,19 @@ mod tests {
         assert_eq!(
             s3.connection.secret_key, real_secret_key,
             "save destroyed the real secret_key"
+        );
+        assert_eq!(
+            live_cfg.hec.token, real_hec_token,
+            "save destroyed the real hec.token"
+        );
+        assert_eq!(
+            live_cfg.otlp.bearer_token.as_deref(),
+            Some(real_otlp_token),
+            "save destroyed the real otlp.bearer_token"
+        );
+        assert_eq!(
+            live_cfg.syslog.http_token, real_syslog_http_token,
+            "save destroyed the real syslog.http_token"
         );
     }
 

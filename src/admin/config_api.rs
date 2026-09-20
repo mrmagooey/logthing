@@ -140,8 +140,35 @@ fn redact_s3_connection(conn: &S3ConnectionConfig) -> S3ConnectionConfig {
     }
 }
 
+/// Redact a shared-secret token field (`hec.token`, `syslog.http_token`).
+///
+/// An empty token is each field's documented "auth disabled" default — not a
+/// secret. Masking it would turn "no auth configured" into the literal
+/// sentinel string on every `GET /config`, which a client (or a re-imported
+/// export) would then treat as a real, enforced token. So only a non-empty
+/// token is replaced with the sentinel; empty stays empty.
+fn redact_token(token: &str) -> String {
+    if token.is_empty() {
+        String::new()
+    } else {
+        REDACTED.to_string()
+    }
+}
+
+/// Same as `redact_token`, for the `Option<String>` shape used by
+/// `otlp.bearer_token`, where both `None` and `Some("")` mean auth is
+/// disabled (see `OtlpConfig::bearer_token`'s doc comment).
+fn redact_optional_token(token: &Option<String>) -> Option<String> {
+    match token {
+        Some(t) if !t.is_empty() => Some(REDACTED.to_string()),
+        other => other.clone(),
+    }
+}
+
 /// Produce a sanitised copy of `cfg` where every `access_key` / `secret_key`
-/// field is replaced with `***REDACTED***`.
+/// field, and every configured ingest shared-secret token
+/// (`hec.token`, `otlp.bearer_token`, `syslog.http_token`), is replaced with
+/// `***REDACTED***`.
 ///
 /// NOTE: export → import round-trips will lose the real credentials — that is
 /// intentional.  A security-export must never contain live secrets.
@@ -179,6 +206,10 @@ pub fn redacted_config(cfg: &Config) -> Config {
         s3.connection = redact_s3_connection(&s3.connection);
     }
 
+    out.hec.token = redact_token(&out.hec.token);
+    out.otlp.bearer_token = redact_optional_token(&out.otlp.bearer_token);
+    out.syslog.http_token = redact_token(&out.syslog.http_token);
+
     out
 }
 
@@ -203,16 +234,13 @@ pub fn redacted_config(cfg: &Config) -> Config {
 /// runs, so validation sees real values and the sentinel is never persisted in
 /// place of a live credential.
 ///
-/// Covers the same ten S3-bearing sections as `redacted_config`, listed in the
-/// same order, so the two are easy to diff by eye — if a future section grows
-/// credential fields, add it to both.
-///
-/// NOTE: this intentionally does NOT cover `hec.token`, `otlp.bearer_token`, or
-/// `syslog.http_token` — a separate finding covers redacting those and is
-/// being triaged independently. If/when redaction is added for any of them,
-/// add a matching one-line merge for that field here in the SAME change —
-/// redacting a secret without a merge-back here reproduces this exact
-/// "save destroys the secret" bug for that field.
+/// Covers the same ten S3-bearing sections as `redacted_config`, plus the
+/// three ingest shared-secret tokens it also redacts (`hec.token`,
+/// `otlp.bearer_token`, `syslog.http_token`), listed in the same order in
+/// both functions so the two are easy to diff by eye — if a future field
+/// gains redaction in `redacted_config`, add a matching merge-back here in
+/// the SAME change. Redacting a secret without a merge-back here reproduces
+/// this exact "save destroys the secret" bug for that field.
 pub fn merge_redacted_secrets(incoming: &mut Config, current: &Config) {
     fn merge(incoming: Option<&mut S3ConnectionConfig>, current: Option<&S3ConnectionConfig>) {
         let (Some(incoming), Some(current)) = (incoming, current) else {
@@ -270,6 +298,16 @@ pub fn merge_redacted_secrets(incoming: &mut Config, current: &Config) {
         incoming.iceberg.s3.as_mut().map(|s| &mut s.connection),
         current.iceberg.s3.as_ref().map(|s| &s.connection),
     );
+
+    if incoming.hec.token == REDACTED {
+        incoming.hec.token = current.hec.token.clone();
+    }
+    if incoming.otlp.bearer_token.as_deref() == Some(REDACTED) {
+        incoming.otlp.bearer_token = current.otlp.bearer_token.clone();
+    }
+    if incoming.syslog.http_token == REDACTED {
+        incoming.syslog.http_token = current.syslog.http_token.clone();
+    }
 }
 
 /// Structural validation of a candidate `Config` that must hold before the
@@ -855,6 +893,57 @@ mod tests {
         assert!(toml_str.contains(REDACTED));
     }
 
+    // A3: redacted_config (what GET /config, /config/export, and
+    // /config/reload all return) must mask the three ingest shared-secret
+    // tokens the same way it masks S3 credentials.
+    #[test]
+    fn redacted_config_masks_ingest_tokens() {
+        let mut cfg = Config::default();
+        cfg.hec.token = "REAL_HEC_TOKEN".to_string();
+        cfg.otlp.bearer_token = Some("REAL_OTLP_TOKEN".to_string());
+        cfg.syslog.http_token = "REAL_SYSLOG_TOKEN".to_string();
+
+        let out = redacted_config(&cfg);
+
+        assert_eq!(out.hec.token, REDACTED);
+        assert_eq!(out.otlp.bearer_token.as_deref(), Some(REDACTED));
+        assert_eq!(out.syslog.http_token, REDACTED);
+
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(!json.contains("REAL_HEC_TOKEN"), "hec.token leaked: {json}");
+        assert!(
+            !json.contains("REAL_OTLP_TOKEN"),
+            "otlp.bearer_token leaked: {json}"
+        );
+        assert!(
+            !json.contains("REAL_SYSLOG_TOKEN"),
+            "syslog.http_token leaked: {json}"
+        );
+    }
+
+    // A3: an unset token (empty string / None) means auth is disabled for that
+    // route — it must stay empty, not become the literal sentinel, otherwise a
+    // round trip would turn "no auth configured" into a live-looking token.
+    #[test]
+    fn redacted_config_leaves_unset_ingest_tokens_empty() {
+        let cfg = Config::default();
+        assert_eq!(cfg.hec.token, "");
+        assert_eq!(cfg.otlp.bearer_token, None);
+        assert_eq!(cfg.syslog.http_token, "");
+
+        let out = redacted_config(&cfg);
+
+        assert_eq!(out.hec.token, "", "unset hec.token must stay empty");
+        assert_eq!(
+            out.otlp.bearer_token, None,
+            "unset otlp.bearer_token must stay None"
+        );
+        assert_eq!(
+            out.syslog.http_token, "",
+            "unset syslog.http_token must stay empty"
+        );
+    }
+
     /// Sets every S3-bearing config section's `access_key`/`secret_key` to
     /// the given sentinels. Each `*S3Config` struct flattens
     /// `S3ConnectionConfig` and defaults every other field via
@@ -880,6 +969,14 @@ mod tests {
         cfg.sflow.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
         cfg.aggregate.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
         cfg.iceberg.s3 = Some(serde_json::from_value(conn).unwrap());
+    }
+
+    /// Sets all three ingest shared-secret tokens (`hec.token`,
+    /// `otlp.bearer_token`, `syslog.http_token`) to the given value.
+    fn populate_ingest_tokens(cfg: &mut Config, token: &str) {
+        cfg.hec.token = token.to_string();
+        cfg.otlp.bearer_token = Some(token.to_string());
+        cfg.syslog.http_token = token.to_string();
     }
 
     /// Every S3-bearing config section must be redacted, not just the three that
@@ -1010,6 +1107,7 @@ mod tests {
     fn round_trip_through_redacted_config_and_merge_restores_real_credentials() {
         let mut cfg = Config::default();
         populate_all_s3_sections(&mut cfg, "REAL_ACCESS_KEY", "REAL_SECRET_KEY");
+        populate_ingest_tokens(&mut cfg, "REAL_INGEST_TOKEN");
 
         let mut resubmitted = redacted_config(&cfg);
         merge_redacted_secrets(&mut resubmitted, &cfg);
@@ -1026,6 +1124,20 @@ mod tests {
                 "{name}: secret_key destroyed by redact+merge round trip"
             );
         }
+
+        assert_eq!(
+            resubmitted.hec.token, "REAL_INGEST_TOKEN",
+            "hec.token destroyed by redact+merge round trip"
+        );
+        assert_eq!(
+            resubmitted.otlp.bearer_token.as_deref(),
+            Some("REAL_INGEST_TOKEN"),
+            "otlp.bearer_token destroyed by redact+merge round trip"
+        );
+        assert_eq!(
+            resubmitted.syslog.http_token, "REAL_INGEST_TOKEN",
+            "syslog.http_token destroyed by redact+merge round trip"
+        );
     }
 
     // H-7: validate_config_invariants rejects port 0.
