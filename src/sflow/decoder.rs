@@ -17,27 +17,150 @@ use crate::sflow::{SampleType, SflowRecord};
 /// single sFlow v5 sample can declare thousands of 8-byte-envelope unknown
 /// records, and each one is promoted to a `serde_json::Map` (~632 bytes of
 /// heap for a handful of keys) — roughly 80x the wire size per record before
-/// this cap, and unbounded in the number of records. A real exporter emits a
-/// handful of records per sample (curated raw_packet_header / sampled_ipv4 /
-/// generic_if_counters, plus maybe one or two vendor extensions), so 32 is
-/// generous headroom for any legitimate sample while bounding the
-/// attacker-controlled multiplier to a small, fixed worst case per sample.
+/// this cap. A real exporter emits a handful of records per sample (curated
+/// raw_packet_header / sampled_ipv4 / generic_if_counters, plus maybe one or
+/// two vendor extensions), so 32 is generous headroom for any legitimate
+/// sample.
+///
+/// This bound alone is **not sufficient**: an attacker can pack many small
+/// samples into one datagram, each staying under this cap, and defeat it in
+/// aggregate. See `MAX_UNKNOWN_RECORDS_PER_DATAGRAM`, which is the bound
+/// that actually holds regardless of how records are distributed across
+/// samples.
 const MAX_UNKNOWN_RECORDS_PER_SAMPLE: usize = 32;
 
-/// Push an unknown/vendor-specific record into `unknown_records`, unless the
-/// per-sample cap has already been reached — in which case the record is
-/// dropped and counted in `dropped` so a single truncation marker can be
-/// emitted once the sample is fully parsed. Parsing of the rest of the
-/// sample (and datagram) continues unaffected either way.
-fn push_unknown_record(
-    unknown_records: &mut Vec<serde_json::Value>,
-    dropped: &mut u64,
-    value: serde_json::Value,
-) {
-    if unknown_records.len() < MAX_UNKNOWN_RECORDS_PER_SAMPLE {
-        unknown_records.push(value);
-    } else {
-        *dropped += 1;
+/// Maximum number of non-curated records accumulated into `extra` across an
+/// *entire datagram* — shared by every sample decoded from one
+/// `decode_datagram` call, decremented as records are accepted, regardless
+/// of how the attacker splits records across samples.
+///
+/// Why a per-sample cap alone does not work: a minimal capped sample costs
+/// (on the wire) 8 bytes for the sample envelope (`data_format` +
+/// `sample_length`) plus 32 bytes for the flow-sample header
+/// (`num_flow_records` at offset 28) plus `MAX_UNKNOWN_RECORDS_PER_SAMPLE`
+/// record envelopes of 8 bytes each (zero-length bodies): 8 + 32 + 32x8 =
+/// 296 bytes total. A 65,535-byte datagram can therefore carry roughly
+/// (65535 - 28) / 296 ≈ 221 such samples, i.e. 221 x 32 ≈ 7,072 unknown
+/// records retained — at the ~713 bytes/record this decoder actually
+/// allocates (measured by `tests/channel_budget_allocator.rs`), that is
+/// still ~5.0 MB per datagram, essentially the original unbounded amount.
+///
+/// This datagram-wide budget bounds total *accepted-record* retention
+/// regardless of that distribution: `MAX_UNKNOWN_RECORDS_PER_DATAGRAM` times
+/// the ~713-byte per-record cost is 512 x 713 ≈ 365,056 bytes (~365 KB /
+/// 356 KiB) of real record data — versus the original ~5.34 MB. 512 is
+/// comfortably above what a legitimate multi-sample datagram carries: even a
+/// busy datagram with ~100 samples, each with a couple of vendor-specific
+/// extension records, is only ~200 unknown records.
+///
+/// One more thing has to be bounded once this budget exists: a truncation
+/// *marker* is itself a small `serde_json` object (~632 bytes, same node
+/// cost as a real record). Once the budget hits zero, every remaining sample
+/// in the datagram would otherwise mint its own marker for free (a sample
+/// needs only one 8-byte record envelope to trigger one) — with ~48-byte
+/// minimal samples that's up to ~1,365 markers in a 65,535-byte datagram,
+/// which would itself retain close to 1,365 * 632 ≈ 862 KB, undermining the
+/// bound this budget is supposed to provide. `DatagramUnknownBudget::notified`
+/// fixes this: the "datagram budget exhausted" marker is emitted at most
+/// once per datagram (on whichever sample first observes `remaining == 0`);
+/// every later sample's budget-exhaustion drops are still counted (for
+/// correctness) but are silent, since the first marker already told the
+/// operator the datagram-wide budget ran out and no further per-sample
+/// detail is added by repeating it.
+const MAX_UNKNOWN_RECORDS_PER_DATAGRAM: usize = 512;
+
+/// Per-datagram state for `UnknownRecordSink`, shared (via `&mut`) across
+/// every sample decoded from one `decode_datagram` call.
+struct DatagramUnknownBudget {
+    /// Unknown records still accepted before `MAX_UNKNOWN_RECORDS_PER_DATAGRAM`
+    /// is reached. Never replenished within a datagram.
+    remaining: usize,
+    /// Whether some sample has already emitted the "datagram budget
+    /// exhausted" marker -- see `MAX_UNKNOWN_RECORDS_PER_DATAGRAM` doc.
+    notified: bool,
+}
+
+impl DatagramUnknownBudget {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_UNKNOWN_RECORDS_PER_DATAGRAM,
+            notified: false,
+        }
+    }
+}
+
+/// Accumulates the unknown/vendor-specific records for one sample, subject
+/// to two bounds: the sample-local cap (`MAX_UNKNOWN_RECORDS_PER_SAMPLE`) and
+/// the datagram-wide budget shared across every sample in this datagram.
+/// Either bound dropping a record does not abort parsing of the rest of the
+/// sample or datagram — the record is simply counted and, once the sample
+/// finishes, folded into a truncation marker rather than pushed (subject to
+/// the "notify once" rule for datagram-budget exhaustion, see
+/// `MAX_UNKNOWN_RECORDS_PER_DATAGRAM`).
+struct UnknownRecordSink<'a> {
+    records: Vec<serde_json::Value>,
+    dropped_sample_cap: u64,
+    dropped_datagram_budget: u64,
+    /// True iff *this* sample is the first to observe the datagram budget
+    /// hitting zero, and therefore should carry the marker for it.
+    report_datagram_exhaustion: bool,
+    budget: &'a mut DatagramUnknownBudget,
+}
+
+impl<'a> UnknownRecordSink<'a> {
+    fn new(budget: &'a mut DatagramUnknownBudget) -> Self {
+        Self {
+            records: Vec::new(),
+            dropped_sample_cap: 0,
+            dropped_datagram_budget: 0,
+            report_datagram_exhaustion: false,
+            budget,
+        }
+    }
+
+    fn push(&mut self, value: serde_json::Value) {
+        if self.records.len() >= MAX_UNKNOWN_RECORDS_PER_SAMPLE {
+            self.dropped_sample_cap += 1;
+            return;
+        }
+        if self.budget.remaining == 0 {
+            self.dropped_datagram_budget += 1;
+            if !self.budget.notified {
+                self.budget.notified = true;
+                self.report_datagram_exhaustion = true;
+            }
+            return;
+        }
+        self.records.push(value);
+        self.budget.remaining -= 1;
+    }
+
+    /// Consume the sink, appending a truncation marker if anything was
+    /// dropped (subject to the "notify once" rule for datagram-budget
+    /// exhaustion), and return the records.
+    fn finish(mut self) -> Vec<serde_json::Value> {
+        let has_sample_cap = self.dropped_sample_cap > 0;
+        let has_datagram_budget = self.report_datagram_exhaustion;
+        let marker = match (has_sample_cap, has_datagram_budget) {
+            (true, true) => Some(serde_json::json!({
+                "truncated": self.dropped_sample_cap + self.dropped_datagram_budget,
+                "truncated_sample_cap": self.dropped_sample_cap,
+                "truncated_datagram_budget": self.dropped_datagram_budget,
+            })),
+            (true, false) => Some(serde_json::json!({
+                "truncated": self.dropped_sample_cap,
+                "reason": "sample_cap",
+            })),
+            (false, true) => Some(serde_json::json!({
+                "truncated": self.dropped_datagram_budget,
+                "reason": "datagram_budget",
+            })),
+            (false, false) => None,
+        };
+        if let Some(marker) = marker {
+            self.records.push(marker);
+        }
+        self.records
     }
 }
 
@@ -126,6 +249,10 @@ pub fn decode_datagram(buf: &[u8], _exporter: IpAddr) -> anyhow::Result<Vec<Sflo
     let mut pos = hdr_end + 16;
     let mut records: Vec<SflowRecord> = Vec::new();
     let received_at = chrono::Utc::now();
+    // Shared across every sample in this datagram -- see
+    // `MAX_UNKNOWN_RECORDS_PER_DATAGRAM` for why a per-sample-only cap is
+    // insufficient.
+    let mut datagram_budget = DatagramUnknownBudget::new();
 
     for _ in 0..num_samples {
         // Each sample: data_format(4) + sample_length(4) + body(sample_length)
@@ -160,7 +287,13 @@ pub fn decode_datagram(buf: &[u8], _exporter: IpAddr) -> anyhow::Result<Vec<Sflo
         match format {
             1 | 3 => {
                 // flow_sample (1) or expanded_flow_sample (3)
-                match decode_flow_sample(sample_body, format, agent_addr, received_at) {
+                match decode_flow_sample(
+                    sample_body,
+                    format,
+                    agent_addr,
+                    received_at,
+                    &mut datagram_budget,
+                ) {
                     Ok(mut recs) => records.append(&mut recs),
                     Err(e) => {
                         metrics::counter!("sflow_decode_errors").increment(1);
@@ -170,7 +303,13 @@ pub fn decode_datagram(buf: &[u8], _exporter: IpAddr) -> anyhow::Result<Vec<Sflo
             }
             2 | 4 => {
                 // counter_sample (2) or expanded_counter_sample (4)
-                match decode_counter_sample(sample_body, format, agent_addr, received_at) {
+                match decode_counter_sample(
+                    sample_body,
+                    format,
+                    agent_addr,
+                    received_at,
+                    &mut datagram_budget,
+                ) {
                     Ok(mut recs) => records.append(&mut recs),
                     Err(e) => {
                         metrics::counter!("sflow_decode_errors").increment(1);
@@ -194,6 +333,7 @@ fn decode_flow_sample(
     format: u32,
     agent_addr: IpAddr,
     received_at: chrono::DateTime<chrono::Utc>,
+    datagram_budget: &mut DatagramUnknownBudget,
 ) -> anyhow::Result<Vec<SflowRecord>> {
     // flow_sample (format 1) body layout:
     //   sequence_number(4) source_id(4) sampling_rate(4) sample_pool(4)
@@ -267,8 +407,7 @@ fn decode_flow_sample(
         extra: serde_json::json!([]),
     };
 
-    let mut unknown_records: Vec<serde_json::Value> = Vec::new();
-    let mut dropped_unknown_records: u64 = 0;
+    let mut unknown = UnknownRecordSink::new(datagram_budget);
 
     for _ in 0..num_records {
         if pos + 8 > body.len() {
@@ -294,18 +433,15 @@ fn decode_flow_sample(
         let rec_format = flow_data_format & 0xFFF;
 
         if rec_enterprise != 0 {
-            // Enterprise-specific — store raw in extra, up to the per-sample cap.
+            // Enterprise-specific — store raw in extra, up to the per-sample/
+            // per-datagram budget.
             let data_hex = hex::encode(rec_body);
-            push_unknown_record(
-                &mut unknown_records,
-                &mut dropped_unknown_records,
-                serde_json::json!({
-                    "enterprise": rec_enterprise,
-                    "format": rec_format,
-                    "length": flow_data_length,
-                    "data_hex": data_hex,
-                }),
-            );
+            unknown.push(serde_json::json!({
+                "enterprise": rec_enterprise,
+                "format": rec_format,
+                "length": flow_data_length,
+                "data_hex": data_hex,
+            }));
             continue;
         }
 
@@ -335,22 +471,16 @@ fn decode_flow_sample(
             }
             other => {
                 let data_hex = hex::encode(rec_body);
-                push_unknown_record(
-                    &mut unknown_records,
-                    &mut dropped_unknown_records,
-                    serde_json::json!({
-                        "format": other,
-                        "length": flow_data_length,
-                        "data_hex": data_hex,
-                    }),
-                );
+                unknown.push(serde_json::json!({
+                    "format": other,
+                    "length": flow_data_length,
+                    "data_hex": data_hex,
+                }));
             }
         }
     }
 
-    if dropped_unknown_records > 0 {
-        unknown_records.push(serde_json::json!({ "truncated": dropped_unknown_records }));
-    }
+    let unknown_records = unknown.finish();
     if !unknown_records.is_empty() {
         rec.extra = serde_json::Value::Array(unknown_records);
     }
@@ -516,6 +646,7 @@ fn decode_counter_sample(
     format: u32,
     agent_addr: IpAddr,
     received_at: chrono::DateTime<chrono::Utc>,
+    datagram_budget: &mut DatagramUnknownBudget,
 ) -> anyhow::Result<Vec<SflowRecord>> {
     // counter_sample (format 2) body:
     //   sequence_number(4) source_id(4) num_counter_records(4) → 12 bytes
@@ -562,8 +693,7 @@ fn decode_counter_sample(
         extra: serde_json::json!([]),
     };
 
-    let mut unknown_records: Vec<serde_json::Value> = Vec::new();
-    let mut dropped_unknown_records: u64 = 0;
+    let mut unknown = UnknownRecordSink::new(datagram_budget);
 
     for _ in 0..num_records {
         if pos + 8 > body.len() {
@@ -589,18 +719,15 @@ fn decode_counter_sample(
         let rec_format = counter_data_format & 0xFFF;
 
         if rec_enterprise != 0 || rec_format != 1 {
-            // Non-generic counter record — store raw in extra, up to the per-sample cap.
+            // Non-generic counter record — store raw in extra, up to the
+            // per-sample/per-datagram budget.
             let data_hex = hex::encode(rec_body);
-            push_unknown_record(
-                &mut unknown_records,
-                &mut dropped_unknown_records,
-                serde_json::json!({
-                    "enterprise": rec_enterprise,
-                    "format": rec_format,
-                    "length": counter_data_length,
-                    "data_hex": data_hex,
-                }),
-            );
+            unknown.push(serde_json::json!({
+                "enterprise": rec_enterprise,
+                "format": rec_format,
+                "length": counter_data_length,
+                "data_hex": data_hex,
+            }));
             continue;
         }
 
@@ -650,9 +777,7 @@ fn decode_counter_sample(
         // ifPromiscuousMode  @ 84 — not separately curated
     }
 
-    if dropped_unknown_records > 0 {
-        unknown_records.push(serde_json::json!({ "truncated": dropped_unknown_records }));
-    }
+    let unknown_records = unknown.finish();
     if !unknown_records.is_empty() {
         rec.extra = serde_json::Value::Array(unknown_records);
     }
@@ -1098,8 +1223,10 @@ pub(crate) mod tests {
         let dropped = NUM_RECORDS as u64 - MAX_UNKNOWN_RECORDS_PER_SAMPLE as u64;
         assert_eq!(
             extra.last().unwrap(),
-            &serde_json::json!({ "truncated": dropped }),
-            "last element must be a single truncation marker with the dropped count"
+            &serde_json::json!({ "truncated": dropped, "reason": "sample_cap" }),
+            "last element must be a single truncation marker with the dropped count; \
+             this datagram only has one sample, so the sample-local cap trips \
+             (budget of 512 is untouched, only 32 records were ever accepted)"
         );
     }
 
@@ -1231,7 +1358,158 @@ pub(crate) mod tests {
         let dropped = NUM_RECORDS as u64 - MAX_UNKNOWN_RECORDS_PER_SAMPLE as u64;
         assert_eq!(
             extra.last().unwrap(),
-            &serde_json::json!({ "truncated": dropped })
+            &serde_json::json!({ "truncated": dropped, "reason": "sample_cap" })
+        );
+    }
+
+    // ── FIX ROUND 2 (per-datagram, not per-sample, is the real attack shape) ──
+
+    #[test]
+    fn multi_sample_hostile_datagram_caps_total_unknown_records_at_datagram_budget() {
+        // The per-sample cap alone does not bound an attacker who splits
+        // records across many samples, each staying under the per-sample
+        // cap. Build 20 samples, each declaring exactly
+        // MAX_UNKNOWN_RECORDS_PER_SAMPLE (32) unknown records -- so no
+        // sample ever trips its own per-sample cap -- and confirm the
+        // datagram-wide budget (512) is still the bound that holds: only
+        // the first 16 samples (16*32=512) actually retain records, the
+        // 17th sample is the one that observes and reports the budget
+        // running out, and samples 18-20 are silently unaffected (no
+        // marker, per the "notify once" rule) since the operator already
+        // learned the datagram-wide budget was exhausted from sample 17.
+        const NUM_SAMPLES: u32 = 20;
+        const RECORDS_PER_SAMPLE: u32 = MAX_UNKNOWN_RECORDS_PER_SAMPLE as u32;
+        let samples_fully_accepted = (MAX_UNKNOWN_RECORDS_PER_DATAGRAM as u32) / RECORDS_PER_SAMPLE;
+        assert_eq!(
+            samples_fully_accepted, 16,
+            "test assumes 512 / 32 == 16 -- update the fixture if the constants change"
+        );
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&5u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&[10, 0, 0, 1]);
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&NUM_SAMPLES.to_be_bytes());
+
+        let sample_body_len = 32 + (RECORDS_PER_SAMPLE as usize) * 8;
+        for _ in 0..NUM_SAMPLES {
+            buf.extend_from_slice(&1u32.to_be_bytes()); // data_format = flow_sample
+            buf.extend_from_slice(&(sample_body_len as u32).to_be_bytes());
+            buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
+            buf.extend_from_slice(&1u32.to_be_bytes()); // source_id
+            buf.extend_from_slice(&512u32.to_be_bytes()); // sampling_rate
+            buf.extend_from_slice(&512u32.to_be_bytes()); // sample_pool
+            buf.extend_from_slice(&0u32.to_be_bytes()); // drops
+            buf.extend_from_slice(&1u32.to_be_bytes()); // input_ifindex
+            buf.extend_from_slice(&2u32.to_be_bytes()); // output_ifindex
+            buf.extend_from_slice(&RECORDS_PER_SAMPLE.to_be_bytes()); // num_flow_records
+            for _ in 0..RECORDS_PER_SAMPLE {
+                buf.extend_from_slice(&1001u32.to_be_bytes()); // enterprise 0, format 1001
+                buf.extend_from_slice(&0u32.to_be_bytes()); // flow_data_length = 0
+            }
+        }
+
+        let records =
+            decode_datagram(&buf, exporter()).expect("must decode despite hostile sample count");
+        assert_eq!(
+            records.len(),
+            NUM_SAMPLES as usize,
+            "every sample must decode"
+        );
+
+        // Samples 0..16: fully within the datagram budget -- 32 real records, no marker.
+        let mut total_accepted_records = 0usize;
+        for r in &records[0..16] {
+            let extra = r.extra.as_array().expect("extra must be an array");
+            assert_eq!(extra.len(), RECORDS_PER_SAMPLE as usize);
+            assert!(extra.iter().all(|v| v.get("data_hex").is_some()));
+            total_accepted_records += extra.len();
+        }
+        assert_eq!(
+            total_accepted_records, MAX_UNKNOWN_RECORDS_PER_DATAGRAM,
+            "the datagram-wide budget, not the per-sample cap, must bound the total"
+        );
+
+        // Sample 16 (17th): first to observe the datagram budget exhausted -- all
+        // 32 of its records dropped, one marker naming the datagram_budget reason.
+        let reporting = &records[16];
+        let extra = reporting.extra.as_array().expect("extra must be an array");
+        assert_eq!(
+            extra,
+            &vec![serde_json::json!({
+                "truncated": RECORDS_PER_SAMPLE as u64,
+                "reason": "datagram_budget",
+            })]
+        );
+
+        // Samples 17..20: budget was already exhausted and already reported --
+        // silently unaffected, no marker (the "notify once" rule).
+        for r in &records[17..20] {
+            assert_eq!(
+                r.extra,
+                serde_json::json!([]),
+                "later samples must not each mint their own marker once the datagram \
+                 budget has already been reported once"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_sample_hostile_counter_datagram_caps_total_at_datagram_budget() {
+        // Same multi-sample-splits-the-per-sample-cap shape as the flow-sample
+        // test above, through decode_counter_sample's push site.
+        const NUM_SAMPLES: u32 = 20;
+        const RECORDS_PER_SAMPLE: u32 = MAX_UNKNOWN_RECORDS_PER_SAMPLE as u32;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&5u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&[10, 0, 0, 1]);
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&NUM_SAMPLES.to_be_bytes());
+
+        let sample_body_len = 12 + (RECORDS_PER_SAMPLE as usize) * 8;
+        for _ in 0..NUM_SAMPLES {
+            buf.extend_from_slice(&2u32.to_be_bytes()); // data_format = counter_sample
+            buf.extend_from_slice(&(sample_body_len as u32).to_be_bytes());
+            buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
+            buf.extend_from_slice(&1u32.to_be_bytes()); // source_id
+            buf.extend_from_slice(&RECORDS_PER_SAMPLE.to_be_bytes()); // num_counter_records
+            for _ in 0..RECORDS_PER_SAMPLE {
+                buf.extend_from_slice(&1001u32.to_be_bytes());
+                buf.extend_from_slice(&0u32.to_be_bytes());
+            }
+        }
+
+        let records =
+            decode_datagram(&buf, exporter()).expect("must decode despite hostile sample count");
+        assert_eq!(records.len(), NUM_SAMPLES as usize);
+
+        let total_accepted_records: usize = records
+            .iter()
+            .filter_map(|r| r.extra.as_array())
+            .flat_map(|a| a.iter())
+            .filter(|v| v.get("data_hex").is_some())
+            .count();
+        assert_eq!(
+            total_accepted_records, MAX_UNKNOWN_RECORDS_PER_DATAGRAM,
+            "counter-sample path must respect the same datagram-wide budget"
+        );
+
+        let total_datagram_budget_markers = records
+            .iter()
+            .filter_map(|r| r.extra.as_array())
+            .flat_map(|a| a.iter())
+            .filter(|v| v.get("reason") == Some(&serde_json::json!("datagram_budget")))
+            .count();
+        assert_eq!(
+            total_datagram_budget_markers, 1,
+            "the datagram-budget marker must be emitted exactly once, not per sample"
         );
     }
 }

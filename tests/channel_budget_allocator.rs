@@ -307,3 +307,93 @@ fn hostile_sflow_sample_heap_retention_is_bounded_by_the_cap_not_the_record_coun
          to a small, fixed footprint regardless of the attacker-declared record count"
     );
 }
+
+/// The real attack shape: a per-sample cap alone does not bound retention,
+/// because an attacker can split records across many samples in one
+/// datagram, each staying under the per-sample cap
+/// (`MAX_UNKNOWN_RECORDS_PER_SAMPLE`). `decode_datagram` shares a single
+/// `MAX_UNKNOWN_RECORDS_PER_DATAGRAM` budget across every sample it decodes,
+/// which is the bound this test exercises.
+///
+/// Fixture: the maximum-density packing of capped samples into one
+/// 65,535-byte UDP datagram. Each sample costs 8 (envelope) + 32
+/// (flow-sample header) + 32*8 (32 unknown-record envelopes, zero-length
+/// bodies) = 296 bytes on the wire, so (65535 - 28) / 296 ~= 221 samples fit
+/// -- 221 * 32 ~= 7,072 unknown records *declared*, matching the worst-case
+/// arithmetic in `MAX_UNKNOWN_RECORDS_PER_DATAGRAM`'s doc comment. Before
+/// the datagram-wide budget, this shape retained ~5 MB (matching the
+/// single-sample exploit, since the per-sample cap alone barely bit).
+#[test]
+fn multi_sample_hostile_sflow_datagram_heap_retention_is_bounded_by_the_datagram_budget() {
+    use logthing::sflow::decoder::decode_datagram;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    const NUM_SAMPLES: u32 = 221;
+    const RECORDS_PER_SAMPLE: u32 = 32; // == MAX_UNKNOWN_RECORDS_PER_SAMPLE
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&5u32.to_be_bytes()); // version = 5
+    buf.extend_from_slice(&1u32.to_be_bytes()); // agent_addr_type = IPv4
+    buf.extend_from_slice(&[10, 0, 0, 1]); // agent_addr
+    buf.extend_from_slice(&0u32.to_be_bytes()); // sub_agent_id
+    buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
+    buf.extend_from_slice(&1u32.to_be_bytes()); // uptime_ms
+    buf.extend_from_slice(&NUM_SAMPLES.to_be_bytes()); // num_samples
+
+    let sample_body_len = 32 + (RECORDS_PER_SAMPLE as usize) * 8;
+    for _ in 0..NUM_SAMPLES {
+        buf.extend_from_slice(&1u32.to_be_bytes()); // data_format = flow_sample
+        buf.extend_from_slice(&(sample_body_len as u32).to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes()); // sequence_number
+        buf.extend_from_slice(&1u32.to_be_bytes()); // source_id
+        buf.extend_from_slice(&1000u32.to_be_bytes()); // sampling_rate
+        buf.extend_from_slice(&1000u32.to_be_bytes()); // sample_pool
+        buf.extend_from_slice(&0u32.to_be_bytes()); // drops
+        buf.extend_from_slice(&1u32.to_be_bytes()); // input ifindex
+        buf.extend_from_slice(&2u32.to_be_bytes()); // output ifindex
+        buf.extend_from_slice(&RECORDS_PER_SAMPLE.to_be_bytes()); // num_flow_records
+        for _ in 0..RECORDS_PER_SAMPLE {
+            buf.extend_from_slice(&1001u32.to_be_bytes()); // enterprise 0, format 1001
+            buf.extend_from_slice(&0u32.to_be_bytes()); // flow_data_length = 0
+        }
+    }
+    assert!(
+        buf.len() <= 65_535,
+        "fixture must fit one UDP datagram; got {} bytes",
+        buf.len()
+    );
+
+    let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let (extras, real) = live_heap_of(|| {
+        let records = decode_datagram(&buf, exporter).expect("must decode");
+        records.into_iter().map(|r| r.extra).collect::<Vec<_>>()
+    });
+
+    let total_accepted_records: usize = extras
+        .iter()
+        .filter_map(|e| e.as_array())
+        .flat_map(|a| a.iter())
+        .filter(|v| v.get("data_hex").is_some())
+        .count();
+    assert_eq!(
+        total_accepted_records,
+        512,
+        "total accepted unknown records across the whole datagram must be bounded by \
+         the datagram budget (512), not by {NUM_SAMPLES} samples x {RECORDS_PER_SAMPLE} \
+         records/sample = {}",
+        NUM_SAMPLES * RECORDS_PER_SAMPLE
+    );
+
+    // Before the datagram-wide budget, this exact shape retained ~4.9 MB (the
+    // per-sample cap alone barely reduced the single-sample exploit's ~5.34
+    // MB). Measured post-fix: ~416,534 bytes for 512 accepted records plus
+    // one truncation marker -- the datagram budget plus "notify once"
+    // truncation-marker dedup (see MAX_UNKNOWN_RECORDS_PER_DATAGRAM's doc
+    // comment) bounds this to a small, fixed footprint regardless of how
+    // records are spread across samples.
+    assert!(
+        real < 500_000,
+        "multi-sample hostile datagram retained {real} bytes -- expected the datagram \
+         budget to bound this regardless of how records are spread across samples"
+    );
+}
