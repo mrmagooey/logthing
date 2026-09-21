@@ -261,6 +261,59 @@ impl AggFields for crate::syslog::SyslogMessage {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WEF: cardinality-watcher-only impl, NOT an aggregate source
+// ---------------------------------------------------------------------------
+
+/// `AggFields` for `WindowsEvent`, added so `stats::cardinality`'s watcher
+/// can count distinct WEF field values (e.g. `computer`) the same way it
+/// already counts zeek fields.
+///
+/// This impl exists ONLY for the cardinality watcher. WEF is deliberately
+/// absent from `aggregate::mod::KNOWN_SOURCES` — wiring it into
+/// `[[aggregate.rules]]` is a separate, out-of-scope change; don't read this
+/// impl's presence as WEF having become a supported aggregate source.
+impl AggFields for crate::models::WindowsEvent {
+    /// The parsed event's `Channel` (e.g. `"Security"`, `"System"`,
+    /// `"Application"`). An unparsed event (`parsed` is `None` — malformed
+    /// or partial XML) has no channel, so it reports `""`, which matches no
+    /// configured watch and is correctly ignored rather than mis-bucketed
+    /// under a guessed stream.
+    fn stream(&self) -> &str {
+        self.parsed.as_ref().map_or("", |p| p.channel.as_str())
+    }
+
+    /// `source_host` is resolved outside `match` because it's the one field
+    /// available even when `parsed` is `None` — every other field lives on
+    /// `ParsedEvent`.
+    ///
+    /// `source_host` vs `computer`: `source_host` is the host that
+    /// DELIVERED this event to the WEF endpoint (the connecting peer);
+    /// `computer` is the `Computer` field read out of the event's own XML.
+    /// Behind a WEF collector relaying on behalf of many machines, these
+    /// differ — `source_host` counts collectors, `computer` counts
+    /// originating machines. For "do I see all my hosts", `computer` is the
+    /// field to watch; that distinction is the whole reason this impl
+    /// exists (see the module doc on `config::CardinalityWatch`).
+    fn field(&self, name: &str) -> Option<FieldValue<'_>> {
+        if name == "source_host" {
+            return Some(FieldValue::Str(Cow::Borrowed(self.source_host.as_str())));
+        }
+        let parsed = self.parsed.as_ref()?;
+        match name {
+            "computer" => Some(FieldValue::Str(Cow::Borrowed(parsed.computer.as_str()))),
+            "provider" => Some(FieldValue::Str(Cow::Borrowed(parsed.provider.as_str()))),
+            "channel" => Some(FieldValue::Str(Cow::Borrowed(parsed.channel.as_str()))),
+            "event_id" => Some(FieldValue::Num(parsed.event_id as f64)),
+            "security_user_id" => parsed
+                .security_user_id
+                .as_deref()
+                .map(|s| FieldValue::Str(Cow::Borrowed(s))),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +618,99 @@ mod tests {
         assert!(matches!(msg.field("severity"), Some(FieldValue::Num(n)) if n == 2.0));
         assert!(matches!(msg.field("message"), Some(FieldValue::Str(s)) if s == "Failed password"));
         assert!(msg.field("proc_id").is_none());
+    }
+
+    // -- AggFields for WindowsEvent (cardinality-watcher-only) --
+
+    fn windows_event_parsed(channel: &str, computer: &str) -> crate::models::WindowsEvent {
+        let parsed = crate::models::ParsedEvent {
+            provider: "Microsoft-Windows-Security-Auditing".to_string(),
+            event_id: 4624,
+            level: crate::models::EventLevel::Information,
+            task: 0,
+            opcode: 0,
+            keywords: 0,
+            time_created: chrono::Utc::now(),
+            event_record_id: 1,
+            process_id: None,
+            thread_id: None,
+            channel: channel.to_string(),
+            computer: computer.to_string(),
+            security_user_id: Some("S-1-5-21-1".to_string()),
+            message: None,
+            data: None,
+        };
+        crate::models::WindowsEvent::new("collector-1".to_string(), "<Event/>".to_string())
+            .with_parsed(parsed)
+    }
+
+    #[test]
+    fn windows_event_parsed_exposes_stream_and_mapped_fields() {
+        let ev = windows_event_parsed("Security", "WORKSTATION-01");
+        assert_eq!(ev.stream(), "Security");
+        assert!(matches!(ev.field("computer"), Some(FieldValue::Str(s)) if s == "WORKSTATION-01"));
+        assert!(matches!(ev.field("source_host"), Some(FieldValue::Str(s)) if s == "collector-1"));
+        assert!(
+            matches!(ev.field("provider"), Some(FieldValue::Str(s)) if s == "Microsoft-Windows-Security-Auditing")
+        );
+        assert!(matches!(ev.field("channel"), Some(FieldValue::Str(s)) if s == "Security"));
+        assert!(matches!(ev.field("event_id"), Some(FieldValue::Num(n)) if n == 4624.0));
+        assert!(
+            matches!(ev.field("security_user_id"), Some(FieldValue::Str(s)) if s == "S-1-5-21-1")
+        );
+    }
+
+    #[test]
+    fn windows_event_unmapped_field_names_return_none() {
+        let ev = windows_event_parsed("Security", "WORKSTATION-01");
+        assert!(ev.field("raw_xml").is_none());
+        assert!(ev.field("subscription_id").is_none());
+        assert!(ev.field("level").is_none());
+        assert!(ev.field("nonexistent").is_none());
+    }
+
+    #[test]
+    fn windows_event_security_user_id_absent_is_a_miss_not_a_phantom_value() {
+        let mut ev = windows_event_parsed("Security", "WORKSTATION-01");
+        ev.parsed.as_mut().unwrap().security_user_id = None;
+        assert!(ev.field("security_user_id").is_none());
+    }
+
+    /// Hostile `computer` values (16 KiB, NUL-embedded, empty) must read
+    /// back byte-for-byte through `field("computer")` — this impl does no
+    /// validation or truncation of its own; that job belongs entirely to
+    /// `stats::cardinality`'s bounded set (`CardinalityWatcher::observe`'s
+    /// `group_value_string` call) and its own hostile-input test
+    /// (`hostile_values_bound_series_count_and_memory_not_labels` in
+    /// `stats::cardinality`), not to this field-lookup layer.
+    #[test]
+    fn windows_event_hostile_computer_values_round_trip_unchanged() {
+        let huge = "H".repeat(16 * 1024);
+        for value in [huge.as_str(), "evil\0value", ""] {
+            let ev = windows_event_parsed("Security", value);
+            match ev.field("computer") {
+                Some(FieldValue::Str(s)) => assert_eq!(s, value),
+                other => panic!("expected computer={value:?} to round-trip, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn windows_event_unparsed_has_empty_stream_but_still_resolves_source_host() {
+        let ev = crate::models::WindowsEvent::new("collector-1".to_string(), "<bad".to_string());
+        assert_eq!(
+            ev.stream(),
+            "",
+            "an unparsed event must report an empty stream, matching no configured watch"
+        );
+        assert!(
+            matches!(ev.field("source_host"), Some(FieldValue::Str(s)) if s == "collector-1"),
+            "source_host lives on the outer WindowsEvent, available even without a parse"
+        );
+        assert!(
+            ev.field("computer").is_none(),
+            "computer lives on ParsedEvent, which is absent for an unparsed event"
+        );
     }
 
     #[test]

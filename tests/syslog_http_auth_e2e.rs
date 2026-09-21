@@ -25,6 +25,7 @@ async fn build_app_state(token: &str) -> Arc<AppState> {
     Arc::new(AppState {
         config: Arc::new(RwLock::new(config)),
         throughput: Arc::new(ThroughputStats::new()),
+        wef_cardinality_watchers: Vec::new(),
         parser: WefParser::new(),
         event_parser: None,
         parquet_s3_sender: None,

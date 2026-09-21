@@ -192,6 +192,98 @@ pub struct MetricsConfig {
     /// behaviour when scraping from another host.
     #[serde(default)]
     pub bind_address: Option<String>,
+
+    /// Field-cardinality watches: each entry counts distinct values of one
+    /// field, on one stream, from one source, published as the
+    /// `field_distinct_values{source,stream,field}` gauge — "is ingestion
+    /// working?" answered by comparing this against a known-good count
+    /// (e.g. "we have ~5000 hosts; is `computer` reporting ~5000 distinct
+    /// values?"). Empty (the default) means the feature is off, adding zero
+    /// hot-path work.
+    ///
+    /// This is a list, not a single field/stream pair, and each entry names
+    /// its `source` (one of "zeek", "wef", "suricata", "syslog", "ipfix",
+    /// "sflow") — an earlier version of this knob was
+    /// a single flat field/stream pair with no `source` key, cut back
+    /// deliberately when zeek was the only source with an `AggFields` impl
+    /// wired to the watcher and every non-"zeek" source was rejected at
+    /// startup. That YAGNI call stops paying off now that a second source
+    /// (WEF) has a genuine, different-shaped identity field (`computer`)
+    /// worth watching, and an operator plausibly wants a zeek host count and
+    /// a WEF host count running side by side — see `stats::cardinality`'s
+    /// module doc for the compiled-watch validation this list feeds.
+    ///
+    /// `id.orig_h` (zeek) is an IP, not a stable host identity: DHCP churn,
+    /// NAT, and multi-homing move the distinct-IP count independently of
+    /// ingestion health, and a sensor that sees inbound/external traffic
+    /// will count external originators that are not org hosts at all.
+    /// `computer` (WEF) is a materially better signal for the same reason —
+    /// see the `AggFields for WindowsEvent` doc comment
+    /// (`forwarding::aggregate::fields`) for the `source_host`-vs-`computer`
+    /// distinction. Either way, treat the gauge as a proxy for host count,
+    /// not an exact one, and alert on a SUSTAINED multi-window drop rather
+    /// than on absolute equality to a known host count — a single window's
+    /// value is noisy for the reasons above and the conn.log emission
+    /// pattern described on `cardinality_window_secs`.
+    #[serde(default)]
+    pub cardinality_watch: Vec<CardinalityWatch>,
+
+    /// Window for `field_distinct_values`: distinct values are counted,
+    /// published, then cleared every this-many seconds, so the gauge always
+    /// reports the MOST RECENTLY COMPLETED window rather than a since-boot
+    /// count that could only ratchet upward and would never show a source
+    /// going silent. In-memory only — resets on restart, same as every
+    /// other stat in `crate::stats`.
+    ///
+    /// Defaults to 3600s (one hour), not a short window: zeek `conn.log`
+    /// entries are emitted per-connection-CLOSE, not as a heartbeat, so the
+    /// window must be long enough that a normally-quiet host's connection
+    /// still closes (and so appears) within it — a short window would read
+    /// as a false alarm on exactly the comparison this metric exists to
+    /// support, for hosts that are perfectly healthy but simply idle.
+    #[serde(default = "default_cardinality_window_secs")]
+    pub cardinality_window_secs: u64,
+
+    /// Cap on distinct values tracked within one window. Bounds worst-case
+    /// memory to roughly `cardinality_max_values * 256 bytes` (256 =
+    /// `group_value_string`'s `MAX_GROUP_VALUE_BYTES`).
+    ///
+    /// Default 100000 is sized roughly an order of magnitude above a
+    /// typical internal host count, headroom for the 3600s default window
+    /// (a longer window naturally accumulates more distinct values than a
+    /// short one). A sensor that also observes external originators — not
+    /// just internal hosts — can exceed it in normal operation, not only
+    /// under adversarial input; if so, raise this and watch
+    /// `field_distinct_values_capped`.
+    ///
+    /// A gauge sitting at EXACTLY this number means "read the
+    /// `field_distinct_values_capped` counter", not "this is the real
+    /// count" — e.g. 150k distinct values against a 100k cap reports
+    /// 100000 flat, with the other 50k absorbed by the capped counter.
+    #[serde(default = "default_cardinality_max_values")]
+    pub cardinality_max_values: usize,
+}
+
+/// One `[[metrics.cardinality_watch]]` entry: watch `field` on `stream`,
+/// from `source`. Validated fatal at startup by
+/// `stats::cardinality::compile_watches` — see that function's doc comment
+/// for the full list of checks (unknown `source`, empty `field`/`stream`,
+/// duplicate `(source, stream, field)` triples).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CardinalityWatch {
+    /// One of: "zeek", "wef", "suricata", "syslog", "ipfix", "sflow".
+    pub source: String,
+    /// Stream the field is counted on: zeek `_path` (e.g. `"conn"`), WEF
+    /// `Channel` (e.g. `"Security"`), suricata's EVE `event_type`, syslog's
+    /// `app_name` (empty for RFC 3164 traffic with no `app_name` — which an
+    /// empty `stream` here can therefore never match, since an empty
+    /// `stream` is itself rejected at startup), ipfix's mandatory constant
+    /// `"flows"`, or sflow's `"flow"`/`"counter"`. Watching a field across
+    /// every stream at once is not supported — a single unqualified counter
+    /// would conflate e.g. zeek's `conn` and `dns` streams' `id.orig_h` into
+    /// one number with no way to tell which stream contributed it.
+    pub stream: String,
+    pub field: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1515,8 +1607,19 @@ impl Default for MetricsConfig {
             enabled: default_metrics_enabled(),
             port: default_metrics_port(),
             bind_address: None,
+            cardinality_watch: Vec::new(),
+            cardinality_window_secs: default_cardinality_window_secs(),
+            cardinality_max_values: default_cardinality_max_values(),
         }
     }
+}
+
+fn default_cardinality_window_secs() -> u64 {
+    3600
+}
+
+fn default_cardinality_max_values() -> usize {
+    100_000
 }
 
 // Default value functions

@@ -53,6 +53,7 @@ async fn http_only_deployment_stays_up_then_shuts_down_cleanly() {
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
         IpWhitelist::empty(),
+        Vec::new(),
     )
     .await
     .expect("Server::new must succeed with no S3/local targets configured");

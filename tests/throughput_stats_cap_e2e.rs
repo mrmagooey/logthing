@@ -87,6 +87,7 @@ async fn throughput_endpoint_stays_bounded_under_a_flood_of_distinct_event_types
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
         IpWhitelist::empty(),
+        Vec::new(),
     )
     .await
     .expect("Server::new must succeed with no S3/local targets configured");

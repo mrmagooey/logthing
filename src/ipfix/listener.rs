@@ -3,6 +3,7 @@
 use crate::ipfix::FlowRecord;
 use crate::ipfix::decoder::{IpfixDecoder, decode_datagram};
 use crate::middleware::IpWhitelist;
+use crate::stats::cardinality::CardinalityWatcher;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -74,11 +75,44 @@ impl IpfixHandler for DefaultIpfixHandler {
     }
 }
 
+/// Observe every flow in a decoded batch against the configured ipfix
+/// cardinality watches, then dispatch the whole batch to the handler. Every
+/// dispatch site in this file — the `recv_tasks <= 1` inline arms,
+/// `run_with_socket`, and both arms of `ipfix_recv_loop` (the `recv_tasks >
+/// 1` fan-out this listener defaults to) — routes through this one
+/// function, mirroring `zeek::listener`'s shared per-record dispatch point
+/// but as its own free function, looped over the batch since IPFIX delivers
+/// flows in batches rather than one at a time.
+///
+/// ponytail: the cost is per-watcher AND per-record-in-batch — `observe`
+/// allocates a `String` for the field value before its set-membership check
+/// (see its own `ponytail:` comment), so N watches means N such allocations
+/// for every flow in every batch, even when all N already track the value.
+/// A batch multiplies it, which makes this and sflow the heaviest of the six.
+/// Fine at the one-or-two watches this is meant for. Ceiling: if someone
+/// configures many watches on one source, hoist the value-extraction out of
+/// the inner loop for watches sharing a `field`. Same disclosure as
+/// `zeek::listener`'s dispatch point.
+async fn observe_and_dispatch(
+    cardinality: &[Arc<CardinalityWatcher>],
+    flows: Vec<FlowRecord>,
+    src: SocketAddr,
+    handler: &Arc<dyn IpfixHandler>,
+) {
+    for flow in &flows {
+        for watcher in cardinality {
+            watcher.observe(flow);
+        }
+    }
+    handler.handle_flows(flows, src).await;
+}
+
 /// IPFIX UDP listener.
 pub struct IpfixListener {
     config: IpfixListenerConfig,
     handler: Arc<dyn IpfixHandler>,
     allowed_ips: IpWhitelist,
+    cardinality: Vec<Arc<CardinalityWatcher>>,
 }
 
 impl IpfixListener {
@@ -87,6 +121,7 @@ impl IpfixListener {
             config,
             handler,
             allowed_ips: IpWhitelist::empty(),
+            cardinality: Vec::new(),
         }
     }
 
@@ -94,6 +129,16 @@ impl IpfixListener {
     /// [`IpWhitelist::empty()`] (allow all) via `new()`.
     pub fn with_allowed_ips(mut self, allowed_ips: IpWhitelist) -> Self {
         self.allowed_ips = allowed_ips;
+        self
+    }
+
+    /// Attach the `[[metrics.cardinality_watch]]` watchers configured for
+    /// `source = "ipfix"`. Defaults to empty via `new()` — `main.rs` builds
+    /// the full list from config (see `stats::cardinality::compile_watches`)
+    /// and partitions it by source once at startup, so this listener only
+    /// ever sees its own ipfix watches.
+    pub fn with_cardinality_watchers(mut self, cardinality: Vec<Arc<CardinalityWatcher>>) -> Self {
+        self.cardinality = cardinality;
         self
     }
 
@@ -161,7 +206,7 @@ impl IpfixListener {
                                             );
                                         }
                                         Ok(flows) => {
-                                            self.handler.handle_flows(flows, src).await;
+                                            observe_and_dispatch(&self.cardinality, flows, src, &self.handler).await;
                                         }
                                         Err(e) => {
                                             metrics::counter!("ipfix_decode_errors").increment(1);
@@ -213,7 +258,7 @@ impl IpfixListener {
                                             debug!("IPFIX datagram from {} produced no flows (template-only or empty)", src);
                                         }
                                         Ok(flows) => {
-                                            self.handler.handle_flows(flows, src).await;
+                                            observe_and_dispatch(&self.cardinality, flows, src, &self.handler).await;
                                         }
                                         Err(e) => {
                                             metrics::counter!("ipfix_decode_errors").increment(1);
@@ -288,6 +333,7 @@ impl IpfixListener {
             let handler = self.handler.clone();
             let allowed_ips = self.allowed_ips.clone();
             let shutdown_rx = shutdown_rx.clone();
+            let cardinality = self.cardinality.clone();
             // Only the first task takes the shared drop-stats tracker, so it
             // is polled exactly once per SO_REUSEPORT group.
             let stats = if i == 0 { socket_stats.take() } else { None };
@@ -299,6 +345,7 @@ impl IpfixListener {
                 shutdown_rx,
                 stats,
                 self.config.recv_batch_size,
+                cardinality,
             )));
         }
 
@@ -350,7 +397,7 @@ impl IpfixListener {
                                     );
                                 }
                                 Ok(flows) => {
-                                    self.handler.handle_flows(flows, src).await;
+                                    observe_and_dispatch(&self.cardinality, flows, src, &self.handler).await;
                                 }
                                 Err(e) => {
                                     metrics::counter!("ipfix_decode_errors").increment(1);
@@ -376,6 +423,11 @@ impl IpfixListener {
 /// so it can be spawned once per `SO_REUSEPORT` socket. `socket_stats` is
 /// `Some` for exactly one task per group (see the call site) so the shared
 /// drop counter is polled once, not once per task.
+// ponytail: 8 params over clippy's default 7-arg threshold — a struct here
+// would be a one-use bag with no behaviour, purely to satisfy a lint;
+// every field already has a load-bearing doc comment above (or at its own
+// call site). Revisit if a ninth parameter ever wants to join it.
+#[allow(clippy::too_many_arguments)]
 async fn ipfix_recv_loop(
     socket: UdpSocket,
     mut decoder: IpfixDecoder,
@@ -384,6 +436,7 @@ async fn ipfix_recv_loop(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mut socket_stats: Option<crate::net::SocketDropStats>,
     recv_batch_size: usize,
+    cardinality: Vec<Arc<CardinalityWatcher>>,
 ) {
     let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
@@ -409,7 +462,7 @@ async fn ipfix_recv_loop(
                                     );
                                 }
                                 Ok(flows) => {
-                                    handler.handle_flows(flows, src).await;
+                                    observe_and_dispatch(&cardinality, flows, src, &handler).await;
                                 }
                                 Err(e) => {
                                     metrics::counter!("ipfix_decode_errors").increment(1);
@@ -462,7 +515,7 @@ async fn ipfix_recv_loop(
                                     debug!("IPFIX datagram from {} produced no flows (template-only or empty)", src);
                                 }
                                 Ok(flows) => {
-                                    handler.handle_flows(flows, src).await;
+                                    observe_and_dispatch(&cardinality, flows, src, &handler).await;
                                 }
                                 Err(e) => {
                                     metrics::counter!("ipfix_decode_errors").increment(1);
@@ -1346,5 +1399,182 @@ mod tests {
                 .any(|m| m.contains("a receive task terminated abnormally")),
             "expected an error log containing 'a receive task terminated abnormally', got: {events:?}"
         );
+    }
+
+    // -- Cardinality watching: recv_tasks <= 1 (inline) AND recv_tasks > 1 --
+    // -- (SO_REUSEPORT fan-out, the default) must both observe flows --
+
+    /// Same shape as `start_test_listener`, but attaches the given
+    /// cardinality watchers and uses `DefaultIpfixHandler` — these tests
+    /// only care about what the watcher observed, not what the handler did
+    /// with the batch.
+    async fn start_test_listener_with_cardinality(
+        recv_tasks: usize,
+        recv_batch_size: usize,
+        cardinality: Vec<Arc<CardinalityWatcher>>,
+    ) -> (
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = tmp.local_addr().unwrap().port();
+        drop(tmp);
+        let bound: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
+
+        let config = IpfixListenerConfig {
+            udp_port,
+            bind_address: "127.0.0.1".to_string(),
+            recv_tasks,
+            recv_batch_size,
+            ..IpfixListenerConfig::default()
+        };
+        let listener = IpfixListener::new(config, Arc::new(DefaultIpfixHandler))
+            .with_cardinality_watchers(cardinality);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { listener.start_with_shutdown(shutdown_rx).await });
+        sleep(Duration::from_millis(50)).await;
+
+        (task, bound, shutdown_tx)
+    }
+
+    /// `recv_tasks <= 1`: drives the inline UDP arm of `start_with_shutdown`
+    /// directly. Round-1 defect context: wiring only this branch would still
+    /// pass this test while leaving the default-config fan-out path (see the
+    /// next test) completely unwired.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn cardinality_watcher_reports_distinct_values_at_recv_tasks_one() {
+        use crate::stats::cardinality::CompiledWatch;
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let watcher = Arc::new(CardinalityWatcher::new(
+            CompiledWatch {
+                source: "ipfix".to_string(),
+                stream: "flows".to_string(),
+                field: "src_addr".to_string(),
+            },
+            1000,
+        ));
+
+        let (listener, bound, shutdown_tx) =
+            start_test_listener_with_cardinality(1, 1, vec![watcher.clone()]).await;
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.send_to(&template_datagram(1), bound).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        // 3 data records, 2 distinct src_addr (n=0 repeated).
+        for (seq, n) in [(2u32, 0u64), (3, 1), (4, 0)] {
+            sock.send_to(&data_datagram(seq, n), bound).await.unwrap();
+        }
+        sleep(Duration::from_millis(200)).await;
+
+        watcher.tick();
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let key = CompositeKey::new(
+            MetricKind::Gauge,
+            metrics::Key::from_parts(
+                "field_distinct_values",
+                vec![
+                    metrics::Label::new("source", "ipfix"),
+                    metrics::Label::new("stream", "flows"),
+                    metrics::Label::new("field", "src_addr"),
+                ],
+            ),
+        );
+        let gauge = map
+            .get(&key)
+            .map(|(_, _, v)| match v {
+                DebugValue::Gauge(g) => g.into_inner(),
+                _ => 0.0,
+            })
+            .unwrap_or(0.0);
+        assert_eq!(
+            gauge, 2.0,
+            "2 distinct src_addr values must be observed through the recv_tasks <= 1 inline \
+             UDP arm"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), listener).await;
+    }
+
+    /// `recv_tasks > 1` (4, forcing the `SO_REUSEPORT` fan-out —
+    /// `ipfix_recv_loop`, spawned once per socket, sharing one
+    /// `IpfixDecoder`): this is the branch that ships at the real default
+    /// (8) and that the round-1 defect left unwired. Sends come from the
+    /// same client socket so the kernel routes every datagram to the same
+    /// group member, keeping the decode path deterministic without changing
+    /// what's under test — the watcher is one `Arc` shared by every task
+    /// regardless of which one observes a given flow.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn cardinality_watcher_reports_distinct_values_at_recv_tasks_fan_out() {
+        use crate::stats::cardinality::CompiledWatch;
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let watcher = Arc::new(CardinalityWatcher::new(
+            CompiledWatch {
+                source: "ipfix".to_string(),
+                stream: "flows".to_string(),
+                field: "src_addr".to_string(),
+            },
+            1000,
+        ));
+
+        let (listener, bound, shutdown_tx) =
+            start_test_listener_with_cardinality(4, 1, vec![watcher.clone()]).await;
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.send_to(&template_datagram(1), bound).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        for (seq, n) in [(2u32, 0u64), (3, 1), (4, 0)] {
+            sock.send_to(&data_datagram(seq, n), bound).await.unwrap();
+        }
+        sleep(Duration::from_millis(300)).await;
+
+        watcher.tick();
+
+        let map = snapshotter.snapshot().into_hashmap();
+        let key = CompositeKey::new(
+            MetricKind::Gauge,
+            metrics::Key::from_parts(
+                "field_distinct_values",
+                vec![
+                    metrics::Label::new("source", "ipfix"),
+                    metrics::Label::new("stream", "flows"),
+                    metrics::Label::new("field", "src_addr"),
+                ],
+            ),
+        );
+        let gauge = map
+            .get(&key)
+            .map(|(_, _, v)| match v {
+                DebugValue::Gauge(g) => g.into_inner(),
+                _ => 0.0,
+            })
+            .unwrap_or(0.0);
+        assert_eq!(
+            gauge, 2.0,
+            "2 distinct src_addr values must be observed through the recv_tasks > 1 \
+             SO_REUSEPORT fan-out path"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), listener).await;
     }
 }

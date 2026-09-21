@@ -64,6 +64,7 @@ async fn default_empty_allowed_ips_still_serves_metrics() {
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
         IpWhitelist::empty(),
+        Vec::new(),
     )
     .await
     .expect("Server::new must succeed with no S3/local targets configured");

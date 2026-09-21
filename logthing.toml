@@ -30,6 +30,69 @@ enabled = true   # env: LOGTHING__METRICS__ENABLED
 port = 9090      # env: LOGTHING__METRICS__PORT
 # bind_address = "0.0.0.0"   # env: LOGTHING__METRICS__BIND_ADDRESS
 
+# Optional: "is ingestion working?" gauge(s) — each entry counts distinct
+# values of one field, on one stream, from one source, e.g. "we have ~5000
+# hosts; is /metrics reporting ~5000 distinct values?" Empty (the default)
+# disables the feature entirely. `source`/`stream`/`field` are all required
+# on every entry — a field with no stream is rejected at startup (watching a
+# field across every stream at once is not supported), and so is an unknown
+# OR disabled `source`. Valid `source` values: "zeek", "wef", "suricata",
+# "syslog", "ipfix", "sflow". Multiple entries are fine, including more than
+# one per source — remove the entries below (or the whole
+# [[metrics.cardinality_watch]] blocks) to disable.
+#
+# zeek example: requires zeek to be enabled (it is disabled by default
+# below). id.orig_h is an IP, not a stable host identity — DHCP churn, NAT,
+# and multi-homing move the distinct-IP count independently of ingestion
+# health.
+# [[metrics.cardinality_watch]]
+# source = "zeek"
+# stream = "conn"       # zeek stream (_path) it's counted on
+# field  = "id.orig_h"  # zeek field to watch
+#
+# WEF example: requires the WEF HTTP endpoint (always on) to actually be
+# receiving events. Unlike id.orig_h, `computer` (the Computer field from
+# inside the event XML) IS a stable machine identity — not an IP that
+# DHCP/NAT can move around — making it a materially better "do I see all my
+# hosts" signal than zeek's id.orig_h.
+# [[metrics.cardinality_watch]]
+# source = "wef"
+# stream = "Security"  # WEF Channel it's counted on
+# field  = "computer"
+#
+# syslog example: `stream` is the message's `app_name` (e.g. the program tag
+# in "sshd: Failed password..."), not a fixed enum — RFC 3164 traffic with no
+# app_name reports an empty stream, and an empty `stream` is rejected at
+# startup, so that traffic can never be watched this way. `hostname` is a
+# better host-identity field than an IP for the same DHCP/NAT reasons as
+# zeek's id.orig_h.
+# [[metrics.cardinality_watch]]
+# source = "syslog"
+# stream = "sshd"       # the app_name this watch counts on
+# field  = "hostname"
+#
+# ipfix example: `stream` is the mandatory constant "flows" — IPFIX has no
+# other stream concept, so this dimension carries no information and any
+# other value is rejected at startup. `exporter` (the device that sent the
+# flow) is the natural host-identity field here.
+# [[metrics.cardinality_watch]]
+# source = "ipfix"
+# stream = "flows"
+# field  = "exporter"
+#
+# Window the gauge is published and cleared on (default 3600s = 1 hour, not
+# shorter: conn.log entries are emitted per-connection-CLOSE, not as a
+# heartbeat, so the window must be long enough that a normally-quiet host's
+# connection still closes within it).
+# cardinality_window_secs = 3600
+#
+# Cap on distinct values tracked per window (default 100000): sized roughly
+# an order of magnitude above a typical internal host count. A sensor that
+# also sees external originators (not just internal hosts) can exceed this
+# in normal operation — raise it and watch field_distinct_values_capped if
+# the gauge sits pinned at exactly this number.
+# cardinality_max_values = 100000
+
 # Bind ports below can be overridden without editing this file, via
 # LOGTHING__SYSLOG__UDP_PORT / LOGTHING__SYSLOG__TCP_PORT env vars. Unlike the other
 # listeners below, syslog's bind address is fixed at 0.0.0.0 — there is no

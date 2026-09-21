@@ -91,6 +91,7 @@ async fn allowed_ips_gates_metrics_in_both_directions() {
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
         ip_whitelist,
+        Vec::new(),
     )
     .await
     .expect("Server::new must succeed with no S3/local targets configured");
