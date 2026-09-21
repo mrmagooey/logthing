@@ -734,9 +734,10 @@ impl Server {
         // handlers and are always layered so the extractors resolve when the
         // routes are mounted. The config extension is the SAME
         // `Arc<RwLock<Config>>` as `AppState.config`, so `hec.token` is read
-        // LIVE on every request (see `handle_hec_event` and siblings in
-        // `src/ingest/handlers.rs`) instead of the pre-fix snapshot-at-startup
-        // `Extension<Arc<String>>`.
+        // from the config on every request (see `handle_hec_event` and siblings
+        // in `src/ingest/handlers.rs`) rather than snapshot at startup. The
+        // value is effectively fixed at startup — nothing writes the config at
+        // runtime now that the admin interface is read-only.
         let protected_router = protected_router
             .layer(axum::Extension(self.ingest_state.clone()))
             .layer(axum::Extension(self.state.config.clone()))

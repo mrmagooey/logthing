@@ -2,10 +2,11 @@
 //!
 //! All three handlers share the same auth + dispatch pattern:
 //! 1. Extract and validate `Authorization: Splunk <token>` header against
-//!    `hec.token`, read LIVE from the shared config on every request (same
+//!    `hec.token`, read from the shared config on every request (same
 //!    pattern as `syslog.http_token` / `otlp.bearer_token` in
-//!    `src/server/mod.rs`) — an admin-updated token takes effect on the very
-//!    next request, no restart needed.
+//!    `src/server/mod.rs`). The token is effectively fixed at startup — nothing
+//!    writes the config at runtime now that the admin interface is read-only,
+//!    so changing it requires a restart.
 //!    NOTE: If the configured token is empty, auth is skipped entirely
 //!    (dev-only mode). See [hec] config docs.
 //! 2. Parse the body with the appropriate helper.
@@ -132,8 +133,9 @@ fn dispatch_generic_record(
 ///
 /// DEVIATION FROM BRIEF: if `hec.token` is empty, auth check is skipped
 /// entirely (dev-only no-auth mode; see [hec] config docs). The token is
-/// read LIVE from `config` on every request, so an admin-updated
-/// `hec.token` takes effect on the very next request — no restart needed.
+/// read from `config` on every request, but the value is effectively fixed
+/// at startup — nothing writes the config at runtime now that the admin
+/// interface is read-only, so changing it requires a restart.
 pub async fn handle_hec_event(
     headers: HeaderMap,
     Query(params): Query<HecQueryParams>,
@@ -174,8 +176,9 @@ pub async fn handle_hec_event(
 ///
 /// DEVIATION FROM BRIEF: if `hec.token` is empty, auth check is skipped
 /// entirely (dev-only no-auth mode; see [hec] config docs). The token is
-/// read LIVE from `config` on every request, so an admin-updated
-/// `hec.token` takes effect on the very next request — no restart needed.
+/// read from `config` on every request, but the value is effectively fixed
+/// at startup — nothing writes the config at runtime now that the admin
+/// interface is read-only, so changing it requires a restart.
 pub async fn handle_hec_raw(
     headers: HeaderMap,
     Query(params): Query<HecQueryParams>,
@@ -214,8 +217,9 @@ pub async fn handle_hec_raw(
 ///
 /// DEVIATION FROM BRIEF: if `hec.token` is empty, auth check is skipped
 /// entirely (dev-only no-auth mode; see [hec] config docs). The token is
-/// read LIVE from `config` on every request, so an admin-updated
-/// `hec.token` takes effect on the very next request — no restart needed.
+/// read from `config` on every request, but the value is effectively fixed
+/// at startup — nothing writes the config at runtime now that the admin
+/// interface is read-only, so changing it requires a restart.
 pub async fn handle_ndjson(
     headers: HeaderMap,
     Query(params): Query<HecQueryParams>,
@@ -614,7 +618,7 @@ mod tests {
             cfg.hec.token = "new-token".to_string();
         }
 
-        // Old (leaked) token is now rejected — no restart needed.
+        // Old (leaked) token is now rejected by the handler on the next request.
         let resp = app
             .clone()
             .oneshot(request_with("old-token"))

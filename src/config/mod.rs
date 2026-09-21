@@ -289,9 +289,10 @@ pub struct SyslogConfig {
     /// unconditionally, so this preserves today's behaviour for every
     /// existing deployment.
     ///
-    /// LIVE: read from the shared config on every request
-    /// (`handle_syslog_http` in `src/server/mod.rs`). An admin API update
-    /// takes effect on the very next request — no restart needed.
+    /// Read from the shared config on every request (`handle_syslog_http` in
+    /// `src/server/mod.rs`), but nothing writes that config at runtime now
+    /// that the admin interface is read-only, so the value is effectively
+    /// fixed at startup and changing it requires a restart.
     #[serde(default)]
     pub http_token: String,
 }
@@ -799,10 +800,11 @@ pub struct HecConfig {
     /// Shared secret compared against `Authorization: Splunk <token>`.
     /// Empty string means any token is accepted — only useful for local dev.
     ///
-    /// LIVE: read from the shared config on every request (`handle_hec_event`
-    /// and siblings in `src/ingest/handlers.rs`), matching `syslog.http_token`
-    /// and `otlp.bearer_token`. An admin API update (e.g. rotating a leaked
-    /// token) takes effect on the very next request — no restart needed.
+    /// Read from the shared config on every request (`handle_hec_event` and
+    /// siblings in `src/ingest/handlers.rs`), matching `syslog.http_token` and
+    /// `otlp.bearer_token`. Nothing writes that config at runtime now that the
+    /// admin interface is read-only, so the value is effectively fixed at
+    /// startup and changing it requires a restart.
     #[serde(default)]
     pub token: String,
     /// Maximum distinct `sourcetype` partitions before overflow (default: 64).
@@ -850,9 +852,10 @@ pub struct OtlpConfig {
     /// Optional bearer token for the `Authorization: Bearer <token>` header.
     /// If `None`, no bearer auth is enforced (IP whitelist + TLS still apply).
     ///
-    /// LIVE: read from the shared config on every request (`handle_otlp_logs`
-    /// in `src/server/mod.rs`). An admin API update takes effect on the very
-    /// next request — no restart needed.
+    /// Read from the shared config on every request (`handle_otlp_logs` in
+    /// `src/server/mod.rs`), but nothing writes that config at runtime now
+    /// that the admin interface is read-only, so the value is effectively
+    /// fixed at startup and changing it requires a restart.
     #[serde(default)]
     pub bearer_token: Option<String>,
 }
