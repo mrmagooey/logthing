@@ -306,17 +306,24 @@ pub struct AdminState {
     pub csrf_tokens: Arc<RwLock<Vec<(String, Instant)>>>,
     pub request_counts: Arc<RwLock<std::collections::HashMap<String, (Instant, u32)>>>,
     pub source_stats: Arc<crate::stats::SourceHourlyStats>,
-    /// Registry of every running writer's live flush interval, so a full
-    /// config replace via the admin API (`PUT /config`, `/config/reload`,
-    /// `/config/import`) can push updated `flush_interval_secs` values into
-    /// already-running writer tasks without a process restart.
+    /// Registry of every running writer's live flush interval. Previously
+    /// read by the admin API's config-write handlers (`PUT /config`,
+    /// `/config/reload`, `/config/import`) to push updated
+    /// `flush_interval_secs` values into already-running writer tasks
+    /// without a process restart — those handlers are gone (config editing
+    /// moved to `LOGTHING__*` env vars over `logthing.toml`), so this field
+    /// is unread for now. Kept because `spawn_admin_server` still threads
+    /// the same shared instance through from `main.rs`; a future live-apply
+    /// consumer for env/file-sourced config changes will read it again.
+    #[allow(dead_code)]
     pub flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry,
     /// The SAME `IpWhitelist` instance shared by the main HTTP router, the
     /// metrics server, and all five wire-protocol listeners (constructed
-    /// once in `main.rs`). A full config replace via the admin API pushes
-    /// updated `security.allowed_ips` into it via `IpWhitelist::set_networks`,
-    /// so the change reaches every consumer on their next request/datagram
-    /// without a process restart. See `crate::middleware::IpWhitelist`.
+    /// once in `main.rs`). Previously updated live by the admin API's
+    /// config-write handlers via `IpWhitelist::set_networks` — those
+    /// handlers are gone (see `flush_registry` above for why this field is
+    /// kept anyway), so it is unread for now. See `crate::middleware::IpWhitelist`.
+    #[allow(dead_code)]
     pub ip_whitelist: crate::middleware::IpWhitelist,
 }
 
