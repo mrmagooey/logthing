@@ -516,6 +516,16 @@ impl ZeekListener {
             // source once at startup in `main.rs`), so this loop is over
             // at most a handful of `Arc` clones per record, not every
             // configured watch across every source.
+            //
+            // ponytail: the cost is per-watcher, not per-record —
+            // `observe` allocates a `String` for the field value before
+            // its set-membership check (see its own `ponytail:` comment),
+            // so N watches on this source means N such allocations per
+            // record even when all N already track the value. Fine at the
+            // one-or-two watches this is meant for. Ceiling: if someone
+            // configures many watches on one source, hoist the
+            // value-extraction out of the loop for watches sharing a
+            // `field`.
             for watcher in &cardinality {
                 watcher.observe(&record);
             }

@@ -93,7 +93,7 @@ use tracing::warn;
 const KNOWN_WATCH_SOURCES: [&str; 2] = ["zeek", "wef"];
 
 /// A validated watch, ready to construct a `CardinalityWatcher` from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct CompiledWatch {
     pub source: String,
     pub stream: String,
@@ -433,6 +433,34 @@ mod tests {
         }
     }
 
+    /// Gauge value for one specific `stream` label, so a test with more than
+    /// one watch can tell the two series apart — `gauge_value` matches on
+    /// metric name alone and would return whichever series it happened to
+    /// find first.
+    #[allow(clippy::mutable_key_type)]
+    fn gauge_value_for_stream(
+        snapshotter: &metrics_util::debugging::Snapshotter,
+        name: &str,
+        stream: &str,
+    ) -> f64 {
+        let map = snapshotter.snapshot().into_hashmap();
+        map.iter()
+            .find_map(|(k, (_, _, v))| {
+                let matches_stream = k
+                    .key()
+                    .labels()
+                    .any(|l| l.key() == "stream" && l.value() == stream);
+                if k.key().name() == name
+                    && matches_stream
+                    && let DebugValue::Gauge(g) = v
+                {
+                    return Some(g.into_inner());
+                }
+                None
+            })
+            .unwrap_or(0.0)
+    }
+
     // False positive, same as every other `into_hashmap()` use in this
     // codebase (e.g. `forwarding::buffered_writer`'s tests): `CompositeKey`'s
     // interior mutability is an `AtomicBool` clippy can't see is never
@@ -696,6 +724,68 @@ mod tests {
             1.0,
             "two values differing only past the {MAX_GROUP_VALUE_BYTES}-byte truncation \
              boundary must merge into a single tracked value, not count as two"
+        );
+    }
+
+    /// The shared ticker drives a `Vec` of watchers, so each one's set and
+    /// window accounting must stay entirely its own. Every other test in
+    /// this module configures exactly one watch, which would leave the
+    /// multi-watcher path — the whole point of the shared-ticker shape —
+    /// with no regression net: a future change that hoisted per-watch state
+    /// onto something shared would pass the rest of this suite untouched.
+    #[test]
+    #[allow(clippy::mutable_key_type)]
+    fn two_watchers_on_one_source_keep_independent_counts() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let conn = CardinalityWatcher::new(watch("conn", "id.orig_h"), 100);
+        let dns = CardinalityWatcher::new(watch("dns", "id.orig_h"), 100);
+
+        // Every record is offered to BOTH watchers, exactly as the
+        // observation sites do — each must take only its own stream.
+        for r in [
+            rec("conn", "10.0.0.1"),
+            rec("conn", "10.0.0.2"),
+            rec("conn", "10.0.0.1"), // repeat: must not double-count
+            rec("dns", "10.0.0.7"),
+            rec("dns", "10.0.0.8"),
+            rec("dns", "10.0.0.9"),
+            rec("ssl", "10.0.0.99"), // matches neither
+        ] {
+            conn.observe(&r);
+            dns.observe(&r);
+        }
+
+        // Tick both in one pass, the way `spawn_ticker`'s loop does.
+        conn.tick();
+        dns.tick();
+
+        assert_eq!(
+            gauge_value_for_stream(&snapshotter, "field_distinct_values", "conn"),
+            2.0,
+            "the conn watch must count only its own stream's distinct values"
+        );
+        assert_eq!(
+            gauge_value_for_stream(&snapshotter, "field_distinct_values", "dns"),
+            3.0,
+            "the dns watch must count only its own stream's distinct values"
+        );
+
+        // Clearing is per-watcher too: ticking one must not reset the other.
+        conn.observe(&rec("conn", "10.0.0.5"));
+        conn.tick();
+        assert_eq!(
+            gauge_value_for_stream(&snapshotter, "field_distinct_values", "conn"),
+            1.0,
+            "conn's second window sees one value"
+        );
+        assert_eq!(
+            gauge_value_for_stream(&snapshotter, "field_distinct_values", "dns"),
+            3.0,
+            "dns's gauge must still report its own last completed window, \
+             untouched by conn's tick"
         );
     }
 

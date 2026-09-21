@@ -1263,6 +1263,14 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
     // = "wef"` watches (partitioned by source once at startup in
     // `main.rs`), so this is a per-record loop over at most a handful of
     // `Arc` clones, not every configured watch across every source.
+    //
+    // ponytail: the cost is per-watcher, not per-record — `observe`
+    // allocates a `String` for the field value before its set-membership
+    // check (see its own `ponytail:` comment), so N watches on this source
+    // means N such allocations per event even when all N already track the
+    // value. Fine at the one-or-two watches this is meant for. Ceiling: if
+    // someone configures many watches on one source, hoist the
+    // value-extraction out of the loop for watches that share a `field`.
     for watcher in &state.wef_cardinality_watchers {
         watcher.observe(event.as_ref());
     }
