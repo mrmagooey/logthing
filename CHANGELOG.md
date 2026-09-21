@@ -72,11 +72,18 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   `Config::load()`): TLS enabled without `tls.cert_file`/`tls.key_file`, a
   zero `bind_address` port, a zero `security.max_connections` or
   `security.connection_timeout_secs`, and a malformed `security.allowed_ips`
-  entry now all fail the process immediately at startup. Previously these
-  were only caught when the config-write endpoints (now removed) accepted a
-  change, or not at all if the same bad value came from `logthing.toml` or
-  an environment variable at startup — a bad `bind_address` port, for
-  example, previously surfaced only when the listener tried to bind it.
+  entry now all fail the process immediately at startup. For TLS-without-cert
+  and a zero `max_connections`/`connection_timeout_secs`, this just moves an
+  existing failure earlier: previously these were only caught when the
+  config-write endpoints (now removed) accepted a change, or not at all if
+  the same bad value came from `logthing.toml` or an environment variable at
+  startup — they'd instead fail later, downstream, in `build_tls_config` or
+  `create_router`. The zero `bind_address` port check is new strictness, not
+  an earlier surfacing of an existing failure: `TcpListener::bind` on port 0
+  always succeeds (the OS assigns an ephemeral port), so previously a
+  deployment with `bind_address` port 0 started fine, just confusingly
+  logging `:0` while actually listening on a different, unlogged port. An
+  operator who relied on that behaviour will now fail to start.
 
 ### Fixed
 

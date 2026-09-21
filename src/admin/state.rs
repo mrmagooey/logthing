@@ -1472,7 +1472,7 @@ mod tests {
             assert_eq!(tls.key_file, PathBuf::from("/etc/ssl/key.pem"));
         }
 
-        // ── Scenario 13: LOGTHING_ADMIN_ENABLE_RATE_LIMIT=0 ───────────────────────────
+        // ── Scenario 11: LOGTHING_ADMIN_ENABLE_RATE_LIMIT=0 ───────────────────────────
         {
             let cfg = with_env("LOGTHING_ADMIN_ENABLE_RATE_LIMIT", "0", || {
                 load_admin_config().expect("rate limit disabled should succeed")

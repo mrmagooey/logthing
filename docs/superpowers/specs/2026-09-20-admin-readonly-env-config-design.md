@@ -71,10 +71,17 @@ validation and one new diagnostic view.
 
   This is **new behaviour for every deployment**, not deletion. Today
   the function is reachable only from the admin write endpoints, so a
-  config that enables TLS without a certificate, or sets a port to 0,
-  is accepted at startup and fails later. With the write endpoints
-  gone the function would otherwise become dead code, and there would
-  be nothing validating those invariants at all.
+  config that enables TLS without a certificate is accepted at startup
+  and fails later, downstream, in `build_tls_config`. A `bind_address`
+  port of 0 is different: `TcpListener::bind` on port 0 always succeeds
+  (the OS assigns an ephemeral port), so today that config is accepted
+  at startup and *keeps running*, just confusingly listening on a
+  different, unlogged port than the one in the config. Rejecting it at
+  startup is a new strictness improvement, not an earlier surfacing of
+  an existing failure — an operator who somehow relied on port 0 will
+  now fail to start. With the write endpoints gone the function would
+  otherwise become dead code, and there would be nothing validating
+  those invariants at all.
 
   Two notes for the implementer. First, its doc comment references
   `apply_live_security_settings` and "before persist" — both concepts

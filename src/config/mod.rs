@@ -1617,12 +1617,8 @@ impl Config {
         // Written by the admin API before it became read-only. It is no
         // longer a config source, so say so rather than letting an
         // operator wonder why their settings changed after the upgrade.
-        if Path::new("logthing.admin.toml").exists() {
-            tracing::warn!(
-                "logthing.admin.toml exists but is no longer read. The admin \
-                 interface is read-only; set configuration with LOGTHING__* \
-                 environment variables or logthing.toml, then delete this file."
-            );
+        if let Some(warning) = stale_admin_override_warning(Path::new(".")) {
+            tracing::warn!("{warning}");
         }
 
         validate_config_invariants(&config).map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
@@ -1630,6 +1626,24 @@ impl Config {
         validate_recv_tasks_config(&config)?;
         validate_recv_batch_size_config(&config)?;
         Ok(config)
+    }
+}
+
+/// Returns the warning to emit when a leftover `logthing.admin.toml` is
+/// found, or `None` when there is nothing to warn about.
+///
+/// Split out from `Config::load` purely so the decision is unit-testable
+/// without capturing `tracing` output.
+fn stale_admin_override_warning(dir: &Path) -> Option<String> {
+    if dir.join("logthing.admin.toml").exists() {
+        Some(
+            "logthing.admin.toml exists but is no longer read. The admin \
+             interface is read-only; set configuration with LOGTHING__* \
+             environment variables or logthing.toml, then delete this file."
+                .to_string(),
+        )
+    } else {
+        None
     }
 }
 
@@ -2195,6 +2209,21 @@ max_buffer_rows = 50000
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
+    }
+
+    #[test]
+    fn stale_admin_override_warning_fires_when_file_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("logthing.admin.toml"), "").unwrap();
+
+        assert!(stale_admin_override_warning(dir.path()).is_some());
+    }
+
+    #[test]
+    fn stale_admin_override_warning_is_none_when_file_absent() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(stale_admin_override_warning(dir.path()), None);
     }
 
     #[test]
