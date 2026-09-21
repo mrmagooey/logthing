@@ -1,23 +1,26 @@
-//! Bounded distinct-value counter for a single, operator-configured field
-//! watch (`[metrics] cardinality_watch_field`).
+//! Bounded distinct-value counter for operator-configured field watches
+//! (`[[metrics.cardinality_watch]]`).
 //!
 //! Answers "is ingestion working?" by comparing a field's observed distinct
 //! value count against a known-good number — e.g. "we have ~5000 hosts; is
-//! `/metrics` reporting ~5000 distinct `id.orig_h` values?" Exposed as
-//! `field_distinct_values{stream,field}` (gauge, most-recently-completed
-//! window — see [`CardinalityWatcher::tick`]) and
-//! `field_distinct_values_capped{stream,field}` (counter, fires each time a
-//! never-before-seen value was discarded because the cap was already
+//! `/metrics` reporting ~5000 distinct `computer` values?" Exposed as
+//! `field_distinct_values{source,stream,field}` (gauge,
+//! most-recently-completed window — see [`CardinalityWatcher::tick`]) and
+//! `field_distinct_values_capped{source,stream,field}` (counter, fires each
+//! time a never-before-seen value was discarded because the cap was already
 //! reached).
 //!
 //! # Reading the gauge
 //!
-//! - `id.orig_h` (this repo's shipped default, `logthing.toml`) is an IP,
-//!   not a stable host identity: DHCP churn, NAT, and multi-homing move the
-//!   distinct-IP count independently of ingestion health, and a sensor that
-//!   sees inbound/external traffic counts external originators that are not
-//!   org hosts at all. Treat the gauge as a proxy for host count, not an
-//!   exact one.
+//! - zeek's `id.orig_h` is an IP, not a stable host identity: DHCP churn,
+//!   NAT, and multi-homing move the distinct-IP count independently of
+//!   ingestion health, and a sensor that sees inbound/external traffic
+//!   counts external originators that are not org hosts at all. WEF's
+//!   `computer` is a materially better signal for the same "do I see all my
+//!   hosts" question — see the `AggFields for WindowsEvent` doc comment
+//!   (`forwarding::aggregate::fields`) for the `source_host`-vs-`computer`
+//!   distinction. Either way, treat the gauge as a proxy for host count,
+//!   not an exact one.
 //! - A gauge sitting at EXACTLY `cardinality_max_values` means "read
 //!   `field_distinct_values_capped`", not "this is the real count" — the
 //!   set stopped growing at the cap, it did not stop because that's how
@@ -31,40 +34,49 @@
 //!   truncates before this module ever sees the value (see `fields.rs`'s
 //!   own disclosure of the same truncation for the aggregator). This
 //!   undercounts, same direction as cap saturation, but is essentially
-//!   never reached by an IP-shaped field like `id.orig_h`.
+//!   never reached by an IP- or hostname-shaped field.
 //!
-//! # Structurally zeek-only, structurally single-stream
+//! # Two sources, any number of watches
 //!
-//! ponytail: there is no `source` config key — watching a non-zeek field is
-//! out of scope, not validated away, and there is no "every stream" mode:
-//! the stream a watch counts on is required whenever a field is configured
-//! (counting one field name across every stream at once would conflate
-//! e.g. `conn`'s and `dns`'s `id.orig_h` into one number with no way to
-//! tell which stream contributed it). Ceiling: exactly one watch, exactly
-//! one source (zeek), exactly one stream. Upgrade path: wiring a second
-//! source needs that source's own `AggFields` impl (already exists for all
-//! five sources in `forwarding::aggregate::fields`), a matching config knob
-//! alongside `cardinality_watch_field`/`_stream`, and one
-//! `watcher.observe(&record)` call at that source's listener observation
-//! point, mirroring zeek's; supporting more than one watch needs
-//! `CardinalityWatcher` to hold a `Vec` of watch state instead of one, and
-//! `compile_watch` to become `compile_watches` (an earlier draft of this
-//! module did exactly that before design review cut it back to one — see
-//! git history). Mirrors `forwarding::aggregate`'s compile-then-consume
-//! shape: [`compile_watch`] validates config at startup, fatal on a bad
-//! watch (`aggregate::compile_rules` is the precedent — a watch that
-//! silently never matches is worse than a startup error), and
+//! ponytail: exactly two supported `source`s ("zeek", "wef") — one
+//! `AggFields` impl each, wired at each source's own per-record observation
+//! point (`zeek::listener` / `server::process_single_event`). Ceiling: a
+//! third source needs that source's own `AggFields` impl (four more already
+//! exist for aggregation in `forwarding::aggregate::fields` — suricata,
+//! ipfix, sflow, syslog — but none is wired to this watcher yet), a new
+//! arm in `compile_watches`'s source-name check, and one
+//! `watcher.observe(&record)` call at that source's own observation point.
+//! There is still no "every stream" mode: the stream a watch counts on is
+//! always required (counting one field name across every stream at once
+//! would conflate e.g. zeek's `conn` and `dns` streams' `id.orig_h` into
+//! one number with no way to tell which stream contributed it).
+//!
+//! This used to be "exactly one watch, exactly one source (zeek)" — a
+//! single flat `cardinality_watch_field`/`_stream` pair, with every source
+//! but `"zeek"` rejected. That was deliberately cut back from an earlier
+//! `Vec`-and-`source` draft during design review, on the grounds that a
+//! second source wasn't wired yet and the flexibility was speculative. It's
+//! no longer speculative now that WEF has its own `AggFields` impl and its
+//! own genuinely better identity field (`computer`) — see
+//! `config::CardinalityWatch`'s doc comment for the reasoning recorded
+//! there.
+//!
+//! Mirrors `forwarding::aggregate`'s compile-then-consume shape:
+//! [`compile_watches`] validates config at startup, fatal on a bad watch
+//! (`aggregate::compile_rules` is the precedent — a watch that silently
+//! never matches is worse than a startup error), and
 //! [`CardinalityWatcher::observe`] is the per-record hot path, called from
-//! `zeek::listener` alongside `zeek_records_received`.
+//! `zeek::listener` alongside `zeek_records_received` and from
+//! `server::process_single_event` alongside `throughput.record_event`.
 //!
 //! In-memory only, same as every other stat in this module — resets on
 //! restart (see the doc comment on `SourceHourlyStats`).
 //!
 //! # Safety property
 //!
-//! `stream` and `field` both come from CONFIG, never the wire. A
-//! wire-derived label would let any client that can reach the zeek listener
-//! mint unbounded Prometheus series — the same reasoning behind
+//! `source`, `stream`, and `field` all come from CONFIG, never the wire. A
+//! wire-derived label would let any client that can reach a listener mint
+//! unbounded Prometheus series — the same reasoning behind
 //! `metric_event_type` (`suricata::schema`) and `metric_log_path`
 //! (`zeek::schema`). Only the *value count* is wire-influenced, and it is
 //! bounded by `cardinality_max_values` before it ever reaches a metric.
@@ -77,40 +89,34 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::warn;
 
+/// Sources a `[[metrics.cardinality_watch]]` entry may name.
+const KNOWN_WATCH_SOURCES: [&str; 2] = ["zeek", "wef"];
+
 /// A validated watch, ready to construct a `CardinalityWatcher` from.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledWatch {
+    pub source: String,
     pub stream: String,
     pub field: String,
 }
 
-/// Validate `config.metrics.cardinality_watch_field` (and the
-/// stream/window/cap knobs it enables). Returns `None` when
-/// `cardinality_watch_field` is unset (feature off). Every failure is fatal
-/// at startup: a bad field name would leave an operator staring at a gauge
-/// stuck at 0 with no error telling them why, an unset stream would
-/// silently mean "watch nothing representable" (see the module doc's
-/// "structurally single-stream" section), a zero window would panic later
-/// when `tokio::time::interval` is constructed — see
-/// `aggregate::compile_rules`'s `flush_interval_secs == 0` check for the
-/// exact same trap — and a zero cap would pin the gauge at 0 forever, which
-/// reads identically to "ingestion is dead" (see the `cardinality_max_values
-/// == 0` check below, matching `compile_rules`'s `max_groups == 0` check).
-pub fn compile_watch(config: &Config) -> anyhow::Result<Option<CompiledWatch>> {
+/// Validate `config.metrics.cardinality_watch` (and the shared
+/// window/cap knobs every entry uses). Returns an empty `Vec` when
+/// `cardinality_watch` is empty (feature off). Every failure is fatal at
+/// startup, mirroring `aggregate::compile_rules`: a bad field name would
+/// leave an operator staring at a gauge stuck at 0 with no error telling
+/// them why, an unknown `source` would silently watch nothing, a zero
+/// window would panic later when `tokio::time::interval` is constructed
+/// (see `aggregate::compile_rules`'s `flush_interval_secs == 0` check for
+/// the exact same trap), and a zero cap would pin every gauge at 0 forever,
+/// which reads identically to "ingestion is dead" (see the
+/// `cardinality_max_values == 0` check below, matching `compile_rules`'s
+/// `max_groups == 0` check).
+pub fn compile_watches(config: &Config) -> anyhow::Result<Vec<CompiledWatch>> {
     let cfg = &config.metrics;
-    let Some(field) = cfg.cardinality_watch_field.as_ref() else {
-        return Ok(None);
-    };
-    if field.trim().is_empty() {
-        anyhow::bail!("[metrics] cardinality_watch_field must not be empty");
+    if cfg.cardinality_watch.is_empty() {
+        return Ok(Vec::new());
     }
-    let stream = match cfg.cardinality_watch_stream.as_deref() {
-        Some(s) if !s.trim().is_empty() => s.to_string(),
-        _ => anyhow::bail!(
-            "[metrics] cardinality_watch_stream must be set whenever cardinality_watch_field is \
-             set (watching a field across every stream at once is not supported)"
-        ),
-    };
     if cfg.cardinality_window_secs == 0 {
         anyhow::bail!(
             "[metrics] cardinality_window_secs must be greater than 0 (tokio::time::interval \
@@ -125,14 +131,56 @@ pub fn compile_watch(config: &Config) -> anyhow::Result<Option<CompiledWatch>> {
              feature exists to prevent)"
         );
     }
-    Ok(Some(CompiledWatch {
-        stream,
-        field: field.clone(),
-    }))
+
+    let mut seen: Vec<(&str, &str, &str)> = Vec::with_capacity(cfg.cardinality_watch.len());
+    let mut compiled = Vec::with_capacity(cfg.cardinality_watch.len());
+
+    for watch in &cfg.cardinality_watch {
+        if !KNOWN_WATCH_SOURCES.contains(&watch.source.as_str()) {
+            anyhow::bail!(
+                "[[metrics.cardinality_watch]] names unknown source '{}' (expected one of {:?})",
+                watch.source,
+                KNOWN_WATCH_SOURCES
+            );
+        }
+        if watch.field.trim().is_empty() {
+            anyhow::bail!("[[metrics.cardinality_watch]] has an empty `field`");
+        }
+        if watch.stream.trim().is_empty() {
+            anyhow::bail!(
+                "[[metrics.cardinality_watch]] has an empty `stream` (watching a field across \
+                 every stream at once is not supported)"
+            );
+        }
+        let key = (
+            watch.source.as_str(),
+            watch.stream.as_str(),
+            watch.field.as_str(),
+        );
+        if seen.contains(&key) {
+            anyhow::bail!(
+                "[[metrics.cardinality_watch]] duplicate watch: source '{}', stream '{}', \
+                 field '{}'",
+                watch.source,
+                watch.stream,
+                watch.field
+            );
+        }
+        seen.push(key);
+
+        compiled.push(CompiledWatch {
+            source: watch.source.clone(),
+            stream: watch.stream.clone(),
+            field: watch.field.clone(),
+        });
+    }
+
+    Ok(compiled)
 }
 
-/// Live state for the configured watch.
+/// Live state for one configured watch.
 pub struct CardinalityWatcher {
+    source: String,
     stream: String,
     field: String,
     values: DashSet<String>,
@@ -149,6 +197,7 @@ pub struct CardinalityWatcher {
 impl CardinalityWatcher {
     pub fn new(watch: CompiledWatch, max_values: usize) -> Self {
         Self {
+            source: watch.source,
             stream: watch.stream,
             field: watch.field,
             values: DashSet::new(),
@@ -201,6 +250,7 @@ impl CardinalityWatcher {
                 // captured at construction time binds to the no-op recorder
                 // forever. This only runs on a cap miss, not the hot path.
                 metrics::counter!("field_distinct_values_capped",
+                    "source" => self.source.clone(),
                     "stream" => self.stream.clone(),
                     "field" => self.field.clone()
                 )
@@ -231,6 +281,7 @@ impl CardinalityWatcher {
         // in `observe`'s cap-miss branch. This only runs once per window, so
         // resolving the handle here instead of caching it costs nothing.
         metrics::gauge!("field_distinct_values",
+            "source" => self.source.clone(),
             "stream" => self.stream.clone(),
             "field" => self.field.clone()
         )
@@ -248,6 +299,7 @@ impl CardinalityWatcher {
         // exists to remove, and initialising counters to zero is the
         // conventional Prometheus answer to it.
         metrics::counter!("field_distinct_values_capped",
+            "source" => self.source.clone(),
             "stream" => self.stream.clone(),
             "field" => self.field.clone()
         )
@@ -255,66 +307,79 @@ impl CardinalityWatcher {
 
         // Req 5: records matched this watch's stream filter, but the
         // configured field was never found in any of them — almost always
-        // a typo in `cardinality_watch_field`, not an outage (an outage
-        // means NO records matched at all, which is silently and correctly
-        // just a gauge of 0). One warning per affected window, not once per
+        // a typo in the watch's `field`, not an outage (an outage means NO
+        // records matched at all, which is silently and correctly just a
+        // gauge of 0). One warning per affected window, not once per
         // record.
         let matched = self.matched_this_window.swap(false, Ordering::Relaxed);
         let field_seen = self.field_seen_this_window.swap(false, Ordering::Relaxed);
         if matched && !field_seen {
             warn!(
+                source = %self.source,
+                stream = %self.stream,
                 field = %self.field,
                 "cardinality watch: records matched this window but field '{}' was never \
-                 found on any of them — check cardinality_watch_field for a typo",
+                 found on any of them — check this [[metrics.cardinality_watch]] entry's \
+                 `field` for a typo",
                 self.field
             );
         }
     }
+}
 
-    /// Spawn the window ticker: publishes and clears every `window_secs`,
-    /// and once more on shutdown so a partial window is not lost.
-    ///
-    /// Unlike `Aggregator::spawn_emit_task` (`forwarding/aggregate/mod.rs`),
-    /// this does NOT sleep and take a second pass after that final tick.
-    /// `spawn_emit_task`'s second pass exists because Zeek/Suricata
-    /// per-connection tasks are detached and keep handing `consume()`
-    /// records to the aggregator for a couple of seconds after the
-    /// shutdown signal — missing those would mean durable S3 rows silently
-    /// never written, real data loss. Here a miss only means a gauge
-    /// value on a `/metrics` endpoint that is itself about to stop being
-    /// scraped, and this state resets on restart anyway (see the module
-    /// doc). So: values observed after the shutdown signal fires may not
-    /// reach the final gauge publish — accepted, not mirrored.
-    pub fn spawn_ticker(
-        self: Arc<Self>,
-        window_secs: u64,
-        mut shutdown: tokio::sync::watch::Receiver<bool>,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            // Belt-and-braces: `compile_watch` already rejects
-            // `cardinality_window_secs == 0`, but `tokio::time::interval`
-            // panics on a zero period, so clamp here too — matches
-            // `Aggregator::spawn_emit_task`'s identical clamp.
-            let mut ticker =
-                tokio::time::interval(Duration::from_secs(window_secs).max(Duration::from_secs(1)));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            ticker.tick().await; // the first tick completes immediately
+/// Spawn ONE shared window ticker for every configured watch: publishes and
+/// clears each watcher every `window_secs`, and once more on shutdown so a
+/// partial window is not lost. One task for the whole list, not one per
+/// watch — `tick()` itself is cheap (one gauge set, one counter set, a
+/// `DashSet::clear`), so looping over however many watches are configured
+/// (0, 1, or several) inside a single tick is negligible next to spawning
+/// and scheduling a separate task per watch. This loop runs once per
+/// window, not per record — it is not on the `observe()` hot path.
+///
+/// Unlike `Aggregator::spawn_emit_task` (`forwarding/aggregate/mod.rs`),
+/// this does NOT sleep and take a second pass after that final tick.
+/// `spawn_emit_task`'s second pass exists because Zeek/Suricata
+/// per-connection tasks are detached and keep handing `consume()` records
+/// to the aggregator for a couple of seconds after the shutdown signal —
+/// missing those would mean durable S3 rows silently never written, real
+/// data loss. Here a miss only means a gauge value on a `/metrics` endpoint
+/// that is itself about to stop being scraped, and this state resets on
+/// restart anyway (see the module doc). So: values observed after the
+/// shutdown signal fires may not reach the final gauge publish — accepted,
+/// not mirrored.
+pub fn spawn_ticker(
+    watchers: Vec<Arc<CardinalityWatcher>>,
+    window_secs: u64,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Belt-and-braces: `compile_watches` already rejects
+        // `cardinality_window_secs == 0`, but `tokio::time::interval`
+        // panics on a zero period, so clamp here too — matches
+        // `Aggregator::spawn_emit_task`'s identical clamp.
+        let mut ticker =
+            tokio::time::interval(Duration::from_secs(window_secs).max(Duration::from_secs(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await; // the first tick completes immediately
 
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        self.tick();
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    for w in &watchers {
+                        w.tick();
                     }
-                    res = shutdown.changed() => {
-                        if res.is_err() || *shutdown.borrow() {
-                            self.tick();
-                            return;
+                }
+                res = shutdown.changed() => {
+                    if res.is_err() || *shutdown.borrow() {
+                        for w in &watchers {
+                            w.tick();
                         }
+                        return;
                     }
                 }
             }
-        })
-    }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -362,6 +427,7 @@ mod tests {
 
     fn watch(stream: &str, field: &str) -> CompiledWatch {
         CompiledWatch {
+            source: "zeek".to_string(),
             stream: stream.to_string(),
             field: field.to_string(),
         }
@@ -401,13 +467,22 @@ mod tests {
             .unwrap_or(0)
     }
 
-    // -- compile_watch: config validation --
+    // -- compile_watches: config validation --
 
-    fn config_with(field: Option<&str>, stream: Option<&str>) -> Config {
+    use crate::config::CardinalityWatch;
+
+    fn raw_watch(source: &str, stream: &str, field: &str) -> CardinalityWatch {
+        CardinalityWatch {
+            source: source.to_string(),
+            stream: stream.to_string(),
+            field: field.to_string(),
+        }
+    }
+
+    fn config_with(watches: Vec<CardinalityWatch>) -> Config {
         Config {
             metrics: MetricsConfig {
-                cardinality_watch_field: field.map(str::to_string),
-                cardinality_watch_stream: stream.map(str::to_string),
+                cardinality_watch: watches,
                 ..MetricsConfig::default()
             },
             ..Config::default()
@@ -415,58 +490,111 @@ mod tests {
     }
 
     #[test]
-    fn compile_watch_accepts_a_valid_watch() {
-        let cfg = config_with(Some("id.orig_h"), Some("conn"));
-        let watch = compile_watch(&cfg)
-            .expect("valid watch compiles")
-            .expect("field configured => Some");
-        assert_eq!(watch.field, "id.orig_h");
-        assert_eq!(watch.stream, "conn");
+    fn compile_watches_accepts_a_valid_zeek_watch() {
+        let cfg = config_with(vec![raw_watch("zeek", "conn", "id.orig_h")]);
+        let watches = compile_watches(&cfg).expect("valid watch compiles");
+        assert_eq!(watches.len(), 1);
+        assert_eq!(watches[0].source, "zeek");
+        assert_eq!(watches[0].stream, "conn");
+        assert_eq!(watches[0].field, "id.orig_h");
     }
 
     #[test]
-    fn compile_watch_is_a_noop_when_unconfigured() {
+    fn compile_watches_accepts_a_valid_wef_watch() {
+        let cfg = config_with(vec![raw_watch("wef", "Security", "computer")]);
+        let watches = compile_watches(&cfg).expect("valid watch compiles");
+        assert_eq!(watches.len(), 1);
+        assert_eq!(watches[0].source, "wef");
+        assert_eq!(watches[0].stream, "Security");
+        assert_eq!(watches[0].field, "computer");
+    }
+
+    #[test]
+    fn compile_watches_is_a_noop_when_unconfigured() {
         let cfg = Config::default();
-        assert!(compile_watch(&cfg).expect("unset field compiles").is_none());
-    }
-
-    #[test]
-    fn compile_watch_rejects_an_empty_field() {
-        let cfg = config_with(Some(""), Some("conn"));
-        let err = compile_watch(&cfg).unwrap_err().to_string();
-        assert!(err.contains("cardinality_watch_field"), "got: {err}");
-    }
-
-    #[test]
-    fn compile_watch_rejects_a_field_with_no_stream() {
-        let cfg = config_with(Some("id.orig_h"), None);
-        let err = compile_watch(&cfg).unwrap_err().to_string();
         assert!(
-            err.contains("cardinality_watch_stream"),
-            "error must name the missing key: {err}"
+            compile_watches(&cfg)
+                .expect("empty list compiles")
+                .is_empty()
         );
     }
 
     #[test]
-    fn compile_watch_rejects_a_field_with_an_empty_stream() {
-        let cfg = config_with(Some("id.orig_h"), Some(""));
-        let err = compile_watch(&cfg).unwrap_err().to_string();
-        assert!(err.contains("cardinality_watch_stream"), "got: {err}");
+    fn compile_watches_accepts_a_zeek_watch_and_a_wef_watch_together() {
+        let cfg = config_with(vec![
+            raw_watch("zeek", "conn", "id.orig_h"),
+            raw_watch("wef", "Security", "computer"),
+        ]);
+        let watches = compile_watches(&cfg).expect("both watches compile");
+        assert_eq!(watches.len(), 2);
+        assert!(watches.iter().any(|w| w.source == "zeek"));
+        assert!(watches.iter().any(|w| w.source == "wef"));
     }
 
     #[test]
-    fn compile_watch_rejects_a_zero_window() {
-        let mut cfg = config_with(Some("id.orig_h"), Some("conn"));
+    fn compile_watches_rejects_an_unknown_source() {
+        let cfg = config_with(vec![raw_watch("suricata", "dns", "query")]);
+        let err = compile_watches(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("suricata"),
+            "error must name the bad source: {err}"
+        );
+        assert!(
+            err.contains("zeek") && err.contains("wef"),
+            "error must name both valid sources: {err}"
+        );
+    }
+
+    #[test]
+    fn compile_watches_rejects_an_empty_field() {
+        let cfg = config_with(vec![raw_watch("zeek", "conn", "")]);
+        let err = compile_watches(&cfg).unwrap_err().to_string();
+        assert!(err.contains("field"), "got: {err}");
+    }
+
+    #[test]
+    fn compile_watches_rejects_an_empty_stream() {
+        let cfg = config_with(vec![raw_watch("zeek", "", "id.orig_h")]);
+        let err = compile_watches(&cfg).unwrap_err().to_string();
+        assert!(err.contains("stream"), "got: {err}");
+    }
+
+    #[test]
+    fn compile_watches_rejects_a_duplicate_source_stream_field_triple() {
+        let cfg = config_with(vec![
+            raw_watch("zeek", "conn", "id.orig_h"),
+            raw_watch("zeek", "conn", "id.orig_h"),
+        ]);
+        let err = compile_watches(&cfg).unwrap_err().to_string();
+        assert!(err.contains("duplicate"), "got: {err}");
+        assert!(err.contains("zeek") && err.contains("conn") && err.contains("id.orig_h"));
+    }
+
+    #[test]
+    fn compile_watches_allows_the_same_stream_field_on_different_sources() {
+        // Same stream/field text, different source — not a duplicate: zeek
+        // and wef are independent series (source is part of the key).
+        let cfg = config_with(vec![
+            raw_watch("zeek", "Security", "computer"),
+            raw_watch("wef", "Security", "computer"),
+        ]);
+        let watches = compile_watches(&cfg).expect("not a duplicate across sources");
+        assert_eq!(watches.len(), 2);
+    }
+
+    #[test]
+    fn compile_watches_rejects_a_zero_window() {
+        let mut cfg = config_with(vec![raw_watch("zeek", "conn", "id.orig_h")]);
         cfg.metrics.cardinality_window_secs = 0;
-        let err = compile_watch(&cfg).unwrap_err().to_string();
+        let err = compile_watches(&cfg).unwrap_err().to_string();
         assert!(err.contains("window"), "got: {err}");
     }
 
     #[test]
-    fn compile_watch_rejects_a_zero_cap() {
-        let mut cfg = config_with(Some("id.orig_h"), Some("conn"));
+    fn compile_watches_rejects_a_zero_cap() {
+        let mut cfg = config_with(vec![raw_watch("zeek", "conn", "id.orig_h")]);
         cfg.metrics.cardinality_max_values = 0;
-        let err = compile_watch(&cfg).unwrap_err().to_string();
+        let err = compile_watches(&cfg).unwrap_err().to_string();
         assert!(err.contains("cardinality_max_values"), "got: {err}");
     }
 

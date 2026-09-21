@@ -114,6 +114,7 @@ async fn suricata_records_received_visible_on_real_metrics_endpoint_with_forward
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
         IpWhitelist::empty(),
+        Vec::new(),
     )
     .await
     .expect("Server::new must succeed with no S3/local targets configured");

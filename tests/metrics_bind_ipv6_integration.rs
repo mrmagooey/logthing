@@ -68,6 +68,7 @@ async fn ipv6_bind_address_starts_server_and_serves_metrics_over_ipv6() {
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
         IpWhitelist::empty(),
+        Vec::new(),
     )
     .await
     .expect("Server::new must succeed with no S3/local targets configured");

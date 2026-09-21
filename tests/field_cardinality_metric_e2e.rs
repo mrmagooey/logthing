@@ -7,24 +7,28 @@
 //! Same shape — real `logthing::server::Server` with `metrics.enabled =
 //! true`, a real `ZeekListener` fed over a real TCP connection, a real
 //! non-default forwarding handler (local-disk zeek writer) — but this test
-//! additionally builds a `CardinalityWatcher` from
-//! `[metrics] cardinality_watch_field` / `cardinality_watch_stream` exactly
-//! the way `main.rs` does, attaches it to the listener via
-//! `with_cardinality_watcher`, and spawns its window ticker. A short
+//! additionally builds a `CardinalityWatcher` from a `source = "zeek"`
+//! `[[metrics.cardinality_watch]]` entry exactly the way `main.rs` does,
+//! attaches it to the listener via `with_cardinality_watchers`, and spawns
+//! its shared window ticker (`stats::cardinality::spawn_ticker`). A short
 //! `cardinality_window_secs` keeps the test fast without needing to fake
 //! the clock.
+//!
+//! The WEF counterpart of this test — driving the SAME feature through
+//! `/wsman/events` instead of the zeek TCP listener — is
+//! `tests/field_cardinality_metric_wef_e2e.rs`.
 //!
 //! This MUST be the only `#[tokio::test]` in this binary — see the doc
 //! comment on the template test for why (the Prometheus recorder is a
 //! process-global, install-once call).
 
-use logthing::config::{Config, MetricsConfig, TlsConfig, ZeekLocalConfig};
+use logthing::config::{CardinalityWatch, Config, MetricsConfig, TlsConfig, ZeekLocalConfig};
 use logthing::forwarding::flush_registry::FlushIntervalRegistry;
 use logthing::forwarding::local_sink::LocalDiskSink;
 use logthing::forwarding::zeek_s3::{MultiZeekHandler, zeek_local_start};
 use logthing::middleware::IpWhitelist;
 use logthing::server::Server;
-use logthing::stats::cardinality::{CardinalityWatcher, compile_watch};
+use logthing::stats::cardinality::{CardinalityWatcher, compile_watches, spawn_ticker};
 use logthing::stats::{SourceHourlyStats, ThroughputStats};
 use logthing::zeek::listener::{ZeekListener, ZeekListenerConfig};
 use std::sync::Arc;
@@ -96,8 +100,11 @@ async fn field_distinct_values_visible_on_real_metrics_endpoint_after_a_window_b
         metrics: MetricsConfig {
             enabled: true,
             port: metrics_port,
-            cardinality_watch_field: Some("id.orig_h".to_string()),
-            cardinality_watch_stream: Some("conn".to_string()),
+            cardinality_watch: vec![CardinalityWatch {
+                source: "zeek".to_string(),
+                stream: "conn".to_string(),
+                field: "id.orig_h".to_string(),
+            }],
             // Short window so the test does not need to wait an hour (the
             // production default) for the gauge to publish.
             cardinality_window_secs: 1,
@@ -114,6 +121,9 @@ async fn field_distinct_values_visible_on_real_metrics_endpoint_after_a_window_b
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
         IpWhitelist::empty(),
+        // No wef watch configured in this test — that path is covered by
+        // tests/field_cardinality_metric_wef_e2e.rs.
+        Vec::new(),
     )
     .await
     .expect("Server::new must succeed with no S3/local targets configured");
@@ -138,16 +148,17 @@ async fn field_distinct_values_visible_on_real_metrics_endpoint_after_a_window_b
     // for construction to race the recorder install.
 
     // --- Build the CardinalityWatcher the same way main.rs does: validate
-    // config, construct, spawn its window ticker. ---
-    let watch = compile_watch(&config)
-        .expect("valid cardinality watch config compiles")
-        .expect("cardinality_watch_field is set in this test's config");
+    // config, construct, spawn the shared window ticker. ---
+    let mut watches = compile_watches(&config).expect("valid cardinality watch config compiles");
+    assert_eq!(watches.len(), 1, "this test configures exactly one watch");
+    let watch = watches.remove(0);
     let watcher = Arc::new(CardinalityWatcher::new(
         watch,
         config.metrics.cardinality_max_values,
     ));
     let (cardinality_shutdown_tx, cardinality_shutdown_rx) = tokio::sync::watch::channel(false);
-    let ticker_task = watcher.clone().spawn_ticker(
+    let ticker_task = spawn_ticker(
+        vec![watcher.clone()],
         config.metrics.cardinality_window_secs,
         cardinality_shutdown_rx,
     );
@@ -182,7 +193,7 @@ async fn field_distinct_values_visible_on_real_metrics_endpoint_after_a_window_b
         bind_address: "127.0.0.1".to_string(),
     };
     let zeek_listener =
-        ZeekListener::new(zeek_listener_config, handler).with_cardinality_watcher(Some(watcher));
+        ZeekListener::new(zeek_listener_config, handler).with_cardinality_watchers(vec![watcher]);
     let (zeek_shutdown_tx, zeek_shutdown_rx) = tokio::sync::watch::channel(false);
     let zeek_task = tokio::spawn(async move {
         zeek_listener
@@ -233,7 +244,7 @@ async fn field_distinct_values_visible_on_real_metrics_endpoint_after_a_window_b
             && text.contains("field_distinct_values{")
             && find_metric_value(
                 &text,
-                "field_distinct_values{stream=\"conn\",field=\"id.orig_h\"} ",
+                "field_distinct_values{source=\"zeek\",stream=\"conn\",field=\"id.orig_h\"}",
             ) == Some(2.0)
         {
             break text;
@@ -252,12 +263,13 @@ async fn field_distinct_values_visible_on_real_metrics_endpoint_after_a_window_b
 
     let distinct = find_metric_value(
         &body,
-        "field_distinct_values{stream=\"conn\",field=\"id.orig_h\"} ",
+        "field_distinct_values{source=\"zeek\",stream=\"conn\",field=\"id.orig_h\"}",
     )
     .unwrap_or_else(|| {
         panic!(
-            "field_distinct_values{{stream=\"conn\",field=\"id.orig_h\"}} never appeared \
-                 on the real /metrics endpoint within 15s. Full scrape body:\n{body}"
+            "field_distinct_values{{source=\"zeek\",stream=\"conn\",field=\"id.orig_h\"}} \
+                 never appeared on the real /metrics endpoint within 15s. Full scrape \
+                 body:\n{body}"
         )
     });
     assert_eq!(
@@ -273,7 +285,7 @@ async fn field_distinct_values_visible_on_real_metrics_endpoint_after_a_window_b
     // at zero is the behaviour under test — not an incidental detail.
     let capped = find_metric_value(
         &body,
-        "field_distinct_values_capped{stream=\"conn\",field=\"id.orig_h\"} ",
+        "field_distinct_values_capped{source=\"zeek\",stream=\"conn\",field=\"id.orig_h\"} ",
     );
     assert_eq!(
         capped,

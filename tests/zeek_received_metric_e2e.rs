@@ -125,6 +125,7 @@ async fn zeek_records_received_visible_on_real_metrics_endpoint_with_forwarding_
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
         IpWhitelist::empty(),
+        Vec::new(),
     )
     .await
     .expect("Server::new must succeed with no S3/local targets configured");

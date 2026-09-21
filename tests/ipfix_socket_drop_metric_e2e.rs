@@ -83,6 +83,7 @@ async fn ipfix_socket_drop_metrics_visible_on_real_metrics_endpoint() {
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
         IpWhitelist::empty(),
+        Vec::new(),
     )
     .await
     .expect("Server::new must succeed with no S3/local targets configured");

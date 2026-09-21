@@ -11,6 +11,7 @@ use crate::parser::GenericEventParser;
 use crate::protocol::{
     WefMessage, WefParser, create_heartbeat_response, create_subscription_response,
 };
+use crate::stats::cardinality::CardinalityWatcher;
 use crate::stats::{ThroughputSnapshot, ThroughputStats};
 use crate::syslog::SyslogMessage;
 #[cfg(feature = "kerberos-auth")]
@@ -268,6 +269,11 @@ async fn body_budget_middleware(
 pub struct AppState {
     pub config: Arc<RwLock<Config>>,
     pub throughput: Arc<ThroughputStats>,
+    /// `[[metrics.cardinality_watch]]` entries configured for
+    /// `source = "wef"`, partitioned out of the full compiled list once at
+    /// startup (`main.rs`) — this is never filtered by source at request
+    /// time. Empty unless an operator configured a wef watch.
+    pub wef_cardinality_watchers: Vec<Arc<CardinalityWatcher>>,
     pub parser: WefParser,
     pub event_parser: Option<GenericEventParser>,
     pub parquet_s3_sender: Option<
@@ -339,6 +345,7 @@ impl Server {
     ///         source_stats,
     ///         flush_registry,
     ///         ip_whitelist,
+    ///         Vec::new(),
     ///     )
     ///     .await?;
     ///     // server.run().await?;
@@ -352,6 +359,7 @@ impl Server {
         source_stats: Arc<crate::stats::SourceHourlyStats>,
         flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry,
         ip_whitelist: IpWhitelist,
+        wef_cardinality_watchers: Vec<Arc<CardinalityWatcher>>,
     ) -> anyhow::Result<Self> {
         #[cfg(feature = "kerberos-auth")]
         {
@@ -495,6 +503,7 @@ impl Server {
         let state = Arc::new(AppState {
             config: Arc::clone(&shared_config),
             throughput,
+            wef_cardinality_watchers,
             parser: WefParser::new(),
             event_parser,
             parquet_s3_sender,
@@ -1245,6 +1254,19 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
     let event_type = describe_event_type(&event);
     state.throughput.record_event(event_type).await;
 
+    // Cardinality watching observes here for the same reason
+    // `zeek::listener` observes beside `zeek_records_received`: this is
+    // WEF's per-record chokepoint, upstream of every forwarding
+    // destination. `event` is already `Arc<WindowsEvent>` from the wrap
+    // above, so `.as_ref()` borrows it for `observe` without cloning.
+    // `wef_cardinality_watchers` only ever holds this deployment's `source
+    // = "wef"` watches (partitioned by source once at startup in
+    // `main.rs`), so this is a per-record loop over at most a handful of
+    // `Arc` clones, not every configured watch across every source.
+    for watcher in &state.wef_cardinality_watchers {
+        watcher.observe(event.as_ref());
+    }
+
     // Send to Parquet S3 and/or local-disk via channel (non-blocking, independent
     // per target — a full/closed channel on one does not affect the other).
     if let Some(ref sender) = state.parquet_s3_sender
@@ -1341,9 +1363,20 @@ mod tests {
     }
 
     async fn build_state_with_config(config: Config) -> Arc<AppState> {
+        build_state_with_config_and_wef_watchers(config, Vec::new()).await
+    }
+
+    /// Like `build_state_with_config`, but with `wef_cardinality_watchers`
+    /// set explicitly — used by the cardinality-watching integration test,
+    /// which needs `process_single_event` to actually observe records.
+    async fn build_state_with_config_and_wef_watchers(
+        config: Config,
+        wef_cardinality_watchers: Vec<Arc<CardinalityWatcher>>,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
             config: Arc::new(RwLock::new(config)),
             throughput: Arc::new(ThroughputStats::new()),
+            wef_cardinality_watchers,
             parser: WefParser::new(),
             event_parser: None,
             parquet_s3_sender: None,
@@ -1724,6 +1757,7 @@ event_parsers:
         let state = Arc::new(AppState {
             config: Arc::new(RwLock::new(Config::default())),
             throughput: Arc::new(ThroughputStats::new()),
+            wef_cardinality_watchers: Vec::new(),
             parser: WefParser::new(),
             event_parser: Some(event_parser),
             parquet_s3_sender: None,
@@ -1869,6 +1903,103 @@ event_parsers:
 
         // Should not panic; throughput entry is recorded as "unknown".
         let _summary = state.throughput.snapshot().await;
+    }
+
+    // -- Cardinality watching: observed at the same point as throughput --
+
+    /// Drives real `WindowsEvent`s through `process_single_event` with a
+    /// `source = "wef"` `CardinalityWatcher` attached via `AppState`, then
+    /// forces a window boundary and asserts the gauge. Integration-level
+    /// counterpart of `zeek::listener`'s
+    /// `cardinality_watcher_reports_distinct_values_after_a_window_boundary`
+    /// test — same `DebuggingRecorder` + `set_default_local_recorder`
+    /// pattern, but through `process_single_event` instead of a raw TCP
+    /// connection.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn wef_cardinality_watcher_reports_distinct_values_after_a_window_boundary() {
+        use crate::stats::cardinality::{CardinalityWatcher, CompiledWatch};
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let watcher = Arc::new(CardinalityWatcher::new(
+            CompiledWatch {
+                source: "wef".to_string(),
+                stream: "Security".to_string(),
+                field: "computer".to_string(),
+            },
+            1000,
+        ));
+
+        let state =
+            build_state_with_config_and_wef_watchers(Config::default(), vec![watcher.clone()])
+                .await;
+
+        // 3 Security events, 2 distinct `computer` (HOST-A repeated), plus
+        // one System-channel event whose computer must be excluded by the
+        // stream filter.
+        let mut parsed_a = sample_parsed_event();
+        parsed_a.computer = "HOST-A".to_string();
+        let mut parsed_b = sample_parsed_event();
+        parsed_b.computer = "HOST-B".to_string();
+        let mut parsed_other_channel = sample_parsed_event();
+        parsed_other_channel.channel = "System".to_string();
+        parsed_other_channel.computer = "HOST-EXCLUDED".to_string();
+
+        process_single_event(
+            &state,
+            WindowsEvent::new("collector".into(), "<Event/>".into()).with_parsed(parsed_a.clone()),
+        )
+        .await;
+        process_single_event(
+            &state,
+            WindowsEvent::new("collector".into(), "<Event/>".into()).with_parsed(parsed_b),
+        )
+        .await;
+        process_single_event(
+            &state,
+            WindowsEvent::new("collector".into(), "<Event/>".into()).with_parsed(parsed_a),
+        )
+        .await;
+        process_single_event(
+            &state,
+            WindowsEvent::new("collector".into(), "<Event/>".into())
+                .with_parsed(parsed_other_channel),
+        )
+        .await;
+
+        let read = |name: &str| -> f64 {
+            let map = snapshotter.snapshot().into_hashmap();
+            map.iter()
+                .find_map(|(k, (_, _, v))| {
+                    if k.key().name() == name
+                        && let DebugValue::Gauge(g) = v
+                    {
+                        return Some(g.into_inner());
+                    }
+                    None
+                })
+                .unwrap_or(0.0)
+        };
+
+        assert_eq!(
+            read("field_distinct_values"),
+            0.0,
+            "the gauge must not reflect observations before a window boundary"
+        );
+
+        watcher.tick();
+
+        assert_eq!(
+            read("field_distinct_values"),
+            2.0,
+            "2 distinct computer values from Security events; the System event's computer \
+             must have been excluded by the stream filter"
+        );
     }
 
     /// XFF header is present but ignored; peer IP is used for source attribution.
@@ -3483,6 +3614,7 @@ event_parsers:
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
             crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
             IpWhitelist::empty(),
+            Vec::new(),
         )
         .await
         .expect("Server::new must succeed")
@@ -3717,6 +3849,7 @@ event_parsers:
             std::sync::Arc::new(crate::stats::SourceHourlyStats::new()),
             crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
             IpWhitelist::empty(),
+            Vec::new(),
         )
         .await
         .unwrap();

@@ -191,29 +191,52 @@ async fn async_main() -> anyhow::Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Build the field-cardinality watcher (optional). Same fatal-on-bad-config
-    // stance as the aggregator above: see `stats::cardinality::compile_watch`.
+    // Build the field-cardinality watchers (optional, any number). Same
+    // fatal-on-bad-config stance as the aggregator above: see
+    // `stats::cardinality::compile_watches`. Compiled once, then partitioned
+    // by source so each observation site (the zeek listener below, WEF's
+    // `process_single_event` inside `Server`) only ever sees its own
+    // watches — no per-record source filtering at the observation site.
     // -----------------------------------------------------------------------
-    let cardinality_watcher: Option<Arc<stats::cardinality::CardinalityWatcher>> = {
-        match stats::cardinality::compile_watch(&config)? {
-            None => None,
-            Some(watch) => {
-                let watcher = Arc::new(stats::cardinality::CardinalityWatcher::new(
-                    watch,
-                    config.metrics.cardinality_max_values,
-                ));
-                let ticker = watcher
-                    .clone()
-                    .spawn_ticker(config.metrics.cardinality_window_secs, shutdown_rx.clone());
-                writer_handles.push(ticker);
-                info!(
-                    "Field-cardinality watching enabled: {}s window",
-                    config.metrics.cardinality_window_secs
-                );
-                Some(watcher)
-            }
+    let compiled_watches = stats::cardinality::compile_watches(&config)?;
+    let mut zeek_cardinality_watchers: Vec<Arc<stats::cardinality::CardinalityWatcher>> =
+        Vec::new();
+    let mut wef_cardinality_watchers: Vec<Arc<stats::cardinality::CardinalityWatcher>> = Vec::new();
+    for watch in compiled_watches {
+        let source = watch.source.clone();
+        let watcher = Arc::new(stats::cardinality::CardinalityWatcher::new(
+            watch,
+            config.metrics.cardinality_max_values,
+        ));
+        match source.as_str() {
+            "zeek" => zeek_cardinality_watchers.push(watcher),
+            "wef" => wef_cardinality_watchers.push(watcher),
+            // Unreachable: `compile_watches` already rejected any other
+            // source name.
+            other => unreachable!("compile_watches let an unknown source '{other}' through"),
         }
-    };
+    }
+    let all_cardinality_watchers: Vec<Arc<stats::cardinality::CardinalityWatcher>> =
+        zeek_cardinality_watchers
+            .iter()
+            .chain(wef_cardinality_watchers.iter())
+            .cloned()
+            .collect();
+    if !all_cardinality_watchers.is_empty() {
+        let ticker = stats::cardinality::spawn_ticker(
+            all_cardinality_watchers.clone(),
+            config.metrics.cardinality_window_secs,
+            shutdown_rx.clone(),
+        );
+        writer_handles.push(ticker);
+        info!(
+            "Field-cardinality watching enabled: {} watch(es) ({} zeek, {} wef), {}s window",
+            all_cardinality_watchers.len(),
+            zeek_cardinality_watchers.len(),
+            wef_cardinality_watchers.len(),
+            config.metrics.cardinality_window_secs
+        );
+    }
 
     // Per-source "does any rule even target this source" checks, so a
     // deployment with e.g. one Zeek rule does not also pay an extra
@@ -555,11 +578,11 @@ async fn async_main() -> anyhow::Result<()> {
             bind_address: zeek_config_clone.zeek.bind_address.clone(),
         };
         let zeek_ip_whitelist = ip_whitelist.clone();
-        let zeek_cardinality_watcher = cardinality_watcher.clone();
+        let zeek_watchers_for_listener = zeek_cardinality_watchers.clone();
         let handle = tokio::spawn(async move {
             let listener = zeek::listener::ZeekListener::new(listener_config, zeek_handler)
                 .with_allowed_ips(zeek_ip_whitelist)
-                .with_cardinality_watcher(zeek_cardinality_watcher);
+                .with_cardinality_watchers(zeek_watchers_for_listener);
             if let Err(e) = listener.start_with_shutdown(zeek_shutdown_rx).await {
                 error!("Zeek listener error: {}", e);
             }
@@ -767,6 +790,7 @@ async fn async_main() -> anyhow::Result<()> {
         source_stats,
         flush_registry,
         ip_whitelist,
+        wef_cardinality_watchers,
     )
     .await?;
 

@@ -30,14 +30,34 @@ enabled = true   # env: LOGTHING__METRICS__ENABLED
 port = 9090      # env: LOGTHING__METRICS__PORT
 # bind_address = "0.0.0.0"   # env: LOGTHING__METRICS__BIND_ADDRESS
 
-# Optional: "is ingestion working?" gauge — counts distinct values of one
-# zeek field within each window, e.g. "we have ~5000 hosts; is id.orig_h
-# reporting ~5000 distinct values?" Requires zeek to be enabled (it is
-# disabled by default below). Both keys must be set together — a field with
-# no stream is rejected at startup (watching a field across every stream at
-# once is not supported). Remove or comment out to disable.
-# cardinality_watch_field  = "id.orig_h"  # zeek field to watch
-# cardinality_watch_stream = "conn"       # zeek stream (_path) it's counted on
+# Optional: "is ingestion working?" gauge(s) — each entry counts distinct
+# values of one field, on one stream, from one source, e.g. "we have ~5000
+# hosts; is /metrics reporting ~5000 distinct values?" Empty (the default)
+# disables the feature entirely. `source`/`stream`/`field` are all required
+# on every entry — a field with no stream is rejected at startup (watching a
+# field across every stream at once is not supported), and so is an unknown
+# `source` (currently "zeek" or "wef"). Multiple entries are fine, including
+# more than one per source — remove the entries below (or the whole
+# [[metrics.cardinality_watch]] blocks) to disable.
+#
+# zeek example: requires zeek to be enabled (it is disabled by default
+# below). id.orig_h is an IP, not a stable host identity — DHCP churn, NAT,
+# and multi-homing move the distinct-IP count independently of ingestion
+# health.
+# [[metrics.cardinality_watch]]
+# source = "zeek"
+# stream = "conn"       # zeek stream (_path) it's counted on
+# field  = "id.orig_h"  # zeek field to watch
+#
+# WEF example: requires the WEF HTTP endpoint (always on) to actually be
+# receiving events. Unlike id.orig_h, `computer` (the Computer field from
+# inside the event XML) IS a stable machine identity — not an IP that
+# DHCP/NAT can move around — making it a materially better "do I see all my
+# hosts" signal than zeek's id.orig_h.
+# [[metrics.cardinality_watch]]
+# source = "wef"
+# stream = "Security"  # WEF Channel it's counted on
+# field  = "computer"
 #
 # Window the gauge is published and cleared on (default 3600s = 1 hour, not
 # shorter: conn.log entries are emitted per-connection-CLOSE, not as a

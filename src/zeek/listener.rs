@@ -171,7 +171,7 @@ pub struct ZeekListener {
     config: ZeekListenerConfig,
     handler: Arc<dyn ZeekHandler>,
     allowed_ips: IpWhitelist,
-    cardinality: Option<Arc<CardinalityWatcher>>,
+    cardinality: Vec<Arc<CardinalityWatcher>>,
 }
 
 impl ZeekListener {
@@ -180,7 +180,7 @@ impl ZeekListener {
             config,
             handler,
             allowed_ips: IpWhitelist::empty(),
-            cardinality: None,
+            cardinality: Vec::new(),
         }
     }
 
@@ -191,13 +191,12 @@ impl ZeekListener {
         self
     }
 
-    /// Attach the optional `[metrics] cardinality_watch_field` watcher.
-    /// Defaults to `None` via `new()` — absent unless `main.rs` built one
-    /// from config (see `stats::cardinality::compile_watch`).
-    pub fn with_cardinality_watcher(
-        mut self,
-        cardinality: Option<Arc<CardinalityWatcher>>,
-    ) -> Self {
+    /// Attach the `[[metrics.cardinality_watch]]` watchers configured for
+    /// `source = "zeek"`. Defaults to empty via `new()` — `main.rs` builds
+    /// the full list from config (see `stats::cardinality::compile_watches`)
+    /// and partitions it by source once at startup, so this listener only
+    /// ever sees its own zeek watches, never wef's.
+    pub fn with_cardinality_watchers(mut self, cardinality: Vec<Arc<CardinalityWatcher>>) -> Self {
         self.cardinality = cardinality;
         self
     }
@@ -346,7 +345,7 @@ impl ZeekListener {
         handler: Arc<dyn ZeekHandler>,
         idle_timeout: Duration,
         byte_budget: Arc<Semaphore>,
-        cardinality: Option<Arc<CardinalityWatcher>>,
+        cardinality: Vec<Arc<CardinalityWatcher>>,
     ) -> anyhow::Result<()> {
         let mut reader = BufReader::new(stream);
         let mut buf: Vec<u8> = Vec::new();
@@ -512,8 +511,12 @@ impl ZeekListener {
             // `AggregatingZeekHandler` swallows a matched record before it
             // ever reaches an inner handler
             // (`forwarding/aggregate/handlers.rs`), which is correct: the
-            // record was still real ingested traffic.
-            if let Some(watcher) = &cardinality {
+            // record was still real ingested traffic. `cardinality` only
+            // ever holds this listener's own zeek watches (partitioned by
+            // source once at startup in `main.rs`), so this loop is over
+            // at most a handful of `Arc` clones per record, not every
+            // configured watch across every source.
+            for watcher in &cardinality {
                 watcher.observe(&record);
             }
             handler.handle_record(record, src).await;
@@ -637,7 +640,7 @@ mod tests {
             CapturingHandler::new(),
             TCP_IDLE_TIMEOUT,
             full_byte_budget(),
-            None,
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -707,7 +710,7 @@ mod tests {
             handler.clone(),
             TCP_IDLE_TIMEOUT,
             full_byte_budget(),
-            None,
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -768,6 +771,7 @@ mod tests {
 
         let watcher = Arc::new(CardinalityWatcher::new(
             CompiledWatch {
+                source: "zeek".to_string(),
                 stream: "conn".to_string(),
                 field: "id.orig_h".to_string(),
             },
@@ -800,7 +804,7 @@ mod tests {
             CapturingHandler::new(),
             TCP_IDLE_TIMEOUT,
             full_byte_budget(),
-            Some(watcher.clone()),
+            vec![watcher.clone()],
         )
         .await
         .unwrap();
@@ -811,6 +815,7 @@ mod tests {
             metrics::Key::from_parts(
                 "field_distinct_values",
                 vec![
+                    metrics::Label::new("source", "zeek"),
                     metrics::Label::new("stream", "conn"),
                     metrics::Label::new("field", "id.orig_h"),
                 ],
@@ -1289,7 +1294,7 @@ mod tests {
             CapturingHandler::new(),
             Duration::from_millis(100),
             full_byte_budget(),
-            None,
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -1418,7 +1423,7 @@ mod tests {
             handler,
             Duration::from_secs(5),
             full_byte_budget(),
-            None,
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -1501,7 +1506,7 @@ mod tests {
                     handler,
                     TCP_IDLE_TIMEOUT,
                     budget,
-                    None,
+                    Vec::new(),
                 )
                 .await
             }));

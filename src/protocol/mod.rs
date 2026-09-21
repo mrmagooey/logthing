@@ -201,6 +201,7 @@ impl WefParser {
         let mut level: u8 = 0;
         let mut time_created = Utc::now();
         let mut computer = String::new();
+        let mut channel = String::new();
         let mut message: Option<String> = None;
         let mut in_message = false;
         let mut in_data = false;
@@ -270,6 +271,7 @@ impl WefParser {
                             }
                         }
                         "Computer" => computer = text.to_string(),
+                        "Channel" => channel = text.to_string(),
                         "Message" if in_message => {
                             message = Some(text.to_string());
                         }
@@ -317,7 +319,7 @@ impl WefParser {
             event_record_id: 0,
             process_id: None,
             thread_id: None,
-            channel: String::new(),
+            channel,
             computer,
             security_user_id: None,
             message,
@@ -453,6 +455,45 @@ mod tests {
                 assert_eq!(parsed.event_id, 4624);
                 assert_eq!(parsed.computer, "host");
                 assert_eq!(parsed.provider, "Security");
+            }
+            other => panic!("expected events but got {:?}", other),
+        }
+    }
+
+    /// `Channel` (e.g. "Security", "System") is what `stats::cardinality`'s
+    /// WEF watch matches a configured `stream` against
+    /// (`AggFields for WindowsEvent` in `forwarding::aggregate::fields`) —
+    /// a real Windows Event XML System element always carries it, so it
+    /// must come through parsed, not hardcoded empty.
+    #[test]
+    fn parses_channel() {
+        let parser = WefParser::new();
+        let xml = r#"
+        <Envelope>
+          <Body>
+            <Events>
+              <Event>
+                <System>
+                  <Provider>Microsoft-Windows-Security-Auditing</Provider>
+                  <EventID>4624</EventID>
+                  <Level>4</Level>
+                  <Channel>Security</Channel>
+                  <TimeCreated>2024-01-01T00:00:00Z</TimeCreated>
+                  <Computer>host</Computer>
+                </System>
+              </Event>
+            </Events>
+          </Body>
+        </Envelope>
+        "#;
+
+        match parser
+            .parse_message(xml, "collector".into())
+            .expect("parse succeeds")
+        {
+            WefMessage::Events(events) => {
+                let parsed = events[0].parsed.as_ref().expect("parsed event");
+                assert_eq!(parsed.channel, "Security");
             }
             other => panic!("expected events but got {:?}", other),
         }

@@ -84,6 +84,7 @@ async fn metrics_listener_inherits_bind_address_and_is_whitelist_gated() {
         Arc::new(SourceHourlyStats::new()),
         FlushIntervalRegistry::new(),
         ip_whitelist,
+        Vec::new(),
     )
     .await
     .expect("Server::new must succeed with no S3/local targets configured");
