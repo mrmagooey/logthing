@@ -266,20 +266,20 @@ async fn field_distinct_values_visible_on_real_metrics_endpoint_after_a_window_b
          record's id.orig_h must have been excluded by the stream filter. Full body:\n{body}"
     );
 
-    // The capped counter's handle is resolved only on a cap miss inside
-    // `observe` (not cached, not touched by `tick`), so a series that never
-    // hit the cap is never recorded and must not appear on the scrape at
-    // all (a described-but-unrecorded metric emits no line — see
-    // `metrics_descriptions`'s module doc). Nothing exceeded the default
-    // cap in this test.
-    assert!(
-        find_metric_value(
-            &body,
-            "field_distinct_values_capped{stream=\"conn\",field=\"id.orig_h\"} ",
-        )
-        .is_none(),
-        "field_distinct_values_capped must not appear on the scrape when the cap was never \
-             hit. Full body:\n{body}"
+    // `tick` registers the capped counter at zero every window, so the
+    // series is present from the first scrape even though nothing here came
+    // near the default cap. An absent counter would leave an operator unable
+    // to distinguish a healthy watch from a mistyped config, so its presence
+    // at zero is the behaviour under test — not an incidental detail.
+    let capped = find_metric_value(
+        &body,
+        "field_distinct_values_capped{stream=\"conn\",field=\"id.orig_h\"} ",
+    );
+    assert_eq!(
+        capped,
+        Some(0.0),
+        "field_distinct_values_capped must be present and zero when the cap was never hit. \
+         Full body:\n{body}"
     );
 
     // --- Clean shutdown ---

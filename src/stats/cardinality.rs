@@ -237,6 +237,22 @@ impl CardinalityWatcher {
         .set(self.values.len() as f64);
         self.values.clear();
 
+        // Register the capped counter at its current value so the series
+        // exists from the first window, even when the cap is never hit.
+        // `increment(0)` records without changing it. Without this the
+        // counter is absent from `/metrics` until the first cap miss, and a
+        // freshly started process publishes neither series for a full window
+        // (an hour, by default) — leaving an operator unable to tell "the
+        // watch is running and healthy" from "I mistyped the config and
+        // nothing is watching". That is the exact ambiguity this metric
+        // exists to remove, and initialising counters to zero is the
+        // conventional Prometheus answer to it.
+        metrics::counter!("field_distinct_values_capped",
+            "stream" => self.stream.clone(),
+            "field" => self.field.clone()
+        )
+        .increment(0);
+
         // Req 5: records matched this watch's stream filter, but the
         // configured field was never found in any of them — almost always
         // a typo in `cardinality_watch_field`, not an outage (an outage
