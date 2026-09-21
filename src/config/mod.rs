@@ -192,6 +192,76 @@ pub struct MetricsConfig {
     /// behaviour when scraping from another host.
     #[serde(default)]
     pub bind_address: Option<String>,
+
+    /// Zeek field to watch for distinct-value counting, published as the
+    /// `field_distinct_values{stream,field}` gauge — "is ingestion working?"
+    /// answered by comparing this against a known-good count (e.g. "we have
+    /// ~5000 hosts; is `id.orig_h` reporting ~5000 distinct values?"). Unset
+    /// (the default) means the feature is off, adding zero hot-path work.
+    /// Requires `cardinality_watch_stream` to also be set — see that field's
+    /// doc comment.
+    ///
+    /// Structurally zeek-only: there is no `source` key. Watching a
+    /// different source would need that source's own config knob plus one
+    /// `watcher.observe(&record)` call at its listener's observation point
+    /// (see `stats::cardinality`'s module doc) — not attempted here.
+    ///
+    /// `id.orig_h` (this repo's shipped example, commented out in
+    /// `logthing.toml`) is an IP, not a stable host identity: DHCP churn,
+    /// NAT, and multi-homing move the distinct-IP count independently of
+    /// ingestion health, and a sensor that sees inbound/external traffic
+    /// will count external originators that are not org hosts at all. Treat
+    /// the gauge as a proxy for host count, not an exact one, and alert on a
+    /// SUSTAINED multi-window drop rather than on absolute equality to a
+    /// known host count — a single window's value is noisy for the reasons
+    /// above and the conn.log emission pattern described on
+    /// `cardinality_window_secs`.
+    #[serde(default)]
+    pub cardinality_watch_field: Option<String>,
+
+    /// Zeek stream (`_path`) `cardinality_watch_field` is counted on, e.g.
+    /// `"conn"`. Required (and validated fatal at startup) whenever
+    /// `cardinality_watch_field` is set — watching a field across every
+    /// stream at once is not supported; a single unqualified counter would
+    /// conflate e.g. `conn`'s and `dns`'s `id.orig_h` into one number with
+    /// no way to tell which stream contributed it.
+    #[serde(default)]
+    pub cardinality_watch_stream: Option<String>,
+
+    /// Window for `field_distinct_values`: distinct values are counted,
+    /// published, then cleared every this-many seconds, so the gauge always
+    /// reports the MOST RECENTLY COMPLETED window rather than a since-boot
+    /// count that could only ratchet upward and would never show a source
+    /// going silent. In-memory only — resets on restart, same as every
+    /// other stat in `crate::stats`.
+    ///
+    /// Defaults to 3600s (one hour), not a short window: zeek `conn.log`
+    /// entries are emitted per-connection-CLOSE, not as a heartbeat, so the
+    /// window must be long enough that a normally-quiet host's connection
+    /// still closes (and so appears) within it — a short window would read
+    /// as a false alarm on exactly the comparison this metric exists to
+    /// support, for hosts that are perfectly healthy but simply idle.
+    #[serde(default = "default_cardinality_window_secs")]
+    pub cardinality_window_secs: u64,
+
+    /// Cap on distinct values tracked within one window. Bounds worst-case
+    /// memory to roughly `cardinality_max_values * 256 bytes` (256 =
+    /// `group_value_string`'s `MAX_GROUP_VALUE_BYTES`).
+    ///
+    /// Default 100000 is sized roughly an order of magnitude above a
+    /// typical internal host count, headroom for the 3600s default window
+    /// (a longer window naturally accumulates more distinct values than a
+    /// short one). A sensor that also observes external originators — not
+    /// just internal hosts — can exceed it in normal operation, not only
+    /// under adversarial input; if so, raise this and watch
+    /// `field_distinct_values_capped`.
+    ///
+    /// A gauge sitting at EXACTLY this number means "read the
+    /// `field_distinct_values_capped` counter", not "this is the real
+    /// count" — e.g. 150k distinct values against a 100k cap reports
+    /// 100000 flat, with the other 50k absorbed by the capped counter.
+    #[serde(default = "default_cardinality_max_values")]
+    pub cardinality_max_values: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1515,8 +1585,20 @@ impl Default for MetricsConfig {
             enabled: default_metrics_enabled(),
             port: default_metrics_port(),
             bind_address: None,
+            cardinality_watch_field: None,
+            cardinality_watch_stream: None,
+            cardinality_window_secs: default_cardinality_window_secs(),
+            cardinality_max_values: default_cardinality_max_values(),
         }
     }
+}
+
+fn default_cardinality_window_secs() -> u64 {
+    3600
+}
+
+fn default_cardinality_max_values() -> usize {
+    100_000
 }
 
 // Default value functions

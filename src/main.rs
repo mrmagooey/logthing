@@ -190,6 +190,31 @@ async fn async_main() -> anyhow::Result<()> {
         }
     };
 
+    // -----------------------------------------------------------------------
+    // Build the field-cardinality watcher (optional). Same fatal-on-bad-config
+    // stance as the aggregator above: see `stats::cardinality::compile_watch`.
+    // -----------------------------------------------------------------------
+    let cardinality_watcher: Option<Arc<stats::cardinality::CardinalityWatcher>> = {
+        match stats::cardinality::compile_watch(&config)? {
+            None => None,
+            Some(watch) => {
+                let watcher = Arc::new(stats::cardinality::CardinalityWatcher::new(
+                    watch,
+                    config.metrics.cardinality_max_values,
+                ));
+                let ticker = watcher
+                    .clone()
+                    .spawn_ticker(config.metrics.cardinality_window_secs, shutdown_rx.clone());
+                writer_handles.push(ticker);
+                info!(
+                    "Field-cardinality watching enabled: {}s window",
+                    config.metrics.cardinality_window_secs
+                );
+                Some(watcher)
+            }
+        }
+    };
+
     // Per-source "does any rule even target this source" checks, so a
     // deployment with e.g. one Zeek rule does not also pay an extra
     // async_trait boxed future plus an all-rules consume() scan on every
@@ -530,9 +555,11 @@ async fn async_main() -> anyhow::Result<()> {
             bind_address: zeek_config_clone.zeek.bind_address.clone(),
         };
         let zeek_ip_whitelist = ip_whitelist.clone();
+        let zeek_cardinality_watcher = cardinality_watcher.clone();
         let handle = tokio::spawn(async move {
             let listener = zeek::listener::ZeekListener::new(listener_config, zeek_handler)
-                .with_allowed_ips(zeek_ip_whitelist);
+                .with_allowed_ips(zeek_ip_whitelist)
+                .with_cardinality_watcher(zeek_cardinality_watcher);
             if let Err(e) = listener.start_with_shutdown(zeek_shutdown_rx).await {
                 error!("Zeek listener error: {}", e);
             }

@@ -30,6 +30,28 @@ enabled = true   # env: LOGTHING__METRICS__ENABLED
 port = 9090      # env: LOGTHING__METRICS__PORT
 # bind_address = "0.0.0.0"   # env: LOGTHING__METRICS__BIND_ADDRESS
 
+# Optional: "is ingestion working?" gauge — counts distinct values of one
+# zeek field within each window, e.g. "we have ~5000 hosts; is id.orig_h
+# reporting ~5000 distinct values?" Requires zeek to be enabled (it is
+# disabled by default below). Both keys must be set together — a field with
+# no stream is rejected at startup (watching a field across every stream at
+# once is not supported). Remove or comment out to disable.
+# cardinality_watch_field  = "id.orig_h"  # zeek field to watch
+# cardinality_watch_stream = "conn"       # zeek stream (_path) it's counted on
+#
+# Window the gauge is published and cleared on (default 3600s = 1 hour, not
+# shorter: conn.log entries are emitted per-connection-CLOSE, not as a
+# heartbeat, so the window must be long enough that a normally-quiet host's
+# connection still closes within it).
+# cardinality_window_secs = 3600
+#
+# Cap on distinct values tracked per window (default 100000): sized roughly
+# an order of magnitude above a typical internal host count. A sensor that
+# also sees external originators (not just internal hosts) can exceed this
+# in normal operation — raise it and watch field_distinct_values_capped if
+# the gauge sits pinned at exactly this number.
+# cardinality_max_values = 100000
+
 # Bind ports below can be overridden without editing this file, via
 # LOGTHING__SYSLOG__UDP_PORT / LOGTHING__SYSLOG__TCP_PORT env vars. Unlike the other
 # listeners below, syslog's bind address is fixed at 0.0.0.0 — there is no

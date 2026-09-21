@@ -1,6 +1,7 @@
 //! Zeek TCP NDJSON listener.
 
 use crate::middleware::IpWhitelist;
+use crate::stats::cardinality::CardinalityWatcher;
 use crate::zeek::ZeekRecord;
 use chrono::Utc;
 use std::net::SocketAddr;
@@ -170,6 +171,7 @@ pub struct ZeekListener {
     config: ZeekListenerConfig,
     handler: Arc<dyn ZeekHandler>,
     allowed_ips: IpWhitelist,
+    cardinality: Option<Arc<CardinalityWatcher>>,
 }
 
 impl ZeekListener {
@@ -178,6 +180,7 @@ impl ZeekListener {
             config,
             handler,
             allowed_ips: IpWhitelist::empty(),
+            cardinality: None,
         }
     }
 
@@ -185,6 +188,17 @@ impl ZeekListener {
     /// [`IpWhitelist::empty()`] (allow all) via `new()`.
     pub fn with_allowed_ips(mut self, allowed_ips: IpWhitelist) -> Self {
         self.allowed_ips = allowed_ips;
+        self
+    }
+
+    /// Attach the optional `[metrics] cardinality_watch_field` watcher.
+    /// Defaults to `None` via `new()` — absent unless `main.rs` built one
+    /// from config (see `stats::cardinality::compile_watch`).
+    pub fn with_cardinality_watcher(
+        mut self,
+        cardinality: Option<Arc<CardinalityWatcher>>,
+    ) -> Self {
+        self.cardinality = cardinality;
         self
     }
 
@@ -229,9 +243,10 @@ impl ZeekListener {
                                     let handler = self.handler.clone();
                                     let idle_timeout = TCP_IDLE_TIMEOUT;
                                     let byte_budget = byte_budget.clone();
+                                    let cardinality = self.cardinality.clone();
                                     tokio::spawn(async move {
                                         let _permit = permit; // held for connection lifetime
-                                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler, idle_timeout, byte_budget).await {
+                                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler, idle_timeout, byte_budget, cardinality).await {
                                             error!("Zeek TCP connection error from {}: {}", src, e);
                                         }
                                     });
@@ -285,6 +300,7 @@ impl ZeekListener {
                             let handler = self.handler.clone();
                             let idle_timeout = TCP_IDLE_TIMEOUT;
                             let byte_budget = byte_budget.clone();
+                            let cardinality = self.cardinality.clone();
                             tokio::spawn(async move {
                                 let _permit = permit; // held for connection lifetime
                                 if let Err(e) = Self::handle_tcp_connection(
@@ -293,6 +309,7 @@ impl ZeekListener {
                                     handler,
                                     idle_timeout,
                                     byte_budget,
+                                    cardinality,
                                 )
                                 .await
                                 {
@@ -329,6 +346,7 @@ impl ZeekListener {
         handler: Arc<dyn ZeekHandler>,
         idle_timeout: Duration,
         byte_budget: Arc<Semaphore>,
+        cardinality: Option<Arc<CardinalityWatcher>>,
     ) -> anyhow::Result<()> {
         let mut reader = BufReader::new(stream);
         let mut buf: Vec<u8> = Vec::new();
@@ -487,6 +505,17 @@ impl ZeekListener {
                 "log_path" => crate::zeek::schema::metric_log_path(&record.log_path)
             )
             .increment(1);
+            // Cardinality watching observes here for the same reason as the
+            // counters above: every handler routes through this one point,
+            // so a configured watch fires regardless of which forwarding
+            // destination is installed — including when
+            // `AggregatingZeekHandler` swallows a matched record before it
+            // ever reaches an inner handler
+            // (`forwarding/aggregate/handlers.rs`), which is correct: the
+            // record was still real ingested traffic.
+            if let Some(watcher) = &cardinality {
+                watcher.observe(&record);
+            }
             handler.handle_record(record, src).await;
         }
         Ok(())
@@ -608,6 +637,7 @@ mod tests {
             CapturingHandler::new(),
             TCP_IDLE_TIMEOUT,
             full_byte_budget(),
+            None,
         )
         .await
         .unwrap();
@@ -677,6 +707,7 @@ mod tests {
             handler.clone(),
             TCP_IDLE_TIMEOUT,
             full_byte_budget(),
+            None,
         )
         .await
         .unwrap();
@@ -715,6 +746,103 @@ mod tests {
                 "zeek_records_by_path{{log_path=\"{path}\"}} must be emitted"
             );
         }
+    }
+
+    // -- Cardinality watching: observed at the same point as the received counters --
+
+    /// Drives real conn records (distinct `id.orig_h` values) through
+    /// `handle_tcp_connection` with a `CardinalityWatcher` attached, then
+    /// forces a window boundary and asserts the gauge. Template:
+    /// `received_counters_fire_with_a_non_default_handler` above.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn cardinality_watcher_reports_distinct_values_after_a_window_boundary() {
+        use crate::stats::cardinality::{CardinalityWatcher, CompiledWatch};
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let watcher = Arc::new(CardinalityWatcher::new(
+            CompiledWatch {
+                stream: "conn".to_string(),
+                field: "id.orig_h".to_string(),
+            },
+            1000,
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // 3 conn records, 2 distinct id.orig_h (10.0.0.1 repeated) — plus
+            // one dns record, which must be excluded by the stream filter.
+            stream
+                .write_all(
+                    b"{\"_path\":\"conn\",\"uid\":\"C1\",\"id.orig_h\":\"10.0.0.1\"}\n\
+                      {\"_path\":\"conn\",\"uid\":\"C2\",\"id.orig_h\":\"10.0.0.2\"}\n\
+                      {\"_path\":\"conn\",\"uid\":\"C3\",\"id.orig_h\":\"10.0.0.1\"}\n\
+                      {\"_path\":\"dns\",\"uid\":\"C4\",\"id.orig_h\":\"10.0.0.9\"}\n",
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let (stream, src) = listener.accept().await.unwrap();
+        ZeekListener::handle_tcp_connection(
+            stream,
+            src,
+            CapturingHandler::new(),
+            TCP_IDLE_TIMEOUT,
+            full_byte_budget(),
+            Some(watcher.clone()),
+        )
+        .await
+        .unwrap();
+        client.await.unwrap();
+
+        let gauge_key = CompositeKey::new(
+            MetricKind::Gauge,
+            metrics::Key::from_parts(
+                "field_distinct_values",
+                vec![
+                    metrics::Label::new("stream", "conn"),
+                    metrics::Label::new("field", "id.orig_h"),
+                ],
+            ),
+        );
+        let read = |map: &std::collections::HashMap<_, _>| -> f64 {
+            map.get(&gauge_key)
+                .map(|(_, _, v)| match v {
+                    DebugValue::Gauge(g) => g.into_inner(),
+                    _ => 0.0,
+                })
+                .unwrap_or(0.0)
+        };
+
+        // Before the window boundary, `observe()` has only updated the
+        // internal set — the gauge itself (registered at construction, like
+        // every `metrics::gauge!()` call) must still read its untouched
+        // initial value, not the 2 distinct values already observed.
+        assert_eq!(
+            read(&snapshotter.snapshot().into_hashmap()),
+            0.0,
+            "the gauge must not reflect observations before a window boundary"
+        );
+
+        watcher.tick();
+
+        assert_eq!(
+            read(&snapshotter.snapshot().into_hashmap()),
+            2.0,
+            "2 distinct id.orig_h values from conn records; the dns record's \
+             id.orig_h must have been excluded by the stream filter"
+        );
     }
 
     // -- Shutdown-arm test --
@@ -1159,6 +1287,7 @@ mod tests {
             CapturingHandler::new(),
             Duration::from_millis(100),
             full_byte_budget(),
+            None,
         )
         .await
         .unwrap();
@@ -1287,6 +1416,7 @@ mod tests {
             handler,
             Duration::from_secs(5),
             full_byte_budget(),
+            None,
         )
         .await
         .unwrap();
@@ -1363,8 +1493,15 @@ mod tests {
             let handler = CapturingHandler::new();
             let budget = byte_budget.clone();
             servers.push(tokio::spawn(async move {
-                ZeekListener::handle_tcp_connection(stream, src, handler, TCP_IDLE_TIMEOUT, budget)
-                    .await
+                ZeekListener::handle_tcp_connection(
+                    stream,
+                    src,
+                    handler,
+                    TCP_IDLE_TIMEOUT,
+                    budget,
+                    None,
+                )
+                .await
             }));
         }
 
