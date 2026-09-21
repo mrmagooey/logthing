@@ -22,7 +22,9 @@
 //! comment on the template test for why (the Prometheus recorder is a
 //! process-global, install-once call).
 
-use logthing::config::{CardinalityWatch, Config, MetricsConfig, TlsConfig, ZeekLocalConfig};
+use logthing::config::{
+    CardinalityWatch, Config, MetricsConfig, TlsConfig, ZeekConfig, ZeekLocalConfig,
+};
 use logthing::forwarding::flush_registry::FlushIntervalRegistry;
 use logthing::forwarding::local_sink::LocalDiskSink;
 use logthing::forwarding::zeek_s3::{MultiZeekHandler, zeek_local_start};
@@ -96,6 +98,15 @@ async fn field_distinct_values_visible_on_real_metrics_endpoint_after_a_window_b
         tls: TlsConfig {
             enabled: false,
             ..TlsConfig::default()
+        },
+        // compile_watches now rejects a watch naming a disabled source (see
+        // stats::cardinality::cardinality_source_enabled) — this test drives
+        // ZeekListener directly rather than through main.rs's config.zeek
+        // gating, but config.zeek.enabled still has to be true for the watch
+        // below to pass startup validation.
+        zeek: ZeekConfig {
+            enabled: true,
+            ..ZeekConfig::default()
         },
         metrics: MetricsConfig {
             enabled: true,

@@ -3,6 +3,7 @@
 use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::forwarding::structured_syslog_s3::StructuredS3Handler;
 use crate::middleware::IpWhitelist;
+use crate::stats::cardinality::CardinalityWatcher;
 use crate::syslog::{SyslogMessage, dns::DnsLogEntry, payload};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -266,6 +267,34 @@ pub struct SyslogListener {
     config: SyslogListenerConfig,
     handler: Arc<dyn SyslogHandler>,
     allowed_ips: IpWhitelist,
+    cardinality: Vec<Arc<CardinalityWatcher>>,
+}
+
+/// Observe a parsed message against every configured syslog cardinality
+/// watch, then dispatch it to the handler. Every one of this file's six
+/// dispatch sites — the `recv_tasks <= 1` inline UDP arms, `start_udp_listener`,
+/// `handle_tcp_connection` (shared by every TCP accept path), and
+/// `syslog_udp_recv_loop`'s two arms (the `recv_tasks > 1` fan-out this
+/// listener defaults to) — routes through this one function, mirroring
+/// `zeek::listener`'s shared per-record dispatch point but as its own free
+/// function since (unlike zeek) the call sites here are not already funneled
+/// through one shared loop.
+///
+/// `PayloadDispatchingHandler::handle_message` (above) is deliberately NOT a
+/// call site: it is a `SyslogHandler` trait impl invoked BY these dispatch
+/// sites, not a listener observation point in its own right — observing
+/// there would repeat the "metric inside a `Default*Handler` never fires"
+/// bug this repo has already shipped once.
+async fn observe_and_dispatch(
+    cardinality: &[Arc<CardinalityWatcher>],
+    message: SyslogMessage,
+    src: SocketAddr,
+    handler: &Arc<dyn SyslogHandler>,
+) {
+    for watcher in cardinality {
+        watcher.observe(&message);
+    }
+    handler.handle_message(message, src).await;
 }
 
 impl SyslogListener {
@@ -274,6 +303,7 @@ impl SyslogListener {
             config,
             handler,
             allowed_ips: IpWhitelist::empty(),
+            cardinality: Vec::new(),
         }
     }
 
@@ -281,6 +311,16 @@ impl SyslogListener {
     /// [`IpWhitelist::empty()`] (allow all) via `new()`.
     pub fn with_allowed_ips(mut self, allowed_ips: IpWhitelist) -> Self {
         self.allowed_ips = allowed_ips;
+        self
+    }
+
+    /// Attach the `[[metrics.cardinality_watch]]` watchers configured for
+    /// `source = "syslog"`. Defaults to empty via `new()` — `main.rs` builds
+    /// the full list from config (see `stats::cardinality::compile_watches`)
+    /// and partitions it by source once at startup, so this listener only
+    /// ever sees its own syslog watches.
+    pub fn with_cardinality_watchers(mut self, cardinality: Vec<Arc<CardinalityWatcher>>) -> Self {
+        self.cardinality = cardinality;
         self
     }
 
@@ -343,6 +383,8 @@ impl SyslogListener {
 
             let handler_udp = self.handler.clone();
             let handler_tcp = self.handler.clone();
+            let cardinality_udp = self.cardinality.clone();
+            let cardinality_tcp = self.cardinality.clone();
             let tcp_idle_timeout = self.config.tcp_idle_timeout;
             let mut socket_stats = crate::net::SocketDropStats::new(&udp_socket, "syslog_udp");
             let mut socket_stats_ticker =
@@ -366,7 +408,7 @@ impl SyslogListener {
                                     debug!("Received UDP syslog message from {}: {} bytes", src, len);
                                     metrics::counter!("syslog_messages_received").increment(1);
                                     if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
-                                        handler_udp.handle_message(syslog_msg, src).await;
+                                        observe_and_dispatch(&cardinality_udp, syslog_msg, src, &handler_udp).await;
                                     } else {
                                         metrics::counter!("syslog_parse_errors").increment(1);
                                         warn!(
@@ -394,9 +436,10 @@ impl SyslogListener {
                                     match semaphore.clone().try_acquire_owned() {
                                         Ok(permit) => {
                                             let handler = handler_tcp.clone();
+                                            let cardinality = cardinality_tcp.clone();
                                             tokio::spawn(async move {
                                                 let _permit = permit; // held for connection lifetime
-                                                if let Err(e) = Self::handle_tcp_connection(stream, src, handler, tcp_idle_timeout).await {
+                                                if let Err(e) = Self::handle_tcp_connection(stream, src, handler, tcp_idle_timeout, cardinality).await {
                                                     error!("TCP connection error from {}: {}", src, e);
                                                 }
                                             });
@@ -459,7 +502,7 @@ impl SyslogListener {
                                     debug!("Received UDP syslog message from {}: {} bytes", src, payload.len());
                                     metrics::counter!("syslog_messages_received").increment(1);
                                     if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
-                                        handler_udp.handle_message(syslog_msg, src).await;
+                                        observe_and_dispatch(&cardinality_udp, syslog_msg, src, &handler_udp).await;
                                     } else {
                                         metrics::counter!("syslog_parse_errors").increment(1);
                                         warn!(
@@ -498,6 +541,7 @@ impl SyslogListener {
                                 match semaphore.clone().try_acquire_owned() {
                                     Ok(permit) => {
                                         let handler = handler_tcp.clone();
+                                        let cardinality = cardinality_tcp.clone();
                                         tokio::spawn(async move {
                                             let _permit = permit; // held for connection lifetime
                                             if let Err(e) = Self::handle_tcp_connection(
@@ -505,6 +549,7 @@ impl SyslogListener {
                                                 src,
                                                 handler,
                                                 tcp_idle_timeout,
+                                                cardinality,
                                             )
                                             .await
                                             {
@@ -579,6 +624,7 @@ impl SyslogListener {
             let handler = self.handler.clone();
             let allowed_ips = self.allowed_ips.clone();
             let task_shutdown_rx = shutdown_rx.clone();
+            let cardinality = self.cardinality.clone();
             // Only the first task takes the shared drop-stats tracker, so it
             // is polled exactly once per SO_REUSEPORT group.
             let stats = if i == 0 { socket_stats.take() } else { None };
@@ -589,6 +635,7 @@ impl SyslogListener {
                 task_shutdown_rx,
                 stats,
                 self.config.recv_batch_size,
+                cardinality,
             )));
         }
 
@@ -596,6 +643,7 @@ impl SyslogListener {
         let tcp_allowed_ips = self.allowed_ips.clone();
         let tcp_shutdown_rx = shutdown_rx.clone();
         let tcp_idle_timeout = self.config.tcp_idle_timeout;
+        let tcp_cardinality = self.cardinality.clone();
         tasks.push(tokio::spawn(syslog_tcp_accept_loop(
             tcp_listener,
             tcp_handler,
@@ -603,6 +651,7 @@ impl SyslogListener {
             semaphore,
             tcp_shutdown_rx,
             tcp_idle_timeout,
+            tcp_cardinality,
         )));
 
         for task in tasks {
@@ -655,7 +704,7 @@ impl SyslogListener {
 
                             metrics::counter!("syslog_messages_received").increment(1);
                             if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
-                                self.handler.handle_message(syslog_msg, src).await;
+                                observe_and_dispatch(&self.cardinality, syslog_msg, src, &self.handler).await;
                             } else {
                                 metrics::counter!("syslog_parse_errors").increment(1);
                                 warn!(
@@ -713,6 +762,7 @@ impl SyslogListener {
                         Ok(permit) => {
                             let handler = self.handler.clone();
                             let tcp_idle_timeout = self.config.tcp_idle_timeout;
+                            let cardinality = self.cardinality.clone();
                             tokio::spawn(async move {
                                 let _permit = permit; // held for connection lifetime
                                 if let Err(e) = Self::handle_tcp_connection(
@@ -720,6 +770,7 @@ impl SyslogListener {
                                     src,
                                     handler,
                                     tcp_idle_timeout,
+                                    cardinality,
                                 )
                                 .await
                                 {
@@ -755,6 +806,7 @@ impl SyslogListener {
         src: SocketAddr,
         handler: Arc<dyn SyslogHandler>,
         idle_timeout: Duration,
+        cardinality: Vec<Arc<CardinalityWatcher>>,
     ) -> anyhow::Result<()> {
         let mut reader = BufReader::new(stream);
         let mut buf: Vec<u8> = Vec::new();
@@ -809,7 +861,7 @@ impl SyslogListener {
             );
             metrics::counter!("syslog_messages_received").increment(1);
             if let Some(syslog_msg) = SyslogMessage::parse(&line) {
-                handler.handle_message(syslog_msg, src).await;
+                observe_and_dispatch(&cardinality, syslog_msg, src, &handler).await;
             } else {
                 metrics::counter!("syslog_parse_errors").increment(1);
                 // `read_until(b'\n', ...)` above only guarantees no *trailing*
@@ -842,6 +894,7 @@ async fn syslog_udp_recv_loop(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mut socket_stats: Option<crate::net::SocketDropStats>,
     recv_batch_size: usize,
+    cardinality: Vec<Arc<CardinalityWatcher>>,
 ) {
     let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
@@ -862,7 +915,7 @@ async fn syslog_udp_recv_loop(
                             debug!("Received UDP syslog message from {}: {} bytes", src, len);
                             metrics::counter!("syslog_messages_received").increment(1);
                             if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
-                                handler.handle_message(syslog_msg, src).await;
+                                observe_and_dispatch(&cardinality, syslog_msg, src, &handler).await;
                             } else {
                                 metrics::counter!("syslog_parse_errors").increment(1);
                                 warn!(
@@ -915,7 +968,7 @@ async fn syslog_udp_recv_loop(
                             debug!("Received UDP syslog message from {}: {} bytes", src, payload.len());
                             metrics::counter!("syslog_messages_received").increment(1);
                             if let Some(syslog_msg) = SyslogMessage::parse(&msg) {
-                                handler.handle_message(syslog_msg, src).await;
+                                observe_and_dispatch(&cardinality, syslog_msg, src, &handler).await;
                             } else {
                                 metrics::counter!("syslog_parse_errors").increment(1);
                                 warn!(
@@ -962,6 +1015,7 @@ async fn syslog_tcp_accept_loop(
     semaphore: Arc<Semaphore>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     idle_timeout: Duration,
+    cardinality: Vec<Arc<CardinalityWatcher>>,
 ) {
     loop {
         tokio::select! {
@@ -977,6 +1031,7 @@ async fn syslog_tcp_accept_loop(
                         match semaphore.clone().try_acquire_owned() {
                             Ok(permit) => {
                                 let handler = handler.clone();
+                                let cardinality = cardinality.clone();
                                 tokio::spawn(async move {
                                     let _permit = permit; // held for connection lifetime
                                     if let Err(e) = SyslogListener::handle_tcp_connection(
@@ -984,6 +1039,7 @@ async fn syslog_tcp_accept_loop(
                                         src,
                                         handler,
                                         idle_timeout,
+                                        cardinality,
                                     )
                                     .await
                                     {
@@ -1994,9 +2050,15 @@ mod tests {
         drop(client); // close so the next read_until sees a clean EOF and returns
 
         let handler = CapturingHandler::new();
-        SyslogListener::handle_tcp_connection(server_stream, src, handler, Duration::from_secs(5))
-            .await
-            .unwrap();
+        SyslogListener::handle_tcp_connection(
+            server_stream,
+            src,
+            handler,
+            Duration::from_secs(5),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
 
         let events = crate::test_support::captured_events();
         let warn_line = events
@@ -2070,5 +2132,181 @@ mod tests {
             line.contains('\u{fffd}'),
             "expected U+FFFD replacement characters in the log line: {line:?}"
         );
+    }
+
+    // -- Cardinality watching: recv_tasks <= 1 (inline) AND recv_tasks > 1 --
+    // -- (SO_REUSEPORT fan-out, the default) must both observe records --
+
+    /// Bind ephemeral UDP and TCP ports, then drop the sockets so
+    /// `SyslogListener` (and, for `recv_tasks > 1`, its `SO_REUSEPORT`
+    /// group) can bind the same addresses — same pattern as this module's
+    /// other listener-driving tests.
+    async fn alloc_udp_tcp_ports_for_tests() -> (u16, u16) {
+        let tmp_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = tmp_udp.local_addr().unwrap().port();
+        drop(tmp_udp);
+        let tmp_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tmp_tcp.local_addr().unwrap().port();
+        drop(tmp_tcp);
+        (udp_port, tcp_port)
+    }
+
+    /// RFC 3164 line with a fixed `app_name` ("sshd", via the `tag[pid]:`
+    /// syntax) and a variable `hostname` — `SyslogMessage::stream()` returns
+    /// `app_name`, so every line here matches a `stream = "sshd"` watch,
+    /// while `hostname` is the field under test.
+    fn syslog_line(hostname: &str) -> Vec<u8> {
+        format!("<34>Oct 11 22:14:15 {hostname} sshd[123]: test message").into_bytes()
+    }
+
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    fn read_gauge(snapshotter: &metrics_util::debugging::Snapshotter) -> f64 {
+        use metrics_util::debugging::DebugValue;
+        use metrics_util::{CompositeKey, MetricKind};
+        let map = snapshotter.snapshot().into_hashmap();
+        let key = CompositeKey::new(
+            MetricKind::Gauge,
+            metrics::Key::from_parts(
+                "field_distinct_values",
+                vec![
+                    metrics::Label::new("source", "syslog"),
+                    metrics::Label::new("stream", "sshd"),
+                    metrics::Label::new("field", "hostname"),
+                ],
+            ),
+        );
+        map.get(&key)
+            .map(|(_, _, v)| match v {
+                DebugValue::Gauge(g) => g.into_inner(),
+                _ => 0.0,
+            })
+            .unwrap_or(0.0)
+    }
+
+    /// `recv_tasks <= 1`: drives the inline UDP arm of `start_with_shutdown`
+    /// directly (not the `SO_REUSEPORT` fan-out). Round-1 defect context:
+    /// wiring only this branch would still pass this test while leaving the
+    /// default-config fan-out path (see the next test) completely unwired.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn cardinality_watcher_reports_distinct_values_at_recv_tasks_one() {
+        use crate::stats::cardinality::{CardinalityWatcher, CompiledWatch};
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let watcher = Arc::new(CardinalityWatcher::new(
+            CompiledWatch {
+                source: "syslog".to_string(),
+                stream: "sshd".to_string(),
+                field: "hostname".to_string(),
+            },
+            1000,
+        ));
+
+        let (udp_port, tcp_port) = alloc_udp_tcp_ports_for_tests().await;
+        let cfg = SyslogListenerConfig {
+            udp_port,
+            tcp_port,
+            bind_address: "127.0.0.1".to_string(),
+            parse_dns_logs: false,
+            recv_tasks: 1,
+            ..SyslogListenerConfig::default()
+        };
+        let listener = SyslogListener::new(cfg, CapturingHandler::new())
+            .with_cardinality_watchers(vec![watcher.clone()]);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { listener.start_with_shutdown(shutdown_rx).await });
+        sleep(Duration::from_millis(100)).await;
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // 3 messages, 2 distinct hostnames (host-a repeated).
+        for host in ["host-a", "host-b", "host-a"] {
+            sock.send_to(&syslog_line(host), format!("127.0.0.1:{udp_port}"))
+                .await
+                .unwrap();
+        }
+        sleep(Duration::from_millis(200)).await;
+
+        watcher.tick();
+        assert_eq!(
+            read_gauge(&snapshotter),
+            2.0,
+            "2 distinct hostnames must be observed through the recv_tasks <= 1 inline UDP arm"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// `recv_tasks > 1` (left at `SyslogListenerConfig::default()`'s
+    /// production value, 8): drives the `SO_REUSEPORT` fan-out —
+    /// `syslog_udp_recv_loop`, spawned once per socket — which is what
+    /// `main.rs` actually runs at stock config. This is the branch the
+    /// round-1 defect left unwired; a test that only exercised
+    /// `recv_tasks <= 1` would not have caught it.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn cardinality_watcher_reports_distinct_values_at_default_recv_tasks_fan_out() {
+        use crate::stats::cardinality::{CardinalityWatcher, CompiledWatch};
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let watcher = Arc::new(CardinalityWatcher::new(
+            CompiledWatch {
+                source: "syslog".to_string(),
+                stream: "sshd".to_string(),
+                field: "hostname".to_string(),
+            },
+            1000,
+        ));
+
+        let (udp_port, tcp_port) = alloc_udp_tcp_ports_for_tests().await;
+        let cfg = SyslogListenerConfig {
+            udp_port,
+            tcp_port,
+            bind_address: "127.0.0.1".to_string(),
+            parse_dns_logs: false,
+            // recv_tasks intentionally left at SyslogListenerConfig::default()'s
+            // production value (8) -- see that field's doc comment, and
+            // tests/syslog_panic_resilience_e2e.rs, which does the same for
+            // the same reason.
+            ..SyslogListenerConfig::default()
+        };
+        let listener = SyslogListener::new(cfg, CapturingHandler::new())
+            .with_cardinality_watchers(vec![watcher.clone()]);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { listener.start_with_shutdown(shutdown_rx).await });
+        sleep(Duration::from_millis(100)).await;
+
+        // All sends from the SAME client socket, so the kernel's
+        // SO_REUSEPORT hash routes every datagram to the same recv task --
+        // irrelevant to correctness here (the watcher is shared across all
+        // tasks via the same Vec<Arc<...>>), but keeps this deterministic.
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for host in ["host-a", "host-b", "host-a"] {
+            sock.send_to(&syslog_line(host), format!("127.0.0.1:{udp_port}"))
+                .await
+                .unwrap();
+        }
+        sleep(Duration::from_millis(200)).await;
+
+        watcher.tick();
+        assert_eq!(
+            read_gauge(&snapshotter),
+            2.0,
+            "2 distinct hostnames must be observed through the default recv_tasks (8) \
+             SO_REUSEPORT fan-out path"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 }

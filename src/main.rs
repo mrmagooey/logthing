@@ -194,7 +194,7 @@ async fn async_main() -> anyhow::Result<()> {
     // Build the field-cardinality watchers (optional, any number). Same
     // fatal-on-bad-config stance as the aggregator above: see
     // `stats::cardinality::compile_watches`. Compiled once, then partitioned
-    // by source so each observation site (the zeek listener below, WEF's
+    // by source so each observation site (the five listeners below, WEF's
     // `process_single_event` inside `Server`) only ever sees its own
     // watches — no per-record source filtering at the observation site.
     // -----------------------------------------------------------------------
@@ -202,6 +202,14 @@ async fn async_main() -> anyhow::Result<()> {
     let mut zeek_cardinality_watchers: Vec<Arc<stats::cardinality::CardinalityWatcher>> =
         Vec::new();
     let mut wef_cardinality_watchers: Vec<Arc<stats::cardinality::CardinalityWatcher>> = Vec::new();
+    let mut suricata_cardinality_watchers: Vec<Arc<stats::cardinality::CardinalityWatcher>> =
+        Vec::new();
+    let mut syslog_cardinality_watchers: Vec<Arc<stats::cardinality::CardinalityWatcher>> =
+        Vec::new();
+    let mut ipfix_cardinality_watchers: Vec<Arc<stats::cardinality::CardinalityWatcher>> =
+        Vec::new();
+    let mut sflow_cardinality_watchers: Vec<Arc<stats::cardinality::CardinalityWatcher>> =
+        Vec::new();
     for watch in compiled_watches {
         let source = watch.source.clone();
         let watcher = Arc::new(stats::cardinality::CardinalityWatcher::new(
@@ -211,6 +219,10 @@ async fn async_main() -> anyhow::Result<()> {
         match source.as_str() {
             "zeek" => zeek_cardinality_watchers.push(watcher),
             "wef" => wef_cardinality_watchers.push(watcher),
+            "suricata" => suricata_cardinality_watchers.push(watcher),
+            "syslog" => syslog_cardinality_watchers.push(watcher),
+            "ipfix" => ipfix_cardinality_watchers.push(watcher),
+            "sflow" => sflow_cardinality_watchers.push(watcher),
             // Unreachable: `compile_watches` already rejected any other
             // source name.
             other => unreachable!("compile_watches let an unknown source '{other}' through"),
@@ -220,6 +232,10 @@ async fn async_main() -> anyhow::Result<()> {
         zeek_cardinality_watchers
             .iter()
             .chain(wef_cardinality_watchers.iter())
+            .chain(suricata_cardinality_watchers.iter())
+            .chain(syslog_cardinality_watchers.iter())
+            .chain(ipfix_cardinality_watchers.iter())
+            .chain(sflow_cardinality_watchers.iter())
             .cloned()
             .collect();
     if !all_cardinality_watchers.is_empty() {
@@ -230,10 +246,15 @@ async fn async_main() -> anyhow::Result<()> {
         );
         writer_handles.push(ticker);
         info!(
-            "Field-cardinality watching enabled: {} watch(es) ({} zeek, {} wef), {}s window",
+            "Field-cardinality watching enabled: {} watch(es) ({} zeek, {} wef, {} suricata, \
+             {} syslog, {} ipfix, {} sflow), {}s window",
             all_cardinality_watchers.len(),
             zeek_cardinality_watchers.len(),
             wef_cardinality_watchers.len(),
+            suricata_cardinality_watchers.len(),
+            syslog_cardinality_watchers.len(),
+            ipfix_cardinality_watchers.len(),
+            sflow_cardinality_watchers.len(),
             config.metrics.cardinality_window_secs
         );
     }
@@ -399,9 +420,11 @@ async fn async_main() -> anyhow::Result<()> {
             ..syslog::listener::SyslogListenerConfig::default()
         };
         let syslog_ip_whitelist = ip_whitelist.clone();
+        let syslog_watchers_for_listener = syslog_cardinality_watchers.clone();
         let handle = tokio::spawn(async move {
             let listener = syslog::listener::SyslogListener::new(syslog_config, syslog_handler)
-                .with_allowed_ips(syslog_ip_whitelist);
+                .with_allowed_ips(syslog_ip_whitelist)
+                .with_cardinality_watchers(syslog_watchers_for_listener);
             if let Err(e) = listener.start_with_shutdown(syslog_shutdown_rx).await {
                 error!("Syslog listener error: {}", e);
             }
@@ -490,9 +513,11 @@ async fn async_main() -> anyhow::Result<()> {
             recv_batch_size: ipfix_config_clone.ipfix.recv_batch_size,
         };
         let ipfix_ip_whitelist = ip_whitelist.clone();
+        let ipfix_watchers_for_listener = ipfix_cardinality_watchers.clone();
         let handle = tokio::spawn(async move {
             let listener = ipfix::listener::IpfixListener::new(listener_config, ipfix_handler)
-                .with_allowed_ips(ipfix_ip_whitelist);
+                .with_allowed_ips(ipfix_ip_whitelist)
+                .with_cardinality_watchers(ipfix_watchers_for_listener);
             if let Err(e) = listener.start_with_shutdown(ipfix_shutdown_rx).await {
                 error!("IPFIX listener error: {}", e);
             }
@@ -671,10 +696,12 @@ async fn async_main() -> anyhow::Result<()> {
             bind_address: suricata_config_clone.suricata.bind_address.clone(),
         };
         let suricata_ip_whitelist = ip_whitelist.clone();
+        let suricata_watchers_for_listener = suricata_cardinality_watchers.clone();
         let handle = tokio::spawn(async move {
             let listener =
                 suricata::listener::SuricataListener::new(listener_config, suricata_handler)
-                    .with_allowed_ips(suricata_ip_whitelist);
+                    .with_allowed_ips(suricata_ip_whitelist)
+                    .with_cardinality_watchers(suricata_watchers_for_listener);
             if let Err(e) = listener.start_with_shutdown(suricata_shutdown_rx).await {
                 error!("Suricata listener error: {}", e);
             }
@@ -763,9 +790,11 @@ async fn async_main() -> anyhow::Result<()> {
             recv_batch_size: sflow_config_clone.sflow.recv_batch_size,
         };
         let sflow_ip_whitelist = ip_whitelist.clone();
+        let sflow_watchers_for_listener = sflow_cardinality_watchers.clone();
         let handle = tokio::spawn(async move {
             let listener = sflow::listener::SflowListener::new(listener_config, sflow_handler)
-                .with_allowed_ips(sflow_ip_whitelist);
+                .with_allowed_ips(sflow_ip_whitelist)
+                .with_cardinality_watchers(sflow_watchers_for_listener);
             if let Err(e) = listener.start_with_shutdown(sflow_shutdown_rx).await {
                 error!("sFlow listener error: {}", e);
             }

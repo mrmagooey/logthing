@@ -36,20 +36,22 @@
 //!   undercounts, same direction as cap saturation, but is essentially
 //!   never reached by an IP- or hostname-shaped field.
 //!
-//! # Two sources, any number of watches
+//! # Six sources, any number of watches
 //!
-//! ponytail: exactly two supported `source`s ("zeek", "wef") — one
-//! `AggFields` impl each, wired at each source's own per-record observation
-//! point (`zeek::listener` / `server::process_single_event`). Ceiling: a
-//! third source needs that source's own `AggFields` impl (four more already
-//! exist for aggregation in `forwarding::aggregate::fields` — suricata,
-//! ipfix, sflow, syslog — but none is wired to this watcher yet), a new
-//! arm in `compile_watches`'s source-name check, and one
-//! `watcher.observe(&record)` call at that source's own observation point.
-//! There is still no "every stream" mode: the stream a watch counts on is
-//! always required (counting one field name across every stream at once
-//! would conflate e.g. zeek's `conn` and `dns` streams' `id.orig_h` into
-//! one number with no way to tell which stream contributed it).
+//! All six ingest sources (zeek, wef, suricata, syslog, ipfix, sflow) are
+//! wired, each via its own `AggFields` impl
+//! (`forwarding::aggregate::fields`) and its own observation point: zeek's
+//! is `zeek::listener`, wef's is `server::process_single_event`, and each of
+//! `suricata::listener`, `syslog::listener`, `ipfix::listener`,
+//! `sflow::listener` has its own small `observe_and_dispatch` helper that
+//! every dispatch site in that file routes through — including the
+//! `recv_tasks > 1` `SO_REUSEPORT` fan-out path those three listeners
+//! default to, not just the `recv_tasks <= 1` inline branch (see those
+//! modules' own doc comments). There is still no "every stream" mode: the
+//! stream a watch counts on is always required (counting one field name
+//! across every stream at once would conflate e.g. zeek's `conn` and `dns`
+//! streams' `id.orig_h` into one number with no way to tell which stream
+//! contributed it).
 //!
 //! This used to be "exactly one watch, exactly one source (zeek)" — a
 //! single flat `cardinality_watch_field`/`_stream` pair, with every source
@@ -90,7 +92,32 @@ use std::time::Duration;
 use tracing::warn;
 
 /// Sources a `[[metrics.cardinality_watch]]` entry may name.
-const KNOWN_WATCH_SOURCES: [&str; 2] = ["zeek", "wef"];
+const KNOWN_WATCH_SOURCES: [&str; 6] = ["zeek", "wef", "suricata", "syslog", "ipfix", "sflow"];
+
+/// Whether `source` is enabled in `config`. A watch naming a disabled source
+/// is fatal at startup (see `compile_watches`'s call site) — otherwise it
+/// produces a permanently-absent gauge that reads as an outage, not a config
+/// mistake. Mirrors `aggregate::compile_rules`'s `source_enabled` precedent,
+/// but is NOT a call to that function: it has no `"wef"` arm and falls
+/// through to `_ => false`, which would reject every existing
+/// `source = "wef"` watch — `WefConfig` (`config::mod`) has no `enabled`
+/// field and `/wsman` is mounted unconditionally in `server::mod`, so WEF
+/// has no enable/disable toggle to check. Reusing that function verbatim
+/// would break the shipped, tested WEF cardinality watch
+/// (`tests/field_cardinality_metric_wef_e2e.rs`).
+fn cardinality_source_enabled(config: &Config, source: &str) -> bool {
+    match source {
+        "zeek" => config.zeek.enabled,
+        "suricata" => config.suricata.enabled,
+        "syslog" => config.syslog.enabled,
+        "ipfix" => config.ipfix.enabled,
+        "sflow" => config.sflow.enabled,
+        // No config toggle exists for WEF — the HTTP endpoint is always
+        // mounted, so a `source = "wef"` watch is never rejected here.
+        "wef" => true,
+        _ => false,
+    }
+}
 
 /// A validated watch, ready to construct a `CardinalityWatcher` from.
 #[derive(Debug)]
@@ -143,6 +170,14 @@ pub fn compile_watches(config: &Config) -> anyhow::Result<Vec<CompiledWatch>> {
                 KNOWN_WATCH_SOURCES
             );
         }
+        if !cardinality_source_enabled(config, &watch.source) {
+            anyhow::bail!(
+                "[[metrics.cardinality_watch]] names source '{}' which is disabled in config \
+                 (a watch on a disabled source would produce a gauge permanently stuck at 0, \
+                 indistinguishable from an outage — enable the source or remove this watch)",
+                watch.source
+            );
+        }
         if watch.field.trim().is_empty() {
             anyhow::bail!("[[metrics.cardinality_watch]] has an empty `field`");
         }
@@ -151,6 +186,37 @@ pub fn compile_watches(config: &Config) -> anyhow::Result<Vec<CompiledWatch>> {
                 "[[metrics.cardinality_watch]] has an empty `stream` (watching a field across \
                  every stream at once is not supported)"
             );
+        }
+        // Stream validation only where `AggFields::stream()` returns a
+        // literal or a closed enum — ipfix and sflow. Every other source's
+        // stream is an open wire value with no fixed set to validate
+        // against: suricata's `stream()` returns the raw EVE `event_type`,
+        // not the collapsed `metric_event_type` label — `EVE_EVENT_TYPES`
+        // (`suricata::schema`) is a hand-maintained label allowlist that is
+        // incomplete BY DESIGN (its own doc comment: adding a type is "a
+        // deliberate act; until it is added it reports as `other`"), so
+        // validating a configured stream against it would reject a
+        // legitimate Suricata event type that simply hasn't been added to
+        // that list yet. Do not "fix" this into a suricata stream check.
+        // zeek, wef, and syslog streams are equally open and equally
+        // unvalidatable.
+        match watch.source.as_str() {
+            "ipfix" if watch.stream != "flows" => {
+                anyhow::bail!(
+                    "[[metrics.cardinality_watch]] source 'ipfix' requires stream = \"flows\" \
+                     (IPFIX has no other stream concept — FlowRecord::stream() always returns \
+                     that literal — got '{}')",
+                    watch.stream
+                );
+            }
+            "sflow" if watch.stream != "flow" && watch.stream != "counter" => {
+                anyhow::bail!(
+                    "[[metrics.cardinality_watch]] source 'sflow' requires stream = \"flow\" or \
+                     \"counter\" (SflowRecord::stream() never returns anything else — got '{}')",
+                    watch.stream
+                );
+            }
+            _ => {}
         }
         let key = (
             watch.source.as_str(),
@@ -192,6 +258,19 @@ pub struct CardinalityWatcher {
     // window in `tick`.
     matched_this_window: AtomicBool,
     field_seen_this_window: AtomicBool,
+    // Set once (never reset) the first time `observe`'s stream filter
+    // matches any record, for the whole life of the process — unlike
+    // `matched_this_window`, which `tick` clears every window. Distinguishes
+    // "this watch's stream has NEVER matched since startup" (misconfigured
+    // `stream`, or the source genuinely receiving nothing) from "matched
+    // before, quiet this window" (an ordinary silent window, already and
+    // correctly just a 0 gauge with no warning). See `tick`'s doc comment
+    // for the warning this drives.
+    ever_matched: AtomicBool,
+    // One-shot latch: set the first time the "never matched" warning below
+    // fires, so it does not repeat for the rest of the process's life even
+    // though `!ever_matched` stays true for every window after that.
+    never_matched_warned: AtomicBool,
 }
 
 impl CardinalityWatcher {
@@ -204,6 +283,8 @@ impl CardinalityWatcher {
             max_values,
             matched_this_window: AtomicBool::new(false),
             field_seen_this_window: AtomicBool::new(false),
+            ever_matched: AtomicBool::new(false),
+            never_matched_warned: AtomicBool::new(false),
         }
     }
 
@@ -217,6 +298,7 @@ impl CardinalityWatcher {
             return;
         }
         self.matched_this_window.store(true, Ordering::Relaxed);
+        self.ever_matched.store(true, Ordering::Relaxed);
 
         // ponytail: `group_value_string` heap-allocates (and truncates) the
         // value BEFORE the `contains` check below, so an already-tracked
@@ -266,6 +348,24 @@ impl CardinalityWatcher {
     /// since-boot: since-boot could only ratchet upward and would never
     /// show a source going silent, which is the failure an operator is
     /// trying to catch.
+    ///
+    /// Also fires the one-shot "never matched" warning (see `ever_matched`)
+    /// at the first window boundary at which this watch has never matched
+    /// any record since process start — naming both causes, a misconfigured
+    /// `stream` or the source genuinely receiving nothing, since a gauge
+    /// stuck at 0 looks identical either way. Accepted false positive: a
+    /// source that is legitimately silent during its very first window
+    /// still warns once — "never matched YET" and "never matches AT ALL"
+    /// are indistinguishable at the first window boundary, and one warning
+    /// is cheap next to the alternative of never telling a genuinely
+    /// misconfigured `stream` apart from silence. And because this
+    /// watcher's state is in-memory and resets on restart (same as every
+    /// other stat in this module — see the module doc), a source that is
+    /// actually down under a crash-loop, or restarting on a cadence near
+    /// `cardinality_window_secs`, re-arms this warning on every restart
+    /// rather than firing once total. That is inherited from the module's
+    /// existing reset-on-restart property (the field-typo warning below
+    /// shares it too) — not engineered around here.
     //
     // ponytail: `len()` then `clear()` on a DashSet is not atomic — an
     // insert landing between the two calls can be reported a window late or
@@ -322,6 +422,25 @@ impl CardinalityWatcher {
                  found on any of them — check this [[metrics.cardinality_watch]] entry's \
                  `field` for a typo",
                 self.field
+            );
+        }
+
+        // See this function's doc comment for the false-positive and
+        // restart-re-arm caveats. `!ever_matched` stays true forever once a
+        // real match happens, so checking `never_matched_warned` first is
+        // what makes this fire on at most one window boundary per process.
+        if !self.ever_matched.load(Ordering::Relaxed)
+            && !self.never_matched_warned.swap(true, Ordering::Relaxed)
+        {
+            warn!(
+                source = %self.source,
+                stream = %self.stream,
+                field = %self.field,
+                "cardinality watch: no record has EVER matched this watch's stream since \
+                 process start — check this [[metrics.cardinality_watch]] entry's `stream` for \
+                 a typo, or confirm source '{}' is actually receiving traffic. This warning \
+                 fires at most once per process lifetime.",
+                self.source
             );
         }
     }
@@ -507,11 +626,32 @@ mod tests {
         }
     }
 
+    /// Every source enabled (zeek/suricata/ipfix/sflow default to disabled;
+    /// syslog defaults to enabled; wef has no toggle) so tests exercising
+    /// the *rest* of `compile_watches`'s validation are not also tripped by
+    /// the disabled-source check — that check gets its own dedicated tests
+    /// below.
     fn config_with(watches: Vec<CardinalityWatch>) -> Config {
         Config {
             metrics: MetricsConfig {
                 cardinality_watch: watches,
                 ..MetricsConfig::default()
+            },
+            zeek: crate::config::ZeekConfig {
+                enabled: true,
+                ..Config::default().zeek
+            },
+            suricata: crate::config::SuricataConfig {
+                enabled: true,
+                ..Config::default().suricata
+            },
+            ipfix: crate::config::IpfixConfig {
+                enabled: true,
+                ..Config::default().ipfix
+            },
+            sflow: crate::config::SflowConfig {
+                enabled: true,
+                ..Config::default().sflow
             },
             ..Config::default()
         }
@@ -561,15 +701,15 @@ mod tests {
 
     #[test]
     fn compile_watches_rejects_an_unknown_source() {
-        let cfg = config_with(vec![raw_watch("suricata", "dns", "query")]);
+        let cfg = config_with(vec![raw_watch("netflow9", "dns", "query")]);
         let err = compile_watches(&cfg).unwrap_err().to_string();
         assert!(
-            err.contains("suricata"),
+            err.contains("netflow9"),
             "error must name the bad source: {err}"
         );
         assert!(
             err.contains("zeek") && err.contains("wef"),
-            "error must name both valid sources: {err}"
+            "error must name the valid sources: {err}"
         );
     }
 
@@ -624,6 +764,104 @@ mod tests {
         cfg.metrics.cardinality_max_values = 0;
         let err = compile_watches(&cfg).unwrap_err().to_string();
         assert!(err.contains("cardinality_max_values"), "got: {err}");
+    }
+
+    // -- compile_watches: all six sources, and the disabled-source / --
+    // -- WEF-exception / stream-validation rules added for the four new --
+    // -- sources --
+
+    #[test]
+    fn compile_watches_accepts_all_six_sources() {
+        let cfg = config_with(vec![
+            raw_watch("zeek", "conn", "id.orig_h"),
+            raw_watch("wef", "Security", "computer"),
+            raw_watch("suricata", "dns", "query"),
+            raw_watch("syslog", "sshd", "hostname"),
+            raw_watch("ipfix", "flows", "exporter"),
+            raw_watch("sflow", "flow", "exporter"),
+        ]);
+        let watches = compile_watches(&cfg).expect("all six sources are valid");
+        assert_eq!(watches.len(), 6);
+        for source in ["zeek", "wef", "suricata", "syslog", "ipfix", "sflow"] {
+            assert!(
+                watches.iter().any(|w| w.source == source),
+                "missing compiled watch for source {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_watches_rejects_a_watch_on_a_disabled_source() {
+        // config_with() enables every toggleable source; disable suricata
+        // specifically so this watch is the only thing that can fail.
+        let mut cfg = config_with(vec![raw_watch("suricata", "dns", "query")]);
+        cfg.suricata.enabled = false;
+        let err = compile_watches(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("suricata") && err.contains("disabled"),
+            "error must name the disabled source: {err}"
+        );
+    }
+
+    #[test]
+    fn compile_watches_accepts_wef_even_though_wef_has_no_enable_toggle() {
+        // WefConfig has no `enabled` field at all — this must never be
+        // rejected as "disabled" the way aggregate::source_enabled's
+        // `_ => false` fallthrough would reject it.
+        let cfg = config_with(vec![raw_watch("wef", "Security", "computer")]);
+        let watches = compile_watches(&cfg).expect("wef has no enable toggle to fail against");
+        assert_eq!(watches.len(), 1);
+    }
+
+    #[test]
+    fn compile_watches_rejects_a_bad_ipfix_stream() {
+        let cfg = config_with(vec![raw_watch("ipfix", "not-flows", "exporter")]);
+        let err = compile_watches(&cfg).unwrap_err().to_string();
+        assert!(err.contains("ipfix") && err.contains("flows"), "got: {err}");
+    }
+
+    #[test]
+    fn compile_watches_accepts_the_only_valid_ipfix_stream() {
+        let cfg = config_with(vec![raw_watch("ipfix", "flows", "exporter")]);
+        assert!(compile_watches(&cfg).is_ok());
+    }
+
+    #[test]
+    fn compile_watches_rejects_a_bad_sflow_stream() {
+        let cfg = config_with(vec![raw_watch("sflow", "not-a-stream", "exporter")]);
+        let err = compile_watches(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("sflow") && err.contains("flow") && err.contains("counter"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn compile_watches_accepts_both_valid_sflow_streams() {
+        for stream in ["flow", "counter"] {
+            let cfg = config_with(vec![raw_watch("sflow", stream, "exporter")]);
+            assert!(
+                compile_watches(&cfg).is_ok(),
+                "sflow stream {stream:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_watches_accepts_an_arbitrary_suricata_stream() {
+        // Regression guard for the deliberate non-validation: suricata's
+        // `stream()` is the raw wire `event_type`, and `EVE_EVENT_TYPES` is
+        // an incomplete-by-design label allowlist — a stream value that
+        // does not appear there must still compile, unlike ipfix/sflow.
+        let cfg = config_with(vec![raw_watch(
+            "suricata",
+            "some_future_event_type_not_yet_in_EVE_EVENT_TYPES",
+            "query",
+        )]);
+        assert!(
+            compile_watches(&cfg).is_ok(),
+            "suricata must accept any non-empty stream value"
+        );
     }
 
     // -- CardinalityWatcher: the capped set --
@@ -894,6 +1132,53 @@ mod tests {
         assert!(!w.matched_this_window.load(Ordering::Relaxed));
     }
 
+    // -- One-shot "never matched since startup" warning --
+
+    #[test]
+    fn never_matched_state_latches_after_the_first_tick_and_does_not_repeat() {
+        // Can't assert on the log line directly here (see the field-typo
+        // warning tests' own comment on why) — assert the state the warning
+        // is computed from instead: `ever_matched` stays false when nothing
+        // ever matches, and `never_matched_warned` flips true after exactly
+        // one `tick()`, then stays true (one-shot) across further ticks.
+        let w = CardinalityWatcher::new(watch("conn", "id.orig_h"), 100);
+        // Only offer records on a DIFFERENT stream — this watch's "conn"
+        // filter never matches.
+        w.observe(&rec("dns", "a"));
+        assert!(!w.ever_matched.load(Ordering::Relaxed));
+        assert!(!w.never_matched_warned.load(Ordering::Relaxed));
+
+        w.tick();
+        assert!(
+            w.never_matched_warned.load(Ordering::Relaxed),
+            "the warning must latch after the first window boundary with zero matches ever"
+        );
+
+        // Further windows, still with no match, must leave the latch
+        // exactly as it is — that is what makes the warning one-shot rather
+        // than once-per-silent-window.
+        w.tick();
+        w.tick();
+        assert!(w.never_matched_warned.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_watch_that_matches_at_least_once_never_latches_the_never_matched_warning() {
+        let w = CardinalityWatcher::new(watch("conn", "id.orig_h"), 100);
+        w.observe(&rec("conn", "10.0.0.1"));
+        assert!(w.ever_matched.load(Ordering::Relaxed));
+        w.tick();
+        assert!(
+            !w.never_matched_warned.load(Ordering::Relaxed),
+            "a watch that has matched at least once must never latch the never-matched warning"
+        );
+        // `ever_matched` stays true forever, even across a later silent
+        // window — a real mid-life outage is a different concern (a
+        // sustained gauge drop), not this warning's job.
+        w.tick();
+        assert!(!w.never_matched_warned.load(Ordering::Relaxed));
+    }
+
     // -- Hostile input: labels stay config-derived, memory stays bounded --
 
     /// In the spirit of `metric_event_type_bounds_the_label_to_the_known_set`:
@@ -947,5 +1232,86 @@ mod tests {
             counter_value(&snapshotter, "field_distinct_values_capped") > 0,
             "values past the cap must have been counted as capped"
         );
+    }
+
+    // -- Guard: every dispatch site in the four new listeners routes --
+    // -- through its per-source observe_and_dispatch helper --
+
+    /// `(relative src/ path, dispatch trait method, expected raw `.method(`
+    /// call sites outside tests, expected `observe_and_dispatch(`
+    /// occurrences outside tests)`.
+    ///
+    /// The raw-call count pins "every dispatch site routes through the
+    /// helper, not straight to the handler": the helper's own body is the
+    /// only place that may call the raw method. syslog's expected count is 2,
+    /// not 1 — `PayloadDispatchingHandler::handle_message` (excluded by
+    /// design; see its own doc comment) calls `self.inner.handle_message(...)`
+    /// to invoke the handler it wraps, unrelated to this listener's own
+    /// per-record dispatch sites.
+    ///
+    /// The `observe_and_dispatch(` count pins the exact dispatch-site
+    /// inventory the design spec counted by hand (1 suricata + 6 syslog + 5
+    /// ipfix + 5 sflow = 17): 1 for the helper's own `fn` line, plus one per
+    /// call site. A future dispatch site that bypasses the helper changes
+    /// the raw-call count; one that forgets to call the helper at all
+    /// changes neither count and so is NOT caught here — but as of this
+    /// writing every one of the 17 sites in the design spec's inventory maps
+    /// to a call visible in these counts. Same textual-scan idiom as
+    /// `metrics_descriptions::describes_every_metric_emitted_in_src`.
+    const DISPATCH_GUARDS: &[(&str, &str, usize, usize)] = &[
+        ("suricata/listener.rs", "handle_record", 1, 2),
+        ("syslog/listener.rs", "handle_message", 2, 7),
+        ("ipfix/listener.rs", "handle_flows", 1, 6),
+        ("sflow/listener.rs", "handle_samples", 1, 6),
+    ];
+
+    /// Source of `path` with the `#[cfg(test)] mod tests { ... }` block
+    /// dropped — test doubles (`CapturingHandler`, `DefaultXHandler` test
+    /// impls, direct `handle_tcp_connection(...)` calls, etc.) define and
+    /// call these same method/helper names and would otherwise swamp the
+    /// counts below.
+    fn production_code(path: &std::path::Path) -> String {
+        let src = std::fs::read_to_string(path).unwrap();
+        match src.find("#[cfg(test)]\nmod tests") {
+            Some(idx) => src[..idx].to_string(),
+            None => src,
+        }
+    }
+
+    #[test]
+    fn every_listener_dispatch_site_routes_through_its_observe_and_dispatch_helper() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for (rel_path, method, expected_raw_calls, expected_helper_occurrences) in DISPATCH_GUARDS {
+            let path = src_dir.join(rel_path);
+            let code = production_code(&path);
+
+            // Sanity-check the scraper itself before trusting its verdict —
+            // if the `#[cfg(test)]` strip above ever regresses to eating the
+            // whole file (or matching nothing on an empty read), a silently
+            // vacuous 0-vs-0 comparison must not pass.
+            assert!(
+                code.contains("async fn observe_and_dispatch"),
+                "{rel_path}: production-code scan did not find observe_and_dispatch at all — \
+                 the #[cfg(test)] strip probably ate the whole file (scanned {} bytes)",
+                code.len()
+            );
+
+            let raw_calls = code.matches(&format!(".{method}(")).count();
+            assert_eq!(
+                raw_calls, *expected_raw_calls,
+                "{rel_path}: expected {expected_raw_calls} raw `.{method}(` call site(s) \
+                 outside tests, found {raw_calls} — a dispatch site is bypassing \
+                 observe_and_dispatch"
+            );
+
+            let helper_occurrences = code.matches("observe_and_dispatch(").count();
+            assert_eq!(
+                helper_occurrences, *expected_helper_occurrences,
+                "{rel_path}: expected {expected_helper_occurrences} `observe_and_dispatch(` \
+                 occurrences (1 fn definition + every dispatch site), found \
+                 {helper_occurrences} — the dispatch-site inventory has drifted from the design \
+                 spec's count"
+            );
+        }
     }
 }

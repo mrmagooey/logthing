@@ -4,6 +4,7 @@
 use crate::middleware::IpWhitelist;
 use crate::sflow::SflowRecord;
 use crate::sflow::decoder::decode_datagram;
+use crate::stats::cardinality::CardinalityWatcher;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -67,11 +68,34 @@ impl SflowHandler for DefaultSflowHandler {
     }
 }
 
+/// Observe every sample in a decoded batch against the configured sflow
+/// cardinality watches, then dispatch the whole batch to the handler. Every
+/// dispatch site in this file — the `recv_tasks <= 1` inline arms,
+/// `run_with_socket`, and both arms of `sflow_recv_loop` (the `recv_tasks >
+/// 1` fan-out this listener defaults to) — routes through this one
+/// function, mirroring `zeek::listener`'s shared per-record dispatch point
+/// but as its own free function, looped over the batch since sFlow delivers
+/// samples in batches rather than one at a time.
+async fn observe_and_dispatch(
+    cardinality: &[Arc<CardinalityWatcher>],
+    samples: Vec<SflowRecord>,
+    src: SocketAddr,
+    handler: &Arc<dyn SflowHandler>,
+) {
+    for sample in &samples {
+        for watcher in cardinality {
+            watcher.observe(sample);
+        }
+    }
+    handler.handle_samples(samples, src).await;
+}
+
 /// sFlow UDP listener.
 pub struct SflowListener {
     config: SflowListenerConfig,
     handler: Arc<dyn SflowHandler>,
     allowed_ips: IpWhitelist,
+    cardinality: Vec<Arc<CardinalityWatcher>>,
 }
 
 impl SflowListener {
@@ -80,6 +104,7 @@ impl SflowListener {
             config,
             handler,
             allowed_ips: IpWhitelist::empty(),
+            cardinality: Vec::new(),
         }
     }
 
@@ -87,6 +112,16 @@ impl SflowListener {
     /// [`IpWhitelist::empty()`] (allow all) via `new()`.
     pub fn with_allowed_ips(mut self, allowed_ips: IpWhitelist) -> Self {
         self.allowed_ips = allowed_ips;
+        self
+    }
+
+    /// Attach the `[[metrics.cardinality_watch]]` watchers configured for
+    /// `source = "sflow"`. Defaults to empty via `new()` — `main.rs` builds
+    /// the full list from config (see `stats::cardinality::compile_watches`)
+    /// and partitions it by source once at startup, so this listener only
+    /// ever sees its own sflow watches.
+    pub fn with_cardinality_watchers(mut self, cardinality: Vec<Arc<CardinalityWatcher>>) -> Self {
+        self.cardinality = cardinality;
         self
     }
 
@@ -152,7 +187,7 @@ impl SflowListener {
                                             debug!("sFlow datagram from {} produced no samples", src);
                                         }
                                         Ok(samples) => {
-                                            self.handler.handle_samples(samples, src).await;
+                                            observe_and_dispatch(&self.cardinality, samples, src, &self.handler).await;
                                         }
                                         Err(e) => {
                                             metrics::counter!("sflow_decode_errors").increment(1);
@@ -204,7 +239,7 @@ impl SflowListener {
                                             debug!("sFlow datagram from {} produced no samples", src);
                                         }
                                         Ok(samples) => {
-                                            self.handler.handle_samples(samples, src).await;
+                                            observe_and_dispatch(&self.cardinality, samples, src, &self.handler).await;
                                         }
                                         Err(e) => {
                                             metrics::counter!("sflow_decode_errors").increment(1);
@@ -273,6 +308,7 @@ impl SflowListener {
             let handler = self.handler.clone();
             let allowed_ips = self.allowed_ips.clone();
             let shutdown_rx = shutdown_rx.clone();
+            let cardinality = self.cardinality.clone();
             // Only the first task takes the shared drop-stats tracker, so it
             // is polled exactly once per SO_REUSEPORT group.
             let stats = if i == 0 { socket_stats.take() } else { None };
@@ -283,6 +319,7 @@ impl SflowListener {
                 shutdown_rx,
                 stats,
                 self.config.recv_batch_size,
+                cardinality,
             )));
         }
 
@@ -330,7 +367,7 @@ impl SflowListener {
                                     debug!("sFlow datagram from {} produced no samples", src);
                                 }
                                 Ok(samples) => {
-                                    self.handler.handle_samples(samples, src).await;
+                                    observe_and_dispatch(&self.cardinality, samples, src, &self.handler).await;
                                 }
                                 Err(e) => {
                                     metrics::counter!("sflow_decode_errors").increment(1);
@@ -363,6 +400,7 @@ async fn sflow_recv_loop(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mut socket_stats: Option<crate::net::SocketDropStats>,
     recv_batch_size: usize,
+    cardinality: Vec<Arc<CardinalityWatcher>>,
 ) {
     let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
@@ -385,7 +423,7 @@ async fn sflow_recv_loop(
                                     debug!("sFlow datagram from {} produced no samples", src);
                                 }
                                 Ok(samples) => {
-                                    handler.handle_samples(samples, src).await;
+                                    observe_and_dispatch(&cardinality, samples, src, &handler).await;
                                 }
                                 Err(e) => {
                                     metrics::counter!("sflow_decode_errors").increment(1);
@@ -438,7 +476,7 @@ async fn sflow_recv_loop(
                                     debug!("sFlow datagram from {} produced no samples", src);
                                 }
                                 Ok(samples) => {
-                                    handler.handle_samples(samples, src).await;
+                                    observe_and_dispatch(&cardinality, samples, src, &handler).await;
                                 }
                                 Err(e) => {
                                     metrics::counter!("sflow_decode_errors").increment(1);
@@ -474,7 +512,9 @@ async fn sflow_recv_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sflow::decoder::tests::{FIXTURE_SFLOW_COUNTER, FIXTURE_SFLOW_FLOW_RAW_HEADER};
+    use crate::sflow::decoder::tests::{
+        FIXTURE_SFLOW_COUNTER, FIXTURE_SFLOW_FLOW_RAW_HEADER, FIXTURE_SFLOW_SAMPLED_IPV4,
+    };
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::net::UdpSocket;
@@ -1310,5 +1350,181 @@ mod tests {
                 .any(|m| m.contains("a receive task terminated abnormally")),
             "expected an error log containing 'a receive task terminated abnormally', got: {events:?}"
         );
+    }
+
+    // -- Cardinality watching: recv_tasks <= 1 (inline) AND recv_tasks > 1 --
+    // -- (SO_REUSEPORT fan-out, the default) must both observe samples --
+
+    /// Same shape as `start_test_listener`, but attaches the given
+    /// cardinality watchers and uses `DefaultSflowHandler` — these tests
+    /// only care about what the watcher observed, not what the handler did
+    /// with the batch.
+    async fn start_test_listener_with_cardinality(
+        recv_tasks: usize,
+        recv_batch_size: usize,
+        cardinality: Vec<Arc<CardinalityWatcher>>,
+    ) -> (
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = tmp.local_addr().unwrap().port();
+        drop(tmp);
+        let bound: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
+
+        let config = SflowListenerConfig {
+            udp_port,
+            bind_address: "127.0.0.1".to_string(),
+            recv_tasks,
+            recv_batch_size,
+            ..SflowListenerConfig::default()
+        };
+        let listener = SflowListener::new(config, Arc::new(DefaultSflowHandler))
+            .with_cardinality_watchers(cardinality);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { listener.start_with_shutdown(shutdown_rx).await });
+        sleep(Duration::from_millis(50)).await;
+
+        (task, bound, shutdown_tx)
+    }
+
+    /// Copy of `FIXTURE_SFLOW_SAMPLED_IPV4` with its datagram-header
+    /// `agent_addr` (IPv4, offset 8..12 — see `decode_datagram`'s header
+    /// layout comment) overwritten. `SflowRecord::exporter` comes from this
+    /// embedded agent address, NOT from the sending socket's address
+    /// (`decode_datagram`'s `_exporter` parameter is unused) — so distinct
+    /// `exporter` values for this test come from patching this field, the
+    /// same byte-patch idiom `decoder.rs`'s own tests use (e.g.
+    /// `unknown_flow_record_format_goes_to_extra`).
+    fn sflow_datagram_with_agent(agent: [u8; 4]) -> Vec<u8> {
+        let mut buf = FIXTURE_SFLOW_SAMPLED_IPV4.to_vec();
+        buf[8..12].copy_from_slice(&agent);
+        buf
+    }
+
+    /// Reads the `field_distinct_values{source="sflow",stream="flow",
+    /// field="exporter"}` gauge from a `DebuggingRecorder` snapshot.
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    fn read_exporter_gauge(snapshotter: &metrics_util::debugging::Snapshotter) -> f64 {
+        use metrics_util::debugging::DebugValue;
+        use metrics_util::{CompositeKey, MetricKind};
+        let map = snapshotter.snapshot().into_hashmap();
+        let key = CompositeKey::new(
+            MetricKind::Gauge,
+            metrics::Key::from_parts(
+                "field_distinct_values",
+                vec![
+                    metrics::Label::new("source", "sflow"),
+                    metrics::Label::new("stream", "flow"),
+                    metrics::Label::new("field", "exporter"),
+                ],
+            ),
+        );
+        map.get(&key)
+            .map(|(_, _, v)| match v {
+                DebugValue::Gauge(g) => g.into_inner(),
+                _ => 0.0,
+            })
+            .unwrap_or(0.0)
+    }
+
+    /// `recv_tasks <= 1`: drives the inline UDP arm of `start_with_shutdown`
+    /// directly. Round-1 defect context: wiring only this branch would still
+    /// pass this test while leaving the default-config fan-out path (see the
+    /// next test) completely unwired.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn cardinality_watcher_reports_distinct_values_at_recv_tasks_one() {
+        use crate::stats::cardinality::CompiledWatch;
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let watcher = Arc::new(CardinalityWatcher::new(
+            CompiledWatch {
+                source: "sflow".to_string(),
+                stream: "flow".to_string(),
+                field: "exporter".to_string(),
+            },
+            1000,
+        ));
+
+        let (listener, bound, shutdown_tx) =
+            start_test_listener_with_cardinality(1, 1, vec![watcher.clone()]).await;
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // 3 sends, 2 distinct agent (exporter) addresses (10.0.0.1 repeated).
+        for agent in [[10, 0, 0, 1], [10, 0, 0, 2], [10, 0, 0, 1]] {
+            sock.send_to(&sflow_datagram_with_agent(agent), bound)
+                .await
+                .unwrap();
+        }
+        sleep(Duration::from_millis(200)).await;
+
+        watcher.tick();
+        assert_eq!(
+            read_exporter_gauge(&snapshotter),
+            2.0,
+            "2 distinct exporter addresses must be observed through the recv_tasks <= 1 inline \
+             UDP arm"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), listener).await;
+    }
+
+    /// `recv_tasks > 1` (4, forcing the `SO_REUSEPORT` fan-out —
+    /// `sflow_recv_loop`, spawned once per socket): the branch that ships at
+    /// the real default (8) and that the round-1 defect left unwired. Sends
+    /// come from the same client socket so the kernel routes every datagram
+    /// to the same group member, keeping this deterministic — the watcher is
+    /// one `Arc` shared by every task regardless of which one observes a
+    /// given sample.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn cardinality_watcher_reports_distinct_values_at_recv_tasks_fan_out() {
+        use crate::stats::cardinality::CompiledWatch;
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let watcher = Arc::new(CardinalityWatcher::new(
+            CompiledWatch {
+                source: "sflow".to_string(),
+                stream: "flow".to_string(),
+                field: "exporter".to_string(),
+            },
+            1000,
+        ));
+
+        let (listener, bound, shutdown_tx) =
+            start_test_listener_with_cardinality(4, 1, vec![watcher.clone()]).await;
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for agent in [[10, 0, 0, 1], [10, 0, 0, 2], [10, 0, 0, 1]] {
+            sock.send_to(&sflow_datagram_with_agent(agent), bound)
+                .await
+                .unwrap();
+        }
+        sleep(Duration::from_millis(300)).await;
+
+        watcher.tick();
+        assert_eq!(
+            read_exporter_gauge(&snapshotter),
+            2.0,
+            "2 distinct exporter addresses must be observed through the recv_tasks > 1 \
+             SO_REUSEPORT fan-out path"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), listener).await;
     }
 }

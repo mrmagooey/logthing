@@ -1,6 +1,7 @@
 //! Suricata TCP EVE JSON listener.
 
 use crate::middleware::IpWhitelist;
+use crate::stats::cardinality::CardinalityWatcher;
 use crate::suricata::SuricataRecord;
 use chrono::Utc;
 use std::net::SocketAddr;
@@ -165,11 +166,30 @@ impl SuricataHandler for DefaultSuricataHandler {
     }
 }
 
+/// Observe a decoded record against every configured suricata cardinality
+/// watch, then dispatch it to the handler. The single point every dispatch
+/// site in this file must route through — mirrors `zeek::listener`'s shared
+/// per-record dispatch point, factored into its own free function (rather
+/// than inlined at the one call site, as zeek does) so a future second call
+/// site cannot silently skip the observe step.
+async fn observe_and_dispatch(
+    cardinality: &[Arc<CardinalityWatcher>],
+    record: SuricataRecord,
+    src: SocketAddr,
+    handler: &Arc<dyn SuricataHandler>,
+) {
+    for watcher in cardinality {
+        watcher.observe(&record);
+    }
+    handler.handle_record(record, src).await;
+}
+
 /// Suricata TCP EVE JSON listener.
 pub struct SuricataListener {
     config: SuricataListenerConfig,
     handler: Arc<dyn SuricataHandler>,
     allowed_ips: IpWhitelist,
+    cardinality: Vec<Arc<CardinalityWatcher>>,
 }
 
 impl SuricataListener {
@@ -178,6 +198,7 @@ impl SuricataListener {
             config,
             handler,
             allowed_ips: IpWhitelist::empty(),
+            cardinality: Vec::new(),
         }
     }
 
@@ -185,6 +206,17 @@ impl SuricataListener {
     /// [`IpWhitelist::empty()`] (allow all) via `new()`.
     pub fn with_allowed_ips(mut self, allowed_ips: IpWhitelist) -> Self {
         self.allowed_ips = allowed_ips;
+        self
+    }
+
+    /// Attach the `[[metrics.cardinality_watch]]` watchers configured for
+    /// `source = "suricata"`. Defaults to empty via `new()` — `main.rs`
+    /// builds the full list from config (see
+    /// `stats::cardinality::compile_watches`) and partitions it by source
+    /// once at startup, so this listener only ever sees its own suricata
+    /// watches.
+    pub fn with_cardinality_watchers(mut self, cardinality: Vec<Arc<CardinalityWatcher>>) -> Self {
+        self.cardinality = cardinality;
         self
     }
 
@@ -229,9 +261,10 @@ impl SuricataListener {
                                     let handler = self.handler.clone();
                                     let idle_timeout = TCP_IDLE_TIMEOUT;
                                     let byte_budget = byte_budget.clone();
+                                    let cardinality = self.cardinality.clone();
                                     tokio::spawn(async move {
                                         let _permit = permit; // held for connection lifetime
-                                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler, idle_timeout, byte_budget).await {
+                                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler, idle_timeout, byte_budget, cardinality).await {
                                             error!("Suricata TCP connection error from {}: {}", src, e);
                                         }
                                     });
@@ -288,6 +321,7 @@ impl SuricataListener {
                             let handler = self.handler.clone();
                             let idle_timeout = TCP_IDLE_TIMEOUT;
                             let byte_budget = byte_budget.clone();
+                            let cardinality = self.cardinality.clone();
                             tokio::spawn(async move {
                                 let _permit = permit; // held for connection lifetime
                                 if let Err(e) = Self::handle_tcp_connection(
@@ -296,6 +330,7 @@ impl SuricataListener {
                                     handler,
                                     idle_timeout,
                                     byte_budget,
+                                    cardinality,
                                 )
                                 .await
                                 {
@@ -333,6 +368,7 @@ impl SuricataListener {
         handler: Arc<dyn SuricataHandler>,
         idle_timeout: Duration,
         byte_budget: Arc<Semaphore>,
+        cardinality: Vec<Arc<CardinalityWatcher>>,
     ) -> anyhow::Result<()> {
         let mut reader = BufReader::new(stream);
         let mut buf: Vec<u8> = Vec::new();
@@ -486,7 +522,7 @@ impl SuricataListener {
                 "event_type" => crate::suricata::schema::metric_event_type(&parsed.record.event_type)
             )
             .increment(1);
-            handler.handle_record(parsed.record, src).await;
+            observe_and_dispatch(&cardinality, parsed.record, src, &handler).await;
         }
         Ok(())
     }
@@ -926,6 +962,7 @@ mod tests {
             CapturingHandler::new(),
             TCP_IDLE_TIMEOUT,
             full_byte_budget(),
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -998,6 +1035,7 @@ mod tests {
             handler.clone(),
             TCP_IDLE_TIMEOUT,
             full_byte_budget(),
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -1114,6 +1152,7 @@ mod tests {
             CapturingHandler::new(),
             Duration::from_millis(100),
             full_byte_budget(),
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -1244,6 +1283,7 @@ mod tests {
             handler,
             Duration::from_secs(5),
             full_byte_budget(),
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -1327,6 +1367,7 @@ mod tests {
                     handler,
                     TCP_IDLE_TIMEOUT,
                     budget,
+                    Vec::new(),
                 )
                 .await
             }));
@@ -1494,6 +1535,105 @@ mod tests {
         assert!(
             line.contains('\u{fffd}'),
             "expected U+FFFD replacement characters in the log line: {line:?}"
+        );
+    }
+
+    // -- Cardinality watching: observed at the same point as the received counters --
+
+    /// Drives real EVE JSON records (distinct `src_ip` values on the `dns`
+    /// stream) through `handle_tcp_connection` with a `CardinalityWatcher`
+    /// attached, then forces a window boundary and asserts the gauge.
+    /// Template: `zeek::listener`'s
+    /// `cardinality_watcher_reports_distinct_values_after_a_window_boundary`.
+    /// Suricata has no `recv_tasks` fan-out (it's a TCP listener, not a UDP
+    /// one), so `handle_tcp_connection` is this file's only dispatch site —
+    /// one test covers it completely.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn cardinality_watcher_reports_distinct_values_after_a_window_boundary() {
+        use crate::stats::cardinality::{CardinalityWatcher, CompiledWatch};
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let watcher = Arc::new(CardinalityWatcher::new(
+            CompiledWatch {
+                source: "suricata".to_string(),
+                stream: "dns".to_string(),
+                field: "src_ip".to_string(),
+            },
+            1000,
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // 3 dns records, 2 distinct src_ip (10.0.0.1 repeated) — plus one
+            // alert record, which must be excluded by the stream filter.
+            stream
+                .write_all(
+                    b"{\"event_type\":\"dns\",\"src_ip\":\"10.0.0.1\"}\n\
+                      {\"event_type\":\"dns\",\"src_ip\":\"10.0.0.2\"}\n\
+                      {\"event_type\":\"dns\",\"src_ip\":\"10.0.0.1\"}\n\
+                      {\"event_type\":\"alert\",\"src_ip\":\"10.0.0.9\"}\n",
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let (stream, src) = listener.accept().await.unwrap();
+        SuricataListener::handle_tcp_connection(
+            stream,
+            src,
+            CapturingHandler::new(),
+            TCP_IDLE_TIMEOUT,
+            full_byte_budget(),
+            vec![watcher.clone()],
+        )
+        .await
+        .unwrap();
+        client.await.unwrap();
+
+        let gauge_key = CompositeKey::new(
+            MetricKind::Gauge,
+            metrics::Key::from_parts(
+                "field_distinct_values",
+                vec![
+                    metrics::Label::new("source", "suricata"),
+                    metrics::Label::new("stream", "dns"),
+                    metrics::Label::new("field", "src_ip"),
+                ],
+            ),
+        );
+        let read = |map: &std::collections::HashMap<_, _>| -> f64 {
+            map.get(&gauge_key)
+                .map(|(_, _, v)| match v {
+                    DebugValue::Gauge(g) => g.into_inner(),
+                    _ => 0.0,
+                })
+                .unwrap_or(0.0)
+        };
+
+        assert_eq!(
+            read(&snapshotter.snapshot().into_hashmap()),
+            0.0,
+            "the gauge must not reflect observations before a window boundary"
+        );
+
+        watcher.tick();
+
+        assert_eq!(
+            read(&snapshotter.snapshot().into_hashmap()),
+            2.0,
+            "2 distinct src_ip values from dns records; the alert record's src_ip must have \
+             been excluded by the stream filter"
         );
     }
 }

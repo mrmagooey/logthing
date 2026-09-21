@@ -202,7 +202,8 @@ pub struct MetricsConfig {
     /// hot-path work.
     ///
     /// This is a list, not a single field/stream pair, and each entry names
-    /// its `source` ("zeek" or "wef") — an earlier version of this knob was
+    /// its `source` (one of "zeek", "wef", "suricata", "syslog", "ipfix",
+    /// "sflow") — an earlier version of this knob was
     /// a single flat field/stream pair with no `source` key, cut back
     /// deliberately when zeek was the only source with an `AggFields` impl
     /// wired to the watcher and every non-"zeek" source was rejected at
@@ -270,13 +271,17 @@ pub struct MetricsConfig {
 /// duplicate `(source, stream, field)` triples).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CardinalityWatch {
-    /// One of: "zeek", "wef".
+    /// One of: "zeek", "wef", "suricata", "syslog", "ipfix", "sflow".
     pub source: String,
     /// Stream the field is counted on: zeek `_path` (e.g. `"conn"`), WEF
-    /// `Channel` (e.g. `"Security"`). Watching a field across every stream
-    /// at once is not supported — a single unqualified counter would
-    /// conflate e.g. zeek's `conn` and `dns` streams' `id.orig_h` into one
-    /// number with no way to tell which stream contributed it.
+    /// `Channel` (e.g. `"Security"`), suricata's EVE `event_type`, syslog's
+    /// `app_name` (empty for RFC 3164 traffic with no `app_name` — which an
+    /// empty `stream` here can therefore never match, since an empty
+    /// `stream` is itself rejected at startup), ipfix's mandatory constant
+    /// `"flows"`, or sflow's `"flow"`/`"counter"`. Watching a field across
+    /// every stream at once is not supported — a single unqualified counter
+    /// would conflate e.g. zeek's `conn` and `dns` streams' `id.orig_h` into
+    /// one number with no way to tell which stream contributed it.
     pub stream: String,
     pub field: String,
 }

@@ -36,8 +36,9 @@ port = 9090      # env: LOGTHING__METRICS__PORT
 # disables the feature entirely. `source`/`stream`/`field` are all required
 # on every entry — a field with no stream is rejected at startup (watching a
 # field across every stream at once is not supported), and so is an unknown
-# `source` (currently "zeek" or "wef"). Multiple entries are fine, including
-# more than one per source — remove the entries below (or the whole
+# OR disabled `source`. Valid `source` values: "zeek", "wef", "suricata",
+# "syslog", "ipfix", "sflow". Multiple entries are fine, including more than
+# one per source — remove the entries below (or the whole
 # [[metrics.cardinality_watch]] blocks) to disable.
 #
 # zeek example: requires zeek to be enabled (it is disabled by default
@@ -58,6 +59,26 @@ port = 9090      # env: LOGTHING__METRICS__PORT
 # source = "wef"
 # stream = "Security"  # WEF Channel it's counted on
 # field  = "computer"
+#
+# syslog example: `stream` is the message's `app_name` (e.g. the program tag
+# in "sshd: Failed password..."), not a fixed enum — RFC 3164 traffic with no
+# app_name reports an empty stream, and an empty `stream` is rejected at
+# startup, so that traffic can never be watched this way. `hostname` is a
+# better host-identity field than an IP for the same DHCP/NAT reasons as
+# zeek's id.orig_h.
+# [[metrics.cardinality_watch]]
+# source = "syslog"
+# stream = "sshd"       # the app_name this watch counts on
+# field  = "hostname"
+#
+# ipfix example: `stream` is the mandatory constant "flows" — IPFIX has no
+# other stream concept, so this dimension carries no information and any
+# other value is rejected at startup. `exporter` (the device that sent the
+# flow) is the natural host-identity field here.
+# [[metrics.cardinality_watch]]
+# source = "ipfix"
+# stream = "flows"
+# field  = "exporter"
 #
 # Window the gauge is published and cleared on (default 3600s = 1 hour, not
 # shorter: conn.log entries are emitted per-connection-CLOSE, not as a
