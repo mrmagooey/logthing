@@ -219,7 +219,42 @@ async fn admin_page(
         .log("ADMIN_PAGE_ACCESS", &username, &client_ip, None)
         .await;
 
-    Ok(Html(include_str!("templates/admin.html").to_string()))
+    let redacted = redacted_config(&*state.config.read().await);
+    let config_toml = toml::to_string_pretty(&redacted)
+        .unwrap_or_else(|e| format!("could not render configuration: {e}"));
+    let env_names = set_env_var_names();
+    let env_block = if env_names.is_empty() {
+        "(none set — every value comes from logthing.toml or a built-in default)".to_string()
+    } else {
+        env_names.join("\n")
+    };
+
+    // Config values are operator-supplied and can contain markup.
+    let html = include_str!("templates/admin.html")
+        .replace("{{CONFIG_TOML}}", &quick_xml::escape::escape(&config_toml))
+        .replace("{{ENV_VAR_NAMES}}", &quick_xml::escape::escape(&env_block));
+    Ok(Html(html))
+}
+
+/// Names — never values — of the `LOGTHING__*` variables set in this
+/// process, sorted.
+///
+/// Values are withheld because `LOGTHING__HEC__TOKEN` and the S3
+/// credentials would otherwise be rendered straight into the page.
+///
+/// This is an approximation of provenance, not provenance itself: the
+/// `config` crate exposes no per-field source attribution, so a typo'd
+/// name like `LOGTHING__SYSLOG__UDP_PRT` still appears here looking
+/// legitimate. What disambiguates it is the resolved config shown
+/// alongside — the variable is listed, but the field it was meant to set
+/// still shows its old value.
+fn set_env_var_names() -> Vec<String> {
+    let mut names: Vec<String> = std::env::vars()
+        .map(|(name, _)| name)
+        .filter(|name| name.starts_with("LOGTHING__"))
+        .collect();
+    names.sort();
+    names
 }
 
 /// Get audit log endpoint
@@ -1086,6 +1121,61 @@ mod tests {
         assert!(
             entries.iter().any(|e| e.username == payload),
             "the audit API must store and serve the raw username unescaped"
+        );
+    }
+
+    #[test]
+    fn set_env_var_names_lists_names_and_never_values() {
+        // SAFETY: single-threaded test, variable removed before returning.
+        unsafe { std::env::set_var("LOGTHING__HEC__TOKEN", "super-secret-value") };
+
+        let names = set_env_var_names();
+
+        unsafe { std::env::remove_var("LOGTHING__HEC__TOKEN") };
+
+        assert!(
+            names.iter().any(|n| n == "LOGTHING__HEC__TOKEN"),
+            "the variable name must be listed: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("super-secret-value")),
+            "a value must never appear: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_page_renders_config_read_only() {
+        let state = test_state().await;
+        let mut request = create_request_with_auth(Method::GET, "/", "admin", "admin", None);
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(admin_page))
+            .with_state(state);
+
+        let res = app.oneshot(request).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body = String::from_utf8(
+            axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+
+        assert!(!body.contains("<form"), "the config form must be gone");
+        assert!(
+            !body.contains("wef-server.admin.toml"),
+            "stale subtitle must be gone"
+        );
+        assert!(
+            body.contains("security.allowed_ips") && body.contains("aggregate.rules"),
+            "the page must name the two file-only settings that have no env equivalent"
+        );
+        assert!(
+            body.contains("bind_address"),
+            "the effective config must be rendered"
         );
     }
 }
