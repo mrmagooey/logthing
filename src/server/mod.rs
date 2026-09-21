@@ -4504,6 +4504,12 @@ async fn start_metrics_server(addr: SocketAddr, ip_whitelist: IpWhitelist) {
 
     metrics::set_global_recorder(recorder).expect("Failed to install Prometheus recorder");
 
+    // After the recorder is installed, never before: `describe_*!` writes to
+    // whichever recorder is currently installed, so descriptions registered
+    // ahead of this line would go nowhere and every series would render
+    // without its `# HELP`.
+    crate::metrics_descriptions::describe_all();
+
     // Gated by the same `security.allowed_ips` whitelist as the main router:
     // inheriting `bind_address` does nothing when `bind_address` is itself
     // `0.0.0.0` (a common production setting), so the whitelist is the

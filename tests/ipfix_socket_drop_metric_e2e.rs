@@ -144,6 +144,23 @@ async fn ipfix_socket_drop_metrics_visible_on_real_metrics_endpoint() {
          /metrics endpoint within the deadline. Full scrape body:\n{body}"
     );
 
+    // Both series must carry `# HELP`, not just the `# TYPE` line the
+    // exporter writes unconditionally. These two names are built with
+    // `format!` per protocol in `metrics_descriptions::describe_all`, so they
+    // are the ones that break if the describe call stops running after
+    // `set_global_recorder` or drops a protocol from SOCKET_POLL_PROTOCOLS.
+    assert!(
+        body.contains("# HELP ipfix_socket_drops"),
+        "regression: ipfix_socket_drops rendered without a # HELP line — \
+         metrics_descriptions::describe_all did not reach the installed \
+         recorder. Full scrape body:\n{body}"
+    );
+    assert!(
+        body.contains("# HELP ipfix_socket_rx_queue_bytes"),
+        "regression: ipfix_socket_rx_queue_bytes rendered without a # HELP \
+         line. Full scrape body:\n{body}"
+    );
+
     // Neither metric must be mislabelled as another protocol's.
     assert!(
         !body.contains("sflow_socket_drops") && !body.contains("syslog_udp_socket_drops"),

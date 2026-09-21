@@ -10,6 +10,7 @@ pub mod config;
 pub mod forwarding;
 pub mod ingest;
 pub mod ipfix;
+pub mod metrics_descriptions;
 pub mod middleware;
 pub mod models;
 pub mod net;

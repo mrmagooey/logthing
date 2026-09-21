@@ -237,6 +237,16 @@ async fn zeek_records_received_visible_on_real_metrics_endpoint_with_forwarding_
          installed. Full scrape body:\n{body}"
     );
 
+    // The exposition must carry the `# HELP` text registered by
+    // `metrics_descriptions::describe_all` (DESCRIPTIONS table path), not
+    // just the `# TYPE` line the exporter writes for every recorded series.
+    assert!(
+        body.contains("# HELP zeek_records_received"),
+        "regression: zeek_records_received rendered without a # HELP line — \
+         metrics_descriptions::describe_all did not reach the installed \
+         recorder. Full scrape body:\n{body}"
+    );
+
     let received = find_metric_value(&body, "zeek_records_received ").unwrap_or_else(|| {
         panic!(
             "regression: could not parse zeek_records_received value from /metrics body:\n{body}"
