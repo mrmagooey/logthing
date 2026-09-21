@@ -32,9 +32,10 @@ pub type ActivityProbe = Box<dyn Fn() -> Option<u64> + Send + Sync>;
 /// Profiling configuration, parsed from environment variables.
 ///
 /// Environment variables are used rather than the config file deliberately:
-/// `logthing.admin.toml` is git-tracked and loaded at higher precedence than
-/// `logthing.toml`, which has previously overridden settings during a
-/// benchmark run without anyone noticing.
+/// a now-removed admin override file (`logthing.admin.toml`) used to be
+/// git-tracked and loaded at higher precedence than `logthing.toml`, which
+/// previously overrode settings during a benchmark run without anyone
+/// noticing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileConfig {
     /// How long to sample for, in seconds. Never zero.
