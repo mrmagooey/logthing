@@ -204,7 +204,6 @@ pub struct AdminServerConfig {
     pub password_hash: PasswordHash,
     pub allowed_ips: Vec<IpNet>,
     pub tls_config: Option<AdminTlsConfig>,
-    pub enable_csrf: bool,
     pub enable_rate_limiting: bool,
     /// `None` disables trusted reverse-proxy-header auth entirely (default).
     pub trusted_header: Option<TrustedHeaderConfig>,
@@ -303,21 +302,8 @@ pub struct AdminState {
     pub config: Arc<RwLock<Config>>,
     pub server_config: AdminServerConfig,
     pub audit_logger: AuditLogger,
-    pub csrf_tokens: Arc<RwLock<Vec<(String, Instant)>>>,
     pub request_counts: Arc<RwLock<std::collections::HashMap<String, (Instant, u32)>>>,
     pub source_stats: Arc<crate::stats::SourceHourlyStats>,
-    /// Registry of every running writer's live flush interval, so a full
-    /// config replace via the admin API (`PUT /config`, `/config/reload`,
-    /// `/config/import`) can push updated `flush_interval_secs` values into
-    /// already-running writer tasks without a process restart.
-    pub flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry,
-    /// The SAME `IpWhitelist` instance shared by the main HTTP router, the
-    /// metrics server, and all five wire-protocol listeners (constructed
-    /// once in `main.rs`). A full config replace via the admin API pushes
-    /// updated `security.allowed_ips` into it via `IpWhitelist::set_networks`,
-    /// so the change reaches every consumer on their next request/datagram
-    /// without a process restart. See `crate::middleware::IpWhitelist`.
-    pub ip_whitelist: crate::middleware::IpWhitelist,
 }
 
 /// Rate limit error response
@@ -497,7 +483,6 @@ fn parse_admin_allowed_ips(allowed_ips_str: Option<&str>) -> anyhow::Result<Vec<
 /// * `allowed_ips_str`     – raw `LOGTHING_ADMIN_ALLOWED_IPS` value, or `None`.
 /// * `tls_cert`            – `LOGTHING_ADMIN_TLS_CERT`, or `None`.
 /// * `tls_key`             – `LOGTHING_ADMIN_TLS_KEY`, or `None`.
-/// * `enable_csrf`         – `LOGTHING_ADMIN_ENABLE_CSRF` parsed value (default `true`).
 /// * `enable_rate_limiting`– `LOGTHING_ADMIN_ENABLE_RATE_LIMIT` parsed value (default `true`).
 #[allow(clippy::too_many_arguments)]
 pub fn build_admin_config_from_parts(
@@ -508,7 +493,6 @@ pub fn build_admin_config_from_parts(
     allowed_ips_str: Option<&str>,
     tls_cert: Option<&str>,
     tls_key: Option<&str>,
-    enable_csrf: bool,
     enable_rate_limiting: bool,
     trusted_header_env: TrustedHeaderEnvArgs,
 ) -> anyhow::Result<AdminServerConfig> {
@@ -587,7 +571,6 @@ pub fn build_admin_config_from_parts(
         password_hash,
         allowed_ips,
         tls_config,
-        enable_csrf,
         enable_rate_limiting,
         trusted_header,
     })
@@ -602,9 +585,6 @@ pub fn load_admin_config() -> anyhow::Result<AdminServerConfig> {
     let allowed_ips_str = std::env::var("LOGTHING_ADMIN_ALLOWED_IPS").ok();
     let tls_cert = std::env::var("LOGTHING_ADMIN_TLS_CERT").ok();
     let tls_key = std::env::var("LOGTHING_ADMIN_TLS_KEY").ok();
-    let enable_csrf = std::env::var("LOGTHING_ADMIN_ENABLE_CSRF")
-        .map(|s| s == "true" || s == "1")
-        .unwrap_or(true);
     let enable_rate_limiting = std::env::var("LOGTHING_ADMIN_ENABLE_RATE_LIMIT")
         .map(|s| s == "true" || s == "1")
         .unwrap_or(true);
@@ -625,7 +605,6 @@ pub fn load_admin_config() -> anyhow::Result<AdminServerConfig> {
         allowed_ips_str.as_deref(),
         tls_cert.as_deref(),
         tls_key.as_deref(),
-        enable_csrf,
         enable_rate_limiting,
         TrustedHeaderEnvArgs {
             trust_proxy_headers,
@@ -758,7 +737,6 @@ mod tests {
             None,    // allowed_ips_str
             None,    // tls_cert
             None,    // tls_key
-            true,    // enable_csrf
             true,    // enable_rate_limiting
             TrustedHeaderEnvArgs::default(),
         )
@@ -784,7 +762,6 @@ mod tests {
             None,
             None,
             true,
-            true,
             TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
@@ -802,7 +779,6 @@ mod tests {
             None,
             None,
             None,
-            true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -824,7 +800,6 @@ mod tests {
             None,
             None,
             None,
-            true,
             true,
             TrustedHeaderEnvArgs::default(),
         );
@@ -850,7 +825,6 @@ mod tests {
             None,
             None,
             true,
-            true,
             TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
@@ -870,7 +844,6 @@ mod tests {
             None,
             None,
             true,
-            true,
             TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
@@ -889,7 +862,6 @@ mod tests {
             None,
             None,
             true,
-            true,
             TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
@@ -907,7 +879,6 @@ mod tests {
             Some("10.0.0.0/8, 192.168.1.0/24, 203.0.113.5/32"),
             None,
             None,
-            true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -936,7 +907,6 @@ mod tests {
             None,
             None,
             true,
-            true,
             TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
@@ -954,7 +924,6 @@ mod tests {
             Some("10.0.0.0/8, not-a-valid-cidr, 192.168.0.0/16"),
             None,
             None,
-            true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -1022,7 +991,6 @@ mod tests {
             None,
             None,
             true,
-            true,
             TrustedHeaderEnvArgs::default(),
         );
         assert!(
@@ -1042,7 +1010,6 @@ mod tests {
             None,
             Some("/etc/ssl/cert.pem"),
             Some("/etc/ssl/key.pem"),
-            true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -1064,7 +1031,6 @@ mod tests {
             Some("/etc/ssl/cert.pem"),
             None, // no key
             true,
-            true,
             TrustedHeaderEnvArgs::default(),
         )
         .unwrap();
@@ -1081,42 +1047,6 @@ mod tests {
     }
 
     #[test]
-    fn build_config_csrf_disabled() {
-        let cfg = build_admin_config_from_parts(
-            None,
-            "admin",
-            "admin",
-            None,
-            None,
-            None,
-            None,
-            false, // enable_csrf = false
-            true,
-            TrustedHeaderEnvArgs::default(),
-        )
-        .unwrap();
-        assert!(!cfg.enable_csrf);
-    }
-
-    #[test]
-    fn build_config_csrf_enabled() {
-        let cfg = build_admin_config_from_parts(
-            None,
-            "admin",
-            "admin",
-            None,
-            None,
-            None,
-            None,
-            true, // enable_csrf = true
-            true,
-            TrustedHeaderEnvArgs::default(),
-        )
-        .unwrap();
-        assert!(cfg.enable_csrf);
-    }
-
-    #[test]
     fn build_config_rate_limiting_disabled() {
         let cfg = build_admin_config_from_parts(
             None,
@@ -1126,7 +1056,6 @@ mod tests {
             None,
             None,
             None,
-            true,
             false, // enable_rate_limiting = false
             TrustedHeaderEnvArgs::default(),
         )
@@ -1144,7 +1073,6 @@ mod tests {
             None,
             None,
             None,
-            true,
             true,
             TrustedHeaderEnvArgs::default(),
         )
@@ -1170,7 +1098,6 @@ mod tests {
             None,
             None,
             None,
-            true,
             true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
@@ -1200,7 +1127,6 @@ mod tests {
             None,
             None,
             true,
-            true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 secret: Some("shhhshhhshhhshhh"),
@@ -1226,7 +1152,6 @@ mod tests {
             None,
             None,
             None,
-            true,
             true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
@@ -1255,7 +1180,6 @@ mod tests {
             None,
             None,
             true,
-            true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 username_header: Some("X-Custom-User"),
@@ -1283,7 +1207,6 @@ mod tests {
             None,
             None,
             true,
-            true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 username_header: Some("not a valid header name!!"),
@@ -1308,7 +1231,6 @@ mod tests {
             None,
             None,
             None,
-            true,
             true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
@@ -1340,7 +1262,6 @@ mod tests {
             None,
             None,
             true,
-            true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
                 secret: Some("0123456789abcdef"), // exactly 16 chars
@@ -1363,7 +1284,6 @@ mod tests {
             None,
             None,
             None,
-            true,
             true,
             TrustedHeaderEnvArgs {
                 trust_proxy_headers: true,
@@ -1441,7 +1361,6 @@ mod tests {
             assert!(cfg.password_hash.verify("admin"));
             assert!(cfg.tls_config.is_none());
             assert!(cfg.allowed_ips.is_empty());
-            assert!(cfg.enable_csrf);
             assert!(cfg.enable_rate_limiting);
         }
 
@@ -1553,28 +1472,12 @@ mod tests {
             assert_eq!(tls.key_file, PathBuf::from("/etc/ssl/key.pem"));
         }
 
-        // ── Scenario 12: LOGTHING_ADMIN_ENABLE_CSRF=false ─────────────────────────────
-        {
-            let cfg = with_env("LOGTHING_ADMIN_ENABLE_CSRF", "false", || {
-                load_admin_config().expect("CSRF disabled should succeed")
-            });
-            assert!(!cfg.enable_csrf);
-        }
-
-        // ── Scenario 13: LOGTHING_ADMIN_ENABLE_RATE_LIMIT=0 ───────────────────────────
+        // ── Scenario 11: LOGTHING_ADMIN_ENABLE_RATE_LIMIT=0 ───────────────────────────
         {
             let cfg = with_env("LOGTHING_ADMIN_ENABLE_RATE_LIMIT", "0", || {
                 load_admin_config().expect("rate limit disabled should succeed")
             });
             assert!(!cfg.enable_rate_limiting);
-        }
-
-        // ── Scenario 14: LOGTHING_ADMIN_ENABLE_CSRF=1 ─────────────────────────────────
-        {
-            let cfg = with_env("LOGTHING_ADMIN_ENABLE_CSRF", "1", || {
-                load_admin_config().expect("CSRF with '1' should succeed")
-            });
-            assert!(cfg.enable_csrf);
         }
     }
 }

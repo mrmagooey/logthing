@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Extension, State},
-    response::{Html, IntoResponse, Response},
+    response::{Html, Response},
 };
 use axum_extra::extract::TypedHeader;
 use headers::{Authorization, authorization::Basic};
@@ -9,11 +9,8 @@ use std::sync::Arc;
 use tokio::{net::TcpListener, sync::RwLock};
 use tracing::{error, info};
 
-use crate::admin::auth::{ensure_authorized, generate_csrf_token};
-use crate::admin::config_api::{
-    PartialConfigUpdate, apply_flush_intervals, apply_live_security_settings,
-    merge_redacted_secrets, persist_config, redacted_config, validate_config_invariants,
-};
+use crate::admin::auth::ensure_authorized;
+use crate::admin::config_api::redacted_config;
 use crate::admin::middleware::security_middleware;
 use crate::admin::state::{
     AdminServerConfig, AdminState, AuditLogger, ResolvedClientIp, TrustedIdentity,
@@ -25,21 +22,11 @@ use crate::config::Config;
 pub fn spawn_admin_server(
     config: Arc<RwLock<Config>>,
     source_stats: Arc<crate::stats::SourceHourlyStats>,
-    flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry,
-    ip_whitelist: crate::middleware::IpWhitelist,
 ) {
     tokio::spawn(async move {
         match load_admin_config() {
             Ok(server_config) => {
-                if let Err(err) = run_admin_server(
-                    config,
-                    server_config,
-                    source_stats,
-                    flush_registry,
-                    ip_whitelist,
-                )
-                .await
-                {
+                if let Err(err) = run_admin_server(config, server_config, source_stats).await {
                     error!("Admin server error: {}", err);
                 }
             }
@@ -55,12 +42,8 @@ async fn run_admin_server(
     config: Arc<RwLock<Config>>,
     server_config: AdminServerConfig,
     source_stats: Arc<crate::stats::SourceHourlyStats>,
-    flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry,
-    ip_whitelist: crate::middleware::IpWhitelist,
 ) -> anyhow::Result<()> {
     let audit_logger = AuditLogger::new(1000).await;
-    let csrf_tokens: Arc<RwLock<Vec<(String, std::time::Instant)>>> =
-        Arc::new(RwLock::new(Vec::new()));
     let request_counts: Arc<RwLock<std::collections::HashMap<String, (std::time::Instant, u32)>>> =
         Arc::new(RwLock::new(std::collections::HashMap::new()));
 
@@ -68,41 +51,43 @@ async fn run_admin_server(
         config,
         server_config: server_config.clone(),
         audit_logger: audit_logger.clone(),
-        csrf_tokens: csrf_tokens.clone(),
         request_counts: request_counts.clone(),
         source_stats,
-        flush_registry,
-        ip_whitelist,
     };
 
-    let app = axum::Router::new()
+    let app = build_admin_router(state);
+
+    let addr = server_config.bind_address;
+    let listener = TcpListener::bind(addr).await?;
+
+    if let Some(ref tls_config) = server_config.tls_config {
+        info!(
+            "Admin interface available on https://{} (TLS enabled)",
+            addr
+        );
+        run_tls_server(listener, app, tls_config).await?;
+    } else {
+        info!(
+            "Admin interface available on http://{} (HTTP - consider enabling TLS)",
+            addr
+        );
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Build the admin router: every route plus the two security layers, in
+/// their deliberate order. Split out of `run_admin_server` so tests can
+/// exercise the exact production routing table (see `config_write_endpoints_are_gone`).
+pub(crate) fn build_admin_router(state: AdminState) -> Router {
+    axum::Router::new()
         .route("/", axum::routing::get(admin_page))
-        .route(
-            "/config",
-            axum::routing::get(get_config)
-                .put(update_config)
-                .patch(patch_config),
-        )
-        .route(
-            "/config/validate",
-            axum::routing::post(crate::admin::config_api::validate_config),
-        )
-        .route(
-            "/config/diff",
-            axum::routing::post(crate::admin::config_api::diff_config),
-        )
-        .route(
-            "/config/export",
-            axum::routing::post(crate::admin::config_api::export_config),
-        )
-        .route(
-            "/config/import",
-            axum::routing::post(crate::admin::config_api::import_config),
-        )
-        .route(
-            "/config/reload",
-            axum::routing::post(crate::admin::config_api::reload_config),
-        )
+        .route("/config", axum::routing::get(get_config))
         .route("/health", axum::routing::get(health_check))
         .route("/audit-log", axum::routing::get(get_audit_log))
         .route("/stats", axum::routing::get(get_stats))
@@ -112,14 +97,13 @@ async fn run_admin_server(
         //
         // `axum`'s `.layer(A).layer(B)` makes B the OUTER layer: on an
         // incoming request B runs first, then A, then the handler (layers
-        // added later wrap the ones added earlier). The three `.layer()`
+        // added later wrap the ones added earlier). The two `.layer()`
         // calls below are listed in the order they're ADDED, so read them
         // bottom-to-top to get request-flow order:
         //
-        //   csrf_middleware (outermost, runs 1st)
-        //     -> trusted_header_middleware (runs 2nd)
-        //       -> security_middleware (innermost, runs 3rd)
-        //         -> handler
+        //   trusted_header_middleware (outermost, runs 1st)
+        //     -> security_middleware (innermost, runs 2nd)
+        //       -> handler
         //
         // `trusted_header_middleware` MUST run before `security_middleware`
         // because it's the one that resolves the real client IP (from
@@ -163,34 +147,7 @@ async fn run_admin_server(
             state.clone(),
             crate::admin::middleware::trusted_header_middleware,
         ))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::admin::middleware::csrf_middleware,
-        ))
-        .with_state(state);
-
-    let addr = server_config.bind_address;
-    let listener = TcpListener::bind(addr).await?;
-
-    if let Some(ref tls_config) = server_config.tls_config {
-        info!(
-            "Admin interface available on https://{} (TLS enabled)",
-            addr
-        );
-        run_tls_server(listener, app, tls_config).await?;
-    } else {
-        info!(
-            "Admin interface available on http://{} (HTTP - consider enabling TLS)",
-            addr
-        );
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await?;
-    }
-
-    Ok(())
+        .with_state(state)
 }
 
 /// Run the admin server with TLS using axum-server
@@ -257,208 +214,47 @@ async fn admin_page(
     let username =
         ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
-    // Generate CSRF token if enabled
-    let csrf_token = if state.server_config.enable_csrf {
-        generate_csrf_token(&state).await
-    } else {
-        String::new()
-    };
-
     state
         .audit_logger
         .log("ADMIN_PAGE_ACCESS", &username, &client_ip, None)
         .await;
 
-    let html = include_str!("templates/admin.html").replace("{{CSRF_TOKEN}}", &csrf_token);
+    let redacted = redacted_config(&*state.config.read().await);
+    let config_toml = toml::to_string_pretty(&redacted)
+        .unwrap_or_else(|e| format!("could not render configuration: {e}"));
+    let env_names = set_env_var_names();
+    let env_block = if env_names.is_empty() {
+        "(none set — every value comes from logthing.toml or a built-in default)".to_string()
+    } else {
+        env_names.join("\n")
+    };
+
+    // Config values are operator-supplied and can contain markup.
+    let html = include_str!("templates/admin.html")
+        .replace("{{CONFIG_TOML}}", &quick_xml::escape::escape(&config_toml))
+        .replace("{{ENV_VAR_NAMES}}", &quick_xml::escape::escape(&env_block));
     Ok(Html(html))
 }
 
-/// Update configuration endpoint
-async fn update_config(
-    State(state): State<AdminState>,
-    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
-    trusted: Option<Extension<TrustedIdentity>>,
-    resolved_ip: Option<Extension<ResolvedClientIp>>,
-    auth: Option<TypedHeader<Authorization<Basic>>>,
-    Json(mut new_config): Json<Config>,
-) -> Result<Json<Config>, Response> {
-    let client_ip = resolved_ip
-        .map(|Extension(ResolvedClientIp(ip))| ip.to_string())
-        .unwrap_or_else(|| addr.ip().to_string());
-    let username =
-        ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
-
-    // A1: the admin UI round-trips whatever GET /config returned (always
-    // redacted), so a save with no credential change would otherwise
-    // overwrite every live S3 access_key/secret_key with the literal
-    // `***REDACTED***` sentinel. Merge real values back in BEFORE validation.
-    {
-        let current = state.config.read().await;
-        merge_redacted_secrets(&mut new_config, &current);
-    }
-
-    // H-7: validate before touching shared state.
-    if let Err(msg) = validate_config_invariants(&new_config) {
-        state
-            .audit_logger
-            .log(
-                "CONFIG_UPDATE_REJECTED",
-                &username,
-                &client_ip,
-                Some(&format!("Validation error: {msg}")),
-            )
-            .await;
-        return Err((axum::http::StatusCode::BAD_REQUEST, msg).into_response());
-    }
-
-    // H-7: persist first, then swap (atomic: on-disk and in-memory stay consistent).
-    if let Err(err) = persist_config(&new_config).await {
-        error!("Failed to persist admin config: {}", err);
-        state
-            .audit_logger
-            .log(
-                "CONFIG_UPDATE_FAILED",
-                &username,
-                &client_ip,
-                Some(&format!("Persistence error: {}", err)),
-            )
-            .await;
-        return Err((
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Persist failed",
-        )
-            .into_response());
-    }
-
-    // Persist succeeded — now update in-memory state.
-    let updated_config = {
-        let mut cfg = state.config.write().await;
-        *cfg = new_config;
-        cfg.clone()
-    };
-
-    apply_flush_intervals(&state.flush_registry, &updated_config);
-    apply_live_security_settings(&state, &updated_config);
-
-    // Log the change
-    state
-        .audit_logger
-        .log("CONFIG_UPDATED", &username, &client_ip, None)
-        .await;
-
-    info!("Configuration updated via admin API by {}", username);
-
-    Ok(Json(redacted_config(&updated_config)))
-}
-
-/// Patch configuration endpoint (partial updates)
+/// Names — never values — of the `LOGTHING__*` variables set in this
+/// process, sorted.
 ///
-/// A1: does NOT need `merge_redacted_secrets`. `PartialConfigUpdate` has no
-/// S3 credential fields (bind_address, tls_enabled/port, logging_level,
-/// metrics_enabled/port, syslog_enabled/udp_port/tcp_port only), and the
-/// candidate below starts as a clone of the live in-memory config — so an
-/// S3 `access_key`/`secret_key` can never be overwritten with the
-/// `***REDACTED***` sentinel via this endpoint.
-async fn patch_config(
-    State(state): State<AdminState>,
-    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
-    trusted: Option<Extension<TrustedIdentity>>,
-    resolved_ip: Option<Extension<ResolvedClientIp>>,
-    auth: Option<TypedHeader<Authorization<Basic>>>,
-    Json(partial): Json<PartialConfigUpdate>,
-) -> Result<Json<Config>, Response> {
-    let client_ip = resolved_ip
-        .map(|Extension(ResolvedClientIp(ip))| ip.to_string())
-        .unwrap_or_else(|| addr.ip().to_string());
-    let username =
-        ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
-
-    // Build candidate config by applying partial fields to a COPY (do NOT touch
-    // shared state yet — we validate first).
-    let candidate = {
-        let cfg = state.config.read().await;
-        let mut candidate = cfg.clone();
-
-        if let Some(bind_addr) = partial.bind_address {
-            candidate.bind_address = bind_addr;
-        }
-        if let Some(enabled) = partial.tls_enabled {
-            candidate.tls.enabled = enabled;
-        }
-        if let Some(port) = partial.tls_port {
-            candidate.tls.port = port;
-        }
-        if let Some(level) = partial.logging_level {
-            candidate.logging.level = level;
-        }
-        if let Some(enabled) = partial.metrics_enabled {
-            candidate.metrics.enabled = enabled;
-        }
-        if let Some(port) = partial.metrics_port {
-            candidate.metrics.port = port;
-        }
-        if let Some(enabled) = partial.syslog_enabled {
-            candidate.syslog.enabled = enabled;
-        }
-        if let Some(port) = partial.syslog_udp_port {
-            candidate.syslog.udp_port = port;
-        }
-        if let Some(port) = partial.syslog_tcp_port {
-            candidate.syslog.tcp_port = port;
-        }
-
-        candidate
-    };
-
-    // H-7: validate before touching shared state.
-    if let Err(msg) = validate_config_invariants(&candidate) {
-        state
-            .audit_logger
-            .log(
-                "CONFIG_PATCH_REJECTED",
-                &username,
-                &client_ip,
-                Some(&format!("Validation error: {msg}")),
-            )
-            .await;
-        return Err((axum::http::StatusCode::BAD_REQUEST, msg).into_response());
-    }
-
-    // H-7: persist first, then swap (atomic: on-disk and in-memory stay consistent).
-    if let Err(err) = persist_config(&candidate).await {
-        error!("Failed to persist patched config: {}", err);
-        state
-            .audit_logger
-            .log(
-                "CONFIG_PATCH_FAILED",
-                &username,
-                &client_ip,
-                Some(&format!("Persistence error: {}", err)),
-            )
-            .await;
-        return Err((
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Persist failed",
-        )
-            .into_response());
-    }
-
-    // Persist succeeded — now update in-memory state.
-    let updated_config = {
-        let mut cfg = state.config.write().await;
-        *cfg = candidate;
-        cfg.clone()
-    };
-
-    state
-        .audit_logger
-        .log("CONFIG_PATCHED", &username, &client_ip, None)
-        .await;
-
-    info!("Configuration partially updated via PATCH by {}", username);
-
-    // H-6: return redacted config — never expose plaintext S3 secrets.
-    Ok(Json(redacted_config(&updated_config)))
+/// Values are withheld because `LOGTHING__HEC__TOKEN` and the S3
+/// credentials would otherwise be rendered straight into the page.
+///
+/// This is an approximation of provenance, not provenance itself: the
+/// `config` crate exposes no per-field source attribution, so a typo'd
+/// name like `LOGTHING__SYSLOG__UDP_PRT` still appears here looking
+/// legitimate. What disambiguates it is the resolved config shown
+/// alongside — the variable is listed, but the field it was meant to set
+/// still shows its old value.
+fn set_env_var_names() -> Vec<String> {
+    let mut names: Vec<String> = std::env::vars()
+        .map(|(name, _)| name)
+        .filter(|name| name.starts_with("LOGTHING__"))
+        .collect();
+    names.sort();
+    names
 }
 
 /// Get audit log endpoint
@@ -587,7 +383,6 @@ mod tests {
             password_hash: PasswordHash::hash("admin").unwrap(),
             allowed_ips: vec![],
             tls_config: None,
-            enable_csrf: false,
             enable_rate_limiting: false,
             trusted_header: None,
         };
@@ -596,11 +391,8 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             server_config,
             audit_logger: AuditLogger::new(100).await,
-            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
-            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-            ip_whitelist: crate::middleware::IpWhitelist::empty(),
         }
     }
 
@@ -719,46 +511,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_config_requires_auth() {
-        let state = test_state().await;
-        let json_body = serde_json::to_string(&Config::default()).unwrap();
-        let mut request = Request::builder()
-            .method(Method::PUT)
-            .uri("/config")
-            .header("content-type", "application/json")
-            .body(Body::from(json_body))
-            .unwrap();
-        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
-
-        let app = axum::Router::new()
-            .route("/config", axum::routing::put(update_config))
-            .with_state(state);
-
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn patch_config_requires_auth() {
-        let state = test_state().await;
-        let json_body = serde_json::to_string(&PartialConfigUpdate::default()).unwrap();
-        let mut request = Request::builder()
-            .method(Method::PATCH)
-            .uri("/config")
-            .header("content-type", "application/json")
-            .body(Body::from(json_body))
-            .unwrap();
-        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
-
-        let app = axum::Router::new()
-            .route("/config", axum::routing::patch(patch_config))
-            .with_state(state);
-
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
     async fn get_audit_log_requires_auth() {
         let state = test_state().await;
         let mut request = create_request_without_auth(Method::GET, "/audit-log");
@@ -838,6 +590,39 @@ mod tests {
         let syslog_row = rows.iter().find(|r| r.source == "syslog").unwrap();
         let total: u64 = syslog_row.hours.iter().map(|h| h.count).sum();
         assert_eq!(total, 5);
+    }
+
+    /// Config write endpoints must not be routed by the real admin router.
+    /// Drives `build_admin_router` — the exact function `run_admin_server`
+    /// calls in production — rather than a private test-only router, so this
+    /// actually asserts something about production routing.
+    #[tokio::test]
+    async fn config_write_endpoints_are_gone() {
+        let app = build_admin_router(test_state().await);
+
+        for (method, path, expected) in [
+            (Method::PUT, "/config", StatusCode::METHOD_NOT_ALLOWED),
+            (Method::PATCH, "/config", StatusCode::METHOD_NOT_ALLOWED),
+            (Method::POST, "/config/validate", StatusCode::NOT_FOUND),
+            (Method::POST, "/config/diff", StatusCode::NOT_FOUND),
+            (Method::POST, "/config/export", StatusCode::NOT_FOUND),
+            (Method::POST, "/config/import", StatusCode::NOT_FOUND),
+            (Method::POST, "/config/reload", StatusCode::NOT_FOUND),
+        ] {
+            let mut request = Request::builder()
+                .method(method.clone())
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+            let res = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                res.status(),
+                expected,
+                "{method} {path} must no longer be routed by the real admin router"
+            );
+        }
     }
 
     /// End-to-end: reproduces main.rs's actual wiring — ONE shared
@@ -941,7 +726,6 @@ mod tests {
             password_hash: PasswordHash::hash("admin").unwrap(),
             allowed_ips: vec![],
             tls_config: None,
-            enable_csrf: false,
             enable_rate_limiting: false,
             trusted_header: None,
         };
@@ -949,11 +733,8 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             server_config,
             audit_logger: AuditLogger::new(100).await,
-            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: source_stats.clone(),
-            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-            ip_whitelist: crate::middleware::IpWhitelist::empty(),
         };
         let app = axum::Router::new()
             .route("/stats.json", axum::routing::get(get_stats_json))
@@ -1001,7 +782,6 @@ mod tests {
             password_hash: PasswordHash::hash("admin").unwrap(),
             allowed_ips: vec![],
             tls_config: None,
-            enable_csrf: false,
             enable_rate_limiting: false,
             trusted_header: Some(TrustedHeaderConfig {
                 username_header: axum::http::HeaderName::from_static("x-authentik-username"),
@@ -1015,11 +795,8 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             server_config,
             audit_logger: AuditLogger::new(100).await,
-            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
-            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-            ip_whitelist: crate::middleware::IpWhitelist::empty(),
         };
 
         let app = axum::Router::new()
@@ -1072,180 +849,6 @@ mod tests {
             reqwest::StatusCode::UNAUTHORIZED,
             "a wrong shared secret must not grant access, even with correct-looking identity headers"
         );
-    }
-
-    #[tokio::test]
-    async fn update_config_with_valid_auth_updates_configuration() {
-        let state = test_state().await;
-        let new_config = Config::default();
-        let json_body = serde_json::to_string(&new_config).unwrap();
-        let mut request = create_request_with_auth(
-            Method::PUT,
-            "/config",
-            "admin",
-            "admin",
-            Some(Body::from(json_body)),
-        );
-        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
-
-        // Add content-type header
-        let request = axum::http::Request::builder()
-            .method(Method::PUT)
-            .uri("/config")
-            .header("content-type", "application/json")
-            .header(
-                "Authorization",
-                request
-                    .headers()
-                    .get("Authorization")
-                    .unwrap()
-                    .to_str()
-                    .unwrap(),
-            )
-            .body(Body::from(
-                serde_json::to_string(&Config::default()).unwrap(),
-            ))
-            .unwrap();
-
-        let app = axum::Router::new()
-            .route("/config", axum::routing::put(update_config))
-            .with_state(state);
-
-        let response = app.oneshot(request).await.unwrap();
-        // Will fail because persist_config tries to write to disk
-        // but we're testing the auth flow works
-        assert!(
-            response.status() == StatusCode::OK
-                || response.status() == StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    // Sandboxes persist_config()'s write path; see config_api::test_support for
-    // why this must be a single lock shared crate-wide across test modules.
-    use crate::admin::config_api::test_support::sandbox_persist_config_path;
-
-    #[tokio::test]
-    async fn patch_config_with_valid_auth_updates_configuration() {
-        use crate::config::TlsConfig;
-
-        let _sandbox = sandbox_persist_config_path().await;
-        let state = test_state().await;
-        // Config::default() has tls.enabled = true with no cert, which fails
-        // validate_config_invariants on its own — give it a valid baseline first.
-        {
-            let mut cfg = state.config.write().await;
-            cfg.tls = TlsConfig {
-                enabled: false,
-                ..TlsConfig::default()
-            };
-        }
-        let partial = PartialConfigUpdate::default();
-        let json_body = serde_json::to_string(&partial).unwrap();
-
-        let mut request = axum::http::Request::builder()
-            .method(Method::PATCH)
-            .uri("/config")
-            .header("content-type", "application/json")
-            .header(
-                "Authorization",
-                format!("Basic {}", encode_base64("admin:admin")),
-            )
-            .body(Body::from(json_body))
-            .unwrap();
-        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
-
-        let app = axum::Router::new()
-            .route("/config", axum::routing::patch(patch_config))
-            .with_state(state);
-
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn patch_config_with_partial_fields() {
-        use crate::config::TlsConfig;
-
-        let _sandbox = sandbox_persist_config_path().await;
-        let state = test_state().await;
-        // Config::default() has tls.enabled = true with no cert, which fails
-        // validate_config_invariants on its own — give it a valid baseline first.
-        {
-            let mut cfg = state.config.write().await;
-            cfg.tls = TlsConfig {
-                enabled: false,
-                ..TlsConfig::default()
-            };
-        }
-        let partial = PartialConfigUpdate {
-            bind_address: Some("0.0.0.0:9999".parse().unwrap()),
-            // tls_enabled intentionally omitted: enabling TLS via PartialConfigUpdate
-            // with no cert/key path always fails validate_config_invariants (see
-            // patch_config_tls_without_cert_rejected_and_config_unchanged).
-            tls_port: Some(9443),
-            logging_level: Some("debug".to_string()),
-            metrics_enabled: Some(true),
-            metrics_port: Some(9090),
-            syslog_enabled: Some(true),
-            syslog_udp_port: Some(5514),
-            syslog_tcp_port: Some(5601),
-            ..PartialConfigUpdate::default()
-        };
-        let json_body = serde_json::to_string(&partial).unwrap();
-
-        let mut request = axum::http::Request::builder()
-            .method(Method::PATCH)
-            .uri("/config")
-            .header("content-type", "application/json")
-            .header(
-                "Authorization",
-                format!("Basic {}", encode_base64("admin:admin")),
-            )
-            .body(Body::from(json_body))
-            .unwrap();
-        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
-
-        let app = axum::Router::new()
-            .route("/config", axum::routing::patch(patch_config))
-            .with_state(state);
-
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn admin_page_with_csrf_enabled_generates_token() {
-        let server_config = AdminServerConfig {
-            bind_address: "0.0.0.0:8080".parse().unwrap(),
-            username: "admin".to_string(),
-            password_hash: PasswordHash::hash("admin").unwrap(),
-            allowed_ips: vec![],
-            tls_config: None,
-            enable_csrf: true,
-            enable_rate_limiting: false,
-            trusted_header: None,
-        };
-
-        let state = AdminState {
-            config: Arc::new(RwLock::new(Config::default())),
-            server_config,
-            audit_logger: AuditLogger::new(100).await,
-            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
-            request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
-            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-            ip_whitelist: crate::middleware::IpWhitelist::empty(),
-        };
-
-        let mut request = create_request_with_auth(Method::GET, "/", "admin", "admin", None);
-        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
-
-        let app = axum::Router::new()
-            .route("/", axum::routing::get(admin_page))
-            .with_state(state);
-
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1312,469 +915,6 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------ //
-    // R-1: patch_config security regression tests                         //
-    // ------------------------------------------------------------------ //
-
-    /// A PATCH that enables TLS without supplying cert/key files must be rejected
-    /// with HTTP 400 and leave the running config unchanged.
-    ///
-    /// Note: Config::default() already has tls.enabled=true + no cert_file, so
-    /// the candidate config (which inherits those values) always fails validation.
-    /// We explicitly disable TLS first so the initial state is valid, then attempt
-    /// to re-enable it (still no cert_file) and verify rejection.
-    #[tokio::test]
-    async fn patch_config_tls_without_cert_rejected_and_config_unchanged() {
-        use crate::config::TlsConfig;
-
-        let state = test_state().await;
-
-        // Set the shared config to a valid baseline (TLS disabled, valid bind port).
-        {
-            let mut cfg = state.config.write().await;
-            cfg.tls = TlsConfig {
-                enabled: false,
-                ..TlsConfig::default()
-            };
-        }
-
-        // Now attempt to enable TLS via PATCH — without cert/key files this should
-        // fail validate_config_invariants and be rejected with 400.
-        let partial = PartialConfigUpdate {
-            tls_enabled: Some(true),
-            ..PartialConfigUpdate::default()
-        };
-        let json_body = serde_json::to_string(&partial).unwrap();
-
-        let mut request = axum::http::Request::builder()
-            .method(Method::PATCH)
-            .uri("/config")
-            .header("content-type", "application/json")
-            .header(
-                "Authorization",
-                format!("Basic {}", encode_base64("admin:admin")),
-            )
-            .body(Body::from(json_body))
-            .unwrap();
-        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
-
-        let app = axum::Router::new()
-            .route("/config", axum::routing::patch(patch_config))
-            .with_state(state.clone());
-
-        let response = app.oneshot(request).await.unwrap();
-
-        // Must be rejected — TLS enabled with no cert is invalid.
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "PATCH enabling TLS without cert files must be rejected with 400"
-        );
-
-        // Running config must remain unchanged (tls.enabled still false).
-        let cfg = state.config.read().await;
-        assert!(
-            !cfg.tls.enabled,
-            "Running config must not be mutated after a rejected PATCH"
-        );
-    }
-
-    /// A PATCH that sets bind_address port to 0 must be rejected with HTTP 400.
-    #[tokio::test]
-    async fn patch_config_bind_port_zero_rejected() {
-        use crate::config::TlsConfig;
-
-        let state = test_state().await;
-
-        // Set a valid baseline config (TLS disabled).
-        {
-            let mut cfg = state.config.write().await;
-            cfg.tls = TlsConfig {
-                enabled: false,
-                ..TlsConfig::default()
-            };
-        }
-
-        let partial = PartialConfigUpdate {
-            bind_address: Some("0.0.0.0:0".parse().unwrap()),
-            ..PartialConfigUpdate::default()
-        };
-        let json_body = serde_json::to_string(&partial).unwrap();
-
-        let mut request = axum::http::Request::builder()
-            .method(Method::PATCH)
-            .uri("/config")
-            .header("content-type", "application/json")
-            .header(
-                "Authorization",
-                format!("Basic {}", encode_base64("admin:admin")),
-            )
-            .body(Body::from(json_body))
-            .unwrap();
-        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
-
-        let app = axum::Router::new()
-            .route("/config", axum::routing::patch(patch_config))
-            .with_state(state.clone());
-
-        let response = app.oneshot(request).await.unwrap();
-
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "PATCH with bind_address port 0 must be rejected with 400"
-        );
-    }
-
-    /// A successful PATCH response must not contain any real S3 secret values.
-    ///
-    /// We verify that the response body from a successful PATCH uses redacted_config
-    /// (i.e., the route returns `redacted_config(&updated_config)` not the raw config).
-    /// persist_config() writes to disk, so we sandbox its target path.
-    #[tokio::test]
-    async fn patch_config_success_response_redacts_secrets() {
-        use crate::config::{S3ConnectionConfig, SyslogS3Config, TlsConfig};
-        #[allow(unused_imports)]
-        use axum::body::to_bytes;
-
-        let _sandbox = sandbox_persist_config_path().await;
-        let state = test_state().await;
-
-        // Set a valid baseline config with a known S3 secret, TLS disabled.
-        let real_secret = "super-secret-key-should-not-appear";
-        {
-            let mut cfg = state.config.write().await;
-            cfg.tls = TlsConfig {
-                enabled: false,
-                ..TlsConfig::default()
-            };
-            cfg.syslog.s3 = Some(SyslogS3Config {
-                connection: S3ConnectionConfig {
-                    endpoint: "https://s3.example.com".to_string(),
-                    bucket: "test-bucket".to_string(),
-                    region: "us-east-1".to_string(),
-                    access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
-                    secret_key: real_secret.to_string(),
-                },
-                prefix: "syslog".to_string(),
-                max_buffer_rows: 1000,
-                flush_interval_secs: 60,
-                channel_capacity: 100,
-            });
-        }
-
-        // Empty PATCH — noop fields. Should hit persist then return redacted config.
-        let partial = PartialConfigUpdate::default();
-        let json_body = serde_json::to_string(&partial).unwrap();
-
-        let mut request = axum::http::Request::builder()
-            .method(Method::PATCH)
-            .uri("/config")
-            .header("content-type", "application/json")
-            .header(
-                "Authorization",
-                format!("Basic {}", encode_base64("admin:admin")),
-            )
-            .body(Body::from(json_body))
-            .unwrap();
-        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
-
-        let app = axum::Router::new()
-            .route("/config", axum::routing::patch(patch_config))
-            .with_state(state);
-
-        let response = app.oneshot(request).await.unwrap();
-
-        // Must not be 400 (valid config must not be rejected).
-        assert_ne!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "An empty PATCH on a valid config must not be rejected as invalid"
-        );
-
-        if response.status() == StatusCode::OK {
-            // On success, verify the secret is not in the response body.
-            let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let body_str = String::from_utf8_lossy(&body_bytes);
-            assert!(
-                !body_str.contains(real_secret),
-                "PATCH success response must not contain plaintext S3 secret; got: {body_str}"
-            );
-        }
-    }
-
-    /// End-to-end regression test for the live-reload `security.allowed_ips`
-    /// fix, exercised through the actual HTTP `PUT /config` path (not just
-    /// unit-level `IpWhitelist::set_networks` plumbing): a config change
-    /// must push the new allowlist into the SAME `IpWhitelist` instance the
-    /// main HTTP router and every wire-protocol listener hold a `Clone` of
-    /// — proven here by asserting `state.ip_whitelist.is_allowed` flips for
-    /// a fixed source address, before vs. after the PUT.
-    #[tokio::test]
-    async fn put_config_pushes_allowed_ips_change_into_shared_ip_whitelist() {
-        use crate::config::TlsConfig;
-        use crate::middleware::IpWhitelist;
-
-        let _sandbox = sandbox_persist_config_path().await;
-        let mut state = test_state().await;
-
-        // Start with a whitelist that excludes 203.0.113.5 — the SAME
-        // instance `state.ip_whitelist` is set to, standing in for the one
-        // instance shared with `main.rs`'s Server and wire listeners.
-        let ip_whitelist = IpWhitelist::new(vec!["10.0.0.0/8".to_string()]).unwrap();
-        state.ip_whitelist = ip_whitelist.clone();
-
-        let probe_addr: std::net::SocketAddr = "203.0.113.5:12345".parse().unwrap();
-        assert!(
-            !ip_whitelist.is_allowed(&probe_addr),
-            "test premise: 203.0.113.5 must start out blocked"
-        );
-
-        let mut new_config = Config {
-            tls: TlsConfig {
-                enabled: false,
-                ..TlsConfig::default()
-            },
-            ..Config::default()
-        };
-        new_config.security.allowed_ips = vec!["203.0.113.0/24".to_string()];
-
-        let json_body = serde_json::to_string(&new_config).unwrap();
-        let mut request = axum::http::Request::builder()
-            .method(Method::PUT)
-            .uri("/config")
-            .header("content-type", "application/json")
-            .header(
-                "Authorization",
-                format!("Basic {}", encode_base64("admin:admin")),
-            )
-            .body(Body::from(json_body))
-            .unwrap();
-        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
-
-        let app = axum::Router::new()
-            .route("/config", axum::routing::put(update_config))
-            .with_state(state);
-
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "PUT /config must succeed for a valid config"
-        );
-
-        assert!(
-            ip_whitelist.is_allowed(&probe_addr),
-            "PUT /config must push the new allowed_ips into the shared IpWhitelist \
-             instance — this is the actual bug fix, exercised end-to-end through the \
-             HTTP path, no restart"
-        );
-    }
-
-    /// End-to-end regression test for the live-reload flush-interval fix,
-    /// exercised through the actual HTTP path (not just unit-level plumbing):
-    /// a `PUT /config` request whose `syslog.s3.flush_interval_secs` differs
-    /// from an already-registered writer's current value must push the new
-    /// value into that writer's `LiveInterval` handle.
-    #[tokio::test]
-    async fn put_config_pushes_flush_interval_change_into_registered_live_writer() {
-        use crate::config::{S3ConnectionConfig, SyslogS3Config, TlsConfig};
-        use crate::forwarding::buffered_writer::LiveInterval;
-        use crate::forwarding::flush_registry::FlushIntervalRegistry;
-
-        let _sandbox = sandbox_persist_config_path().await;
-        let mut state = test_state().await;
-
-        // Register a `LiveInterval` under "syslog.s3", exactly as a running
-        // writer would at startup via
-        // `flush_registry.register("syslog.s3", handler.flush_interval())`.
-        let live = LiveInterval::new(std::time::Duration::from_secs(900));
-        let registry = FlushIntervalRegistry::new();
-        registry.register("syslog.s3", live.clone());
-        state.flush_registry = registry;
-
-        // Build a new config whose syslog.s3.flush_interval_secs (5s) differs
-        // from the registered writer's current value (900s).
-        let mut new_config = Config {
-            tls: TlsConfig {
-                enabled: false,
-                ..TlsConfig::default()
-            },
-            ..Config::default()
-        };
-        new_config.syslog.s3 = Some(SyslogS3Config {
-            connection: S3ConnectionConfig {
-                endpoint: "https://s3.example.com".to_string(),
-                bucket: "test-bucket".to_string(),
-                region: "us-east-1".to_string(),
-                access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
-                secret_key: "super-secret-key".to_string(),
-            },
-            prefix: "syslog".to_string(),
-            max_buffer_rows: 1000,
-            flush_interval_secs: 5,
-            channel_capacity: 100,
-        });
-
-        let json_body = serde_json::to_string(&new_config).unwrap();
-        let mut request = axum::http::Request::builder()
-            .method(Method::PUT)
-            .uri("/config")
-            .header("content-type", "application/json")
-            .header(
-                "Authorization",
-                format!("Basic {}", encode_base64("admin:admin")),
-            )
-            .body(Body::from(json_body))
-            .unwrap();
-        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
-
-        let app = axum::Router::new()
-            .route("/config", axum::routing::put(update_config))
-            .with_state(state);
-
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "PUT /config must succeed for a valid config"
-        );
-
-        assert_eq!(
-            live.get(),
-            std::time::Duration::from_secs(5),
-            "PUT /config must push the new flush_interval_secs into the \
-             already-registered live writer handle — this is the actual bug \
-             fix, exercised end-to-end through the HTTP path"
-        );
-    }
-
-    /// A1 HTTP-level regression test: GET /config then PUT /config with the
-    /// exact body it returned — this is precisely what the admin UI does on
-    /// every save (`buildPayload()` deep-clones `currentConfig`, which was
-    /// populated from a prior `GET /config` response, and PUTs that clone
-    /// back). Drives the real router (both routes registered exactly as in
-    /// production), not the handler function directly.
-    #[tokio::test]
-    async fn get_then_put_round_trip_through_router_preserves_real_s3_credentials() {
-        use crate::config::{S3ConnectionConfig, SyslogS3Config, TlsConfig};
-
-        let _sandbox = sandbox_persist_config_path().await;
-        let state = test_state().await;
-
-        let real_access_key = "AKIAIOSFODNN7EXAMPLE";
-        let real_secret_key = "super-secret-should-survive-a-save";
-        let real_hec_token = "super-secret-hec-token";
-        let real_otlp_token = "super-secret-otlp-token";
-        let real_syslog_http_token = "super-secret-syslog-http-token";
-        {
-            let mut cfg = state.config.write().await;
-            cfg.tls = TlsConfig {
-                enabled: false,
-                ..TlsConfig::default()
-            };
-            cfg.syslog.s3 = Some(SyslogS3Config {
-                connection: S3ConnectionConfig {
-                    endpoint: "https://s3.example.com".to_string(),
-                    bucket: "test-bucket".to_string(),
-                    region: "us-east-1".to_string(),
-                    access_key: real_access_key.to_string(),
-                    secret_key: real_secret_key.to_string(),
-                },
-                prefix: "syslog".to_string(),
-                max_buffer_rows: 1000,
-                flush_interval_secs: 60,
-                channel_capacity: 100,
-            });
-            cfg.hec.token = real_hec_token.to_string();
-            cfg.otlp.bearer_token = Some(real_otlp_token.to_string());
-            cfg.syslog.http_token = real_syslog_http_token.to_string();
-        }
-
-        let app = axum::Router::new()
-            .route(
-                "/config",
-                axum::routing::get(get_config)
-                    .put(update_config)
-                    .patch(patch_config),
-            )
-            .with_state(state.clone());
-
-        // GET /config — this is what the admin UI stores as `currentConfig`.
-        let mut get_request =
-            create_request_with_auth(Method::GET, "/config", "admin", "admin", None);
-        inject_connect_info(&mut get_request, "127.0.0.1:12345".parse().unwrap());
-        let get_response = app.clone().oneshot(get_request).await.unwrap();
-        assert_eq!(get_response.status(), StatusCode::OK);
-        let get_body = axum::body::to_bytes(get_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let get_body_str = String::from_utf8_lossy(&get_body);
-        assert!(
-            get_body_str.contains("***REDACTED***"),
-            "GET /config must return the redacted sentinel, not the real secret: {get_body_str}"
-        );
-        assert!(
-            !get_body_str.contains(real_hec_token)
-                && !get_body_str.contains(real_otlp_token)
-                && !get_body_str.contains(real_syslog_http_token),
-            "GET /config must not return live ingest tokens: {get_body_str}"
-        );
-
-        // PUT /config with exactly that (redacted) body — no edits, same as an
-        // operator who changed an unrelated field elsewhere in the form.
-        let mut put_request = axum::http::Request::builder()
-            .method(Method::PUT)
-            .uri("/config")
-            .header("content-type", "application/json")
-            .header(
-                "Authorization",
-                format!("Basic {}", encode_base64("admin:admin")),
-            )
-            .body(Body::from(get_body))
-            .unwrap();
-        inject_connect_info(&mut put_request, "127.0.0.1:12345".parse().unwrap());
-
-        let put_response = app.oneshot(put_request).await.unwrap();
-        assert_eq!(
-            put_response.status(),
-            StatusCode::OK,
-            "PUT /config with the GET-returned (redacted) body must succeed"
-        );
-
-        // The live in-memory config must still hold the REAL credentials, not
-        // the `***REDACTED***` sentinel the client just submitted.
-        let live_cfg = state.config.read().await;
-        let s3 = live_cfg
-            .syslog
-            .s3
-            .as_ref()
-            .expect("syslog.s3 still present");
-        assert_eq!(
-            s3.connection.access_key, real_access_key,
-            "save destroyed the real access_key"
-        );
-        assert_eq!(
-            s3.connection.secret_key, real_secret_key,
-            "save destroyed the real secret_key"
-        );
-        assert_eq!(
-            live_cfg.hec.token, real_hec_token,
-            "save destroyed the real hec.token"
-        );
-        assert_eq!(
-            live_cfg.otlp.bearer_token.as_deref(),
-            Some(real_otlp_token),
-            "save destroyed the real otlp.bearer_token"
-        );
-        assert_eq!(
-            live_cfg.syslog.http_token, real_syslog_http_token,
-            "save destroyed the real syslog.http_token"
-        );
-    }
-
     mod trusted_header_integration_tests {
         use super::*;
         use crate::admin::state::TrustedHeaderConfig;
@@ -1786,7 +926,6 @@ mod tests {
                 password_hash: PasswordHash::hash("admin").unwrap(),
                 allowed_ips: vec![],
                 tls_config: None,
-                enable_csrf: false,
                 enable_rate_limiting: false,
                 trusted_header: Some(TrustedHeaderConfig {
                     username_header: axum::http::HeaderName::from_static("x-authentik-username"),
@@ -1800,11 +939,8 @@ mod tests {
                 config: Arc::new(RwLock::new(Config::default())),
                 server_config,
                 audit_logger: AuditLogger::new(100).await,
-                csrf_tokens: Arc::new(RwLock::new(Vec::new())),
                 request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
                 source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
-                flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-                ip_whitelist: crate::middleware::IpWhitelist::empty(),
             }
         }
 
@@ -1827,27 +963,6 @@ mod tests {
 
             let app = axum::Router::new()
                 .route("/config", axum::routing::get(get_config))
-                .layer(axum::middleware::from_fn_with_state(
-                    state.clone(),
-                    crate::admin::middleware::trusted_header_middleware,
-                ))
-                .with_state(state);
-
-            let response = app.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-        }
-
-        #[tokio::test]
-        async fn export_config_succeeds_with_trusted_headers_alone_no_basic_auth() {
-            let state = test_state_with_trust().await;
-            let mut request = trusted_headers_request(Method::POST, "/config/export");
-            inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
-
-            let app = axum::Router::new()
-                .route(
-                    "/config/export",
-                    axum::routing::post(crate::admin::config_api::export_config),
-                )
                 .layer(axum::middleware::from_fn_with_state(
                     state.clone(),
                     crate::admin::middleware::trusted_header_middleware,
@@ -2006,6 +1121,61 @@ mod tests {
         assert!(
             entries.iter().any(|e| e.username == payload),
             "the audit API must store and serve the raw username unescaped"
+        );
+    }
+
+    #[test]
+    fn set_env_var_names_lists_names_and_never_values() {
+        // SAFETY: single-threaded test, variable removed before returning.
+        unsafe { std::env::set_var("LOGTHING__HEC__TOKEN", "super-secret-value") };
+
+        let names = set_env_var_names();
+
+        unsafe { std::env::remove_var("LOGTHING__HEC__TOKEN") };
+
+        assert!(
+            names.iter().any(|n| n == "LOGTHING__HEC__TOKEN"),
+            "the variable name must be listed: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("super-secret-value")),
+            "a value must never appear: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_page_renders_config_read_only() {
+        let state = test_state().await;
+        let mut request = create_request_with_auth(Method::GET, "/", "admin", "admin", None);
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(admin_page))
+            .with_state(state);
+
+        let res = app.oneshot(request).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body = String::from_utf8(
+            axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+
+        assert!(!body.contains("<form"), "the config form must be gone");
+        assert!(
+            !body.contains("wef-server.admin.toml"),
+            "stale subtitle must be gone"
+        );
+        assert!(
+            body.contains("security.allowed_ips") && body.contains("aggregate.rules"),
+            "the page must name the two file-only settings that have no env equivalent"
+        );
+        assert!(
+            body.contains("bind_address"),
+            "the effective config must be rendered"
         );
     }
 }

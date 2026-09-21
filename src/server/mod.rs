@@ -300,12 +300,11 @@ pub struct Server {
     /// and construct successfully). Awaited during graceful shutdown.
     hec_worker_handles: Vec<tokio::task::JoinHandle<()>>,
     /// The SAME `IpWhitelist` instance shared with `main.rs`'s five
-    /// wire-protocol listeners and the admin API (via `AdminState::ip_whitelist`).
-    /// `run`/`run_tls` clone this into `create_router` and the metrics server
-    /// instead of building their own from `config.security.allowed_ips`, so a
-    /// live `security.allowed_ips` update (see
-    /// `crate::admin::config_api::apply_live_security_settings`) reaches every
-    /// consumer — not just the ones constructed after the update.
+    /// wire-protocol listeners, built once from `config.security.allowed_ips`
+    /// at startup. `run`/`run_tls` clone this into `create_router` and the
+    /// metrics server instead of building their own, so every consumer sees
+    /// the identical allowlist. `security.allowed_ips` is restart-only —
+    /// there is no live-reload path.
     ip_whitelist: IpWhitelist,
 }
 
@@ -735,9 +734,10 @@ impl Server {
         // handlers and are always layered so the extractors resolve when the
         // routes are mounted. The config extension is the SAME
         // `Arc<RwLock<Config>>` as `AppState.config`, so `hec.token` is read
-        // LIVE on every request (see `handle_hec_event` and siblings in
-        // `src/ingest/handlers.rs`) instead of the pre-fix snapshot-at-startup
-        // `Extension<Arc<String>>`.
+        // from the config on every request (see `handle_hec_event` and siblings
+        // in `src/ingest/handlers.rs`) rather than snapshot at startup. The
+        // value is effectively fixed at startup — nothing writes the config at
+        // runtime now that the admin interface is read-only.
         let protected_router = protected_router
             .layer(axum::Extension(self.ingest_state.clone()))
             .layer(axum::Extension(self.state.config.clone()))

@@ -2,10 +2,11 @@
 //!
 //! All three handlers share the same auth + dispatch pattern:
 //! 1. Extract and validate `Authorization: Splunk <token>` header against
-//!    `hec.token`, read LIVE from the shared config on every request (same
+//!    `hec.token`, read from the shared config on every request (same
 //!    pattern as `syslog.http_token` / `otlp.bearer_token` in
-//!    `src/server/mod.rs`) — an admin-updated token takes effect on the very
-//!    next request, no restart needed.
+//!    `src/server/mod.rs`). The token is effectively fixed at startup — nothing
+//!    writes the config at runtime now that the admin interface is read-only,
+//!    so changing it requires a restart.
 //!    NOTE: If the configured token is empty, auth is skipped entirely
 //!    (dev-only mode). See [hec] config docs.
 //! 2. Parse the body with the appropriate helper.
@@ -132,8 +133,9 @@ fn dispatch_generic_record(
 ///
 /// DEVIATION FROM BRIEF: if `hec.token` is empty, auth check is skipped
 /// entirely (dev-only no-auth mode; see [hec] config docs). The token is
-/// read LIVE from `config` on every request, so an admin-updated
-/// `hec.token` takes effect on the very next request — no restart needed.
+/// read from `config` on every request, but the value is effectively fixed
+/// at startup — nothing writes the config at runtime now that the admin
+/// interface is read-only, so changing it requires a restart.
 pub async fn handle_hec_event(
     headers: HeaderMap,
     Query(params): Query<HecQueryParams>,
@@ -174,8 +176,9 @@ pub async fn handle_hec_event(
 ///
 /// DEVIATION FROM BRIEF: if `hec.token` is empty, auth check is skipped
 /// entirely (dev-only no-auth mode; see [hec] config docs). The token is
-/// read LIVE from `config` on every request, so an admin-updated
-/// `hec.token` takes effect on the very next request — no restart needed.
+/// read from `config` on every request, but the value is effectively fixed
+/// at startup — nothing writes the config at runtime now that the admin
+/// interface is read-only, so changing it requires a restart.
 pub async fn handle_hec_raw(
     headers: HeaderMap,
     Query(params): Query<HecQueryParams>,
@@ -214,8 +217,9 @@ pub async fn handle_hec_raw(
 ///
 /// DEVIATION FROM BRIEF: if `hec.token` is empty, auth check is skipped
 /// entirely (dev-only no-auth mode; see [hec] config docs). The token is
-/// read LIVE from `config` on every request, so an admin-updated
-/// `hec.token` takes effect on the very next request — no restart needed.
+/// read from `config` on every request, but the value is effectively fixed
+/// at startup — nothing writes the config at runtime now that the admin
+/// interface is read-only, so changing it requires a restart.
 pub async fn handle_ndjson(
     headers: HeaderMap,
     Query(params): Query<HecQueryParams>,
@@ -574,12 +578,12 @@ mod tests {
 
     // --- Live hec.token reload (no restart) ---
 
-    /// An admin-changed `hec.token` must take effect on the very next
-    /// request — no router rebuild, no restart. Mirrors the finding this
-    /// fixes: before it, `hec.token` was snapshotted into an
-    /// `Extension<Arc<String>>` at router-construction time, so a changed
-    /// token was accepted, persisted, and audited but never actually
-    /// enforced until the process restarted.
+    /// A `hec.token` change written through the shared `Arc<RwLock<Config>>`
+    /// must take effect on the very next request — no router rebuild
+    /// required. Mirrors the finding this fixes: before it, `hec.token` was
+    /// snapshotted into an `Extension<Arc<String>>` at router-construction
+    /// time, so a changed value was never actually enforced without
+    /// rebuilding the router.
     #[tokio::test]
     async fn hec_token_change_takes_effect_on_next_request_without_restart() {
         let mut cfg = Config::default();
@@ -606,16 +610,15 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Simulate the admin API's `PUT /config` swap: write straight
-        // through the SAME `Arc<RwLock<Config>>` the router's `Extension`
-        // holds — exactly what `update_config`/`reload_config` do via
-        // `*state.config.write().await = new_config`.
+        // Write straight through the SAME `Arc<RwLock<Config>>` the
+        // router's `Extension` holds, exactly as a future config-reload
+        // mechanism would.
         {
             let mut cfg = shared_config.write().await;
             cfg.hec.token = "new-token".to_string();
         }
 
-        // Old (leaked) token is now rejected — no restart needed.
+        // Old (leaked) token is now rejected by the handler on the next request.
         let resp = app
             .clone()
             .oneshot(request_with("old-token"))

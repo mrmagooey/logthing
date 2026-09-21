@@ -2,8 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-pub const ADMIN_OVERRIDE_FILE: &str = "logthing.admin.toml";
-
 /// Shared S3 connection parameters embedded (via `#[serde(flatten)]`) into
 /// `SyslogS3Config` and `IpfixS3Config`. This keeps the TOML surface flat
 /// (e.g. `[syslog.s3]\nendpoint = …`) while ensuring the client-construction
@@ -101,12 +99,12 @@ pub struct SecurityConfig {
     /// and all five wire-protocol listeners (syslog, ipfix, zeek, suricata,
     /// sflow). Empty (the default) allows all sources.
     ///
-    /// LIVE: an admin API update (`PUT /config`, `/config/reload`,
-    /// `/config/import`) applies immediately to every one of those
-    /// consumers — no restart needed. They all share ONE
-    /// `crate::middleware::IpWhitelist` instance built once at startup; the
-    /// admin API pushes changes into it via `IpWhitelist::set_networks`
-    /// (see `crate::admin::config_api::apply_live_security_settings`).
+    /// Read once at startup and shared by all of the above through ONE
+    /// `crate::middleware::IpWhitelist` instance. Changing it requires a
+    /// restart. It has no environment-variable equivalent: it's a
+    /// `Vec<String>` and the config loader sets no `list_separator`, so
+    /// `LOGTHING__SECURITY__ALLOWED_IPS` cannot populate it — set it in
+    /// `logthing.toml` or `/etc/logthing/config`.
     #[serde(default)]
     pub allowed_ips: Vec<String>,
 
@@ -291,9 +289,10 @@ pub struct SyslogConfig {
     /// unconditionally, so this preserves today's behaviour for every
     /// existing deployment.
     ///
-    /// LIVE: read from the shared config on every request
-    /// (`handle_syslog_http` in `src/server/mod.rs`). An admin API update
-    /// takes effect on the very next request — no restart needed.
+    /// Read from the shared config on every request (`handle_syslog_http` in
+    /// `src/server/mod.rs`), but nothing writes that config at runtime now
+    /// that the admin interface is read-only, so the value is effectively
+    /// fixed at startup and changing it requires a restart.
     #[serde(default)]
     pub http_token: String,
 }
@@ -801,10 +800,11 @@ pub struct HecConfig {
     /// Shared secret compared against `Authorization: Splunk <token>`.
     /// Empty string means any token is accepted — only useful for local dev.
     ///
-    /// LIVE: read from the shared config on every request (`handle_hec_event`
-    /// and siblings in `src/ingest/handlers.rs`), matching `syslog.http_token`
-    /// and `otlp.bearer_token`. An admin API update (e.g. rotating a leaked
-    /// token) takes effect on the very next request — no restart needed.
+    /// Read from the shared config on every request (`handle_hec_event` and
+    /// siblings in `src/ingest/handlers.rs`), matching `syslog.http_token` and
+    /// `otlp.bearer_token`. Nothing writes that config at runtime now that the
+    /// admin interface is read-only, so the value is effectively fixed at
+    /// startup and changing it requires a restart.
     #[serde(default)]
     pub token: String,
     /// Maximum distinct `sourcetype` partitions before overflow (default: 64).
@@ -852,9 +852,10 @@ pub struct OtlpConfig {
     /// Optional bearer token for the `Authorization: Bearer <token>` header.
     /// If `None`, no bearer auth is enforced (IP whitelist + TLS still apply).
     ///
-    /// LIVE: read from the shared config on every request (`handle_otlp_logs`
-    /// in `src/server/mod.rs`). An admin API update takes effect on the very
-    /// next request — no restart needed.
+    /// Read from the shared config on every request (`handle_otlp_logs` in
+    /// `src/server/mod.rs`), but nothing writes that config at runtime now
+    /// that the admin interface is read-only, so the value is effectively
+    /// fixed at startup and changing it requires a restart.
     #[serde(default)]
     pub bearer_token: Option<String>,
 }
@@ -1585,9 +1586,8 @@ impl Config {
     /// Configuration is loaded from the following sources (in order of precedence):
     /// 1. Default values
     /// 2. `logthing.toml` file (optional)
-    /// 3. Admin override file (`logthing.admin.toml`, optional)
-    /// 4. `/etc/logthing/config.toml` (optional)
-    /// 5. Environment variables with `LOGTHING__` prefix
+    /// 3. `/etc/logthing/config.toml` (optional)
+    /// 4. Environment variables with `LOGTHING__` prefix
     ///
     /// # Examples
     ///
@@ -1602,25 +1602,96 @@ impl Config {
     pub fn load() -> anyhow::Result<Self> {
         let mut builder = config::Config::builder();
 
-        // Add default config
         builder = builder.set_default("bind_address", "0.0.0.0:5985")?;
 
-        // Try to load from file
         builder = builder.add_source(config::File::with_name("logthing").required(false));
-        builder =
-            builder.add_source(config::File::from(Path::new(ADMIN_OVERRIDE_FILE)).required(false));
         builder =
             builder.add_source(config::File::with_name("/etc/logthing/config").required(false));
 
-        // Add environment variables with prefix LOGTHING_
+        // `LOGTHING__<SECTION>__<FIELD>` overrides every file layer above.
         builder = builder.add_source(config::Environment::with_prefix("LOGTHING").separator("__"));
 
         let config = builder.build()?;
         let config: Config = config.try_deserialize()?;
+
+        // Written by the admin API before it became read-only. It is no
+        // longer a config source, so say so rather than letting an
+        // operator wonder why their settings changed after the upgrade.
+        if let Some(warning) = stale_admin_override_warning(Path::new(".")) {
+            tracing::warn!("{warning}");
+        }
+
+        validate_config_invariants(&config).map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
         validate_iceberg_config(&config.iceberg)?;
         validate_recv_tasks_config(&config)?;
         validate_recv_batch_size_config(&config)?;
         Ok(config)
+    }
+}
+
+/// Returns the warning to emit when a leftover `logthing.admin.toml` is
+/// found, or `None` when there is nothing to warn about.
+///
+/// Split out from `Config::load` purely so the decision is unit-testable
+/// without capturing `tracing` output.
+fn stale_admin_override_warning(dir: &Path) -> Option<String> {
+    if dir.join("logthing.admin.toml").exists() {
+        Some(
+            "logthing.admin.toml exists but is no longer read. The admin \
+             interface is read-only; set configuration with LOGTHING__* \
+             environment variables or logthing.toml, then delete this file."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+/// Reject configurations that parse but cannot work.
+///
+/// Called from [`Config::load`], so these checks run once at startup for
+/// every deployment regardless of where the values came from. Before the
+/// admin write endpoints were removed this ran only on an admin-driven
+/// config change, which meant a bad file or environment variable was
+/// accepted at startup and failed later at the point of use.
+///
+/// `security.allowed_ips` is parsed here and again in `main.rs`, where
+/// `IpWhitelist::new` needs the parsed networks anyway. Both fail fast and
+/// agree; the duplication is deliberate, not an oversight.
+pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+
+    if cfg.bind_address.port() == 0 {
+        errors.push("bind_address port cannot be 0".to_string());
+    }
+
+    if cfg.tls.enabled {
+        if cfg.tls.cert_file.is_none() {
+            errors.push("tls.enabled is true but tls.cert_file is not set".to_string());
+        }
+        if cfg.tls.key_file.is_none() {
+            errors.push("tls.enabled is true but tls.key_file is not set".to_string());
+        }
+    }
+
+    // Also rejected at router construction (`Server::create_router`);
+    // catching them here fails the process at startup with a clear message
+    // instead of at first request.
+    if cfg.security.max_connections == 0 {
+        errors.push("security.max_connections must be greater than 0".to_string());
+    }
+    if cfg.security.connection_timeout_secs == 0 {
+        errors.push("security.connection_timeout_secs must be greater than 0".to_string());
+    }
+
+    if let Err(err) = crate::middleware::parse_allowed_ips(&cfg.security.allowed_ips) {
+        errors.push(format!("security.allowed_ips: {err}"));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
@@ -1631,6 +1702,11 @@ mod tests {
         GENERIC_RECORD_BYTES, IPFIX_DATAGRAM_BYTES, SFLOW_RECORD_BYTES, SURICATA_RECORD_BYTES,
         SYSLOG_MESSAGE_BYTES, WEF_EVENT_BYTES, ZEEK_RECORD_BYTES, capacity_for,
     };
+
+    /// Serialises tests that call `Config::load()` against files in the
+    /// process working directory (`logthing.admin.toml`, etc.) so they
+    /// cannot interleave and fight over the same paths.
+    static CONFIG_FILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn default_config_values_match_expectations() {
@@ -2095,28 +2171,81 @@ max_buffer_rows = 50000
 
     #[test]
     fn load_reads_configuration_file() {
-        // Temporarily rename admin override file if it exists to test base config loading
-        let admin_override = Path::new(ADMIN_OVERRIDE_FILE);
-        let admin_override_backup = Path::new("logthing.admin.toml.bak");
-        let had_override = admin_override.exists();
-
-        if had_override {
-            std::fs::rename(admin_override, admin_override_backup).expect("rename override file");
-        }
+        let _guard = CONFIG_FILE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let result = std::panic::catch_unwind(|| {
             let cfg = Config::load().expect("config loads");
             assert!(!cfg.tls.enabled, "logthing.toml disables TLS");
         });
 
-        // Restore admin override file
-        if had_override {
-            std::fs::rename(admin_override_backup, admin_override).expect("restore override file");
-        }
-
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
+    }
+
+    #[test]
+    fn load_ignores_a_stale_admin_override_file() {
+        // logthing.admin.toml was written by the old admin API. It must no
+        // longer be read: an operator upgrading with the file still on disk
+        // gets logthing.toml's values, not the stale override's.
+        let _guard = CONFIG_FILE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let path = std::path::Path::new("logthing.admin.toml");
+        std::fs::write(path, "bind_address = \"127.0.0.1:9999\"\n").unwrap();
+
+        let result = std::panic::catch_unwind(|| {
+            let cfg = Config::load().expect("load must succeed");
+            assert_ne!(
+                cfg.bind_address,
+                "127.0.0.1:9999".parse().unwrap(),
+                "logthing.admin.toml must not be a config source any more"
+            );
+        });
+
+        let _ = std::fs::remove_file(path);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    fn stale_admin_override_warning_fires_when_file_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("logthing.admin.toml"), "").unwrap();
+
+        assert!(stale_admin_override_warning(dir.path()).is_some());
+    }
+
+    #[test]
+    fn stale_admin_override_warning_is_none_when_file_absent() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(stale_admin_override_warning(dir.path()), None);
+    }
+
+    #[test]
+    fn validate_config_invariants_rejects_tls_without_cert() {
+        let mut cfg = Config::default();
+        cfg.tls.enabled = true;
+        cfg.tls.cert_file = None;
+        cfg.tls.key_file = None;
+
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert!(err.contains("tls.cert_file"), "got: {err}");
+        assert!(err.contains("tls.key_file"), "got: {err}");
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn validate_config_invariants_rejects_port_zero() {
+        let mut cfg = Config::default();
+        cfg.bind_address = "0.0.0.0:0".parse().unwrap();
+
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert!(err.contains("bind_address port cannot be 0"), "got: {err}");
     }
 
     #[test]

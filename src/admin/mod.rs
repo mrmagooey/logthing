@@ -20,7 +20,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::RwLock;
 
-    use crate::config::{Config, TlsConfig};
+    use crate::config::Config;
 
     async fn test_state() -> AdminState {
         let server_config = AdminServerConfig {
@@ -29,7 +29,6 @@ mod tests {
             password_hash: PasswordHash::hash("pass").unwrap(),
             allowed_ips: vec![],
             tls_config: None,
-            enable_csrf: false,
             enable_rate_limiting: false,
             trusted_header: None,
         };
@@ -38,11 +37,8 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             server_config,
             audit_logger: AuditLogger::new(100).await,
-            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
-            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-            ip_whitelist: crate::middleware::IpWhitelist::empty(),
         }
     }
 
@@ -105,19 +101,6 @@ mod tests {
         // trusted identity is already present.
         let result = auth::ensure_authorized(&state, trusted, None, client_ip).await;
         assert_eq!(result.unwrap(), "proxied-user");
-    }
-
-    #[tokio::test]
-    async fn write_config_outputs_toml() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("override.toml");
-        let cfg = Config::default();
-
-        config_api::write_config_to_path(&cfg, &path)
-            .await
-            .expect("write succeeds");
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("bind_address"));
     }
 
     #[tokio::test]
@@ -246,143 +229,11 @@ mod tests {
     mod auth_tests {
         use super::*;
 
-        #[tokio::test]
-        async fn generate_csrf_token_creates_valid_token() {
-            let state = test_state().await;
-            let token = auth::generate_csrf_token(&state).await;
-
-            assert!(!token.is_empty());
-            assert_eq!(token.len(), 32);
-
-            // Verify token is stored
-            let tokens = state.csrf_tokens.read().await;
-            assert!(tokens.iter().any(|(t, _)| t == &token));
-        }
-
-        #[tokio::test]
-        async fn verify_csrf_token_accepts_valid_token() {
-            let state = test_state().await;
-            let token = auth::generate_csrf_token(&state).await;
-
-            assert!(auth::verify_csrf_token(&state, &token).await);
-        }
-
-        #[tokio::test]
-        async fn verify_csrf_token_rejects_invalid_token() {
-            let mut state = test_state().await;
-            // Enable CSRF for this test
-            state.server_config.enable_csrf = true;
-
-            // Generate a valid token first
-            let valid_token = auth::generate_csrf_token(&state).await;
-
-            // Invalid token should be rejected
-            assert!(!auth::verify_csrf_token(&state, "invalid_token").await);
-
-            // But valid token should be accepted
-            assert!(auth::verify_csrf_token(&state, &valid_token).await);
-        }
-
-        #[tokio::test]
-        async fn verify_csrf_token_always_passes_when_disabled() {
-            let state = test_state().await;
-            // CSRF is disabled in test_state
-            assert!(auth::verify_csrf_token(&state, "any_token").await);
-        }
-
         #[test]
         fn unauthorized_returns_correct_response() {
             let response = auth::unauthorized();
             // Check it's a valid response type
             let _ = response;
-        }
-    }
-
-    // Config API tests
-    mod config_api_tests {
-        use super::*;
-        use axum::Json;
-        use axum::extract::{ConnectInfo, State};
-
-        #[tokio::test]
-        async fn persist_config_writes_to_file() {
-            // LOGTHING_ADMIN_OVERRIDE_FILE is process-global; serialize against every
-            // other test that touches it crate-wide (see config_api::test_support).
-            let _lock = config_api::test_support::lock_persist_config_env().await;
-
-            let dir = tempdir().unwrap();
-            let path = dir.path().join("test-admin.toml");
-            unsafe {
-                std::env::set_var("LOGTHING_ADMIN_OVERRIDE_FILE", &path);
-            }
-
-            let cfg = Config::default();
-            config_api::persist_config(&cfg)
-                .await
-                .expect("persist succeeds");
-
-            assert!(path.exists());
-            let contents = std::fs::read_to_string(&path).unwrap();
-            assert!(contents.contains("bind_address"));
-
-            unsafe {
-                std::env::remove_var("LOGTHING_ADMIN_OVERRIDE_FILE");
-            }
-        }
-
-        #[tokio::test]
-        async fn validate_config_detects_port_zero() {
-            let state = test_state().await;
-            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
-            let auth = None;
-
-            let invalid_config = Config {
-                bind_address: "127.0.0.1:0".parse().unwrap(),
-                tls: TlsConfig {
-                    enabled: false,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-
-            let result = config_api::validate_config(
-                State(state),
-                ConnectInfo(addr),
-                None,
-                None,
-                auth,
-                Json(invalid_config),
-            )
-            .await;
-
-            assert!(result.is_err());
-        }
-
-        #[tokio::test]
-        async fn diff_config_shows_no_changes_for_identical_configs() {
-            let state = test_state().await;
-            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-            use axum_extra::extract::TypedHeader;
-            use headers::Authorization;
-            let auth = Some(TypedHeader(Authorization::basic("user", "pass")));
-
-            let config = Config::default();
-
-            let Json(diff) = config_api::diff_config(
-                State(state),
-                ConnectInfo(addr),
-                None,
-                None,
-                auth,
-                Json(config),
-            )
-            .await
-            .expect("diff succeeds");
-
-            assert!(diff.changed.is_empty());
-            assert!(diff.added.is_empty());
-            assert!(diff.removed.is_empty());
         }
     }
 
@@ -535,81 +386,11 @@ mod tests {
                 password_hash: PasswordHash::hash("test").unwrap(),
                 allowed_ips: vec![],
                 tls_config: None,
-                enable_csrf: true,
                 enable_rate_limiting: true,
                 trusted_header: None,
             };
 
             let _cloned = config.clone();
-        }
-    }
-
-    // Middleware tests
-    mod middleware_tests {
-        use super::*;
-
-        #[tokio::test]
-        async fn csrf_middleware_allows_when_disabled() {
-            let state = test_state().await;
-            // CSRF is disabled by default in test_state
-            assert!(!state.server_config.enable_csrf);
-        }
-    }
-
-    // Additional config validation tests
-    mod config_validation_tests {
-        use super::*;
-
-        #[tokio::test]
-        async fn validate_config_detects_tls_cert_missing() {
-            let state = test_state().await;
-            use axum_extra::extract::TypedHeader;
-            use headers::Authorization;
-            let auth = TypedHeader(Authorization::basic("user", "pass"));
-            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-            let mut config = Config::default();
-            config.tls.enabled = true;
-            config.tls.cert_file = None;
-            config.tls.key_file = None;
-
-            let result = config_api::validate_config(
-                axum::extract::State(state),
-                axum::extract::ConnectInfo(addr),
-                None,
-                None,
-                Some(auth),
-                axum::Json(config),
-            )
-            .await;
-
-            // Should fail because TLS is enabled but cert/key files are missing
-            assert!(result.is_ok()); // Handler returns Ok, but result.valid is false
-        }
-
-        #[tokio::test]
-        async fn validate_config_accepts_valid_config() {
-            let state = test_state().await;
-            use axum_extra::extract::TypedHeader;
-            use headers::Authorization;
-            let auth = TypedHeader(Authorization::basic("user", "pass"));
-            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-            let mut config = Config::default();
-            config.tls.enabled = false; // Disable TLS to avoid cert validation
-
-            let axum::Json(result) = config_api::validate_config(
-                axum::extract::State(state),
-                axum::extract::ConnectInfo(addr),
-                None,
-                None,
-                Some(auth),
-                axum::Json(config),
-            )
-            .await
-            .expect("validation runs");
-
-            assert!(result.valid);
         }
     }
 
@@ -628,364 +409,14 @@ mod tests {
         }
     }
 
-    // Tests for config_api functions that weren't covered
-    mod config_api_extended_tests {
-        use super::*;
-
-        #[tokio::test]
-        async fn export_config_returns_toml_attachment() {
-            let state = test_state().await;
-            use axum_extra::extract::TypedHeader;
-            use headers::Authorization;
-            let auth = TypedHeader(Authorization::basic("user", "pass"));
-            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-            let response = config_api::export_config(
-                axum::extract::State(state),
-                axum::extract::ConnectInfo(addr),
-                None,
-                None,
-                Some(auth),
-            )
-            .await;
-
-            assert!(response.is_ok());
-            let resp = response.unwrap();
-            assert_eq!(resp.status(), 200);
-        }
-
-        #[tokio::test]
-        async fn import_config_rejects_invalid_content() {
-            let state = test_state().await;
-            use axum_extra::extract::TypedHeader;
-            use headers::Authorization;
-            let auth = TypedHeader(Authorization::basic("user", "pass"));
-            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-            let invalid_content = axum::body::Bytes::from_static(b"invalid toml content");
-
-            let result = config_api::import_config(
-                axum::extract::State(state),
-                axum::extract::ConnectInfo(addr),
-                None,
-                None,
-                Some(auth),
-                invalid_content,
-            )
-            .await;
-
-            assert!(result.is_err());
-        }
-
-        #[tokio::test]
-        async fn import_config_accepts_valid_toml() {
-            // import_config() persists on success; sandbox its write path so this
-            // doesn't clobber the real logthing.admin.toml in the repo root.
-            let _sandbox = config_api::test_support::sandbox_persist_config_path().await;
-
-            let state = test_state().await;
-            use axum_extra::extract::TypedHeader;
-            use headers::Authorization;
-            let auth = TypedHeader(Authorization::basic("user", "pass"));
-            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-            // Must explicitly disable TLS so validate_config_invariants passes
-            // (TLS without cert_file/key_file is an error as of H-7).
-            let toml_content = axum::body::Bytes::from_static(
-                br#"
-bind_address = "127.0.0.1:9999"
-
-[tls]
-enabled = false
-
-[logging]
-level = "debug"
-
-[metrics]
-enabled = true
-port = 9090
-"#,
-            );
-
-            let result = config_api::import_config(
-                axum::extract::State(state),
-                axum::extract::ConnectInfo(addr),
-                None,
-                None,
-                Some(auth),
-                toml_content,
-            )
-            .await;
-
-            assert!(result.is_ok());
-        }
-
-        #[tokio::test]
-        async fn reload_config_loads_from_disk() {
-            let state = test_state().await;
-            use axum_extra::extract::TypedHeader;
-            use headers::Authorization;
-            let auth = TypedHeader(Authorization::basic("user", "pass"));
-            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-            let result = config_api::reload_config(
-                axum::extract::State(state),
-                axum::extract::ConnectInfo(addr),
-                None,
-                None,
-                Some(auth),
-            )
-            .await;
-
-            // The on-disk config may be valid or invalid (e.g. tls.enabled=true without
-            // cert_file after H-7 hardening). Both outcomes are acceptable — what matters
-            // is that no panic occurs and the handler returns a well-formed response.
-            // If it is Ok we verify the body is non-empty; if it is Err we verify it is
-            // a proper HTTP error (not a panic/unwrap).
-            match result {
-                Ok(_) => { /* valid config loaded and applied — all good */ }
-                Err(_) => { /* invalid config on disk correctly rejected */ }
-            }
-        }
-    }
-
     // Integration tests for routes
     mod route_integration_tests {
         use super::*;
-        use axum::Json;
 
         #[tokio::test]
         async fn health_check_returns_ok() {
             let response = routes::health_check().await;
             assert_eq!(response, "OK");
-        }
-
-        #[tokio::test]
-        async fn config_diff_detects_changes() {
-            let state = test_state().await;
-            use axum_extra::extract::TypedHeader;
-            use headers::Authorization;
-            let auth = TypedHeader(Authorization::basic("user", "pass"));
-            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-            // Test with modified config
-            let config = Config {
-                bind_address: "127.0.0.1:9999".parse().unwrap(),
-                ..Default::default()
-            };
-
-            let Json(result) = config_api::diff_config(
-                axum::extract::State(state),
-                axum::extract::ConnectInfo(addr),
-                None,
-                None,
-                Some(auth),
-                axum::Json(config),
-            )
-            .await
-            .expect("diff succeeds");
-
-            // Should detect bind_address changed
-            assert!(!result.changed.is_empty() || !result.unchanged.is_empty());
-        }
-
-        #[tokio::test]
-        async fn validate_config_detects_missing_tls_files() {
-            let state = test_state().await;
-            use axum_extra::extract::TypedHeader;
-            use headers::Authorization;
-            let auth = TypedHeader(Authorization::basic("user", "pass"));
-            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-            let mut config = Config::default();
-            config.tls.enabled = true;
-            config.tls.cert_file = None;
-            config.tls.key_file = None;
-
-            let Json(result) = config_api::validate_config(
-                axum::extract::State(state),
-                axum::extract::ConnectInfo(addr),
-                None,
-                None,
-                Some(auth),
-                axum::Json(config),
-            )
-            .await
-            .expect("validation runs");
-
-            assert!(!result.valid);
-            assert!(!result.errors.is_empty());
-        }
-    }
-
-    // Additional validation tests
-    mod additional_validation_tests {
-        use super::*;
-        use axum::Json;
-        use axum_extra::extract::TypedHeader;
-        use headers::Authorization;
-
-        #[tokio::test]
-        async fn validate_config_with_metrics_port_zero() {
-            let state = test_state().await;
-            let auth = TypedHeader(Authorization::basic("user", "pass"));
-            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-            let mut config = Config::default();
-            config.metrics.enabled = true;
-            config.metrics.port = 0;
-
-            let Json(result) = config_api::validate_config(
-                axum::extract::State(state),
-                axum::extract::ConnectInfo(addr),
-                None,
-                None,
-                Some(auth),
-                axum::Json(config),
-            )
-            .await
-            .expect("validation runs");
-
-            assert!(
-                result
-                    .warnings
-                    .iter()
-                    .any(|w: &String| w.contains("Metrics port"))
-            );
-        }
-
-        #[tokio::test]
-        async fn validate_config_with_syslog_both_ports_zero() {
-            let state = test_state().await;
-            let auth = TypedHeader(Authorization::basic("user", "pass"));
-            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-            let mut config = Config::default();
-            config.syslog.enabled = true;
-            config.syslog.udp_port = 0;
-            config.syslog.tcp_port = 0;
-
-            let Json(result) = config_api::validate_config(
-                axum::extract::State(state),
-                axum::extract::ConnectInfo(addr),
-                None,
-                None,
-                Some(auth),
-                axum::Json(config),
-            )
-            .await
-            .expect("validation runs");
-
-            assert!(
-                result
-                    .warnings
-                    .iter()
-                    .any(|w: &String| w.contains("Syslog is enabled"))
-            );
-        }
-
-        #[tokio::test]
-        async fn validate_config_with_port_conflict() {
-            let state = test_state().await;
-            let auth = TypedHeader(Authorization::basic("user", "pass"));
-            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-            let config = Config {
-                bind_address: state.server_config.bind_address,
-                ..Default::default()
-            };
-
-            let Json(result) = config_api::validate_config(
-                axum::extract::State(state),
-                axum::extract::ConnectInfo(addr),
-                None,
-                None,
-                Some(auth),
-                axum::Json(config),
-            )
-            .await
-            .expect("validation runs");
-
-            assert!(
-                result
-                    .warnings
-                    .iter()
-                    .any(|w: &String| w.contains("conflicts with admin"))
-            );
-        }
-
-        #[tokio::test]
-        async fn validate_config_with_tls_ca_required() {
-            let state = test_state().await;
-            let auth = TypedHeader(Authorization::basic("user", "pass"));
-            let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-            let mut config = Config::default();
-            config.tls.enabled = true;
-            config.tls.require_client_cert = true;
-            config.tls.ca_file = None;
-            let temp_dir = std::env::temp_dir();
-            config.tls.cert_file = Some(temp_dir.join("cert.pem"));
-            config.tls.key_file = Some(temp_dir.join("key.pem"));
-
-            let Json(result) = config_api::validate_config(
-                axum::extract::State(state),
-                axum::extract::ConnectInfo(addr),
-                None,
-                None,
-                Some(auth),
-                axum::Json(config),
-            )
-            .await
-            .expect("validation runs");
-
-            assert!(!result.valid);
-            assert!(
-                result
-                    .errors
-                    .iter()
-                    .any(|e: &String| e.contains("ca_file is not set"))
-            );
-        }
-    }
-
-    // Tests for PartialConfigUpdate
-    mod partial_config_tests {
-        use super::*;
-        use axum_extra::extract::TypedHeader;
-        use headers::Authorization;
-
-        #[tokio::test]
-        async fn update_config_persists_changes() {
-            // LOGTHING_ADMIN_OVERRIDE_FILE is process-global; serialize against every
-            // other test that touches it crate-wide (see config_api::test_support).
-            let _lock = config_api::test_support::lock_persist_config_env().await;
-
-            let dir = tempdir().unwrap();
-            let path = dir.path().join("test-config.toml");
-            unsafe {
-                std::env::set_var("LOGTHING_ADMIN_OVERRIDE_FILE", &path);
-            }
-
-            let _state = test_state().await;
-            let _auth = TypedHeader(Authorization::basic("user", "pass"));
-            let _addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-            let new_config = Config::default();
-
-            // Test that update would be attempted
-            // Note: can't call update_config directly as it's in routes.rs
-            // Just verify persist would work
-            let result = config_api::persist_config(&new_config).await;
-
-            // May fail due to file permissions, but shouldn't panic
-            if result.is_ok() {
-                assert!(path.exists() || !path.exists())
-            }
-
-            unsafe {
-                std::env::remove_var("LOGTHING_ADMIN_OVERRIDE_FILE");
-            }
         }
     }
 }

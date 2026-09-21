@@ -68,6 +68,22 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   emission rate (`BLACKHOLE=1`, no receiver) across 1/2/4 concurrent
   processes, independent of any server, so a generator ceiling is never
   mistaken for a server one.
+- Startup config validation (`validate_config_invariants`, called from
+  `Config::load()`): TLS enabled without `tls.cert_file`/`tls.key_file`, a
+  zero `bind_address` port, a zero `security.max_connections` or
+  `security.connection_timeout_secs`, and a malformed `security.allowed_ips`
+  entry now all fail the process immediately at startup. For TLS-without-cert
+  and a zero `max_connections`/`connection_timeout_secs`, this just moves an
+  existing failure earlier: previously these were only caught when the
+  config-write endpoints (now removed) accepted a change, or not at all if
+  the same bad value came from `logthing.toml` or an environment variable at
+  startup — they'd instead fail later, downstream, in `build_tls_config` or
+  `create_router`. The zero `bind_address` port check is new strictness, not
+  an earlier surfacing of an existing failure: `TcpListener::bind` on port 0
+  always succeeds (the OS assigns an ephemeral port), so previously a
+  deployment with `bind_address` port 0 started fine, just confusingly
+  logging `:0` while actually listening on a different, unlogged port. An
+  operator who relied on that behaviour will now fail to start.
 
 ### Fixed
 
@@ -90,12 +106,50 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ### Removed
 
+- **BREAKING**: The admin interface is now read-only end to end. `PUT`/`PATCH
+  /config` and `POST /config/{validate,diff,export,import,reload}`, and the
+  configuration-editing form on the admin page, are all removed; those
+  routes now return `405`/`404`. The surviving routes (`GET /config`,
+  `/stats`, `/stats.json`, `/audit-log`, `/health`, and the admin page
+  itself) are unchanged. The admin page now renders the redacted effective
+  config as TOML, the list of `LOGTHING__*` variable **names** currently
+  set, the audit log, and a link to `/stats` — nothing on it is editable.
+  Configuration is set with `LOGTHING__*` environment variables layered over
+  `logthing.toml` and `/etc/logthing/config` (environment variables win);
+  `security.allowed_ips` and `aggregate.rules` have no environment-variable
+  equivalent and remain file-only (the first is a list, the second a list of
+  tables — the env loader supports neither shape).
 - `scripts/repeat-ipfix-loopback-loss.sh` — replaced by
   `scripts/max-ingest-rate.sh`, which generalizes the same restart-per-run,
   zeroed-counter, kernel-drop-reconciling approach across all seven formats
   and drops two defects: a `pkill -f` that could kill the invoking shell
   instead of the server, and a cleanup step that deleted the tracked
   `logthing.admin.toml`.
+- The admin web interface's CSRF middleware, CSRF-token generation, and
+  the `LOGTHING_ADMIN_ENABLE_CSRF` env var. Every surviving admin route is
+  a `GET` (the config-write endpoints were removed in an earlier change),
+  so there is nothing left to forge.
+- `IpWhitelist::set_networks` and `FlushIntervalRegistry::set_secs`, the
+  last of the admin API's live-apply plumbing — their only callers were
+  the now-deleted config-write handlers. **BREAKING**: `security.allowed_ips`,
+  `hec.token`, and every sink's `flush_interval_secs` are now restart-only;
+  changing them in `logthing.toml`, an `/etc/logthing/config` drop-in, or a
+  `LOGTHING__*` env var requires restarting the process to take effect.
+  `syslog.http_token` and `otlp.bearer_token` are affected the same way,
+  for the same underlying reason: both were only ever "live" because the
+  now-deleted config-write endpoints could swap the shared, in-memory
+  `Config` at runtime; with no code path left that ever writes to it after
+  startup, every field the admin API used to touch — not only the three
+  above — now behaves like `bind_address` or `tls.*` always did.
+- `admin::spawn_admin_server` dropped its `flush_registry` and
+  `ip_whitelist` parameters (now just `(config, source_stats)`) — internal
+  API, no config changes required.
+- `logthing.admin.toml` as a configuration source. The tracked copy is
+  deleted; `Config::load()` no longer reads it at all, and a leftover file
+  found on disk produces a startup `WARN` (not an error) naming the file
+  and pointing at `LOGTHING__*`/`logthing.toml` as the replacement. Move
+  any settings the file held into `logthing.toml` or `LOGTHING__*` before
+  upgrading — they are silently ignored otherwise, not merged.
 
 ## [0.19.1] - 2026-09-16
 

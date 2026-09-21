@@ -80,12 +80,7 @@ async fn async_main() -> anyhow::Result<()> {
     let shared_config = Arc::new(RwLock::new(config.clone()));
     let source_stats = Arc::new(stats::SourceHourlyStats::new());
     let flush_registry = forwarding::flush_registry::FlushIntervalRegistry::new();
-    admin::spawn_admin_server(
-        shared_config.clone(),
-        source_stats.clone(),
-        flush_registry.clone(),
-        ip_whitelist.clone(),
-    );
+    admin::spawn_admin_server(shared_config.clone(), source_stats.clone());
     let throughput = Arc::new(stats::ThroughputStats::new());
 
     // Shutdown watch channel — send `true` to trigger graceful shutdown.

@@ -56,7 +56,6 @@ To generate a hashed password, use the Argon2 CLI tool or a compatible library.
 All admin interface actions are logged with timestamps and user information:
 
 - Configuration reads (`CONFIG_READ`)
-- Configuration updates (`CONFIG_UPDATED`, `CONFIG_UPDATE_FAILED`)
 - Failed authentication attempts (`AUTH_FAILED`)
 - Admin page access (`ADMIN_PAGE_ACCESS`)
 - Audit log reads (`AUDIT_LOG_READ`)
@@ -64,7 +63,8 @@ All admin interface actions are logged with timestamps and user information:
 Audit logs are available:
 - In the application logs (standard logging)
 - Via the `/audit-log` API endpoint
-- In the admin UI (View Audit Log button)
+- In the admin UI, rendered automatically under "Recent Audit Log" on the
+  admin page (`GET /`) — there is no separate button
 
 ### 6. Rate Limiting
 
@@ -77,18 +77,7 @@ LOGTHING_ADMIN_ENABLE_RATE_LIMIT=true
 
 Default: 30 requests per minute per IP address. Returns `429 Too Many Requests` when exceeded.
 
-### 7. CSRF Protection
-
-Cross-Site Request Forgery tokens are generated for form submissions:
-
-```bash
-# Enable/disable CSRF protection (default: true)
-LOGTHING_ADMIN_ENABLE_CSRF=true
-```
-
-The CSRF token is embedded in the admin page and validated on form submissions.
-
-### 8. Trusted Reverse-Proxy Header Auth (Authentik)
+### 7. Trusted Reverse-Proxy Header Auth (Authentik)
 
 The admin interface can trust identity headers injected by a reverse-proxy
 forward-auth setup (e.g. an Authentik outpost), as an alternative to typing
@@ -141,24 +130,46 @@ rate-limited IP — the shared secret is what makes `X-Forwarded-For`
 trustworthy at all, but only if the proxy guarantees the header it forwards
 is proxy-authored, not attacker-authored.
 
+## Read-only interface
+
+The admin interface no longer writes configuration. Every surviving route is
+a `GET`. `GET /` renders a server-rendered, read-only console showing the
+redacted effective config as TOML, the list of `LOGTHING__*` environment
+variable **names** currently set (never their values), the audit log, and a
+link to `/stats`.
+
+`PUT`/`PATCH /config` and `POST /config/{validate,diff,export,import,reload}`
+have been **removed** — they return `405`/`404` now. Configuration is
+changed by editing `logthing.toml` (or an `/etc/logthing/config` drop-in) or
+setting `LOGTHING__*` environment variables, layered over the file, with
+environment variables winning; both require a restart to take effect.
+`security.allowed_ips` and `aggregate.rules` have **no environment-variable
+equivalent** and remain file-only — the first is a list and the loader sets
+no list separator, the second is a list of tables. Setting
+`LOGTHING__SECURITY__ALLOWED_IPS` does nothing.
+
+Because there are no state-changing routes left, there is nothing left to
+protect against a forged form submission, so the token-based protection for
+that threat and its associated environment variable have been removed (see
+the CHANGELOG).
+
+**Every field is now restart-only.** `hec.token`, `syslog.http_token`,
+`otlp.bearer_token`, `security.allowed_ips`, and every sink's
+`flush_interval_secs` used to be read live from the shared, admin-writable
+config, so an update via `PUT /config`/`/config/reload`/`/config/import` took
+effect on the next request with no restart. Those write endpoints are gone
+and nothing else ever mutates the running config after startup, so every one
+of those fields now behaves like the rest: a change requires a restart to
+take effect. See the CHANGELOG for the breaking-change details.
+
 ## API Endpoints
 
 - `GET /` - Admin web interface (requires authentication)
 - `GET /health` - Health check endpoint (no authentication required)
-- `GET /config` - Get current configuration (requires authentication)
-- `PUT /config` - Update configuration (requires authentication)
-- `POST /config/reload` - Re-read configuration from disk (requires authentication)
-- `POST /config/import` - Import a full configuration file (requires authentication)
+- `GET /config` - Get current (redacted) configuration (requires authentication)
+- `GET /stats` - Ingestion statistics page (requires authentication)
+- `GET /stats.json` - Ingestion statistics as JSON (requires authentication)
 - `GET /audit-log` - Get audit log entries (requires authentication)
-
-**Not every accepted change takes effect immediately.** `PUT /config`, `/config/reload`,
-and `/config/import` all validate, persist to disk, swap the in-memory config, and audit
-the change (`CONFIG_UPDATED` / `CONFIG_RELOADED` / `CONFIG_IMPORTED`) — but most fields
-(bind addresses, TLS, ports, Kerberos, ...) only take effect on the next process restart.
-`hec.token`, `syslog.http_token`, `otlp.bearer_token`, `security.allowed_ips`, and every
-`flush_interval_secs` are the exception: those are applied LIVE, with no restart, to every
-consumer (including the five wire-protocol listeners for `allowed_ips`). See "Live vs.
-restart-required config changes" in the main README for the full field list.
 
 ## Environment Variables Summary
 
@@ -171,7 +182,6 @@ restart-required config changes" in the main README for the full field list.
 | `LOGTHING_ADMIN_ALLOWED_IPS` | Comma-separated allowed IPs/CIDRs | - |
 | `LOGTHING_ADMIN_TLS_CERT` | TLS certificate file path | - |
 | `LOGTHING_ADMIN_TLS_KEY` | TLS private key file path | - |
-| `LOGTHING_ADMIN_ENABLE_CSRF` | Enable CSRF protection | `true` |
 | `LOGTHING_ADMIN_ENABLE_RATE_LIMIT` | Enable rate limiting | `true` |
 | `LOGTHING_ADMIN_TRUST_PROXY_HEADERS` | Enable trusted reverse-proxy header auth | `false` |
 | `LOGTHING_ADMIN_TRUSTED_HEADER` | Header carrying the trusted username | `X-authentik-username` |
