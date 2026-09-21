@@ -26,20 +26,36 @@
 //!   known host count. A single window's value is noisy (see the doc on
 //!   `cardinality_window_secs` for why the default window is an hour, not a
 //!   few minutes).
+//! - Two distinct values that share the same first `MAX_GROUP_VALUE_BYTES`
+//!   (256) bytes collapse into one tracked entry — `group_value_string`
+//!   truncates before this module ever sees the value (see `fields.rs`'s
+//!   own disclosure of the same truncation for the aggregator). This
+//!   undercounts, same direction as cap saturation, but is essentially
+//!   never reached by an IP-shaped field like `id.orig_h`.
 //!
 //! # Structurally zeek-only, structurally single-stream
 //!
-//! There is no `source` config key — watching a non-zeek field is out of
-//! scope, not validated away. There is also no "every stream" mode: the
-//! stream a watch counts on is required whenever a field is configured
+//! ponytail: there is no `source` config key — watching a non-zeek field is
+//! out of scope, not validated away, and there is no "every stream" mode:
+//! the stream a watch counts on is required whenever a field is configured
 //! (counting one field name across every stream at once would conflate
 //! e.g. `conn`'s and `dns`'s `id.orig_h` into one number with no way to
-//! tell which stream contributed it). Mirrors `forwarding::aggregate`'s
-//! compile-then-consume shape: [`compile_watch`] validates config at
-//! startup, fatal on a bad watch (`aggregate::compile_rules` is the
-//! precedent — a watch that silently never matches is worse than a startup
-//! error), and [`CardinalityWatcher::observe`] is the per-record hot path,
-//! called from `zeek::listener` alongside `zeek_records_received`.
+//! tell which stream contributed it). Ceiling: exactly one watch, exactly
+//! one source (zeek), exactly one stream. Upgrade path: wiring a second
+//! source needs that source's own `AggFields` impl (already exists for all
+//! five sources in `forwarding::aggregate::fields`), a matching config knob
+//! alongside `cardinality_watch_field`/`_stream`, and one
+//! `watcher.observe(&record)` call at that source's listener observation
+//! point, mirroring zeek's; supporting more than one watch needs
+//! `CardinalityWatcher` to hold a `Vec` of watch state instead of one, and
+//! `compile_watch` to become `compile_watches` (an earlier draft of this
+//! module did exactly that before design review cut it back to one — see
+//! git history). Mirrors `forwarding::aggregate`'s compile-then-consume
+//! shape: [`compile_watch`] validates config at startup, fatal on a bad
+//! watch (`aggregate::compile_rules` is the precedent — a watch that
+//! silently never matches is worse than a startup error), and
+//! [`CardinalityWatcher::observe`] is the per-record hot path, called from
+//! `zeek::listener` alongside `zeek_records_received`.
 //!
 //! In-memory only, same as every other stat in this module — resets on
 //! restart (see the doc comment on `SourceHourlyStats`).
@@ -68,15 +84,18 @@ pub struct CompiledWatch {
     pub field: String,
 }
 
-/// Validate `config.metrics.cardinality_watch_field` (and the stream/window
-/// knobs it enables). Returns `None` when `cardinality_watch_field` is
-/// unset (feature off). Every failure is fatal at startup: a bad field name
-/// would leave an operator staring at a gauge stuck at 0 with no error
-/// telling them why, an unset stream would silently mean "watch nothing
-/// representable" (see the module doc's "structurally single-stream"
-/// section), and a zero window would panic later when
-/// `tokio::time::interval` is constructed — see `aggregate::compile_rules`'s
-/// `flush_interval_secs == 0` check for the exact same trap.
+/// Validate `config.metrics.cardinality_watch_field` (and the
+/// stream/window/cap knobs it enables). Returns `None` when
+/// `cardinality_watch_field` is unset (feature off). Every failure is fatal
+/// at startup: a bad field name would leave an operator staring at a gauge
+/// stuck at 0 with no error telling them why, an unset stream would
+/// silently mean "watch nothing representable" (see the module doc's
+/// "structurally single-stream" section), a zero window would panic later
+/// when `tokio::time::interval` is constructed — see
+/// `aggregate::compile_rules`'s `flush_interval_secs == 0` check for the
+/// exact same trap — and a zero cap would pin the gauge at 0 forever, which
+/// reads identically to "ingestion is dead" (see the `cardinality_max_values
+/// == 0` check below, matching `compile_rules`'s `max_groups == 0` check).
 pub fn compile_watch(config: &Config) -> anyhow::Result<Option<CompiledWatch>> {
     let cfg = &config.metrics;
     let Some(field) = cfg.cardinality_watch_field.as_ref() else {
@@ -98,6 +117,14 @@ pub fn compile_watch(config: &Config) -> anyhow::Result<Option<CompiledWatch>> {
              panics on a zero period)"
         );
     }
+    if cfg.cardinality_max_values == 0 {
+        anyhow::bail!(
+            "[metrics] cardinality_max_values must be greater than 0 (0 pins \
+             field_distinct_values at 0 forever while field_distinct_values_capped climbs — \
+             indistinguishable from ingestion being completely dead, the exact misreading this \
+             feature exists to prevent)"
+        );
+    }
     Ok(Some(CompiledWatch {
         stream,
         field: field.clone(),
@@ -110,8 +137,6 @@ pub struct CardinalityWatcher {
     field: String,
     values: DashSet<String>,
     max_values: usize,
-    distinct: metrics::Gauge,
-    capped: metrics::Counter,
     // Req 5: distinguish "misconfigured field name" from "ingestion is
     // down" — both otherwise look identical (gauge stuck at 0). Set (not
     // incremented) on the hot path, so `observe` stays a single atomic
@@ -123,21 +148,11 @@ pub struct CardinalityWatcher {
 
 impl CardinalityWatcher {
     pub fn new(watch: CompiledWatch, max_values: usize) -> Self {
-        let distinct = metrics::gauge!("field_distinct_values",
-            "stream" => watch.stream.clone(),
-            "field" => watch.field.clone()
-        );
-        let capped = metrics::counter!("field_distinct_values_capped",
-            "stream" => watch.stream.clone(),
-            "field" => watch.field.clone()
-        );
         Self {
             stream: watch.stream,
             field: watch.field,
             values: DashSet::new(),
             max_values,
-            distinct,
-            capped,
             matched_this_window: AtomicBool::new(false),
             field_seen_this_window: AtomicBool::new(false),
         }
@@ -154,6 +169,17 @@ impl CardinalityWatcher {
         }
         self.matched_this_window.store(true, Ordering::Relaxed);
 
+        // ponytail: `group_value_string` heap-allocates (and truncates) the
+        // value BEFORE the `contains` check below, so an already-tracked
+        // value — the common case once the set has warmed up — still pays
+        // an allocation that is immediately dropped. Same trade this
+        // module's sibling `Aggregator::consume` makes for its group key
+        // (`forwarding/aggregate/mod.rs`, `AggState` doc comment). Upgrade
+        // path: `truncate_to_bytes` alone does not allocate, so a
+        // `contains(&truncated)` check could run first and only call
+        // `group_value_string` on a genuine miss — at the cost of bypassing
+        // `group_value_string`'s `Str` branch (which reuses an owned
+        // `String`'s buffer rather than allocating fresh).
         let Some(value) = rec.field(&self.field).map(group_value_string) else {
             return;
         };
@@ -168,7 +194,17 @@ impl CardinalityWatcher {
         // than closed with a Mutex that would serialize this hot path.
         if !self.values.contains(&value) {
             if self.values.len() >= self.max_values {
-                self.capped.increment(1);
+                // Resolved per-call, not cached on `self`: `CardinalityWatcher::new`
+                // runs before `metrics::set_global_recorder` in production
+                // (`main.rs` constructs it, `start_metrics_server` installs the
+                // recorder later, on the `server.run(...)` path) — a handle
+                // captured at construction time binds to the no-op recorder
+                // forever. This only runs on a cap miss, not the hot path.
+                metrics::counter!("field_distinct_values_capped",
+                    "stream" => self.stream.clone(),
+                    "field" => self.field.clone()
+                )
+                .increment(1);
             } else {
                 self.values.insert(value);
             }
@@ -191,7 +227,14 @@ impl CardinalityWatcher {
     // boundary end to end (`zeek::listener::tests`) needs to call this
     // directly rather than waiting out a real interval.
     pub(crate) fn tick(&self) {
-        self.distinct.set(self.values.len() as f64);
+        // Resolved per-call, not cached on `self` — see the matching comment
+        // in `observe`'s cap-miss branch. This only runs once per window, so
+        // resolving the handle here instead of caching it costs nothing.
+        metrics::gauge!("field_distinct_values",
+            "stream" => self.stream.clone(),
+            "field" => self.field.clone()
+        )
+        .set(self.values.len() as f64);
         self.values.clear();
 
         // Req 5: records matched this watch's stream filter, but the
@@ -213,8 +256,19 @@ impl CardinalityWatcher {
     }
 
     /// Spawn the window ticker: publishes and clears every `window_secs`,
-    /// and once more on shutdown so a partial window is not lost. Mirrors
-    /// `Aggregator::spawn_emit_task`.
+    /// and once more on shutdown so a partial window is not lost.
+    ///
+    /// Unlike `Aggregator::spawn_emit_task` (`forwarding/aggregate/mod.rs`),
+    /// this does NOT sleep and take a second pass after that final tick.
+    /// `spawn_emit_task`'s second pass exists because Zeek/Suricata
+    /// per-connection tasks are detached and keep handing `consume()`
+    /// records to the aggregator for a couple of seconds after the
+    /// shutdown signal — missing those would mean durable S3 rows silently
+    /// never written, real data loss. Here a miss only means a gauge
+    /// value on a `/metrics` endpoint that is itself about to stop being
+    /// scraped, and this state resets on restart anyway (see the module
+    /// doc). So: values observed after the shutdown signal fires may not
+    /// reach the final gauge publish — accepted, not mirrored.
     pub fn spawn_ticker(
         self: Arc<Self>,
         window_secs: u64,
@@ -392,6 +446,14 @@ mod tests {
         assert!(err.contains("window"), "got: {err}");
     }
 
+    #[test]
+    fn compile_watch_rejects_a_zero_cap() {
+        let mut cfg = config_with(Some("id.orig_h"), Some("conn"));
+        cfg.metrics.cardinality_max_values = 0;
+        let err = compile_watch(&cfg).unwrap_err().to_string();
+        assert!(err.contains("cardinality_max_values"), "got: {err}");
+    }
+
     // -- CardinalityWatcher: the capped set --
 
     #[test]
@@ -462,6 +524,34 @@ mod tests {
         assert_eq!(
             counter_value(&snapshotter, "field_distinct_values_capped"),
             0
+        );
+    }
+
+    /// Two distinct values sharing the same first `MAX_GROUP_VALUE_BYTES`
+    /// bytes are truncated by `group_value_string` before this module ever
+    /// sees them, so they collapse into ONE tracked entry — pins the
+    /// undercount caveat documented in the module doc's "Reading the gauge"
+    /// section as tested behaviour, not just a comment.
+    #[test]
+    #[allow(clippy::mutable_key_type)]
+    fn values_sharing_a_256_byte_prefix_merge_into_one_distinct_value() {
+        use crate::forwarding::aggregate::fields::MAX_GROUP_VALUE_BYTES;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let w = CardinalityWatcher::new(watch("conn", "id.orig_h"), 100);
+        let prefix = "a".repeat(MAX_GROUP_VALUE_BYTES);
+        w.observe(&rec("conn", &format!("{prefix}-tail-one")));
+        w.observe(&rec("conn", &format!("{prefix}-tail-two")));
+        w.tick();
+
+        assert_eq!(
+            gauge_value(&snapshotter, "field_distinct_values"),
+            1.0,
+            "two values differing only past the {MAX_GROUP_VALUE_BYTES}-byte truncation \
+             boundary must merge into a single tracked value, not count as two"
         );
     }
 

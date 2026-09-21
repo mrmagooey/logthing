@@ -201,10 +201,14 @@ pub struct MetricsConfig {
     /// Requires `cardinality_watch_stream` to also be set — see that field's
     /// doc comment.
     ///
-    /// Structurally zeek-only: there is no `source` key. Watching a
-    /// different source would need that source's own config knob plus one
-    /// `watcher.observe(&record)` call at its listener's observation point
-    /// (see `stats::cardinality`'s module doc) — not attempted here.
+    /// ponytail: structurally zeek-only, structurally single-watch — there
+    /// is no `source` key and only one field/stream pair may be configured.
+    /// Ceiling: exactly one watch, on zeek only. Upgrade path: watching a
+    /// different source needs that source's own config knob plus one
+    /// `watcher.observe(&record)` call at its listener's observation point;
+    /// watching more than one field needs `CardinalityWatcher` to hold a
+    /// list of watches instead of one (see `stats::cardinality`'s module
+    /// doc for the full breakdown) — not attempted here.
     ///
     /// `id.orig_h` (this repo's shipped example, commented out in
     /// `logthing.toml`) is an IP, not a stable host identity: DHCP churn,

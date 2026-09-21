@@ -126,25 +126,16 @@ async fn field_distinct_values_visible_on_real_metrics_endpoint_after_a_window_b
             .expect("server run must not error");
     });
 
-    // `CardinalityWatcher::new` resolves its gauge/counter handles ONCE, at
-    // construction (mirrors `Aggregator`'s `RuleMetrics` — see that type's
-    // doc comment), rather than re-resolving on every `observe()` call. The
-    // `metrics` crate binds a handle to whatever recorder is installed at
-    // the moment of that resolving call; a handle resolved before a
-    // recorder is installed binds to a permanent no-op recorder instead,
-    // and installing the real one afterwards does not retroactively fix it.
-    // `Server::run` installs the real Prometheus recorder from inside a
-    // spawned task (`start_metrics_server`), so — same as `main.rs` must —
-    // wait for that install to actually happen (observable via the
-    // process-global `METRICS_HANDLE`) before constructing the watcher.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while logthing::server::METRICS_HANDLE.get().is_none() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "Prometheus recorder was never installed within 10s"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // `CardinalityWatcher` resolves its gauge/counter handles fresh via the
+    // `metrics::gauge!`/`counter!` macros at each use site (`tick`'s gauge
+    // set, `observe`'s cap-miss branch) rather than caching them on `self` —
+    // see the comments at those call sites. That is what makes it safe to
+    // construct the watcher here in the SAME order `main.rs` does: before
+    // `Server::run` has spawned `start_metrics_server` and installed the
+    // real Prometheus recorder. A cached handle resolved this early would
+    // bind to the no-op recorder permanently; a macro call resolves against
+    // whatever recorder is installed *at that later moment*, so it is fine
+    // for construction to race the recorder install.
 
     // --- Build the CardinalityWatcher the same way main.rs does: validate
     // config, construct, spawn its window ticker. ---
@@ -275,19 +266,21 @@ async fn field_distinct_values_visible_on_real_metrics_endpoint_after_a_window_b
          record's id.orig_h must have been excluded by the stream filter. Full body:\n{body}"
     );
 
-    // The capped counter must be present (config-derived label, always
-    // registered) and zero — nothing exceeded the default cap.
-    let capped = find_metric_value(
-        &body,
-        "field_distinct_values_capped{stream=\"conn\",field=\"id.orig_h\"} ",
-    )
-    .unwrap_or_else(|| {
-        panic!(
-            "field_distinct_values_capped{{stream=\"conn\",field=\"id.orig_h\"}} missing \
-                 from /metrics. Full body:\n{body}"
+    // The capped counter's handle is resolved only on a cap miss inside
+    // `observe` (not cached, not touched by `tick`), so a series that never
+    // hit the cap is never recorded and must not appear on the scrape at
+    // all (a described-but-unrecorded metric emits no line — see
+    // `metrics_descriptions`'s module doc). Nothing exceeded the default
+    // cap in this test.
+    assert!(
+        find_metric_value(
+            &body,
+            "field_distinct_values_capped{stream=\"conn\",field=\"id.orig_h\"} ",
         )
-    });
-    assert_eq!(capped, 0.0, "nothing exceeded the cap in this test");
+        .is_none(),
+        "field_distinct_values_capped must not appear on the scrape when the cap was never \
+             hit. Full body:\n{body}"
+    );
 
     // --- Clean shutdown ---
     zeek_shutdown_tx

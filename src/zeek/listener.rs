@@ -826,9 +826,11 @@ mod tests {
         };
 
         // Before the window boundary, `observe()` has only updated the
-        // internal set — the gauge itself (registered at construction, like
-        // every `metrics::gauge!()` call) must still read its untouched
-        // initial value, not the 2 distinct values already observed.
+        // internal set — `tick()` is what resolves and sets the gauge
+        // handle (not cached on the watcher, see `CardinalityWatcher::tick`),
+        // so the series does not exist in the recorder yet and `read`'s
+        // `unwrap_or(0.0)` fallback is what's being exercised here, not an
+        // untouched-but-registered initial value.
         assert_eq!(
             read(&snapshotter.snapshot().into_hashmap()),
             0.0,
