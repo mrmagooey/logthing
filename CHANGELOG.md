@@ -68,6 +68,15 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   emission rate (`BLACKHOLE=1`, no receiver) across 1/2/4 concurrent
   processes, independent of any server, so a generator ceiling is never
   mistaken for a server one.
+- Startup config validation (`validate_config_invariants`, called from
+  `Config::load()`): TLS enabled without `tls.cert_file`/`tls.key_file`, a
+  zero `bind_address` port, a zero `security.max_connections` or
+  `security.connection_timeout_secs`, and a malformed `security.allowed_ips`
+  entry now all fail the process immediately at startup. Previously these
+  were only caught when the config-write endpoints (now removed) accepted a
+  change, or not at all if the same bad value came from `logthing.toml` or
+  an environment variable at startup — a bad `bind_address` port, for
+  example, previously surfaced only when the listener tried to bind it.
 
 ### Fixed
 
@@ -90,6 +99,19 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ### Removed
 
+- **BREAKING**: The admin interface is now read-only end to end. `PUT`/`PATCH
+  /config` and `POST /config/{validate,diff,export,import,reload}`, and the
+  configuration-editing form on the admin page, are all removed; those
+  routes now return `405`/`404`. The surviving routes (`GET /config`,
+  `/stats`, `/stats.json`, `/audit-log`, `/health`, and the admin page
+  itself) are unchanged. The admin page now renders the redacted effective
+  config as TOML, the list of `LOGTHING__*` variable **names** currently
+  set, the audit log, and a link to `/stats` — nothing on it is editable.
+  Configuration is set with `LOGTHING__*` environment variables layered over
+  `logthing.toml` and `/etc/logthing/config` (environment variables win);
+  `security.allowed_ips` and `aggregate.rules` have no environment-variable
+  equivalent and remain file-only (the first is a list, the second a list of
+  tables — the env loader supports neither shape).
 - `scripts/repeat-ipfix-loopback-loss.sh` — replaced by
   `scripts/max-ingest-rate.sh`, which generalizes the same restart-per-run,
   zeroed-counter, kernel-drop-reconciling approach across all seven formats
@@ -106,9 +128,21 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   `hec.token`, and every sink's `flush_interval_secs` are now restart-only;
   changing them in `logthing.toml`, an `/etc/logthing/config` drop-in, or a
   `LOGTHING__*` env var requires restarting the process to take effect.
+  `syslog.http_token` and `otlp.bearer_token` are affected the same way,
+  for the same underlying reason: both were only ever "live" because the
+  now-deleted config-write endpoints could swap the shared, in-memory
+  `Config` at runtime; with no code path left that ever writes to it after
+  startup, every field the admin API used to touch — not only the three
+  above — now behaves like `bind_address` or `tls.*` always did.
 - `admin::spawn_admin_server` dropped its `flush_registry` and
   `ip_whitelist` parameters (now just `(config, source_stats)`) — internal
   API, no config changes required.
+- `logthing.admin.toml` as a configuration source. The tracked copy is
+  deleted; `Config::load()` no longer reads it at all, and a leftover file
+  found on disk produces a startup `WARN` (not an error) naming the file
+  and pointing at `LOGTHING__*`/`logthing.toml` as the replacement. Move
+  any settings the file held into `logthing.toml` or `LOGTHING__*` before
+  upgrading — they are silently ignored otherwise, not merged.
 
 ## [0.19.1] - 2026-09-16
 

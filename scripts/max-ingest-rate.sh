@@ -276,11 +276,13 @@ cores_used() {
 # with no output. A pidfile kills exactly the process we started.
 #
 # DEFECT FIX 2: the old script's cleanup did `rm -f logthing.admin.toml`,
-# deleting a TRACKED file. logthing.admin.toml is also loaded AFTER
-# logthing.toml and silently overrides it (the server exits immediately if
-# left in place alongside this harness's config), so it must be moved aside
-# for the run's duration and moved back in cleanup -- never removed, and the
-# restore is verified by checksum against its own backup.
+# deleting a file that was tracked at the time. logthing.admin.toml is no
+# longer read by the server at all -- a leftover copy only produces a
+# startup WARN now, it does not override logthing.toml -- but if a copy
+# exists on disk it's still moved aside for the run's duration and moved
+# back in cleanup, never removed, since this harness has no business
+# deleting a file it doesn't own. The restore is verified by checksum
+# against its own backup.
 #
 # `cleanup` is defined and both traps are registered BEFORE any tracked
 # file is touched (before PIDFILE/TMP_ROOT even exist), so a signal landing

@@ -1,33 +1,44 @@
-bind_address = "0.0.0.0:5985"
+bind_address = "0.0.0.0:5985"   # env: LOGTHING__BIND_ADDRESS
 
 [logging]
-level = "info"
-format = "pretty"
+level = "info"    # env: LOGTHING__LOGGING__LEVEL
+format = "pretty" # env: LOGTHING__LOGGING__FORMAT
 
 [tls]
-enabled = false
-port = 5986
+enabled = false   # env: LOGTHING__TLS__ENABLED
+port = 5986       # env: LOGTHING__TLS__PORT
+# cert_file = "/path/to/cert.pem"   # env: LOGTHING__TLS__CERT_FILE
+# key_file = "/path/to/key.pem"     # env: LOGTHING__TLS__KEY_FILE
 
 [security]
 # Applies to both the HTTP endpoints and the syslog/IPFIX/sFlow/Zeek/Suricata
 # socket listeners. Empty allows all sources.
+#
+# FILE-ONLY: no environment variable equivalent. This is a list, and the
+# loader sets no list separator, so LOGTHING__SECURITY__ALLOWED_IPS cannot
+# set it.
+#
+# RESTART-ONLY: changes here (or in an `/etc/logthing/config` drop-in) only
+# take effect on the next process restart. It is not editable through the
+# admin interface, which is read-only.
 allowed_ips = []
-max_connections = 10000
-connection_timeout_secs = 300
+max_connections = 10000          # env: LOGTHING__SECURITY__MAX_CONNECTIONS
+connection_timeout_secs = 300    # env: LOGTHING__SECURITY__CONNECTION_TIMEOUT_SECS
 
 [metrics]
-enabled = true
-port = 9090
+enabled = true   # env: LOGTHING__METRICS__ENABLED
+port = 9090      # env: LOGTHING__METRICS__PORT
+# bind_address = "0.0.0.0"   # env: LOGTHING__METRICS__BIND_ADDRESS
 
 # Bind ports below can be overridden without editing this file, via
 # LOGTHING__SYSLOG__UDP_PORT / LOGTHING__SYSLOG__TCP_PORT env vars. Unlike the other
 # listeners below, syslog's bind address is fixed at 0.0.0.0 — there is no
 # LOGTHING__SYSLOG__BIND_ADDRESS.
 [syslog]
-enabled = true
+enabled = true      # env: LOGTHING__SYSLOG__ENABLED
 udp_port = 514      # Standard syslog UDP port (env: LOGTHING__SYSLOG__UDP_PORT)
 tcp_port = 601      # Standard syslog TCP port (RFC 6587) (env: LOGTHING__SYSLOG__TCP_PORT)
-parse_dns = true    # Enable DNS log parsing
+parse_dns = true    # Enable DNS log parsing (env: LOGTHING__SYSLOG__PARSE_DNS)
 
 # Number of UDP receive tasks draining udp_port (default: 8; the TCP listener
 # on tcp_port is unaffected). Raise when syslog_udp_socket_drops climbs while
@@ -78,7 +89,7 @@ parse_dns = true    # Enable DNS log parsing
 # Zeek NDJSON TCP listener.
 # Disabled by default — set enabled = true to activate.
 [zeek]
-enabled      = false
+enabled      = false        # env: LOGTHING__ZEEK__ENABLED
 tcp_port     = 47760       # default Zeek NDJSON listener port (env: LOGTHING__ZEEK__TCP_PORT)
 bind_address = "0.0.0.0"   # env: LOGTHING__ZEEK__BIND_ADDRESS
 
@@ -99,7 +110,7 @@ bind_address = "0.0.0.0"   # env: LOGTHING__ZEEK__BIND_ADDRESS
 # IPFIX / NetFlow flow ingestion listener.
 # Disabled by default — set enabled = true to activate.
 [ipfix]
-enabled      = false
+enabled      = false        # env: LOGTHING__IPFIX__ENABLED
 udp_port     = 4739        # IANA-standard IPFIX port (env: LOGTHING__IPFIX__UDP_PORT)
 bind_address = "0.0.0.0"   # env: LOGTHING__IPFIX__BIND_ADDRESS
 
@@ -152,7 +163,7 @@ bind_address = "0.0.0.0"   # env: LOGTHING__IPFIX__BIND_ADDRESS
 # sFlow v5 UDP listener.
 # Disabled by default — set enabled = true to activate.
 [sflow]
-enabled      = false
+enabled      = false        # env: LOGTHING__SFLOW__ENABLED
 udp_port     = 6343        # Standard sFlow UDP port (env: LOGTHING__SFLOW__UDP_PORT)
 bind_address = "0.0.0.0"   # env: LOGTHING__SFLOW__BIND_ADDRESS
 
@@ -227,6 +238,10 @@ bind_address = "0.0.0.0"   # env: LOGTHING__SFLOW__BIND_ADDRESS
 # directory = "/data/agg"
 # prefix = "aggregate"
 #
+# FILE-ONLY: no environment variable equivalent. aggregate.rules is a list
+# of tables ([[aggregate.rules]]), and the env loader has no syntax for
+# setting a list of tables, so it must be configured in logthing.toml (or
+# an /etc/logthing/config drop-in).
 # [[aggregate.rules]]
 # name = "dns_by_query"
 # source = "zeek"

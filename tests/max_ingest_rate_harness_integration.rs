@@ -140,6 +140,6 @@ fn short_run_emits_a_verdict_and_restores_tracked_configs() {
     assert_eq!(
         before_admin,
         std::fs::read(root.join("logthing.admin.toml")).ok(),
-        "harness must restore logthing.admin.toml (it is tracked; the predecessor rm'd it)"
+        "harness must restore logthing.admin.toml if present (the predecessor rm'd it unconditionally)"
     );
 }
