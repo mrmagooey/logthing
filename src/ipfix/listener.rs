@@ -83,6 +83,16 @@ impl IpfixHandler for DefaultIpfixHandler {
 /// function, mirroring `zeek::listener`'s shared per-record dispatch point
 /// but as its own free function, looped over the batch since IPFIX delivers
 /// flows in batches rather than one at a time.
+///
+/// ponytail: the cost is per-watcher AND per-record-in-batch — `observe`
+/// allocates a `String` for the field value before its set-membership check
+/// (see its own `ponytail:` comment), so N watches means N such allocations
+/// for every flow in every batch, even when all N already track the value.
+/// A batch multiplies it, which makes this and sflow the heaviest of the six.
+/// Fine at the one-or-two watches this is meant for. Ceiling: if someone
+/// configures many watches on one source, hoist the value-extraction out of
+/// the inner loop for watches sharing a `field`. Same disclosure as
+/// `zeek::listener`'s dispatch point.
 async fn observe_and_dispatch(
     cardinality: &[Arc<CardinalityWatcher>],
     flows: Vec<FlowRecord>,

@@ -172,6 +172,14 @@ impl SuricataHandler for DefaultSuricataHandler {
 /// per-record dispatch point, factored into its own free function (rather
 /// than inlined at the one call site, as zeek does) so a future second call
 /// site cannot silently skip the observe step.
+///
+/// ponytail: the cost is per-watcher, not per-record — `observe` allocates a
+/// `String` for the field value before its set-membership check (see its own
+/// `ponytail:` comment), so N watches on this source means N such allocations
+/// per record even when all N already track the value. Fine at the one-or-two
+/// watches this is meant for. Ceiling: if someone configures many watches on
+/// one source, hoist the value-extraction out of the loop for watches sharing
+/// a `field`. Same disclosure as `zeek::listener`'s dispatch point.
 async fn observe_and_dispatch(
     cardinality: &[Arc<CardinalityWatcher>],
     record: SuricataRecord,
