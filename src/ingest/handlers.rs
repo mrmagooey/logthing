@@ -574,12 +574,12 @@ mod tests {
 
     // --- Live hec.token reload (no restart) ---
 
-    /// An admin-changed `hec.token` must take effect on the very next
-    /// request — no router rebuild, no restart. Mirrors the finding this
-    /// fixes: before it, `hec.token` was snapshotted into an
-    /// `Extension<Arc<String>>` at router-construction time, so a changed
-    /// token was accepted, persisted, and audited but never actually
-    /// enforced until the process restarted.
+    /// A `hec.token` change written through the shared `Arc<RwLock<Config>>`
+    /// must take effect on the very next request — no router rebuild
+    /// required. Mirrors the finding this fixes: before it, `hec.token` was
+    /// snapshotted into an `Extension<Arc<String>>` at router-construction
+    /// time, so a changed value was never actually enforced without
+    /// rebuilding the router.
     #[tokio::test]
     async fn hec_token_change_takes_effect_on_next_request_without_restart() {
         let mut cfg = Config::default();
@@ -606,10 +606,9 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Simulate the admin API's `PUT /config` swap: write straight
-        // through the SAME `Arc<RwLock<Config>>` the router's `Extension`
-        // holds — exactly what `update_config`/`reload_config` do via
-        // `*state.config.write().await = new_config`.
+        // Write straight through the SAME `Arc<RwLock<Config>>` the
+        // router's `Extension` holds, exactly as a future config-reload
+        // mechanism would.
         {
             let mut cfg = shared_config.write().await;
             cfg.hec.token = "new-token".to_string();

@@ -4,15 +4,15 @@ use axum::{
     Json,
     body::Body,
     extract::{ConnectInfo, State},
-    http::{Method, StatusCode},
+    http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
 };
 
-use crate::admin::auth::{resolve_client_ip, verify_csrf_token, verify_trusted_header};
+use crate::admin::auth::{resolve_client_ip, verify_trusted_header};
 use crate::admin::state::{AdminState, RateLimitError, ResolvedClientIp};
 
-/// Security middleware: rate limiting, IP whitelist, and CSRF protection.
+/// Security middleware: rate limiting and IP whitelist enforcement.
 ///
 /// `resolved_ip` (populated by `trusted_header_middleware`, which must run
 /// BEFORE this middleware — see the ordering note on `run_admin_server` in
@@ -88,39 +88,6 @@ pub async fn security_middleware(
     }
 
     next.run(request).await
-}
-
-/// CSRF protection middleware for state-changing endpoints
-pub async fn csrf_middleware(
-    State(state): State<AdminState>,
-    request: axum::http::Request<Body>,
-    next: Next,
-) -> Response {
-    // Skip CSRF check for GET requests and if CSRF is disabled
-    if request.method() == Method::GET || !state.server_config.enable_csrf {
-        return next.run(request).await;
-    }
-
-    // Extract CSRF token from header
-    let csrf_token = request
-        .headers()
-        .get("X-CSRF-Token")
-        .and_then(|v| v.to_str().ok());
-
-    if let Some(token) = csrf_token
-        && verify_csrf_token(&state, token).await
-    {
-        return next.run(request).await;
-    }
-
-    // CSRF token missing or invalid
-    (
-        StatusCode::FORBIDDEN,
-        Json(serde_json::json!({
-            "error": "CSRF token missing or invalid"
-        })),
-    )
-        .into_response()
 }
 
 /// Resolves a trusted reverse-proxy identity (if any) and, when present,
@@ -200,7 +167,6 @@ mod tests {
 
     async fn test_state_with_config(
         allowed_ips: Vec<IpNet>,
-        enable_csrf: bool,
         enable_rate_limiting: bool,
     ) -> AdminState {
         let server_config = AdminServerConfig {
@@ -209,7 +175,6 @@ mod tests {
             password_hash: PasswordHash::hash("pass").unwrap(),
             allowed_ips,
             tls_config: None,
-            enable_csrf,
             enable_rate_limiting,
             trusted_header: None,
         };
@@ -218,11 +183,8 @@ mod tests {
             config: Arc::new(RwLock::new(crate::config::Config::default())),
             server_config,
             audit_logger: AuditLogger::new(100).await,
-            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(HashMap::new())),
             source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
-            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-            ip_whitelist: crate::middleware::IpWhitelist::empty(),
         }
     }
 
@@ -240,7 +202,7 @@ mod tests {
 
     #[tokio::test]
     async fn security_middleware_allows_request_with_empty_whitelist() {
-        let state = test_state_with_config(vec![], false, false).await;
+        let state = test_state_with_config(vec![], false).await;
         let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let _request = create_test_request(Method::GET, None)
             .map(|b| b)
@@ -274,7 +236,7 @@ mod tests {
     #[tokio::test]
     async fn security_middleware_blocks_ip_not_in_whitelist() {
         let allowed: IpNet = "192.168.1.0/24".parse().unwrap();
-        let state = test_state_with_config(vec![allowed], false, false).await;
+        let state = test_state_with_config(vec![allowed], false).await;
         let addr: SocketAddr = "10.0.0.1:12345".parse().unwrap();
 
         let mut request = axum::http::Request::builder()
@@ -304,7 +266,7 @@ mod tests {
     #[tokio::test]
     async fn security_middleware_allows_ip_in_whitelist() {
         let allowed: IpNet = "192.168.1.0/24".parse().unwrap();
-        let state = test_state_with_config(vec![allowed], false, false).await;
+        let state = test_state_with_config(vec![allowed], false).await;
         let addr: SocketAddr = "192.168.1.100:12345".parse().unwrap();
 
         let mut request = axum::http::Request::builder()
@@ -331,81 +293,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn csrf_middleware_skips_get_requests() {
-        let state = test_state_with_config(vec![], true, false).await;
-        let request = create_test_request(Method::GET, None);
-
-        let app = axum::Router::new()
-            .route("/test", axum::routing::get(|| async { "OK" }))
-            .layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                csrf_middleware,
-            ))
-            .with_state(state);
-
-        let response: axum::http::Response<axum::body::Body> = app.oneshot(request).await.unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn csrf_middleware_skips_when_disabled() {
-        let state = test_state_with_config(vec![], false, false).await;
-        let request = create_test_request(Method::POST, None);
-
-        let app = axum::Router::new()
-            .route("/test", axum::routing::post(|| async { "OK" }))
-            .layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                csrf_middleware,
-            ))
-            .with_state(state);
-
-        let response: axum::http::Response<axum::body::Body> = app.oneshot(request).await.unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn csrf_middleware_blocks_post_without_token() {
-        let state = test_state_with_config(vec![], true, false).await;
-        let request = create_test_request(Method::POST, None);
-
-        let app = axum::Router::new()
-            .route("/test", axum::routing::post(|| async { "OK" }))
-            .layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                csrf_middleware,
-            ))
-            .with_state(state);
-
-        let response: axum::http::Response<axum::body::Body> = app.oneshot(request).await.unwrap();
-
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn csrf_middleware_blocks_invalid_token() {
-        let state = test_state_with_config(vec![], true, false).await;
-        let request =
-            create_test_request(Method::POST, Some(vec![("X-CSRF-Token", "invalid-token")]));
-
-        let app = axum::Router::new()
-            .route("/test", axum::routing::post(|| async { "OK" }))
-            .layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                csrf_middleware,
-            ))
-            .with_state(state);
-
-        let response: axum::http::Response<axum::body::Body> = app.oneshot(request).await.unwrap();
-
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
     async fn rate_limit_map_evicts_entries_outside_the_window() {
-        let state = test_state_with_config(vec![], false, true).await;
+        let state = test_state_with_config(vec![], true).await;
         {
             let mut counts = state.request_counts.write().await;
             let stale = std::time::Instant::now() - std::time::Duration::from_secs(3600);
@@ -467,7 +356,6 @@ mod tests {
                 password_hash: PasswordHash::hash("pass").unwrap(),
                 allowed_ips: vec![],
                 tls_config: None,
-                enable_csrf: false,
                 enable_rate_limiting: false,
                 trusted_header,
             };
@@ -475,11 +363,8 @@ mod tests {
                 config: Arc::new(RwLock::new(crate::config::Config::default())),
                 server_config,
                 audit_logger: isolated_audit_logger().await,
-                csrf_tokens: Arc::new(RwLock::new(Vec::new())),
                 request_counts: Arc::new(RwLock::new(HashMap::new())),
                 source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
-                flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-                ip_whitelist: crate::middleware::IpWhitelist::empty(),
             }
         }
 
@@ -915,7 +800,6 @@ mod tests {
                 password_hash: PasswordHash::hash("pass").unwrap(),
                 allowed_ips,
                 tls_config: None,
-                enable_csrf: false,
                 enable_rate_limiting,
                 trusted_header,
             };
@@ -923,11 +807,8 @@ mod tests {
                 config: Arc::new(RwLock::new(crate::config::Config::default())),
                 server_config,
                 audit_logger: AuditLogger::new(100).await,
-                csrf_tokens: Arc::new(RwLock::new(Vec::new())),
                 request_counts: Arc::new(RwLock::new(HashMap::new())),
                 source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
-                flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-                ip_whitelist: crate::middleware::IpWhitelist::empty(),
             }
         }
 

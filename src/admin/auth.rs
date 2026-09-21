@@ -14,7 +14,7 @@ use crate::admin::state::{AdminState, TrustedIdentity};
 /// proportional to `min(a.len(), b.len())` with no early exit, so an
 /// attacker cannot distinguish a length mismatch from a content mismatch
 /// via timing.  Length mismatches are rejected immediately (acceptable
-/// here: usernames and CSRF tokens are not secret-length-sensitive).
+/// here: usernames are not secret-length-sensitive).
 fn ct_str_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
@@ -165,46 +165,6 @@ pub fn unauthorized() -> Response {
         .into_response()
 }
 
-/// Generate CSRF token
-pub async fn generate_csrf_token(state: &AdminState) -> String {
-    use rand::{Rng, distr::Alphanumeric};
-
-    // Clean expired tokens first
-    let now = std::time::Instant::now();
-    {
-        let mut tokens = state.csrf_tokens.write().await;
-        tokens.retain(|(_, exp)| *exp > now);
-    }
-
-    let token: String = rand::rng()
-        .sample_iter(&Alphanumeric)
-        .take(32)
-        .map(char::from)
-        .collect();
-
-    let expiry = std::time::Instant::now() + std::time::Duration::from_secs(3600);
-    state
-        .csrf_tokens
-        .write()
-        .await
-        .push((token.clone(), expiry));
-
-    token
-}
-
-/// Verify CSRF token
-pub async fn verify_csrf_token(state: &AdminState, token: &str) -> bool {
-    if !state.server_config.enable_csrf {
-        return true;
-    }
-
-    let now = std::time::Instant::now();
-    let tokens = state.csrf_tokens.read().await;
-    tokens
-        .iter()
-        .any(|(t, exp)| ct_str_eq(t, token) && *exp > now)
-}
-
 #[cfg(test)]
 mod tests {
     use super::ct_str_eq;
@@ -257,7 +217,6 @@ mod tests {
                 password_hash: PasswordHash::hash("admin").unwrap(),
                 allowed_ips: vec![],
                 tls_config: None,
-                enable_csrf: false,
                 enable_rate_limiting: false,
                 trusted_header,
             };
@@ -265,11 +224,8 @@ mod tests {
                 config: Arc::new(RwLock::new(crate::config::Config::default())),
                 server_config,
                 audit_logger: AuditLogger::new(10).await,
-                csrf_tokens: Arc::new(RwLock::new(Vec::new())),
                 request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
                 source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
-                flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-                ip_whitelist: crate::middleware::IpWhitelist::empty(),
             }
         }
 
@@ -414,7 +370,6 @@ mod tests {
                 password_hash: PasswordHash::hash("admin").unwrap(),
                 allowed_ips: vec![],
                 tls_config: None,
-                enable_csrf: false,
                 enable_rate_limiting: false,
                 trusted_header,
             };
@@ -422,11 +377,8 @@ mod tests {
                 config: Arc::new(RwLock::new(crate::config::Config::default())),
                 server_config,
                 audit_logger: AuditLogger::new(10).await,
-                csrf_tokens: Arc::new(RwLock::new(Vec::new())),
                 request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
                 source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
-                flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-                ip_whitelist: crate::middleware::IpWhitelist::empty(),
             }
         }
 

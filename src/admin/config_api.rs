@@ -122,7 +122,6 @@ mod tests {
             password_hash: PasswordHash::hash("admin").unwrap(),
             allowed_ips: vec![],
             tls_config: None,
-            enable_csrf: false,
             enable_rate_limiting: false,
             trusted_header: None,
         };
@@ -146,11 +145,8 @@ mod tests {
             config: Arc::new(RwLock::new(cfg)),
             server_config,
             audit_logger: AuditLogger::new(100).await,
-            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
-            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-            ip_whitelist: crate::middleware::IpWhitelist::empty(),
         }
     }
 
@@ -169,7 +165,7 @@ mod tests {
         assert_eq!(s3.connection.endpoint, "http://minio:9000");
     }
 
-    // H-6: the JSON serialised by get_config / export_config must not contain real secrets.
+    // H-6: the JSON serialised by get_config must not contain real secrets.
     #[tokio::test]
     async fn redacted_config_json_contains_no_real_secrets() {
         let state = make_state_with_s3_secrets().await;

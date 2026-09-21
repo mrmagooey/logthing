@@ -96,6 +96,19 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   and drops two defects: a `pkill -f` that could kill the invoking shell
   instead of the server, and a cleanup step that deleted the tracked
   `logthing.admin.toml`.
+- The admin web interface's CSRF middleware, CSRF-token generation, and
+  the `LOGTHING_ADMIN_ENABLE_CSRF` env var. Every surviving admin route is
+  a `GET` (the config-write endpoints were removed in an earlier change),
+  so there is nothing left to forge.
+- `IpWhitelist::set_networks` and `FlushIntervalRegistry::set_secs`, the
+  last of the admin API's live-apply plumbing — their only callers were
+  the now-deleted config-write handlers. **BREAKING**: `security.allowed_ips`,
+  `hec.token`, and every sink's `flush_interval_secs` are now restart-only;
+  changing them in `logthing.toml`, an `/etc/logthing/config` drop-in, or a
+  `LOGTHING__*` env var requires restarting the process to take effect.
+- `admin::spawn_admin_server` dropped its `flush_registry` and
+  `ip_whitelist` parameters (now just `(config, source_stats)`) — internal
+  API, no config changes required.
 
 ## [0.19.1] - 2026-09-16
 

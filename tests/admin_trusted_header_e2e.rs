@@ -17,13 +17,10 @@
 //! `spawn_admin_server` internally calls `load_admin_config()`, which reads
 //! all `LOGTHING_ADMIN_*` env vars including the six trust-mode ones, so no code
 //! changes are needed to test trust mode through this entry point — just
-//! setting the right env vars first, exactly like the existing
-//! `admin_flush_interval_e2e.rs` sets `LOGTHING_ADMIN_BIND`/`LOGTHING_ADMIN_USER`/etc.
+//! setting the right env vars first.
 
 use logthing::admin::spawn_admin_server;
 use logthing::config::{Config, TlsConfig};
-use logthing::forwarding::flush_registry::FlushIntervalRegistry;
-use logthing::middleware::IpWhitelist;
 use logthing::stats::SourceHourlyStats;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,7 +39,7 @@ async fn get_config_over_real_http_succeeds_with_trusted_headers_alone_no_basic_
     // only way to discover a free port up front. This has a small,
     // theoretical TOCTOU race (another process could grab the port in the
     // gap between drop and rebind) but is an accepted, standard pattern for
-    // tests of this shape (see `admin_flush_interval_e2e.rs`).
+    // tests of this shape.
     let port = {
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         probe.local_addr().unwrap().port()
@@ -55,15 +52,8 @@ async fn get_config_over_real_http_succeeds_with_trusted_headers_alone_no_basic_
     // process-global env vars. Cargo compiles each `tests/*.rs` file into
     // its own process, so this doesn't race with other integration/e2e
     // files or the lib's own `#[cfg(test)]` suite either.
-    //
-    // DO NOT add a second `#[tokio::test]` to this file without introducing
-    // the same kind of crate-wide env-var mutex that
-    // `src/admin/config_api.rs`'s `test_support::PERSIST_CONFIG_ENV_LOCK`
-    // uses for `LOGTHING_ADMIN_OVERRIDE_FILE` — that module is `pub(crate)` and
-    // not reusable from here, so a from-scratch equivalent would be needed.
     unsafe {
         std::env::set_var("LOGTHING_ADMIN_BIND", format!("127.0.0.1:{port}"));
-        std::env::set_var("LOGTHING_ADMIN_ENABLE_CSRF", "false");
         std::env::set_var("LOGTHING_ADMIN_ENABLE_RATE_LIMIT", "false");
         std::env::set_var("LOGTHING_ADMIN_TRUST_PROXY_HEADERS", "true");
         std::env::set_var("LOGTHING_ADMIN_TRUSTED_HEADER_SECRET", trusted_secret);
@@ -84,12 +74,7 @@ async fn get_config_over_real_http_succeeds_with_trusted_headers_alone_no_basic_
     };
     let shared_config = Arc::new(RwLock::new(initial_config));
 
-    spawn_admin_server(
-        shared_config,
-        Arc::new(SourceHourlyStats::new()),
-        FlushIntervalRegistry::new(),
-        IpWhitelist::empty(),
-    );
+    spawn_admin_server(shared_config, Arc::new(SourceHourlyStats::new()));
 
     // ---------------------------------------------------------------------
     // 2. Wait for the admin server to actually be listening.

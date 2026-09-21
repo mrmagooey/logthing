@@ -29,7 +29,6 @@ mod tests {
             password_hash: PasswordHash::hash("pass").unwrap(),
             allowed_ips: vec![],
             tls_config: None,
-            enable_csrf: false,
             enable_rate_limiting: false,
             trusted_header: None,
         };
@@ -38,11 +37,8 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             server_config,
             audit_logger: AuditLogger::new(100).await,
-            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
-            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-            ip_whitelist: crate::middleware::IpWhitelist::empty(),
         }
     }
 
@@ -233,50 +229,6 @@ mod tests {
     mod auth_tests {
         use super::*;
 
-        #[tokio::test]
-        async fn generate_csrf_token_creates_valid_token() {
-            let state = test_state().await;
-            let token = auth::generate_csrf_token(&state).await;
-
-            assert!(!token.is_empty());
-            assert_eq!(token.len(), 32);
-
-            // Verify token is stored
-            let tokens = state.csrf_tokens.read().await;
-            assert!(tokens.iter().any(|(t, _)| t == &token));
-        }
-
-        #[tokio::test]
-        async fn verify_csrf_token_accepts_valid_token() {
-            let state = test_state().await;
-            let token = auth::generate_csrf_token(&state).await;
-
-            assert!(auth::verify_csrf_token(&state, &token).await);
-        }
-
-        #[tokio::test]
-        async fn verify_csrf_token_rejects_invalid_token() {
-            let mut state = test_state().await;
-            // Enable CSRF for this test
-            state.server_config.enable_csrf = true;
-
-            // Generate a valid token first
-            let valid_token = auth::generate_csrf_token(&state).await;
-
-            // Invalid token should be rejected
-            assert!(!auth::verify_csrf_token(&state, "invalid_token").await);
-
-            // But valid token should be accepted
-            assert!(auth::verify_csrf_token(&state, &valid_token).await);
-        }
-
-        #[tokio::test]
-        async fn verify_csrf_token_always_passes_when_disabled() {
-            let state = test_state().await;
-            // CSRF is disabled in test_state
-            assert!(auth::verify_csrf_token(&state, "any_token").await);
-        }
-
         #[test]
         fn unauthorized_returns_correct_response() {
             let response = auth::unauthorized();
@@ -434,24 +386,11 @@ mod tests {
                 password_hash: PasswordHash::hash("test").unwrap(),
                 allowed_ips: vec![],
                 tls_config: None,
-                enable_csrf: true,
                 enable_rate_limiting: true,
                 trusted_header: None,
             };
 
             let _cloned = config.clone();
-        }
-    }
-
-    // Middleware tests
-    mod middleware_tests {
-        use super::*;
-
-        #[tokio::test]
-        async fn csrf_middleware_allows_when_disabled() {
-            let state = test_state().await;
-            // CSRF is disabled by default in test_state
-            assert!(!state.server_config.enable_csrf);
         }
     }
 

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::{net::TcpListener, sync::RwLock};
 use tracing::{error, info};
 
-use crate::admin::auth::{ensure_authorized, generate_csrf_token};
+use crate::admin::auth::ensure_authorized;
 use crate::admin::config_api::redacted_config;
 use crate::admin::middleware::security_middleware;
 use crate::admin::state::{
@@ -22,21 +22,11 @@ use crate::config::Config;
 pub fn spawn_admin_server(
     config: Arc<RwLock<Config>>,
     source_stats: Arc<crate::stats::SourceHourlyStats>,
-    flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry,
-    ip_whitelist: crate::middleware::IpWhitelist,
 ) {
     tokio::spawn(async move {
         match load_admin_config() {
             Ok(server_config) => {
-                if let Err(err) = run_admin_server(
-                    config,
-                    server_config,
-                    source_stats,
-                    flush_registry,
-                    ip_whitelist,
-                )
-                .await
-                {
+                if let Err(err) = run_admin_server(config, server_config, source_stats).await {
                     error!("Admin server error: {}", err);
                 }
             }
@@ -52,12 +42,8 @@ async fn run_admin_server(
     config: Arc<RwLock<Config>>,
     server_config: AdminServerConfig,
     source_stats: Arc<crate::stats::SourceHourlyStats>,
-    flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry,
-    ip_whitelist: crate::middleware::IpWhitelist,
 ) -> anyhow::Result<()> {
     let audit_logger = AuditLogger::new(1000).await;
-    let csrf_tokens: Arc<RwLock<Vec<(String, std::time::Instant)>>> =
-        Arc::new(RwLock::new(Vec::new()));
     let request_counts: Arc<RwLock<std::collections::HashMap<String, (std::time::Instant, u32)>>> =
         Arc::new(RwLock::new(std::collections::HashMap::new()));
 
@@ -65,11 +51,8 @@ async fn run_admin_server(
         config,
         server_config: server_config.clone(),
         audit_logger: audit_logger.clone(),
-        csrf_tokens: csrf_tokens.clone(),
         request_counts: request_counts.clone(),
         source_stats,
-        flush_registry,
-        ip_whitelist,
     };
 
     let app = build_admin_router(state);
@@ -98,7 +81,7 @@ async fn run_admin_server(
     Ok(())
 }
 
-/// Build the admin router: every route plus the three security layers, in
+/// Build the admin router: every route plus the two security layers, in
 /// their deliberate order. Split out of `run_admin_server` so tests can
 /// exercise the exact production routing table (see `config_write_endpoints_are_gone`).
 pub(crate) fn build_admin_router(state: AdminState) -> Router {
@@ -114,14 +97,13 @@ pub(crate) fn build_admin_router(state: AdminState) -> Router {
         //
         // `axum`'s `.layer(A).layer(B)` makes B the OUTER layer: on an
         // incoming request B runs first, then A, then the handler (layers
-        // added later wrap the ones added earlier). The three `.layer()`
+        // added later wrap the ones added earlier). The two `.layer()`
         // calls below are listed in the order they're ADDED, so read them
         // bottom-to-top to get request-flow order:
         //
-        //   csrf_middleware (outermost, runs 1st)
-        //     -> trusted_header_middleware (runs 2nd)
-        //       -> security_middleware (innermost, runs 3rd)
-        //         -> handler
+        //   trusted_header_middleware (outermost, runs 1st)
+        //     -> security_middleware (innermost, runs 2nd)
+        //       -> handler
         //
         // `trusted_header_middleware` MUST run before `security_middleware`
         // because it's the one that resolves the real client IP (from
@@ -164,10 +146,6 @@ pub(crate) fn build_admin_router(state: AdminState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::admin::middleware::trusted_header_middleware,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::admin::middleware::csrf_middleware,
         ))
         .with_state(state)
 }
@@ -236,20 +214,12 @@ async fn admin_page(
     let username =
         ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
-    // Generate CSRF token if enabled
-    let csrf_token = if state.server_config.enable_csrf {
-        generate_csrf_token(&state).await
-    } else {
-        String::new()
-    };
-
     state
         .audit_logger
         .log("ADMIN_PAGE_ACCESS", &username, &client_ip, None)
         .await;
 
-    let html = include_str!("templates/admin.html").replace("{{CSRF_TOKEN}}", &csrf_token);
-    Ok(Html(html))
+    Ok(Html(include_str!("templates/admin.html").to_string()))
 }
 
 /// Get audit log endpoint
@@ -378,7 +348,6 @@ mod tests {
             password_hash: PasswordHash::hash("admin").unwrap(),
             allowed_ips: vec![],
             tls_config: None,
-            enable_csrf: false,
             enable_rate_limiting: false,
             trusted_header: None,
         };
@@ -387,11 +356,8 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             server_config,
             audit_logger: AuditLogger::new(100).await,
-            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
-            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-            ip_whitelist: crate::middleware::IpWhitelist::empty(),
         }
     }
 
@@ -725,7 +691,6 @@ mod tests {
             password_hash: PasswordHash::hash("admin").unwrap(),
             allowed_ips: vec![],
             tls_config: None,
-            enable_csrf: false,
             enable_rate_limiting: false,
             trusted_header: None,
         };
@@ -733,11 +698,8 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             server_config,
             audit_logger: AuditLogger::new(100).await,
-            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: source_stats.clone(),
-            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-            ip_whitelist: crate::middleware::IpWhitelist::empty(),
         };
         let app = axum::Router::new()
             .route("/stats.json", axum::routing::get(get_stats_json))
@@ -785,7 +747,6 @@ mod tests {
             password_hash: PasswordHash::hash("admin").unwrap(),
             allowed_ips: vec![],
             tls_config: None,
-            enable_csrf: false,
             enable_rate_limiting: false,
             trusted_header: Some(TrustedHeaderConfig {
                 username_header: axum::http::HeaderName::from_static("x-authentik-username"),
@@ -799,11 +760,8 @@ mod tests {
             config: Arc::new(RwLock::new(Config::default())),
             server_config,
             audit_logger: AuditLogger::new(100).await,
-            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
             request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
             source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
-            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-            ip_whitelist: crate::middleware::IpWhitelist::empty(),
         };
 
         let app = axum::Router::new()
@@ -856,41 +814,6 @@ mod tests {
             reqwest::StatusCode::UNAUTHORIZED,
             "a wrong shared secret must not grant access, even with correct-looking identity headers"
         );
-    }
-
-    #[tokio::test]
-    async fn admin_page_with_csrf_enabled_generates_token() {
-        let server_config = AdminServerConfig {
-            bind_address: "0.0.0.0:8080".parse().unwrap(),
-            username: "admin".to_string(),
-            password_hash: PasswordHash::hash("admin").unwrap(),
-            allowed_ips: vec![],
-            tls_config: None,
-            enable_csrf: true,
-            enable_rate_limiting: false,
-            trusted_header: None,
-        };
-
-        let state = AdminState {
-            config: Arc::new(RwLock::new(Config::default())),
-            server_config,
-            audit_logger: AuditLogger::new(100).await,
-            csrf_tokens: Arc::new(RwLock::new(Vec::new())),
-            request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
-            flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-            ip_whitelist: crate::middleware::IpWhitelist::empty(),
-        };
-
-        let mut request = create_request_with_auth(Method::GET, "/", "admin", "admin", None);
-        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
-
-        let app = axum::Router::new()
-            .route("/", axum::routing::get(admin_page))
-            .with_state(state);
-
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -968,7 +891,6 @@ mod tests {
                 password_hash: PasswordHash::hash("admin").unwrap(),
                 allowed_ips: vec![],
                 tls_config: None,
-                enable_csrf: false,
                 enable_rate_limiting: false,
                 trusted_header: Some(TrustedHeaderConfig {
                     username_header: axum::http::HeaderName::from_static("x-authentik-username"),
@@ -982,11 +904,8 @@ mod tests {
                 config: Arc::new(RwLock::new(Config::default())),
                 server_config,
                 audit_logger: AuditLogger::new(100).await,
-                csrf_tokens: Arc::new(RwLock::new(Vec::new())),
                 request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
                 source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
-                flush_registry: crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
-                ip_whitelist: crate::middleware::IpWhitelist::empty(),
             }
         }
 
