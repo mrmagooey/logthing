@@ -123,15 +123,13 @@ pub struct CardinalityWatcher {
 
 impl CardinalityWatcher {
     pub fn new(watch: CompiledWatch, max_values: usize) -> Self {
-        let distinct = metrics::gauge!(
-            "field_distinct_values",
+        let distinct = metrics::gauge!("field_distinct_values",
             "stream" => watch.stream.clone(),
-            "field" => watch.field.clone(),
+            "field" => watch.field.clone()
         );
-        let capped = metrics::counter!(
-            "field_distinct_values_capped",
+        let capped = metrics::counter!("field_distinct_values_capped",
             "stream" => watch.stream.clone(),
-            "field" => watch.field.clone(),
+            "field" => watch.field.clone()
         );
         Self {
             stream: watch.stream,

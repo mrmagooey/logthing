@@ -342,6 +342,24 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
         "aggregate_groups",
         "Groups present in the most recently closed window, labelled by rule.",
     ),
+    // ── field cardinality watch ──────────────────────────────────────────
+    (
+        Kind::Gauge,
+        "field_distinct_values",
+        "Distinct values of the watched field (cardinality_watch_field) in the most recently \
+         completed window, labelled by stream/field — a count of wire values (e.g. IPs), not a \
+         stable host identity: DHCP churn, NAT, and external traffic can move it independently \
+         of ingestion health. A value pinned at cardinality_max_values means the cap was hit; \
+         check field_distinct_values_capped rather than trusting the number as-is. Prefer \
+         alerting on a sustained multi-window drop over exact equality to a known host count.",
+    ),
+    (
+        Kind::Counter,
+        "field_distinct_values_capped",
+        "Distinct values of the watched field discarded because cardinality_max_values was \
+         already reached, labelled by stream/field — non-zero here means field_distinct_values \
+         is undercounting the true cardinality.",
+    ),
 ];
 
 /// Register `# HELP` text for every metric the crate emits.
