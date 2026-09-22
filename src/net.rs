@@ -162,20 +162,32 @@ impl RecvMmsgBatch {
                 iov_len: b.len(),
             })
             .collect();
+        // `msghdr` is zeroed and then filled field-by-field rather than built
+        // with a struct literal: musl's `msghdr` carries private padding
+        // fields around `msg_iovlen`/`msg_controllen`, so a literal is a hard
+        // compile error there ("cannot construct `msghdr` with struct literal
+        // syntax due to private fields") even though it compiles on glibc.
+        // The widths of those two fields also differ between the two libcs
+        // (`size_t` vs `c_int`/`socklen_t`), so the assignments below are left
+        // to integer inference instead of naming a type. Zeroing first is what
+        // the padding wants anyway.
         let msgs: Vec<libc::mmsghdr> = iovecs
             .iter_mut()
             .zip(addrs.iter())
-            .map(|(iov, addr)| libc::mmsghdr {
-                msg_hdr: libc::msghdr {
-                    msg_name: addr as *const libc::sockaddr_storage as *mut libc::c_void,
-                    msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
-                    msg_iov: iov as *mut libc::iovec,
-                    msg_iovlen: 1,
-                    msg_control: std::ptr::null_mut(),
-                    msg_controllen: 0,
-                    msg_flags: 0,
-                },
-                msg_len: 0,
+            .map(|(iov, addr)| {
+                let mut msg_hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+                msg_hdr.msg_name = addr as *const libc::sockaddr_storage as *mut libc::c_void;
+                msg_hdr.msg_namelen =
+                    std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                msg_hdr.msg_iov = iov as *mut libc::iovec;
+                msg_hdr.msg_iovlen = 1;
+                msg_hdr.msg_control = std::ptr::null_mut();
+                msg_hdr.msg_controllen = 0;
+                msg_hdr.msg_flags = 0;
+                libc::mmsghdr {
+                    msg_hdr,
+                    msg_len: 0,
+                }
             })
             .collect();
         Self {
@@ -245,12 +257,19 @@ impl RecvMmsgBatch {
         // as now) or hangs forever (blocking fd, per recvmmsg(2)'s own BUGS
         // section) -- there is no bounded-wait behaviour to rely on either
         // way.
+        // `MSG_DONTWAIT as _`, not a plain `MSG_DONTWAIT`: `recvmmsg`'s
+        // `flags` parameter is `c_int` on glibc but `c_uint` on musl, while
+        // `MSG_DONTWAIT` is `c_int` everywhere. Naming either type concretely
+        // compiles on one libc and breaks the other -- the musl release
+        // binaries built by `.github/workflows/binaries.yml` failed exactly
+        // this way while the gnu test suite stayed green. Inference picks the
+        // right width per target; both are the same ABI.
         let n = unsafe {
             libc::recvmmsg(
                 fd,
                 self.msgs.as_mut_ptr(),
                 self.batch_size as libc::c_uint,
-                libc::MSG_DONTWAIT,
+                libc::MSG_DONTWAIT as _,
                 std::ptr::null_mut(),
             )
         };
