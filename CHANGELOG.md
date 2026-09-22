@@ -8,6 +8,15 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ### Added
 
+- A new `GET /metrics` page on the admin console shows live in-process counter
+  and gauge values — the same numbers the unauthenticated `/metrics` endpoint
+  serves — behind the admin server's authentication and audit logging. The page
+  includes a dedicated section for configured `[[metrics.cardinality_watch]]`
+  entries; watches awaiting their first window boundary display `awaiting first
+  window (<N>s)`, which clarifies why a correctly configured watch appears
+  absent from the metrics output — `field_distinct_values` is only published at
+  a window boundary (default 3600s), so a watch legitimately has no data for up
+  to an hour after startup.
 - `recv_tasks` config option on the `[ipfix]`, `[sflow]`, and `[syslog]`
   (UDP arm only) listeners — binds `N` `SO_REUSEPORT` sockets on the same
   port, each drained by its own task, instead of one socket drained by one
