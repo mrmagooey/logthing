@@ -341,11 +341,15 @@ mod tests {
 
     fn test_router(token: &str) -> axum::Router {
         use axum::{Extension, Router, routing::post};
+        use logthing::config::Config;
         use logthing::ingest::{IngestState, handle_hec_event};
+
+        let mut cfg = Config::default();
+        cfg.hec.token = token.to_string();
 
         Router::new()
             .route("/services/collector/event", post(handle_hec_event))
-            .layer(Extension(Arc::new(token.to_string())))
+            .layer(Extension(Arc::new(tokio::sync::RwLock::new(cfg))))
             .layer(Extension(IngestState::default()))
     }
 
