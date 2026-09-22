@@ -49,13 +49,12 @@ async fn metrics_endpoint_reachable_over_real_tls() {
     // (hyper-rustls, pulled in by the AWS SDK deps, enables "ring"; axum-server
     // /tokio-rustls enable "aws-lc-rs") -- with both present, rustls refuses
     // to auto-select one and `rustls::ServerConfig::builder()` (inside
-    // `build_tls_config`) panics instead of guessing. Nothing in this crate
-    // installs a default provider anywhere today, production included; this
-    // is test-harness plumbing standing in for that gap, not a change to
-    // production TLS behaviour. Picking aws-lc-rs here matches the feature
-    // rustls itself defaults to.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
+    // `build_tls_config`) panics instead of guessing. No test-side workaround
+    // here anymore: `build_tls_config` now calls `install_crypto_provider`
+    // itself (see its doc comment in `src/server/mod.rs`), reached via
+    // `run_tls` below exactly as production reaches it. This test's whole
+    // point is to prove that production call, not a test-harness stand-in
+    // for it -- installing a provider here directly would defeat that.
     let https_port = reserve_port().await;
     let metrics_port = reserve_port().await;
 

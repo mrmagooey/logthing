@@ -10,6 +10,17 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 fn main() -> anyhow::Result<()> {
+    // Install the process-wide rustls `CryptoProvider` before anything else
+    // runs. This tree links two rustls-0.23 crypto backends (`aws-lc-rs` and
+    // `ring`), so the first TLS handshake anywhere in the process panics
+    // without one installed — see `install_crypto_provider`'s doc comment.
+    // `build_tls_config`/`run_tls_server` also call this themselves (so
+    // server TLS is covered even without this line), but outbound HTTPS
+    // needs it too and has no single call site to hook — installing here,
+    // synchronously, unconditionally, and before the config is even loaded
+    // (so it's not gated on `tls.enabled`), covers all of them up front.
+    logthing::server::install_crypto_provider();
+
     // Determine number of worker threads (default to all CPU cores)
     let num_cpus = std::thread::available_parallelism()
         .map(|n| n.get())

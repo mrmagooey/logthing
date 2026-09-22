@@ -4569,6 +4569,14 @@ fn build_tls_config(
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use rustls::server::WebPkiClientVerifier;
 
+    // Every path below hits `rustls::ServerConfig::builder()`, which needs a
+    // process-level `CryptoProvider` already installed — see
+    // `install_crypto_provider`'s doc comment for why. `main.rs` installs it
+    // too, but this call makes the guarantee local: anything that reaches
+    // `build_tls_config` (production or test) is covered without relying on
+    // caller discipline.
+    install_crypto_provider();
+
     let cert_file = tls
         .cert_file
         .as_ref()
@@ -4689,6 +4697,40 @@ fn resolve_metrics_ip(
 /// round-trip breaks IPv6.
 fn tls_bind_addr(bind_address: &SocketAddr, port: u16) -> SocketAddr {
     SocketAddr::new(bind_address.ip(), port)
+}
+
+/// Install the process-level rustls `CryptoProvider`, once, for the whole
+/// binary.
+///
+/// rustls 0.23 refuses to auto-select a crypto backend once more than one is
+/// linked into the process, and this tree links two for rustls 0.23:
+/// `aws-lc-rs` (pulled in by axum-server/tokio-rustls) and `ring` (pulled in
+/// transitively via the AWS SDK's own rustls-based HTTP client stack). With
+/// both present and nothing installed, the first `rustls::ServerConfig::
+/// builder()`/`ClientConfig::builder()` call in the process — server TLS in
+/// `build_tls_config` below, or the admin console's TLS in
+/// `admin::routes::run_tls_server` — panics with "Could not automatically
+/// determine the process-level CryptoProvider" instead of guessing.
+///
+/// `aws_lc_rs`, not `ring`: it's rustls 0.23's own default backend, and it's
+/// already what axum-server/tokio-rustls pull in, so installing it adds no
+/// new linked backend. `CryptoProvider` is a shared trait object — one
+/// process-wide install covers every rustls-0.23 consumer (server and any
+/// outbound HTTPS alike), so call sites don't need to agree on which
+/// backend to ask for.
+///
+/// Idempotent: `install_default()` returns `Err` only when a provider is
+/// already installed process-wide, which just means an earlier call site
+/// (this function is meant to be called from several — `main.rs` up front,
+/// plus every rustls-0.23 entry point itself) already did the job. That
+/// `Err` is a benign no-op here, not a failure, so it's discarded rather
+/// than propagated.
+///
+/// rustls 0.21 (also in this tree, via `hyper-rustls 0.24` for parts of the
+/// AWS SDK stack) predates `CryptoProvider` and is unaffected — this
+/// installer has nothing to do with it.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 /// Build the Prometheus recorder, publish its handle via `METRICS_HANDLE`,
