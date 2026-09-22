@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>logthing admin — metrics</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; }
+    table { border-collapse: collapse; width: 100%; margin-bottom: 2rem; }
+    th, td { border: 1px solid #ccc; padding: 0.4rem 0.6rem; text-align: left; vertical-align: top; }
+    td.help { color: #555; font-size: 0.85rem; max-width: 32rem; }
+    code { word-break: break-all; }
+    caption { caption-side: bottom; font-size: 0.85rem; color: #555; margin-top: 0.75rem; text-align: left; }
+    .notice { border: 1px solid #c88; background: #fff4f4; border-radius: 8px; padding: 0.75rem; margin-bottom: 1.5rem; }
+  </style>
+</head>
+<body>
+  <h1>Metrics</h1>
+  <p>The live in-process values — the same numbers the <code>/metrics</code>
+  endpoint serves. Read-only.</p>
+
+  {{NOTICE}}
+
+  <h2>Configured cardinality watches</h2>
+  <table>
+    <thead><tr><th>Source</th><th>Stream</th><th>Field</th><th>Distinct values</th><th>Capped</th></tr></thead>
+    <tbody>
+      {{CARDINALITY_ROWS}}
+    </tbody>
+    <caption>Distinct values are counted per window and published at each
+    window boundary, so this reports the most recently completed window, not a
+    since-boot total. A watch shows &ldquo;awaiting first window&rdquo; until its
+    first boundary passes. A count sitting exactly at
+    <code>metrics.cardinality_max_values</code> means the cap was hit — read the
+    Capped column, not the count.</caption>
+  </table>
+
+  <h2>All metrics</h2>
+  <table>
+    <thead><tr><th>Metric</th><th>Description</th><th>Labels</th><th>Value</th></tr></thead>
+    <tbody>
+      {{METRIC_TABLES}}
+    </tbody>
+    <caption>{{SERIES_COUNT}} series. Counters are cumulative since process
+    start; gauges are instantaneous. Values reset on restart.</caption>
+  </table>
+
+  <p><a href="/">Admin console</a> &middot; <a href="/stats">Ingest statistics</a></p>
+</body>
+</html>
