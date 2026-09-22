@@ -58,6 +58,9 @@ All admin interface actions are logged with timestamps and user information:
 - Configuration reads (`CONFIG_READ`)
 - Failed authentication attempts (`AUTH_FAILED`)
 - Admin page access (`ADMIN_PAGE_ACCESS`)
+- Statistics page access (`STATS_PAGE_ACCESS`)
+- Statistics JSON read (`STATS_JSON_READ`)
+- Metrics page access (`METRICS_PAGE_ACCESS`)
 - Audit log reads (`AUDIT_LOG_READ`)
 
 Audit logs are available:
@@ -169,6 +172,7 @@ take effect. See the CHANGELOG for the breaking-change details.
 - `GET /config` - Get current (redacted) configuration (requires authentication)
 - `GET /stats` - Ingestion statistics page (requires authentication)
 - `GET /stats.json` - Ingestion statistics as JSON (requires authentication)
+- `GET /metrics` - Live in-process metric values and cardinality-watch status (requires authentication)
 - `GET /audit-log` - Get audit log entries (requires authentication)
 
 ## Environment Variables Summary

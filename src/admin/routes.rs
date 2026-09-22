@@ -11,6 +11,7 @@ use tracing::{error, info};
 
 use crate::admin::auth::ensure_authorized;
 use crate::admin::config_api::redacted_config;
+use crate::admin::metrics_view;
 use crate::admin::middleware::security_middleware;
 use crate::admin::state::{
     AdminServerConfig, AdminState, AuditLogger, ResolvedClientIp, TrustedIdentity,
@@ -92,6 +93,7 @@ pub(crate) fn build_admin_router(state: AdminState) -> Router {
         .route("/audit-log", axum::routing::get(get_audit_log))
         .route("/stats", axum::routing::get(get_stats))
         .route("/stats.json", axum::routing::get(get_stats_json))
+        .route("/metrics", axum::routing::get(get_metrics))
         // Layer ordering is deliberate and security-relevant — do not reorder
         // without re-reading this comment.
         //
@@ -372,6 +374,74 @@ async fn get_stats_json(
         .await;
 
     Ok(Json(snapshot))
+}
+
+/// Render the live in-process metric values, plus the configured
+/// cardinality watches.
+///
+/// Reads `crate::server::METRICS_HANDLE` per request rather than caching a
+/// `PrometheusHandle`: `main.rs` spawns the admin server *before* it installs
+/// the recorder, so a handle captured at admin startup would be captured too
+/// early. (This crate has shipped the cached-metrics-handle bug twice —
+/// `CardinalityWatcher` and `RuleMetrics`.) A `None` handle is not an error;
+/// it means the recorder is off or not up yet, and the page says which.
+async fn get_metrics(
+    State(state): State<AdminState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    trusted: Option<Extension<TrustedIdentity>>,
+    resolved_ip: Option<Extension<ResolvedClientIp>>,
+    auth: Option<TypedHeader<Authorization<Basic>>>,
+) -> Result<Html<String>, Response> {
+    let client_ip = resolved_ip
+        .map(|Extension(ResolvedClientIp(ip))| ip.to_string())
+        .unwrap_or_else(|| addr.ip().to_string());
+    let username =
+        ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
+
+    let rendered = crate::server::METRICS_HANDLE
+        .get()
+        .map(|handle| handle.render());
+
+    let (watches, window_secs, metrics_enabled) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.metrics.cardinality_watch.clone(),
+            cfg.metrics.cardinality_window_secs,
+            cfg.metrics.enabled,
+        )
+    };
+
+    // Distinguishing these two matters: "off by configuration" is a settled
+    // state an operator chose, while "not installed yet" is the narrow
+    // startup window between `spawn_admin_server` and
+    // `install_metrics_recorder` in `main.rs` and resolves on its own.
+    let notice = match (rendered.is_some(), metrics_enabled) {
+        (true, _) => String::new(),
+        (false, false) => "<div class=\"notice\">Metrics collection is disabled: \
+             <code>metrics.enabled = false</code>. Nothing is being recorded, so this \
+             page has no values to show.</div>"
+            .to_string(),
+        (false, true) => "<div class=\"notice\">The metrics recorder has not finished \
+             starting. Reload in a moment.</div>"
+            .to_string(),
+    };
+
+    let groups = metrics_view::parse_exposition(rendered.as_deref().unwrap_or(""));
+    let cardinality_rows = metrics_view::render_cardinality_html(&watches, &groups, window_secs);
+    let metric_rows = metrics_view::render_groups_html(&groups);
+    let series_count = metrics_view::series_count(&groups);
+
+    state
+        .audit_logger
+        .log("METRICS_PAGE_ACCESS", &username, &client_ip, None)
+        .await;
+
+    let html = include_str!("templates/metrics.html")
+        .replace("{{NOTICE}}", &notice)
+        .replace("{{CARDINALITY_ROWS}}", &cardinality_rows)
+        .replace("{{METRIC_TABLES}}", &metric_rows)
+        .replace("{{SERIES_COUNT}}", &series_count.to_string());
+    Ok(Html(html))
 }
 
 #[cfg(test)]
@@ -1185,6 +1255,114 @@ mod tests {
         assert!(
             body.contains("bind_address"),
             "the effective config must be rendered"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_metrics_requires_auth() {
+        let state = test_state().await;
+        let app = Router::new()
+            .route("/metrics", axum::routing::get(get_metrics))
+            .with_state(state);
+        let mut request = create_request_without_auth(Method::GET, "/metrics");
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The page must show the live in-process values. Asserted against a
+    /// metric this test increments itself, with a name no other test uses:
+    /// the Prometheus recorder is a process-global shared with the rest of
+    /// this binary, so asserting on a shared metric's exact value would be
+    /// flaky.
+    #[tokio::test]
+    async fn get_metrics_renders_recorded_series_with_valid_auth() {
+        crate::server::install_metrics_recorder();
+        metrics::counter!("aggregate_records_consumed", "rule" => "get_metrics_page_test")
+            .increment(7);
+
+        let state = test_state().await;
+        let app = Router::new()
+            .route("/metrics", axum::routing::get(get_metrics))
+            .with_state(state);
+        let mut request = create_request_with_auth(Method::GET, "/metrics", "admin", "admin", None);
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("aggregate_records_consumed"), "{body}");
+        assert!(body.contains("get_metrics_page_test"), "{body}");
+        // The exact HELP text registered in `metrics_descriptions.rs` for
+        // `aggregate_records_consumed` must reach the page, not just the
+        // metric name (already asserted above).
+        assert!(
+            body.contains("Records fed into an aggregation rule"),
+            "the HELP text registered by metrics_descriptions should reach the page:\n{body}"
+        );
+    }
+
+    /// A watch configured in `logthing.toml` has no `field_distinct_values`
+    /// series until its first window boundary (default 3600s). The page must
+    /// name it and say so, not silently omit it.
+    #[tokio::test]
+    async fn get_metrics_lists_a_configured_cardinality_watch_before_its_first_window() {
+        let mut config = Config::default();
+        config.metrics.cardinality_watch = vec![crate::config::CardinalityWatch {
+            source: "wef".to_string(),
+            stream: "Security".to_string(),
+            field: "computer".to_string(),
+        }];
+        config.metrics.cardinality_window_secs = 1234;
+
+        let mut state = test_state().await;
+        state.config = Arc::new(RwLock::new(config));
+        let app = Router::new()
+            .route("/metrics", axum::routing::get(get_metrics))
+            .with_state(state);
+        let mut request = create_request_with_auth(Method::GET, "/metrics", "admin", "admin", None);
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("computer"), "{body}");
+        assert!(body.contains("Security"), "{body}");
+        assert!(body.contains("awaiting first window (1234s)"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn get_metrics_records_audit_log() {
+        let state = test_state().await;
+        let app = Router::new()
+            .route("/metrics", axum::routing::get(get_metrics))
+            .with_state(state.clone());
+        let mut request = create_request_with_auth(Method::GET, "/metrics", "admin", "admin", None);
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let entries = state.audit_logger.get_entries(10).await;
+        assert!(
+            entries.iter().any(|e| e.action == "METRICS_PAGE_ACCESS"),
+            "expected a METRICS_PAGE_ACCESS entry, got {entries:?}"
+        );
+    }
+
+    /// The page is server-rendered HTML in an authenticated console; it must
+    /// not gain a second interpolation path that bypasses escaping.
+    #[test]
+    fn metrics_template_contains_no_javascript() {
+        let template = include_str!("templates/metrics.html");
+        assert!(
+            !template.contains("<script"),
+            "the metrics page must stay JS-free"
         );
     }
 }
