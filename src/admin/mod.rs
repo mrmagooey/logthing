@@ -5,6 +5,7 @@
 
 mod auth;
 mod config_api;
+mod metrics_view;
 mod middleware;
 mod routes;
 mod state;
