@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file, newest
 first, loosely following [Keep a Changelog](https://keepachangelog.com/).
 This file starts at 0.15.0; earlier releases are not backfilled.
 
-## [Unreleased]
+## [0.20.0] - 2026-09-21
 
 ### Added
 
@@ -93,6 +93,30 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   deployment with `bind_address` port 0 started fine, just confusingly
   logging `:0` while actually listening on a different, unlogged port. An
   operator who relied on that behaviour will now fail to start.
+- Bounded field-cardinality watch: configure one or more
+  `[[metrics.cardinality_watch]]` entries (`source`, `stream`, `field`) to
+  publish `field_distinct_values`, a gauge of how many distinct values a
+  wire-derived field took on in the most recently completed window,
+  labelled by `source`/`stream`/`field`. A companion counter,
+  `field_distinct_values_capped`, increments whenever a window's distinct
+  count would have exceeded `cardinality_max_values` (default `100000`),
+  so a gauge pinned at the cap can be told apart from a genuinely stable
+  count. `cardinality_window_secs` (default `3600`) controls how often the
+  gauge is published and cleared. Supported `source` values are `zeek`,
+  `wef`, `suricata`, `syslog`, `ipfix`, and `sflow`; an unknown or disabled
+  source, a missing `stream`/`field`, a duplicate watch, or
+  `cardinality_max_values = 0` all fail startup rather than silently
+  watching nothing. Ships with every example commented out in
+  `logthing.toml` — the feature is opt-in and adds no overhead unless
+  configured. Intended use: compare a watched field's distinct-value count
+  (e.g. zeek `id.orig_h`, WEF `computer`, ipfix `exporter`) against a
+  known-good host count as an "is ingestion actually working?" check.
+- `# HELP` text for every metric on `/metrics`. The Prometheus exporter
+  always wrote a `# TYPE` line for a recorded series but previously wrote
+  no `# HELP` line for any of them, since nothing called
+  `Recorder::describe_*`. All statically-named metrics, plus the
+  `<protocol>_socket_drops`/`_socket_rx_queue_bytes` pairs for
+  `syslog_udp`/`ipfix`/`sflow`, now carry a description.
 
 ### Fixed
 
@@ -101,6 +125,177 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   until `recv_tasks > 1` (above) made multiple sockets share one port via
   `SO_REUSEPORT` — before the fix, the harness-side drop reconciliation
   read one socket of `N` and disagreed with the in-process counter.
+- **CRITICAL**: nine log sites sliced wire-derived strings (syslog,
+  suricata, WEF) by a raw byte offset for truncation, which panics when
+  the cut lands inside a multi-byte UTF-8 character. On syslog UDP, the
+  panicking task was one of the `recv_tasks` `SO_REUSEPORT` receive tasks;
+  its `JoinError` was discarded, so that socket was silently never drained
+  again for the life of the process. Truncation now walks back to the
+  nearest character boundary, and a receive task that dies now logs an
+  error and increments a counter instead of vanishing silently.
+- The same silent-death pattern (a panicking `SO_REUSEPORT` receive task's
+  `JoinError` discarded with `let _ = task.await`) existed independently
+  in IPFIX's and sFlow's fan-out join loops, not just syslog's. Both now
+  log an error and increment `ipfix_recv_task_failed` /
+  `sflow_recv_task_failed` on a dead receive task, matching syslog.
+- **HIGH**: the admin audit-log viewer rendered entries via `innerHTML`,
+  so an unauthenticated attacker could get arbitrary script executed in
+  an admin's browser (same-origin, with cached credentials) just by
+  failing Basic-Auth login with a script payload as the username — any
+  failed login is audited regardless of whether it succeeds. The viewer
+  now builds DOM nodes and sets `textContent`; the `/audit-log` API still
+  serves the raw string unescaped, since escaping is a render-time
+  concern.
+- **HIGH**: `GET /config` (and the redacted config the admin console
+  renders) only masked S3 credentials in three of the ten config sections
+  that carry them (`syslog.s3`, `ipfix.s3`, `zeek.s3`) — `access_key`/
+  `secret_key` for `syslog.structured_s3`, `suricata.s3`, `wef.s3`,
+  `hec.s3`, `sflow.s3`, `aggregate.s3`, and `iceberg.s3` were served in
+  plaintext. All ten sections are now redacted.
+- **MEDIUM**: `hec.token`, `otlp.bearer_token`, and `syslog.http_token`
+  were likewise served in plaintext by the redacted config, letting any
+  admin-API principal read the shared secrets needed to forge ingest
+  records past HEC/OTLP/syslog auth. All three are now masked with the
+  same `***REDACTED***` sentinel as S3 credentials when set; an unset/
+  empty token (each field's documented "auth disabled" state) is left
+  empty rather than becoming a literal secret-looking string.
+- **HIGH**: a posted HEC `sourcetype` of e.g. `../zeek/conn` was used
+  verbatim as an S3 object-key path segment, so a wire-supplied
+  sourcetype could write forged HEC records into another source's S3
+  partition (S3 does not collapse `..`). `sourcetype` is now sanitized
+  the same way Zeek's `_path` and Suricata's `event_type` already are
+  (lowercased, `[a-z0-9_]` only, truncated to 64 characters). logthing
+  also now warns at startup if HEC is enabled with an empty token, since
+  that is what makes the endpoint reachable unauthenticated in the first
+  place.
+- **MEDIUM**: the IPFIX/NetFlow v9 template cache had a 100,000-entry
+  capacity bound but no eviction of any kind, so an attacker who filled
+  it with spoofed templates left it full — refusing every legitimate
+  exporter's new template — until the process was restarted. Entries now
+  carry a last-seen timestamp, refreshed on insert and lookup; a sweep
+  runs only when an insert arrives at a full cache, so a healthy
+  deployment never evicts anything.
+- **MEDIUM**: the syslog, Zeek, and Suricata TCP listeners bounded
+  concurrency with a 1024-permit semaphore but applied no read timeout,
+  so a client that connected and sent nothing held its permit forever;
+  1024 idle connections exhausted the listener for everyone else. Idle
+  TCP connections on all three are now closed after 300 seconds (5
+  minutes) without a complete line, incrementing
+  `syslog_tcp_idle_timeouts`, `suricata_tcp_idle_timeouts`, and
+  `zeek_tcp_idle_timeouts`. Not configurable via `logthing.toml`/env. A well-behaved
+  forwarder simply reconnects; if one is seen reconnecting periodically
+  for no obvious reason, this timeout is a likely cause.
+- **MEDIUM**: the metrics listener and the TLS listener both always bound
+  `0.0.0.0`, ignoring `bind_address` — the metrics listener additionally
+  had no auth and no IP whitelist of its own, so an operator who narrowed
+  `bind_address` to a private interface still exposed `/metrics` on every
+  interface. Both now inherit `bind_address`, and `/metrics` is gated by
+  the same `security.allowed_ips` whitelist as the main HTTP router (there
+  is no separate `metrics.allowed_ips` — a Prometheus scraper's source
+  address must already be on that list). **BREAKING**: if you rely on
+  `/metrics` being reachable on every interface regardless of
+  `bind_address` (e.g. scraping from a different host than the main
+  listener), set `metrics.bind_address = "0.0.0.0"` explicitly to restore
+  the old behaviour.
+- **LOW**: wire-derived text reaching a log line was truncated but not
+  sanitized, so a syslog UDP datagram containing a raw newline (or an
+  ANSI escape sequence) could forge an apparently separate operator log
+  entry or inject terminal escapes — reachable from an unauthenticated,
+  spoofable UDP sender. Control characters in wire-derived text are now
+  replaced with U+FFFD before logging, at the syslog UDP parse-error sites, the
+  syslog/Zeek/Suricata TCP parse-error sites, and the other wire-derived
+  log-injection sites `A4` found (the admin audit logger's `username`
+  field, reachable from a failed Basic-Auth attempt or a rejected
+  trusted-header request; WEF's `SubscriptionId`; the WEF
+  unknown-message-type warning; the formatted-message log in
+  `process_single_event`; the Zeek/Suricata/syslog default handlers
+  installed when no forwarding destination is configured; and the WEF XML
+  tag name logged during parsing).
+- **LOW**: the admin API's rate-limit map reset an IP's entry in place
+  when its window expired but never removed it, so a client rotating
+  source IPs grew the map without bound. Expired entries are now swept on
+  every request. Separately, a `LOGTHING_ADMIN_ALLOWED_IPS` value whose
+  entries all failed to parse was silently treated as an empty (i.e.
+  allow-all) list, identically to never setting it at all — this is now a
+  startup error; a partially malformed list still starts, with a warning
+  naming how many entries were dropped.
+- **CRITICAL**: `field_count`, a `u16` read directly off the wire, was
+  passed unclamped to `Vec::with_capacity` in all three IPFIX/NetFlow v9
+  template parsers. One 65,526-byte datagram of maximally-truncated
+  Options Template Sets measured 4.80 GiB retained (a ~78,630x
+  amplification) — enough to abort the process outright via
+  `handle_alloc_error`. Capacity is now clamped to
+  `field_count.min(remaining / 4)` (4 bytes being the minimum wire
+  size of one field specifier) at all three allocation sites; wire
+  truncation handling is otherwise unchanged.
+- **HIGH**: `MAX_ZEEK_TCP_CONNECTIONS`/`MAX_SURICATA_TCP_CONNECTIONS`
+  (1024) and `ZEEK_MAX_LINE_BYTES`/`SURICATA_MAX_LINE_BYTES` (16 MiB) were
+  each individually reasonable, but their product was not: 1024
+  connections each holding a 16 MiB unterminated line is up to ~15 GiB of
+  attacker-controlled heap per listener, and the idle timeout above does
+  not mitigate a sender that never goes idle. Both listeners now share a
+  512 MiB byte-budget semaphore (64 KiB per permit); a connection that
+  can't get budget is closed immediately, counted by
+  `zeek_tcp_budget_exhausted`/`suricata_tcp_budget_exhausted`. Per-
+  connection line-length limits are unchanged, so a legitimate large
+  record is unaffected; a connection's read buffer also now releases its
+  allocation once retained capacity exceeds 256 KiB, rather than holding
+  onto a one-time large allocation forever.
+- **HIGH**: sFlow's unknown-record handling (records logthing doesn't
+  curate, retained verbatim in `extra` for operator diagnosis) had no
+  bound on how many records, across how many samples, of what size, could
+  be retained from one datagram — a crafted 65,535-byte datagram could
+  retain several MiB. It is now bounded on all three axes: at most 8
+  unknown records per sample, at most 512 per datagram (shared across
+  every sample in one `decode_datagram` call, so splitting records across
+  many small samples no longer defeats the per-sample cap), and each
+  record's retained body capped to 128 bytes (with `body_truncated: true`
+  and the full declared `length` still reported when a body is cut).
+  `SFLOW_RECORD_BYTES` (the per-record footprint `channel_budget.rs`
+  sizes the sFlow channel against) is raised from 1280 to **8960**,
+  measured against the real worst-case shape through a counting
+  allocator, and is now asserted as a true ceiling rather than an
+  average. Channel capacity falls accordingly, from 81,920 slots (set in
+  0.19.1) to **11,702** — still bounded well under the 100 MiB channel
+  budget, and no longer resting on an unrepresentative per-record cost.
+  A single aggregate `sflow_unknown_records_dropped` counter and warning
+  now report the true total dropped across an entire datagram, correcting
+  an earlier undercount that only reflected the first sample to hit the
+  cap.
+- **MEDIUM**: no route extracting a request body (`/wsman*`, `/syslog`,
+  the HEC routes, `/ingest`, `/v1/logs`) bounded aggregate in-flight body
+  memory across concurrent requests — `MAX_BODY_SIZE` (64 MiB) and
+  `security.max_connections` (default 10,000) were each reasonable alone,
+  but an unauthenticated attacker opening many connections and trickling
+  max-size bodies could drive up to ~640 GiB of in-flight heap. A
+  process-wide 1 GiB byte budget now charges every request by its real
+  streamed bytes as the body is read (not by a client-supplied
+  `Content-Length`, which is unenforced over HTTP/2 and would otherwise
+  let the budget be bypassed entirely); a request that exhausts the
+  budget is rejected rather than queued, so one attacker can't starve
+  legitimate traffic. Bodyless `GET` routes are unaffected. Neither
+  `MAX_BODY_SIZE` nor `security.max_connections` changes, so a single
+  legitimate large HEC batch is unaffected.
+- `RuleMetrics` (the aggregation rule counters `aggregate_records_consumed`
+  and `aggregate_overflow_records`) never appeared on `/metrics` in
+  production: their handles were cached at `Aggregator::new` time, which
+  runs before the Prometheus recorder is installed, so they resolved to a
+  permanent no-op. Separately, `run_tls`'s TLS branch never started the
+  metrics-serving task at all when TLS was enabled without delegating to
+  the non-TLS path — since TLS defaults to enabled, a deployment with no
+  explicit `[tls]` block got no working `/metrics` endpoint at all. The
+  Prometheus recorder is now installed synchronously, before anything
+  that might cache a metric handle, and both `Server::run` and its TLS
+  branch now start the metrics endpoint.
+- A deployment with `tls.enabled = true` (the default) panicked on its
+  first TLS handshake with "Could not automatically determine the
+  process-level CryptoProvider": this dependency tree links two rustls
+  0.23 crypto backends (`aws-lc-rs` and `ring`), and rustls refuses to
+  auto-select one once more than one is linked. The process-level
+  `CryptoProvider` (`aws_lc_rs`) is now installed unconditionally at
+  startup, before config is even loaded, and again at every TLS entry
+  point (main server TLS, admin console TLS) so nothing depends on
+  startup-order discipline.
 
 ### Changed
 
