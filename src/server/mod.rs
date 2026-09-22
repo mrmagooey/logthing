@@ -630,12 +630,17 @@ impl Server {
 
         let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-        // Start metrics server if enabled
+        // Start metrics server if enabled. `install_metrics_recorder` is a
+        // no-op when `main.rs` already installed it synchronously before
+        // building the aggregator; calling it again here keeps every
+        // existing caller of `Server::run` (tests included) working
+        // unchanged even when it is the first/only installer.
         if self.config.metrics.enabled {
             let metrics_ip =
                 resolve_metrics_ip(&self.config.metrics.bind_address, &self.config.bind_address)?;
             let metrics_addr = SocketAddr::new(metrics_ip, self.config.metrics.port);
-            tokio::spawn(start_metrics_server(metrics_addr, metrics_whitelist));
+            install_metrics_recorder();
+            tokio::spawn(serve_metrics_endpoint(metrics_addr, metrics_whitelist));
         }
 
         // Gap-b: wire graceful shutdown so the axum server stops on SIGTERM,
@@ -815,7 +820,27 @@ impl Server {
         // comment on `Server`.
         let ip_whitelist = self.ip_whitelist.clone();
 
+        // Clone before `create_router` consumes `ip_whitelist` below — same
+        // reason as the matching clone in `run`.
+        let metrics_whitelist = ip_whitelist.clone();
+
         let app = self.create_router(ip_whitelist)?;
+
+        // Start metrics server if enabled. Bug fix: this branch used to skip
+        // metrics entirely — `run_tls` only ever reached the `start_metrics_server`
+        // call by delegating to `run()` when TLS was OFF (the early return
+        // above). With TLS on it built its own router and served directly,
+        // so the recorder was never installed and every metric in the
+        // process stayed a no-op handle forever. TLS deployments serve
+        // `/metrics` over plain HTTP on `metrics.port`, same as the non-TLS
+        // path — there is no TLS variant of this endpoint to build.
+        if self.config.metrics.enabled {
+            let metrics_ip =
+                resolve_metrics_ip(&self.config.metrics.bind_address, &self.config.bind_address)?;
+            let metrics_addr = SocketAddr::new(metrics_ip, self.config.metrics.port);
+            install_metrics_recorder();
+            tokio::spawn(serve_metrics_endpoint(metrics_addr, metrics_whitelist));
+        }
 
         let tls_config = build_tls_config(&self.config.tls)?;
         let tls_addr = tls_bind_addr(&self.config.bind_address, self.config.tls.port);
@@ -1394,6 +1419,38 @@ mod tests {
 
     async fn default_state() -> Arc<AppState> {
         build_state_with_config(Config::default()).await
+    }
+
+    /// `install_metrics_recorder` must tolerate a second call: it's called
+    /// once (at most) by `main.rs` and again, unconditionally, by every
+    /// `Server::run`/`run_tls`. A naive second `set_global_recorder` call
+    /// returns `Err`; unwrapping it would panic, and swallowing it silently
+    /// could leave `METRICS_HANDLE` pointing at a handle detached from
+    /// whichever recorder actually won the race.
+    #[test]
+    fn install_metrics_recorder_is_idempotent() {
+        install_metrics_recorder();
+        install_metrics_recorder();
+
+        let handle = METRICS_HANDLE
+            .get()
+            .expect("METRICS_HANDLE must be set after install_metrics_recorder");
+
+        // A working handle renders real exposition text reflecting the live
+        // global recorder -- proves the second call didn't detach
+        // `METRICS_HANDLE` from it or install a second, shadow recorder.
+        metrics::counter!(
+            "aggregate_records_consumed",
+            "rule" => "install_metrics_recorder_is_idempotent"
+        )
+        .increment(1);
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                "aggregate_records_consumed{rule=\"install_metrics_recorder_is_idempotent\"} 1"
+            ),
+            "handle must reflect the live global recorder after a repeat install call, got:\n{rendered}"
+        );
     }
 
     #[test]
@@ -4634,14 +4691,45 @@ fn tls_bind_addr(bind_address: &SocketAddr, port: u16) -> SocketAddr {
     SocketAddr::new(bind_address.ip(), port)
 }
 
-async fn start_metrics_server(addr: SocketAddr, ip_whitelist: IpWhitelist) {
+/// Build the Prometheus recorder, publish its handle via `METRICS_HANDLE`,
+/// and install it as the process-global `metrics` recorder — synchronously.
+///
+/// Split out of what used to be `start_metrics_server` (now
+/// `serve_metrics_endpoint`, below) so this half can run to completion
+/// *before* anything that constructs and caches a `metrics::Counter`/`Gauge`
+/// handle. `metrics::counter!`/`gauge!` resolve against whichever recorder
+/// is installed at the moment the macro runs; with none installed yet they
+/// return a no-op handle, and a no-op handle cached in a struct field
+/// (rather than re-resolved per call) stays no-op for the life of the
+/// process. See the call site in `main.rs` for the concrete case
+/// (`forwarding::aggregate::RuleMetrics`) this was fixed for.
+///
+/// Idempotent: `Server::run`/`run_tls` call this unconditionally too, after
+/// `main.rs` may already have. `metrics::set_global_recorder` itself errors
+/// on a second call, so a naive repeat call would either panic (if
+/// unwrapped) or leave `METRICS_HANDLE` and the live global recorder
+/// mismatched (if the error were swallowed). Guarding on `METRICS_HANDLE`
+/// itself — already a `OnceLock`, set exactly once, only here — makes a
+/// repeat call a cheap no-op instead, with no extra state needed.
+pub fn install_metrics_recorder() {
+    if METRICS_HANDLE.get().is_some() {
+        return;
+    }
+
     use metrics_exporter_prometheus::PrometheusBuilder;
 
     let recorder = PrometheusBuilder::new().build_recorder();
-
     let handle = recorder.handle();
 
-    let _ = METRICS_HANDLE.set(handle.clone());
+    if METRICS_HANDLE.set(handle).is_err() {
+        // Lost a race with a concurrent installer (there is currently no
+        // caller that can actually trigger this — `main.rs` installs
+        // synchronously before `Server::run`/`run_tls` ever spawn — but the
+        // guard is cheap and correct if that ever changes). The other
+        // caller already installed the global recorder and described all
+        // metrics; do not attempt either again.
+        return;
+    }
 
     metrics::set_global_recorder(recorder).expect("Failed to install Prometheus recorder");
 
@@ -4650,6 +4738,17 @@ async fn start_metrics_server(addr: SocketAddr, ip_whitelist: IpWhitelist) {
     // ahead of this line would go nowhere and every series would render
     // without its `# HELP`.
     crate::metrics_descriptions::describe_all();
+}
+
+/// Render `METRICS_HANDLE` and serve it on `/metrics` at `addr` forever,
+/// gated by `ip_whitelist`. The recorder half of the old `start_metrics_server`
+/// — see `install_metrics_recorder`, which every caller must have already
+/// run (directly or via `Server::run`/`run_tls`) before spawning this.
+async fn serve_metrics_endpoint(addr: SocketAddr, ip_whitelist: IpWhitelist) {
+    let handle = METRICS_HANDLE
+        .get()
+        .cloned()
+        .expect("install_metrics_recorder must run before serve_metrics_endpoint");
 
     // Gated by the same `security.allowed_ips` whitelist as the main router:
     // inheriting `bind_address` does nothing when `bind_address` is itself

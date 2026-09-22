@@ -101,6 +101,26 @@ async fn async_main() -> anyhow::Result<()> {
                 None
             });
 
+    // Install the Prometheus recorder now, synchronously — BEFORE anything
+    // below (starting with the aggregator) constructs and caches a
+    // `metrics::Counter`/`Gauge` handle. `metrics::counter!`/`gauge!`
+    // resolve against whichever recorder is installed at the moment the
+    // macro runs; with none installed yet they return a no-op handle, and a
+    // no-op handle cached in a struct field (rather than re-resolved via the
+    // macro on every call) stays no-op for the life of the process.
+    // `Server::run`/`run_tls` also call `install_metrics_recorder`
+    // (idempotent — see its doc comment) but only once spawned, which is too
+    // late for anything constructed here in `async_main` first. This repo
+    // has now shipped that exact bug twice: once in `CardinalityWatcher`
+    // (fixed by resolving its handles per-call instead of caching — see the
+    // comments at `src/stats/cardinality.rs:328-333` and `:380-382`), and
+    // once in `forwarding::aggregate::RuleMetrics`, which still caches by
+    // design (see its own doc comment) and so genuinely needs the recorder
+    // installed before `Aggregator::new` runs below.
+    if config.metrics.enabled {
+        logthing::server::install_metrics_recorder();
+    }
+
     // -----------------------------------------------------------------------
     // Build the aggregator (optional). Rules are validated up front: a bad
     // rule means a noisy stream would keep flowing unaggregated, so a config

@@ -7,7 +7,7 @@
 //! holds the descriptions in one table and [`describe_all`] registers them.
 //!
 //! `describe_*!` talks to whichever recorder is installed, so `describe_all`
-//! must run *after* `metrics::set_global_recorder`. `start_metrics_server`
+//! must run *after* `metrics::set_global_recorder`. `install_metrics_recorder`
 //! (`src/server/mod.rs`) is the single call site and does exactly that.
 //! Describing a name that never gets a sample is harmless: `render` walks
 //! recorded series and looks the description up, so an undescribed metric
