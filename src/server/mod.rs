@@ -4809,6 +4809,15 @@ async fn serve_metrics_endpoint(addr: SocketAddr, ip_whitelist: IpWhitelist) {
         .layer(whitelist_layer)
         .layer(axum::Extension(ip_whitelist));
 
+    // ponytail: unchanged from the pre-split code, but worth naming now that
+    // it is easier to see. This runs in a `tokio::spawn`ed task whose
+    // `JoinHandle` nobody awaits, so a bind failure (port already in use)
+    // panics that task alone: the main server keeps serving, `/metrics` is
+    // silently dead, and nothing surfaces the error. The recorder is still
+    // installed, so counters increment into a handle nobody can scrape —
+    // which reads exactly like the dead-metric bugs this module just fixed.
+    // Ceiling: log-and-return instead of panicking, and surface it via the
+    // health check or a startup-time bind probe so it fails loudly.
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     info!("Metrics server started on http://{}", addr);
 

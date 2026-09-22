@@ -325,12 +325,18 @@ impl CardinalityWatcher {
         // than closed with a Mutex that would serialize this hot path.
         if !self.values.contains(&value) {
             if self.values.len() >= self.max_values {
-                // Resolved per-call, not cached on `self`: `CardinalityWatcher::new`
-                // runs before `metrics::set_global_recorder` in production
-                // (`main.rs` constructs it, `start_metrics_server` installs the
-                // recorder later, on the `server.run(...)` path) — a handle
-                // captured at construction time binds to the no-op recorder
-                // forever. This only runs on a cap miss, not the hot path.
+                // Resolved per-call, not cached on `self`. A handle captured at
+                // construction binds to whatever recorder is installed at that
+                // instant, and stays bound — so caching one before
+                // `metrics::set_global_recorder` runs yields a permanently
+                // no-op metric. `main.rs` now calls `install_metrics_recorder`
+                // before building this watcher, so caching would happen to work
+                // today; resolving per-call keeps it correct regardless of
+                // startup order, which is the property that matters, since this
+                // crate has shipped the cached-handle bug twice already (here,
+                // and in `forwarding::aggregate::RuleMetrics`, which still
+                // caches and therefore depends on that ordering). This only
+                // runs on a cap miss, not the hot path.
                 metrics::counter!("field_distinct_values_capped",
                     "source" => self.source.clone(),
                     "stream" => self.stream.clone(),
