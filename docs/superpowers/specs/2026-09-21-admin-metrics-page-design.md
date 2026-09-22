@@ -66,7 +66,9 @@ New module `src/admin/metrics_view.rs`, pure functions only:
   Malformed lines are skipped, never fatal — a metrics page that 500s is
   worse than one missing a row. Groups sorted by name, samples sorted by
   label text.
-- `render_groups_html(&[MetricGroup]) -> String`.
+- `render_groups_html(&[MetricGroup]) -> String` — one table, one `<tbody>`
+  per metric, the name and HELP text carried in `rowspan` cells so they are
+  stated once per metric rather than repeated per series.
 - `render_cardinality_html(&[CardinalityWatch], &[MetricGroup], window_secs)
   -> String`.
 
