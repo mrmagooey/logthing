@@ -1006,6 +1006,17 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                         None => self.sink.to_record_batch(&record, &schema),
                     };
                     match mapped {
+                        Ok(b) if b.schema() != schema => {
+                            // A sink handed back a batch that doesn't match this
+                            // buffer's schema. Buffering it would make every later
+                            // flush of this buffer fail in `concat_batches` and
+                            // retry forever, so skip just this record.
+                            tracing::warn!(
+                                source = self.sink.source(),
+                                "record batch schema does not match buffer schema, skipping record"
+                            );
+                            return Ok(());
+                        }
                         Ok(b) => {
                             let est_bytes = used_bytes(&b);
                             let n = b.num_rows();
@@ -1038,6 +1049,17 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 None => self.sink.to_record_batch(&record, &schema),
             };
             match mapped {
+                Ok(b) if b.schema() != schema => {
+                    // A sink handed back a batch that doesn't match this
+                    // buffer's schema. Buffering it would make every later
+                    // flush of this buffer fail in `concat_batches` and
+                    // retry forever, so skip just this record.
+                    tracing::warn!(
+                        source = self.sink.source(),
+                        "record batch schema does not match buffer schema, skipping record"
+                    );
+                    return Ok(());
+                }
                 Ok(b) => {
                     let est_bytes = used_bytes(&b);
                     let n = b.num_rows();
@@ -2412,6 +2434,59 @@ max_partitions = 128
             MockSink.new_batch(&test_schema()).is_none(),
             "MockSink does not override new_batch, so it must default to None"
         );
+    }
+
+    /// Sink whose `schema()` advertises `test_schema()` (a single `val: Utf8`
+    /// column) but whose `to_record_batch()` hands back a batch built with a
+    /// different schema entirely. `new_batch` is not overridden, so it
+    /// defaults to `None` and every push goes through the non-amortized
+    /// `to_record_batch` arm.
+    #[derive(Clone)]
+    struct MismatchedSchemaSink;
+    impl ParquetSink for MismatchedSchemaSink {
+        type Record = String;
+        fn source(&self) -> &'static str {
+            "test"
+        }
+        fn partition(&self, _r: &String) -> Option<String> {
+            None
+        }
+        fn schema(&self, _p: Option<&str>) -> Arc<Schema> {
+            test_schema()
+        }
+        fn to_record_batch(
+            &self,
+            _record: &String,
+            _schema: &Arc<Schema>,
+        ) -> anyhow::Result<RecordBatch> {
+            use arrow::array::{ArrayRef, Int64Array};
+            let other_schema = Arc::new(Schema::new(vec![Field::new(
+                "other",
+                DataType::Int64,
+                false,
+            )]));
+            let col: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+            Ok(RecordBatch::try_new(other_schema, vec![col])?)
+        }
+    }
+
+    #[tokio::test]
+    async fn push_rejects_a_batch_whose_schema_does_not_match_the_buffer() {
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(1_000_000); // nothing flushes on its own
+        let mut w = PartitionedParquetWriter::new(MismatchedSchemaSink, s3, cfg, policy);
+
+        w.push("boom".to_string()).await.unwrap();
+
+        let buf = w.buffer_by_partition("").expect("buffer exists");
+        assert_eq!(
+            buf.buffer.len(),
+            0,
+            "a batch whose schema differs from the buffer's must not be buffered"
+        );
+        assert_eq!(buf.row_count, 0);
+
+        w.flush_all().await.unwrap();
     }
 
     // -----------------------------------------------------------------------

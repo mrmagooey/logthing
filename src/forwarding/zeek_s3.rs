@@ -782,38 +782,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mismatched_raw_log_path_falls_back_to_envelope_not_conn_accumulator() {
-        let sink = unreachable_sink().await;
+    async fn mixed_case_log_path_joins_conn_buffer_and_flushes() {
+        use crate::forwarding::local_sink::LocalDiskSink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(
+            LocalDiskSink::new(dir.path().to_path_buf())
+                .await
+                .expect("LocalDiskSink::new"),
+        );
         let (bwc, policy) = make_zeek_cfg(100_000, usize::MAX, 256);
         let mut writer = PartitionedParquetWriter::new(ZeekSink, sink, bwc, policy);
 
-        // Raw log_path "Conn" (mixed case) sanitizes to partition "conn"
-        // (ZeekSink::new_batch will offer a ConnAccumulator for that
-        // partition's schema), but the raw-path registry lookup inside
-        // ConnAccumulator::try_append is case-sensitive and misses -- this
-        // record must be rejected and fall back to the envelope mapper,
-        // exactly as to_record_batch's pre-existing fallback already does.
-        let rec = ZeekRecord {
-            log_path: "Conn".to_string(),
-            fields: serde_json::json!({"_path": "Conn", "ts": 1700000000.0, "uid": "C1"}),
-            received_at: Utc::now(),
-        };
-        writer.push(rec).await.unwrap();
+        // Raw log_path "Conn" (mixed case) sanitizes to partition "conn", the
+        // same buffer the plain "conn" record lands in. Regression coverage
+        // for the bug where `get_schema_entry(&record.log_path)` (the RAW,
+        // unsanitized path) missed the case-sensitive registry for "Conn",
+        // fell back to the envelope schema, and got pushed straight into the
+        // typed "conn" buffer -- poisoning every later flush of that buffer
+        // in `concat_batches` forever.
+        writer.push(make_conn_record("Lower1")).await.unwrap();
+        let mut mixed = make_conn_record("Mixed1");
+        mixed.log_path = "Conn".to_string();
+        mixed.fields["_path"] = serde_json::json!("Conn");
+        writer.push(mixed).await.unwrap();
 
-        let buf = writer.buffer_by_partition("conn").unwrap();
+        writer.flush_all().await.unwrap();
+        writer.drain_pending_flushes().await;
+
         assert_eq!(
-            buf.row_count, 1,
-            "the record must still be counted, just via the fallback path"
+            writer
+                .buffer_by_partition("conn")
+                .map(|b| b.buffer.len())
+                .unwrap_or(0),
+            0,
+            "conn buffer must have no pending unflushed batches after flush_all"
+        );
+
+        let conn_dir = dir.path().join("zeek/conn");
+        let parquet_files = walk_all_parquet_files(&conn_dir);
+        assert!(
+            !parquet_files.is_empty(),
+            "expected at least one Parquet file under {conn_dir:?}"
+        );
+
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let mut total_rows = 0usize;
+        let mut schema_has_extra = false;
+        for file_path in &parquet_files {
+            let bytes = std::fs::read(file_path).expect("read parquet file");
+            let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+                .expect("parquet builder for conn");
+            schema_has_extra =
+                schema_has_extra || builder.schema().field_with_name("_extra").is_ok();
+            let reader = builder.build().expect("parquet reader for conn");
+            for rb in reader {
+                total_rows += rb.expect("batch ok").num_rows();
+            }
+        }
+        assert_eq!(
+            total_rows, 2,
+            "both the 'conn' and 'Conn' records must land in the same conn buffer \
+             and flush together into the typed conn Parquet file(s)"
         );
         assert!(
-            buf.live_builder.as_ref().map(|b| b.len()).unwrap_or(0) == 0,
-            "the mismatched record must NOT have been accepted into the conn live builder"
+            schema_has_extra,
+            "flushed file(s) must use the typed conn schema (has _extra), not envelope"
         );
-        assert_eq!(
-            buf.buffer.len(),
-            1,
-            "the rejected record's fallback batch must be pushed directly onto buf.buffer"
-        );
+    }
+
+    fn walk_all_parquet_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "parquet") {
+                    out.push(path);
+                }
+            }
+        }
+        out
     }
 
     // -----------------------------------------------------------------------

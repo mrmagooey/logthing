@@ -10,6 +10,8 @@ use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
+use crate::forwarding::buffered_writer::sanitize_log_path;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -1785,8 +1787,18 @@ pub fn metric_log_path(log_path: &str) -> &'static str {
 
 /// Look up the SchemaEntry for `log_path`. Falls back to the envelope schema for unknown paths.
 /// The envelope mapper always uses the actual `log_path` at call time via a wrapper.
+///
+/// Tries an exact match first, then the `sanitize_log_path`-normalized key:
+/// `ZeekSink::partition()`/`schema()` key buffers by `sanitize_log_path` (which
+/// lowercases), so `"Conn"` must resolve to the same typed conn schema its
+/// buffer holds -- a case-sensitive-only lookup would fall through to the
+/// envelope schema here while the buffer stays typed conn, and every later
+/// flush of that buffer would fail in `concat_batches` forever.
 pub fn get_schema_entry(log_path: &str) -> Arc<SchemaEntry> {
     if let Some(entry) = REGISTRY.get(log_path) {
+        return entry.clone();
+    }
+    if let Some(entry) = REGISTRY.get(sanitize_log_path(log_path).as_str()) {
         return entry.clone();
     }
     // For unknown paths, build a fresh SchemaEntry with the actual log_path captured.
@@ -2560,6 +2572,28 @@ mod tests {
                 has_extra,
                 "typed schema for {} must have _extra column",
                 path
+            );
+        }
+    }
+
+    #[test]
+    fn get_schema_entry_resolves_case_and_rotation_variants() {
+        let conn = get_schema_entry("conn");
+        for raw in ["Conn", "CONN", "cOnN"] {
+            assert!(
+                Arc::ptr_eq(&get_schema_entry(raw).schema, &conn.schema),
+                "{raw} must resolve to the typed conn schema"
+            );
+        }
+        // The listener runs normalize_log_path first; the pair must compose.
+        let rotated = crate::zeek::normalize_log_path("CONN.2026-08-14-16-08-44");
+        assert!(Arc::ptr_eq(&get_schema_entry(rotated).schema, &conn.schema));
+        // Hostile / non-ASCII inputs: no panic, envelope unless the sanitized key is real.
+        for raw in ["Ｃonn", "../Conn", "", "weird"] {
+            let e = get_schema_entry(raw);
+            assert!(
+                e.schema.field_with_name("payload").is_ok(),
+                "{raw:?} must be envelope"
             );
         }
     }
