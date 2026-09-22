@@ -65,7 +65,7 @@ fn metric_value(rendered: &str, prefix: &str) -> Option<f64> {
 #[tokio::test]
 async fn suricata_records_received_and_by_event_type_survive_the_real_accept_and_forwarding_path() {
     // --- Install the real Prometheus recorder globally, exactly as
-    // `start_metrics_server` in src/server/mod.rs does for the production
+    // `install_metrics_recorder` in src/server/mod.rs does for the production
     // `/metrics` endpoint. Must happen exactly once per process; see the
     // file-level doc comment for why this file has only one test.
     let recorder = PrometheusBuilder::new().build_recorder();

@@ -10,6 +10,17 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 fn main() -> anyhow::Result<()> {
+    // Install the process-wide rustls `CryptoProvider` before anything else
+    // runs. This tree links two rustls-0.23 crypto backends (`aws-lc-rs` and
+    // `ring`), so the first TLS handshake anywhere in the process panics
+    // without one installed — see `install_crypto_provider`'s doc comment.
+    // `build_tls_config`/`run_tls_server` also call this themselves (so
+    // server TLS is covered even without this line), but outbound HTTPS
+    // needs it too and has no single call site to hook — installing here,
+    // synchronously, unconditionally, and before the config is even loaded
+    // (so it's not gated on `tls.enabled`), covers all of them up front.
+    logthing::server::install_crypto_provider();
+
     // Determine number of worker threads (default to all CPU cores)
     let num_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -100,6 +111,26 @@ async fn async_main() -> anyhow::Result<()> {
                 error!("Failed to construct Iceberg descriptor sink, descriptors disabled: {e}");
                 None
             });
+
+    // Install the Prometheus recorder now, synchronously — BEFORE anything
+    // below (starting with the aggregator) constructs and caches a
+    // `metrics::Counter`/`Gauge` handle. `metrics::counter!`/`gauge!`
+    // resolve against whichever recorder is installed at the moment the
+    // macro runs; with none installed yet they return a no-op handle, and a
+    // no-op handle cached in a struct field (rather than re-resolved via the
+    // macro on every call) stays no-op for the life of the process.
+    // `Server::run`/`run_tls` also call `install_metrics_recorder`
+    // (idempotent — see its doc comment) but only once spawned, which is too
+    // late for anything constructed here in `async_main` first. This repo
+    // has now shipped that exact bug twice: once in `CardinalityWatcher`
+    // (fixed by resolving its handles per-call instead of caching — see the
+    // comments at `src/stats/cardinality.rs:328-333` and `:380-382`), and
+    // once in `forwarding::aggregate::RuleMetrics`, which still caches by
+    // design (see its own doc comment) and so genuinely needs the recorder
+    // installed before `Aggregator::new` runs below.
+    if config.metrics.enabled {
+        logthing::server::install_metrics_recorder();
+    }
 
     // -----------------------------------------------------------------------
     // Build the aggregator (optional). Rules are validated up front: a bad

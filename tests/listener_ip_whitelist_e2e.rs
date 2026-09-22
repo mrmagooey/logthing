@@ -20,7 +20,7 @@
 //! set to a range that excludes 127.0.0.1, so every probe sent from
 //! 127.0.0.1 below must be rejected.
 //!
-//! The metrics server (`start_metrics_server`, `src/server/mod.rs`) now has
+//! The metrics server (`serve_metrics_endpoint`, `src/server/mod.rs`) now has
 //! the same `IpWhitelist` layer attached as the main router (fixed
 //! alongside the `bind_address` hardcoding — see the "Bind address" note in
 //! the README's `## Metrics` section), so it is gated by the exact same

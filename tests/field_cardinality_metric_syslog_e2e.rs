@@ -119,9 +119,14 @@ async fn field_distinct_values_visible_on_real_metrics_endpoint_at_default_recv_
     // `CardinalityWatcher` resolves its gauge/counter handles fresh via the
     // `metrics::gauge!`/`counter!` macros at each use site rather than
     // caching them on `self` — see `CardinalityWatcher::observe`/`tick`'s own
-    // comments. That is what makes it safe to construct the watcher here in
-    // the SAME order `main.rs` does: before `Server::run` has spawned
-    // `start_metrics_server` and installed the real Prometheus recorder.
+    // comments. That is what makes it safe to construct the watcher here
+    // before any recorder is installed: a cached handle would bind to the
+    // no-op recorder permanently, a macro call resolves at fire time.
+    //
+    // Production no longer has that hazard — `main.rs` calls
+    // `install_metrics_recorder` synchronously before building any watcher —
+    // but per-call resolution keeps the watcher correct under either
+    // ordering, which is why this test keeps the harder one.
 
     // --- Build the CardinalityWatcher the same way main.rs does: validate
     // config, construct, spawn the shared window ticker. ---

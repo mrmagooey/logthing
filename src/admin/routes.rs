@@ -158,6 +158,15 @@ async fn run_tls_server(
 ) -> anyhow::Result<()> {
     use axum_server::tls_rustls::RustlsConfig;
 
+    // `RustlsConfig::from_pem_file` builds a `rustls::ServerConfig`
+    // internally via `rustls::ServerConfig::builder()`, which needs a
+    // process-level `CryptoProvider` installed first — see
+    // `crate::server::install_crypto_provider`'s doc comment. This is a
+    // separate TLS entry point from the main server's `build_tls_config`, so
+    // it needs its own (idempotent) call rather than relying on that one
+    // having already run.
+    crate::server::install_crypto_provider();
+
     let rustls_config =
         RustlsConfig::from_pem_file(&tls_config.cert_file, &tls_config.key_file).await?;
 
