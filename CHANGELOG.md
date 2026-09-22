@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file, newest
 first, loosely following [Keep a Changelog](https://keepachangelog.com/).
 This file starts at 0.15.0; earlier releases are not backfilled.
 
+## [Unreleased]
+
+### Fixed
+
+- The `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` release
+  binaries failed to compile, so v0.20.0 published a GitHub Release with no
+  binary assets attached. `RecvMmsgBatch` (new in 0.20.0) used two constructs
+  that are valid on glibc but not on musl: `recvmmsg`'s `flags` parameter is
+  `c_int` on glibc and `c_uint` on musl, and musl's `msghdr` carries private
+  padding fields that make struct-literal construction a hard error. The
+  `flags` argument is now `MSG_DONTWAIT as _` so inference picks the right
+  width per target, and the `msghdr` is zeroed and filled field-by-field
+  rather than built as a literal. Both are compile-time-only changes with no
+  effect on the running binary. `.github/workflows/rust.yml` builds only the
+  gnu target, so nothing caught this before the tag was pushed; both musl
+  targets are now verified building via `cargo zigbuild`, the same tool
+  `binaries.yml` uses.
+
 ## [0.20.0] - 2026-09-21
 
 ### Added
