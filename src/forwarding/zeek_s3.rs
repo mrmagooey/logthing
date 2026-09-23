@@ -107,16 +107,16 @@ impl ParquetSink for ZeekSink {
                 anyhow::anyhow!("ZeekSink mapper error for '{}': {e}", record.log_path)
             })
         } else {
-            // The partition was overflowed to "_overflow" (or the sanitized path doesn't match
-            // the raw path).  Use the envelope mapper for the schema we were given.
-            let overflow_entry = get_schema_entry("_overflow_nonexistent_");
-            // get_schema_entry for unknown path always returns envelope — use that mapper.
-            (overflow_entry.mapper)(&record.fields, record.received_at).map_err(|e| {
-                anyhow::anyhow!(
-                    "ZeekSink overflow mapper error for '{}': {e}",
-                    record.log_path
-                )
-            })
+            // The buffer holds the envelope schema (the `_overflow` partition)
+            // but this record's own path is typed: map it as an envelope row
+            // under its real `log_path`.
+            crate::zeek::schema::map_envelope(&record.fields, &record.log_path, record.received_at)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "ZeekSink overflow mapper error for '{}': {e}",
+                        record.log_path
+                    )
+                })
         }
     }
 
@@ -553,6 +553,29 @@ mod tests {
         assert_eq!(batch.num_rows(), 1);
     }
 
+    /// Regression: when a typed record's partition has overflowed (the
+    /// caller-supplied `schema` is the envelope schema even though
+    /// `get_schema_entry(&record.log_path)` resolves to a typed schema), the
+    /// mapped row's `log_path` column must still carry the record's real
+    /// `log_path` -- not a hardcoded placeholder that could never appear on
+    /// the wire.
+    #[test]
+    fn to_record_batch_on_envelope_schema_keeps_real_log_path_for_typed_record() {
+        let rec = ZeekRecord {
+            log_path: "dns".to_string(),
+            fields: serde_json::json!({"_path": "dns", "ts": 1700000000.0}),
+            received_at: Utc::now(),
+        };
+        let batch = ZeekSink.to_record_batch(&rec, &envelope_schema()).unwrap();
+        let col = batch
+            .column_by_name("log_path")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(col.value(0), "dns");
+    }
+
     // -----------------------------------------------------------------------
     // S3 key layout verification
     // -----------------------------------------------------------------------
@@ -848,6 +871,68 @@ mod tests {
         assert!(
             schema_has_extra,
             "flushed file(s) must use the typed conn schema (has _extra), not envelope"
+        );
+    }
+
+    /// Regression: once a typed partition (`dns`) overflows into the shared
+    /// `"_overflow"` buffer, its rows must keep the record's real `log_path`
+    /// -- not the `"_overflow_nonexistent_"` placeholder the pre-fix
+    /// `to_record_batch` else-branch hardcoded. `weird` (already unknown, so
+    /// never typed) is included as a control: it must keep working exactly
+    /// as before.
+    #[tokio::test]
+    async fn overflow_records_keep_their_real_log_path() {
+        use crate::forwarding::local_sink::LocalDiskSink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(
+            LocalDiskSink::new(dir.path().to_path_buf())
+                .await
+                .expect("LocalDiskSink::new"),
+        );
+        // max_partitions = 1: "conn" claims the one slot; "dns" and "weird"
+        // are the 2nd/3rd distinct partitions and overflow.
+        let (bwc, policy) = make_zeek_cfg(100_000, usize::MAX, 1);
+        let mut writer = PartitionedParquetWriter::new(ZeekSink, sink, bwc, policy);
+
+        writer.push(make_conn_record("C1")).await.unwrap();
+        writer.push(make_dns_record("D1")).await.unwrap();
+        writer.push(make_unknown_record()).await.unwrap();
+
+        writer.flush_all().await.unwrap();
+        writer.drain_pending_flushes().await;
+
+        let overflow_dir = dir.path().join("zeek/_overflow");
+        let parquet_files = walk_all_parquet_files(&overflow_dir);
+        assert!(
+            !parquet_files.is_empty(),
+            "expected at least one Parquet file under {overflow_dir:?}"
+        );
+
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let mut log_paths = std::collections::HashSet::new();
+        for file_path in &parquet_files {
+            let bytes = std::fs::read(file_path).expect("read parquet file");
+            let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+                .expect("parquet builder for _overflow");
+            let reader = builder.build().expect("parquet reader for _overflow");
+            for rb in reader {
+                let rb = rb.expect("batch ok");
+                let col = rb
+                    .column_by_name("log_path")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .unwrap();
+                for i in 0..arrow_array::Array::len(col) {
+                    log_paths.insert(col.value(i).to_string());
+                }
+            }
+        }
+        assert_eq!(
+            log_paths,
+            std::collections::HashSet::from(["dns".to_string(), "weird".to_string()]),
+            "overflowed rows must keep their real log_path, never a placeholder"
         );
     }
 

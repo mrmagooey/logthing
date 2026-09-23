@@ -53,8 +53,15 @@ async fn reserve_port() -> u16 {
 }
 
 fn conn_line(uid: &str) -> String {
+    conn_line_with_path("conn", uid)
+}
+
+/// Same fields as `conn_line`, but with a caller-chosen `_path` spelling —
+/// used to prove `metric_log_path` resolves case variants (e.g. `"Conn"`)
+/// to the same `zeek_records_by_path{log_path="conn"}` series.
+fn conn_line_with_path(path: &str, uid: &str) -> String {
     serde_json::json!({
-        "_path": "conn",
+        "_path": path,
         "ts": 1700000000.0,
         "uid": uid,
         "id.orig_h": "10.0.0.1",
@@ -197,11 +204,14 @@ async fn zeek_records_received_visible_on_real_metrics_endpoint_with_forwarding_
     let mut zeek_stream = zeek_stream.expect("zeek TCP listener did not accept in time");
 
     // --- Send real NDJSON zeek lines over the real TCP connection ---
-    // 2x conn, 1x dns — distinct _path values to verify per-path label
-    // breakdown, not just the aggregate counter.
+    // 2x conn, 1x dns, 1x "Conn" (mixed case) — distinct _path values to
+    // verify per-path label breakdown, not just the aggregate counter. The
+    // "Conn" line proves `metric_log_path` resolves case variants to the
+    // same `log_path="conn"` series as plain "conn" (spec A2).
     let lines = [
         conn_line("CReceived001"),
         conn_line("CReceived002"),
+        conn_line_with_path("Conn", "CReceived003"),
         dns_line("DReceived001"),
     ];
     for line in &lines {
@@ -254,8 +264,8 @@ async fn zeek_records_received_visible_on_real_metrics_endpoint_with_forwarding_
         )
     });
     assert_eq!(
-        received, 3.0,
-        "regression: zeek_records_received must count all 3 records ingested via the \
+        received, 4.0,
+        "regression: zeek_records_received must count all 4 records ingested via the \
          real zeek TCP listener even though a forwarding handler (not DefaultZeekHandler) \
          is installed. Full scrape body:\n{body}"
     );
@@ -275,8 +285,9 @@ async fn zeek_records_received_visible_on_real_metrics_endpoint_with_forwarding_
             )
         });
     assert_eq!(
-        conn_count, 2.0,
-        "expected 2 conn records counted by log_path; full body:\n{body}"
+        conn_count, 3.0,
+        "expected 3 conn records counted by log_path (2x \"conn\" + 1x \"Conn\", \
+         both resolving to the same series); full body:\n{body}"
     );
     assert_eq!(
         dns_count, 1.0,

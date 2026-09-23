@@ -138,10 +138,12 @@ async fn zeek_records_received_and_by_path_survive_the_real_accept_and_forwardin
     .expect("listener accepted a connection within 5s");
 
     // --- Write real NDJSON zeek lines over the real TCP connection: 2x
-    // conn, 1x dns, distinct `_path` values.
-    let conn_line = |uid: &str| {
+    // conn, 1x "Conn" (mixed case), 1x dns, distinct `_path` values. The
+    // "Conn" line proves `metric_log_path` resolves case variants to the
+    // same `log_path="conn"` series as plain "conn" (spec A2).
+    let conn_line_with_path = |path: &str, uid: &str| {
         serde_json::json!({
-            "_path": "conn",
+            "_path": path,
             "ts": 1700000000.0,
             "uid": uid,
             "id.orig_h": "10.0.0.1",
@@ -155,6 +157,7 @@ async fn zeek_records_received_and_by_path_survive_the_real_accept_and_forwardin
         })
         .to_string()
     };
+    let conn_line = |uid: &str| conn_line_with_path("conn", uid);
     let dns_line = |uid: &str| {
         serde_json::json!({
             "_path": "dns",
@@ -174,6 +177,7 @@ async fn zeek_records_received_and_by_path_survive_the_real_accept_and_forwardin
     for line in [
         conn_line("CReceived001"),
         conn_line("CReceived002"),
+        conn_line_with_path("Conn", "CReceived003"),
         dns_line("DReceived001"),
     ] {
         stream
@@ -208,15 +212,15 @@ async fn zeek_records_received_and_by_path_survive_the_real_accept_and_forwardin
 
     assert_eq!(
         metric_value(&rendered, "zeek_records_received"),
-        Some(3.0),
-        "zeek_records_received must count all 3 records sent over the real TCP connection \
+        Some(4.0),
+        "zeek_records_received must count all 4 records sent over the real TCP connection \
          through a real (non-default) forwarding handler; rendered exposition:\n{rendered}"
     );
     assert_eq!(
         metric_value(&rendered, "zeek_records_by_path{log_path=\"conn\"}"),
-        Some(2.0),
-        "zeek_records_by_path{{log_path=\"conn\"}} must count both conn records; rendered \
-         exposition:\n{rendered}"
+        Some(3.0),
+        "zeek_records_by_path{{log_path=\"conn\"}} must count all 3 conn records (2x \"conn\" \
+         + 1x \"Conn\", both resolving to the same series); rendered exposition:\n{rendered}"
     );
     assert_eq!(
         metric_value(&rendered, "zeek_records_by_path{log_path=\"dns\"}"),
