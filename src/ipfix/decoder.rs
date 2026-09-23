@@ -879,6 +879,37 @@ fn parse_ipfix_data_set(
     Ok(records)
 }
 
+/// Maximum size, in raw bytes, of a value `insert_hex_capped` hex-encodes
+/// into `FlowRecord.extra` -- enterprise IEs, unknown IEs, and every
+/// wrong-length/fallback branch in `apply_field_to_record`. Mirrors sFlow's
+/// `MAX_UNKNOWN_RECORD_BODY_BYTES` (`src/sflow/decoder.rs`) for the same
+/// reason: `extra` exists so an operator can diagnose an unmodelled or
+/// malformed value, not to store it with full fidelity, and RFC 7011 §7
+/// variable-length IEs make values up to ~64 KiB routine on the wire. Before
+/// this cap, one such value became ~128 KiB of hex in `extra`, which could
+/// dwarf the per-flow share `channel_budget::IPFIX_DATAGRAM_BYTES` budgets
+/// for -- that constant assumes a handful of small IEs per flow, not one
+/// unbounded one. 128 raw bytes (256 hex chars) is comfortably enough to see
+/// an IE's leading structure (a vendor TLV's type/subtype/length fields and
+/// the start of its payload almost always live in the first few dozen
+/// bytes) while bounding the worst-case per-value cost to a small, fixed
+/// string regardless of how large the field claims to be.
+const MAX_EXTRA_VALUE_BYTES: usize = 128;
+
+/// Hex-encode `raw` into `extra[key]`, capped at `MAX_EXTRA_VALUE_BYTES` --
+/// see that constant's doc comment. A value at or under the cap is stored
+/// byte-for-byte, exactly as before this cap existed. Only when `raw` is
+/// truncated does this also record `extra["<key>_original_len"]` with the
+/// true length, so a diagnostician can see how much was cut without having
+/// to infer it from the hex string's length.
+fn insert_hex_capped(extra: &mut serde_json::Value, key: &str, raw: &[u8]) {
+    let cap = raw.len().min(MAX_EXTRA_VALUE_BYTES);
+    extra[key] = serde_json::json!(hex::encode(&raw[..cap]));
+    if raw.len() > MAX_EXTRA_VALUE_BYTES {
+        extra[format!("{key}_original_len")] = serde_json::json!(raw.len());
+    }
+}
+
 /// Decode one field value and write it into the appropriate `FlowRecord` column,
 /// or into `extra` if the IE is unknown or unsupported.
 fn apply_field_to_record(rec: &mut FlowRecord, field: &FieldSpecifier, raw: &[u8]) {
@@ -887,8 +918,7 @@ fn apply_field_to_record(rec: &mut FlowRecord, field: &FieldSpecifier, raw: &[u8
     // Enterprise IEs → always go to extra
     if let Some(pen) = field.enterprise_number {
         let key = format!("ie{}:{}", pen, field.ie_id);
-        let val = hex::encode(raw);
-        rec.extra[key] = json!(val);
+        insert_hex_capped(&mut rec.extra, &key, raw);
         return;
     }
 
@@ -896,7 +926,7 @@ fn apply_field_to_record(rec: &mut FlowRecord, field: &FieldSpecifier, raw: &[u8
         None => {
             // Unknown IE → hex-encoded in extra
             let key = format!("ie{}", field.ie_id);
-            rec.extra[key] = json!(hex::encode(raw));
+            insert_hex_capped(&mut rec.extra, &key, raw);
         }
         Some((name, ie_type)) => match ie_type {
             IeType::Ipv4 => {
@@ -904,7 +934,7 @@ fn apply_field_to_record(rec: &mut FlowRecord, field: &FieldSpecifier, raw: &[u8
                     let addr = IpAddr::V4(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]));
                     set_addr_field(rec, field.ie_id, addr);
                 } else {
-                    rec.extra[name] = json!(hex::encode(raw));
+                    insert_hex_capped(&mut rec.extra, name, raw);
                 }
             }
             IeType::Ipv6 => {
@@ -914,7 +944,7 @@ fn apply_field_to_record(rec: &mut FlowRecord, field: &FieldSpecifier, raw: &[u8
                     let addr = IpAddr::V6(Ipv6Addr::from(bytes));
                     set_addr_field(rec, field.ie_id, addr);
                 } else {
-                    rec.extra[name] = json!(hex::encode(raw));
+                    insert_hex_capped(&mut rec.extra, name, raw);
                 }
             }
             IeType::U8 => {
@@ -966,7 +996,7 @@ fn apply_field_to_record(rec: &mut FlowRecord, field: &FieldSpecifier, raw: &[u8
                         }
                     }
                 } else {
-                    rec.extra[name] = json!(hex::encode(raw));
+                    insert_hex_capped(&mut rec.extra, name, raw);
                 }
             }
             IeType::DateTimeSysUptime => {
@@ -975,7 +1005,7 @@ fn apply_field_to_record(rec: &mut FlowRecord, field: &FieldSpecifier, raw: &[u8
                     let ms = u32::from_be_bytes(raw[..4].try_into().unwrap());
                     rec.extra[name] = json!(ms);
                 } else {
-                    rec.extra[name] = json!(hex::encode(raw));
+                    insert_hex_capped(&mut rec.extra, name, raw);
                 }
             }
         },
@@ -2535,6 +2565,116 @@ mod tests {
         );
     }
 
+    // ---- MAX_EXTRA_VALUE_BYTES: hex-into-extra values are capped ----
+
+    #[test]
+    fn extra_value_exactly_at_cap_is_not_truncated() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut rec = new_flow_record(0, 256, exporter, Utc::now());
+        let field = FieldSpecifier {
+            ie_id: 999, // unknown IE
+            length: MAX_EXTRA_VALUE_BYTES as u16,
+            enterprise_number: None,
+        };
+        let raw = vec![0xABu8; MAX_EXTRA_VALUE_BYTES];
+        apply_field_to_record(&mut rec, &field, &raw);
+        let hex_val = rec.extra["ie999"].as_str().expect("hex string");
+        assert_eq!(hex_val.len(), MAX_EXTRA_VALUE_BYTES * 2);
+        assert!(
+            rec.extra.get("ie999_original_len").is_none(),
+            "a value exactly at the cap must not be flagged as truncated; got: {}",
+            rec.extra
+        );
+    }
+
+    #[test]
+    fn extra_value_over_cap_is_truncated_with_original_len() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut rec = new_flow_record(0, 256, exporter, Utc::now());
+        let field = FieldSpecifier {
+            ie_id: 999, // unknown IE
+            length: 129,
+            enterprise_number: None,
+        };
+        let raw = vec![0xCDu8; 129];
+        apply_field_to_record(&mut rec, &field, &raw);
+        let hex_val = rec.extra["ie999"].as_str().expect("hex string");
+        assert_eq!(
+            hex_val.len(),
+            256,
+            "hex must be capped at 256 chars (128 bytes)"
+        );
+        assert_eq!(
+            rec.extra["ie999_original_len"],
+            serde_json::json!(129),
+            "truncated value must record its true original length"
+        );
+    }
+
+    #[test]
+    fn enterprise_ie_value_over_cap_is_truncated() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut rec = new_flow_record(0, 256, exporter, Utc::now());
+        let field = FieldSpecifier {
+            ie_id: 42,
+            length: 200,
+            enterprise_number: Some(12345),
+        };
+        let raw = vec![0xEFu8; 200];
+        apply_field_to_record(&mut rec, &field, &raw);
+        let hex_val = rec.extra["ie12345:42"].as_str().expect("hex string");
+        assert_eq!(hex_val.len(), 256);
+        assert_eq!(rec.extra["ie12345:42_original_len"], serde_json::json!(200));
+    }
+
+    #[test]
+    fn ipv4_wrong_length_over_cap_is_truncated() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut rec = new_flow_record(0, 256, exporter, Utc::now());
+        let field = FieldSpecifier {
+            ie_id: 8, // sourceIPv4Address, expects raw.len() == 4
+            length: 200,
+            enterprise_number: None,
+        };
+        let raw = vec![0x11u8; 200];
+        apply_field_to_record(&mut rec, &field, &raw);
+        assert!(rec.src_addr.is_none(), "wrong-length IPv4 must not decode");
+        let hex_val = rec.extra["sourceIPv4Address"].as_str().expect("hex string");
+        assert_eq!(hex_val.len(), 256);
+        assert_eq!(
+            rec.extra["sourceIPv4Address_original_len"],
+            serde_json::json!(200)
+        );
+    }
+
+    #[test]
+    fn varlen_field_over_cap_is_truncated() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let fields = vec![FieldSpecifier {
+            ie_id: 97, // not in ie_info's curated table
+            length: VARLEN,
+            enterprise_number: None,
+        }];
+        // RFC 7011 §7: 0xFF marker + 2-byte length for values >= 255.
+        let mut body = vec![0xFFu8];
+        body.extend_from_slice(&1000u16.to_be_bytes());
+        body.extend(vec![0x42u8; 1000]);
+
+        let records = parse_varlen_records(&fields, &body, 256, exporter, 0, Utc::now());
+        assert_eq!(records.len(), 1);
+        let hex_val = records[0].extra["ie97"].as_str().expect("hex string");
+        assert_eq!(hex_val.len(), 256);
+        assert_eq!(
+            records[0].extra["ie97_original_len"],
+            serde_json::json!(1000)
+        );
+    }
+
     // ---- parse_ipfix_data_set: zero-length template (record_len=0) → empty ----
 
     #[test]
@@ -3143,7 +3283,19 @@ mod tests {
         let hex = records[0].extra["ie97"]
             .as_str()
             .expect("extra is a string");
-        assert_eq!(hex.len(), 600, "300 bytes must hex-encode to 600 chars");
+        // A 300-byte value exceeds MAX_EXTRA_VALUE_BYTES (128), so it must be
+        // capped at 256 hex chars with the true length recorded separately —
+        // see `insert_hex_capped`'s doc comment.
+        assert_eq!(
+            hex.len(),
+            256,
+            "300-byte value must be capped at MAX_EXTRA_VALUE_BYTES (128 bytes = 256 hex chars)"
+        );
+        assert_eq!(
+            records[0].extra["ie97_original_len"],
+            serde_json::json!(300),
+            "truncated value must record its true original length"
+        );
     }
 
     /// (c) a zero-length varlen value: `0x00` → record present with `""`.

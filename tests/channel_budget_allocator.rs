@@ -710,3 +710,100 @@ fn normal_small_unknown_record_body_is_not_truncated() {
         "a normal 16-byte body's hex must be preserved in full"
     );
 }
+
+/// `channel_budget.rs`'s `measured_ipfix_datagram_bytes_matches_constant`
+/// (and the `IPFIX_DATAGRAM_BYTES` constant it feeds) only exercises flows
+/// with small `extra` values (five small integer IEs). Before
+/// `insert_hex_capped` (`src/ipfix/decoder.rs`), a single RFC 7011 §7
+/// variable-length IE up to ~64 KiB became ~128 KiB of hex in one flow's
+/// `extra` -- unmodelled by that measurement and able to dwarf
+/// `IPFIX_DATAGRAM_BYTES` on its own, the same class of gap
+/// `MAX_UNKNOWN_RECORD_BODY_BYTES` closed for sFlow. This proves the cap
+/// bounds real retained heap for one such flow to a small, fixed footprint
+/// regardless of the attacker-declared value length, referenced from
+/// `IPFIX_DATAGRAM_BYTES`'s doc comment.
+#[test]
+fn measured_worst_case_single_ipfix_flow_bytes() {
+    use logthing::ipfix::decoder::{IpfixDecoder, decode_ipfix};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    const BODY_LEN: usize = 60_000; // near the largest that fits one UDP datagram
+
+    // Template message: template_id=256, one field -- ie 97 (unregistered,
+    // so it lands hex-encoded in extra under "ie97"), declared
+    // variable-length (0xFFFF, RFC 7011 §7).
+    let template_set_body: [u8; 8] = [
+        0x01, 0x00, // template id = 256
+        0x00, 0x01, // field count = 1
+        0x00, 0x61, // ie_id = 97
+        0xFF, 0xFF, // length = variable
+    ];
+    let mut template_msg = Vec::new();
+    template_msg.extend_from_slice(&10u16.to_be_bytes()); // version = 10
+    let template_total_len = 16 + 4 + template_set_body.len();
+    template_msg.extend_from_slice(&(template_total_len as u16).to_be_bytes());
+    template_msg.extend_from_slice(&0x675C_B020u32.to_be_bytes()); // export_time
+    template_msg.extend_from_slice(&1u32.to_be_bytes()); // sequence
+    template_msg.extend_from_slice(&0u32.to_be_bytes()); // observation domain
+    template_msg.extend_from_slice(&2u16.to_be_bytes()); // set id = 2 (Template Set)
+    template_msg.extend_from_slice(&((4 + template_set_body.len()) as u16).to_be_bytes());
+    template_msg.extend_from_slice(&template_set_body);
+
+    // Data message: one varlen record. RFC 7011 §7: values >= 255 bytes use
+    // a 0xFF marker followed by a 2-byte length.
+    let mut record_bytes = vec![0xFFu8];
+    record_bytes.extend_from_slice(&(BODY_LEN as u16).to_be_bytes());
+    record_bytes.extend(std::iter::repeat_n(0xABu8, BODY_LEN));
+
+    let mut data_msg = Vec::new();
+    data_msg.extend_from_slice(&10u16.to_be_bytes());
+    let data_total_len = 16 + 4 + record_bytes.len();
+    data_msg.extend_from_slice(&(data_total_len as u16).to_be_bytes());
+    data_msg.extend_from_slice(&0x675C_B020u32.to_be_bytes());
+    data_msg.extend_from_slice(&2u32.to_be_bytes());
+    data_msg.extend_from_slice(&0u32.to_be_bytes());
+    data_msg.extend_from_slice(&256u16.to_be_bytes()); // set id = 256 (== template id)
+    data_msg.extend_from_slice(&((4 + record_bytes.len()) as u16).to_be_bytes());
+    data_msg.extend_from_slice(&record_bytes);
+    assert!(
+        data_msg.len() <= 65_535,
+        "fixture must fit one UDP datagram; got {} bytes",
+        data_msg.len()
+    );
+
+    let exporter = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let mut dec = IpfixDecoder::new();
+    decode_ipfix(&mut dec, &template_msg, exporter).expect("template must decode");
+
+    let (flows, real) =
+        live_heap_of(|| decode_ipfix(&mut dec, &data_msg, exporter).expect("data must decode"));
+
+    assert_eq!(flows.len(), 1, "one varlen record must survive, capped");
+    let extra = &flows[0].extra;
+    assert_eq!(
+        extra.get("ie97").and_then(|v| v.as_str()).map(str::len),
+        Some(128 * 2),
+        "ie97 must be capped at 256 hex chars regardless of the {BODY_LEN}-byte value; \
+         got {extra:?}"
+    );
+    assert_eq!(
+        extra.get("ie97_original_len"),
+        Some(&serde_json::json!(BODY_LEN)),
+        "the true original value length must still be recorded; got {extra:?}"
+    );
+
+    // Before the cap: ~800 bytes of BTreeMap node + 2 bytes of hex per input
+    // byte =~ 800 + 2*60,000 =~ 120,800 bytes for this one flow's `extra`
+    // alone -- roughly 13x IPFIX_DATAGRAM_BYTES (9216) on its own, for a
+    // single flow out of a representative 10-flow datagram. After the cap,
+    // retention must be a small, fixed footprint unrelated to BODY_LEN --
+    // well under one representative flow's share of IPFIX_DATAGRAM_BYTES
+    // (9216 / 10 flows =~ 922 bytes/flow).
+    assert!(
+        real < 5_000,
+        "worst-case single IPFIX flow retained {real} bytes -- expected the value cap to \
+         bound this regardless of the attacker-declared value length"
+    );
+
+    eprintln!("measured worst-case single IPFIX flow (Vec<FlowRecord> of 1): {real} bytes");
+}

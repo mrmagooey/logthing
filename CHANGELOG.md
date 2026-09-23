@@ -29,6 +29,17 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   3954 has no variable-length encoding, so a v9 template with `0xFFFF`
   still decodes nothing, exactly as before.
 
+### Changed
+
+- IPFIX values stored hex-encoded in `extra` — enterprise IEs, unknown IEs,
+  and RFC 7011 §7 variable-length IEs alike — are now truncated to 128 bytes,
+  with `<key>_original_len` recording the real length when truncation
+  happens. A single Information Element's value can be up to ~64 KiB on the
+  wire (routine now that variable-length fields are decoded), which
+  previously became ~128 KiB of hex in one flow's `extra` with nothing
+  bounding it; this caps per-flow memory the same way sFlow's unknown record
+  bodies already are (`MAX_UNKNOWN_RECORD_BODY_BYTES`).
+
 ### Fixed
 
 - A Zeek `_path` of mixed case (e.g. `"Conn"` instead of `"conn"`) resolved
