@@ -10,6 +10,8 @@ use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
+use crate::forwarding::buffered_writer::sanitize_log_path;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -1707,7 +1709,7 @@ impl crate::forwarding::buffered_writer::RecordBatchAccumulator<crate::zeek::Zee
 }
 
 /// Map one unmodelled Zeek record to a single-row envelope `RecordBatch`.
-fn map_envelope(
+pub(crate) fn map_envelope(
     value: &serde_json::Value,
     log_path: &str,
     received_at: chrono::DateTime<chrono::Utc>,
@@ -1768,6 +1770,17 @@ static REGISTRY: LazyLock<HashMap<&'static str, Arc<SchemaEntry>>> = LazyLock::n
     m
 });
 
+/// The registry entry for `log_path`: exact match first, then the
+/// `sanitize_log_path` key `ZeekSink` partitions by. The single lookup both
+/// `get_schema_entry` and `metric_log_path` use, so the schema a record is
+/// written with and the label it is counted under can never disagree.
+fn registry_lookup(log_path: &str) -> Option<(&'static str, &'static Arc<SchemaEntry>)> {
+    REGISTRY
+        .get_key_value(log_path)
+        .or_else(|| REGISTRY.get_key_value(sanitize_log_path(log_path).as_str()))
+        .map(|(k, v)| (*k, v))
+}
+
 /// Bound a `_path` value to the set of modelled zeek streams, for use as a
 /// metric label. `_path` comes straight off the wire and is unbounded in both
 /// length and charset, so labelling a Prometheus counter with it raw lets any
@@ -1776,17 +1789,27 @@ static REGISTRY: LazyLock<HashMap<&'static str, Arc<SchemaEntry>>> = LazyLock::n
 /// modelled streams plus `"other"` — and drops the per-record string clone
 /// the label used to cost (the `counter!` macro's own one-element label Vec
 /// is unchanged).
+///
+/// Resolves case/rotation variants the same way `get_schema_entry` does (via
+/// `registry_lookup`'s `sanitize_log_path` fallback), so `"Conn"` and `"conn"`
+/// are always counted under the same series.
 pub fn metric_log_path(log_path: &str) -> &'static str {
-    REGISTRY
-        .get_key_value(log_path)
-        .map(|(name, _)| *name)
+    registry_lookup(log_path)
+        .map(|(name, _)| name)
         .unwrap_or("other")
 }
 
 /// Look up the SchemaEntry for `log_path`. Falls back to the envelope schema for unknown paths.
 /// The envelope mapper always uses the actual `log_path` at call time via a wrapper.
+///
+/// Tries an exact match first, then the `sanitize_log_path`-normalized key (via
+/// `registry_lookup`): `ZeekSink::partition()`/`schema()` key buffers by
+/// `sanitize_log_path` (which lowercases), so `"Conn"` must resolve to the same
+/// typed conn schema its buffer holds -- a case-sensitive-only lookup would
+/// fall through to the envelope schema here while the buffer stays typed conn,
+/// and every later flush of that buffer would fail in `concat_batches` forever.
 pub fn get_schema_entry(log_path: &str) -> Arc<SchemaEntry> {
-    if let Some(entry) = REGISTRY.get(log_path) {
+    if let Some((_, entry)) = registry_lookup(log_path) {
         return entry.clone();
     }
     // For unknown paths, build a fresh SchemaEntry with the actual log_path captured.
@@ -1831,6 +1854,19 @@ mod tests {
                 "other",
                 "an unmodelled _path must collapse to a single series, not mint a new one"
             );
+        }
+    }
+
+    /// `metric_log_path` must resolve case variants the same way
+    /// `get_schema_entry` does (via the shared `sanitize_log_path` fallback),
+    /// so the metric label and the schema a record is written with never
+    /// disagree. Hostile input must still collapse to `"other"`.
+    #[test]
+    fn metric_log_path_resolves_case_variants_and_bounds_hostile_input() {
+        assert_eq!(metric_log_path("Conn"), "conn");
+        assert_eq!(metric_log_path("DNS"), "dns");
+        for hostile in ["../Conn", "Ｃonn", "", &"x".repeat(1024)] {
+            assert_eq!(metric_log_path(hostile), "other", "{hostile:?}");
         }
     }
 
@@ -2560,6 +2596,28 @@ mod tests {
                 has_extra,
                 "typed schema for {} must have _extra column",
                 path
+            );
+        }
+    }
+
+    #[test]
+    fn get_schema_entry_resolves_case_and_rotation_variants() {
+        let conn = get_schema_entry("conn");
+        for raw in ["Conn", "CONN", "cOnN"] {
+            assert!(
+                Arc::ptr_eq(&get_schema_entry(raw).schema, &conn.schema),
+                "{raw} must resolve to the typed conn schema"
+            );
+        }
+        // The listener runs normalize_log_path first; the pair must compose.
+        let rotated = crate::zeek::normalize_log_path("CONN.2026-08-14-16-08-44");
+        assert!(Arc::ptr_eq(&get_schema_entry(rotated).schema, &conn.schema));
+        // Hostile / non-ASCII inputs: no panic, envelope unless the sanitized key is real.
+        for raw in ["Ｃonn", "../Conn", "", "weird"] {
+            let e = get_schema_entry(raw);
+            assert!(
+                e.schema.field_with_name("payload").is_ok(),
+                "{raw:?} must be envelope"
             );
         }
     }

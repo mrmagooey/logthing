@@ -248,11 +248,23 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
         "body_budget_exhausted",
         "HTTP requests rejected because the in-flight request-body memory budget was exhausted.",
     ),
+    // ── wef ───────────────────────────────────────────────────────────────
+    (
+        Kind::Counter,
+        "wef_xml_parse_errors",
+        "WEF events whose XML failed to parse; each is kept as its own raw event and parsing \
+         resumes at the next event, so the well-formed events around it are not lost too.",
+    ),
     // ── listener access control ───────────────────────────────────────────
     (
         Kind::Counter,
         "listener_source_rejected",
         "Inbound datagrams or connections rejected because the source IP is not in the listener whitelist, labelled by protocol.",
+    ),
+    (
+        Kind::Counter,
+        "listener_accept_errors",
+        "TCP accept errors per listener; non-per-connection errors (e.g. fd exhaustion) pause accepts for 1s.",
     ),
     // ── stats ─────────────────────────────────────────────────────────────
     (
@@ -280,6 +292,12 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
         Kind::Counter,
         "parquet_s3_dropped",
         "Records dropped on the way to the writer task because its channel was full or closed.",
+    ),
+    (
+        Kind::Counter,
+        "parquet_s3_records_skipped",
+        "Records the writer could not convert into a Parquet batch and skipped (schema \
+         mismatch, mapping failure, or unparsed event).",
     ),
     (
         Kind::Counter,

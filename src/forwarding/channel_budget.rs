@@ -264,9 +264,17 @@ pub const SFLOW_RECORD_BYTES: usize = 8960;
 /// BTreeMap node per flow whatever its key count, which is why five small
 /// integer IEs cost 696 bytes each.
 ///
-/// **Average-case, not a ceiling.** Flows-per-datagram is variable; this uses a
-/// representative count from the repo's IPFIX test fixtures. Datagrams denser
-/// than that average will push this source past `CHANNEL_BUDGET_BYTES`. Known
+/// **Average-case, not a ceiling** -- but only along one axis now. Per-value
+/// size in `extra` (`ie<id>`, enterprise IEs, and RFC 7011 §7
+/// variable-length fields alike) is capped at
+/// `ipfix::decoder::MAX_EXTRA_VALUE_BYTES` (128 raw bytes / 256 hex chars)
+/// by `insert_hex_capped`, so one oversized IE value can no longer make a
+/// flow's `extra` dwarf this estimate -- see
+/// `measured_worst_case_single_ipfix_flow_bytes` in
+/// `tests/channel_budget_allocator.rs`. The remaining gap is
+/// flows-per-datagram: it is variable, and this uses a representative count
+/// from the repo's IPFIX test fixtures, so datagrams denser than that
+/// average will still push this source past `CHANNEL_BUDGET_BYTES`. Known
 /// and accepted limitation — see the spec §4.3.
 pub const IPFIX_DATAGRAM_BYTES: usize = 9216;
 
@@ -681,10 +689,10 @@ mod tests {
     fn measured_wef_event_bytes_counts_the_pointee_not_the_pointer() {
         use crate::models::{EventLevel, ParsedEvent, WindowsEvent};
         // `parsed` must be `Some(..)`, not `None`: on the real ingest path
-        // `parse_single_event` (`src/protocol/mod.rs:187-196`) always attaches a
-        // `ParsedEvent` — `parse_event_data` has no `Err` path that fires in
-        // practice, malformed XML just truncates the read loop and still
-        // returns `Ok`. A `parsed: None` fixture measures a record shape that
+        // `WefParser::parse_single_event` always attaches a `ParsedEvent` --
+        // `parse_event_data` has no `Err` path that fires in practice,
+        // malformed XML just truncates the read loop and still returns
+        // `Ok`. A `parsed: None` fixture measures a record shape that
         // essentially never reaches the channel.
         let parsed = ParsedEvent {
             provider: "Microsoft-Windows-Security-Auditing".to_string(),

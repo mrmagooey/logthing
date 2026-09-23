@@ -225,10 +225,11 @@ impl ZeekListener {
 
         let semaphore = Arc::new(Semaphore::new(MAX_ZEEK_TCP_CONNECTIONS));
         let byte_budget = Arc::new(Semaphore::new(ZEEK_BYTE_BUDGET_PERMITS));
+        let mut accept_backoff = crate::net::AcceptBackoff::new("zeek");
 
         loop {
             tokio::select! {
-                result = listener.accept() => {
+                result = accept_backoff.accept(&listener) => {
                     match result {
                         Ok((stream, src)) => {
                             // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
@@ -284,9 +285,10 @@ impl ZeekListener {
 
         let semaphore = Arc::new(Semaphore::new(MAX_ZEEK_TCP_CONNECTIONS));
         let byte_budget = Arc::new(Semaphore::new(ZEEK_BYTE_BUDGET_PERMITS));
+        let mut accept_backoff = crate::net::AcceptBackoff::new("zeek");
 
         loop {
-            match listener.accept().await {
+            match accept_backoff.accept(&listener).await {
                 Ok((stream, src)) => {
                     if !self.allowed_ips.is_allowed(&src) {
                         metrics::counter!("listener_source_rejected", "protocol" => "zeek")

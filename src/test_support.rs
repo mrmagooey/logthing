@@ -38,7 +38,13 @@ use std::cell::RefCell;
 use std::sync::OnceLock;
 
 thread_local! {
-    static CAPTURED_EVENTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    // `(level, message)` per captured event. `captured_events()` still
+    // returns just the messages (unaffected — every existing call site
+    // keeps working); `captured_events_at` additionally filters by level,
+    // for tests that need to distinguish e.g. a batched `error!` from an
+    // individual `debug!`.
+    static CAPTURED_EVENTS: RefCell<Vec<(tracing::Level, String)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 struct MessageOnlyVisitor(String);
@@ -71,7 +77,8 @@ impl tracing::Subscriber for GlobalCaptureSubscriber {
     fn event(&self, event: &tracing::Event<'_>) {
         let mut visitor = MessageOnlyVisitor(String::new());
         event.record(&mut visitor);
-        CAPTURED_EVENTS.with(|events| events.borrow_mut().push(visitor.0));
+        let level = *event.metadata().level();
+        CAPTURED_EVENTS.with(|events| events.borrow_mut().push((level, visitor.0)));
     }
     fn enter(&self, _span: &tracing::span::Id) {}
     fn exit(&self, _span: &tracing::span::Id) {}
@@ -92,5 +99,18 @@ pub(crate) fn install_and_clear() {
 /// Returns the `message` field of every tracing event captured on this
 /// thread since the last [`install_and_clear`] call.
 pub(crate) fn captured_events() -> Vec<String> {
-    CAPTURED_EVENTS.with(|events| events.borrow().clone())
+    CAPTURED_EVENTS.with(|events| events.borrow().iter().map(|(_, msg)| msg.clone()).collect())
+}
+
+/// Like [`captured_events`], but only the `message` field of events
+/// captured at exactly `level`.
+pub(crate) fn captured_events_at(level: tracing::Level) -> Vec<String> {
+    CAPTURED_EVENTS.with(|events| {
+        events
+            .borrow()
+            .iter()
+            .filter(|(l, _)| *l == level)
+            .map(|(_, msg)| msg.clone())
+            .collect()
+    })
 }

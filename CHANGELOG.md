@@ -4,6 +4,99 @@ All notable changes to this project are documented in this file, newest
 first, loosely following [Keep a Changelog](https://keepachangelog.com/).
 This file starts at 0.15.0; earlier releases are not backfilled.
 
+## [Unreleased]
+
+### Added
+
+- `parquet_s3_records_skipped{source,target}` — records the Parquet writer
+  could not convert into a batch and skipped, whatever the reason (schema
+  mismatch, a mapping failure, or an unparsed event). Previously these skips
+  were silent: an unthrottled `warn!` per record and no metric at all.
+- `wef_xml_parse_errors` — WEF batches whose XML the parser could not read
+  past a given event. Each occurrence is kept as its own raw event and
+  parsing resumes at the next `<Event`, so one malformed event no longer
+  costs every event after it.
+- `listener_accept_errors{protocol}` — TCP accept errors on the syslog,
+  Zeek, and Suricata listeners (`protocol` = `syslog_tcp`/`zeek`/`suricata`).
+  Climbing steadily (rather than the occasional per-connection blip) points
+  at fd exhaustion or a similar persistent condition.
+- IPFIX (v10) variable-length fields (RFC 7011 §7) are now decoded.
+  Previously any template containing one silently produced no records:
+  a field length of `0xFFFF` summed into the fixed-length record size as
+  65535 bytes, so no data set built from that template ever matched. Values
+  of Information Elements not in the known-IE table land hex-encoded in
+  `extra`, the same as any other unknown IE. NetFlow v9 is unchanged — RFC
+  3954 has no variable-length encoding, so a v9 template with `0xFFFF`
+  still decodes nothing, exactly as before.
+
+### Changed
+
+- IPFIX values stored hex-encoded in `extra` — enterprise IEs, unknown IEs,
+  and RFC 7011 §7 variable-length IEs alike — are now truncated to 128 bytes,
+  with `<key>_original_len` recording the real length when truncation
+  happens. A single Information Element's value can be up to ~64 KiB on the
+  wire (routine now that variable-length fields are decoded), which
+  previously became ~128 KiB of hex in one flow's `extra` with nothing
+  bounding it; this caps per-flow memory the same way sFlow's unknown record
+  bodies already are (`MAX_UNKNOWN_RECORD_BODY_BYTES`).
+
+### Fixed
+
+- A Zeek `_path` of mixed case (e.g. `"Conn"` instead of `"conn"`) resolved
+  its schema differently from its write buffer: `get_schema_entry` looked up
+  the case-sensitive schema registry with the raw path (falling back to the
+  untyped envelope schema), while the buffer itself was keyed by the
+  lowercased, sanitized path and stayed typed `conn`. The mismatched,
+  envelope-shaped batch then landed in the typed `conn` buffer, and every
+  later flush of that buffer failed in `concat_batches` — permanently, until
+  the process restarted — silently dropping every row queued behind it.
+  `get_schema_entry` now falls back to a sanitized-path lookup before
+  defaulting to the envelope schema, and `push()` now rejects (with a `warn!`
+  and a skip, counted by the new `parquet_s3_records_skipped` above) any
+  batch whose schema doesn't match its buffer's, so a future adapter bug of
+  the same shape can no longer jam a buffer instead of just dropping the one
+  bad batch.
+- A WEF batch with one malformed event lost every event after it, while the
+  HTTP response still answered `200` — so the Windows Event Forwarder,
+  having been told the batch succeeded, never resent it, and the data was
+  gone for good. `WefParser::parse_events` now resyncs on a parse error:
+  the malformed event's own fragment is kept as a raw event, and parsing
+  resumes at the next `<Event` start with a fresh reader, so well-formed
+  events on both sides of a malformed one still reach Parquet.
+- The syslog, Zeek, and Suricata TCP accept loops logged an error and
+  immediately re-polled `accept()` on failure. For errors like `EMFILE` (fd
+  exhaustion), the listening socket's readiness is never cleared, so the
+  loop spun at 100% CPU with a matching flood of log lines instead of
+  backing off. Accept errors that aren't per-connection noise
+  (`ConnectionRefused`/`ConnectionAborted`/`ConnectionReset`, which get no
+  pause) now pause that listener's accept loop for 1 second, bounding both
+  the CPU spin and the log volume to about once a second.
+- The four "skip this record" branches in the Parquet writer's `push()` (a
+  `day_and_batch` error, two `to_record_batch` errors, and a live-builder
+  `try_append` error) each logged an unthrottled `warn!` and incremented no
+  metric — a sustained source of skips (e.g. every event from one
+  persistently-malformed sender) could flood the log with no corresponding
+  number an operator could alert on. All four now increment
+  `parquet_s3_records_skipped` and log at most once per 30 seconds per
+  writer, carrying the error and the running skipped count.
+- Zeek rows routed to the `_overflow` partition (after `max_partitions` is
+  reached) recorded the placeholder `"_overflow_nonexistent_"` as their
+  `log_path` instead of the record's real path. `ZeekSink::to_record_batch`'s
+  overflow branch now maps the row through `map_envelope(&record.fields,
+  &record.log_path, ...)` directly, so overflowed rows keep the log path
+  they actually came from.
+- A mixed-case Zeek `_path` (e.g. `"Conn"`) was written under its real,
+  typed stream but counted under `zeek_records_by_path{log_path="other"}`:
+  `metric_log_path` was missing the sanitized-path fallback
+  `get_schema_entry` already had, so the two disagreed on the same record.
+  Both now share one `registry_lookup` so a schema resolution and its metric
+  label can no longer diverge.
+- The Parquet writer's shutdown `flush_all` zeroed a buffer's `row_count`
+  and `byte_count` only on the failure path, not on success — a successful
+  flush left both stale until the next `push()` overwrote them, which
+  inflated the `rows_still_buffered` figure logged if shutdown's flush
+  loop hit an error on a later partition.
+
 ## [0.20.1] - 2026-09-22
 
 ### Fixed

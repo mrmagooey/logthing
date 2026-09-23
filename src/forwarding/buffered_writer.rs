@@ -818,6 +818,10 @@ pub struct PartitionedParquetWriter<S: ParquetSink> {
     /// Acquired INSIDE the spawned task (`encode_and_upload`), never
     /// before spawning — see `MAX_CONCURRENT_FLUSHES_PER_WRITER`.
     flush_semaphore: Arc<tokio::sync::Semaphore>,
+    /// When `record_skipped` last logged; gates its warn line to one per 30 s.
+    last_skip_warn: Option<Instant>,
+    /// Records `push()` could not buffer over this writer's lifetime.
+    skipped_total: u64,
 }
 
 /// Bytes a batch's data actually occupies, as opposed to the capacity its
@@ -882,6 +886,32 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             flush_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_FLUSHES_PER_WRITER,
             )),
+            last_skip_warn: None,
+            skipped_total: 0,
+        }
+    }
+
+    /// Count one record `push()` could not buffer, logging at most every 30 s.
+    /// Same cadence as `drop_oldest_to_cap`'s `last_drop_warn`: a per-record
+    /// unthrottled warn on this path is what `drop_log.rs` measured at ~21% of
+    /// ingest throughput.
+    fn record_skipped(&mut self, reason: &'static str, err: &dyn std::fmt::Display) {
+        let source = self.sink.source();
+        let target = self.s3.target_label();
+        metrics::counter!("parquet_s3_records_skipped", "source" => source, "target" => target)
+            .increment(1);
+        self.skipped_total += 1;
+        if self
+            .last_skip_warn
+            .is_none_or(|t| t.elapsed().as_secs() >= 30)
+        {
+            tracing::warn!(
+                source,
+                target,
+                skipped_total = self.skipped_total,
+                "parquet_s3: skipping record ({reason}): {err}"
+            );
+            self.last_skip_warn = Some(Instant::now());
         }
     }
 
@@ -949,10 +979,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         let (day, pre_mapped) = match self.sink.day_and_batch(&record, &schema, now) {
             Ok(pair) => pair,
             Err(e) => {
-                tracing::warn!(
-                    source = self.sink.source(),
-                    "day_and_batch failed, skipping record: {e}"
-                );
+                self.record_skipped("day_and_batch failed", &e);
                 return Ok(());
             }
         };
@@ -1006,6 +1033,17 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                         None => self.sink.to_record_batch(&record, &schema),
                     };
                     match mapped {
+                        Ok(b) if b.schema() != schema => {
+                            // A sink handed back a batch that doesn't match this
+                            // buffer's schema. Buffering it would make every later
+                            // flush of this buffer fail in `concat_batches` and
+                            // retry forever, so skip just this record.
+                            self.record_skipped(
+                                "schema mismatch",
+                                &"batch schema differs from buffer schema",
+                            );
+                            return Ok(());
+                        }
                         Ok(b) => {
                             let est_bytes = used_bytes(&b);
                             let n = b.num_rows();
@@ -1013,19 +1051,13 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                             (n, est_bytes)
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                source = self.sink.source(),
-                                "to_record_batch failed, skipping record: {e}"
-                            );
+                            self.record_skipped("to_record_batch failed", &e);
                             return Ok(());
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        source = self.sink.source(),
-                        "live builder append failed, skipping record: {e}"
-                    );
+                    self.record_skipped("live builder append failed", &e);
                     return Ok(());
                 }
             }
@@ -1038,6 +1070,17 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 None => self.sink.to_record_batch(&record, &schema),
             };
             match mapped {
+                Ok(b) if b.schema() != schema => {
+                    // A sink handed back a batch that doesn't match this
+                    // buffer's schema. Buffering it would make every later
+                    // flush of this buffer fail in `concat_batches` and
+                    // retry forever, so skip just this record.
+                    self.record_skipped(
+                        "schema mismatch",
+                        &"batch schema differs from buffer schema",
+                    );
+                    return Ok(());
+                }
                 Ok(b) => {
                     let est_bytes = used_bytes(&b);
                     let n = b.num_rows();
@@ -1045,10 +1088,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                     (n, est_bytes)
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        source = self.sink.source(),
-                        "to_record_batch failed, skipping record: {e}"
-                    );
+                    self.record_skipped("to_record_batch failed", &e);
                     return Ok(());
                 }
             }
@@ -1098,6 +1138,8 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 let batches = std::mem::take(&mut buf.buffer);
                 let row_count = buf.row_count;
                 let byte_count = buf.byte_count;
+                buf.row_count = 0;
+                buf.byte_count = 0;
                 (schema, batches, row_count, byte_count)
             };
             let (schema, batches, row_count, byte_count) = taken;
@@ -2298,6 +2340,38 @@ max_partitions = 128
         Arc::new(Schema::new(vec![Field::new("val", DataType::Utf8, false)]))
     }
 
+    /// Reads the current value of `parquet_s3_records_skipped{source,target}`
+    /// out of a `DebuggingRecorder` snapshot. Shared by every test asserting
+    /// `record_skipped`'s counter increments.
+    #[allow(clippy::mutable_key_type)]
+    fn skipped_counter(
+        snapshotter: &metrics_util::debugging::Snapshotter,
+        source: &'static str,
+        target: &'static str,
+    ) -> u64 {
+        let snapshot = snapshotter.snapshot();
+        let map = snapshot.into_hashmap();
+        let key = metrics_util::CompositeKey::new(
+            metrics_util::MetricKind::Counter,
+            metrics::Key::from_parts(
+                "parquet_s3_records_skipped",
+                vec![
+                    metrics::Label::new("source", source),
+                    metrics::Label::new("target", target),
+                ],
+            ),
+        );
+        map.get(&key)
+            .map(|(_, _, v)| {
+                if let metrics_util::debugging::DebugValue::Counter(c) = v {
+                    *c
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0)
+    }
+
     // -----------------------------------------------------------------------
     // In-test tracing field capture (for asserting `source`/`target` fields
     // on warn! calls -- uses only already-present `tracing`/`tracing-subscriber`
@@ -2411,6 +2485,222 @@ max_partitions = 128
         assert!(
             MockSink.new_batch(&test_schema()).is_none(),
             "MockSink does not override new_batch, so it must default to None"
+        );
+    }
+
+    /// Sink whose `schema()` advertises `test_schema()` (a single `val: Utf8`
+    /// column) but whose `to_record_batch()` hands back a batch built with a
+    /// different schema entirely. `new_batch` is not overridden, so it
+    /// defaults to `None` and every push goes through the non-amortized
+    /// `to_record_batch` arm.
+    #[derive(Clone)]
+    struct MismatchedSchemaSink;
+    impl ParquetSink for MismatchedSchemaSink {
+        type Record = String;
+        fn source(&self) -> &'static str {
+            "test"
+        }
+        fn partition(&self, _r: &String) -> Option<String> {
+            None
+        }
+        fn schema(&self, _p: Option<&str>) -> Arc<Schema> {
+            test_schema()
+        }
+        fn to_record_batch(
+            &self,
+            _record: &String,
+            _schema: &Arc<Schema>,
+        ) -> anyhow::Result<RecordBatch> {
+            use arrow::array::{ArrayRef, Int64Array};
+            let other_schema = Arc::new(Schema::new(vec![Field::new(
+                "other",
+                DataType::Int64,
+                false,
+            )]));
+            let col: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+            Ok(RecordBatch::try_new(other_schema, vec![col])?)
+        }
+    }
+
+    #[tokio::test]
+    async fn push_rejects_a_batch_whose_schema_does_not_match_the_buffer() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(1_000_000); // nothing flushes on its own
+        let mut w = PartitionedParquetWriter::new(MismatchedSchemaSink, s3, cfg, policy);
+
+        w.push("boom".to_string()).await.unwrap();
+
+        let buf = w.buffer_by_partition("").expect("buffer exists");
+        assert_eq!(
+            buf.buffer.len(),
+            0,
+            "a batch whose schema differs from the buffer's must not be buffered"
+        );
+        assert_eq!(buf.row_count, 0);
+
+        let skipped = skipped_counter(&snapshotter, "test", "s3");
+        assert_eq!(
+            skipped, 1,
+            "schema mismatch must increment parquet_s3_records_skipped"
+        );
+
+        w.flush_all().await.unwrap();
+    }
+
+    /// Accumulator that rejects every record (`Ok(false)`), forcing
+    /// `push()`'s live-builder branch down its `Ok(false)` fallback on
+    /// every push instead of ever taking the `Ok(true)` accept path.
+    struct RejectingAccumulator;
+    impl RecordBatchAccumulator<String> for RejectingAccumulator {
+        fn try_append(
+            &mut self,
+            _record: &String,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn len(&self) -> usize {
+            0
+        }
+        fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+            unreachable!("RejectingAccumulator never accumulates a row")
+        }
+    }
+
+    /// Same schema mismatch as `MismatchedSchemaSink`, but opts into a live
+    /// builder (`RejectingAccumulator`) that always returns `Ok(false)` --
+    /// so `push()`'s live-builder `Ok(false)` fallback arm is the one that
+    /// hits the schema-mismatch guard, not the non-amortized `else` arm
+    /// `MismatchedSchemaSink` exercises above.
+    #[derive(Clone)]
+    struct MismatchedSchemaLiveBuilderSink;
+    impl ParquetSink for MismatchedSchemaLiveBuilderSink {
+        type Record = String;
+        fn source(&self) -> &'static str {
+            "test"
+        }
+        fn partition(&self, _r: &String) -> Option<String> {
+            None
+        }
+        fn schema(&self, _p: Option<&str>) -> Arc<Schema> {
+            test_schema()
+        }
+        fn to_record_batch(
+            &self,
+            _record: &String,
+            _schema: &Arc<Schema>,
+        ) -> anyhow::Result<RecordBatch> {
+            use arrow::array::{ArrayRef, Int64Array};
+            let other_schema = Arc::new(Schema::new(vec![Field::new(
+                "other",
+                DataType::Int64,
+                false,
+            )]));
+            let col: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+            Ok(RecordBatch::try_new(other_schema, vec![col])?)
+        }
+        fn new_batch(
+            &self,
+            _schema: &Arc<Schema>,
+        ) -> Option<Box<dyn RecordBatchAccumulator<String>>> {
+            Some(Box::new(RejectingAccumulator))
+        }
+    }
+
+    #[tokio::test]
+    async fn push_rejects_a_batch_whose_schema_does_not_match_the_buffer_via_live_builder() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(1_000_000); // nothing flushes on its own
+        let mut w = PartitionedParquetWriter::new(MismatchedSchemaLiveBuilderSink, s3, cfg, policy);
+
+        w.push("boom".to_string()).await.unwrap();
+
+        let buf = w.buffer_by_partition("").expect("buffer exists");
+        assert_eq!(
+            buf.buffer.len(),
+            0,
+            "a batch whose schema differs from the buffer's must not be buffered"
+        );
+        assert_eq!(buf.row_count, 0);
+
+        let skipped = skipped_counter(&snapshotter, "test", "s3");
+        assert_eq!(
+            skipped, 1,
+            "schema mismatch via the live-builder Ok(false) fallback must increment parquet_s3_records_skipped"
+        );
+
+        w.flush_all().await.unwrap();
+    }
+
+    /// Sink whose `to_record_batch` always fails and whose `new_batch` (not
+    /// overridden) defaults to `None` -- every push takes the non-amortized
+    /// `to_record_batch` arm in `push()` and fails it, every time.
+    #[derive(Clone)]
+    struct AlwaysFailSink;
+    impl ParquetSink for AlwaysFailSink {
+        type Record = String;
+        fn source(&self) -> &'static str {
+            "test"
+        }
+        fn partition(&self, _r: &String) -> Option<String> {
+            None
+        }
+        fn schema(&self, _p: Option<&str>) -> Arc<Schema> {
+            test_schema()
+        }
+        fn to_record_batch(
+            &self,
+            _record: &String,
+            _schema: &Arc<Schema>,
+        ) -> anyhow::Result<RecordBatch> {
+            anyhow::bail!("boom")
+        }
+    }
+
+    #[tokio::test]
+    async fn push_counts_and_throttles_skipped_records() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(1_000_000); // nothing flushes on its own
+        let mut w = PartitionedParquetWriter::new(AlwaysFailSink, s3, cfg, policy);
+
+        w.push("one".to_string()).await.unwrap();
+        let first_warn = w
+            .last_skip_warn
+            .expect("first skip must set last_skip_warn");
+
+        w.push("two".to_string()).await.unwrap();
+        w.push("three".to_string()).await.unwrap();
+        let third_warn = w.last_skip_warn.expect("last_skip_warn must still be set");
+        assert_eq!(
+            first_warn, third_warn,
+            "second/third skip within 30s must not re-log (throttled)"
+        );
+
+        let skipped = skipped_counter(&snapshotter, "test", "s3");
+        assert_eq!(
+            skipped, 3,
+            "every push that fails to_record_batch must count as skipped, throttling only affects logging"
         );
     }
 
@@ -2781,6 +3071,130 @@ max_partitions = 128
             1,
             "flush_all (graceful shutdown) must not silently drop rows sitting \
              in an unmaterialized live builder"
+        );
+    }
+
+    /// A successful `flush_all` must zero every buffer's `row_count` and
+    /// `byte_count` -- `try_flush_partition_async` already does this when it
+    /// takes a buffer; `flush_all` must match, not leave the counts stale
+    /// after the data they described has been handed off for upload.
+    #[tokio::test]
+    async fn flush_all_success_zeroes_row_and_byte_counts() {
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: Arc<dyn UploadSink> = Arc::new(RecordingSink {
+            uploads: uploads.clone(),
+        });
+        let (cfg, policy) = test_config(1_000_000); // nothing flushes on its own
+        let mut w = PartitionedParquetWriter::new(MockSink, sink, cfg, policy);
+
+        for i in 0..3 {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+        assert_eq!(w.total_buffered_rows(), 3);
+
+        w.flush_all().await.unwrap();
+
+        assert_eq!(
+            w.total_buffered_rows(),
+            0,
+            "flush_all must zero total_buffered_rows on success"
+        );
+        for (key, buf) in &w.buffers {
+            assert_eq!(
+                buf.row_count, 0,
+                "{key:?} row_count must be zeroed after a successful flush_all"
+            );
+            assert_eq!(
+                buf.byte_count, 0,
+                "{key:?} byte_count must be zeroed after a successful flush_all"
+            );
+        }
+    }
+
+    /// A `flush_all` that fails to upload must restore the taken buffer's
+    /// `row_count`/`byte_count` exactly as `try_flush_partition_async`'s
+    /// failure branch already does -- data is still sitting in the buffer,
+    /// so the counts describing it must not read zero.
+    #[tokio::test]
+    async fn flush_all_failure_restores_row_and_byte_counts() {
+        // `unreachable_s3()` points at 127.0.0.1:1 -- nothing listens there,
+        // so any real upload attempt fails immediately with connection
+        // refused. Used elsewhere in this module as the standard
+        // failing/unreachable upload sink.
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(1_000_000); // nothing flushes on its own
+        let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
+
+        for i in 0..3 {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+        let byte_count_before = w.buffer_by_partition("").unwrap().byte_count;
+
+        let result = w.flush_all().await;
+        assert!(
+            result.is_err(),
+            "unreachable upload target must fail flush_all"
+        );
+
+        let buf = w.buffer_by_partition("").unwrap();
+        assert_eq!(
+            buf.row_count, 3,
+            "row_count must be restored on flush failure"
+        );
+        assert_eq!(
+            buf.byte_count, byte_count_before,
+            "byte_count must be restored unchanged on flush failure"
+        );
+    }
+
+    /// Integration coverage against a real `UploadSink` implementation
+    /// (`LocalDiskSink`, writing actual Parquet bytes to a tempdir) rather
+    /// than the in-memory `RecordingSink` -- proves the fix holds end to
+    /// end through the real encode-and-upload path, not just against a
+    /// mock that always succeeds trivially. `total_buffered_rows` is
+    /// `pub(crate)`, so this lives in-crate rather than under `tests/`,
+    /// which cannot see it.
+    #[tokio::test]
+    async fn flush_all_integration_local_disk_writes_file_and_zeroes_counts() {
+        use crate::forwarding::local_sink::LocalDiskSink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sink: Arc<dyn UploadSink> = Arc::new(
+            LocalDiskSink::new(dir.path().to_path_buf())
+                .await
+                .expect("LocalDiskSink::new"),
+        );
+        let (cfg, policy) = test_config(1_000_000); // nothing flushes on its own
+        let mut w = PartitionedParquetWriter::new(MockSink, sink, cfg, policy);
+
+        for i in 0..3 {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+        assert_eq!(w.total_buffered_rows(), 3);
+
+        w.flush_all().await.unwrap();
+
+        assert_eq!(
+            w.total_buffered_rows(),
+            0,
+            "total_buffered_rows must be zero after a successful flush_all"
+        );
+
+        let mut parquet_files = Vec::new();
+        let mut stack = vec![dir.path().to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "parquet") {
+                    parquet_files.push(path);
+                }
+            }
+        }
+        assert!(
+            !parquet_files.is_empty(),
+            "flush_all must have written at least one Parquet file to {dir:?}"
         );
     }
 

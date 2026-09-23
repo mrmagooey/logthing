@@ -946,16 +946,27 @@ Per-source ingest counters:
   `sflow_datagrams_received`, `suricata_records_received`, `hec_events_received`,
   `otlp_logs_received`
 - Decode/parse failures: `ipfix_decode_errors`, `sflow_decode_errors`,
-  `suricata_parse_errors`, `hec_parse_errors`
+  `suricata_parse_errors`, `hec_parse_errors`, `wef_xml_parse_errors` - a WEF
+  batch's XML failed to parse past a given event; that event is kept as its
+  own raw event and parsing resumes at the next one, so it doesn't cost the
+  rest of the batch
 
 Parquet persistence (labelled `source="wef"|"syslog"|"ipfix"|"zeek"|"suricata"|"sflow"|"hec"|"otlp"`):
 
 - `parquet_s3_records_written`, `parquet_s3_uploads`, `parquet_s3_upload_errors`
 - `parquet_s3_dropped`, `parquet_s3_buffer_dropped` - backpressure drops
+- `parquet_s3_records_skipped` - a record the writer could not convert into a
+  batch (schema mismatch, a mapping failure, or an unparsed event), also
+  labelled `target`
 - `parquet_s3_buffer_rows`, `parquet_s3_channel_queued`, `parquet_s3_channel_available`
 
 Aggregation: `aggregate_records_consumed`, `aggregate_rows_emitted`, `aggregate_groups`,
 `aggregate_overflow_records`.
+
+Listener health: `listener_accept_errors` (labelled `protocol="syslog_tcp"|"zeek"|"suricata"`)
+- TCP accept errors on that listener; a persistent condition (e.g. fd
+  exhaustion) pauses that listener's accept loop for 1s per error instead of
+  spinning.
 
 Counters are exported with a `_total` suffix by the Prometheus exporter.
 

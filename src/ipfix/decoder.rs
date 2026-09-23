@@ -87,7 +87,10 @@ pub type TemplateKey = (IpAddr, u32, u16);
 pub struct FieldSpecifier {
     /// Information Element id (top bit cleared; enterprise IEs have enterprise_number set).
     pub ie_id: u16,
-    /// Declared field length in bytes (0xFFFF = variable-length, not used in phase 1).
+    /// Declared field length in bytes. 0xFFFF means variable-length (RFC 7011
+    /// §7): handled for IPFIX v10 data sets; NetFlow v9 has no such encoding
+    /// and never sets `allow_varlen`, so it decodes this value as a
+    /// (deliberately unmatched) fixed length instead.
     pub length: u16,
     /// Present when the enterprise bit (bit 15) was set in the original ie_id word.
     pub enterprise_number: Option<u32>,
@@ -564,6 +567,7 @@ pub fn decode_ipfix(
                     exporter,
                     obs_domain_id,
                     export_time,
+                    true,
                 )?;
                 records.append(&mut set_records);
             }
@@ -697,6 +701,123 @@ fn parse_ipfix_options_template_set(
     Ok(())
 }
 
+/// RFC 7011 §7: a field length of 0xFFFF means variable-length encoding.
+const VARLEN: u16 = 0xFFFF;
+
+/// Build a fresh `FlowRecord` shell with only the provenance fields set;
+/// every curated column starts `None` and `extra` starts empty, ready for
+/// `apply_field_to_record` to fill in as the caller walks the template's
+/// fields. Shared by the fixed-length and variable-length decode loops so
+/// neither duplicates the field list.
+fn new_flow_record(
+    obs_domain_id: u32,
+    template_id: u16,
+    exporter: IpAddr,
+    export_time: DateTime<Utc>,
+) -> FlowRecord {
+    FlowRecord {
+        observation_domain_id: obs_domain_id,
+        template_id,
+        protocol_version: 10,
+        exporter,
+        export_time,
+        src_addr: None,
+        dst_addr: None,
+        src_port: None,
+        dst_port: None,
+        ip_protocol: None,
+        octet_delta_count: None,
+        packet_delta_count: None,
+        flow_start: None,
+        flow_end: None,
+        tcp_flags: None,
+        input_interface: None,
+        output_interface: None,
+        extra: serde_json::json!({}),
+    }
+}
+
+/// Decode a data set whose template has at least one variable-length field
+/// (RFC 7011 §7): a 1-byte length, or 255 followed by a 2-byte length. A
+/// record cut short partway ends the set (the rest is truncated data or
+/// padding); records before it are kept.
+fn parse_varlen_records(
+    fields: &[FieldSpecifier],
+    body: &[u8],
+    set_id: u16,
+    exporter: IpAddr,
+    obs_domain_id: u32,
+    export_time: DateTime<Utc>,
+) -> Vec<FlowRecord> {
+    // Padding (RFC 7011 §3.3.1) is shorter than any record, so stopping below
+    // the minimum record size never decodes it. Every varlen field costs at
+    // least its 1-byte length, so each record advances `pos`.
+    let min_record_len: usize = fields
+        .iter()
+        .map(|f| {
+            if f.length == VARLEN {
+                1
+            } else {
+                f.length as usize
+            }
+        })
+        .sum();
+    // ponytail: accepted protocol limit, not a bug. RFC 7011 §3.3.1 requires
+    // padding to be shorter than any allowable record, so a compliant
+    // exporter never pads with >= min_record_len bytes here. A
+    // non-compliant exporter using a template whose min_record_len is tiny
+    // (<= 3, e.g. a single varlen field with a 1-byte zero length) could
+    // send padding that this loop decodes as one spurious empty record --
+    // the wire format carries no length delimiter between "padding" and "a
+    // record", so the two are indistinguishable from these bytes alone.
+    // Not worth guarding: an exporter capable of sending such padding could
+    // just as easily send a real (if empty) record instead, so there is no
+    // attacker capability gained by exploiting the ambiguity.
+    //
+    // min_record_len is always >= 1 here: this function only runs when the
+    // template has at least one VARLEN field (see the `allow_varlen &&
+    // fields.iter().any(...)` dispatch in `parse_ipfix_data_set`), and every
+    // VARLEN field contributes at least 1 to the sum above.
+    debug_assert!(
+        min_record_len >= 1,
+        "parse_varlen_records must only run on a template with >= 1 varlen field"
+    );
+    let mut records = Vec::new();
+    let mut pos = 0usize;
+    'records: while body.len().saturating_sub(pos) >= min_record_len {
+        let mut rec = new_flow_record(obs_domain_id, set_id, exporter, export_time);
+        let mut p = pos;
+        for field in fields {
+            let len = if field.length == VARLEN {
+                let Ok(l) = read_bytes(body, p, 1) else {
+                    break 'records;
+                };
+                p += 1;
+                if l[0] < 255 {
+                    l[0] as usize
+                } else {
+                    let Ok(l) = read_u16_be(body, p) else {
+                        break 'records;
+                    };
+                    p += 2;
+                    l as usize
+                }
+            } else {
+                field.length as usize
+            };
+            let Ok(raw) = read_bytes(body, p, len) else {
+                break 'records;
+            };
+            apply_field_to_record(&mut rec, field, raw);
+            p += len;
+        }
+        pos = p;
+        metrics::counter!("ipfix_flows_decoded").increment(1);
+        records.push(rec);
+    }
+    records
+}
+
 fn parse_ipfix_data_set(
     decoder: &mut IpfixDecoder,
     body: &[u8],
@@ -704,6 +825,7 @@ fn parse_ipfix_data_set(
     exporter: IpAddr,
     obs_domain_id: u32,
     export_time: DateTime<Utc>,
+    allow_varlen: bool,
 ) -> Result<Vec<FlowRecord>, DecodeError> {
     let key: TemplateKey = (exporter, obs_domain_id, set_id);
     let fields = match decoder.cache_get(&key) {
@@ -717,6 +839,21 @@ fn parse_ipfix_data_set(
         }
     };
 
+    // RFC 7011 §7: a field length of 0xFFFF means variable-length encoding.
+    // RFC 3954 (NetFlow v9) has no such encoding, so `allow_varlen` is false
+    // on the v9 path and this dispatch is skipped there unconditionally,
+    // keeping v9's fixed-length behaviour exactly as it was.
+    if allow_varlen && fields.iter().any(|f| f.length == VARLEN) {
+        return Ok(parse_varlen_records(
+            &fields,
+            body,
+            set_id,
+            exporter,
+            obs_domain_id,
+            export_time,
+        ));
+    }
+
     let record_len: usize = fields.iter().map(|f| f.length as usize).sum();
     if record_len == 0 {
         return Ok(Vec::new());
@@ -726,26 +863,7 @@ fn parse_ipfix_data_set(
     let mut pos = 0usize;
 
     while pos + record_len <= body.len() {
-        let mut rec = FlowRecord {
-            observation_domain_id: obs_domain_id,
-            template_id: set_id,
-            protocol_version: 10,
-            exporter,
-            export_time,
-            src_addr: None,
-            dst_addr: None,
-            src_port: None,
-            dst_port: None,
-            ip_protocol: None,
-            octet_delta_count: None,
-            packet_delta_count: None,
-            flow_start: None,
-            flow_end: None,
-            tcp_flags: None,
-            input_interface: None,
-            output_interface: None,
-            extra: serde_json::json!({}),
-        };
+        let mut rec = new_flow_record(obs_domain_id, set_id, exporter, export_time);
 
         for field in &fields {
             let flen = field.length as usize;
@@ -761,6 +879,44 @@ fn parse_ipfix_data_set(
     Ok(records)
 }
 
+/// Maximum size, in raw bytes, of a value `insert_hex_capped` hex-encodes
+/// into `FlowRecord.extra` -- enterprise IEs, unknown IEs, and every
+/// wrong-length/fallback branch in `apply_field_to_record`. Mirrors sFlow's
+/// `MAX_UNKNOWN_RECORD_BODY_BYTES` (`src/sflow/decoder.rs`) for the same
+/// reason: `extra` exists so an operator can diagnose an unmodelled or
+/// malformed value, not to store it with full fidelity, and RFC 7011 §7
+/// variable-length IEs make values up to ~64 KiB routine on the wire. Before
+/// this cap, one such value became ~128 KiB of hex in `extra`, which could
+/// dwarf the per-flow share `channel_budget::IPFIX_DATAGRAM_BYTES` budgets
+/// for -- that constant assumes a handful of small IEs per flow, not one
+/// unbounded one. 128 raw bytes (256 hex chars) is comfortably enough to see
+/// an IE's leading structure (a vendor TLV's type/subtype/length fields and
+/// the start of its payload almost always live in the first few dozen
+/// bytes) while bounding the worst-case per-value cost to a small, fixed
+/// string regardless of how large the field claims to be.
+const MAX_EXTRA_VALUE_BYTES: usize = 128;
+
+/// Hex-encode `raw` into `extra[key]`, capped at `MAX_EXTRA_VALUE_BYTES` --
+/// see that constant's doc comment. A value at or under the cap is stored
+/// byte-for-byte, exactly as before this cap existed. Only when `raw` is
+/// truncated does this also record `extra["<key>_original_len"]` with the
+/// true length, so a diagnostician can see how much was cut without having
+/// to infer it from the hex string's length.
+fn insert_hex_capped(extra: &mut serde_json::Value, key: &str, raw: &[u8]) {
+    let cap = raw.len().min(MAX_EXTRA_VALUE_BYTES);
+    extra[key] = serde_json::json!(hex::encode(&raw[..cap]));
+    let original_len_key = format!("{key}_original_len");
+    if raw.len() > MAX_EXTRA_VALUE_BYTES {
+        extra[original_len_key] = serde_json::json!(raw.len());
+    } else if let Some(obj) = extra.as_object_mut() {
+        // A template can list the same IE twice (not deduplicated -- see
+        // `apply_field_to_record`'s callers); a later, untruncated write for
+        // the same key must not leave a stale `_original_len` from an
+        // earlier, truncated write for that key.
+        obj.remove(&original_len_key);
+    }
+}
+
 /// Decode one field value and write it into the appropriate `FlowRecord` column,
 /// or into `extra` if the IE is unknown or unsupported.
 fn apply_field_to_record(rec: &mut FlowRecord, field: &FieldSpecifier, raw: &[u8]) {
@@ -769,8 +925,7 @@ fn apply_field_to_record(rec: &mut FlowRecord, field: &FieldSpecifier, raw: &[u8
     // Enterprise IEs → always go to extra
     if let Some(pen) = field.enterprise_number {
         let key = format!("ie{}:{}", pen, field.ie_id);
-        let val = hex::encode(raw);
-        rec.extra[key] = json!(val);
+        insert_hex_capped(&mut rec.extra, &key, raw);
         return;
     }
 
@@ -778,7 +933,7 @@ fn apply_field_to_record(rec: &mut FlowRecord, field: &FieldSpecifier, raw: &[u8
         None => {
             // Unknown IE → hex-encoded in extra
             let key = format!("ie{}", field.ie_id);
-            rec.extra[key] = json!(hex::encode(raw));
+            insert_hex_capped(&mut rec.extra, &key, raw);
         }
         Some((name, ie_type)) => match ie_type {
             IeType::Ipv4 => {
@@ -786,7 +941,7 @@ fn apply_field_to_record(rec: &mut FlowRecord, field: &FieldSpecifier, raw: &[u8
                     let addr = IpAddr::V4(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]));
                     set_addr_field(rec, field.ie_id, addr);
                 } else {
-                    rec.extra[name] = json!(hex::encode(raw));
+                    insert_hex_capped(&mut rec.extra, name, raw);
                 }
             }
             IeType::Ipv6 => {
@@ -796,7 +951,7 @@ fn apply_field_to_record(rec: &mut FlowRecord, field: &FieldSpecifier, raw: &[u8
                     let addr = IpAddr::V6(Ipv6Addr::from(bytes));
                     set_addr_field(rec, field.ie_id, addr);
                 } else {
-                    rec.extra[name] = json!(hex::encode(raw));
+                    insert_hex_capped(&mut rec.extra, name, raw);
                 }
             }
             IeType::U8 => {
@@ -848,7 +1003,7 @@ fn apply_field_to_record(rec: &mut FlowRecord, field: &FieldSpecifier, raw: &[u8
                         }
                     }
                 } else {
-                    rec.extra[name] = json!(hex::encode(raw));
+                    insert_hex_capped(&mut rec.extra, name, raw);
                 }
             }
             IeType::DateTimeSysUptime => {
@@ -857,7 +1012,7 @@ fn apply_field_to_record(rec: &mut FlowRecord, field: &FieldSpecifier, raw: &[u8
                     let ms = u32::from_be_bytes(raw[..4].try_into().unwrap());
                     rec.extra[name] = json!(ms);
                 } else {
-                    rec.extra[name] = json!(hex::encode(raw));
+                    insert_hex_capped(&mut rec.extra, name, raw);
                 }
             }
         },
@@ -989,8 +1144,15 @@ pub fn decode_netflow_v9(
                 tracing::debug!("ipfix: skipping v9 options template flowset");
             }
             id if id >= 256 => {
-                let mut set_records =
-                    parse_ipfix_data_set(decoder, body, id, exporter, source_id, export_time)?;
+                let mut set_records = parse_ipfix_data_set(
+                    decoder,
+                    body,
+                    id,
+                    exporter,
+                    source_id,
+                    export_time,
+                    false,
+                )?;
                 // Correct protocol version (parse_ipfix_data_set sets it to 10)
                 for r in &mut set_records {
                     r.protocol_version = 9;
@@ -2410,6 +2572,183 @@ mod tests {
         );
     }
 
+    // ---- MAX_EXTRA_VALUE_BYTES: hex-into-extra values are capped ----
+
+    #[test]
+    fn extra_value_exactly_at_cap_is_not_truncated() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut rec = new_flow_record(0, 256, exporter, Utc::now());
+        let field = FieldSpecifier {
+            ie_id: 999, // unknown IE
+            length: MAX_EXTRA_VALUE_BYTES as u16,
+            enterprise_number: None,
+        };
+        let raw = vec![0xABu8; MAX_EXTRA_VALUE_BYTES];
+        apply_field_to_record(&mut rec, &field, &raw);
+        let hex_val = rec.extra["ie999"].as_str().expect("hex string");
+        assert_eq!(hex_val.len(), MAX_EXTRA_VALUE_BYTES * 2);
+        assert!(
+            rec.extra.get("ie999_original_len").is_none(),
+            "a value exactly at the cap must not be flagged as truncated; got: {}",
+            rec.extra
+        );
+    }
+
+    #[test]
+    fn extra_value_over_cap_is_truncated_with_original_len() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut rec = new_flow_record(0, 256, exporter, Utc::now());
+        let field = FieldSpecifier {
+            ie_id: 999, // unknown IE
+            length: 129,
+            enterprise_number: None,
+        };
+        let raw = vec![0xCDu8; 129];
+        apply_field_to_record(&mut rec, &field, &raw);
+        let hex_val = rec.extra["ie999"].as_str().expect("hex string");
+        assert_eq!(
+            hex_val.len(),
+            256,
+            "hex must be capped at 256 chars (128 bytes)"
+        );
+        assert_eq!(
+            rec.extra["ie999_original_len"],
+            serde_json::json!(129),
+            "truncated value must record its true original length"
+        );
+    }
+
+    #[test]
+    fn enterprise_ie_value_over_cap_is_truncated() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut rec = new_flow_record(0, 256, exporter, Utc::now());
+        let field = FieldSpecifier {
+            ie_id: 42,
+            length: 200,
+            enterprise_number: Some(12345),
+        };
+        let raw = vec![0xEFu8; 200];
+        apply_field_to_record(&mut rec, &field, &raw);
+        let hex_val = rec.extra["ie12345:42"].as_str().expect("hex string");
+        assert_eq!(hex_val.len(), 256);
+        assert_eq!(rec.extra["ie12345:42_original_len"], serde_json::json!(200));
+    }
+
+    #[test]
+    fn ipv4_wrong_length_over_cap_is_truncated() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut rec = new_flow_record(0, 256, exporter, Utc::now());
+        let field = FieldSpecifier {
+            ie_id: 8, // sourceIPv4Address, expects raw.len() == 4
+            length: 200,
+            enterprise_number: None,
+        };
+        let raw = vec![0x11u8; 200];
+        apply_field_to_record(&mut rec, &field, &raw);
+        assert!(rec.src_addr.is_none(), "wrong-length IPv4 must not decode");
+        let hex_val = rec.extra["sourceIPv4Address"].as_str().expect("hex string");
+        assert_eq!(hex_val.len(), 256);
+        assert_eq!(
+            rec.extra["sourceIPv4Address_original_len"],
+            serde_json::json!(200)
+        );
+    }
+
+    #[test]
+    fn varlen_field_over_cap_is_truncated() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let fields = vec![FieldSpecifier {
+            ie_id: 97, // not in ie_info's curated table
+            length: VARLEN,
+            enterprise_number: None,
+        }];
+        // RFC 7011 §7: 0xFF marker + 2-byte length for values >= 255.
+        let mut body = vec![0xFFu8];
+        body.extend_from_slice(&1000u16.to_be_bytes());
+        body.extend(vec![0x42u8; 1000]);
+
+        let records = parse_varlen_records(&fields, &body, 256, exporter, 0, Utc::now());
+        assert_eq!(records.len(), 1);
+        let hex_val = records[0].extra["ie97"].as_str().expect("hex string");
+        assert_eq!(hex_val.len(), 256);
+        assert_eq!(
+            records[0].extra["ie97_original_len"],
+            serde_json::json!(1000)
+        );
+    }
+
+    // ---- insert_hex_capped: repeated IE in one template must not leave a
+    // stale `_original_len` from an earlier write for the same key ----
+
+    #[test]
+    fn repeated_key_over_cap_then_under_cap_clears_original_len() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut rec = new_flow_record(0, 256, exporter, Utc::now());
+        let field = FieldSpecifier {
+            ie_id: 999, // unknown IE
+            length: 0,  // unused by apply_field_to_record; raw drives length
+            enterprise_number: None,
+        };
+
+        // First write: over the cap -> truncated, with _original_len.
+        apply_field_to_record(&mut rec, &field, &[0xCDu8; 200]);
+        assert!(rec.extra.get("ie999_original_len").is_some());
+
+        // Second write for the SAME key: at/under the cap -> must end up
+        // untruncated with NO leftover _original_len from the first write.
+        apply_field_to_record(&mut rec, &field, &[0xABu8; 10]);
+        assert_eq!(
+            rec.extra["ie999"].as_str().map(str::len),
+            Some(20),
+            "the later, short write must win; got: {}",
+            rec.extra
+        );
+        assert!(
+            rec.extra.get("ie999_original_len").is_none(),
+            "a later untruncated write must clear a stale _original_len \
+             from an earlier truncated write for the same key; got: {}",
+            rec.extra
+        );
+    }
+
+    #[test]
+    fn repeated_key_under_cap_then_over_cap_sets_original_len() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut rec = new_flow_record(0, 256, exporter, Utc::now());
+        let field = FieldSpecifier {
+            ie_id: 999, // unknown IE
+            length: 0,
+            enterprise_number: None,
+        };
+
+        // First write: at/under the cap -> untruncated, no _original_len.
+        apply_field_to_record(&mut rec, &field, &[0xABu8; 10]);
+        assert!(rec.extra.get("ie999_original_len").is_none());
+
+        // Second write for the SAME key: over the cap -> must end up
+        // truncated, with _original_len reflecting THIS write, not stale.
+        apply_field_to_record(&mut rec, &field, &[0xCDu8; 200]);
+        assert_eq!(
+            rec.extra["ie999"].as_str().map(str::len),
+            Some(256),
+            "the later, over-cap write must win; got: {}",
+            rec.extra
+        );
+        assert_eq!(
+            rec.extra["ie999_original_len"],
+            serde_json::json!(200),
+            "_original_len must reflect the later write's true length; got: {}",
+            rec.extra
+        );
+    }
+
     // ---- parse_ipfix_data_set: zero-length template (record_len=0) → empty ----
 
     #[test]
@@ -2944,6 +3283,189 @@ mod tests {
         assert!(
             !dec.cache_contains_key(&v10_key_wrong_domain),
             "v10 domain=0 template must not exist in v9-populated cache"
+        );
+    }
+
+    // ---- parse_ipfix_data_set: variable-length fields (RFC 7011 §7) --------
+    //
+    // IE 97 and 98 are used below because neither is in `ie_info`'s curated
+    // table (confirmed against the match arms above: 1, 2, 4, 6, 7, 8, 10,
+    // 11, 12, 14, 21, 22, 27, 28, 32, 56, 58, 60, 61, 62, 64, 70, 89, 96,
+    // 130, 131, 136, 148, 152, 153, 176, 177, 225-228 -- 96 is taken by
+    // mpls_vpn_rd, so 97/98 are the nearest free ids), so a varlen value for
+    // them always lands hex-encoded in `extra["ie<id>"]` via the existing
+    // unknown-IE branch.
+
+    fn varlen_field(ie_id: u16) -> FieldSpecifier {
+        FieldSpecifier {
+            ie_id,
+            length: 0xFFFF,
+            enterprise_number: None,
+        }
+    }
+
+    fn fixed_field(ie_id: u16, length: u16) -> FieldSpecifier {
+        FieldSpecifier {
+            ie_id,
+            length,
+            enterprise_number: None,
+        }
+    }
+
+    fn varlen_test_ctx() -> (IpfixDecoder, IpAddr, DateTime<Utc>) {
+        let dec = IpfixDecoder::new();
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        use chrono::TimeZone;
+        let export_time = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        (dec, exporter, export_time)
+    }
+
+    /// (a) fixed field + 1-byte-length varlen field: `0x03 "abc"`.
+    #[test]
+    fn varlen_one_byte_length_decodes_value_into_extra() {
+        let (mut dec, exporter, export_time) = varlen_test_ctx();
+        let fields = vec![fixed_field(8, 4), varlen_field(97)];
+        dec.try_insert_template((exporter, 0, 256), fields);
+        let mut body = vec![192, 168, 1, 1]; // sourceIPv4Address
+        body.push(0x03);
+        body.extend_from_slice(b"abc");
+
+        let records = parse_ipfix_data_set(&mut dec, &body, 256, exporter, 0, export_time, true)
+            .expect("varlen decode must not error");
+
+        assert_eq!(records.len(), 1, "expected exactly 1 record");
+        assert_eq!(
+            records[0].src_addr,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))
+        );
+        assert_eq!(records[0].extra["ie97"], "616263");
+    }
+
+    /// (b) 3-byte length form: `0xFF 0x01 0x2C` (255, then u16 300) + 300 bytes.
+    #[test]
+    fn varlen_three_byte_length_form_decodes_300_byte_value() {
+        let (mut dec, exporter, export_time) = varlen_test_ctx();
+        let fields = vec![varlen_field(97)];
+        dec.try_insert_template((exporter, 0, 256), fields);
+        let mut body = vec![0xFF, 0x01, 0x2C];
+        body.extend(std::iter::repeat_n(0xABu8, 300));
+
+        let records = parse_ipfix_data_set(&mut dec, &body, 256, exporter, 0, export_time, true)
+            .expect("varlen 3-byte-length decode must not error");
+
+        assert_eq!(records.len(), 1);
+        let hex = records[0].extra["ie97"]
+            .as_str()
+            .expect("extra is a string");
+        // A 300-byte value exceeds MAX_EXTRA_VALUE_BYTES (128), so it must be
+        // capped at 256 hex chars with the true length recorded separately —
+        // see `insert_hex_capped`'s doc comment.
+        assert_eq!(
+            hex.len(),
+            256,
+            "300-byte value must be capped at MAX_EXTRA_VALUE_BYTES (128 bytes = 256 hex chars)"
+        );
+        assert_eq!(
+            records[0].extra["ie97_original_len"],
+            serde_json::json!(300),
+            "truncated value must record its true original length"
+        );
+    }
+
+    /// (c) a zero-length varlen value: `0x00` → record present with `""`.
+    #[test]
+    fn varlen_zero_length_value_yields_empty_string() {
+        let (mut dec, exporter, export_time) = varlen_test_ctx();
+        let fields = vec![varlen_field(97)];
+        dec.try_insert_template((exporter, 0, 256), fields);
+        let body = vec![0x00u8];
+
+        let records = parse_ipfix_data_set(&mut dec, &body, 256, exporter, 0, export_time, true)
+            .expect("varlen zero-length decode must not error");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].extra["ie97"], "");
+    }
+
+    /// (d) two records back to back, then 1 padding byte (< min_record_len = 5)
+    /// → exactly 2 records, padding never decoded.
+    #[test]
+    fn varlen_trailing_padding_shorter_than_min_record_len_is_not_decoded() {
+        let (mut dec, exporter, export_time) = varlen_test_ctx();
+        let fields = vec![fixed_field(8, 4), varlen_field(97)]; // min_record_len = 4 + 1 = 5
+        dec.try_insert_template((exporter, 0, 256), fields);
+        let mut body = Vec::new();
+        body.extend_from_slice(&[10, 0, 0, 1]);
+        body.push(0x00); // zero-length varlen value
+        body.extend_from_slice(&[10, 0, 0, 2]);
+        body.push(0x00);
+        body.push(0xFF); // 1 padding byte, shorter than min_record_len
+
+        let records = parse_ipfix_data_set(&mut dec, &body, 256, exporter, 0, export_time, true)
+            .expect("varlen padding decode must not error");
+
+        assert_eq!(
+            records.len(),
+            2,
+            "padding byte must not be decoded as a 3rd record"
+        );
+    }
+
+    /// (e) a record declaring a 65535-byte value with only 10 bytes left →
+    /// the truncated record is dropped, no panic, no `Err`; earlier records
+    /// are kept.
+    #[test]
+    fn varlen_record_cut_short_is_dropped_earlier_records_kept() {
+        let (mut dec, exporter, export_time) = varlen_test_ctx();
+        let fields = vec![varlen_field(97)]; // min_record_len = 1
+        dec.try_insert_template((exporter, 0, 256), fields);
+        let mut body = vec![0x00u8]; // record 1: zero-length value
+        body.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // record 2: declares 65535 bytes
+        body.extend_from_slice(&[0u8; 7]); // only 7 more bytes follow (10 total left)
+
+        let records = parse_ipfix_data_set(&mut dec, &body, 256, exporter, 0, export_time, true)
+            .expect("truncated varlen record must not surface as Err");
+
+        assert_eq!(
+            records.len(),
+            1,
+            "the cut-short 2nd record must be dropped, keeping only the 1st"
+        );
+    }
+
+    /// (f) a template of ONLY two varlen fields, data `00 00 00 00` → 2 records.
+    #[test]
+    fn varlen_template_with_only_varlen_fields_decodes_two_records() {
+        let (mut dec, exporter, export_time) = varlen_test_ctx();
+        let fields = vec![varlen_field(97), varlen_field(98)];
+        dec.try_insert_template((exporter, 0, 256), fields);
+        let body = vec![0x00u8, 0x00, 0x00, 0x00];
+
+        let records = parse_ipfix_data_set(&mut dec, &body, 256, exporter, 0, export_time, true)
+            .expect("all-varlen template decode must not error");
+
+        assert_eq!(records.len(), 2);
+    }
+
+    /// (g) v9 must keep today's behaviour exactly: a template with a 0xFFFF
+    /// field still yields 0 records (RFC 3954 has no variable-length
+    /// encoding, so `allow_varlen = false` must skip the varlen dispatch).
+    #[test]
+    fn v9_path_with_0xffff_template_field_yields_no_records() {
+        let (mut dec, exporter, export_time) = varlen_test_ctx();
+        let fields = vec![fixed_field(8, 4), varlen_field(97)];
+        dec.try_insert_template((exporter, 0, 256), fields);
+        let mut body = vec![192, 168, 1, 1];
+        body.push(0x03);
+        body.extend_from_slice(b"abc");
+
+        let records = parse_ipfix_data_set(&mut dec, &body, 256, exporter, 0, export_time, false)
+            .expect("v9 path must not error");
+
+        assert_eq!(
+            records.len(),
+            0,
+            "v9 (allow_varlen=false) must not decode 0xFFFF as variable-length"
         );
     }
 }
