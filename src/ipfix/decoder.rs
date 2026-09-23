@@ -762,9 +762,29 @@ fn parse_varlen_records(
             }
         })
         .sum();
+    // ponytail: accepted protocol limit, not a bug. RFC 7011 §3.3.1 requires
+    // padding to be shorter than any allowable record, so a compliant
+    // exporter never pads with >= min_record_len bytes here. A
+    // non-compliant exporter using a template whose min_record_len is tiny
+    // (<= 3, e.g. a single varlen field with a 1-byte zero length) could
+    // send padding that this loop decodes as one spurious empty record --
+    // the wire format carries no length delimiter between "padding" and "a
+    // record", so the two are indistinguishable from these bytes alone.
+    // Not worth guarding: an exporter capable of sending such padding could
+    // just as easily send a real (if empty) record instead, so there is no
+    // attacker capability gained by exploiting the ambiguity.
+    //
+    // min_record_len is always >= 1 here: this function only runs when the
+    // template has at least one VARLEN field (see the `allow_varlen &&
+    // fields.iter().any(...)` dispatch in `parse_ipfix_data_set`), and every
+    // VARLEN field contributes at least 1 to the sum above.
+    debug_assert!(
+        min_record_len >= 1,
+        "parse_varlen_records must only run on a template with >= 1 varlen field"
+    );
     let mut records = Vec::new();
     let mut pos = 0usize;
-    'records: while body.len().saturating_sub(pos) >= min_record_len.max(1) {
+    'records: while body.len().saturating_sub(pos) >= min_record_len {
         let mut rec = new_flow_record(obs_domain_id, set_id, exporter, export_time);
         let mut p = pos;
         for field in fields {
