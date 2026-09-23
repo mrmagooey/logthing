@@ -20,6 +20,14 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   Zeek, and Suricata listeners (`protocol` = `syslog_tcp`/`zeek`/`suricata`).
   Climbing steadily (rather than the occasional per-connection blip) points
   at fd exhaustion or a similar persistent condition.
+- IPFIX (v10) variable-length fields (RFC 7011 §7) are now decoded.
+  Previously any template containing one silently produced no records:
+  a field length of `0xFFFF` summed into the fixed-length record size as
+  65535 bytes, so no data set built from that template ever matched. Values
+  of Information Elements not in the known-IE table land hex-encoded in
+  `extra`, the same as any other unknown IE. NetFlow v9 is unchanged — RFC
+  3954 has no variable-length encoding, so a v9 template with `0xFFFF`
+  still decodes nothing, exactly as before.
 
 ### Fixed
 
@@ -60,6 +68,23 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   number an operator could alert on. All four now increment
   `parquet_s3_records_skipped` and log at most once per 30 seconds per
   writer, carrying the error and the running skipped count.
+- Zeek rows routed to the `_overflow` partition (after `max_partitions` is
+  reached) recorded the placeholder `"_overflow_nonexistent_"` as their
+  `log_path` instead of the record's real path. `ZeekSink::to_record_batch`'s
+  overflow branch now maps the row through `map_envelope(&record.fields,
+  &record.log_path, ...)` directly, so overflowed rows keep the log path
+  they actually came from.
+- A mixed-case Zeek `_path` (e.g. `"Conn"`) was written under its real,
+  typed stream but counted under `zeek_records_by_path{log_path="other"}`:
+  `metric_log_path` was missing the sanitized-path fallback
+  `get_schema_entry` already had, so the two disagreed on the same record.
+  Both now share one `registry_lookup` so a schema resolution and its metric
+  label can no longer diverge.
+- The Parquet writer's shutdown `flush_all` zeroed a buffer's `row_count`
+  and `byte_count` only on the failure path, not on success — a successful
+  flush left both stale until the next `push()` overwrote them, which
+  inflated the `rows_still_buffered` figure logged if shutdown's flush
+  loop hit an error on a later partition.
 
 ## [0.20.1] - 2026-09-22
 
