@@ -248,6 +248,12 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
         "body_budget_exhausted",
         "HTTP requests rejected because the in-flight request-body memory budget was exhausted.",
     ),
+    // ── wef ───────────────────────────────────────────────────────────────
+    (
+        Kind::Counter,
+        "wef_xml_parse_errors",
+        "WEF batches whose XML failed to parse; the unparsed remainder is kept as one raw event.",
+    ),
     // ── listener access control ───────────────────────────────────────────
     (
         Kind::Counter,

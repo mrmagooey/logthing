@@ -168,7 +168,24 @@ impl WefParser {
                 }
                 Ok(XmlEvent::Eof) => break,
                 Err(e) => {
+                    metrics::counter!("wef_xml_parse_errors").increment(1);
                     error!("XML parsing error: {}", e);
+                    // The handler acks this batch with 200, so the forwarder will
+                    // never resend it: keep everything not yet emitted as one raw
+                    // event instead of dropping it. Outside an event, a remainder
+                    // with no `<Event` in it is envelope junk with no event data
+                    // to keep.
+                    let from = if in_event {
+                        event_start_pos.unwrap_or(pos)
+                    } else {
+                        pos
+                    };
+                    if let Some(rest) = body.get(from..)
+                        && !rest.trim().is_empty()
+                        && (in_event || rest.contains("<Event"))
+                    {
+                        events.push(WindowsEvent::new(source_host.clone(), rest.to_string()));
+                    }
                     break;
                 }
                 _ => {}
@@ -1083,5 +1100,79 @@ mod tests {
             line.contains('\u{fffd}'),
             "expected U+FFFD replacement characters in the log line: {line:?}"
         );
+    }
+
+    /// Well-formed `<Event>` for event number `n`, matching real WEF shape.
+    fn wef_event(n: u32) -> String {
+        format!(
+            "<Event><System><Provider>P</Provider><EventID>{n}</EventID><Level>4</Level>\
+             </System></Event>"
+        )
+    }
+
+    /// Malformed `<Event>` for event number `n`: a stray `</Mismatch>` end
+    /// tag inside `<System>` trips quick-xml's default `check_end_names`
+    /// and returns `Err` from `read_event_into` (verified by the RED run of
+    /// the tests below).
+    fn wef_malformed_event(n: u32) -> String {
+        format!(
+            "<Event><System><Provider>P</Provider></Mismatch><EventID>{n}</EventID>\
+             <Level>4</Level></System></Event>"
+        )
+    }
+
+    fn wef_envelope(events_xml: &str) -> String {
+        format!("<Envelope><Body><Events>{events_xml}</Events></Body></Envelope>")
+    }
+
+    #[test]
+    fn parse_events_malformed_middle_event_keeps_remainder_raw() {
+        let parser = WefParser::new();
+        let body = wef_envelope(&format!(
+            "{}{}{}",
+            wef_event(1),
+            wef_malformed_event(2),
+            wef_event(3)
+        ));
+
+        let WefMessage::Events(ev) = parser.parse_message(&body, "h".into()).unwrap() else {
+            panic!("expected Events");
+        };
+        assert_eq!(ev.len(), 2);
+        assert!(ev[0].raw_xml.contains("<EventID>1</EventID>"));
+        assert!(ev[1].raw_xml.contains("</Mismatch>"));
+        assert!(
+            ev[1].raw_xml.contains("<EventID>3</EventID>"),
+            "events after the error must be kept, got: {}",
+            ev[1].raw_xml
+        );
+    }
+
+    #[test]
+    fn parse_events_error_in_first_event_keeps_everything_raw() {
+        let parser = WefParser::new();
+        let body = wef_envelope(&format!("{}{}", wef_malformed_event(1), wef_event(2)));
+
+        let WefMessage::Events(ev) = parser.parse_message(&body, "h".into()).unwrap() else {
+            panic!("expected Events");
+        };
+        assert_eq!(ev.len(), 1);
+        assert!(ev[0].raw_xml.contains("<EventID>1</EventID>"));
+        assert!(ev[0].raw_xml.contains("<EventID>2</EventID>"));
+    }
+
+    #[test]
+    fn parse_events_trailing_junk_after_last_event_adds_no_raw_row() {
+        let parser = WefParser::new();
+        let body = format!(
+            "<Envelope><Body><Events>{}{}</Events></Bogus></Body></Envelope>",
+            wef_event(1),
+            wef_event(2)
+        );
+
+        let WefMessage::Events(ev) = parser.parse_message(&body, "h".into()).unwrap() else {
+            panic!("expected Events");
+        };
+        assert_eq!(ev.len(), 2);
     }
 }
