@@ -833,11 +833,19 @@ mod tests {
         writer.flush_all().await.unwrap();
         writer.drain_pending_flushes().await;
 
+        let conn_buf = writer.buffer_by_partition("conn");
         assert_eq!(
-            writer
-                .buffer_by_partition("conn")
-                .map(|b| b.buffer.len())
-                .unwrap_or(0),
+            conn_buf.map(|b| b.row_count).unwrap_or(0),
+            0,
+            "conn buffer row_count must be reset to zero after a successful flush_all"
+        );
+        assert_eq!(
+            conn_buf.map(|b| b.byte_count).unwrap_or(0),
+            0,
+            "conn buffer byte_count must be reset to zero after a successful flush_all"
+        );
+        assert_eq!(
+            conn_buf.map(|b| b.buffer.len()).unwrap_or(0),
             0,
             "conn buffer must have no pending unflushed batches after flush_all"
         );
