@@ -17,8 +17,6 @@
 //! `u128` -> `u64` narrowing conversion). No allocation, no locking; still
 //! roughly three orders of magnitude below a formatted, stdout-locking
 //! `tracing` emission.
-//!
-//! See `docs/superpowers/specs/2026-07-25-drop-log-throttle-design.md`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;

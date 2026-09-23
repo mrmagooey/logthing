@@ -1,6 +1,7 @@
 //! Criterion micro-benchmark comparing Zeek's "conn" record→RecordBatch
-//! construction cost before vs. after amortized builder reuse (see
-//! `docs/superpowers/specs/2026-07-24-record-batch-amortization-design.md`).
+//! construction cost before vs. after amortized builder reuse. Targets a
+//! per-record cost profiled at ~500µs-1.3ms pre-amortization, the dominant
+//! per-record cost in the whole Zeek ingest path.
 //!
 //! Both code paths are exercised through already-public API:
 //! - "Before" (fresh Arrow builders allocated and finished on every single

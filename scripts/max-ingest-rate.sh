@@ -2,8 +2,6 @@
 # Per-format maximum sustainable ingest rate. Supersedes
 # scripts/repeat-ipfix-loopback-loss.sh -- same restart-per-run, zeroed-counter,
 # socket-drop-reconciling machinery, generalised across formats.
-#
-# Spec: docs/superpowers/specs/2026-09-16-max-ingest-rate-design.md
 set -u
 
 median_of() { sort -n | awk '{a[NR]=$1} END {n=NR; if(n==0){print "nan"; exit} if(n%2==1) print a[(n+1)/2]; else printf "%.4f\n", (a[n/2]+a[n/2+1])/2}'; }
@@ -26,10 +24,10 @@ sum_proc_net_udp_drops() {
 }
 
 # Fraction of target the generator must actually achieve for the run's loss
-# figure to mean anything. docs/performance/2026-09-13-multiformat-load-results.md
-# §2 read zeek achieving 15,283/s against a 20,000/s target as a generator
-# ceiling; on TCP that signature is equally consistent with server
-# backpressure. This harness refuses to call either one a ceiling.
+# figure to mean anything. A prior run read zeek achieving 15,283/s against
+# a 20,000/s target as a generator ceiling; on TCP that signature is equally
+# consistent with server backpressure. This harness refuses to call either
+# one a ceiling.
 ACHIEVED_FLOOR_PCT="${ACHIEVED_FLOOR_PCT:-99}"
 
 classify_run() {

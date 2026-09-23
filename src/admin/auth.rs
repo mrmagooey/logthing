@@ -100,7 +100,7 @@ pub fn verify_trusted_header(state: &AdminState, headers: &HeaderMap) -> Option<
     let groups_raw = headers.get(&cfg.groups_header)?.to_str().ok()?;
     // Authentik's exact delimiter for this header was not confirmed against
     // live docs at design time — accept both `,` and `|` as a best-effort
-    // default (see docs/admin-security.md for the operator-facing caveat).
+    // default (see docs/admin.md for the operator-facing caveat).
     let matched = groups_raw
         .split([',', '|'])
         .map(str::trim)

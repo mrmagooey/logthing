@@ -104,8 +104,7 @@ pub trait ParquetSink: Send + Sync + 'static {
     /// event day -- the column `day_and_batch`'s default implementation
     /// reads to bucket buffers (and therefore Parquet files) so each one
     /// is "day-clean": every row decodes to the same Iceberg `day()`
-    /// partition tuple. See
-    /// docs/superpowers/specs/2026-09-05-day-clean-parquet-partitions-design.md.
+    /// partition tuple.
     ///
     /// `None` means this sink has not opted in, so `day_and_batch`'s
     /// default falls straight through to the generic `received_at` / `now`
@@ -831,8 +830,7 @@ pub struct PartitionedParquetWriter<S: ParquetSink> {
 /// batch built one row at a time that is dominated by a fixed per-builder
 /// allocation — measured at 94,080 bytes for a 1-row IPFIX batch whose real
 /// payload is 109 — a ~860x overstatement that drove the byte-based flush
-/// threshold 1-2 orders of magnitude too early. See
-/// `docs/performance/2026-09-14-writer-channel-loss.md`.
+/// threshold 1-2 orders of magnitude too early.
 ///
 /// `get_slice_memory_size` is arrow's own used-bytes accounting: slice-aware
 /// (a hand-rolled `buffers().map(|b| b.len())` sum reports the *parent*

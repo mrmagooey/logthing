@@ -1,5 +1,4 @@
-//! Integration test for the flush byte-accounting fix
-//! (`docs/superpowers/plans/2026-09-14-flush-byte-accounting-fix.md`, Task 2).
+//! Integration test for the flush byte-accounting fix.
 //!
 //! `buffered_writer.rs`'s byte-based flush threshold used to be driven by
 //! `RecordBatch::get_array_memory_size()`, which reports allocated builder

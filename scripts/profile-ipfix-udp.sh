@@ -5,9 +5,11 @@
 # trap and the forced `error` log level; not repeated in full here.
 #
 # Deliberately drives ONE rate point per run, and (via FORWARD) one handler
-# shape per run -- see docs/performance/2026-09-14-ipfix-recv-path-cpu-profile.md
-# for why a forwarding-destination on/off comparison is the point of this
-# script's FORWARD switch (recv/handler-coupling hypothesis).
+# shape per run -- a trivial-vs-real-handler comparison at a fixed offered
+# rate previously found total CPU nearly quadrupling and loss rising ~44%
+# relatively, from resource contention on shared worker threads/allocator
+# rather than the handler literally blocking recv; FORWARD lets a rerun
+# isolate that coupling.
 #
 # Build the profiling binary before running this script:
 #   export CC=/usr/bin/gcc CXX=/usr/bin/g++
