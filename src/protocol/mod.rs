@@ -162,17 +162,7 @@ impl WefParser {
                                 && let Some(event_xml) = window.get(start..pos)
                             {
                                 // Parse this individual event
-                                match self.parse_single_event(event_xml, &source_host) {
-                                    Ok(event) => events.push(event),
-                                    Err(e) => {
-                                        error!("Failed to parse individual event: {}", e);
-                                        // Still add raw event
-                                        events.push(WindowsEvent::new(
-                                            source_host.clone(),
-                                            event_xml.to_string(),
-                                        ));
-                                    }
-                                }
+                                events.push(self.parse_single_event(event_xml, &source_host));
                             }
                             depth = 0;
                         } else if in_event {
@@ -188,16 +178,7 @@ impl WefParser {
                             if let Some(start) = event_start_pos
                                 && let Some(event_xml) = window.get(start..pos)
                             {
-                                match self.parse_single_event(event_xml, &source_host) {
-                                    Ok(event) => events.push(event),
-                                    Err(e) => {
-                                        error!("Failed to parse individual event: {}", e);
-                                        events.push(WindowsEvent::new(
-                                            source_host.clone(),
-                                            event_xml.to_string(),
-                                        ));
-                                    }
-                                }
+                                events.push(self.parse_single_event(event_xml, &source_host));
                             }
                         }
                     }
@@ -304,7 +285,7 @@ impl WefParser {
         Ok(WefMessage::Events(events))
     }
 
-    fn parse_single_event(&self, xml: &str, source_host: &str) -> Result<WindowsEvent> {
+    fn parse_single_event(&self, xml: &str, source_host: &str) -> WindowsEvent {
         let mut event = WindowsEvent::new(source_host.to_string(), xml.to_string());
 
         // Try to parse the event XML into structured data
@@ -312,7 +293,7 @@ impl WefParser {
             event = event.with_parsed(parsed);
         }
 
-        Ok(event)
+        event
     }
 
     fn parse_event_data(&self, xml: &str) -> Result<ParsedEvent> {
