@@ -283,6 +283,11 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     ),
     (
         Kind::Counter,
+        "parquet_s3_records_skipped",
+        "Records the writer could not convert into its buffer's schema and skipped.",
+    ),
+    (
+        Kind::Counter,
         "parquet_s3_buffer_dropped",
         "Buffered rows discarded to bring the writer's in-memory buffer back under its byte budget.",
     ),
