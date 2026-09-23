@@ -494,7 +494,7 @@ mod tests {
         )
     }
 
-    // -- Task 1: schema shape --
+    // -- schema shape --
 
     #[test]
     fn schema_has_correct_columns_and_types() {
@@ -874,7 +874,7 @@ mod tests {
         assert!(col.is_null(0));
     }
 
-    // -- Task 1: row mapping --
+    // -- row mapping --
 
     #[test]
     fn row_mapping_produces_expected_column_values() {
@@ -953,7 +953,7 @@ mod tests {
         assert!(sd.is_null(0));
     }
 
-    // -- Task 2: Parquet round-trip --
+    // -- Parquet round-trip --
 
     #[test]
     fn encode_parquet_round_trips_expected_schema_and_values() {

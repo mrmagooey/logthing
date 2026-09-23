@@ -1262,7 +1262,7 @@ mod tests {
         );
     }
 
-    // -- Task 5: rule_schema / AggregateSink --
+    // -- rule_schema / AggregateSink --
 
     #[test]
     fn rule_schema_orders_columns_group_count_aggs_window() {
@@ -1439,7 +1439,7 @@ mod tests {
         assert_ne!(partition_time.value(0), window_end.timestamp_micros());
     }
 
-    // -- Task 6: emit task --
+    // -- emit task --
 
     #[tokio::test]
     async fn the_emit_task_drains_on_tick_and_again_on_shutdown() {

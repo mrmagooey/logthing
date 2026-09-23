@@ -1379,7 +1379,7 @@ mod tests {
         assert!(e.to_string().contains("99"));
     }
 
-    // ---- Tests for read helpers and template cache (Task 3) ----
+    // ---- Tests for read helpers and template cache ----
 
     #[test]
     fn read_u16_be_requires_two_bytes() {
@@ -1493,7 +1493,7 @@ mod tests {
         assert!(!b.cache_contains_key(&new_key));
     }
 
-    // ---- IPFIX v10 decode tests (Task 4) ----
+    // ---- IPFIX v10 decode tests ----
 
     #[tokio::test]
     async fn ipfix_template_then_data_decodes_src_dst() {
@@ -1550,7 +1550,7 @@ mod tests {
         );
     }
 
-    // ---- NetFlow v9 decode tests (Task 5) ----
+    // ---- NetFlow v9 decode tests ----
 
     #[test]
     fn netflow_v9_template_then_data_decodes_correctly() {
@@ -1576,7 +1576,7 @@ mod tests {
         assert!(decode_netflow_v9(&mut dec, FIXTURE_NFV9_TRUNCATED, exporter).is_err());
     }
 
-    // ---- NetFlow v5 decode tests (Task 6) ----
+    // ---- NetFlow v5 decode tests ----
 
     #[test]
     fn netflow_v5_single_record_decoded_correctly() {
@@ -1619,7 +1619,7 @@ mod tests {
         assert_eq!(records.len(), 0);
     }
 
-    // ---- Version dispatch tests (Task 7) ----
+    // ---- Version dispatch tests ----
 
     #[test]
     fn dispatch_routes_v10_correctly() {
@@ -3012,7 +3012,7 @@ mod tests {
         assert_eq!(dec.cache_len(), MAX_CACHED_TEMPLATES);
     }
 
-    // ---- try_insert_template: TTL sweep (Task 5) ----
+    // ---- try_insert_template: TTL sweep ----
 
     fn test_field() -> FieldSpecifier {
         FieldSpecifier {

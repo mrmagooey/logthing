@@ -3541,7 +3541,7 @@ event_parsers:
     }
 
     // ------------------------------------------------------------------ //
-    // Task 4.8: HEC / NDJSON route wiring tests                          //
+    // HEC / NDJSON route wiring tests                                    //
     // ------------------------------------------------------------------ //
 
     /// Helper: build a minimal router with the three HEC routes and the same
@@ -3665,7 +3665,7 @@ event_parsers:
     }
 
     // ------------------------------------------------------------------ //
-    // Task 4.8 (gating): HEC routes registered only when hec.enabled      //
+    // HEC routes registered only when hec.enabled                         //
     // These exercise the REAL create_router path, not the isolated helper.//
     // ------------------------------------------------------------------ //
 
@@ -4079,7 +4079,7 @@ event_parsers:
     }
 
     // ------------------------------------------------------------------ //
-    // Task 5.4: OTLP handler tests                                        //
+    // OTLP handler tests                                                  //
     // ------------------------------------------------------------------ //
 
     #[cfg(feature = "otlp")]

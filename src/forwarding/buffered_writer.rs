@@ -2221,7 +2221,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     // -----------------------------------------------------------------------
-    // Task 1.1 — config deserialization tests
+    // config deserialization tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2282,7 +2282,7 @@ max_partitions = 128
     }
 
     // -----------------------------------------------------------------------
-    // Task 1.2 — build_key tests
+    // build_key tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3315,7 +3315,7 @@ max_partitions = 128
     }
 
     // -----------------------------------------------------------------------
-    // Task 1.3 — PartitionedParquetWriter push / flush / cap tests
+    // PartitionedParquetWriter push / flush / cap tests
     // -----------------------------------------------------------------------
 
     /// Records accumulate below the row threshold.
@@ -4011,7 +4011,7 @@ max_partitions = 128
     }
 
     // -----------------------------------------------------------------------
-    // Task 1.4 — partition-count cap tests
+    // partition-count cap tests
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -4056,7 +4056,7 @@ max_partitions = 128
     }
 
     // -----------------------------------------------------------------------
-    // Task 1.5 — ParquetWriterHandle tests
+    // ParquetWriterHandle tests
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -4359,7 +4359,7 @@ max_partitions = 128
     }
 
     // -----------------------------------------------------------------------
-    // Task 1.6 — Additional tests: byte/age flush triggers, encode round-trip,
+    // Additional tests: byte/age flush triggers, encode round-trip,
     //            multi-partition
     // -----------------------------------------------------------------------
 
@@ -4846,7 +4846,7 @@ secret_key  = "SECRET"
     }
 
     // -----------------------------------------------------------------------
-    // Task 1: start_writer<S> generic helper function test
+    // start_writer<S> generic helper function test
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -5047,7 +5047,7 @@ secret_key  = "SECRET"
     }
 
     // -----------------------------------------------------------------------
-    // Task 6 — concurrency-guarantee tests for the decoupling mechanism
+    // concurrency-guarantee tests for the decoupling mechanism
     // -----------------------------------------------------------------------
 
     /// A second threshold-crossing while a flush is already in-flight for
