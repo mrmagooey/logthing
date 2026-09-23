@@ -905,8 +905,15 @@ const MAX_EXTRA_VALUE_BYTES: usize = 128;
 fn insert_hex_capped(extra: &mut serde_json::Value, key: &str, raw: &[u8]) {
     let cap = raw.len().min(MAX_EXTRA_VALUE_BYTES);
     extra[key] = serde_json::json!(hex::encode(&raw[..cap]));
+    let original_len_key = format!("{key}_original_len");
     if raw.len() > MAX_EXTRA_VALUE_BYTES {
-        extra[format!("{key}_original_len")] = serde_json::json!(raw.len());
+        extra[original_len_key] = serde_json::json!(raw.len());
+    } else if let Some(obj) = extra.as_object_mut() {
+        // A template can list the same IE twice (not deduplicated -- see
+        // `apply_field_to_record`'s callers); a later, untruncated write for
+        // the same key must not leave a stale `_original_len` from an
+        // earlier, truncated write for that key.
+        obj.remove(&original_len_key);
     }
 }
 
@@ -2672,6 +2679,73 @@ mod tests {
         assert_eq!(
             records[0].extra["ie97_original_len"],
             serde_json::json!(1000)
+        );
+    }
+
+    // ---- insert_hex_capped: repeated IE in one template must not leave a
+    // stale `_original_len` from an earlier write for the same key ----
+
+    #[test]
+    fn repeated_key_over_cap_then_under_cap_clears_original_len() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut rec = new_flow_record(0, 256, exporter, Utc::now());
+        let field = FieldSpecifier {
+            ie_id: 999, // unknown IE
+            length: 0,  // unused by apply_field_to_record; raw drives length
+            enterprise_number: None,
+        };
+
+        // First write: over the cap -> truncated, with _original_len.
+        apply_field_to_record(&mut rec, &field, &[0xCDu8; 200]);
+        assert!(rec.extra.get("ie999_original_len").is_some());
+
+        // Second write for the SAME key: at/under the cap -> must end up
+        // untruncated with NO leftover _original_len from the first write.
+        apply_field_to_record(&mut rec, &field, &[0xABu8; 10]);
+        assert_eq!(
+            rec.extra["ie999"].as_str().map(str::len),
+            Some(20),
+            "the later, short write must win; got: {}",
+            rec.extra
+        );
+        assert!(
+            rec.extra.get("ie999_original_len").is_none(),
+            "a later untruncated write must clear a stale _original_len \
+             from an earlier truncated write for the same key; got: {}",
+            rec.extra
+        );
+    }
+
+    #[test]
+    fn repeated_key_under_cap_then_over_cap_sets_original_len() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let mut rec = new_flow_record(0, 256, exporter, Utc::now());
+        let field = FieldSpecifier {
+            ie_id: 999, // unknown IE
+            length: 0,
+            enterprise_number: None,
+        };
+
+        // First write: at/under the cap -> untruncated, no _original_len.
+        apply_field_to_record(&mut rec, &field, &[0xABu8; 10]);
+        assert!(rec.extra.get("ie999_original_len").is_none());
+
+        // Second write for the SAME key: over the cap -> must end up
+        // truncated, with _original_len reflecting THIS write, not stale.
+        apply_field_to_record(&mut rec, &field, &[0xCDu8; 200]);
+        assert_eq!(
+            rec.extra["ie999"].as_str().map(str::len),
+            Some(256),
+            "the later, over-cap write must win; got: {}",
+            rec.extra
+        );
+        assert_eq!(
+            rec.extra["ie999_original_len"],
+            serde_json::json!(200),
+            "_original_len must reflect the later write's true length; got: {}",
+            rec.extra
         );
     }
 
