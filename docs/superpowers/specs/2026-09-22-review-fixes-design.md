@@ -64,21 +64,25 @@ Full/Closed kind, which is a different failure category.
 quick-xml reader error and returns `Ok(partial)`. The handlers answer 200, so
 the forwarder never resends and the rest of the batch is lost.
 
-**Fix.** On a reader error, keep the **entire unparsed remainder** of the body
-as one raw `WindowsEvent`, then stop. The remainder runs from the start of the
-event currently being parsed if we are inside one, else from the error
-position; it is skipped if empty or whitespace-only. This follows the file's
-existing rule that unparseable events are kept raw ("Still add raw event").
-Increment a new counter `wef_xml_parse_errors` and keep the log line. Nothing
-is dropped, so 200 is accurate.
+**Fix (revised during implementation).** On a reader error, keep the
+malformed event's own fragment as a raw `WindowsEvent` (existing convention),
+then **resume parsing at the next event start** after it: the next `<Event`
+followed by `>`, `/` or whitespace (so not `<EventData`/`<EventID`/`<Events`),
+searched from `max(error position, bad event start + 1)` so every resume
+advances. A fresh quick-xml reader runs over the rest of the body in an
+**iterative** outer loop (not recursion: a batch of many malformed events must
+not grow the stack). Count `wef_xml_parse_errors` per error. If no later event
+start exists, stop. Envelope junk outside any event adds no raw row.
 
-Rejected alternatives: returning 4xx/5xx makes a permanently malformed batch
-retry forever and block that forwarder; resyncing at the next `<Event` needs a
-hand-rolled scanner that can false-positive on `<Event` text inside CDATA.
-Accepted trade-off: well-formed events *after* the malformed one land as one
-unparsed raw row rather than as individually parsed events. Windows produces
-well-formed XML, so this path is effectively only hit by broken or hostile
-clients.
+Why revised: the first version kept the whole remainder as ONE raw event. But
+`WefSink` drops events with no parsed data (pre-existing,
+`parquet_s3.rs` `to_record_batch`), so every well-formed event after the
+error was still lost from Parquet: the goal failed. With the resync only the
+malformed event itself is unparseable. It is skipped by `WefSink` exactly as
+before, but now counted by `parquet_s3_records_skipped{source="wef"}` (#4).
+Accepted risk: a literal `<Event` inside CDATA in an *already-malformed*
+batch may create a spurious boundary; the spurious fragment fails to parse
+and is skipped and counted, so no well-formed event is affected.
 
 ## #3 (medium) TCP accept loops spin on persistent accept errors
 
