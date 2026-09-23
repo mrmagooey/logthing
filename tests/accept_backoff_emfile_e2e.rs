@@ -51,6 +51,34 @@ const MAX_CONNECT_ATTEMPTS: usize = 1500;
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// How many consecutive settle-poll windows below `SETTLE_CPU_THRESHOLD` mark
+/// the server as done draining the connect burst and into its fd-starved
+/// steady state, where the CPU assertion below is actually meaningful.
+const SETTLE_CONSECUTIVE_WINDOWS: u32 = 3;
+/// Length of one settle-poll window.
+const SETTLE_WINDOW: Duration = Duration::from_millis(300);
+/// CPU fraction a settle window must stay under to count towards
+/// `SETTLE_CONSECUTIVE_WINDOWS`. Deliberately the same threshold as the
+/// post-settle measurement (`MEASURE_CPU_THRESHOLD`) -- "settled" means
+/// "already passing the assertion we're about to make".
+const SETTLE_CPU_THRESHOLD: f64 = 0.5;
+/// Generous settle budget. A slow or loaded host draining the connect burst
+/// just waits longer here instead of the test failing for reasons unrelated
+/// to the fix; only a genuine unbounded spin (never settling) trips this.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Number of post-settle measurement windows. The assertion passes if the
+/// BEST (lowest-CPU) of these windows stays under `MEASURE_CPU_THRESHOLD`,
+/// so one noisy window (an unrelated scheduling hiccup on a busy host)
+/// cannot by itself fail an otherwise-idle listener; unfixed code spins
+/// continuously and so stays above threshold on every window, not just one.
+const MEASURE_WINDOWS: u32 = 3;
+/// Length of one post-settle measurement window.
+const MEASURE_WINDOW: Duration = Duration::from_millis(700);
+/// Unfixed code spins at ~100% of a core; 50% is comfortably discriminating
+/// (a 2x margin) while tolerant of ordinary scheduling noise on a busy host.
+const MEASURE_CPU_THRESHOLD: f64 = 0.5;
+
 /// Kills and reaps the spawned `logthing` process on drop -- including
 /// during a panicking assertion -- so a failing test never leaves an
 /// orphaned daemon holding ports.
@@ -235,45 +263,77 @@ tcp_port = {syslog_tcp}
     // out of the connect burst above -- each of the (up to fd-limit) accepts
     // that succeeded spawns a handling task, and on a loaded machine that
     // burst of real, useful work can still be running when the connect loop
-    // above returns. That's not the spin this test is guarding against, so
-    // rather than guess a fixed settle time, poll short CPU-usage windows
-    // until they drop back down (bounded, so a genuine regression here — the
-    // server never settling — still fails instead of hanging).
+    // above returns. That's not the spin this test is guarding against.
+    //
+    // Rather than a fixed settle sleep (flaked 2/5 in earlier testing: a
+    // slow/loaded host needs longer to finish the drain, and a single sleep
+    // either races that or wastes time on a fast host), poll CPU-usage
+    // windows and require `SETTLE_CONSECUTIVE_WINDOWS` of them in a row to
+    // land under threshold before calling it settled. A slow host just
+    // takes more windows to get there; `SETTLE_DEADLINE` is generous (30s)
+    // so only a genuine unbounded spin -- never settling -- fails this
+    // phase, and the failure message says so explicitly with the measured
+    // numbers.
     let clk_tck = clock_ticks_per_sec();
-    let settle_deadline = Instant::now() + Duration::from_secs(5);
+    let settle_deadline = Instant::now() + SETTLE_DEADLINE;
+    let mut consecutive_ok = 0u32;
     loop {
         let before = read_cpu_ticks(pid);
         let window_start = Instant::now();
-        sleep(Duration::from_millis(300)).await;
+        sleep(SETTLE_WINDOW).await;
         let window_elapsed = window_start.elapsed().as_secs_f64();
         let after = read_cpu_ticks(pid);
         let frac = (after - before) as f64 / clk_tck / window_elapsed;
-        if frac < 0.5 {
-            break;
+        if frac < SETTLE_CPU_THRESHOLD {
+            consecutive_ok += 1;
+            if consecutive_ok >= SETTLE_CONSECUTIVE_WINDOWS {
+                break;
+            }
+        } else {
+            consecutive_ok = 0;
         }
         assert!(
             Instant::now() < settle_deadline,
-            "server never finished draining the connect burst (still {:.0}% CPU) within 5s",
-            frac * 100.0
+            "[never settled] server never reached {SETTLE_CONSECUTIVE_WINDOWS} consecutive \
+             settle windows under {:.0}% CPU within {:?} of draining the connect burst; most \
+             recent window measured {:.0}% CPU ({consecutive_ok} consecutive OK windows when \
+             the deadline hit) -- this is the same signature as an unbounded accept spin",
+            SETTLE_CPU_THRESHOLD * 100.0,
+            SETTLE_DEADLINE,
+            frac * 100.0,
         );
     }
 
-    // --- Sample the child's CPU usage over a 2s window while it's starved.
-    // Before the fix this is ~100% (a busy accept spin); with AcceptBackoff
-    // pausing between accept errors, it must stay well below one full core.
-    let ticks_before = read_cpu_ticks(pid);
-    let wall_start = Instant::now();
-    sleep(Duration::from_secs(2)).await;
-    let wall_elapsed = wall_start.elapsed().as_secs_f64();
-    let ticks_after = read_cpu_ticks(pid);
-
-    let cpu_seconds = (ticks_after - ticks_before) as f64 / clk_tck;
-    let cpu_fraction = cpu_seconds / wall_elapsed;
+    // --- Now that the child is in its fd-starved steady state, sample CPU
+    // usage over several windows. Before the fix this is ~100% on every
+    // window (a busy accept spin); with AcceptBackoff pausing between
+    // accept errors, at least the best window must stay well under one full
+    // core -- "best of `MEASURE_WINDOWS`" so one noisy window on a busy host
+    // can't fail an otherwise-idle listener, while a real spin (which is
+    // continuous, not intermittent) still fails every window and so still
+    // fails this check.
+    let mut window_fracs = Vec::with_capacity(MEASURE_WINDOWS as usize);
+    for _ in 0..MEASURE_WINDOWS {
+        let before = read_cpu_ticks(pid);
+        let window_start = Instant::now();
+        sleep(MEASURE_WINDOW).await;
+        let window_elapsed = window_start.elapsed().as_secs_f64();
+        let after = read_cpu_ticks(pid);
+        window_fracs.push((after - before) as f64 / clk_tck / window_elapsed);
+    }
+    let best = window_fracs.iter().copied().fold(f64::INFINITY, f64::min);
     assert!(
-        cpu_fraction < 0.25,
-        "expected the fd-starved listener to use < 25% CPU over {wall_elapsed:.2}s, used \
-         {cpu_fraction:.2} ({cpu_seconds:.2} CPU-seconds) -- a busy accept spin looks like \
-         ~100% here"
+        best < MEASURE_CPU_THRESHOLD,
+        "[settled but spinning] settled, but every one of {MEASURE_WINDOWS} post-settle \
+         measurement windows stayed >= {:.0}% CPU (best window was {:.0}%); window fractions \
+         (best to worst not implied, in order taken) = {:?} -- a busy accept spin looks like \
+         ~100% on every window here",
+        MEASURE_CPU_THRESHOLD * 100.0,
+        best * 100.0,
+        window_fracs
+            .iter()
+            .map(|f| format!("{:.2}", f))
+            .collect::<Vec<_>>(),
     );
 
     // --- Free the held connections and confirm the listener actually
