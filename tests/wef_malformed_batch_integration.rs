@@ -1,16 +1,17 @@
-//! Integration test: a WEF batch with a malformed trailing event still
-//! survives to Parquet for the events that parsed cleanly, exercising the
-//! fix in `WefParser::parse_events` (src/protocol/mod.rs) end to end through
-//! `wef_local_start` (pattern: `tests/wef_local_integration.rs`).
+//! Integration test: a WEF batch with a malformed MIDDLE event still lands
+//! the well-formed events on both sides of it in Parquet, exercising the
+//! resync fix in `WefParser::parse_events` (src/protocol/mod.rs) end to end
+//! through `wef_local_start` (pattern: `tests/wef_local_integration.rs`).
 //!
 //! The malformed event itself (`</Mismatch>` inside `<System>`, same trigger
-//! as the unit tests in `src/protocol/mod.rs`) becomes one raw, *unparsed*
-//! `WindowsEvent` (`WindowsEvent::new` with no `.with_parsed`) per the fix —
-//! `WefAccumulator::append_event`/`try_append` (src/forwarding/parquet_s3.rs)
-//! silently skip unparsed events (pre-existing behavior, unrelated to this
-//! fix), so it never becomes a Parquet row itself. What this test proves is
-//! that the fix does not lose or corrupt the well-formed events around it:
-//! both land as real rows.
+//! as the unit tests in `src/protocol/mod.rs`) becomes its own raw,
+//! *unparsed* `WindowsEvent` — `WefAccumulator::append_event`/`try_append`
+//! (src/forwarding/parquet_s3.rs) silently skip unparsed events (pre-existing
+//! behavior, unrelated to this fix), so it never becomes a Parquet row
+//! itself. What this test proves is the resync itself: parsing resumes at
+//! the next `<Event` start rather than folding the rest of the batch into
+//! that one unparsed fragment, so the event AFTER the malformed one — not
+//! just the one before it — still reaches Parquet.
 
 use bytes::Bytes;
 use logthing::config::WefLocalConfig;
@@ -38,24 +39,28 @@ fn wef_malformed_event() -> &'static str {
 }
 
 #[tokio::test]
-async fn malformed_trailing_event_does_not_drop_the_good_events_around_it() {
+async fn malformed_middle_event_does_not_drop_the_good_events_on_either_side() {
     let body = format!(
         "<Envelope><Body><Events>{}{}{}</Events></Body></Envelope>",
         wef_event(1),
-        wef_event(3),
-        wef_malformed_event()
+        wef_malformed_event(),
+        wef_event(3)
     );
 
     let parser = WefParser::new();
     let WefMessage::Events(events) = parser
         .parse_message(&body, "host-a".into())
-        .expect("parse_message must not error even on a malformed trailing event")
+        .expect("parse_message must not error even on a malformed middle event")
     else {
         panic!("expected Events");
     };
 
-    // event(1), event(3), and one raw fallback event for the malformed tail.
+    // event(1), the malformed event's raw fragment, and event(3) — resync
+    // must reach event 3 rather than swallowing it into the raw fragment.
     assert_eq!(events.len(), 3, "events: {events:?}");
+    assert_eq!(events[0].parsed.as_ref().map(|p| p.event_id), Some(1));
+    assert!(events[1].parsed.is_none());
+    assert_eq!(events[2].parsed.as_ref().map(|p| p.event_id), Some(3));
 
     let tmp = tempfile::tempdir().unwrap();
     let sink = Arc::new(
@@ -91,7 +96,7 @@ async fn malformed_trailing_event_does_not_drop_the_good_events_around_it() {
         .expect("writer task must exit within 5s")
         .expect("writer task must not panic");
 
-    // Find the single Parquet file under the tempdir.
+    // Find every Parquet file under the tempdir.
     let mut all_files = Vec::new();
     let mut stack = vec![tmp.path().to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -110,8 +115,8 @@ async fn malformed_trailing_event_does_not_drop_the_good_events_around_it() {
         .collect();
     // event(1) and event(3) partition into separate `event_type=<id>/`
     // directories (unlike `wef_local_integration.rs`, whose two events share
-    // one event_id), so 2 files are expected here — the malformed tail's raw
-    // fallback event has no parsed data and produces no file at all.
+    // one event_id), so 2 files are expected here — the malformed middle
+    // event has no parsed data and produces no file at all.
     assert_eq!(
         parquet_files.len(),
         2,
@@ -121,6 +126,7 @@ async fn malformed_trailing_event_does_not_drop_the_good_events_around_it() {
 
     use arrow::array::{Array, StringArray};
     let mut total_rows = 0usize;
+    let mut found_event_id_1 = false;
     let mut found_event_id_3 = false;
     for path in &parquet_files {
         let raw = std::fs::read(path).unwrap();
@@ -137,6 +143,9 @@ async fn malformed_trailing_event_does_not_drop_the_good_events_around_it() {
                 .downcast_ref::<StringArray>()
                 .unwrap();
             for i in 0..event_data.len() {
+                if event_data.value(i).contains("<EventID>1</EventID>") {
+                    found_event_id_1 = true;
+                }
                 if event_data.value(i).contains("<EventID>3</EventID>") {
                     found_event_id_3 = true;
                 }
@@ -146,12 +155,16 @@ async fn malformed_trailing_event_does_not_drop_the_good_events_around_it() {
 
     assert_eq!(
         total_rows, 2,
-        "only the 2 well-formed events must land as Parquet rows; the malformed tail's raw \
-         fallback event has no parsed data and is skipped by WefSink, matching pre-existing \
-         behavior"
+        "only the 2 well-formed events must land as Parquet rows; the malformed middle event \
+         has no parsed data and is skipped by WefSink, matching pre-existing behavior"
+    );
+    assert!(
+        found_event_id_1,
+        "the event BEFORE the malformed one must be in Parquet"
     );
     assert!(
         found_event_id_3,
-        "one row's raw XML (event_data column) must contain <EventID>3</EventID>"
+        "the event AFTER the malformed one must be in Parquet too — proves the resync actually \
+         reached it instead of folding it into the malformed fragment"
     );
 }

@@ -97,100 +97,161 @@ impl WefParser {
         debug!("Parsing events batch");
 
         let mut events = Vec::new();
-        let mut reader = Reader::from_str(body);
-        reader.trim_text(true);
 
-        let mut buf = Vec::new();
-        let mut event_start_pos: Option<usize> = None;
-        let mut in_event = false;
-        let mut depth: u32 = 0;
+        // `base` is the absolute offset into `body` where the current
+        // window (and its fresh quick-xml `Reader`) starts. On a reader
+        // error, rather than giving up on the rest of the batch (or, per
+        // the first cut of this fix, folding everything after the error
+        // into one giant raw event — which `WefSink` then drops wholesale
+        // since it has no parsed data), we resync: keep only the malformed
+        // event's own fragment as raw, find the next `<Event` start, and
+        // restart parsing from there with a brand-new `Reader`. Iterative,
+        // not recursive: a batch of thousands of malformed events must not
+        // grow the stack.
+        let mut base = 0usize;
 
-        loop {
-            let pos = reader.buffer_position();
-            match reader.read_event_into(&mut buf) {
-                Ok(XmlEvent::Start(e)) => {
-                    if e.name().as_ref() == b"Event" && !in_event {
-                        in_event = true;
-                        depth = 1;
-                        event_start_pos = Some(pos);
-                    } else if in_event {
-                        depth += 1;
-                    }
-                }
-                Ok(XmlEvent::End(e)) => {
-                    if e.name().as_ref() == b"Event" && in_event && depth == 1 {
-                        // Event ends here - extract the XML slice
-                        in_event = false;
-
-                        if let Some(start) = event_start_pos {
-                            // Extract raw XML slice from original body (zero-copy)
-                            let event_xml = &body[start..pos];
-
-                            // Parse this individual event
-                            match self.parse_single_event(event_xml, &source_host) {
-                                Ok(event) => events.push(event),
-                                Err(e) => {
-                                    error!("Failed to parse individual event: {}", e);
-                                    // Still add raw event
-                                    events.push(WindowsEvent::new(
-                                        source_host.clone(),
-                                        event_xml.to_string(),
-                                    ));
-                                }
-                            }
-                        }
-                        depth = 0;
-                    } else if in_event {
-                        depth = depth.saturating_sub(1);
-                    }
-                }
-                #[allow(clippy::collapsible_match)]
-                Ok(XmlEvent::Empty(e)) => {
-                    if in_event && e.name().as_ref() == b"Event" && depth == 0 {
-                        // Self-closing Event tag
-                        in_event = false;
-
-                        if let Some(start) = event_start_pos {
-                            let event_xml = &body[start..pos];
-
-                            match self.parse_single_event(event_xml, &source_host) {
-                                Ok(event) => events.push(event),
-                                Err(e) => {
-                                    error!("Failed to parse individual event: {}", e);
-                                    events.push(WindowsEvent::new(
-                                        source_host.clone(),
-                                        event_xml.to_string(),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(XmlEvent::Eof) => break,
-                Err(e) => {
-                    metrics::counter!("wef_xml_parse_errors").increment(1);
-                    error!("XML parsing error: {}", e);
-                    // The handler acks this batch with 200, so the forwarder will
-                    // never resend it: keep everything not yet emitted as one raw
-                    // event instead of dropping it. Outside an event, a remainder
-                    // with no `<Event` in it is envelope junk with no event data
-                    // to keep.
-                    let from = if in_event {
-                        event_start_pos.unwrap_or(pos)
-                    } else {
-                        pos
-                    };
-                    if let Some(rest) = body.get(from..)
-                        && !rest.trim().is_empty()
-                        && (in_event || rest.contains("<Event"))
-                    {
-                        events.push(WindowsEvent::new(source_host.clone(), rest.to_string()));
-                    }
-                    break;
-                }
-                _ => {}
+        'outer: while let Some(window) = body.get(base..) {
+            if window.is_empty() {
+                break;
             }
-            buf.clear();
+
+            let mut reader = Reader::from_str(window);
+            reader.trim_text(true);
+
+            let mut buf = Vec::new();
+            let mut event_start_pos: Option<usize> = None;
+            let mut in_event = false;
+            let mut depth: u32 = 0;
+            // Absolute resume offset for the *next* outer iteration, set
+            // only when an `Err` is handled and a later event start is
+            // found. Left `None` on a clean `Eof` or when no later event
+            // start exists — either way, parsing is done.
+            let mut resume_at: Option<usize> = None;
+
+            loop {
+                let pos = reader.buffer_position();
+                match reader.read_event_into(&mut buf) {
+                    Ok(XmlEvent::Start(e)) => {
+                        if e.name().as_ref() == b"Event" && !in_event {
+                            in_event = true;
+                            depth = 1;
+                            event_start_pos = Some(pos);
+                        } else if in_event {
+                            depth += 1;
+                        }
+                    }
+                    Ok(XmlEvent::End(e)) => {
+                        if e.name().as_ref() == b"Event" && in_event && depth == 1 {
+                            // Event ends here - extract the XML slice
+                            in_event = false;
+
+                            if let Some(start) = event_start_pos
+                                && let Some(event_xml) = window.get(start..pos)
+                            {
+                                // Parse this individual event
+                                match self.parse_single_event(event_xml, &source_host) {
+                                    Ok(event) => events.push(event),
+                                    Err(e) => {
+                                        error!("Failed to parse individual event: {}", e);
+                                        // Still add raw event
+                                        events.push(WindowsEvent::new(
+                                            source_host.clone(),
+                                            event_xml.to_string(),
+                                        ));
+                                    }
+                                }
+                            }
+                            depth = 0;
+                        } else if in_event {
+                            depth = depth.saturating_sub(1);
+                        }
+                    }
+                    #[allow(clippy::collapsible_match)]
+                    Ok(XmlEvent::Empty(e)) => {
+                        if in_event && e.name().as_ref() == b"Event" && depth == 0 {
+                            // Self-closing Event tag
+                            in_event = false;
+
+                            if let Some(start) = event_start_pos
+                                && let Some(event_xml) = window.get(start..pos)
+                            {
+                                match self.parse_single_event(event_xml, &source_host) {
+                                    Ok(event) => events.push(event),
+                                    Err(e) => {
+                                        error!("Failed to parse individual event: {}", e);
+                                        events.push(WindowsEvent::new(
+                                            source_host.clone(),
+                                            event_xml.to_string(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(XmlEvent::Eof) => break,
+                    Err(e) => {
+                        error!("XML parsing error: {}", e);
+
+                        // Where to resume searching for the next `<Event`
+                        // start from: past the bad event's own start (so a
+                        // malformed event can never match itself again),
+                        // or the error position when we're not inside one.
+                        let search_from = if in_event {
+                            pos.max(event_start_pos.unwrap_or(pos).saturating_add(1))
+                        } else {
+                            pos
+                        };
+                        let next_start = find_next_event_start(window, search_from);
+
+                        // Only inside an event is there a malformed
+                        // fragment worth keeping raw — outside one, a
+                        // reader error is envelope junk (a stray/mismatched
+                        // closing tag) with no event data to preserve.
+                        //
+                        // This is also why the counter increments only
+                        // here, not unconditionally: every *resumed* reader
+                        // (one restarted after a resync) starts with an
+                        // empty quick-xml tag stack, so once it legitimately
+                        // reaches the original document's own closing
+                        // `</Events></Body></Envelope>` — bytes that were
+                        // always well-formed — check_end_names has no record
+                        // of those tags ever opening and returns a second,
+                        // spurious `Err` purely as an artifact of resuming
+                        // mid-document. That happens with `in_event == false`
+                        // and carries no lost event data, so it is logged
+                        // (the line above) but must not inflate a metric
+                        // whose whole purpose is "an event was lost".
+                        if in_event {
+                            metrics::counter!("wef_xml_parse_errors").increment(1);
+                            let frag_from = event_start_pos.unwrap_or(pos);
+                            let frag_to = next_start.unwrap_or(window.len());
+                            if let Some(frag) = window.get(frag_from..frag_to)
+                                && !frag.trim().is_empty()
+                            {
+                                events
+                                    .push(WindowsEvent::new(source_host.clone(), frag.to_string()));
+                            }
+                        }
+
+                        // `next_start` is window-relative; only accept it
+                        // as a resume point if it actually advances past
+                        // this window's start — otherwise resyncing would
+                        // spin forever re-parsing the same bytes.
+                        resume_at = next_start.map(|rel| base + rel).filter(|&abs| abs > base);
+                        break;
+                    }
+                    _ => {}
+                }
+                buf.clear();
+            }
+
+            match resume_at {
+                Some(next_base) => {
+                    base = next_base;
+                    continue 'outer;
+                }
+                None => break 'outer,
+            }
         }
 
         debug!("Parsed {} events from batch", events.len());
@@ -376,6 +437,27 @@ impl WefParser {
 
         None
     }
+}
+
+/// Find the next `<Event` element start in `window`, searching from byte
+/// offset `from`, for `parse_events`' resync-on-error path.
+///
+/// Matches `<Event` only when immediately followed by `>`, `/` (self-closing)
+/// or ASCII whitespace — so `<EventData`, `<EventID` and `<Events` (the
+/// batch wrapper itself) are correctly excluded. Returns a `window`-relative
+/// byte offset.
+fn find_next_event_start(window: &str, from: usize) -> Option<usize> {
+    let haystack = window.get(from..)?;
+    for (rel_offset, _) in haystack.match_indices("<Event") {
+        let abs_offset = from + rel_offset;
+        let after = abs_offset + "<Event".len();
+        if let Some(&b) = window.as_bytes().get(after)
+            && (b == b'>' || b == b'/' || b.is_ascii_whitespace())
+        {
+            return Some(abs_offset);
+        }
+    }
+    None
 }
 
 pub fn create_subscription_response(subscription_id: &str) -> String {
@@ -1125,8 +1207,12 @@ mod tests {
         format!("<Envelope><Body><Events>{events_xml}</Events></Body></Envelope>")
     }
 
+    /// (a) Malformed MIDDLE event: resync must reach event 3, not fold it
+    /// into the malformed fragment — both good events come back genuinely
+    /// PARSED (`.parsed` is `Some`), not just raw text that happens to
+    /// contain their `EventID`.
     #[test]
-    fn parse_events_malformed_middle_event_keeps_remainder_raw() {
+    fn parse_events_malformed_middle_event_keeps_good_events_on_both_sides_parsed() {
         let parser = WefParser::new();
         let body = wef_envelope(&format!(
             "{}{}{}",
@@ -1138,29 +1224,78 @@ mod tests {
         let WefMessage::Events(ev) = parser.parse_message(&body, "h".into()).unwrap() else {
             panic!("expected Events");
         };
-        assert_eq!(ev.len(), 2);
-        assert!(ev[0].raw_xml.contains("<EventID>1</EventID>"));
+        assert_eq!(ev.len(), 3, "events: {ev:?}");
+
+        assert_eq!(
+            ev[0].parsed.as_ref().map(|p| p.event_id),
+            Some(1),
+            "event 1 must come back parsed"
+        );
+
+        assert!(
+            ev[1].parsed.is_none(),
+            "the malformed event has no parsed data"
+        );
         assert!(ev[1].raw_xml.contains("</Mismatch>"));
         assert!(
-            ev[1].raw_xml.contains("<EventID>3</EventID>"),
-            "events after the error must be kept, got: {}",
+            !ev[1].raw_xml.contains("<EventID>3</EventID>"),
+            "the malformed fragment must stop at the next event start, not swallow event 3: {}",
             ev[1].raw_xml
+        );
+
+        assert_eq!(
+            ev[2].parsed.as_ref().map(|p| p.event_id),
+            Some(3),
+            "event 3 after the error must also come back parsed, not folded into raw text"
         );
     }
 
+    /// (b) Two malformed events in a batch of 4 — both good events must
+    /// still parse, independent of how many resyncs happened before them.
     #[test]
-    fn parse_events_error_in_first_event_keeps_everything_raw() {
+    fn parse_events_two_malformed_events_in_batch_of_four_both_good_events_parsed() {
+        let parser = WefParser::new();
+        let body = wef_envelope(&format!(
+            "{}{}{}{}",
+            wef_event(1),
+            wef_malformed_event(2),
+            wef_event(3),
+            wef_malformed_event(4)
+        ));
+
+        let WefMessage::Events(ev) = parser.parse_message(&body, "h".into()).unwrap() else {
+            panic!("expected Events");
+        };
+        assert_eq!(ev.len(), 4, "events: {ev:?}");
+        assert_eq!(ev[0].parsed.as_ref().map(|p| p.event_id), Some(1));
+        assert!(ev[1].parsed.is_none());
+        assert_eq!(ev[2].parsed.as_ref().map(|p| p.event_id), Some(3));
+        assert!(ev[3].parsed.is_none());
+    }
+
+    /// (c) Malformed FIRST event: resync must still reach and parse the
+    /// event after it, rather than folding both into one raw blob.
+    #[test]
+    fn parse_events_malformed_first_event_still_parses_the_good_event_after_it() {
         let parser = WefParser::new();
         let body = wef_envelope(&format!("{}{}", wef_malformed_event(1), wef_event(2)));
 
         let WefMessage::Events(ev) = parser.parse_message(&body, "h".into()).unwrap() else {
             panic!("expected Events");
         };
-        assert_eq!(ev.len(), 1);
-        assert!(ev[0].raw_xml.contains("<EventID>1</EventID>"));
-        assert!(ev[0].raw_xml.contains("<EventID>2</EventID>"));
+        assert_eq!(ev.len(), 2, "events: {ev:?}");
+        assert!(ev[0].parsed.is_none());
+        assert!(ev[0].raw_xml.contains("</Mismatch>"));
+        assert_eq!(
+            ev[1].parsed.as_ref().map(|p| p.event_id),
+            Some(2),
+            "the event after a malformed first event must still parse"
+        );
     }
 
+    /// (d) Trailing junk after the last event: the reader error happens
+    /// outside any event and no later `<Event` start exists to resync to,
+    /// so no raw row is added.
     #[test]
     fn parse_events_trailing_junk_after_last_event_adds_no_raw_row() {
         let parser = WefParser::new();
@@ -1174,5 +1309,24 @@ mod tests {
             panic!("expected Events");
         };
         assert_eq!(ev.len(), 2);
+    }
+
+    /// (e) A batch of many consecutive malformed events must complete
+    /// (iterative resync, no recursion — no stack overflow) with one raw
+    /// fragment per malformed event.
+    #[test]
+    fn parse_events_many_consecutive_malformed_events_completes_without_stack_overflow() {
+        let parser = WefParser::new();
+        const N: u32 = 5000;
+        let body = wef_envelope(&(0..N).map(wef_malformed_event).collect::<String>());
+
+        let WefMessage::Events(ev) = parser.parse_message(&body, "h".into()).unwrap() else {
+            panic!("expected Events");
+        };
+        assert_eq!(ev.len(), N as usize, "one raw fragment per malformed event");
+        assert!(
+            ev.iter().all(|e| e.parsed.is_none()),
+            "every fragment here is malformed and must have no parsed data"
+        );
     }
 }

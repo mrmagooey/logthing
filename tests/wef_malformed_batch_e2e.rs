@@ -1,11 +1,13 @@
-//! End-to-end test: a WEF batch with a malformed trailing event, POSTed to
+//! End-to-end test: a WEF batch with a malformed MIDDLE event, POSTed to
 //! the real `/wsman/events` HTTP endpoint of a real `logthing::server::Server`
-//! with a `[wef.local]` destination wired up — proving the fix in
+//! with a `[wef.local]` destination wired up — proving the resync fix in
 //! `WefParser::parse_events` (src/protocol/mod.rs) end to end: the HTTP
 //! response is still 200 (so the Windows forwarder does not resend), the
 //! `wef_xml_parse_errors` counter increments on the real `/metrics` scrape,
-//! and the well-formed events around the malformed one still reach Parquet
-//! on local disk.
+//! and the well-formed events on BOTH sides of the malformed one still
+//! reach Parquet on local disk (proving resync actually resumes parsing
+//! after the error, rather than folding everything after it into one
+//! unparsed fragment).
 //!
 //! Template: `tests/field_cardinality_metric_wef_e2e.rs` for the overall
 //! shape (real `Server`, `metrics.enabled = true`, `reserve_port`, real
@@ -141,8 +143,8 @@ async fn malformed_batch_returns_200_counts_the_error_and_keeps_the_good_events(
     let body = format!(
         "<Envelope><Body><Events>{}{}{}</Events></Body></Envelope>",
         wef_event(1),
-        wef_event(3),
-        wef_malformed_event()
+        wef_malformed_event(),
+        wef_event(3)
     );
 
     let resp = client
@@ -154,7 +156,7 @@ async fn malformed_batch_returns_200_counts_the_error_and_keeps_the_good_events(
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::OK,
-        "a malformed trailing event must not fail the whole batch response — the forwarder \
+        "a malformed middle event must not fail the whole batch response — the forwarder \
          must not be told to resend"
     );
 
@@ -221,6 +223,7 @@ async fn malformed_batch_returns_200_counts_the_error_and_keeps_the_good_events(
 
     use arrow::array::{Array, StringArray};
     let mut total_rows = 0usize;
+    let mut found_event_id_1 = false;
     let mut found_event_id_3 = false;
     for path in &parquet_files {
         let raw = std::fs::read(path).unwrap();
@@ -237,6 +240,9 @@ async fn malformed_batch_returns_200_counts_the_error_and_keeps_the_good_events(
                 .downcast_ref::<StringArray>()
                 .unwrap();
             for i in 0..event_data.len() {
+                if event_data.value(i).contains("<EventID>1</EventID>") {
+                    found_event_id_1 = true;
+                }
                 if event_data.value(i).contains("<EventID>3</EventID>") {
                     found_event_id_3 = true;
                 }
@@ -246,12 +252,16 @@ async fn malformed_batch_returns_200_counts_the_error_and_keeps_the_good_events(
 
     assert_eq!(
         total_rows, 2,
-        "only the 2 well-formed events must land as Parquet rows; the malformed tail's raw \
-         fallback event has no parsed data and is skipped by WefSink, matching pre-existing \
-         behavior"
+        "only the 2 well-formed events must land as Parquet rows; the malformed middle event \
+         has no parsed data and is skipped by WefSink, matching pre-existing behavior"
+    );
+    assert!(
+        found_event_id_1,
+        "the event BEFORE the malformed one must be in Parquet"
     );
     assert!(
         found_event_id_3,
-        "one row's raw XML (event_data column) must contain <EventID>3</EventID>"
+        "the event AFTER the malformed one must be in Parquet too — proves the resync actually \
+         reached it instead of folding it into the malformed fragment"
     );
 }

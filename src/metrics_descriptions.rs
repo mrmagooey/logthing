@@ -252,7 +252,8 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     (
         Kind::Counter,
         "wef_xml_parse_errors",
-        "WEF batches whose XML failed to parse; the unparsed remainder is kept as one raw event.",
+        "WEF events whose XML failed to parse; each is kept as its own raw event and parsing \
+         resumes at the next event, so the well-formed events around it are not lost too.",
     ),
     // ── listener access control ───────────────────────────────────────────
     (
