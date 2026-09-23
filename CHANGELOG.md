@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file, newest
 first, loosely following [Keep a Changelog](https://keepachangelog.com/).
 This file starts at 0.15.0; earlier releases are not backfilled.
 
-## [Unreleased]
+## [0.20.2] - 2026-09-22
 
 ### Added
 
