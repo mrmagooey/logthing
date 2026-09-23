@@ -98,6 +98,19 @@ impl WefParser {
 
         let mut events = Vec::new();
 
+        // Resync (see below) means a batch of N malformed events can hit
+        // the reader-error arm N+1 times per POST -- the +1 is a spurious
+        // out-of-event artifact at the document's real closing tags (see
+        // the comment on that arm). WEF is unauthenticated-reachable and a
+        // 64 MiB body could turn that into an enormous burst of `error!`
+        // lines. So in-event errors (the ones that actually correspond to
+        // a lost/raw event) are only counted and remembered here; a single
+        // batched `error!` is emitted once, after the whole call, with the
+        // count and the first message. Out-of-event errors are logged
+        // individually but at `debug!`, not `error!` -- see that arm.
+        let mut in_event_error_count: u32 = 0;
+        let mut first_in_event_error: Option<String> = None;
+
         // `base` is the absolute offset into `body` where the current
         // window (and its fresh quick-xml `Reader`) starts. On a reader
         // error, rather than giving up on the rest of the batch (or, per
@@ -190,8 +203,6 @@ impl WefParser {
                     }
                     Ok(XmlEvent::Eof) => break,
                     Err(e) => {
-                        error!("XML parsing error: {}", e);
-
                         // Where to resume searching for the next `<Event`
                         // start from: past the bad event's own start (so a
                         // malformed event can never match itself again),
@@ -218,10 +229,27 @@ impl WefParser {
                         // of those tags ever opening and returns a second,
                         // spurious `Err` purely as an artifact of resuming
                         // mid-document. That happens with `in_event == false`
-                        // and carries no lost event data, so it is logged
-                        // (the line above) but must not inflate a metric
-                        // whose whole purpose is "an event was lost".
+                        // and carries no lost event data, so it's logged
+                        // below at `debug!`, not `error!`, and must not
+                        // inflate a metric whose whole purpose is "an event
+                        // was lost".
+                        //
+                        // Logging: a batch of N malformed events resyncs N
+                        // times, each hitting this arm — plus the spurious
+                        // out-of-event one above. WEF is
+                        // unauthenticated-reachable, so logging every one
+                        // individually at `error!` would let a single 64 MiB
+                        // hostile POST produce an enormous burst of log
+                        // lines. In-event errors are only counted and the
+                        // first one's message remembered here; the batched
+                        // `error!` fires once, after the whole call. An
+                        // out-of-event error carries no lost event data, so
+                        // it's logged immediately but only at `debug!`.
                         if in_event {
+                            in_event_error_count += 1;
+                            if first_in_event_error.is_none() {
+                                first_in_event_error = Some(e.to_string());
+                            }
                             metrics::counter!("wef_xml_parse_errors").increment(1);
                             let frag_from = event_start_pos.unwrap_or(pos);
                             let frag_to = next_start.unwrap_or(window.len());
@@ -231,6 +259,12 @@ impl WefParser {
                                 events
                                     .push(WindowsEvent::new(source_host.clone(), frag.to_string()));
                             }
+                        } else {
+                            debug!(
+                                "XML parsing error outside an event (envelope junk or a \
+                                 resync artifact): {}",
+                                e
+                            );
                         }
 
                         // `next_start` is window-relative; only accept it
@@ -252,6 +286,18 @@ impl WefParser {
                 }
                 None => break 'outer,
             }
+        }
+
+        if in_event_error_count > 0 {
+            // Bounded/sanitized like the file's other attacker-derived log
+            // fields (e.g. `handle_wef_subscription_log` in server/mod.rs):
+            // the quick-xml error message embeds bytes read from the wire.
+            let first = first_in_event_error.as_deref().unwrap_or("");
+            error!(
+                "XML parsing failed for {} event(s) in this WEF batch; first error: {}",
+                in_event_error_count,
+                crate::sanitize_for_log(first, 200)
+            );
         }
 
         debug!("Parsed {} events from batch", events.len());
@@ -1327,6 +1373,104 @@ mod tests {
         assert!(
             ev.iter().all(|e| e.parsed.is_none()),
             "every fragment here is malformed and must have no parsed data"
+        );
+    }
+
+    /// (F1) A malformed middle event resyncs twice per `parse_events` call:
+    /// once for the malformed event itself (`in_event == true`, a real lost
+    /// event) and once more as a spurious artifact when the *resumed*
+    /// reader legitimately reaches the document's own trailing
+    /// `</Events></Body></Envelope>` with an empty quick-xml tag stack
+    /// (`in_event == false`, no lost data — see the comment on the `Err`
+    /// arm). WEF is unauthenticated-reachable, so logging every one of
+    /// those individually at `error!` would let a single hostile POST with
+    /// many malformed events produce an unbounded burst of log lines: only
+    /// ONE batched `error!` may fire per `parse_events` call, carrying the
+    /// in-event error count and the first in-event error's message: the
+    /// out-of-event artifact must log at `debug!` only, never `error!`.
+    #[test]
+    fn parse_events_batches_in_event_errors_into_one_error_log_line() {
+        crate::test_support::install_and_clear();
+
+        let parser = WefParser::new();
+        let body = wef_envelope(&format!(
+            "{}{}{}",
+            wef_event(1),
+            wef_malformed_event(2),
+            wef_event(3)
+        ));
+
+        let WefMessage::Events(ev) = parser.parse_message(&body, "h".into()).unwrap() else {
+            panic!("expected Events");
+        };
+        // Sanity: same batch as the (a) test above — 1 in-event error.
+        assert_eq!(ev.len(), 3, "events: {ev:?}");
+
+        let error_lines = crate::test_support::captured_events_at(tracing::Level::ERROR);
+        let xml_error_lines: Vec<_> = error_lines
+            .iter()
+            .filter(|m| m.contains("XML parsing failed"))
+            .collect();
+        assert_eq!(
+            xml_error_lines.len(),
+            1,
+            "exactly one batched error! line for 1 in-event error, got: {error_lines:?}"
+        );
+        assert!(
+            xml_error_lines[0].contains("1 event"),
+            "batched line must carry the in-event error count: {xml_error_lines:?}"
+        );
+        assert!(
+            xml_error_lines[0].contains("Mismatch"),
+            "batched line must carry the first in-event error's message: {xml_error_lines:?}"
+        );
+        assert!(
+            !error_lines.iter().any(|m| m.contains("outside an event")),
+            "the out-of-event resync artifact must never log at error!: {error_lines:?}"
+        );
+
+        let debug_lines = crate::test_support::captured_events_at(tracing::Level::DEBUG);
+        assert!(
+            debug_lines
+                .iter()
+                .any(|m| m.contains("XML parsing error outside an event")),
+            "the out-of-event resync artifact must still be visible at debug!: {debug_lines:?}"
+        );
+    }
+
+    /// (F1) Two in-event errors in one call still produce exactly one
+    /// batched `error!` line, with the count reflecting both.
+    #[test]
+    fn parse_events_batches_two_in_event_errors_with_correct_count() {
+        crate::test_support::install_and_clear();
+
+        let parser = WefParser::new();
+        let body = wef_envelope(&format!(
+            "{}{}{}{}",
+            wef_event(1),
+            wef_malformed_event(2),
+            wef_event(3),
+            wef_malformed_event(4)
+        ));
+
+        let WefMessage::Events(ev) = parser.parse_message(&body, "h".into()).unwrap() else {
+            panic!("expected Events");
+        };
+        assert_eq!(ev.len(), 4, "events: {ev:?}");
+
+        let error_lines = crate::test_support::captured_events_at(tracing::Level::ERROR);
+        let xml_error_lines: Vec<_> = error_lines
+            .iter()
+            .filter(|m| m.contains("XML parsing failed"))
+            .collect();
+        assert_eq!(
+            xml_error_lines.len(),
+            1,
+            "exactly one batched error! line for 2 in-event errors, got: {error_lines:?}"
+        );
+        assert!(
+            xml_error_lines[0].contains("2 event"),
+            "batched line must carry the in-event error count: {xml_error_lines:?}"
         );
     }
 }

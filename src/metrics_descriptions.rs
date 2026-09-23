@@ -296,7 +296,8 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     (
         Kind::Counter,
         "parquet_s3_records_skipped",
-        "Records the writer could not convert into its buffer's schema and skipped.",
+        "Records the writer could not convert into a Parquet batch and skipped (schema \
+         mismatch, mapping failure, or unparsed event).",
     ),
     (
         Kind::Counter,

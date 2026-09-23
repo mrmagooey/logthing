@@ -7,7 +7,12 @@
 //! and the well-formed events on BOTH sides of the malformed one still
 //! reach Parquet on local disk (proving resync actually resumes parsing
 //! after the error, rather than folding everything after it into one
-//! unparsed fragment).
+//! unparsed fragment). Also asserts
+//! `parquet_s3_records_skipped{source="wef",target="local"} == 1` — the
+//! malformed event's raw fragment (no `.parsed` data) reaches the WEF
+//! local writer and is skipped there, exactly once, making this the real
+//! outer-interface trigger for that counter (see the `#4` fix in
+//! `docs/superpowers/specs/2026-09-22-review-fixes-design.md`).
 //!
 //! Template: `tests/field_cardinality_metric_wef_e2e.rs` for the overall
 //! shape (real `Server`, `metrics.enabled = true`, `reserve_port`, real
@@ -160,12 +165,18 @@ async fn malformed_batch_returns_200_counts_the_error_and_keeps_the_good_events(
          must not be told to resend"
     );
 
-    // Scrape /metrics until wef_xml_parse_errors shows up.
+    // Scrape /metrics until both wef_xml_parse_errors AND
+    // parquet_s3_records_skipped{source="wef",target="local"} show up —
+    // the latter is incremented asynchronously by the WEF local writer
+    // task once it receives and rejects the malformed event's unparsed
+    // fragment, so it can lag slightly behind the HTTP response.
+    const SKIPPED_PREFIX: &str = "parquet_s3_records_skipped{source=\"wef\",target=\"local\"} ";
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let scrape = loop {
         if let Ok(resp) = reqwest::get(&metrics_url).await
             && let Ok(text) = resp.text().await
             && find_metric_value(&text, "wef_xml_parse_errors ") == Some(1.0)
+            && find_metric_value(&text, SKIPPED_PREFIX) == Some(1.0)
         {
             break text;
         }
@@ -185,6 +196,13 @@ async fn malformed_batch_returns_200_counts_the_error_and_keeps_the_good_events(
         Some(1.0),
         "wef_xml_parse_errors never reached 1 on the real /metrics endpoint within 15s. Full \
          scrape body:\n{scrape}"
+    );
+    assert_eq!(
+        find_metric_value(&scrape, SKIPPED_PREFIX),
+        Some(1.0),
+        "parquet_s3_records_skipped{{source=\"wef\",target=\"local\"}} never reached 1 on the \
+         real /metrics endpoint within 15s — the malformed event's unparsed fragment must reach \
+         the WEF local writer and be counted as skipped there. Full scrape body:\n{scrape}"
     );
 
     // --- Clean shutdown: signal, join the server task (drops AppState,
