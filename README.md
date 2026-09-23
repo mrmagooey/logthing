@@ -99,7 +99,7 @@ Configuration is loaded from multiple sources (in order of precedence, later win
 
 There is no admin-editable override file any more: `logthing.admin.toml` is
 no longer read (a leftover copy on disk produces a startup warning telling
-you to delete it). The admin interface (`docs/admin-security.md`) is
+you to delete it). The admin interface (`docs/admin.md`) is
 read-only — it shows the effective config and the `LOGTHING__*` variable
 names currently set, but does not accept writes. Change configuration by
 editing `logthing.toml`/`/etc/logthing/config.toml` or setting `LOGTHING__*`
@@ -1012,7 +1012,7 @@ Every configuration field is restart-required now. Configuration is set with
 `LOGTHING__*` environment variables layered over `logthing.toml` and
 `/etc/logthing/config` — environment variables win — and a change in either
 place only takes effect on the next process restart. The admin interface
-(`docs/admin-security.md`) is read-only: it shows the effective config and
+(`docs/admin.md`) is read-only: it shows the effective config and
 which `LOGTHING__*` variable names are set, but has no endpoint that writes
 configuration, so there is no live-apply path left.
 
