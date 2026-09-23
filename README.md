@@ -8,9 +8,14 @@ A high-performance log ingestion server written in Rust. Receives Windows Event 
 - **Syslog Support**: UDP/TCP syslog listener with RFC 3164 and RFC 5424 parsing
 - **IPFIX / NetFlow Support**: UDP flow ingestion supporting IPFIX v10, NetFlow v9, and NetFlow v5; S3 Parquet persistence
 - **Zeek NDJSON Support**: TCP NDJSON listener for Zeek network security monitor logs; per-stream typed Parquet schemas with S3 persistence
+- **Suricata EVE JSON Support**: TCP NDJSON listener for Suricata EVE JSON records; S3 Parquet persistence
+- **sFlow Support**: UDP listener for sFlow v5 flow and counter samples; S3 Parquet persistence
+- **HEC Ingest**: Splunk HTTP Event Collector-compatible endpoints (`/services/collector/event`, `/services/collector/raw`, `/ingest`)
+- **OTLP Logs Support**: `POST /v1/logs` OTLP/HTTP log ingest (protobuf or JSON); built when the `otlp` Cargo feature is enabled
 - **DNS Log Parsing**: Automatic parsing of BIND, Unbound, and PowerDNS query logs
 - **Generic Event Parser**: YAML-configurable parsing for specific Windows event codes
-- **Parquet S3 Storage**: Aggregate events into Parquet files and store in S3-compatible storage
+- **Parquet Storage**: Aggregate events into Parquet files and store in S3-compatible storage or on local disk
+- **Iceberg Descriptor Output**: Optional per-file JSON descriptors (row count, stats, location) for an external Apache Iceberg committer
 - **Log Aggregation**: Optionally count records as they arrive, grouped by configured columns, writing an SQL `GROUP BY`-style table to Parquet instead of the raw rows — cuts noisy streams down to their useful summary
 - **TLS/SSL Encryption**: Secure connections with certificate support
 - **IP Whitelisting**: Control which hosts can connect
@@ -32,9 +37,9 @@ cargo build --release
 cargo install --path .
 ```
 
-### Configuration
+### Minimal Configuration
 
-Create a configuration file at `logthing.toml` or set environment variables:
+Create a configuration file at `logthing.toml`:
 
 ```toml
 bind_address = "0.0.0.0:5985"
@@ -43,607 +48,51 @@ bind_address = "0.0.0.0:5985"
 level = "info"
 format = "json"
 
-[tls]
-enabled = true
-port = 5986
-cert_file = "/path/to/cert.pem"
-key_file = "/path/to/key.pem"
-ca_file = "/path/to/ca.pem"           # Optional: for client certificate verification
-require_client_cert = false           # Set to true to enforce mTLS
-
-[security]
-# Restricts the HTTP endpoints (WEF, syslog-over-HTTP, HEC, OTLP, ...), the
-# wire-protocol socket listeners (syslog UDP/TCP, IPFIX, sFlow, Zeek,
-# Suricata), AND the /metrics endpoint to these sources. Empty (the
-# default) allows all sources everywhere.
-#
-# This also gates Prometheus: if you set allowed_ips, your scraper's
-# address must be in the list too, or scraping /metrics starts returning
-# 403. See the "Bind address (breaking change)" note under ## Metrics.
-#
-# RESTART-ONLY, FILE-ONLY: a change here only takes effect on the next
-# process restart, and there is no LOGTHING__SECURITY__ALLOWED_IPS
-# equivalent — this is a list, and the env loader sets no list separator.
-# See "Live vs. restart-required config changes" below.
-allowed_ips = ["192.168.1.0/24", "10.0.0.0/8"]
-max_connections = 10000
-connection_timeout_secs = 300
-
-[metrics]
-enabled = true
-port = 9090
-# The metrics and TLS listeners bind the same interface as `bind_address`
-# above (here, all interfaces). If you narrow `bind_address` to a private
-# interface but scrape metrics from another host, set this explicitly to
-# restore the old behaviour:
-# bind_address = "0.0.0.0"
-#
-# /metrics is also gated by [security] allowed_ips above (there is no
-# separate metrics.allowed_ips) — make sure your scraper's address is on
-# that list, or it will get 403.
-
 [syslog]
 enabled = true
 udp_port = 514
 tcp_port = 601
-parse_dns = true
 ```
 
-### Configuration Sources
+See [docs/configuration.md](docs/configuration.md) for the full option set
+(TLS, security/whitelisting, metrics, Kerberos, per-source S3/local sinks,
+environment variable overrides, and which settings are restart-only).
 
-Configuration is loaded from multiple sources (in order of precedence, later wins):
-1. Default values
-2. `logthing.toml` file (optional)
-3. `/etc/logthing/config.toml` (optional)
-4. Environment variables with `LOGTHING__` prefix (double underscore for nesting) — these win over both files
-
-There is no admin-editable override file any more: `logthing.admin.toml` is
-no longer read (a leftover copy on disk produces a startup warning telling
-you to delete it). The admin interface (`docs/admin-security.md`) is
-read-only — it shows the effective config and the `LOGTHING__*` variable
-names currently set, but does not accept writes. Change configuration by
-editing `logthing.toml`/`/etc/logthing/config.toml` or setting `LOGTHING__*`
-environment variables, then restart the process; nothing here applies live.
-**Two settings have no environment-variable equivalent and must be set in a
-file**: `security.allowed_ips` (a list; the env loader sets no list
-separator) and `aggregate.rules` (a list of tables; the env loader has no
-syntax for that shape either).
-
-Every config field is reachable this way, including each listener's bind
-port: `LOGTHING__SYSLOG__UDP_PORT`, `LOGTHING__SYSLOG__TCP_PORT`,
-`LOGTHING__IPFIX__UDP_PORT`, `LOGTHING__ZEEK__TCP_PORT`, `LOGTHING__SURICATA__TCP_PORT`,
-`LOGTHING__SFLOW__UDP_PORT`. Ipfix, Zeek, Suricata, and sFlow additionally accept
-`LOGTHING__<SECTION>__BIND_ADDRESS` to change which interface they listen on;
-syslog's bind address is fixed at `0.0.0.0` and has no such override.
-
-### Iceberg descriptor output
-
-Optionally, logthing can emit a small JSON "descriptor" file alongside
-every Parquet file it writes, describing the file (row count, byte size,
-partition, per-column stats, fully-qualified location) for an external
-Apache Iceberg committer process — logthing itself has no Iceberg
-dependency and never talks to a catalog. Enable it with `[iceberg.s3]` or
-`[iceberg.local]` in `logthing.toml` (mirroring every other source's
-`.s3`/`.local` shape), or via `LOGTHING__ICEBERG__S3__BUCKET` etc. Configuring
-both `iceberg.s3` and `iceberg.local` simultaneously is a startup error —
-unlike other sources, the descriptor sink supports exactly one
-destination.
-
-#### Suggested deployment pattern
-
-logthing only ever writes Parquet + descriptor files — it never talks to
-an Iceberg catalog. Turning those descriptors into real Iceberg tables is
-the job of a separate, standalone **committer** process that you run
-alongside logthing:
-
-```
-logthing ──writes──▶ Parquet files   (existing [<source>.s3]/[<source>.local])
-         └─writes──▶ descriptor JSON  ([iceberg.s3]/[iceberg.local])
-                            │
-                            ▼
-                    committer (external, not part of logthing)
-                            │
-                            ▼
-                      Iceberg catalog + tables
-```
-
-- **Committer**: a small, independently-deployed job (batch or
-  long-running) that lists new descriptor files and builds Iceberg
-  manifests from their contents. Two options, with a real tradeoff between
-  them:
-  - **PyIceberg's `add_files`** — fastest to stand up, but it does not
-    use the descriptor's pre-computed stats: it opens each Parquet file
-    itself and reads its footer to derive row count, byte size, column
-    stats, and partition values. This still works fine, but it re-reads
-    every file (a footer-only range-read, not a full download, but still
-    I/O against the Parquet object) and doesn't need the descriptor JSON
-    at all — it could just as well list the S3 prefix directly.
-  - **A custom committer** built on `iceberg-rust`'s low-level primitives
-    (`DataFileBuilder`, `ManifestWriter`, `ManifestListWriter`), populated
-    directly from the descriptor JSON's `record_count`/`file_size_in_bytes`/
-    `column_stats` fields — this is the option that actually delivers on
-    "never re-reads Parquet," since it never opens the Parquet file at
-    all. More work to build than reaching for `add_files`, but it's the
-    only path that uses the descriptor for what it was designed for.
-- **Catalog**: [Lakekeeper](https://github.com/lakekeeper/lakekeeper) (a
-  single-binary, no-JVM, self-hosted REST catalog) for self-hosted/dev
-  deployments; AWS Glue Data Catalog for AWS deployments — both require
-  no new infrastructure beyond what you likely already run.
-- **Compaction**: run as a separate, periodic batch job (e.g. Trino/Spark
-  `OPTIMIZE`) rather than folding it into the committer — neither
-  PyIceberg nor `iceberg-rust` currently ships an atomic file-rewrite
-  action, so merging small files is best treated as independent
-  table-maintenance, not part of every commit.
-
-This keeps logthing decoupled from Iceberg's release cadence: the
-committer and catalog can be swapped or upgraded independently, and a
-logthing deploy never blocks on either.
-
-### Kerberos Client Authentication
-
-Require inbound clients (e.g., Windows Event Forwarding collectors) to authenticate with SPNEGO/Negotiate.
-
-```toml
-[security.kerberos]
-enabled = true
-spn = "HTTP/wef.contoso.com@CONTOSO.COM"
-keytab = "/etc/logthing/krb5.keytab"
-```
-
-- Build the binary or container with `--features kerberos-auth` so the Kerberos middleware is compiled in. (Without the feature the server will log a warning and continue without enforcing Negotiate.)
-- When `enabled = true`, the main server's protected routes (`/wsman`, `/wsman/subscriptions`, `/wsman/events`, `/syslog`) enforce Kerberos authentication before any route logic runs. `/health` and `/stats/throughput` stay public. The **admin API is a separate server on its own port and is NOT covered by Kerberos** — it has its own Basic-auth/trusted-header authentication and its own IP allowlist.
-- `spn` must match the service principal registered in Active Directory (format `HTTP/hostname@REALM`).
-- `keytab` (optional) points to the keytab that contains the service principal’s keys. If provided, logthing sets `KRB5_KTNAME` automatically so `libgssapi` can decrypt tickets.
-- The middleware logs the authenticated client principal at `debug` level; there is no extractor exposing it to handlers.
-- Only two-pass SPNEGO is supported: the client is expected to already hold a Kerberos ticket and send a single, complete `Negotiate` token, as real Kerberos-over-HTTP normally works. Multi-leg negotiation (as an NTLM fallback would need) is not implemented — a token that comes back "continue needed" is rejected with `401` rather than tracked across requests.
-
-#### Active Directory Setup (Kerberos clients → logthing)
-
-1. **Create a service account** that represents the logthing server itself, e.g., `CONTOSO\logthing-appliance`.
-2. **Register the HTTP SPN** so KDCs know which account owns the hostname clients connect to:
-   ```powershell
-   setspn -S HTTP/wef.contoso.com CONTOSO\logthing-appliance
-   ```
-3. **Generate a keytab** for that account (Domain Admin privilege required):
-   ```powershell
-   ktpass /princ HTTP/wef.contoso.com@CONTOSO.COM ^
-          /mapuser CONTOSO\logthing-appliance ^
-          /pass * ^
-          /ptype KRB5_NT_PRINCIPAL ^
-          /crypto AES256-SHA1 ^
-          /out C:\temp\logthing.keytab
-   ```
-   Copy the resulting keytab to the Linux host/container that runs logthing and guard it (`chmod 600`).
-4. **Configure `/etc/krb5.conf`** with your AD realm and KDCs.
-5. **Sanity check Kerberos locally** before enabling the server:
-   ```bash
-   export KRB5_KTNAME=/etc/logthing/krb5.keytab
-   kinit -k -t "$KRB5_KTNAME" HTTP/wef.contoso.com@CONTOSO.COM
-   curl --negotiate -u : https://wef.contoso.com/wsman -d '' -k
-   ```
-   (The curl call should return `401` until you pass a valid SOAP payload, but it proves SPNEGO works.)
-6. **Update `logthing.toml`** as shown above, restart the service, and ensure the keytab is mounted into any containers. Clients will now need valid Kerberos tickets to reach the API.
-
-### Syslog Listener
-
-Receive and parse syslog messages via UDP (port 514) and TCP (port 601):
-
-```toml
-[syslog]
-enabled = true
-udp_port = 514      # Standard syslog UDP port
-tcp_port = 601      # Standard syslog TCP port (RFC 6587)
-parse_dns = true    # Enable DNS log parsing
-```
-
-**TCP idle timeout:** a TCP connection to the syslog listener (and, the same
-way, to the Zeek and Suricata TCP listeners below) is closed if it goes 300
-seconds (5 minutes) without delivering a complete line. This is not
-configurable via `logthing.toml`/env. A forwarder that holds a connection
-open but sends complete lines less often than every 5 minutes will see that
-connection closed and must reconnect — if you notice a forwarder reconnecting
-periodically for no obvious reason, this timeout is a likely cause. Unlike
-the metrics bind-address change below, this is not a breaking change in the
-sense of altering delivery semantics: a well-behaved forwarder simply
-reconnects and resumes sending.
-
-**Supported Formats**:
-- **RFC 3164** (BSD syslog): `<priority>timestamp hostname tag[pid]: message`
-- **RFC 5424**: `<priority>version timestamp hostname app-name procid msgid [structured-data] message`
-
-**HTTP Endpoints**:
-- `POST /syslog` - Submit syslog messages via HTTP
-- `GET /syslog/udp` - Get UDP listener info
-- `GET /syslog/examples` - Get example DNS syslog records
-
-`POST /syslog` is mounted unconditionally (it doesn't depend on `syslog.enabled`), so by
-default it accepts requests with no authentication. Set `syslog.http_token` to require
-`Authorization: Bearer <token>` on that route:
-
-```toml
-[syslog]
-http_token = "shared-secret"   # optional; empty (default) = no auth required
-```
-
-`http_token` is restart-only, same as `hec.token` and `otlp.bearer_token`: change it in
-`logthing.toml`/`LOGTHING__SYSLOG__HTTP_TOKEN` and restart. See "Live vs. restart-required
-config changes" below.
-
-**DNS Log Parsing**:
-The server automatically parses DNS query logs from:
-- BIND/named: `client 192.168.1.100#12345: query: example.com IN A + (93.184.216.34)`
-- Unbound: `info: 192.168.1.100 example.com. A IN`
-- PowerDNS: `Remote 192.168.1.100 wants 'example.com|A', do = 0, bufsize = 512`
-
-### Host tuning for UDP ingest
-
-The UDP listeners (syslog, IPFIX, sFlow) request a **4 MiB socket receive
-buffer** by default via `SO_RCVBUF`. Linux silently clamps that request to
-`net.core.rmem_max`, whose default on most distributions is **212992 bytes
-(208 KiB)** — roughly 20x smaller than requested. Under sustained load the
-kernel then discards datagrams before logthing ever sees them.
-
-logthing detects the clamp and warns at startup:
-
-```
-WARN syslog_udp: SO_RCVBUF requested 4194304 bytes, kernel granted only
-     425984 bytes (clamped by net.core.rmem_max)
-```
-
-(The granted figure is double `rmem_max` because the kernel doubles the value
-for its own bookkeeping.)
-
-**If you see that warning and care about UDP throughput, raise the limit:**
+### Running
 
 ```bash
-# Immediate, until reboot
-sudo sysctl -w net.core.rmem_max=16777216
-
-# Persistent
-echo 'net.core.rmem_max=16777216' | sudo tee /etc/sysctl.d/60-logthing.conf
+./logthing
+# or, with environment variable overrides:
+LOGTHING__BIND_ADDRESS=0.0.0.0:5985 LOGTHING__TLS__ENABLED=true ./logthing
 ```
 
-Measured impact: at 40,000 syslog messages/s on a host with the stock 208 KiB
-limit, ~16.8% of datagrams were lost in the kernel socket — with zero drops
-recorded inside logthing, because those messages never arrived. This loss is
-invisible to `parquet_s3_dropped`; watch `syslog_socket_drops` and
-`syslog_socket_rx_queue_bytes` instead, which are read per-socket from
-`/proc/net/udp`.
-
-To decline the larger buffer entirely and keep the OS default, set
-`receive_buffer_bytes = 0`:
-
-```toml
-[syslog]
-receive_buffer_bytes = 0   # 0 = leave SO_RCVBUF alone; omit for the 4 MiB default
-```
-
-TCP syslog is unaffected — `SO_RCVBUF` here applies only to the UDP arm.
-
-### IPFIX / NetFlow Ingestion
-
-Receive and decode network flow records via UDP (port 4739 by default):
-
-```toml
-[ipfix]
-enabled = true
-udp_port = 4739      # IANA-standard IPFIX port
-bind_address = "0.0.0.0"
-```
-
-**Supported Versions**:
-- **IPFIX v10** (RFC 7011): template-based variable-length records
-- **NetFlow v9** (RFC 3954): template-based, same decoder as IPFIX v10
-- **NetFlow v5**: fixed 48-byte record format, no template required
-
-**Template Model**:
-Each exporter maintains a stateful template cache keyed on `(exporter IP, observation domain ID, template ID)`. Data records are decoded only once the matching template has been received; data sets referencing an uncached template are silently skipped (counter `ipfix_templates_missing` is incremented). The cache is bounded at 100,000 entries to guard against template floods from spoofed UDP sources.
-
-**Information Elements**:
-A curated set of IANA IEs (source/destination address/port, protocol, byte/packet counts, flow start/end, TCP flags, interfaces, etc.) is mapped directly to `FlowRecord` fields. Unknown or enterprise IEs are hex-encoded and stored in the `extra` JSON column.
-
-### Syslog S3 Persistence
-
-Syslog messages can be persisted directly to S3-compatible storage as compressed Parquet files:
-
-```toml
-[syslog]
-enabled = true
-parse_dns = true   # see note below
-
-[syslog.s3]
-endpoint   = "http://localhost:9000"
-bucket     = "syslog-logs"
-region     = "us-east-1"
-access_key = "minioadmin"
-secret_key = "minioadmin"
-prefix     = "syslog"          # slash-free; builder inserts /
-max_buffer_rows = 10000        # flush when this many rows buffered (default 10 000)
-flush_interval_secs = 900      # flush every N seconds regardless of row count (default 900)
-channel_capacity = 136533      # bounded channel between listener and writer
-                               # (default: 100 MiB budget / 768 B per message)
-```
-
-**Note — `parse_dns` and `[syslog.s3]` are currently mutually exclusive.**
-When `[syslog.s3]` is present the S3 handler is used instead of the default syslog
-handler.  The S3 handler writes every received message to Parquet and does **not** run
-the DNS-log extraction (`parse_dns`).  If you need both S3 persistence and DNS-log
-parsing, omit `[syslog.s3]` and forward syslog messages to an external pipeline.
-Combining both in a single handler is a planned future feature.
-
-### Zeek Ingestion
-
-Receive Zeek (network security monitor) logs forwarded as newline-delimited JSON (NDJSON) over TCP (port 47760 by default):
-
-```toml
-[zeek]
-enabled      = true
-tcp_port     = 47760     # default Zeek NDJSON listener port
-bind_address = "0.0.0.0"
-```
-
-**Stream identification**:
-Each incoming JSON record is identified by its `_path` field (e.g. `"conn"`, `"dns"`). If `_path` is absent or is not a string, the record is assigned the stream name `"unknown"` and the `zeek_missing_path` counter is incremented.
-
-**Typed schemas — 6 curated streams**:
-
-| Stream | Arrow columns (promoted) | `_extra` | `partition_time` |
-|--------|--------------------------|----------|------------------|
-| `conn` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `proto`, `service`, `duration`, `orig_bytes`, `resp_bytes`, `conn_state`, `history`, `orig_pkts`, `resp_pkts` | yes | yes |
-| `dns` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `proto`, `trans_id`, `query`, `qtype_name`, `qclass_name`, `rcode_name`, `answers` | yes | yes |
-| `http` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `method`, `host`, `uri`, `status_code`, `user_agent`, `request_body_len`, `response_body_len` | yes | yes |
-| `ssl` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `version`, `cipher`, `curve`, `server_name`, `validation_status` | yes | yes |
-| `files` | `ts`, `fuid`, `tx_hosts`, `rx_hosts`, `source`, `mime_type`, `filename`, `total_bytes` | yes | yes |
-| `notice` | `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `note`, `msg`, `sub`, `actions` | yes | yes |
-
-Note: Zeek JSON uses dot-notation for connection-id fields (`id.orig_h`, etc.); the Arrow column names use underscores (`id_orig_h`). All typed schemas include a non-null `_extra` JSON column that captures every field not listed above, as well as any field whose runtime type does not match the expected Arrow type (best-effort, type-mismatch-safe mapping). Every typed schema also ends with a non-null `partition_time` column (Arrow `Timestamp(Microsecond, UTC)`) — see below.
-
-`ts` is written as a microsecond-precision UTC timestamp (Arrow `Timestamp(Microsecond, UTC)`), but it is **nullable** in all seven Zeek schemas (six typed plus the envelope), so it is not a safe Iceberg partition-transform source: a file with even one row missing `ts` would yield two partition values (`{date, null}`) and Iceberg refuses the write. Use the non-null `partition_time` column instead — it holds the instant (the record's own `ts` when present and within a bounded backfill/skew window of receipt, otherwise the receipt time) that the file's buffer day was actually derived from, and is guaranteed non-null and single-valued per file.
-
-**Envelope fallback**:
-Records with a `_path` value that does not match one of the six curated stream names (including `"unknown"`) are routed to a generic envelope schema with columns: `ts`, `uid`, `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p`, `log_path`, `ingest_time`, `payload`, `partition_time`. The full JSON object is stored verbatim in `payload`.
-
-**Robustness**:
-- Lines longer than 16 MiB are rejected and the connection is closed; the `zeek_oversized_lines` counter is incremented.
-- Non-UTF-8 and invalid JSON lines are skipped (per-line, not per-connection); `zeek_parse_errors` is incremented.
-- The per-process stream map is bounded at 256 distinct `_path` values (`MAX_ZEEK_STREAMS`). Records whose sanitised path would create a 257th stream are routed to the `"unknown"` envelope stream and counted by `parquet_s3_partitions_capped{source="zeek"}`.
-- `_path` values are sanitised before use in S3 keys (lowercased, `[a-z0-9_]` only, truncated to 64 characters; empty result → `"unknown"`).
-- **TCP idle timeout**: same 300-second (5 minute) idle timeout as syslog's TCP listener — see "TCP idle timeout" under Syslog Listener above. Applies to the Suricata TCP listener too.
-
-### IPFIX S3 Persistence
-
-Flow records can be persisted directly to S3-compatible storage as compressed Parquet files:
-
-```toml
-[ipfix]
-enabled = true
-
-[ipfix.s3]
-endpoint              = "http://localhost:9000"
-bucket                = "ipfix-flows"
-region                = "us-east-1"
-access_key            = "minioadmin"
-secret_key            = "minioadmin"
-prefix                = "ipfix"          # slash-free; builder inserts /
-flush_threshold_bytes = 104857600        # flush when buffer reaches 100 MiB (default)
-flush_interval_secs   = 900             # flush every N seconds regardless of size (default 900)
-channel_capacity      = 11377           # bounded channel between listener and writer
-                                        # (default: 100 MiB budget / 9216 B per datagram)
-max_buffer_rows       = 100000          # hard-cap rows before oldest are dropped (default 100 000)
-```
-
-The `[ipfix.s3]` block is optional; when absent, flows are handled by the default handler (logged only) and no S3 writes occur.
-
-**Parquet Schema** (fixed, 19 columns):
-
-| Column | Type | Nullable |
-|--------|------|----------|
-| observation_domain_id | UInt32 | no |
-| template_id | UInt16 | no |
-| protocol_version | UInt8 | no |
-| exporter | String | no |
-| export_time | Timestamp(µs, UTC) | no |
-| src_addr | String | yes |
-| dst_addr | String | yes |
-| src_port | UInt16 | yes |
-| dst_port | UInt16 | yes |
-| ip_protocol | UInt8 | yes |
-| octet_delta_count | UInt64 | yes |
-| packet_delta_count | UInt64 | yes |
-| flow_start | Timestamp(µs, UTC) | yes |
-| flow_end | Timestamp(µs, UTC) | yes |
-| tcp_flags | UInt8 | yes |
-| input_interface | UInt32 | yes |
-| output_interface | UInt32 | yes |
-| extra | String (JSON) | no |
-| partition_time | Timestamp(µs, UTC) | no |
-
-Objects are stored at `ipfix/year=YYYY/month=MM/day=DD/<uuid>.parquet`, distinct from syslog's `syslog/` prefix. Files are ZSTD-compressed.
-
-`flow_start` and `flow_end` are nullable, so neither is a safe Iceberg partition-transform source on its own — a file with a null in either would yield two partition values and Iceberg refuses the write. `partition_time` is the correct source: it is non-null, derived from `export_time` (clamped to a bounded backfill/skew window around receipt time and otherwise falling back to receipt time), and holds the instant the file's buffer day was actually derived from.
-
-**Memory safety**: when S3 is unavailable and the buffer exceeds `max_buffer_rows * 4` rows, the oldest batches are dropped and the `parquet_s3_buffer_dropped{source="ipfix"}` counter is incremented.
-
-### Zeek S3 Persistence
-
-Zeek log records can be persisted to S3-compatible storage as per-stream ZSTD-compressed Parquet files:
-
-```toml
-[zeek]
-enabled = true
-
-[zeek.s3]
-endpoint              = "http://localhost:9000"
-bucket                = "zeek-logs"
-region                = "us-east-1"
-access_key            = "minioadmin"
-secret_key            = "minioadmin"
-prefix                = "zeek"           # slash-free; builder inserts /  (default: "zeek")
-flush_threshold_bytes = 104857600        # flush when buffer reaches 100 MiB (default)
-flush_interval_secs   = 900             # flush every N seconds regardless of size (default 900)
-channel_capacity      = 40960           # bounded channel between listener and writer
-                                        # (default: 100 MiB budget / 2560 B per record)
-max_buffer_rows       = 100000          # hard-cap rows before oldest are dropped (default 100 000)
-```
-
-The `[zeek.s3]` block is optional; when absent, records are handled by the default handler (logged only) and no S3 writes occur.
-
-**S3 key layout** — one prefix level per stream:
+## Architecture
 
 ```
-{prefix}/<log_path>/year=YYYY/month=MM/day=DD/<uuid>.parquet
-```
+Ingest sources                        logthing                      Output
+───────────────                ───────────────────────          ──────────────
+Windows Hosts (WEF/HTTPS) ─┐
+Syslog (UDP/TCP/HTTP)      ─┤
+IPFIX / NetFlow (UDP)      ─┤   ┌────────────────────┐
+Zeek NDJSON (TCP)          ─┼──▶│  Per-source socket/ │
+Suricata EVE JSON (TCP)    ─┤   │  HTTP listeners +   │
+sFlow v5 (UDP)             ─┤   │  parsers            │
+HEC (Splunk-compatible)    ─┤   └──────────┬──────────┘
+OTLP logs (HTTP)           ─┘              │
+                                            ▼
+                                ┌────────────────────────┐
+                                │  optional aggregation   │
+                                │  (SQL GROUP BY-style)   │
+                                └────────────┬────────────┘
+                                             ▼
+                                ┌────────────────────────┐
+                                │     Parquet writers     │──▶ S3 (S3-compatible)
+                                │ (+ optional Iceberg     │──▶ local disk
+                                │    descriptors)         │
+                                └────────────────────────┘
 
-Examples:
-```
-zeek/conn/year=2024/month=03/day=15/f3a9….parquet
-zeek/dns/year=2024/month=03/day=15/8b2c….parquet
-zeek/unknown/year=2024/month=03/day=15/1e7f….parquet
-zeek/_overflow/year=2024/month=03/day=15/9a1b….parquet
-```
-
-Each stream produces a separate Parquet file series using its own typed schema (or the envelope schema for unrecognised stream names).
-
-**Stream routing rules**:
-- A record whose JSON `_path` field is absent or non-string is assigned `log_path = "unknown"` by the listener; after `sanitize_log_path` it lands at `zeek/unknown/`.
-- A record whose sanitised `_path` produces an empty string (e.g. a path composed entirely of non-alphanumeric, non-underscore characters) also maps to `zeek/unknown/` via `sanitize_log_path`'s empty-result fallback.
-- A record with a valid `_path` that would create a new partition beyond the `max_partitions` cap (default 256) is routed to `zeek/_overflow/` by the generic partition-cap machinery.
-
-**Memory safety**: when S3 is unavailable and a stream's buffer exceeds `max_buffer_rows * 4` rows, the oldest batches are dropped and the `parquet_s3_buffer_dropped{source="zeek"}` counter is incremented.
-
-### Log Aggregation
-
-Aggregation counts records as they arrive, grouped by configured columns, and
-writes the counted table to Parquet. A stream covered by a rule **stops
-writing raw rows entirely** — that is the point: the noisy stream is reduced to
-its summary.
-
-```toml
-[aggregate]
-enabled = true
-flush_interval_secs = 300   # window length; each row carries window_start/window_end
-max_groups = 100000         # per rule, per window
-channel_capacity = 4096     # bounded channel between the emit task and the Parquet writer (default: 4096)
-
-[aggregate.local]           # and/or [aggregate.s3], same shape as other sources
-directory = "/data/agg"
-prefix = "aggregate"
-
-[[aggregate.rules]]
-name = "dns_by_query"       # unique; becomes the output partition
-source = "zeek"             # zeek | suricata | syslog | ipfix | sflow
-stream = "dns"              # optional; omitted = every record from that source
-group_by = ["query", "id.orig_h"]
-
-[[aggregate.rules]]
-name = "flow_talkers"
-source = "ipfix"
-group_by = ["src_addr", "dst_addr", "dst_port"]
-sum = ["octet_delta_count", "packet_delta_count"]
-```
-
-Output lands at `<prefix>/<rule>/year=/month=/day=/<uuid>.parquet` with one
-column per `group_by` field, a `count`, one column per `sum`/`min`/`max`,
-`window_start`/`window_end`, and `partition_time`.
-
-Column names in the output schema:
-
-| Config field | Output column |
-| --- | --- |
-| each `group_by` entry | used verbatim, e.g. `query`, `id.orig_h` |
-| — | `count` (always present) |
-| each `sum` field | `sum_<field>` |
-| each `min` field | `min_<field>` |
-| each `max` field | `max_<field>` |
-| — | `window_start`, `window_end` (always present) |
-| — | `partition_time` (always present, non-null; see below) |
-
-For the `flow_talkers` rule above, the schema is: `src_addr, dst_addr,
-dst_port, count, sum_octet_delta_count, sum_packet_delta_count, window_start,
-window_end, partition_time`. A `group_by` entry can't be named `count`, and no two output
-columns may collide (e.g. `group_by = ["sum_x"]` with `sum = ["x"]`) — both
-are rejected at startup.
-
-`partition_time` is materialised last and always equals `window_start` for
-aggregate output (both were already non-null), but it is the column to
-declare an Iceberg partition transform against — it is the one name every
-sink's schema agrees on, so the same committer logic works unmodified
-across all nine.
-
-Notes:
-
-- `stream` matches the Zeek `_path` (normalized to the stable stream name, so rotation
-  suffixes are stripped; e.g., `conn.2026-08-14-16-08-44.log.gz` → `conn`), Suricata
-  `event_type`, syslog `app_name`, sFlow `"flow"`/`"counter"`, or IPFIX `"flows"`.
-- A record matching two rules is counted in both.
-- Aggregates follow SQL semantics: missing and non-numeric values are skipped,
-  the record is still counted, and a group with no numeric observations emits
-  NULL rather than 0.
-- Past `max_groups` distinct groups in a window, further keys fold into a
-  single `_other` row so the window total stays exact.
-- `flush_interval_secs` is the only window-length knob — there's no separate
-  setting; it also drives the writer's flush age. Windows are bounded by
-  arrival time, not event time: a record counts into whichever window is
-  open when it *arrives*, and a late/out-of-order record is never re-bucketed
-  into the window its own timestamp would suggest.
-- Invalid rules (unknown or disabled source, empty `group_by`, duplicate name,
-  no destination) are fatal at startup rather than silently inert.
-- Aggregation doesn't disable a source's raw persistence — that's controlled
-  independently by `[<source>.s3]`/`[<source>.local]`. To store *only* the
-  aggregate output: leave a source's `s3`/`local` blocks unset (so raw rows
-  have no destination), and omit `stream` in its rule so every record from
-  that source is matched — otherwise unmatched records are silently dropped
-  rather than persisted anywhere.
-- Do not put `_path` in a Zeek rule's `group_by`: unlike the `stream` filter
-  above, `group_by` reads the field straight off the raw JSON, which still
-  holds the un-normalized value — a new group per rotation suffix.
-- syslog's `protocol` is not an addressable field (falls through to the
-  structured-data lookup and misses); `group_by = ["protocol"]` yields NULL.
-
-### WEF (Windows Event) S3 Persistence
-
-Store Windows events in S3-compatible storage (AWS S3, MinIO, etc.) as ZSTD-compressed Parquet files:
-
-```toml
-[wef.s3]
-endpoint              = "http://localhost:9000"   # S3-compatible endpoint
-bucket                = "wef-events"
-region                = "us-east-1"
-access_key            = "minioadmin"
-secret_key            = "minioadmin"
-# prefix defaults to "" (empty) — preserves event_type=.../year=... layout at root
-flush_threshold_bytes = 104857600        # flush when buffer reaches 100 MiB (default)
-flush_interval_secs   = 900             # flush every N seconds regardless of size (default 900)
-channel_capacity      = 22755           # bounded channel depth
-                                        # (default: 100 MiB budget / 4608 B per record)
-max_buffer_rows       = 100000          # hard-cap rows before oldest are dropped (default 100 000)
-```
-
-The `[wef.s3]` block is optional; when absent, WEF events are not persisted to S3.
-
-**Features**:
-- **Event Type Partitioning**: Each Windows Event ID gets its own Parquet file series
-- **Time-Based Partitioning**: Files organized by `event_type/year/month/day/`
-- **Compression**: ZSTD compression for efficient storage
-- **Backpressure**: Bounded channel; drops are counted by `parquet_s3_dropped{source="wef"}`
-- **Drop-log throttling**: The human-facing "channel full/closed" log line for a dropped record
-  is capped at one line per 30 seconds per (call site, drop reason) pair; its `dropped_total`
-  field is cumulative since process start, not a per-window count — `parquet_s3_dropped` remains
-  the authoritative per-drop metric
-
-**S3 Path Structure**:
-```
-s3://bucket-name/
-  event_type=4624/
-    year=2024/
-      month=01/
-        day=15/
-          <uuid>.parquet
-  event_type=4668/
-    year=2024/
-      month=01/
-        day=15/
-          <uuid>.parquet
+                       Prometheus metrics exposed on :9090 (/metrics),
+                       covering every stage from ingest through write.
 ```
 
 ## Container Image / Releases
@@ -669,372 +118,54 @@ docker pull ghcr.io/mrmagooey/logthing:latest  # most recent non-prerelease rele
 
 The runtime listeners (syslog UDP 514/TCP 601, IPFIX UDP 4739) must be published separately via `-p` or the compose `ports:` mapping if they need to be reachable from outside the container.
 
-## End-to-End Test Harness
-
-Spin up a self-contained validation stack (logthing, generators, MinIO) to exercise the full data path.
-
-Requirements: Docker with Compose v2.
+## Development
 
 ```bash
-# from repo root
+cargo build            # debug build
+cargo test              # unit + integration tests
+```
+
+**End-to-end suite** (requires Docker with Compose v2) — builds the helper
+images, launches `tests/e2e/docker-compose.yml`, replays Windows event
+fixtures, emits syslog traffic, sends IPFIX flows, emits Zeek NDJSON logs,
+verifies throughput counters, and confirms Parquet files arrive in the MinIO
+bucket for each protocol. Containers shut down automatically once the
+generators and verifiers exit:
+
+```bash
 bash tests/e2e/simulation-environment/run.sh
 ```
 
-This script builds the helper images, launches `tests/e2e/docker-compose.yml`, replays Windows event fixtures, emits syslog traffic, sends IPFIX flows, emits Zeek NDJSON logs, verifies throughput counters, and confirms Parquet files arrive in the MinIO bucket for each protocol. Containers shut down automatically once the generators and verifiers exit.
+Performance tests are part of that same suite; see
+[tests/e2e/simulation-environment/performance-test/README.md](tests/e2e/simulation-environment/performance-test/README.md)
+for how to run and interpret them.
 
-### Performance Testing
-
-The E2E suite includes comprehensive performance tests:
-
-**Test Coverage:**
-- **Baseline Performance**: Maximum throughput measurement (~48k events/second)
-- **Target Rate Tests**: Sustained load at 100k, 200k, and 500k RPS targets
-- **10k Sustained Test**: 60-second test validating both ingestion and S3 parquet file generation (100MB file limit)
-
-```bash
-# Run specific performance test
-cd tests/e2e/simulation-environment
-docker compose up -d logthing-10k-sustained
-docker compose run --rm performance-test-10k-sustained
-
-# View performance test documentation
-cat tests/e2e/simulation-environment/performance-test/README.md
-```
-
-**Example Performance Test Output:**
-```
-Performance Test Results
-========================
-Total time: 60.07 seconds
-Events sent: 570,000
-Overall ingestion rate: 9489.41 events/second
-S3 files: 12 parquet files (20.93 MB total)
-Status: ✓ PASSED
-```
-
-## Test Coverage
-
-Generate coverage reports with [cargo-tarpaulin](https://github.com/xd009642/tarpaulin):
+**Coverage** with [cargo-tarpaulin](https://github.com/xd009642/tarpaulin):
 
 ```bash
 cargo install cargo-tarpaulin        # one-time tool install
 scripts/run_coverage.sh              # runs tests with instrumentation
 ```
 
-The helper script writes HTML and XML reports to `target/coverage/`, so you can open `target/coverage/tarpaulin-report.html` locally or feed the LCOV/XML data into CI.
+Writes HTML and XML reports to `target/coverage/` — open
+`target/coverage/tarpaulin-report.html` locally or feed the LCOV/XML data
+into CI.
 
-### Generic Event Parser Configuration
+See [AGENTS.md](AGENTS.md) for the full build/test/lint command reference and
+repository conventions.
 
-Add per-event parser definitions under `config/event_parsers/`. Each file contains a single event definition so you can mix and match without touching the others. For example, `config/event_parsers/4624_successful_logon.yaml`:
+## Documentation
 
-```yaml
-event_id: 4624
-name: "Successful Logon"
-description: "An account was successfully logged on"
-fields:
-  - name: "TargetUserName"
-    source: EventData
-    xpath: "Data[@Name='TargetUserName']"
-    required: true
-    type: string
-  - name: "LogonType"
-    source: EventData
-    xpath: "Data[@Name='LogonType']"
-    required: true
-    type: integer
-enrichments:
-  - field: "LogonType"
-    lookup_table:
-      "2": "Interactive"
-      "3": "Network"
-      "10": "RemoteInteractive"
-output_format: |
-  User {TargetUserName} logged on via {LogonType_Name}
-```
-
-> **Note:** The legacy aggregated `config/event_parsers.yaml` file format is still supported for backward compatibility, but the directory layout makes it easier to version and swap individual event definitions.
-
-The parser supports:
-- **Field Extraction**: Extract specific fields from EventData, System, RenderingInfo, or UserData sections
-- **Type Conversion**: Convert fields to string, integer, boolean, IP address, or GUID
-- **Enrichments**: Add lookup tables to enrich raw values (e.g., logon type codes to names)
-- **Message Formatting**: Generate custom output messages using field placeholders
-
-### Event Parser Coverage
-
-The repository ships example parsers for 50 high-value Windows Security events. Each file in `config/event_parsers/` matches one of the entries below:
-
-| Event ID | Description |
-| --- | --- |
-| 4624 | Successful Logon |
-| 4625 | Failed Logon |
-| 4634 | Logoff |
-| 4647 | User Initiated Logoff |
-| 4648 | Logon Using Explicit Credentials |
-| 4649 | Replay Attack Detected |
-| 4656 | Handle Requested |
-| 4657 | Registry Value Changed |
-| 4658 | Handle Closed |
-| 4660 | Object Deleted |
-| 4661 | Handle Requested for Object |
-| 4662 | Operation Performed on Object |
-| 4663 | Attempted Object Access |
-| 4670 | Permissions on Object Changed |
-| 4672 | Admin Logon |
-| 4673 | Privileged Service Called |
-| 4674 | Privileged Service Operation |
-| 4688 | Process Created |
-| 4689 | Process Terminated |
-| 4697 | Service Installed |
-| 4698 | Scheduled Task Created |
-| 4699 | Scheduled Task Deleted |
-| 4700 | Scheduled Task Enabled |
-| 4702 | Scheduled Task Updated |
-| 4719 | System Audit Policy Changed |
-| 4720 | User Account Created |
-| 4722 | User Account Enabled |
-| 4723 | Password Change Attempt |
-| 4724 | Password Reset Attempt |
-| 4725 | User Account Disabled |
-| 4726 | User Account Deleted |
-| 4727 | Global Group Created |
-| 4728 | Member Added to Global Group |
-| 4729 | Member Removed from Global Group |
-| 4730 | Global Group Deleted |
-| 4731 | Local Group Created |
-| 4732 | Member Added to Local Group |
-| 4733 | Member Removed from Local Group |
-| 4735 | Local Group Changed |
-| 4737 | Global Group Changed |
-| 4740 | Account Locked |
-| 4741 | Computer Account Created |
-| 4742 | Computer Account Changed |
-| 4743 | Computer Account Deleted |
-| 4756 | Member Added to Universal Group |
-| 4757 | Member Removed from Universal Group |
-| 4767 | Account Unlocked |
-| 4768 | Kerberos TGT Requested |
-| 4769 | Kerberos Service Ticket Requested |
-| 4770 | Kerberos Service Ticket Renewed |
-
-### Running
-
-```bash
-# Run with config file
-./logthing
-
-# Or with environment variables (note the double underscore)
-LOGTHING__BIND_ADDRESS=0.0.0.0:5985 LOGTHING__TLS__ENABLED=true ./logthing
-
-# For nested configuration values
-LOGTHING__SECURITY__MAX_CONNECTIONS=5000 LOGTHING__METRICS__PORT=8080 ./logthing
-
-# Every listener's bind port (and, except for syslog, its bind address) can
-# be overridden the same way — no code or config-file changes needed:
-LOGTHING__SYSLOG__UDP_PORT=5514 LOGTHING__SYSLOG__TCP_PORT=5601 ./logthing
-LOGTHING__IPFIX__UDP_PORT=14739 LOGTHING__IPFIX__BIND_ADDRESS=127.0.0.1 ./logthing
-LOGTHING__ZEEK__TCP_PORT=47760 LOGTHING__ZEEK__BIND_ADDRESS=127.0.0.1 ./logthing
-LOGTHING__SURICATA__TCP_PORT=47761 LOGTHING__SURICATA__BIND_ADDRESS=127.0.0.1 ./logthing
-LOGTHING__SFLOW__UDP_PORT=6343 LOGTHING__SFLOW__BIND_ADDRESS=127.0.0.1 ./logthing
-```
-
-Note: syslog has no `LOGTHING__SYSLOG__BIND_ADDRESS` — its listener always binds
-`0.0.0.0` (not configurable), unlike ipfix/zeek/suricata/sflow above.
-
-## Windows Client Configuration
-
-On each Windows host that will forward events:
-
-### 1. Enable WinRM
-```powershell
-Enable-PSRemoting -Force
-winrm quickconfig -q
-```
-
-### 2. Create Subscription (Source-Initiated)
-```powershell
-wecutil cs subscription.xml
-```
-
-Example `subscription.xml`:
-```xml
-<Subscription xmlns="http://schemas.microsoft.com/2006/03/windows/events/subscription">
-  <SubscriptionId>SecurityEvents</SubscriptionId>
-  <SubscriptionType>SourceInitiated</SubscriptionType>
-  <Description>Forward security events</Description>
-  <Enabled>true</Enabled>
-  <Uri>http://schemas.microsoft.com/wbem/wsman/1/windows/EventLog</Uri>
-  <ConfigurationMode>Custom</ConfigurationMode>
-  <Delivery Mode="Push">
-    <Batching>
-      <MaxItems>5</MaxItems>
-      <MaxLatencyTime>30000</MaxLatencyTime>
-    </Batching>
-    <PushSettings>
-      <Heartbeat Interval="900000"/>
-    </PushSettings>
-  </Delivery>
-  <Query>
-    <![CDATA[
-      <QueryList>
-        <Query Id="0" Path="Security">
-          <Select Path="Security">*</Select>
-        </Query>
-      </QueryList>
-    ]]>
-  </Query>
-  <ReadExistingEvents>true</ReadExistingEvents>
-  <TransportName>HTTPS</TransportName>
-  <ContentFormat>RenderedText</ContentFormat>
-  <Locale Language="en-US"/>
-  <LogFile>ForwardedEvents</LogFile>
-  <PublisherName>Microsoft-Windows-EventCollector</PublisherName>
-  <AllowedSourceNonDomainComputers></AllowedSourceNonDomainComputers>
-  <AllowedSourceDomainComputers>O:NSG:NSD:(A;;GA;;;DC)(A;;GA;;;NS)</AllowedSourceDomainComputers>
-</Subscription>
-```
-
-### 3. Configure Forwarder
-
-Set the collector server:
-```powershell
-winrm set winrm/config/client '@{TrustedHosts="your-logthing-ip"}'
-```
-
-## API Endpoints
-
-### WEF Endpoints
-- `POST /wsman` - Main WEF endpoint for subscriptions and events
-
-### Syslog Endpoints
-- `POST /syslog` - Receive syslog messages via HTTP
-- `GET /syslog/udp` - Get UDP listener configuration info
-- `GET /syslog/examples` - Get example DNS syslog records (JSON)
-
-### Management Endpoints
-- `GET /health` - Health check endpoint
-- `GET /metrics` - Prometheus metrics (port 9090)
-
-## Metrics
-
-The server exposes Prometheus metrics on port 9090:
-
-**Bind address (breaking change):** the metrics listener binds the same
-interface as the main server's `bind_address` (previously it always bound
-`0.0.0.0`, regardless of `bind_address`), and is gated by the same
-`security.allowed_ips` whitelist as the main HTTP router — it has no
-authentication of its own, so the whitelist is what restricts who can reach
-it. The TLS listener (`[tls]`) now follows `bind_address` the same way, for
-the same reason (it previously always bound `0.0.0.0` too, though it already
-carried the whitelist and auth layers).
-If you bind the main server to a narrow interface but scrape metrics from a
-different host, set `metrics.bind_address = "0.0.0.0"` explicitly to restore
-the old behaviour (see the `[metrics]` block above).
-
-**`allowed_ips` now also gates `/metrics` (breaking change):** there is no
-separate `metrics.allowed_ips` — `security.allowed_ips` is a single list
-that applies to wire-ingest sources *and* metrics scrapers alike. If you set
-`allowed_ips`, add your Prometheus (or other scraper's) address to the same
-list, or scraping will start returning 403 instead of timing out or being
-refused. Metrics has no auth of its own, so widening `allowed_ips` to admit
-a scraper also admits that source to every other listener it covers —
-there's no way to allow a scraper without also trusting it as a log source.
-
-Per-source ingest counters:
-
-- `syslog_messages_received`, `ipfix_datagrams_received`, `ipfix_flows_decoded`,
-  `sflow_datagrams_received`, `suricata_records_received`, `hec_events_received`,
-  `otlp_logs_received`
-- Decode/parse failures: `ipfix_decode_errors`, `sflow_decode_errors`,
-  `suricata_parse_errors`, `hec_parse_errors`, `wef_xml_parse_errors` - a WEF
-  batch's XML failed to parse past a given event; that event is kept as its
-  own raw event and parsing resumes at the next one, so it doesn't cost the
-  rest of the batch
-
-Parquet persistence (labelled `source="wef"|"syslog"|"ipfix"|"zeek"|"suricata"|"sflow"|"hec"|"otlp"`):
-
-- `parquet_s3_records_written`, `parquet_s3_uploads`, `parquet_s3_upload_errors`
-- `parquet_s3_dropped`, `parquet_s3_buffer_dropped` - backpressure drops
-- `parquet_s3_records_skipped` - a record the writer could not convert into a
-  batch (schema mismatch, a mapping failure, or an unparsed event), also
-  labelled `target`
-- `parquet_s3_buffer_rows`, `parquet_s3_channel_queued`, `parquet_s3_channel_available`
-
-Aggregation: `aggregate_records_consumed`, `aggregate_rows_emitted`, `aggregate_groups`,
-`aggregate_overflow_records`.
-
-Listener health: `listener_accept_errors` (labelled `protocol="syslog_tcp"|"zeek"|"suricata"`)
-- TCP accept errors on that listener; a persistent condition (e.g. fd
-  exhaustion) pauses that listener's accept loop for 1s per error instead of
-  spinning.
-
-Counters are exported with a `_total` suffix by the Prometheus exporter.
-
-## Architecture
-
-```
-                    ┌─────────────────────────────────────┐
-                    │            logthing                 │
-  Windows Hosts →   │  ┌─────────┐  ┌─────────────────┐  │   → S3 (Parquet)
-      (HTTPS)       │  │  WEF    │  │  Syslog Parser  │  │
-                    │  │Handler  │  │  (RFC 3164/5424)│  │
-                    │  └────┬────┘  └────────┬────────┘  │
-                    │       │                │           │
-                    │       ↓                ↓           │
-                    │  ┌─────────────────────────────┐   │
-                    │  │   Event Processors          │   │
-                    │  │   - Parser                  │   │
-                    │  │   - DNS Log Parser          │   │
-                    │  └──────────────┬──────────────┘   │
-                    │                 │                  │
-                    │       ┌─────────┴─────────┐        │
-                    │       ↓                   ↓        │
-                    │  ┌──────────┐        ┌──────────┐  │
-                    │  │ Prometheus│       │ Parquet  │  │
-                    │  │ Metrics   │       │ S3 Store │  │
-                    │  └──────────┘       └────┬─────┘  │
-                    └──────────────────────────┼─────────┘
-                                               ↓
-                                          S3 Storage
-```
-
-## Security Considerations
-
-1. **Use TLS**: Always enable TLS in production
-2. **IP Whitelisting**: Restrict to known Windows host IP ranges
-3. **Client Certificates**: Configure mTLS for additional security
-4. **Firewall**: Open only port 5985/5986 between hosts
-5. **Least Privilege**: Run server with minimal permissions
-
-### Live vs. restart-required config changes
-
-Every configuration field is restart-required now. Configuration is set with
-`LOGTHING__*` environment variables layered over `logthing.toml` and
-`/etc/logthing/config` — environment variables win — and a change in either
-place only takes effect on the next process restart. The admin interface
-(`docs/admin-security.md`) is read-only: it shows the effective config and
-which `LOGTHING__*` variable names are set, but has no endpoint that writes
-configuration, so there is no live-apply path left.
-
-This wasn't always true. Before the admin write endpoints (`PUT /config`,
-`POST /config/reload`, `POST /config/import`) were removed, a handful of
-authentication and access-control fields applied live, with no restart, to
-let an operator react during an incident:
-
-| Field | Previously live? | Applied to |
-|---|---|---|
-| `hec.token` | Yes | `/services/collector/event`, `/services/collector/raw`, `/ingest` |
-| `syslog.http_token` | Yes | `POST /syslog` |
-| `otlp.bearer_token` | Yes | `POST /v1/logs` |
-| `security.allowed_ips` | Yes | Main HTTP router, `/metrics`, and all five wire-protocol listeners (syslog, IPFIX, sFlow, Zeek, Suricata) |
-| `*.flush_interval_secs` | Yes | Already-running Parquet writers |
-
-All five now require a restart, same as everything else. Operators who
-relied on rotating `hec.token`/`syslog.http_token`/`otlp.bearer_token` or
-updating `security.allowed_ips` without a restart need to change their
-process to restart after the config change. `security.allowed_ips` and
-`aggregate.rules` additionally have no `LOGTHING__*` equivalent at all and
-must be set in a file — see "Configuration Sources" above.
+- [docs/configuration.md](docs/configuration.md) — full `logthing.toml` reference, config sources/precedence, environment variable overrides, and live-vs-restart-required settings
+- [docs/wef.md](docs/wef.md) — Kerberos client authentication, Active Directory setup, Windows client (WEF) configuration, WEF S3 persistence, the generic event parser, and event parser coverage
+- [docs/syslog.md](docs/syslog.md) — syslog listener, HTTP endpoint, DNS log parsing, and syslog S3 persistence
+- [docs/ipfix.md](docs/ipfix.md) — IPFIX/NetFlow ingestion and S3 persistence
+- [docs/zeek.md](docs/zeek.md) — Zeek NDJSON ingestion, typed per-stream schemas, and S3 persistence
+- [docs/aggregation.md](docs/aggregation.md) — log aggregation rules and output schema
+- [docs/iceberg.md](docs/iceberg.md) — Iceberg descriptor output and a suggested committer/catalog deployment pattern
+- [docs/deployment.md](docs/deployment.md) — host tuning for UDP ingest and security considerations
+- [docs/metrics.md](docs/metrics.md) — Prometheus metrics and the full API endpoint list
+- [docs/admin.md](docs/admin.md) — read-only admin web interface
 
 ## License
 
