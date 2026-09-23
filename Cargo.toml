@@ -152,6 +152,11 @@ pprof = { version = "0.14", default-features = false, features = [
 tempfile = "3.9"
 metrics-util = { version = "0.16", features = ["debugging"] }
 criterion = "0.5"
+# `start_paused = true` on `#[tokio::test]` (src/net.rs's AcceptBackoff
+# cancel-safety tests) needs tokio's virtual clock. Additive to the
+# `features = ["full"]` main dependency and dev-only, so it does not reach
+# the musl release binary.
+tokio = { version = "1.35", features = ["test-util"] }
 
 [[bench]]
 name = "zeek_conn_batch_amortization"

@@ -261,6 +261,11 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
         "listener_source_rejected",
         "Inbound datagrams or connections rejected because the source IP is not in the listener whitelist, labelled by protocol.",
     ),
+    (
+        Kind::Counter,
+        "listener_accept_errors",
+        "TCP accept errors per listener; non-per-connection errors (e.g. fd exhaustion) pause accepts for 1s.",
+    ),
     // ── stats ─────────────────────────────────────────────────────────────
     (
         Kind::Counter,

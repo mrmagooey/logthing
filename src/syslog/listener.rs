@@ -398,6 +398,10 @@ impl SyslogListener {
             let mut socket_stats = crate::net::SocketDropStats::new(&udp_socket, "syslog_udp");
             let mut socket_stats_ticker =
                 tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
+            // Shared across both loops below -- only one of the two ever
+            // runs per process (recv_batch_size <= 1 returns early), so one
+            // instance is enough to cover the TCP accept arm in either.
+            let mut accept_backoff = crate::net::AcceptBackoff::new("syslog_tcp");
 
             if self.config.recv_batch_size <= 1 {
                 let mut buf = vec![0u8; 65535];
@@ -433,7 +437,7 @@ impl SyslogListener {
                             }
                         }
                         // TCP accept arm
-                        result = tcp_listener.accept() => {
+                        result = accept_backoff.accept(&tcp_listener) => {
                             match result {
                                 Ok((stream, src)) => {
                                     if !self.allowed_ips.is_allowed(&src) {
@@ -538,7 +542,7 @@ impl SyslogListener {
                         }
                     }
                     // TCP accept arm
-                    result = tcp_listener.accept() => {
+                    result = accept_backoff.accept(&tcp_listener) => {
                         match result {
                             Ok((stream, src)) => {
                                 if !self.allowed_ips.is_allowed(&src) {
@@ -754,9 +758,10 @@ impl SyslogListener {
         info!("Syslog TCP listener started on {}", bound);
 
         let semaphore = Arc::new(Semaphore::new(MAX_SYSLOG_TCP_CONNECTIONS));
+        let mut accept_backoff = crate::net::AcceptBackoff::new("syslog_tcp");
 
         loop {
-            match listener.accept().await {
+            match accept_backoff.accept(&listener).await {
                 Ok((stream, src)) => {
                     if !self.allowed_ips.is_allowed(&src) {
                         metrics::counter!("listener_source_rejected", "protocol" => "syslog_tcp")
@@ -1026,9 +1031,10 @@ async fn syslog_tcp_accept_loop(
     idle_timeout: Duration,
     cardinality: Vec<Arc<CardinalityWatcher>>,
 ) {
+    let mut accept_backoff = crate::net::AcceptBackoff::new("syslog_tcp");
     loop {
         tokio::select! {
-            result = listener.accept() => {
+            result = accept_backoff.accept(&listener) => {
                 match result {
                     Ok((stream, src)) => {
                         if !allowed_ips.is_allowed(&src) {

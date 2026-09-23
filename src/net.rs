@@ -506,9 +506,133 @@ impl SocketDropStats {
     }
 }
 
+// ---------------------------------------------------------------------------
+// TCP accept backoff (Task 4)
+// ---------------------------------------------------------------------------
+//
+// Errors like EMFILE leave a `TcpListener` readable, so a naive
+// `loop { listener.accept().await }` re-polls the same error immediately: a
+// 100% CPU spin with a log line per iteration. A plain `sleep` in the `Err`
+// arm would fix the standalone-loop sites, but four of the eight accept
+// sites put the accept inside a `tokio::select!` alongside other arms
+// (syslog's UDP receive, the shutdown signal) -- sleeping there would block
+// those other arms too. Instead the pause lives inside `AcceptBackoff`'s own
+// `accept` future, which `select!` is free to drop and re-poll without
+// losing the pause (see the cancel-safety doc comment below).
+
+/// Pause before the next `accept` after a non-per-connection accept error.
+pub const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
+
+/// `TcpListener::accept` wrapper that stops a listener spinning on a
+/// persistent accept error.
+///
+/// Errors like EMFILE leave the listener readable, so re-polling `accept()`
+/// returns the same error at once: a 100% CPU loop with a log line per spin.
+/// After such an error the next `accept` first waits out
+/// [`ACCEPT_ERROR_BACKOFF`]. Per-connection errors (refused/aborted/reset)
+/// don't pause, matching `axum::serve`.
+///
+/// Cancel-safe: the pause is cleared only after its sleep completes, so a
+/// `select!` that drops this future mid-pause resumes the same pause on the
+/// next call, while the other arms (UDP receive, shutdown) stay live.
+#[derive(Debug)]
+pub struct AcceptBackoff {
+    protocol: &'static str,
+    paused_until: Option<tokio::time::Instant>,
+}
+
+impl AcceptBackoff {
+    /// `protocol` labels `listener_accept_errors`; use the same value as the
+    /// site's `listener_source_rejected` label.
+    pub fn new(protocol: &'static str) -> Self {
+        Self {
+            protocol,
+            paused_until: None,
+        }
+    }
+
+    /// Accept one connection, honouring any pending pause first.
+    pub async fn accept(
+        &mut self,
+        listener: &tokio::net::TcpListener,
+    ) -> io::Result<(tokio::net::TcpStream, SocketAddr)> {
+        if let Some(until) = self.paused_until {
+            tokio::time::sleep_until(until).await;
+            self.paused_until = None;
+        }
+        let result = listener.accept().await;
+        if let Err(e) = &result {
+            metrics::counter!("listener_accept_errors", "protocol" => self.protocol).increment(1);
+            if !is_connection_error(e) {
+                self.paused_until = Some(tokio::time::Instant::now() + ACCEPT_ERROR_BACKOFF);
+            }
+        }
+        result
+    }
+}
+
+/// Per-connection errors (a peer that reset/aborted/refused before or during
+/// the handshake) don't indicate a stuck listener and get no pause -- same
+/// policy as `axum::serve`/hyper. Anything else (EMFILE, ENFILE, ...) does.
+fn is_connection_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_connection_error_matches_per_connection_kinds_only() {
+        use std::io::{Error, ErrorKind};
+        for k in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+        ] {
+            assert!(is_connection_error(&Error::from(k)));
+        }
+        assert!(!is_connection_error(&Error::from_raw_os_error(
+            libc::EMFILE
+        )));
+        assert!(!is_connection_error(&Error::from_raw_os_error(
+            libc::ENFILE
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accept_backoff_pause_survives_cancellation() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut b = AcceptBackoff::new("test");
+        b.paused_until = Some(tokio::time::Instant::now() + ACCEPT_ERROR_BACKOFF);
+        // Cancelled mid-pause (as a select! would): pause must persist.
+        let r = tokio::time::timeout(Duration::from_millis(500), b.accept(&l)).await;
+        assert!(r.is_err(), "accept must still be paused");
+        assert!(
+            b.paused_until.is_some(),
+            "a dropped future must not clear the pause"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accept_backoff_pause_does_not_block_other_select_arms() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut b = AcceptBackoff::new("test");
+        b.paused_until = Some(tokio::time::Instant::now() + ACCEPT_ERROR_BACKOFF);
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        tx.send(true).unwrap();
+        let start = tokio::time::Instant::now();
+        tokio::select! {
+            _ = b.accept(&l) => panic!("accept must not win while paused"),
+            _ = rx.changed() => {}
+        }
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
 
     fn recv_buffer_size(socket: &UdpSocket) -> usize {
         socket2::SockRef::from(socket).recv_buffer_size().unwrap()
