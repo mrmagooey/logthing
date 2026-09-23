@@ -3665,7 +3665,7 @@ event_parsers:
     }
 
     // ------------------------------------------------------------------ //
-    // HEC routes registered only when hec.enabled                         //
+    // HEC routes registered only when hec.enabled                        //
     // These exercise the REAL create_router path, not the isolated helper.//
     // ------------------------------------------------------------------ //
 
@@ -4079,7 +4079,7 @@ event_parsers:
     }
 
     // ------------------------------------------------------------------ //
-    // OTLP handler tests                                                  //
+    // OTLP handler tests                                                 //
     // ------------------------------------------------------------------ //
 
     #[cfg(feature = "otlp")]

@@ -29,8 +29,8 @@ echo 'net.core.rmem_max=16777216' | sudo tee /etc/sysctl.d/60-logthing.conf
 Measured impact: at 40,000 syslog messages/s on a host with the stock 208 KiB
 limit, ~16.8% of datagrams were lost in the kernel socket — with zero drops
 recorded inside logthing, because those messages never arrived. This loss is
-invisible to `parquet_s3_dropped`; watch `syslog_socket_drops` and
-`syslog_socket_rx_queue_bytes` instead, which are read per-socket from
+invisible to `parquet_s3_dropped`; watch `syslog_udp_socket_drops` and
+`syslog_udp_socket_rx_queue_bytes` instead, which are read per-socket from
 `/proc/net/udp`.
 
 To decline the larger buffer entirely and keep the OS default, set

@@ -57,6 +57,8 @@ Counters are exported with a `_total` suffix by the Prometheus exporter.
 
 ### WEF Endpoints
 - `POST /wsman` - Main WEF endpoint for subscriptions and events
+- `POST /wsman/subscriptions` - WEF subscription requests
+- `POST /wsman/events` - WEF event delivery
 
 ### Syslog Endpoints
 - `POST /syslog` - Receive syslog messages via HTTP
@@ -74,4 +76,5 @@ Counters are exported with a `_total` suffix by the Prometheus exporter.
 
 ### Management Endpoints
 - `GET /health` - Health check endpoint
+- `GET /stats/throughput` - Ingest throughput statistics (JSON)
 - `GET /metrics` - Prometheus metrics (port 9090)

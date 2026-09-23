@@ -1122,7 +1122,7 @@ mod tests {
         );
     }
 
-    /// A coverage gap review found directly: the two tests above
+    /// A coverage-gap review identified this directly: the two tests above
     /// both pin `recv_tasks = 1`, so they only ever exercise the batched arm
     /// inside `start_with_shutdown`'s inline loop, never `sflow_recv_loop` (the
     /// `recv_tasks > 1` fan-out function) -- the combined `recv_tasks > 1` AND

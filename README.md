@@ -52,6 +52,11 @@ format = "json"
 enabled = true
 udp_port = 514
 tcp_port = 601
+
+# TLS is on by default and then requires cert_file/key_file; disable it for a
+# first local run, and see docs/configuration.md before going to production.
+[tls]
+enabled = false
 ```
 
 See [docs/configuration.md](docs/configuration.md) for the full option set
@@ -63,36 +68,36 @@ environment variable overrides, and which settings are restart-only).
 ```bash
 ./logthing
 # or, with environment variable overrides:
-LOGTHING__BIND_ADDRESS=0.0.0.0:5985 LOGTHING__TLS__ENABLED=true ./logthing
+LOGTHING__BIND_ADDRESS=0.0.0.0:5985 LOGTHING__LOGGING__LEVEL=debug ./logthing
 ```
 
 ## Architecture
 
 ```
-Ingest sources                        logthing                      Output
-───────────────                ───────────────────────          ──────────────
-Windows Hosts (WEF/HTTPS) ─┐
-Syslog (UDP/TCP/HTTP)      ─┤
-IPFIX / NetFlow (UDP)      ─┤   ┌────────────────────┐
-Zeek NDJSON (TCP)          ─┼──▶│  Per-source socket/ │
-Suricata EVE JSON (TCP)    ─┤   │  HTTP listeners +   │
-sFlow v5 (UDP)             ─┤   │  parsers            │
-HEC (Splunk-compatible)    ─┤   └──────────┬──────────┘
-OTLP logs (HTTP)           ─┘              │
-                                            ▼
-                                ┌────────────────────────┐
-                                │  optional aggregation   │
-                                │  (SQL GROUP BY-style)   │
-                                └────────────┬────────────┘
-                                             ▼
-                                ┌────────────────────────┐
-                                │     Parquet writers     │──▶ S3 (S3-compatible)
-                                │ (+ optional Iceberg     │──▶ local disk
-                                │    descriptors)         │
-                                └────────────────────────┘
+Ingest sources                   logthing                         Output
 
-                       Prometheus metrics exposed on :9090 (/metrics),
-                       covering every stage from ingest through write.
+Windows Hosts (WEF/HTTPS) ─┐
+Syslog (UDP/TCP/HTTP)     ─┤
+IPFIX / NetFlow (UDP)     ─┤   ┌──────────────────────────┐
+Zeek NDJSON (TCP)         ─┼──▶│   listeners + parsers    │
+Suricata EVE JSON (TCP)   ─┤   │     (one per source)     │
+sFlow v5 (UDP)            ─┤   └────────────┬─────────────┘
+HEC (Splunk-compatible)   ─┤                │
+OTLP logs (HTTP)          ─┘                ▼
+                               ┌──────────────────────────┐
+                               │   optional aggregation   │
+                               │   (SQL GROUP BY-style;   │
+                               │ zeek, suricata, syslog,  │
+                               │    ipfix, sflow only)    │
+                               └────────────┬─────────────┘
+                                            ▼
+                               ┌──────────────────────────┐
+                               │     Parquet writers      │──▶ S3 (S3-compatible)
+                               │   (+ optional Iceberg    │──▶ local disk
+                               │       descriptors)       │
+                               └──────────────────────────┘
+
+Prometheus metrics on :9090 (/metrics) cover every stage from ingest to write.
 ```
 
 ## Container Image / Releases
