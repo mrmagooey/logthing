@@ -85,6 +85,40 @@ async fn wait_for_metrics(client: &reqwest::Client, url: &str, deadline: Instant
     }
 }
 
+/// Poll `/metrics` until unlabelled counter `name` reads at least `min`, or
+/// panic with the last scrape body once `deadline` passes. Used in place of
+/// a fixed sleep to know the template set was actually decoded and cached
+/// before the data set (which depends on it) is sent.
+async fn wait_for_counter_at_least(
+    client: &reqwest::Client,
+    url: &str,
+    name: &str,
+    min: u64,
+    deadline: Instant,
+) {
+    loop {
+        let rendered = client
+            .get(url)
+            .send()
+            .await
+            .expect("scrape metrics")
+            .text()
+            .await
+            .expect("read metrics body");
+        let value = logthing::profiling::parse_counter(&rendered, name);
+        if value.is_some_and(|v| v >= min) {
+            return;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "timed out waiting for {name} >= {min} on {url}, got {value:?}\n\
+                 full metrics dump:\n{rendered}"
+            );
+        }
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// IPFIX message #1: a template set declaring template 256 with one
 /// variable-length field (IE 97 -- not in `ie_info`'s curated table).
 /// Message header (16) + template set (12) = 28 bytes total.
@@ -169,7 +203,16 @@ udp_port = {ipfix_port}
     let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let ipfix_addr: SocketAddr = format!("127.0.0.1:{ipfix_port}").parse().unwrap();
     sender.send_to(TEMPLATE_MSG, ipfix_addr).await.unwrap();
-    sleep(Duration::from_millis(100)).await;
+    // Wait for the template to actually be decoded and cached, rather than
+    // a fixed sleep, before sending the data set that depends on it.
+    wait_for_counter_at_least(
+        &metrics_client,
+        &metrics_url,
+        "ipfix_templates_received",
+        1,
+        deadline,
+    )
+    .await;
     sender.send_to(DATA_MSG, ipfix_addr).await.unwrap();
 
     // Poll /metrics until ipfix_flows_decoded >= 2 (deadline 15s).
