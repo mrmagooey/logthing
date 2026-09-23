@@ -1,5 +1,7 @@
 //! E2E: a Zeek sensor outrunning the writer must be back-pressured over TCP,
-//! not silently dropped (spec §6).
+//! not silently dropped -- proven by zero `parquet_s3_dropped` and the
+//! client's own socket writes blocking, showing backpressure reached the
+//! wire rather than being absorbed silently.
 //!
 //! Wires a REAL `ZeekListener` on an ephemeral port, a real `ZeekSink`, a
 //! real `ParquetWriterHandle<ZeekSink>` (the `send_or_drop` code under
@@ -92,8 +94,8 @@ use logthing::zeek::listener::{ZeekHandler, ZeekListener, ZeekListenerConfig};
 /// `examples/flush_decoupling_benchmark.rs`'s `DelayUploadSink`. The delay
 /// alone does not fill the writer's channel (flushes run off the drain
 /// loop's critical path) -- it's here so a flush is genuinely in flight
-/// during the send burst, matching the real-world scenario the spec (§6)
-/// describes rather than a channel that's artificially never flushed.
+/// during the send burst, matching the real-world scenario rather than a
+/// channel that's artificially never flushed.
 struct SlowSink {
     delay: Duration,
 }

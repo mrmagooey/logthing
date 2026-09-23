@@ -185,13 +185,12 @@ async fn flush_count_tracks_real_bytes_not_batch_count() {
     join_handle.await.expect("writer task must not panic");
 }
 
-/// Companion check named directly in the plan's success criteria: fixing
-/// the over-counting direction must not silently introduce the opposite
-/// bug (under-counting bytes so a buffer grows unbounded until the
-/// row-cap hard-evicts it). `parquet_s3_buffer_dropped` is the hard-cap
-/// eviction counter -- distinct from `parquet_s3_dropped` (channel-full
-/// drops) -- and must stay at 0 across a run that never approaches the
-/// (very high) row cap configured here.
+/// Companion check: fixing the over-counting direction must not silently
+/// introduce the opposite bug (under-counting bytes so a buffer grows
+/// unbounded until the row-cap hard-evicts it). `parquet_s3_buffer_dropped`
+/// is the hard-cap eviction counter -- distinct from `parquet_s3_dropped`
+/// (channel-full drops) -- and must stay at 0 across a run that never
+/// approaches the (very high) row cap configured here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn buffer_dropped_stays_zero_under_real_byte_accounting() {
     use metrics::set_default_local_recorder;

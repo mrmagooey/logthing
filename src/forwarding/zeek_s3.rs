@@ -158,8 +158,7 @@ impl ParquetSink for ZeekSink {
     /// log path, not just `conn` -- cheaper than the default for all 7
     /// schemas, and the only correct option for `conn` specifically, whose
     /// amortized `ConnAccumulator` must never pay for a `to_record_batch`
-    /// call it doesn't need (see the design doc's amortized-builder-path
-    /// note).
+    /// call it doesn't need.
     ///
     /// Returning `(day, None)` -- not `(day, Some(batch))` -- is load
     /// bearing: `push()` calls this before it knows whether a record goes

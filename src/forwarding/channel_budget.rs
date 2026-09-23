@@ -271,7 +271,7 @@ pub const SFLOW_RECORD_BYTES: usize = 8960;
 /// flows-per-datagram: it is variable, and this uses a representative count
 /// from the repo's IPFIX test fixtures, so datagrams denser than that
 /// average will still push this source past `CHANNEL_BUDGET_BYTES`. Known
-/// and accepted limitation — see the spec §4.3.
+/// and accepted limitation.
 pub const IPFIX_DATAGRAM_BYTES: usize = 9216;
 
 /// Measured footprint of one `Arc<WindowsEvent>` — the **pointee**, not the

@@ -714,11 +714,12 @@ impl Server {
             .route("/syslog/examples", get(handle_syslog_examples));
 
         // HEC / NDJSON ingest routes are registered ONLY when `hec.enabled` is
-        // true. Per the plan's global constraint, a default deployment (hec
-        // disabled) must see zero behavior change: these routes stay unmounted
-        // and 404, exactly as before this unit. When enabled, they are mounted
-        // BEFORE the .layer() calls below so they inherit the same IP-whitelist
-        // and body-limit middleware as the existing protected routes.
+        // true. Every new config section defaults to disabled, so a default
+        // deployment (hec disabled) must see zero behavior change: these
+        // routes stay unmounted and 404, exactly as before. When enabled,
+        // they are mounted BEFORE the .layer() calls below so they inherit
+        // the same IP-whitelist and body-limit middleware as the existing
+        // protected routes.
         if self.config.hec.enabled {
             protected_router = protected_router
                 .route("/services/collector/event", post(handle_hec_event))
@@ -729,7 +730,7 @@ impl Server {
         // OTLP log ingest route — registered ONLY when the `otlp` feature is
         // compiled in AND `config.otlp.enabled` is true.  A default deployment
         // (otlp disabled) sees zero behavior change: /v1/logs stays unmounted
-        // and returns 404, matching the plan's global constraint.  When enabled
+        // and returns 404, same convention as HEC above.  When enabled
         // the route is added BEFORE .layer() so it inherits the same IP-whitelist
         // and body-limit middleware as the other protected routes.
         #[cfg(feature = "otlp")]
@@ -4420,9 +4421,10 @@ event_parsers:
     // ------------------------------------------------------------------ //
     // Kerberos SPNEGO middleware                                         //
     //                                                                    //
-    // There is no KDC or keytab in this test environment (by design —    //
-    // see the plan), so only the paths that never need a real GSSAPI     //
-    // exchange are covered here:                                        //
+    // There is no KDC or keytab in this test environment (deliberate:    //
+    // a full KDC harness was cut as disproportionate, since this sim     //
+    // env isn't invoked by any CI workflow), so only the paths that      //
+    // never need a real GSSAPI exchange are covered here:                //
     //   * `classify_negotiate_header` — pure, GSSAPI-free header parsing //
     //   * missing header / wrong scheme / malformed base64 — all three  //
     //     short-circuit in the middleware before any GSSAPI call runs   //

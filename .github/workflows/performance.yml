@@ -70,7 +70,7 @@ jobs:
           # logthing.toml, so its checked-in udp_port = 514 / tcp_port = 601 /
           # bind_address = "127.0.0.1:9999" would silently override the
           # baseline config below. Remove it so the baseline config actually
-          # takes effect -- see Task 10's manual workaround for this same trap.
+          # takes effect.
           rm -f logthing.admin.toml
           cp tools/loadgen/ci/logthing-baseline.toml ./logthing.toml
           ./target/profiling/logthing &

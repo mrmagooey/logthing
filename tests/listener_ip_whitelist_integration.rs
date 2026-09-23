@@ -5,7 +5,8 @@
 //! router (`Server::create_router`) — the five socket listeners (syslog
 //! UDP+TCP, IPFIX UDP, sFlow UDP, Zeek TCP, Suricata TCP) performed no
 //! source filtering at all. This test drives two of the five listeners
-//! (syslog TCP and IPFIX UDP — one TCP, one UDP, per the plan) over real
+//! (syslog TCP and IPFIX UDP — one TCP, one UDP, as the integration-tier
+//! representative pair; unit tests cover all five individually) over real
 //! sockets, via each listener's public `start_with_shutdown` entry point
 //! (the same one `main.rs` calls), and asserts that a source outside
 //! `allowed_ips` never reaches the handler while a source inside it does.

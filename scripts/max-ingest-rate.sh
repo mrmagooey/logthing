@@ -201,9 +201,9 @@ SRV_CPUS="${SRV_CPUS:-4-11}"
 # all still pinned to GEN_CPUS, lets the harness reach past a single
 # process's own ceiling. Default 1 keeps today's behaviour unchanged.
 GEN_PROCS="${GEN_PROCS:-1}"
-# See design doc §6.3: passing requires median total loss <= LOSS_BUDGET
-# (percent) AND the generator achieving >= ACHIEVED_FLOOR_PCT of target in
-# every run; classify_run checks the latter first (see its own comment).
+# Passing requires median total loss <= LOSS_BUDGET (percent) AND the
+# generator achieving >= ACHIEVED_FLOOR_PCT of target in every run;
+# classify_run checks the latter first (see its own comment).
 LOSS_BUDGET="${LOSS_BUDGET:-0.1}"
 
 resolve_format || exit 1
@@ -764,7 +764,7 @@ measure_rate() {
 }
 
 # RATE set -> fixed-rate mode (reproduces the old repeat-ipfix harness and
-# the Task 6 reproduce commands, which pass RATE= explicitly and keep
+# any prior reproduce commands that pass RATE= explicitly, which keep
 # working unchanged). RATE unset -> ramp mode: coarse-double then bisect to
 # this format's ceiling.
 if [ -n "${RATE:-}" ]; then

@@ -764,7 +764,10 @@ const CHANNEL_GAUGE_INTERVAL: Duration = Duration::from_secs(1);
 /// "invisible" to `drop_oldest_to_cap`'s hard-cap enforcement at any given
 /// instant (small relative to the default hard cap of
 /// `max_buffer_rows.saturating_mul(4)` = 400,000 at the 100,000-row
-/// default). See the design doc's "BUILDER_BATCH_ROWS" section.
+/// default). Chosen as a tuning parameter without empirical grounding
+/// (medium confidence) -- reasonable now that the hard-cap enforcement
+/// bugs it depends on are fixed; easy to revisit since it is a private
+/// constant, not a stability-sensitive public API.
 const BUILDER_BATCH_ROWS: usize = 1000;
 
 /// Outcome of a background flush task (see `encode_and_upload`), reported
@@ -1008,7 +1011,10 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 Ok(true) => {
                     // Accepted into the live builder. row_count is exact and
                     // immediate; byte_count is deliberately deferred to
-                    // materialization time (see design doc §5).
+                    // materialization time -- a bounded trade-off: the
+                    // byte-threshold flush trigger can under-fire by up to
+                    // BUILDER_BATCH_ROWS-1 records' worth of bytes, delaying
+                    // (never skipping) a byte-triggered flush.
                     //
                     // Derived as a delta rather than assumed to be 1: a
                     // `Record` need not be exactly one row (e.g. a future
@@ -1099,7 +1105,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
 
         // Bound the live builder's own size independent of any flush, so
         // drop_oldest_to_cap always has fine-enough-grained entries to trim
-        // under sustained backpressure (see design doc §3).
+        // under sustained backpressure.
         if buf.live_builder.as_ref().map(|b| b.len()).unwrap_or(0) >= BUILDER_BATCH_ROWS {
             Self::materialize_live_builder(buf);
         }
@@ -1546,8 +1552,10 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
     /// entry, exactly as if that many single-row batches had been pushed
     /// via the non-amortized path. Called defensively from every code path
     /// that reads or takes `buf.buffer` for a flush or hard-cap decision --
-    /// see the design doc's materialization audit table for the full list
-    /// of call sites and why each one needs this.
+    /// `drop_oldest_to_cap`, `try_flush_partition_async`, and `flush_all`
+    /// each call this first, chosen as a single shared fix after separate
+    /// review rounds each found a different previously-unpatched call site
+    /// reaching the same class of bug.
     fn materialize_live_builder(buf: &mut PartitionBuffer<S::Record>) {
         if let Some(builder) = buf.live_builder.as_mut()
             && !builder.is_empty()
@@ -1578,7 +1586,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
 /// decoupled from the writer's channel-draining loop.
 ///
 /// Acquires `semaphore` INSIDE this function, never before calling it —
-/// this is load-bearing once this is called from a spawned task (Task 2):
+/// this is load-bearing once this is called from a spawned task:
 /// acquiring the permit in the *caller* (the main `select!` loop) would
 /// block that loop the instant the semaphore saturates, reintroducing the
 /// exact bug this change fixes.
@@ -1886,7 +1894,7 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
             // It used to ride on `ticker`, whose period is
             // `flush_check_interval(flush_interval)` -- 900s at every source's
             // default `flush_interval_secs`, which makes a queue-depth alert
-            // useless (the spec recommends alerting on this gauge). One
+            // useless (operators are expected to alert on this gauge). One
             // timer wakeup per second per writer is cheap; sampling it on the
             // `recv` arm instead would be per-record work in the hot loop and
             // would freeze the gauge at its last value whenever traffic stops,
@@ -2058,7 +2066,10 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
     /// per-connection task from reading its socket, which closes the TCP
     /// window and pushes the queue back to the sender. Only use it from a task
     /// that owns a single connection — never from a task shared across
-    /// connections or transports (see the spec's §3.1 note on syslog).
+    /// connections or transports: syslog's UDP `recv_from` arm and TCP accept
+    /// arm share one task, so blocking there would stall UDP reception (where
+    /// blocking buys nothing, the kernel drops datagrams regardless) and TCP
+    /// accepts together.
     ///
     /// On timeout or a closed channel the record is dropped and
     /// `parquet_s3_dropped{source,target}` is incremented, exactly as

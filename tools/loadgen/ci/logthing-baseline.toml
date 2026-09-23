@@ -3,8 +3,8 @@
 # variables that are not what this measures.
 #
 # udp_port is 15514, NOT the real default 514: binding <1024 requires root,
-# and this file is also used by the CI job in Task 12, whose runner does not
-# have that privilege.
+# and this file is also used by the performance.yml CI job, whose runner
+# does not have that privilege.
 bind_address = "0.0.0.0:5985"
 
 [tls]

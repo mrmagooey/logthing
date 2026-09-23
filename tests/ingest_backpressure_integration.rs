@@ -1,4 +1,5 @@
-//! Integration coverage for bounded-wait ingest sends (spec §3).
+//! Integration coverage for bounded-wait ingest sends (TCP-framed sources'
+//! backpressure: zeek and suricata).
 //!
 //! Construction pattern follows `tests/zeek_local_integration.rs`: a real
 //! `tempfile::TempDir`, `ZeekLocalConfig`, `zeek_local_start`, and
@@ -306,7 +307,7 @@ async fn wedged_writer_drops_after_the_timeout() {
 }
 
 /// Fan-out latency should be `max()` across destinations, not `sum()`: with
-/// concurrent fan-out (Task 5), the whole batch should take roughly as long
+/// concurrent fan-out, the whole batch should take roughly as long
 /// as one handler alone, not both back to back. Both handlers here sleep
 /// 200ms per record -- if only one carried latency, sequential and
 /// concurrent fan-out would take the same total time regardless of which
@@ -366,7 +367,7 @@ async fn fan_out_latency_should_be_max_not_sum_across_destinations() {
     assert!(
         elapsed < midpoint,
         "expected elapsed ({elapsed:?}) closer to the concurrent bound ({concurrent_bound:?}) \
-         than the serial bound ({serial_bound:?}) -- this requires Task 5's concurrent fan-out"
+         than the serial bound ({serial_bound:?}) -- this requires concurrent fan-out"
     );
 }
 
@@ -501,9 +502,11 @@ async fn channel_depth_gauges_refresh_despite_a_900_second_flush_interval() {
     );
 }
 
-/// The spec's budget gate (§5): a **budget-full** channel must still complete
-/// drain and flush inside the 10s deadline `src/main.rs:619-624` gives every
-/// writer task, "and if it cannot, the budget comes down".
+/// The budget gate: a **budget-full** channel must still complete drain and
+/// flush inside the 10s deadline `src/main.rs:619-624` gives every writer
+/// task -- if it cannot, the budget comes down. Post-close drain+flush at
+/// the full derived capacity previously measured ~0.69s of the 10s deadline
+/// in a debug build, so the budget stands.
 ///
 /// N is therefore the derived capacity itself -- `capacity_for(ZEEK_RECORD_BYTES)`,
 /// a full 100 MiB of Zeek `conn` records -- not a fraction of it. An earlier
@@ -517,8 +520,8 @@ async fn channel_depth_gauges_refresh_despite_a_900_second_flush_interval() {
 /// is the condition that actually threatens the deadline: a whole budget's
 /// worth of records has reached the writer, none of it has been flushed (the
 /// thresholds below see to that), and all of it must be encoded and written
-/// after the channel closes. The pure-CPU drain the spec bounds separately is
-/// included, just spread across the push phase.
+/// after the channel closes. The pure-CPU drain (record→RecordBatch
+/// conversion, no I/O) is included too, just spread across the push phase.
 ///
 /// Uses a fast local-disk sink; nothing here depends on the sink being slow.
 #[tokio::test]
