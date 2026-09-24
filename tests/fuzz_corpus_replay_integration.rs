@@ -9,6 +9,7 @@ use logthing::fuzz_harness;
 type Target = fn(&[u8]) -> usize;
 
 fn targets() -> Vec<(&'static str, Target)> {
+    #[cfg_attr(not(feature = "otlp"), allow(unused_mut))]
     let mut t: Vec<(&'static str, Target)> = vec![
         ("ipfix", fuzz_harness::ipfix),
         ("sflow", fuzz_harness::sflow),
