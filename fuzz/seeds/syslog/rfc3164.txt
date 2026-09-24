@@ -1,0 +1,1 @@
+<134>Jan 15 10:30:45 host1 sshd[123]: Accepted password for root

@@ -1,0 +1,1 @@
+<134>Jan 15 10:30:45 dhcp-server dhcpd: DHCPACK on 10.0.0.5 to aa:bb:cc:dd:ee:ff (host) via eth0

@@ -1,0 +1,1 @@
+<134>Jan 15 10:30:45 ns1 named[42]: client 192.168.1.100#12345: query: example.com IN A + (192.168.1.1)

@@ -11,13 +11,21 @@
 //! Only panics, aborts, OOM and hangs are findings.
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
 
 use crate::forwarding::buffered_writer::ParquetSink;
 use crate::forwarding::ipfix_s3::IpfixSink;
+use crate::forwarding::parquet_s3::WefSink;
 use crate::forwarding::sflow_s3::SflowSink;
+use crate::forwarding::structured_syslog_s3::StructuredSyslogSink;
+use crate::forwarding::syslog_s3::SyslogSink;
 use crate::ipfix::decoder::{IpfixDecoder, MAX_CACHED_TEMPLATES};
+use crate::parser::GenericEventParser;
+use crate::protocol::{WefMessage, WefParser};
+use crate::syslog::SyslogMessage;
+use crate::syslog::payload::{self, StructuredSyslogRecord};
 
 const EXPORTER: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
 
@@ -81,6 +89,75 @@ pub fn sflow(data: &[u8]) -> usize {
     records.len()
 }
 
+/// Syslog UDP path: lossy UTF-8, envelope parse, payload dispatch, and both
+/// the raw and structured Arrow mappings.
+pub fn syslog(data: &[u8]) -> usize {
+    let text = String::from_utf8_lossy(data);
+    let Some(msg) = SyslogMessage::parse(&text) else {
+        return 0;
+    };
+    map_record(&SyslogSink, &msg);
+    let p = payload::dispatch(&msg);
+    let _ = p.to_json();
+    if let Some(rec) = StructuredSyslogRecord::from_syslog_and_payload(&msg, &p) {
+        map_record(&StructuredSyslogSink, &rec);
+    }
+    1
+}
+
+// ponytail: loads the repo's shipped parser configs; fine for fuzz/tests only.
+fn event_parser() -> &'static GenericEventParser {
+    static PARSER: OnceLock<GenericEventParser> = OnceLock::new();
+    PARSER.get_or_init(|| {
+        GenericEventParser::from_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/event_parsers"),
+        )
+        .expect("config/event_parsers must load")
+    })
+}
+
+/// Sorted so a committed input's selector byte maps to the same parser on
+/// every run (`supported_events` iterates a HashMap).
+fn sorted_event_ids() -> &'static [u32] {
+    static IDS: OnceLock<Vec<u32>> = OnceLock::new();
+    IDS.get_or_init(|| {
+        let mut ids = event_parser().supported_events();
+        ids.sort_unstable();
+        ids
+    })
+}
+
+/// Generic WEF event parser: byte 0 picks the configured parser, the rest is
+/// the event XML.
+pub fn wef_event(data: &[u8]) -> usize {
+    let Some((&pick, xml)) = data.split_first() else {
+        return 0;
+    };
+    let ids = sorted_event_ids();
+    let id = ids[usize::from(pick) % ids.len()];
+    usize::from(
+        event_parser()
+            .parse_event(id, &String::from_utf8_lossy(xml))
+            .is_some(),
+    )
+}
+
+/// WEF HTTP body: envelope split, per-event generic parse, and WEF mapping.
+pub fn wef_envelope(data: &[u8]) -> usize {
+    let body = String::from_utf8_lossy(data);
+    let Ok(WefMessage::Events(events)) = WefParser.parse_message(&body, "192.0.2.1".into()) else {
+        return 0;
+    };
+    let n = events.len();
+    for event in events {
+        if let Some(parsed) = &event.parsed {
+            let _ = event_parser().parse_event(parsed.event_id, &event.raw_xml);
+        }
+        map_record(&WefSink, &Arc::new(event));
+    }
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +217,63 @@ mod tests {
         for f in [ipfix, sflow] {
             assert_eq!(f(&[]), 0);
             assert_eq!(f(&[0xff; 64]), 0);
+        }
+    }
+
+    #[test]
+    fn test_syslog_every_seed_parses() {
+        for (path, bytes) in seeds("syslog") {
+            assert!(syslog(&bytes) > 0, "{} did not parse", path.display());
+        }
+    }
+
+    #[test]
+    fn test_syslog_seeds_cover_every_payload_parser() {
+        use crate::syslog::{SyslogMessage, payload};
+        let mut kinds: Vec<&str> = seeds("syslog")
+            .iter()
+            .filter_map(|(_, b)| SyslogMessage::parse(&String::from_utf8_lossy(b)))
+            .filter_map(|m| payload::dispatch(&m).payload_type())
+            .collect();
+        kinds.sort();
+        kinds.dedup();
+        assert_eq!(kinds.len(), 7, "payload kinds seeded: {kinds:?}");
+    }
+
+    #[test]
+    fn test_wef_event_selector_is_stable_and_seed_hits_4624() {
+        let ids = sorted_event_ids();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids must be sorted");
+        let (_, bytes) = seeds("wef_event")
+            .into_iter()
+            .find(|(p, _)| p.ends_with("logon_4624.bin"))
+            .unwrap();
+        assert_eq!(
+            ids[usize::from(bytes[0]) % ids.len()],
+            4624,
+            "fix the seed's first byte"
+        );
+        assert_eq!(wef_event(&bytes), 1);
+    }
+
+    #[test]
+    fn test_wef_envelope_every_events_seed_yields_events() {
+        for (path, bytes) in seeds("wef_envelope") {
+            if path.ends_with("subscribe.xml") {
+                continue;
+            }
+            assert!(
+                wef_envelope(&bytes) > 0,
+                "{} yielded no events",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn test_text_targets_empty_input_returns_zero() {
+        for f in [syslog, wef_event, wef_envelope] {
+            assert_eq!(f(&[]), 0);
         }
     }
 }
