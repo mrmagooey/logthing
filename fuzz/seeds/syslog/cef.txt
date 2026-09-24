@@ -1,0 +1,1 @@
+<134>Jan 15 10:30:45 fw1 arcsight: CEF:0|ArcSight|ArcSight Management Center|2.0|base:system:remotelogin:success|Remote login|3|src=10.0.0.1 dst=10.0.0.2 suser=admin msg=hello\=world

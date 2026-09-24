@@ -1,0 +1,1 @@
+<134>Jan 15 10:30:45 h1 audispd: type=SYSCALL msg=audit(1609459200.000:1234): arch=c000003e syscall=59 success=yes exit=0 uid=0 comm="bash" exe="/bin/bash"

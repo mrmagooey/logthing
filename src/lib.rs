@@ -8,6 +8,8 @@
 pub mod admin;
 pub mod config;
 pub mod forwarding;
+#[doc(hidden)]
+pub mod fuzz_harness;
 pub mod ingest;
 pub mod ipfix;
 pub mod metrics_descriptions;

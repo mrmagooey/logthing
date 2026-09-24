@@ -1,0 +1,21 @@
+<Envelope><Body><Events><Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Security-Auditing">Microsoft-Windows-Security-Auditing</Provider>
+    <EventID>4624</EventID>
+    <Level>0</Level>
+    <Task>12544</Task>
+    <Keywords>0x8020000000000000</Keywords>
+    <TimeCreated SystemTime="2026-09-13T12:00:00.000000Z">2026-09-13T12:00:00.000000Z</TimeCreated>
+    <EventRecordID>4624001</EventRecordID>
+    <Channel>Security</Channel>
+    <Computer>TEST-HOST</Computer>
+  </System>
+  <EventData>
+    <Data Name="TargetUserName">jdoe</Data>
+    <Data Name="TargetDomainName">CONTOSO</Data>
+    <Data Name="LogonType">3</Data>
+    <Data Name="IpAddress">192.0.2.10</Data>
+    <Data Name="IpPort">49732</Data>
+  </EventData>
+</Event>
+</Events></Body></Envelope>

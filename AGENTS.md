@@ -21,6 +21,7 @@ This document explains how automated or semi-automated agents should interact wi
 | Lint check | `cargo clippy -- -D warnings` |
 | Coverage report | `scripts/run_coverage.sh` |
 | E2E tests | `tests/e2e/simulation-environment/run.sh` (requires Docker) |
+| Fuzz (nightly) | `scripts/fuzz.sh <target|all> [secs]` |
 
 **Example - run a specific test:**
 ```bash
@@ -108,6 +109,18 @@ use crate::models::WindowsEvent;
 - Use environment variables for configuration
 - Prefer ASCII unless UTF-8 is required
 - The E2E suite requires Docker; skip if unavailable
+
+## 5a. Fuzzing
+
+- Targets live in `fuzz/fuzz_targets/` and are thin shims over `src/fuzz_harness.rs`,
+  which replays each ingestor's production receive path. Priority: `ipfix`, `sflow`,
+  `syslog`, `wef_event`, `wef_envelope`, then `zeek`, `suricata`, `hec`, `otlp`.
+- Needs nightly + `cargo install cargo-fuzz`; the root crate stays stable-only.
+- On a crash in `fuzz/artifacts/<t>/crash-*`: minimize with
+  `cargo +nightly fuzz tmin <t> <file>`, commit the result to `fuzz/regressions/<t>/`,
+  and fix the root cause with a unit test at the parser. `cargo test` replays every
+  file under `fuzz/seeds/` and `fuzz/regressions/` on stable.
+- `fuzz/target/` grows large; `cargo clean --manifest-path fuzz/Cargo.toml` when done.
 
 ## 6. Project Structure
 

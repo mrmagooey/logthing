@@ -167,7 +167,6 @@ impl IpfixDecoder {
         Some(entry.fields.clone())
     }
 
-    #[cfg(test)]
     pub(crate) fn cache_len(&self) -> usize {
         self.cache
             .read()

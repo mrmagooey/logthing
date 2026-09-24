@@ -1,0 +1,1 @@
+<134>Jan 15 10:30:45 radius-server radiusd: Login OK: [alice] (from client vpn port 10)

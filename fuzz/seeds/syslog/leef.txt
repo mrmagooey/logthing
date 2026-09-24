@@ -1,0 +1,1 @@
+<134>Jan 15 10:30:45 qr qradar: LEEF:1.0|V|P|1.0|E|	key=val	src=10.0.0.1
