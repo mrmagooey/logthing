@@ -1,0 +1,82 @@
+[package]
+name = "logthing-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Own workspace: keeps nightly/libFuzzer out of every root `cargo` command.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+logthing = { path = ".." }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "ipfix"
+path = "fuzz_targets/ipfix.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sflow"
+path = "fuzz_targets/sflow.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "syslog"
+path = "fuzz_targets/syslog.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wef_event"
+path = "fuzz_targets/wef_event.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wef_envelope"
+path = "fuzz_targets/wef_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zeek"
+path = "fuzz_targets/zeek.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "suricata"
+path = "fuzz_targets/suricata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hec"
+path = "fuzz_targets/hec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "otlp"
+path = "fuzz_targets/otlp.rs"
+test = false
+doc = false
+bench = false
