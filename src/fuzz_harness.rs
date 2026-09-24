@@ -16,11 +16,14 @@ use std::sync::{Arc, OnceLock};
 use chrono::{DateTime, Utc};
 
 use crate::forwarding::buffered_writer::ParquetSink;
+use crate::forwarding::generic_s3::GenericSink;
 use crate::forwarding::ipfix_s3::IpfixSink;
 use crate::forwarding::parquet_s3::WefSink;
 use crate::forwarding::sflow_s3::SflowSink;
 use crate::forwarding::structured_syslog_s3::StructuredSyslogSink;
+use crate::forwarding::suricata_s3::SuricataSink;
 use crate::forwarding::syslog_s3::SyslogSink;
+use crate::forwarding::zeek_s3::ZeekSink;
 use crate::ipfix::decoder::{IpfixDecoder, MAX_CACHED_TEMPLATES};
 use crate::parser::GenericEventParser;
 use crate::protocol::{WefMessage, WefParser};
@@ -158,6 +161,74 @@ pub fn wef_envelope(data: &[u8]) -> usize {
     n
 }
 
+/// NDJSON listener framing: `\n`-split, trailing `\r` stripped, empty lines
+/// skipped, non-UTF-8 lines dropped (the listeners count and skip them).
+fn ndjson_lines(data: &[u8]) -> impl Iterator<Item = &str> {
+    data.split(|b| *b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| std::str::from_utf8(l).ok())
+}
+
+/// Zeek TCP NDJSON path: parse + Arrow mapping, one call per line.
+pub fn zeek(data: &[u8]) -> usize {
+    ndjson_lines(data)
+        .filter_map(|l| crate::zeek::parse_line(l, fixed_now()).ok())
+        .map(|p| map_record(&ZeekSink, &p.record))
+        .count()
+}
+
+/// Suricata EVE NDJSON path: parse + Arrow mapping, one call per line.
+pub fn suricata(data: &[u8]) -> usize {
+    ndjson_lines(data)
+        .filter_map(|l| crate::suricata::parse_line(l, fixed_now()).ok())
+        .map(|p| map_record(&SuricataSink, &p.record))
+        .count()
+}
+
+/// HEC / NDJSON HTTP bodies: byte 0 picks the route.
+pub fn hec(data: &[u8]) -> usize {
+    use crate::ingest::parse::{parse_hec_event_body, parse_hec_raw_body, parse_ndjson_body};
+    let Some((&route, body)) = data.split_first() else {
+        return 0;
+    };
+    let records = match route % 3 {
+        0 => parse_hec_event_body(body, "fuzz"),
+        1 => parse_hec_raw_body(body, "fuzz").map(|r| vec![r]),
+        _ => parse_ndjson_body(body, "fuzz"),
+    };
+    let Ok(records) = records else {
+        return 0;
+    };
+    for rec in &records {
+        map_record(&GenericSink, rec);
+    }
+    records.len()
+}
+
+/// OTLP /v1/logs body: byte 0 picks protobuf (even) or JSON (odd).
+#[cfg(feature = "otlp")]
+pub fn otlp(data: &[u8]) -> usize {
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use prost::Message;
+    let Some((&ct, body)) = data.split_first() else {
+        return 0;
+    };
+    let req = if ct % 2 == 0 {
+        ExportLogsServiceRequest::decode(body).ok()
+    } else {
+        serde_json::from_slice::<ExportLogsServiceRequest>(body).ok()
+    };
+    let Some(req) = req else {
+        return 0;
+    };
+    let records = crate::server::otlp::map_otlp_request(req, "192.0.2.1".to_string());
+    for rec in &records {
+        map_record(&GenericSink, rec);
+    }
+    records.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,5 +346,60 @@ mod tests {
         for f in [syslog, wef_event, wef_envelope] {
             assert_eq!(f(&[]), 0);
         }
+    }
+
+    #[test]
+    fn test_ndjson_targets_every_seed_yields_all_lines() {
+        for (target, f) in [("zeek", zeek as fn(&[u8]) -> usize), ("suricata", suricata)] {
+            for (path, bytes) in seeds(target) {
+                let lines = bytes
+                    .split(|b| *b == b'\n')
+                    .filter(|l| !l.is_empty())
+                    .count();
+                assert_eq!(f(&bytes), lines, "{}", path.display());
+            }
+        }
+    }
+
+    #[test]
+    fn test_ndjson_targets_skip_bad_line_and_keep_going() {
+        let input = b"{\"_path\":\"conn\"}\n\xff\xfe\nnot json\r\n{\"event_type\":\"alert\"}";
+        assert_eq!(zeek(input), 2); // both valid JSON lines parse; _path is optional
+        assert_eq!(suricata(input), 2);
+    }
+
+    #[test]
+    fn test_hec_every_seed_yields_records() {
+        for (path, bytes) in seeds("hec") {
+            assert!(hec(&bytes) > 0, "{}", path.display());
+        }
+    }
+
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_otlp_every_seed_yields_records() {
+        for (path, bytes) in seeds("otlp") {
+            assert!(otlp(&bytes) > 0, "{}", path.display());
+        }
+    }
+
+    #[cfg(feature = "otlp")]
+    #[test]
+    #[ignore = "regenerates fuzz/seeds/otlp/proto.bin"]
+    fn write_otlp_proto_seed() {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use prost::Message;
+        let json = &std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/seeds/otlp/json.bin"),
+        )
+        .unwrap()[1..];
+        let req: ExportLogsServiceRequest = serde_json::from_slice(json).unwrap();
+        let mut out = vec![0u8];
+        out.extend(req.encode_to_vec());
+        std::fs::write(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/seeds/otlp/proto.bin"),
+            out,
+        )
+        .unwrap();
     }
 }
