@@ -19,10 +19,10 @@
 //! Fixtures are written inline rather than imported: `src/zeek/listener.rs`'s
 //! are `#[cfg(test)]` and this bench compiles as an external crate.
 //!
-//! Do not compare these numbers to the 94.6us/datagram figure in
-//! `docs/performance/2026-07-25-syslog-udp-cpu-profile.md` — that is
-//! whole-process CPU across all threads, and ratioing single-threaded parse
-//! costs against it is the exact error that doc was written to correct.
+//! Do not compare these numbers to the 94.6us/datagram whole-process CPU
+//! profile figure measured separately (across all threads, at `info`
+//! logging) -- ratioing single-threaded parse costs against it is the
+//! exact error that measurement was misread for once already.
 //!
 //! Run with: `cargo bench --bench zeek_parse_recv_path`
 

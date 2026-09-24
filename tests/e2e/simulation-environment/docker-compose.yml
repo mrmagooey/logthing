@@ -43,8 +43,9 @@ services:
 
   minio:
     # minio/minio on Docker Hub now returns "repository does not exist"; MinIO
-    # publishes to quay.io. Pinned to a digest-free tag deliberately — see the
-    # note in docs/performance/2026-09-13-multiformat-load-results.md.
+    # publishes to quay.io. Pinned to a digest-free tag deliberately: a prior
+    # pin to a specific release tag stopped resolving entirely, and a pin to
+    # a registry path that no longer exists is worse than no pin.
     image: quay.io/minio/minio:latest
     environment:
       - MINIO_ROOT_USER=miniouser

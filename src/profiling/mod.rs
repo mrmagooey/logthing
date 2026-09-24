@@ -2,8 +2,10 @@
 //!
 //! Configuration parsing, Prometheus counter parsing and metadata types are
 //! always compiled so the default test suite covers them. Only the sampler
-//! itself sits behind the off-by-default `pprof` cargo feature — see
-//! `docs/superpowers/specs/2026-07-25-cpu-profiling-instrumentation-design.md`.
+//! itself sits behind the off-by-default `pprof` cargo feature — any new C
+//! dependency is a cross-build risk for this repo's static musl builds, so
+//! `pprof`'s transitive deps are kept opt-in rather than pulled into
+//! `default`.
 
 use std::path::PathBuf;
 use std::str::FromStr;

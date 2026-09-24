@@ -11,8 +11,7 @@
 //! `parquet_s3_records_skipped{source="wef",target="local"} == 1` — the
 //! malformed event's raw fragment (no `.parsed` data) reaches the WEF
 //! local writer and is skipped there, exactly once, making this the real
-//! outer-interface trigger for that counter (see the `#4` fix in
-//! `docs/superpowers/specs/2026-09-22-review-fixes-design.md`).
+//! outer-interface trigger for that counter.
 //!
 //! Template: `tests/field_cardinality_metric_wef_e2e.rs` for the overall
 //! shape (real `Server`, `metrics.enabled = true`, `reserve_port`, real

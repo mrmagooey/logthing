@@ -39,8 +39,6 @@
 //! That is a ceiling, not a reservation (see `CHANNEL_BUDGET_BYTES`): only
 //! Zeek and Suricata apply backpressure and so are the only channels *designed*
 //! to dwell near capacity, ~200 MiB per configured destination pair.
-//!
-//! See `docs/superpowers/specs/2026-08-07-ingest-backpressure-design.md` §4.
 
 /// Memory budget for **one** bounded channel, in bytes.
 ///
@@ -188,11 +186,9 @@ pub const SYSLOG_MESSAGE_BYTES: usize = 768;
 /// `extended_switch` (VLAN tag/priority, close to universal on switch-sourced
 /// flow samples) — is pushed into `extra` verbatim as
 /// `{ "format", "length", "data_hex" }`. This is expected, not exceptional:
-/// the ingestion design doc's own scope guard ("vendor/enterprise-specific
-/// counter records and other non-generic record types are not decoded")
-/// exists because real exporters send them
-/// (`docs/superpowers/specs/2026-06-27-ingestion-formats-expansion-design.md`
-/// §7).
+/// the deliberate scope guard ("vendor/enterprise-specific counter records
+/// and other non-generic record types are not decoded") exists because real
+/// exporters send them.
 ///
 /// **This must be a ceiling, not an average, because a single sample's
 /// `extra` is attacker-influenced up to a hard cap.**
@@ -275,7 +271,7 @@ pub const SFLOW_RECORD_BYTES: usize = 8960;
 /// flows-per-datagram: it is variable, and this uses a representative count
 /// from the repo's IPFIX test fixtures, so datagrams denser than that
 /// average will still push this source past `CHANNEL_BUDGET_BYTES`. Known
-/// and accepted limitation — see the spec §4.3.
+/// and accepted limitation.
 pub const IPFIX_DATAGRAM_BYTES: usize = 9216;
 
 /// Measured footprint of one `Arc<WindowsEvent>` — the **pointee**, not the

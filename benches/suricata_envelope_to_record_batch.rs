@@ -1,10 +1,11 @@
 //! Criterion micro-benchmark: baseline cost of `SuricataSink::to_record_batch`
 //! (`map_envelope`) -- one call per ingested Suricata EVE JSON record. This is
 //! the "before" measurement for any future amortized-builder work on the
-//! Suricata adapter (see
-//! `docs/superpowers/specs/2026-07-24-record-batch-amortization-design.md`
-//! for the pattern already applied to Zeek's "conn" mapper), and a
-//! regression-tracking baseline in its own right.
+//! Suricata adapter (see `ConnAccumulator` in `src/zeek/schema.rs`, which
+//! implements the `RecordBatchAccumulator` trait from
+//! `src/forwarding/buffered_writer.rs`, for the pattern already applied to
+//! Zeek's "conn" mapper), and a regression-tracking baseline in its own
+//! right.
 //!
 //! Run with: `cargo bench --bench suricata_envelope_to_record_batch`
 

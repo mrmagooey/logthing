@@ -1,10 +1,14 @@
 //! `loadgen` -- wire-format load generator for a live `logthing` instance.
 //!
-//! Every format in
-//! `docs/superpowers/specs/2026-07-05-performance-testing-strategy-design.md`
-//! is implemented except `otlp`: `syslog-udp`, `zeek-tcp`, `ipfix-udp`,
-//! `suricata-tcp`, `sflow-udp`, `hec-http`, `generic-http`. `otlp` remains
-//! deferred -- see that design's "Deferred" section for what it would need.
+//! Every format is implemented except `otlp`: `syslog-udp`, `zeek-tcp`,
+//! `ipfix-udp`, `suricata-tcp`, `sflow-udp`, `hec-http`, `generic-http`.
+//! `otlp` remains deferred: it needs `opentelemetry-proto`/`prost`-generated
+//! protobuf message types to build real `ExportLogsServiceRequest` bodies,
+//! meaningfully more setup than any other subcommand, and `hec-http` is a
+//! hard prerequisite for it since HEC and OTLP share `GenericSink`'s exact
+//! writer path -- running both against the same config isolates protobuf-
+//! decode cost specifically, a comparison lost if `otlp` ships without a
+//! `hec-http` baseline already in place.
 
 mod generic_http;
 mod hec_http;

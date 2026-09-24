@@ -19,15 +19,14 @@
 //! in `SyslogMessage::parse`, not in the dispatch try-chain.
 //!
 //! **Scope caveat -- do not compare these to the 94.6us/datagram profile
-//! figure.** `docs/performance/2026-07-25-syslog-udp-cpu-profile.md` reports
-//! 81.54 CPU-sec / 862,145 datagrams = 94.6us/datagram, but that is
-//! *whole-process CPU across all threads* (writer tasks, parquet encode, tokio,
-//! syscalls, logging), measured in a different run at `info` logging. These
-//! benchmarks are single-threaded, single-datagram parse costs. The profile doc
-//! states outright that it "does not, and cannot, produce a percentage
-//! breakdown of the 94.6us/datagram figure" (§4.3); subtracting or ratioing
-//! these numbers against it is exactly the error that doc was written to
-//! correct. What can be said: the recv-path parse cost measured here (~6.1us)
+//! figure.** A separate profiling run reported 81.54 CPU-sec / 862,145
+//! datagrams = 94.6us/datagram, but that is *whole-process CPU across all
+//! threads* (writer tasks, parquet encode, tokio, syscalls, logging),
+//! measured in a different run at `info` logging. These benchmarks are
+//! single-threaded, single-datagram parse costs. That profile could not
+//! itself produce a percentage breakdown of the 94.6us/datagram figure;
+//! subtracting or ratioing these numbers against it would repeat that same
+//! error. What can be said: the recv-path parse cost measured here (~6.1us)
 //! is the same order as the writer-side `syslog_message_to_record_batch`
 //! (~7.07us/record), so neither layer's parse/encode work is where the bulk of
 //! that 94.6us goes.

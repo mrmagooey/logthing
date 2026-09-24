@@ -1155,13 +1155,13 @@ mod tests {
         );
     }
 
-    /// The gap Finding 1 of the plan review named directly: the two tests above
+    /// A coverage-gap review identified this directly: the two tests above
     /// both pin `recv_tasks = 1`, so they only ever exercise the batched arm
     /// inside `start_with_shutdown`'s inline loop, never `ipfix_recv_loop` (the
     /// `recv_tasks > 1` fan-out function) -- the combined `recv_tasks > 1` AND
     /// `recv_batch_size > 1` shape had no automated coverage at all before this
     /// test. `recv_tasks = 4` forces every datagram through the SO_REUSEPORT
-    /// group and `ipfix_recv_loop`'s own batched arm (Step 5); all sends come
+    /// group and `ipfix_recv_loop`'s own batched arm; all sends come
     /// from one client socket, back-to-back with no `.await` between them, so
     /// they consistently hash to the same group member (SO_REUSEPORT hashes by
     /// the full 4-tuple, and one client socket keeps its source port fixed) and

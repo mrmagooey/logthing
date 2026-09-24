@@ -142,15 +142,13 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   per additional socket, idle CPU rising from 0.090s to 0.130s per 30s, and
   zero receive-buffer memory actually charged at any setting (`SO_RCVBUF`
   is a cap, not a reservation) — while the measured throughput saturation
-  point remains `4`; see the idle-cost section of
-  `docs/performance/2026-09-18-udp-recv-fanout-results.md`. Raise it
-  further when `<protocol>_socket_drops` is climbing while the process
-  uses roughly one core; measured recommendation is `4`, which roughly
-  doubled the sustained ingest ceiling for ipfix and sflow and raised
-  syslog's by ~38% (see the same document). Only helps deployments with
-  many distinct senders on one listener — `SO_REUSEPORT` distributes by
-  4-tuple hash, so a single high-rate sender sees no benefit from raising
-  this.
+  point remains `4`. Raise it further when `<protocol>_socket_drops` is
+  climbing while the process uses roughly one core; measured
+  recommendation is `4`, which roughly doubled the sustained ingest
+  ceiling for ipfix and sflow and raised syslog's by ~38%. Only helps
+  deployments with many distinct senders on one listener — `SO_REUSEPORT`
+  distributes by 4-tuple hash, so a single high-rate sender sees no
+  benefit from raising this.
 - `recv_batch_size` config option on the `[ipfix]`, `[sflow]`, and
   `[syslog]` (UDP arm only) listeners — above `1` (off), a recv task
   drains up to `N` already-queued datagrams per `recvmmsg(2)` call instead
@@ -174,8 +172,7 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   setting from `4` upward — the measured win is `1 → ≥4`. The sweep does
   not show `32` outperforming `8`; this host's run-to-run variance is
   large at `n=5`, so `32` was chosen for headroom (~6 MB, above) rather
-  than a demonstrated throughput edge over `8` — see
-  `docs/performance/2026-09-18-recvmmsg-results.md`. Maximum `256`,
+  than a demonstrated throughput edge over `8`. Maximum `256`,
   rejected at config load above that as a likely typo, since each unit
   allocates a 65535-byte buffer per recv task at startup.
 - `scripts/max-ingest-rate.sh` — per-format maximum sustainable ingest rate
@@ -416,8 +413,7 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   measuring HTTP request rate, not record rate — a flat ~21,000-25,000/s
   ceiling regardless of process count, versus a ~385k records/s single-
   threaded per-record decode cost. Batched at 100 events/request, measured
-  ceilings for both formats rose 7-9x (see
-  `docs/performance/2026-09-18-max-ingest-rate.md`).
+  ceilings for both formats rose 7-9x.
 
 ### Removed
 

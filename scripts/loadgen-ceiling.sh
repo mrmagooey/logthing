@@ -1,6 +1,7 @@
 #!/bin/bash
-# Phase 0 generator-ceiling probe. See
-# docs/superpowers/specs/2026-09-16-max-ingest-rate-design.md §4.
+# Generator-ceiling probe: multi-process scaling plus (for UDP formats) a
+# receiver-free reference rate against a bound-but-never-drained socket, so
+# the measured rate is a generator ceiling, not a server or kernel limit.
 set -u
 
 # Every loadgen subcommand ends with the same sentence shape:

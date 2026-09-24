@@ -2,8 +2,8 @@
 //!
 //! `GenericRecord` is the unified envelope for all three ingest routes
 //! (`/services/collector/event`, `/services/collector/raw`, `/ingest`).
-//! `GenericSink` (Task 4.3) is the `ParquetSink` adapter that persists
-//! these records to S3 partitioned by `sourcetype`.
+//! `GenericSink` is the `ParquetSink` adapter that persists these records
+//! to S3 partitioned by `sourcetype`.
 
 pub mod handlers;
 pub mod parse;

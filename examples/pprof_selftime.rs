@@ -3,19 +3,17 @@
 //! `src/profiling/mod.rs` writes `profile.pb` (raw pprof protobuf) alongside
 //! `flamegraph.svg` on every profiling run, but nothing in this repo turned
 //! it back into a self-time-by-function table -- the closest prior attempt
-//! (`docs/performance/2026-07-25-syslog-udp-cpu-profile.md` §3) parsed
-//! `flamegraph.svg`'s `<title>` attributes instead, and its own header notes
-//! that extraction script was never committed, so that breakdown could not
-//! be regenerated or independently reproduced afterwards. This example
-//! closes that gap by reading `profile.pb` directly instead.
+//! parsed `flamegraph.svg`'s `<title>` attributes instead, and that
+//! extraction script was never committed, so that breakdown could not be
+//! regenerated or independently reproduced afterwards. This example closes
+//! that gap by reading `profile.pb` directly instead.
 //!
 //! Per the pprof profile.proto spec, `Sample.location_id[0]` is always the
 //! leaf frame (the docs above `pprof::protos::Sample::location_id` in the
 //! `pprof` crate say so verbatim), so summing `Sample.value[0]` grouped by
 //! that leaf's function name is exactly self-time, not inclusive time --
-//! the same distinction the syslog write-up's §4.1 spent a whole subsection
-//! explaining the limits of, without this tool available to compute it
-//! directly.
+//! a distinction earlier profiling write-ups had to explain the limits of
+//! without this tool available to compute it directly.
 //!
 //! Requires the crate's `pprof` feature (same one that produces `profile.pb`
 //! in the first place):

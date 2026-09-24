@@ -2,8 +2,6 @@
 # Per-format maximum sustainable ingest rate. Supersedes
 # scripts/repeat-ipfix-loopback-loss.sh -- same restart-per-run, zeroed-counter,
 # socket-drop-reconciling machinery, generalised across formats.
-#
-# Spec: docs/superpowers/specs/2026-09-16-max-ingest-rate-design.md
 set -u
 
 median_of() { sort -n | awk '{a[NR]=$1} END {n=NR; if(n==0){print "nan"; exit} if(n%2==1) print a[(n+1)/2]; else printf "%.4f\n", (a[n/2]+a[n/2+1])/2}'; }
@@ -26,10 +24,10 @@ sum_proc_net_udp_drops() {
 }
 
 # Fraction of target the generator must actually achieve for the run's loss
-# figure to mean anything. docs/performance/2026-09-13-multiformat-load-results.md
-# §2 read zeek achieving 15,283/s against a 20,000/s target as a generator
-# ceiling; on TCP that signature is equally consistent with server
-# backpressure. This harness refuses to call either one a ceiling.
+# figure to mean anything. A prior run read zeek achieving 15,283/s against
+# a 20,000/s target as a generator ceiling; on TCP that signature is equally
+# consistent with server backpressure. This harness refuses to call either
+# one a ceiling.
 ACHIEVED_FLOOR_PCT="${ACHIEVED_FLOOR_PCT:-99}"
 
 classify_run() {
@@ -203,9 +201,9 @@ SRV_CPUS="${SRV_CPUS:-4-11}"
 # all still pinned to GEN_CPUS, lets the harness reach past a single
 # process's own ceiling. Default 1 keeps today's behaviour unchanged.
 GEN_PROCS="${GEN_PROCS:-1}"
-# See design doc §6.3: passing requires median total loss <= LOSS_BUDGET
-# (percent) AND the generator achieving >= ACHIEVED_FLOOR_PCT of target in
-# every run; classify_run checks the latter first (see its own comment).
+# Passing requires median total loss <= LOSS_BUDGET (percent) AND the
+# generator achieving >= ACHIEVED_FLOOR_PCT of target in every run;
+# classify_run checks the latter first (see its own comment).
 LOSS_BUDGET="${LOSS_BUDGET:-0.1}"
 
 resolve_format || exit 1
@@ -766,7 +764,7 @@ measure_rate() {
 }
 
 # RATE set -> fixed-rate mode (reproduces the old repeat-ipfix harness and
-# the Task 6 reproduce commands, which pass RATE= explicitly and keep
+# any prior reproduce commands that pass RATE= explicitly, which keep
 # working unchanged). RATE unset -> ramp mode: coarse-double then bisect to
 # this format's ceiling.
 if [ -n "${RATE:-}" ]; then

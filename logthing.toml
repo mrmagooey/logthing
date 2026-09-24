@@ -105,14 +105,13 @@ parse_dns = true    # Enable DNS log parsing (env: LOGTHING__SYSLOG__PARSE_DNS)
 
 # Number of UDP receive tasks draining udp_port (default: 8; the TCP listener
 # on tcp_port is unaffected). Raise when syslog_udp_socket_drops climbs while
-# the process is using roughly one core. Measured recommendation: 4
-# (docs/performance/2026-09-18-udp-recv-fanout-results.md) — 8 bought no
-# further median improvement over 4 on throughput; the default is set to 8
-# anyway for headroom, since idle-cost measurement showed the knob is nearly
-# free (~19 KB RSS and one file descriptor per extra socket, zero receive
-# buffer memory actually charged). Only helps when there are many distinct
-# senders (e.g. a fleet of hosts): SO_REUSEPORT hashes by 4-tuple, so a
-# single sender always lands on the same task regardless of this value.
+# the process is using roughly one core. Measured recommendation: 4 — 8
+# bought no further median improvement over 4 on throughput; the default is
+# set to 8 anyway for headroom, since idle-cost measurement showed the knob
+# is nearly free (~19 KB RSS and one file descriptor per extra socket, zero
+# receive buffer memory actually charged). Only helps when there are many
+# distinct senders (e.g. a fleet of hosts): SO_REUSEPORT hashes by 4-tuple,
+# so a single sender always lands on the same task regardless of this value.
 # Capped at 64 at config load — anything above that is rejected as a
 # likely typo, since it would bind that many sockets at startup.
 # recv_tasks = 8   # env: LOGTHING__SYSLOG__RECV_TASKS
@@ -130,10 +129,10 @@ parse_dns = true    # Enable DNS log parsing (env: LOGTHING__SYSLOG__PARSE_DNS)
 # every setting from 4 upward — the measured win is 1 -> >=4; 32 was not
 # shown to outperform 8 and is a headroom choice, costing roughly 6 MB
 # resident with all three UDP listeners enabled at the default recv_tasks
-# (docs/performance/2026-09-18-recvmmsg-results.md; measured for ipfix, not
-# independently re-measured for sflow/syslog, same code path). Maximum 256,
-# capped at config load — anything above that is rejected as a likely typo,
-# since each unit allocates a 65535-byte buffer per recv task at startup.
+# (measured for ipfix, not independently re-measured for sflow/syslog, same
+# code path). Maximum 256, capped at config load — anything above that is
+# rejected as a likely typo, since each unit allocates a 65535-byte buffer
+# per recv task at startup.
 # recv_batch_size = 32   # env: LOGTHING__SYSLOG__RECV_BATCH_SIZE
 
 # Optional: persist syslog messages to S3 as Parquet files.
@@ -179,8 +178,7 @@ bind_address = "0.0.0.0"   # env: LOGTHING__IPFIX__BIND_ADDRESS
 
 # Number of UDP receive tasks draining udp_port (default: 1). Raise when
 # ipfix_socket_drops climbs while the process is using roughly one core.
-# Default: 8. Measured recommendation: 4
-# (docs/performance/2026-09-18-udp-recv-fanout-results.md) — 8 bought no
+# Default: 8. Measured recommendation: 4 — 8 bought no
 # further median improvement over 4 on throughput; the default is set to 8
 # anyway for headroom, since idle-cost measurement showed the knob is nearly
 # free (~19 KB RSS and one file descriptor per extra socket, zero receive
@@ -203,10 +201,9 @@ bind_address = "0.0.0.0"   # env: LOGTHING__IPFIX__BIND_ADDRESS
 # (RUNS=5): median kernel loss went from 0.72% at 1 to 0.00% at every
 # setting from 4 upward — the measured win is 1 -> >=4; 32 was not shown to
 # outperform 8 and is a headroom choice, costing roughly 6 MB resident with
-# all three UDP listeners enabled at the default recv_tasks
-# (docs/performance/2026-09-18-recvmmsg-results.md). Maximum 256, capped at
-# config load — anything above that is rejected as a likely typo, since
-# each unit allocates a 65535-byte buffer per recv task at startup.
+# all three UDP listeners enabled at the default recv_tasks. Maximum 256,
+# capped at config load — anything above that is rejected as a likely typo,
+# since each unit allocates a 65535-byte buffer per recv task at startup.
 # recv_batch_size = 32   # env: LOGTHING__IPFIX__RECV_BATCH_SIZE
 
 # Optional: persist IPFIX/NetFlow flows to S3 as Parquet files.
@@ -232,13 +229,13 @@ bind_address = "0.0.0.0"   # env: LOGTHING__SFLOW__BIND_ADDRESS
 
 # Number of UDP receive tasks draining udp_port (default: 8). Raise when
 # sflow_socket_drops climbs while the process is using roughly one core.
-# Measured recommendation: 4 (docs/performance/2026-09-18-udp-recv-fanout-results.md)
-# — 8 bought no further median improvement over 4 on throughput; the default
-# is set to 8 anyway for headroom, since idle-cost measurement showed the
-# knob is nearly free (~19 KB RSS and one file descriptor per extra socket,
-# zero receive buffer memory actually charged). Only helps when there are
-# many distinct agents: SO_REUSEPORT hashes by 4-tuple, so a single agent
-# always lands on the same task regardless of this value.
+# Measured recommendation: 4 — 8 bought no further median improvement over
+# 4 on throughput; the default is set to 8 anyway for headroom, since
+# idle-cost measurement showed the knob is nearly free (~19 KB RSS and one
+# file descriptor per extra socket, zero receive buffer memory actually
+# charged). Only helps when there are many distinct agents: SO_REUSEPORT
+# hashes by 4-tuple, so a single agent always lands on the same task
+# regardless of this value.
 # Capped at 64 at config load — anything above that is rejected as a
 # likely typo, since it would bind that many sockets at startup.
 # recv_tasks = 8   # env: LOGTHING__SFLOW__RECV_TASKS
@@ -255,11 +252,11 @@ bind_address = "0.0.0.0"   # env: LOGTHING__SFLOW__BIND_ADDRESS
 # (RUNS=5): median kernel loss went from 0.72% at 1 to 0.00% at every
 # setting from 4 upward — the measured win is 1 -> >=4; 32 was not shown to
 # outperform 8 and is a headroom choice, costing roughly 6 MB resident with
-# all three UDP listeners enabled at the default recv_tasks
-# (docs/performance/2026-09-18-recvmmsg-results.md; measured for ipfix, not
-# independently re-measured for sflow, same code path). Maximum 256, capped
-# at config load — anything above that is rejected as a likely typo, since
-# each unit allocates a 65535-byte buffer per recv task at startup.
+# all three UDP listeners enabled at the default recv_tasks (measured for
+# ipfix, not independently re-measured for sflow, same code path). Maximum
+# 256, capped at config load — anything above that is rejected as a likely
+# typo, since each unit allocates a 65535-byte buffer per recv task at
+# startup.
 # recv_batch_size = 32   # env: LOGTHING__SFLOW__RECV_BATCH_SIZE
 
 # Optional: persist sFlow samples to S3 as Parquet files.

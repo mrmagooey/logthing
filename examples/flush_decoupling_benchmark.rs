@@ -20,10 +20,9 @@
 //! "conn"-schema Arrow mapping cost logthing pays in production), a real
 //! `ParquetWriterHandle<ZeekSink>` (the code under test), and a custom
 //! `UploadSink` that sleeps `upload_delay_ms` instead of doing a real S3 PUT
-//! (matching this repo's own performance-testing-strategy design doc's
-//! rationale: measuring the ingestion/buffering path's own throughput
-//! deliberately decouples it from real storage-backend variability, a
-//! separate, already-tested concern).
+//! (deliberate: measuring the ingestion/buffering path's own throughput
+//! decouples it from real storage-backend variability, a separate,
+//! already-tested concern).
 //!
 //! A real TCP client drives sustained load for `duration_secs`, paced to
 //! `target_rate` records/sec, then the harness waits a fixed drain period and

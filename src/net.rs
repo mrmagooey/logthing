@@ -312,7 +312,7 @@ impl RecvMmsgBatch {
 }
 
 // ---------------------------------------------------------------------------
-// Socket-level drop counter / rx-queue gauge (Task 0.0)
+// Socket-level drop counter / rx-queue gauge
 // ---------------------------------------------------------------------------
 //
 // `<proto>_datagrams_received` (per-listener) counts what arrived; nothing
@@ -507,7 +507,7 @@ impl SocketDropStats {
 }
 
 // ---------------------------------------------------------------------------
-// TCP accept backoff (Task 4)
+// TCP accept backoff
 // ---------------------------------------------------------------------------
 //
 // Errors like EMFILE leave a `TcpListener` readable, so a naive

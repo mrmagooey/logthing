@@ -310,7 +310,7 @@ pub struct SyslogConfig {
     /// Number of UDP receive tasks (default: 8). Applies to the UDP arm
     /// only — the TCP listener on `tcp_port` is unaffected. Raise to spread
     /// socket draining across cores when the kernel is dropping datagrams
-    /// while CPU sits idle. See docs/performance/2026-09-18-udp-recv-fanout-results.md.
+    /// while CPU sits idle.
     ///
     /// The kernel distributes datagrams across the group by hashing each
     /// packet's source/destination address-port 4-tuple, so throughput
@@ -322,11 +322,10 @@ pub struct SyslogConfig {
     /// genuinely benefit here, since a deployment ingesting from a fleet of
     /// hosts has many distinct senders. `0` is treated the same as `1`, not
     /// as "disabled". The default of `8` costs roughly 19 KB RSS and one
-    /// file descriptor per extra socket at idle (measured with zero traffic
-    /// — see the idle-cost table in the perf doc above); the measured
-    /// throughput saturation point is `4`, so `8` is headroom, not a claim
-    /// that it outperforms `4`. Rejected above `MAX_RECV_TASKS` at config
-    /// load — see `validate_recv_tasks_config`.
+    /// file descriptor per extra socket at idle (measured with zero
+    /// traffic); the measured throughput saturation point is `4`, so `8` is
+    /// headroom, not a claim that it outperforms `4`. Rejected above
+    /// `MAX_RECV_TASKS` at config load — see `validate_recv_tasks_config`.
     #[serde(default = "default_syslog_recv_tasks")]
     pub recv_tasks: usize,
 
@@ -347,10 +346,8 @@ pub struct SyslogConfig {
     /// or above for a single-sender IPFIX stream at 50k/s; the default of
     /// `32` is a headroom choice (not shown to measurably beat `8`) costing
     /// roughly 6 MB resident with all three UDP listeners enabled at the
-    /// default `recv_tasks` — see
-    /// docs/performance/2026-09-18-recvmmsg-results.md. Rejected above
-    /// `MAX_RECV_BATCH_SIZE` at config load — see
-    /// `validate_recv_batch_size_config`.
+    /// default `recv_tasks`. Rejected above `MAX_RECV_BATCH_SIZE` at config
+    /// load — see `validate_recv_batch_size_config`.
     #[serde(default = "default_syslog_recv_batch_size")]
     pub recv_batch_size: usize,
 
@@ -423,7 +420,7 @@ pub struct IpfixConfig {
 
     /// Number of UDP receive tasks (default: 8). Raise to spread socket
     /// draining across cores when the kernel is dropping datagrams while CPU
-    /// sits idle. See docs/performance/2026-09-18-udp-recv-fanout-results.md.
+    /// sits idle.
     ///
     /// The kernel distributes datagrams across the group by hashing each
     /// packet's source/destination address-port 4-tuple, so throughput
@@ -433,11 +430,10 @@ pub struct IpfixConfig {
     /// will see no benefit from raising it, because every datagram still
     /// hashes to the same socket. `0` is treated the same as `1`, not as
     /// "disabled". The default of `8` costs roughly 19 KB RSS and one file
-    /// descriptor per extra socket at idle (measured with zero traffic — see
-    /// the idle-cost table in the perf doc above); the measured throughput
-    /// saturation point is `4`, so `8` is headroom, not a claim that it
-    /// outperforms `4`. Rejected above `MAX_RECV_TASKS` at config load — see
-    /// `validate_recv_tasks_config`.
+    /// descriptor per extra socket at idle (measured with zero traffic);
+    /// the measured throughput saturation point is `4`, so `8` is headroom,
+    /// not a claim that it outperforms `4`. Rejected above `MAX_RECV_TASKS`
+    /// at config load — see `validate_recv_tasks_config`.
     #[serde(default = "default_ipfix_recv_tasks")]
     pub recv_tasks: usize,
 
@@ -457,10 +453,8 @@ pub struct IpfixConfig {
     /// or above for a single-sender IPFIX stream at 50k/s; the default of
     /// `32` is a headroom choice (not shown to measurably beat `8`) costing
     /// roughly 6 MB resident with all three UDP listeners enabled at the
-    /// default `recv_tasks` — see
-    /// docs/performance/2026-09-18-recvmmsg-results.md. Rejected above
-    /// `MAX_RECV_BATCH_SIZE` at config load — see
-    /// `validate_recv_batch_size_config`.
+    /// default `recv_tasks`. Rejected above `MAX_RECV_BATCH_SIZE` at config
+    /// load — see `validate_recv_batch_size_config`.
     #[serde(default = "default_ipfix_recv_batch_size")]
     pub recv_batch_size: usize,
 
@@ -1010,17 +1004,16 @@ pub struct IcebergDescriptorLocalConfig {
 }
 
 /// Upper bound on `recv_tasks` for each UDP fan-out listener (ipfix, sflow,
-/// syslog). The measured sweep in
-/// docs/performance/2026-09-18-udp-recv-fanout-results.md found
-/// `recv_tasks = 4` already saturating throughput on a 12-CPU host, with `8`
-/// buying no further median improvement — so anything much larger than a
-/// small multiple of that is not a real tuning choice, it's a typo or a
-/// mis-scaled template. Each unit above 1 binds its own `SO_REUSEPORT`
-/// socket and requests its own `receive_buffer_bytes` (4 MiB by default), so
-/// an unbounded value fails startup part-way through with `EMFILE` or an
-/// OOM-adjacent condition instead of a clear error. A fixed cap (rather than
-/// deriving from `available_parallelism()`) keeps the check deterministic
-/// across hosts and in CI.
+/// syslog). A measured sweep found `recv_tasks = 4` already saturating
+/// throughput on a 12-CPU host, with `8` buying no further median
+/// improvement — so anything much larger than a small multiple of that is
+/// not a real tuning choice, it's a typo or a mis-scaled template. Each unit
+/// above 1 binds its own `SO_REUSEPORT` socket and requests its own
+/// `receive_buffer_bytes` (4 MiB by default), so an unbounded value fails
+/// startup part-way through with `EMFILE` or an OOM-adjacent condition
+/// instead of a clear error. A fixed cap (rather than deriving from
+/// `available_parallelism()`) keeps the check deterministic across hosts
+/// and in CI.
 const MAX_RECV_TASKS: usize = 64;
 
 /// Rejects a `recv_tasks` value above `MAX_RECV_TASKS` for any of the three
@@ -1285,7 +1278,7 @@ pub struct SflowConfig {
 
     /// Number of UDP receive tasks (default: 8). Raise to spread socket
     /// draining across cores when the kernel is dropping datagrams while CPU
-    /// sits idle. See docs/performance/2026-09-18-udp-recv-fanout-results.md.
+    /// sits idle.
     ///
     /// The kernel distributes datagrams across the group by hashing each
     /// packet's source/destination address-port 4-tuple, so throughput
@@ -1295,11 +1288,10 @@ pub struct SflowConfig {
     /// will see no benefit from raising it, because every datagram still
     /// hashes to the same socket. `0` is treated the same as `1`, not as
     /// "disabled". The default of `8` costs roughly 19 KB RSS and one file
-    /// descriptor per extra socket at idle (measured with zero traffic — see
-    /// the idle-cost table in the perf doc above); the measured throughput
-    /// saturation point is `4`, so `8` is headroom, not a claim that it
-    /// outperforms `4`. Rejected above `MAX_RECV_TASKS` at config load — see
-    /// `validate_recv_tasks_config`.
+    /// descriptor per extra socket at idle (measured with zero traffic);
+    /// the measured throughput saturation point is `4`, so `8` is headroom,
+    /// not a claim that it outperforms `4`. Rejected above `MAX_RECV_TASKS`
+    /// at config load — see `validate_recv_tasks_config`.
     #[serde(default = "default_sflow_recv_tasks")]
     pub recv_tasks: usize,
 
@@ -1319,10 +1311,8 @@ pub struct SflowConfig {
     /// or above for a single-sender IPFIX stream at 50k/s; the default of
     /// `32` is a headroom choice (not shown to measurably beat `8`) costing
     /// roughly 6 MB resident with all three UDP listeners enabled at the
-    /// default `recv_tasks` — see
-    /// docs/performance/2026-09-18-recvmmsg-results.md. Rejected above
-    /// `MAX_RECV_BATCH_SIZE` at config load — see
-    /// `validate_recv_batch_size_config`.
+    /// default `recv_tasks`. Rejected above `MAX_RECV_BATCH_SIZE` at config
+    /// load — see `validate_recv_batch_size_config`.
     #[serde(default = "default_sflow_recv_batch_size")]
     pub recv_batch_size: usize,
 

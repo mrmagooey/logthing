@@ -1,7 +1,7 @@
 //! Integration test for `PartitionedParquetWriter::push`'s `record_skipped`
-//! counting (spec #4 / Task 2): a record whose sink mapping fails must be
-//! skipped without corrupting the buffer, while records that map
-//! successfully still make it into the Parquet file written to local disk.
+//! counting: a record whose sink mapping fails must be skipped without
+//! corrupting the buffer, while records that map successfully still make
+//! it into the Parquet file written to local disk.
 //!
 //! Unlike `parquet_records_skipped` in `buffered_writer.rs`'s own test
 //! module (which exercises `push()` directly against an in-memory buffer),

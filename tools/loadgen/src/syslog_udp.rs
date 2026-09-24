@@ -8,9 +8,9 @@
 //! - Structured (`--structured` on): the RFC3164 message body is a CEF
 //!   payload (`CEF:0|...`), which additionally exercises
 //!   `logthing::syslog::payload::dispatch`'s sub-parser try-chain when the
-//!   server has `parse_payloads=true` -- see
-//!   `docs/superpowers/specs/2026-07-05-performance-testing-strategy-design.md`
-//!   §3's note on this being the meaningfully heavier cost path.
+//!   server has `parse_payloads=true` -- a try-chain of 6 sub-parsers run
+//!   per message until one matches, meaningfully heavier than raw
+//!   pass-through.
 //!
 //! Each UDP datagram is exactly one message, with NO trailing newline: the
 //! `regex` crate's `.` does not match `\n` by default, so a trailing

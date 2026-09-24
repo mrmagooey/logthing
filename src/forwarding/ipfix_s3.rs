@@ -587,7 +587,7 @@ mod tests {
         Arc::new(S3Sink::from_connection(&conn).await.expect("constructs"))
     }
 
-    // -- Task 1: schema shape --
+    // -- schema shape --
 
     #[test]
     fn schema_has_correct_fields_and_types() {
@@ -638,7 +638,7 @@ mod tests {
         }
     }
 
-    // -- Task 1: row mapping --
+    // -- row mapping --
 
     #[test]
     fn append_and_finish_produces_correct_columns() {
@@ -882,7 +882,7 @@ mod tests {
         }
     }
 
-    // -- IpfixSink unit tests (Task 2.1) --
+    // -- IpfixSink unit tests --
 
     #[test]
     fn ipfix_sink_to_record_batch_produces_correct_schema_and_rows() {
@@ -1125,7 +1125,7 @@ mod tests {
         }
     }
 
-    // -- Task 2: writer push accumulation and bounded buffer under S3 outage --
+    // -- writer push accumulation and bounded buffer under S3 outage --
 
     #[tokio::test]
     async fn writer_push_accumulates_and_bounded_under_outage() {
@@ -1178,7 +1178,7 @@ mod tests {
         );
     }
 
-    // -- Task 3: IpfixS3Handler overflow test (real handler, real metrics) --
+    // -- IpfixS3Handler overflow test (real handler, real metrics) --
 
     #[tokio::test]
     #[allow(clippy::mutable_key_type)] // clippy false positive: CompositeKey interior mutability (AtomicBool) is never used for hashing
@@ -1405,7 +1405,7 @@ mod tests {
         }
     }
 
-    // -- Task 6 Integration test (gated on IPFIX_S3_INTEGRATION_TEST env var) --
+    // -- Integration test (gated on IPFIX_S3_INTEGRATION_TEST env var) --
 
     #[tokio::test]
     async fn integration_flows_produce_parquet_in_s3() {

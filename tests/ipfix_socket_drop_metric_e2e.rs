@@ -1,6 +1,5 @@
 //! End-to-end test: real IPFIX UDP listener → real production `/metrics`
-//! HTTP endpoint, for the socket-drop / rx-queue-depth metrics added in
-//! Task 0.0 of `docs/superpowers/plans/2026-09-14-throughput-improvements.md`.
+//! HTTP endpoint, for the socket-drop / rx-queue-depth metrics.
 //!
 //! Before this task, `ipfix_datagrams_received` counted what arrived but
 //! nothing counted what the kernel discarded before it ever reached this
@@ -19,10 +18,9 @@
 //!
 //! Ipfix stands in for sflow/syslog_udp here — the wiring is byte-for-byte
 //! identical `SocketDropStats::new` + 1s ticker in a `select!` arm across
-//! all three listeners (see `docs/superpowers/plans/2026-09-14-throughput-
-//! improvements.md` Task 0.0), so one live listener proves the shared
-//! `src/net.rs` mechanism actually reaches `/metrics` without duplicating
-//! the same proof three times.
+//! all three listeners, so one live listener proves the shared `src/net.rs`
+//! mechanism actually reaches `/metrics` without duplicating the same proof
+//! three times.
 //!
 //! This MUST be the only `#[tokio::test]` in this binary: `Server::run`
 //! installs the Prometheus recorder via `metrics::set_global_recorder`,
