@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file, newest
 first, loosely following [Keep a Changelog](https://keepachangelog.com/).
 This file starts at 0.15.0; earlier releases are not backfilled.
 
+## [0.21.0] - 2026-09-30
+
+### Added
+
+- `committer/` — a reference Iceberg committer that drains logthing's
+  descriptor queue into an Iceberg REST catalog via `add_files`, one commit
+  per table per run, partitioned by `day(partition_time)`. Published as the
+  container image `ghcr.io/mrmagooey/logthing-committer` on every release
+  tag. Transient and credential errors leave descriptors queued and exit
+  non-zero; only per-file errors quarantine. See `committer/README.md`.
+- `docs/iceberg.md` gains a table-maintenance section: periodic `optimize`
+  and `expire_snapshots`, and why `remove_orphan_files` must never run
+  against logthing's data location.
+
+### Changed
+
+- The README is split into end-user pages under `docs/`.
+
 ## [0.20.2] - 2026-09-22
 
 ### Added
