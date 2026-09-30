@@ -662,7 +662,16 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stdout,
     )
-    cfg = Config.from_env()
+    try:
+        cfg = Config.from_env()
+    except KeyError as exc:
+        # Config.from_env() reads required vars via os.environ[...], which
+        # raises a bare KeyError naming the missing key -- clear enough in a
+        # traceback, but this turns it into a one-line, non-traceback error
+        # message and a distinct exit code (2) for a container/orchestrator
+        # to recognise as "misconfigured" rather than "run failed".
+        logger.error("missing required environment variable: %s", exc)
+        return 2
     s3 = make_s3_client(cfg)
     catalog = make_catalog(cfg)
     pa_fs = make_pyarrow_fs(cfg)

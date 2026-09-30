@@ -301,3 +301,28 @@ def test_exit_code_aborted_is_nonzero_even_with_no_quarantine():
 
 def test_exit_code_aborted_and_quarantined_is_nonzero():
     assert commit.exit_code(committed=1, skipped=0, quarantined=2, aborted=True) == 1
+
+
+# ---------------------------------------------------------------------------
+# main() -- missing required environment variable
+# ---------------------------------------------------------------------------
+
+
+def test_main_missing_required_env_var_exits_2_with_clear_message(monkeypatch, caplog):
+    # No DATA_BUCKET/S3_ENDPOINT/etc set at all: Config.from_env() raises a bare
+    # KeyError, which main() must turn into a clear, non-traceback error and
+    # exit code 2 -- not let a raw KeyError abort the process with a traceback
+    # as the only clue.
+    for var in (
+        "DATA_BUCKET",
+        "S3_ENDPOINT",
+        "S3_ACCESS_KEY",
+        "S3_SECRET_KEY",
+        "CATALOG_URI",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    with caplog.at_level("ERROR"):
+        assert commit.main() == 2
+
+    assert any("missing required environment variable" in r.message for r in caplog.records)
