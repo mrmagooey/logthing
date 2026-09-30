@@ -38,7 +38,7 @@ logthing ──writes──▶ Parquet files   (existing [<source>.s3]/[<source>
   Kubernetes CronJob, etc.) pointed at the same bucket logthing writes to and
   an Iceberg REST catalog. See [`committer/README.md`](../committer/README.md)
   for the full environment-variable reference, container usage, and how to
-  run its end-to-end test. The alternative sketched below — a custom
+  run its end-to-end test. The alternative — a custom
   committer on `iceberg-rust`'s low-level primitives, populated directly
   from the descriptor JSON's stats instead of re-reading each Parquet
   footer — remains a valid path if `add_files`'s per-file footer read ever

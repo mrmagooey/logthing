@@ -5,6 +5,9 @@
 # what this does and its required environment variables.
 FROM python:3.12-slim
 
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
 LABEL org.opencontainers.image.title="logthing-committer" \
       org.opencontainers.image.description="Drains logthing's Iceberg descriptor queue into an Iceberg REST catalog via add_files" \
       org.opencontainers.image.source="https://github.com/mrmagooey/logthing"
