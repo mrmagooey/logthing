@@ -22,6 +22,8 @@ This document explains how automated or semi-automated agents should interact wi
 | Coverage report | `scripts/run_coverage.sh` |
 | E2E tests | `tests/e2e/simulation-environment/run.sh` (requires Docker) |
 | Fuzz (nightly) | `scripts/fuzz.sh <target|all> [secs]` |
+| Committer tests | `committer/.venv/bin/pytest committer/tests --ignore=committer/tests/e2e` |
+| Committer E2E test | `committer/tests/e2e/run.sh` (requires Docker) |
 
 **Example - run a specific test:**
 ```bash
@@ -138,6 +140,7 @@ src/
   stats/        # Metrics and statistics
   syslog/       # Syslog listener
   zeek/         # Zeek NDJSON ingestion
+committer/  # Python Iceberg committer (separate image)
 ```
 
 Note: `src/lib.rs` is the crate's module root (the crate is both a library and a binary); `src/main.rs` is the binary entry point only.

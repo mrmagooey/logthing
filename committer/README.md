@@ -218,3 +218,53 @@ committer/.venv/bin/pytest committer/tests -q
   results by scanning the resulting Iceberg tables. Slower than the unit
   tests (real HTTP round trips against local moto) but exercises the real
   add_files/partitioning/batching/idempotency/error-handling behavior.
+
+## Container image
+
+Published as `ghcr.io/<owner>/logthing-committer:<version>` (see
+`.github/workflows/committer.yml`; `<owner>` is this repo's GitHub owner),
+for `linux/amd64` and `linux/arm64`, built from the `Dockerfile` in this
+directory (`python:3.12-slim`, runs as a non-root user, entrypoint
+`python /app/commit.py`). It takes no arguments — everything is
+[configuration via environment](#configuration-environment) — and exits 0 on
+a clean run.
+
+```sh
+docker run --rm \
+  -e DATA_BUCKET=my-bucket \
+  -e S3_ENDPOINT=http://minio:9000 \
+  -e S3_ACCESS_KEY=minioadmin \
+  -e S3_SECRET_KEY=minioadmin \
+  -e CATALOG_URI=http://lakekeeper:8181/catalog \
+  -e WAREHOUSE=my-warehouse \
+  -e ICEBERG_NAMESPACE=logs \
+  ghcr.io/<owner>/logthing-committer:<version>
+```
+
+Run it on a schedule (cron, a Kubernetes `CronJob`, ...) — see
+[docs/iceberg.md](../docs/iceberg.md) for the surrounding deployment
+pattern. With no environment configured at all, it prints a one-line error
+naming the missing variable and exits `2`, rather than a bare `KeyError`
+traceback.
+
+## End-to-end test
+
+`tests/e2e/run.sh` proves the whole pipeline for real: a host-run logthing
+process receives syslog over UDP and writes Parquet + Iceberg descriptors to
+a local MinIO, the committer image (built fresh by the script) drains that
+queue into a real Iceberg REST catalog (Postgres + Lakekeeper, via
+`tests/e2e/docker-compose.yml`), and `tests/e2e/verify.py` reads the result
+back through the catalog and S3 — table existence, day partitioning, row
+count, marker content, and an empty descriptor queue — then runs the
+committer a second time to check idempotency (same row count, exit 0).
+
+Requires Docker (Compose v2) and a built `logthing` release binary:
+
+```sh
+cargo build --release   # from the repo root
+committer/tests/e2e/run.sh
+```
+
+Set `LOGTHING_BIN` to point at a binary built elsewhere (e.g. a shared
+`CARGO_TARGET_DIR`); it defaults to `target/release/logthing` relative to
+the repo root.
