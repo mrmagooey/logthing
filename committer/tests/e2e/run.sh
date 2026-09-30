@@ -87,6 +87,9 @@ echo "== [4/8] generate logthing config + start logthing =="
 cat > "$CFG_DIR/logthing.toml" <<TOML
 bind_address = "$HEALTH_ADDR"
 
+[tls]
+enabled = false
+
 [logging]
 level = "info"
 format = "pretty"

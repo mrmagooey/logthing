@@ -21,6 +21,7 @@ import sys
 
 import boto3
 from pyiceberg.catalog.rest import RestCatalog
+from pyiceberg.io.pyarrow import PyArrowFileIO
 
 NAMESPACE = "logs"
 TABLE = "syslog"
@@ -35,16 +36,25 @@ DESC_PREFIX = os.environ.get("DESC_PREFIX", "_iceberg_descriptors/")
 DONE_PREFIX = os.environ.get("DONE_PREFIX", "_committed/")
 
 
+def s3_io_properties() -> dict[str, str]:
+    return {
+        "s3.endpoint": S3_ENDPOINT,
+        "s3.access-key-id": S3_ACCESS_KEY,
+        "s3.secret-access-key": S3_SECRET_KEY,
+        "s3.region": "us-east-1",
+        # Same reasoning as commit.py: pyiceberg property_as_bool() treats
+        # the Python bool False as "absent", so booleans go in as strings.
+        "s3.force-virtual-addressing": "False",
+    }
+
+
 def catalog() -> RestCatalog:
     return RestCatalog(
         "e2e-verify",
         **{
             "uri": CATALOG_URI,
             "warehouse": WAREHOUSE,
-            "s3.endpoint": S3_ENDPOINT,
-            "s3.access-key-id": S3_ACCESS_KEY,
-            "s3.secret-access-key": S3_SECRET_KEY,
-            "s3.force-virtual-addressing": "False",
+            **s3_io_properties(),
         },
     )
 
@@ -79,6 +89,11 @@ def main() -> int:
 
     assert cat.table_exists(identifier), f"table {NAMESPACE}.{TABLE} does not exist"
     table = cat.load_table(identifier)
+    # A REST catalog hands back tables using FsspecFileIO, which needs the
+    # s3fs package (not installed here, and not a dependency of commit.py
+    # either) -- force PyArrowFileIO, exactly as commit.py does, so reading
+    # this table needs nothing beyond what requirements.txt already installs.
+    table.io = PyArrowFileIO(properties=s3_io_properties())
 
     spec = table.spec()
     day_fields = [f for f in spec.fields if f.transform.__class__.__name__ == "DayTransform"]
