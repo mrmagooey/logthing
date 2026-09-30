@@ -6,3 +6,8 @@ profiling-results/
 # subagent-driven-development scratch
 .superpowers/
 /.worktrees/
+
+# committer (Python)
+committer/.venv/
+__pycache__/
+.pytest_cache/

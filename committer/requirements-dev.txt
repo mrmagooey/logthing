@@ -1,0 +1,8 @@
+# Test-only dependencies, on top of the runtime requirements.
+-r requirements.txt
+
+pytest==8.3.5
+moto[server]==5.0.28
+# pyiceberg's SqlCatalog (used in tests as a real, local catalog) needs
+# SQLAlchemy; the REST catalog used in production does not.
+sqlalchemy==2.0.43
