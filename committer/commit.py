@@ -13,7 +13,7 @@ resolves the referenced Parquet file, derives an Iceberg table name, and
 registers the file into that table via ``add_files`` -- the data file is
 adopted in place with no rewrite. Descriptors are moved to ``DONE_PREFIX``
 once committed, or to ``QUARANTINE_PREFIX`` if they turn out to be broken
-beyond repair (see ``is_transient`` below for what counts as "broken").
+beyond repair (see ``should_abort`` below for what counts as "broken").
 
 Each run is idempotent: a descriptor that names a file already registered in
 its target table is skipped and moved straight to ``DONE_PREFIX``, so a
@@ -40,12 +40,11 @@ from botocore.exceptions import ClientError, ConnectionClosedError, EndpointConn
 from pyiceberg.catalog import Catalog
 from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.exceptions import (
+    BadRequestError,
     CommitFailedException,
-    CommitStateUnknownException,
     NamespaceAlreadyExistsError,
     NoSuchTableError,
-    ServerError,
-    ServiceUnavailableError,
+    RESTError,
 )
 from pyiceberg.io.pyarrow import PyArrowFileIO
 from pyiceberg.table import Table
@@ -108,13 +107,10 @@ class Config:
 
     @property
     def s3_io_properties(self) -> dict[str, str]:
-        # Every value here MUST be a non-empty string, not a Python bool.
-        # pyiceberg's `property_as_bool()` does `if value := properties.get(name)`
-        # before parsing the string -- a Python `False` is itself falsy, so it
-        # never reaches the parser and silently falls back to the *default*
-        # (True, i.e. virtual-hosted addressing), defeating path-style access
-        # against MinIO/Garage and similar S3-compatible stores. Passing the
-        # string "False" parses correctly.
+        # pyiceberg catalog/FileIO properties are typed as Dict[str, str], and
+        # its own `property_as_bool()` treats a falsy value (including the
+        # Python bool `False`) as "absent" rather than "false" -- so every
+        # boolean-valued property here is passed as its string form.
         return {
             "s3.endpoint": self.s3_endpoint,
             "s3.access-key-id": self.s3_access_key,
@@ -162,36 +158,60 @@ def make_pyarrow_fs(cfg: Config) -> pafs.S3FileSystem:
 # Error classification
 # ---------------------------------------------------------------------------
 
-# S3 error codes that mean "this object genuinely isn't there" -- permanent,
-# not connectivity.
-_PERMANENT_S3_CODES = frozenset({"NoSuchKey", "NoSuchBucket", "404", "NotFound"})
+# A single object that genuinely isn't there -- permanent, not connectivity,
+# and not systemic: every *other* key can still be read fine.
+_PERMANENT_S3_CODES = frozenset({"NoSuchKey", "404", "NotFound"})
+
+# Credentials/config problems: every request fails the same way, so the whole
+# run must abort rather than quarantine the descriptor that happened to hit
+# it first.
+_ABORT_S3_CODES = frozenset(
+    {"AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "NoSuchBucket", "ExpiredToken"}
+)
 
 # S3 error codes for overload/throttling that a caller should treat the same
 # as a 5xx: transient, retry later.
 _TRANSIENT_S3_CODES = frozenset(
-    {"SlowDown", "Throttling", "ThrottlingException", "RequestTimeout", "ServiceUnavailable", "InternalError"}
+    {
+        "SlowDown",
+        "Throttling",
+        "ThrottlingException",
+        "RequestTimeout",
+        "ServiceUnavailable",
+        "InternalError",
+    }
 )
 
 
-def is_transient(exc: BaseException) -> bool:
-    """Classify an exception as transient (leave the descriptor queued, abort
-    the run) or permanent (quarantine just this one descriptor/file).
+def should_abort(exc: BaseException) -> bool:
+    """Classify an exception as abort (leave the descriptor queued, stop the
+    run) or permanent (quarantine just this one descriptor/file).
 
-    Transient: catalog unreachable or returning 5xx, an Iceberg commit
-    conflict, S3 connection errors/throttling/5xx, and a pyarrow S3 `OSError`
-    that indicates connectivity rather than a specific missing object.
+    Abort covers two kinds of failure that both make quarantining the wrong
+    move: transient (catalog/S3 unreachable or returning 5xx, throttling, an
+    Iceberg commit conflict) and systemic (bad credentials, wrong bucket,
+    expired auth) -- a systemic error hits every descriptor the same way, so
+    quarantining "the" bad one would drain the whole queue into
+    QUARANTINE_PREFIX for a problem that has nothing to do with any of them.
 
     Permanent (the default for anything not recognised below): a schema
-    mismatch, a missing data file, a malformed descriptor, or an unsupported
-    storage target.
+    mismatch, a missing data file, a malformed descriptor, an unsupported
+    storage target, or a catalog 400 on one table's request -- failures
+    attributable to that one descriptor, not to the environment.
 
-    When genuinely unsure, this leans transient -- quarantine means a human
-    has to go triage it, a wrongly-transient classification just costs one
-    extra retry on the next run.
+    When genuinely unsure, this leans toward abort -- quarantine means a
+    human has to go triage it, a wrongly-aborted run just costs one retry on
+    the next invocation.
     """
-    if isinstance(exc, (CommitFailedException, CommitStateUnknownException)):
+    if isinstance(exc, CommitFailedException):
         return True
-    if isinstance(exc, (ServerError, ServiceUnavailableError)):
+    if isinstance(exc, RESTError) and not isinstance(exc, BadRequestError):
+        # Covers ServerError/ServiceUnavailableError (5xx), UnauthorizedError
+        # (401), ForbiddenError (403), AuthorizationExpiredError (419),
+        # OAuthError, and CommitStateUnknownException (an ambiguous commit
+        # outcome -- safer to not assume it failed). BadRequestError (400) is
+        # excluded: that's a bad request for one specific table/commit, not a
+        # systemic problem, so it stays permanent.
         return True
     if isinstance(exc, (RequestsConnectionError, RequestsTimeout)):
         return True
@@ -200,26 +220,29 @@ def is_transient(exc: BaseException) -> bool:
     if isinstance(exc, ClientError):
         error = exc.response.get("Error", {}) or {}
         code = str(error.get("Code", ""))
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") or 0
         if code in _PERMANENT_S3_CODES:
             return False
-        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") or 0
+        if status in (401, 403) or code in _ABORT_S3_CODES:
+            return True
         if status >= 500 or code in _TRANSIENT_S3_CODES:
             return True
         return False
     if isinstance(exc, FileNotFoundError):
         # pyarrow raises this (an OSError subclass) when a descriptor points at
         # a data file that simply isn't in the bucket -- a broken descriptor,
-        # not a connectivity problem.
+        # not a connectivity or permission problem.
         return False
     if isinstance(exc, OSError):
         # Every other OSError out of pyarrow's S3 filesystem (refused, reset,
-        # DNS failure, timeout) is connectivity. Lean transient.
+        # DNS failure, timeout, permission denied) is connectivity or config.
+        # Lean toward abort.
         return True
     return False
 
 
 class _Abort(Exception):
-    """Internal signal: a transient error was hit: stop the run immediately."""
+    """Internal signal: `should_abort` said stop -- unwind the whole run immediately."""
 
     def __init__(self, cause: BaseException) -> None:
         super().__init__(str(cause))
@@ -280,15 +303,22 @@ def parse_file_path(desc: dict[str, Any], bucket: str) -> str:
     MinIO/Garage and similar S3-compatible stores), virtual-hosted-style
     (`https://<bucket>.<host>/<key>`), and `s3://<bucket>/<key>` directly.
 
-    Raises ValueError (permanent -- `is_transient` returns False for it) for
+    Raises ValueError (permanent -- `should_abort` returns False for it) for
     anything that doesn't parse, names the wrong bucket, or isn't S3-backed.
     `file_path` is required; there is no legacy fallback field or
     descriptor-key-mirroring guess.
     """
+    def wrong_bucket(found_bucket: str) -> ValueError:
+        return ValueError(
+            f"file_path bucket {found_bucket!r} does not match "
+            f"DATA_BUCKET {bucket!r}: {file_path!r}"
+        )
+
     storage_target = desc.get("storage_target")
     if storage_target != "s3":
         raise ValueError(
-            f"unsupported storage_target {storage_target!r}: only 's3' descriptors can be committed to Iceberg"
+            f"unsupported storage_target {storage_target!r}: "
+            "only 's3' descriptors can be committed to Iceberg"
         )
 
     file_path = desc.get("file_path")
@@ -299,7 +329,7 @@ def parse_file_path(desc: dict[str, Any], bucket: str) -> str:
         rest = file_path[len("s3://") :]
         found_bucket, _, key = rest.partition("/")
         if found_bucket != bucket or not key:
-            raise ValueError(f"file_path bucket {found_bucket!r} does not match DATA_BUCKET {bucket!r}: {file_path!r}")
+            raise wrong_bucket(found_bucket)
         return f"s3://{bucket}/{key}"
 
     parsed = urllib.parse.urlparse(file_path)
@@ -319,7 +349,7 @@ def parse_file_path(desc: dict[str, Any], bucket: str) -> str:
     # Path-style: http(s)://host[:port]/<bucket>/<key>
     found_bucket, _, key = path.partition("/")
     if found_bucket != bucket or not key:
-        raise ValueError(f"file_path bucket {found_bucket!r} does not match DATA_BUCKET {bucket!r}: {file_path!r}")
+        raise wrong_bucket(found_bucket)
     return f"s3://{bucket}/{key}"
 
 
@@ -399,7 +429,7 @@ def ensure_namespace(catalog: Catalog, namespace: str) -> None:
 def committed_file_set(tbl: Table) -> set[str]:
     """The set of file paths already registered in `tbl`, per its current
     snapshot. Exceptions are NOT swallowed here -- the caller decides via
-    `is_transient` whether that's a reason to abort or to quarantine.
+    `should_abort` whether that's a reason to abort or to quarantine.
     """
     return set(tbl.inspect.files().column("file_path").to_pylist())
 
@@ -452,8 +482,8 @@ def _commit_batch(
 ) -> _Counts:
     """Commit one table's worth of queued descriptors (up to `batch_size`) in
     a single `add_files` call, then move each of their descriptors to
-    `DONE_PREFIX`. Raises `_Abort` on a transient failure -- callers must let
-    that unwind the whole run.
+    `DONE_PREFIX`. Raises `_Abort` when `should_abort` says so -- callers
+    must let that unwind the whole run.
     """
     counts = _Counts()
 
@@ -465,12 +495,14 @@ def _commit_batch(
             tbl = ensure_table(catalog, pa_fs, cfg, name, batch[0][1])
             committed_files = committed_file_set(tbl)
         except Exception as exc:  # noqa: BLE001 - classified immediately below
-            if is_transient(exc):
+            if should_abort(exc):
                 raise _Abort(exc) from exc
             # The table itself can't be loaded/created/inspected -- nothing in
             # this batch can be committed to it. Quarantine the whole batch
             # rather than guessing which file is "the bad one".
-            logger.error("table %s.%s unusable, quarantining its whole batch: %r", cfg.namespace, name, exc)
+            logger.error(
+                "table %s.%s unusable, quarantining its whole batch: %r", cfg.namespace, name, exc
+            )
             for dkey, _uri in batch:
                 _mark_quarantined(s3, cfg, dkey)
             counts.quarantined += len(batch)
@@ -498,12 +530,17 @@ def _commit_batch(
         counts.committed += len(to_add)
         return counts
     except Exception as exc:  # noqa: BLE001 - classified immediately below
-        if is_transient(exc):
+        if should_abort(exc):
             raise _Abort(exc) from exc
         # Permanent failure on the batched call doesn't tell us which file is
         # bad. Retry one at a time so only the actually-broken one quarantines
         # and the rest of the batch still commits.
-        logger.warning("batch commit to %s.%s failed (%r), retrying files individually", cfg.namespace, name, exc)
+        logger.warning(
+            "batch commit to %s.%s failed (%r), retrying files individually",
+            cfg.namespace,
+            name,
+            exc,
+        )
         for dkey, uri in to_add:
             try:
                 tbl.add_files([uri])
@@ -512,7 +549,7 @@ def _commit_batch(
                 counts.committed += 1
                 logger.info("committed %s -> %s.%s", uri, cfg.namespace, name)
             except Exception as exc2:  # noqa: BLE001 - classified immediately below
-                if is_transient(exc2):
+                if should_abort(exc2):
                     raise _Abort(exc2) from exc2
                 logger.error("permanent error committing %s: %r", uri, exc2)
                 _mark_quarantined(s3, cfg, dkey)
@@ -527,7 +564,7 @@ def _commit_batch(
 
 def exit_code(committed: int, skipped: int, quarantined: int, aborted: bool) -> int:
     """Exit 0 only for a clean run: nothing quarantined, and the run wasn't
-    aborted partway through by a transient error.
+    aborted partway through.
     """
     if aborted or quarantined > 0:
         return 1
@@ -540,7 +577,10 @@ def run(cfg: Config, s3: Any, catalog: Catalog, pa_fs: pafs.S3FileSystem) -> int
     Descriptors are listed one page at a time and grouped in memory only as
     small `(descriptor_key, uri)` pairs, never as Parquet bytes; a table's
     pending group is committed and cleared as soon as it reaches
-    `cfg.batch_size`, keeping memory bounded regardless of queue size.
+    `cfg.batch_size`. That bounds memory against queue size -- it does not
+    bound the per-table `committed_file_set` cache, which holds one path per
+    file the table already has, independent of how many descriptors are
+    queued.
     """
     table_cache: dict[str, Table] = {}
     committed_cache: dict[str, set[str]] = {}
@@ -551,7 +591,6 @@ def run(cfg: Config, s3: Any, catalog: Catalog, pa_fs: pafs.S3FileSystem) -> int
     aborted = False
 
     def flush(name: str) -> None:
-        nonlocal totals
         batch = pending.pop(name)
         result = _commit_batch(cfg, s3, catalog, pa_fs, table_cache, committed_cache, name, batch)
         totals.committed += result.committed
@@ -577,7 +616,7 @@ def run(cfg: Config, s3: Any, catalog: Catalog, pa_fs: pafs.S3FileSystem) -> int
                     uri = parse_file_path(desc, cfg.bucket)
                     name = table_name(source, desc.get("partition"))
                 except Exception as exc:  # noqa: BLE001 - classified immediately below
-                    if is_transient(exc):
+                    if should_abort(exc):
                         raise _Abort(exc) from exc
                     logger.error("permanent error reading descriptor %s: %r", dkey, exc)
                     _mark_quarantined(s3, cfg, dkey)
@@ -591,18 +630,18 @@ def run(cfg: Config, s3: Any, catalog: Catalog, pa_fs: pafs.S3FileSystem) -> int
         for name in list(pending.keys()):
             flush(name)
     except _Abort as abort:
-        logger.error("aborting run after transient error: %r", abort.cause)
+        logger.error("aborting run: %r", abort.cause)
         aborted = True
     except Exception as exc:  # noqa: BLE001 - classified immediately below
         # A raw (not pre-classified) exception can only get here from listing
         # the queue itself or creating the namespace -- not attributable to any
-        # one descriptor. Transient (S3/catalog unreachable): abort like any
-        # other transient failure. Anything else is a real bug or
-        # misconfiguration (e.g. the bucket doesn't exist): let it crash the
+        # one descriptor. If should_abort agrees, abort like any other
+        # transient/systemic failure. Anything else is a real bug or
+        # misconfiguration should_abort doesn't recognise: let it crash the
         # process rather than pretend the run completed.
-        if not is_transient(exc):
+        if not should_abort(exc):
             raise
-        logger.error("aborting run after transient error: %r", exc)
+        logger.error("aborting run: %r", exc)
         aborted = True
 
     remaining = seen - totals.committed - totals.skipped - totals.quarantined

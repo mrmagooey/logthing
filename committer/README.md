@@ -40,10 +40,11 @@ any Iceberg REST catalog and any S3-compatible object store.
 A descriptor whose failure is attributable to itself (a schema mismatch, a
 missing data file, a malformed descriptor) is quarantined to
 `QUARANTINE_PREFIX` and the run continues with the rest of the queue. A
-failure that looks like it might resolve on its own (the catalog or S3 is
-unreachable, returning 5xx, or an Iceberg commit conflict) aborts the run
-instead, leaving every not-yet-committed descriptor in the queue — see
-[Error classification](#error-classification).
+failure that isn't attributable to any one descriptor — the catalog or S3 is
+unreachable or returning 5xx, an Iceberg commit conflict, or a
+credentials/bucket-config problem that would hit every descriptor the same
+way — aborts the run instead, leaving every not-yet-committed descriptor in
+the queue — see [Error classification](#error-classification).
 
 ## Table naming
 
@@ -93,28 +94,44 @@ error.
 
 ## Error classification
 
-`is_transient(exc)` decides whether a failure aborts the run (transient) or
-quarantines just the one descriptor/file (permanent):
+`should_abort(exc)` decides whether a failure aborts the run, leaving every
+not-yet-committed descriptor queued, or quarantines just the one
+descriptor/file that hit it. Abort covers two kinds of failure that both
+make quarantining the wrong move: **transient** (retrying later might
+succeed) and **systemic** (a config/credentials problem that will hit every
+descriptor the same way — quarantining "the" bad one would silently drain
+the whole queue into `QUARANTINE_PREFIX` for a problem that has nothing to
+do with any of them).
 
-**Transient** (abort, leave descriptors queued):
-- the Iceberg catalog is unreachable, times out, or returns a 5xx
-  (`pyiceberg.exceptions.ServerError` / `ServiceUnavailableError`, or a
-  `requests` connection/timeout error before any response arrives);
-- `CommitFailedException` / `CommitStateUnknownException` (a commit
-  conflict, or an ambiguous outcome — safer to not assume it failed);
-- S3 connection errors, throttling, or 5xx (`botocore.exceptions
-  .EndpointConnectionError` / `ConnectionClosedError`, or a `ClientError`
-  with a 5xx status or a throttling error code);
+**Abort** (leave descriptors queued):
+- the Iceberg catalog is unreachable, times out, or returns any
+  `pyiceberg.exceptions.RESTError` other than `BadRequestError` — this
+  covers 5xx (`ServerError`/`ServiceUnavailableError`), auth/config errors
+  (`UnauthorizedError` 401, `ForbiddenError` 403, `AuthorizationExpiredError`
+  419, `OAuthError`), and `CommitStateUnknownException` (an ambiguous commit
+  outcome — safer to not assume it failed). `BadRequestError` (400) stays
+  permanent: that's a bad request for one specific table/commit, not
+  something wrong with the whole run;
+- a `requests` connection/timeout error before any response arrives;
+- `CommitFailedException` (a commit conflict);
+- S3 connection errors (`botocore.exceptions.EndpointConnectionError` /
+  `ConnectionClosedError`), or a `ClientError` with a 5xx status, a
+  throttling error code, an HTTP 401/403, or a code that means the
+  credentials/bucket themselves are wrong (`AccessDenied`,
+  `InvalidAccessKeyId`, `SignatureDoesNotMatch`, `NoSuchBucket`,
+  `ExpiredToken`);
 - an `OSError` from pyarrow's S3 filesystem that isn't a
-  `FileNotFoundError` (DNS failure, connection refused/reset, timeout).
+  `FileNotFoundError` (DNS failure, connection refused/reset, timeout,
+  permission denied).
 
 **Permanent** (quarantine just this one, everything else not listed above):
-schema mismatch, a missing data file (`NoSuchKey`/404, or pyarrow's
-`FileNotFoundError`), a malformed descriptor, an unsupported storage target.
+schema mismatch, a missing data file (`NoSuchKey`/404 on that one object, or
+pyarrow's `FileNotFoundError`), a malformed descriptor, an unsupported
+storage target, or a catalog `BadRequestError` for one table's request.
 
-When genuinely unsure, `is_transient` leans transient: quarantine means a
-human has to go triage it, a wrongly-transient call just costs one extra
-retry on the next run.
+When genuinely unsure, `should_abort` leans toward abort: quarantine means a
+human has to go triage it, a wrongly-aborted run just costs one retry on the
+next invocation.
 
 Within one chunk commit, a permanent failure triggers a one-file-at-a-time
 retry of that chunk, so only the actually-broken file is quarantined and the
@@ -154,13 +171,11 @@ collaborators instead.
   `py-io-impl` property is ignored for REST-loaded tables, so the FileIO is
   overridden explicitly before a table is read or written.
 - **`s3.force-virtual-addressing` is set to the string `"False"`, not the
-  Python value `False`.** pyiceberg's own property parser does
-  `if value := properties.get(name)` before parsing a boolean property — a
-  Python `False` is itself falsy, so it never reaches the parser and
-  silently falls back to the *default* (`True`, virtual-hosted addressing),
-  which breaks path-style access against MinIO/Garage-style stores. Every
-  boolean-valued catalog/FileIO property must be passed as a non-empty
-  string for this reason.
+  Python value `False`.** pyiceberg's catalog/FileIO properties are typed as
+  `Dict[str, str]`, and its own `property_as_bool()` treats a falsy value —
+  including the Python bool `False` — as "absent" rather than "false".
+  Every boolean-valued property is passed in its string form for this
+  reason.
 - **Day partitioning only.** `add_files` infers a file's partition value
   from Parquet column min/max stats and raises if they straddle a boundary.
   logthing keys its write buffers by (partition, UTC day), so every file is
@@ -177,9 +192,13 @@ collaborators instead.
   no compensation: if the first succeeds and the second doesn't (a
   transient REST error, a commit conflict), a table would otherwise be
   permanently unpartitioned. Re-checking on load makes that self-healing.
-- **Batching keeps memory bounded.** Descriptors are listed one S3 page at a
-  time and grouped only as small `(descriptor_key, uri)` pairs — the Parquet
-  data itself is never loaded into memory by this script.
+- **Batching keeps queue memory bounded.** Descriptors are listed one S3
+  page at a time and grouped only as small `(descriptor_key, uri)` pairs —
+  the Parquet data itself is never loaded into memory by this script. This
+  bounds memory against queue size, not against table size: the per-table
+  already-committed-file cache (`committed_file_set`) holds one path per
+  file already registered in that table, so it scales with how many files
+  the table already has, independent of how many descriptors are queued.
 
 ## Running the tests
 
@@ -190,7 +209,7 @@ committer/.venv/bin/pytest committer/tests -q
 ```
 
 - `tests/test_unit.py` — pure functions only: table naming, `file_path`
-  parsing, `is_transient`, exit-code logic. No network, no S3, no catalog.
+  parsing, `should_abort`, exit-code logic. No network, no S3, no catalog.
 - `tests/test_integration.py` — real collaborators: moto's
   `ThreadedMotoServer` as a local S3 (used by both `boto3` and pyarrow's
   `S3FileSystem`), and pyiceberg's `SqlCatalog` backed by SQLite in a temp
