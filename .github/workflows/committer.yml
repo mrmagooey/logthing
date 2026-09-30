@@ -1,0 +1,114 @@
+name: Committer
+
+on:
+  push:
+    branches: [ "master" ]
+    paths: [ 'committer/**', '.github/workflows/committer.yml' ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ "master" ]
+    paths: [ 'committer/**', '.github/workflows/committer.yml' ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/logthing-committer
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r committer/requirements-dev.txt
+
+      - name: Run unit + integration tests
+        run: pytest committer/tests --ignore=committer/tests/e2e -q
+
+  # Full stack (logthing + MinIO + Postgres + Lakekeeper) through Docker
+  # Compose -- only on a release tag, since it takes minutes and needs a real
+  # cargo release build. PRs/pushes to master get the fast `test` job above;
+  # this is the gate before `publish` actually ships an image.
+  e2e:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build logthing (release)
+        run: cargo build --release --verbose
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install committer test dependencies
+        run: pip install -r committer/requirements-dev.txt
+
+      - name: Run committer e2e test
+        run: committer/tests/e2e/run.sh
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: e2e
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Unlike the Rust images (release.yml), this one is built once under
+      # QEMU for both platforms rather than split across native amd64/arm64
+      # runners. release.yml avoids QEMU because emulating rustc and C
+      # dependencies (aws-lc-sys, zstd-sys, ...) for the Rust build dominated
+      # release time (1.5-2.5h). This image only runs `pip install -r
+      # requirements.txt` -- no compiler is ever invoked under emulation, it
+      # just unpacks prebuilt wheels, which is fast even emulated. Confirmed
+      # on PyPI: pyiceberg==0.11.1, pyarrow==18.1.0 (which has a compiled
+      # extension) and boto3==1.35.99 (pure Python, py3-none-any) all publish
+      # manylinux aarch64 wheels for cp312, so `pip install` never falls back
+      # to a from-source build on either platform.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: committer
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

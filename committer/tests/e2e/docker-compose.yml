@@ -1,0 +1,100 @@
+# End-to-end stack for the Iceberg committer: MinIO (S3), Postgres (Lakekeeper's
+# metadata store), and Lakekeeper (Iceberg REST catalog). logthing itself and
+# the committer are NOT compose services -- logthing runs as a host process
+# (see run.sh) and the committer image is built/run directly with `docker run
+# --network host` so it can reach both these services and the host-run
+# logthing binary through localhost, the same way a real deployment reaches
+# S3 and a catalog over the network.
+#
+# Image notes:
+# - MinIO's own `minio/minio` and `minio/mc` images stopped allowing
+#   anonymous pulls from Docker Hub and quay.io in September 2026. `pgsty/*`
+#   is the drop-in community fork Lakekeeper's own upstream examples switched
+#   to for the same reason (see lakekeeper/lakekeeper's
+#   examples/minimal/docker-compose.yaml, which now pulls `pgsty/silo` and
+#   `pgsty/mc` instead of `minio/minio`/`minio/mc`). Renamed to `minio`/
+#   `minio-setup` here for readability; the wire protocol is unchanged MinIO.
+# - All image tags are pinned to a specific release, not `latest`.
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+    ports:
+      - "5432:5432"
+
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    # No in-container healthcheck: this image ships neither a shell nor
+    # curl/wget/mc, so there is nothing to exec for a Docker HEALTHCHECK.
+    # `minio-setup` below retries its own connection until MinIO answers,
+    # and run.sh's own polling loops cover MinIO readiness for the rest of
+    # the stack.
+
+  # One-shot: creates the bucket logthing and the committer both read/write.
+  # `docker compose run --rm minio-setup` (see run.sh) rather than an
+  # automatic compose dependency, mirroring
+  # tests/e2e/simulation-environment/run.sh's `run --rm minio-setup` pattern.
+  minio-setup:
+    image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z
+    depends_on:
+      - minio
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        until mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null 2>&1; do
+          sleep 1
+        done
+        mc mb --ignore-existing local/logthing-data
+    restart: "no"
+
+  # One-shot: runs Lakekeeper's DB migrations before `serve` starts.
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:v0.13.6
+    environment:
+      LAKEKEEPER__PG_ENCRYPTION_KEY: "e2e-test-encryption-key-not-secret"
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://postgres:postgres@postgres:5432/postgres
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://postgres:postgres@postgres:5432/postgres
+    command: ["migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:v0.13.6
+    environment:
+      LAKEKEEPER__PG_ENCRYPTION_KEY: "e2e-test-encryption-key-not-secret"
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://postgres:postgres@postgres:5432/postgres
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://postgres:postgres@postgres:5432/postgres
+      LAKEKEEPER__BASE_URI: "http://localhost:8181"
+      # No LAKEKEEPER__OPENID_PROVIDER_URI set -- this is Lakekeeper's
+      # allow-all/no-auth mode, fine for a local, throwaway test stack only.
+    command: ["serve"]
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+    ports:
+      - "8181:8181"

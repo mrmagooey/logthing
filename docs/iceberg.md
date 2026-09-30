@@ -29,34 +29,47 @@ logthing ──writes──▶ Parquet files   (existing [<source>.s3]/[<source>
                       Iceberg catalog + tables
 ```
 
-- **Committer**: a small, independently-deployed job (batch or
-  long-running) that lists new descriptor files and builds Iceberg
-  manifests from their contents. Two options, with a real tradeoff between
-  them:
-  - **PyIceberg's `add_files`** — fastest to stand up, but it does not
-    use the descriptor's pre-computed stats: it opens each Parquet file
-    itself and reads its footer to derive row count, byte size, column
-    stats, and partition values. This still works fine, but it re-reads
-    every file (a footer-only range-read, not a full download, but still
-    I/O against the Parquet object) and doesn't need the descriptor JSON
-    at all — it could just as well list the S3 prefix directly.
-  - **A custom committer** built on `iceberg-rust`'s low-level primitives
-    (`DataFileBuilder`, `ManifestWriter`, `ManifestListWriter`), populated
-    directly from the descriptor JSON's `record_count`/`file_size_in_bytes`/
-    `column_stats` fields — this is the option that actually delivers on
-    "never re-reads Parquet," since it never opens the Parquet file at
-    all. More work to build than reaching for `add_files`, but it's the
-    only path that uses the descriptor for what it was designed for.
+- **Committer**: `committer/` in this repo ships a ready-to-run one, built
+  on PyIceberg's `add_files` — drains the descriptor queue and registers
+  each Parquet file into an Iceberg REST catalog table (partitioned by
+  `day(partition_time)`), with idempotent re-runs and a clear
+  abort-vs-quarantine error policy. Run it as the published container image,
+  `ghcr.io/<owner>/logthing-committer:<version>`, on a schedule (cron, a
+  Kubernetes CronJob, etc.) pointed at the same bucket logthing writes to and
+  an Iceberg REST catalog. See [`committer/README.md`](../committer/README.md)
+  for the full environment-variable reference, container usage, and how to
+  run its end-to-end test. The alternative — a custom
+  committer on `iceberg-rust`'s low-level primitives, populated directly
+  from the descriptor JSON's stats instead of re-reading each Parquet
+  footer — remains a valid path if `add_files`'s per-file footer read ever
+  becomes the bottleneck, but nothing in this repo builds it today.
 - **Catalog**: [Lakekeeper](https://github.com/lakekeeper/lakekeeper) (a
   single-binary, no-JVM, self-hosted REST catalog) for self-hosted/dev
   deployments; AWS Glue Data Catalog for AWS deployments — both require
   no new infrastructure beyond what you likely already run.
-- **Compaction**: run as a separate, periodic batch job (e.g. Trino/Spark
-  `OPTIMIZE`) rather than folding it into the committer — neither
-  PyIceberg nor `iceberg-rust` currently ships an atomic file-rewrite
-  action, so merging small files is best treated as independent
-  table-maintenance, not part of every commit.
 
 This keeps logthing decoupled from Iceberg's release cadence: the
 committer and catalog can be swapped or upgraded independently, and a
 logthing deploy never blocks on either.
+
+## Table maintenance
+
+Neither PyIceberg nor `iceberg-rust` currently ships an atomic file-rewrite
+action, so treat small-file compaction and snapshot cleanup as periodic
+batch jobs, independent of the committer, run with an engine that has them
+(Trino, Spark):
+
+- **Compact small files** periodically, e.g. in Trino:
+  `ALTER TABLE <table> EXECUTE optimize(file_size_threshold => '128MB')`.
+- **Expire old snapshots** periodically, e.g.:
+  `ALTER TABLE <table> EXECUTE expire_snapshots(retention_threshold => '7d')`.
+  Trino enforces a minimum retention via the catalog property
+  `iceberg.expire-snapshots.min-retention` (default `7d`) and rejects a
+  shorter value outright — raise that property first if you need a tighter
+  window.
+- **Do not run `remove_orphan_files`** against logthing's data location.
+  logthing writes a Parquet file and only later has the committer register
+  it; any file written but not yet committed looks "orphaned" to that
+  procedure and would be deleted out from under the queue. If you need
+  orphan cleanup, point it at a location the committer has already fully
+  drained, or exclude the path logthing writes to.
