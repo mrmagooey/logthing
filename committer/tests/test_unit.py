@@ -7,7 +7,17 @@ from pathlib import Path
 
 import pytest
 from botocore.exceptions import ClientError, ConnectionClosedError, EndpointConnectionError
-from pyiceberg.exceptions import CommitFailedException, CommitStateUnknownException
+from pyiceberg.exceptions import (
+    AuthorizationExpiredError,
+    BadRequestError,
+    CommitFailedException,
+    CommitStateUnknownException,
+    ForbiddenError,
+    OAuthError,
+    ServerError,
+    ServiceUnavailableError,
+    UnauthorizedError,
+)
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import Timeout as RequestsTimeout
 
@@ -134,9 +144,10 @@ def test_parse_file_path_requires_file_path():
         commit.parse_file_path(desc, "my-bucket")
 
 
-def test_parse_file_path_permanent_errors_are_not_transient():
+def test_parse_file_path_permanent_errors_do_not_abort():
     # Every failure mode above is a malformed/mismatched descriptor, never a
-    # connectivity problem -- is_transient must say so for all of them.
+    # connectivity/systemic problem -- should_abort must say so for all of
+    # them.
     bad_descs = [
         {"storage_target": "local", "file_path": "file:///x"},
         {"storage_target": "s3"},
@@ -146,86 +157,129 @@ def test_parse_file_path_permanent_errors_are_not_transient():
         try:
             commit.parse_file_path(desc, "my-bucket")
         except ValueError as exc:
-            assert commit.is_transient(exc) is False
+            assert commit.should_abort(exc) is False
 
 
 # ---------------------------------------------------------------------------
-# is_transient
+# should_abort
 # ---------------------------------------------------------------------------
 
 
-def test_is_transient_commit_failed_exception():
-    assert commit.is_transient(CommitFailedException("conflict")) is True
+def test_should_abort_commit_failed_exception():
+    assert commit.should_abort(CommitFailedException("conflict")) is True
 
 
-def test_is_transient_commit_state_unknown_exception():
-    assert commit.is_transient(CommitStateUnknownException("unknown")) is True
+def test_should_abort_commit_state_unknown_exception():
+    # CommitStateUnknownException is a RESTError subclass: an ambiguous commit
+    # outcome, safer to not assume it failed.
+    assert commit.should_abort(CommitStateUnknownException("unknown")) is True
 
 
-def test_is_transient_endpoint_connection_error():
-    assert commit.is_transient(EndpointConnectionError(endpoint_url="http://x")) is True
+def test_should_abort_endpoint_connection_error():
+    assert commit.should_abort(EndpointConnectionError(endpoint_url="http://x")) is True
 
 
-def test_is_transient_connection_closed_error():
-    assert commit.is_transient(ConnectionClosedError(endpoint_url="http://x")) is True
+def test_should_abort_connection_closed_error():
+    assert commit.should_abort(ConnectionClosedError(endpoint_url="http://x")) is True
 
 
-def test_is_transient_requests_connection_error():
-    assert commit.is_transient(RequestsConnectionError("refused")) is True
+def test_should_abort_requests_connection_error():
+    assert commit.should_abort(RequestsConnectionError("refused")) is True
 
 
-def test_is_transient_requests_timeout():
-    assert commit.is_transient(RequestsTimeout("timed out")) is True
+def test_should_abort_requests_timeout():
+    assert commit.should_abort(RequestsTimeout("timed out")) is True
 
 
 @pytest.mark.parametrize("status", [500, 502, 503, 504])
-def test_is_transient_client_error_5xx(status):
+def test_should_abort_client_error_5xx(status):
     exc = ClientError(
         {"Error": {"Code": "InternalError"}, "ResponseMetadata": {"HTTPStatusCode": status}},
         "GetObject",
     )
-    assert commit.is_transient(exc) is True
+    assert commit.should_abort(exc) is True
 
 
 @pytest.mark.parametrize("code", ["SlowDown", "Throttling", "ThrottlingException"])
-def test_is_transient_client_error_throttling(code):
+def test_should_abort_client_error_throttling(code):
     exc = ClientError(
         {"Error": {"Code": code}, "ResponseMetadata": {"HTTPStatusCode": 400}},
         "PutObject",
     )
-    assert commit.is_transient(exc) is True
+    assert commit.should_abort(exc) is True
 
 
-def test_is_transient_client_error_missing_key_is_permanent():
+@pytest.mark.parametrize(
+    "code",
+    ["AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "NoSuchBucket", "ExpiredToken"],
+)
+def test_should_abort_client_error_credentials_and_config_codes(code):
+    # These mean the whole run's config/credentials are wrong, not that this
+    # one object is bad -- every other descriptor would fail the same way, so
+    # this must abort rather than quarantine.
+    exc = ClientError(
+        {"Error": {"Code": code}, "ResponseMetadata": {"HTTPStatusCode": 403}},
+        "GetObject",
+    )
+    assert commit.should_abort(exc) is True
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_should_abort_client_error_any_401_or_403(status):
+    # Even an unrecognised error code should abort on a 401/403 status.
+    exc = ClientError(
+        {"Error": {"Code": "SomeUnrecognisedCode"}, "ResponseMetadata": {"HTTPStatusCode": status}},
+        "GetObject",
+    )
+    assert commit.should_abort(exc) is True
+
+
+def test_should_abort_client_error_missing_key_does_not_abort():
     exc = ClientError(
         {"Error": {"Code": "NoSuchKey"}, "ResponseMetadata": {"HTTPStatusCode": 404}},
         "GetObject",
     )
-    assert commit.is_transient(exc) is False
+    assert commit.should_abort(exc) is False
 
 
-def test_is_transient_client_error_access_denied_is_permanent():
-    exc = ClientError(
-        {"Error": {"Code": "AccessDenied"}, "ResponseMetadata": {"HTTPStatusCode": 403}},
-        "GetObject",
-    )
-    assert commit.is_transient(exc) is False
-
-
-def test_is_transient_file_not_found_is_permanent():
+def test_should_abort_file_not_found_does_not_abort():
     # pyarrow raises FileNotFoundError (an OSError subclass) for a descriptor
     # pointing at a data file that just isn't in the bucket.
-    assert commit.is_transient(FileNotFoundError("no such key")) is False
+    assert commit.should_abort(FileNotFoundError("no such key")) is False
 
 
-def test_is_transient_generic_os_error_is_transient():
-    # Any other OSError out of pyarrow's S3 filesystem is connectivity
-    # (refused, reset, DNS, timeout) -- lean transient.
-    assert commit.is_transient(OSError("AWS Error NETWORK_CONNECTION: curlCode 7")) is True
+def test_should_abort_generic_os_error_aborts():
+    # Any other OSError out of pyarrow's S3 filesystem is connectivity or a
+    # permission problem (refused, reset, DNS, timeout, access denied) --
+    # lean toward abort.
+    assert commit.should_abort(OSError("AWS Error NETWORK_CONNECTION: curlCode 7")) is True
 
 
-def test_is_transient_unrelated_exception_is_permanent():
-    assert commit.is_transient(ValueError("bad schema")) is False
+def test_should_abort_unrelated_exception_does_not_abort():
+    assert commit.should_abort(ValueError("bad schema")) is False
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ServerError("500"),
+        ServiceUnavailableError("503"),
+        UnauthorizedError("401"),
+        ForbiddenError("403"),
+        AuthorizationExpiredError("419"),
+        OAuthError("bad client credentials"),
+    ],
+)
+def test_should_abort_rest_errors_other_than_bad_request(exc):
+    # Every RESTError except BadRequestError is either a 5xx or an
+    # auth/config problem -- both systemic, both must abort.
+    assert commit.should_abort(exc) is True
+
+
+def test_should_abort_bad_request_error_does_not_abort():
+    # A 400 is specific to the one request/table that produced it (e.g. one
+    # table's create with a bad payload) -- not systemic, stays permanent.
+    assert commit.should_abort(BadRequestError("bad create-table request")) is False
 
 
 # ---------------------------------------------------------------------------

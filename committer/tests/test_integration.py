@@ -22,9 +22,10 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
+from botocore.exceptions import ClientError
 from moto.server import ThreadedMotoServer
 from pyiceberg.catalog.sql import SqlCatalog
-from pyiceberg.exceptions import CommitFailedException, NoSuchTableError
+from pyiceberg.exceptions import CommitFailedException
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -119,15 +120,16 @@ def put_descriptor(
     desc_key: str,
     *,
     source: str,
-    partition: str | None,
     data_key: str,
     record_count: int,
+    partition: str | None = None,
     storage_target: str = "s3",
     file_path: str | None = None,
 ) -> None:
+    default_path = f"{cfg.s3_endpoint}/{cfg.bucket}/{data_key}"
     desc = {
         "source": source,
-        "file_path": file_path if file_path is not None else f"{cfg.s3_endpoint}/{cfg.bucket}/{data_key}",
+        "file_path": file_path if file_path is not None else default_path,
         "file_format": "PARQUET",
         "record_count": record_count,
         "file_size_in_bytes": 100,
@@ -138,7 +140,8 @@ def put_descriptor(
     }
     if partition is not None:
         desc["partition"] = partition
-    s3.put_object(Bucket=cfg.bucket, Key=cfg.desc_prefix + desc_key, Body=json.dumps(desc).encode())
+    key = cfg.desc_prefix + desc_key
+    s3.put_object(Bucket=cfg.bucket, Key=key, Body=json.dumps(desc).encode())
 
 
 def list_keys(s3, cfg, prefix: str) -> list[str]:
@@ -152,22 +155,23 @@ def list_keys(s3, cfg, prefix: str) -> list[str]:
 
 
 def test_multiple_tables_get_correct_row_counts(cfg, s3, catalog, pa_fs):
-    write_parquet(s3, cfg.bucket, "syslog/day=2026-01-01/a.parquet", {"message": ["m1", "m2"]}, "2026-01-01")
+    syslog_key = "syslog/day=2026-01-01/a.parquet"
+    write_parquet(s3, cfg.bucket, syslog_key, {"message": ["m1", "m2"]}, "2026-01-01")
+    put_descriptor(s3, cfg, "syslog/a.json", source="syslog", data_key=syslog_key, record_count=2)
+
+    conn_key = "zeek/conn/day=2026-01-01/b.parquet"
+    conn_rows = {"orig_h": ["1.1.1.1", "2.2.2.2", "3.3.3.3"]}
+    write_parquet(s3, cfg.bucket, conn_key, conn_rows, "2026-01-01")
     put_descriptor(
-        s3, cfg, "syslog/a.json", source="syslog", partition=None,
-        data_key="syslog/day=2026-01-01/a.parquet", record_count=2,
+        s3, cfg, "zeek/conn/b.json",
+        source="zeek", partition="conn", data_key=conn_key, record_count=3,
     )
 
-    write_parquet(s3, cfg.bucket, "zeek/conn/day=2026-01-01/b.parquet", {"orig_h": ["1.1.1.1", "2.2.2.2", "3.3.3.3"]}, "2026-01-01")
+    dns_key = "zeek/dns/day=2026-01-01/c.parquet"
+    write_parquet(s3, cfg.bucket, dns_key, {"query": ["a.com"]}, "2026-01-01")
     put_descriptor(
-        s3, cfg, "zeek/conn/b.json", source="zeek", partition="conn",
-        data_key="zeek/conn/day=2026-01-01/b.parquet", record_count=3,
-    )
-
-    write_parquet(s3, cfg.bucket, "zeek/dns/day=2026-01-01/c.parquet", {"query": ["a.com"]}, "2026-01-01")
-    put_descriptor(
-        s3, cfg, "zeek/dns/c.json", source="zeek", partition="dns",
-        data_key="zeek/dns/day=2026-01-01/c.parquet", record_count=1,
+        s3, cfg, "zeek/dns/c.json",
+        source="zeek", partition="dns", data_key=dns_key, record_count=1,
     )
 
     rc = commit.run(cfg, s3, catalog, pa_fs)
@@ -183,8 +187,9 @@ def test_multiple_tables_get_correct_row_counts(cfg, s3, catalog, pa_fs):
 
 
 def test_table_is_partitioned_by_day_of_partition_time(cfg, s3, catalog, pa_fs):
-    write_parquet(s3, cfg.bucket, "syslog/day=2026-02-01/a.parquet", {"message": ["m"]}, "2026-02-01")
-    put_descriptor(s3, cfg, "a.json", source="syslog", partition=None, data_key="syslog/day=2026-02-01/a.parquet", record_count=1)
+    key = "syslog/day=2026-02-01/a.parquet"
+    write_parquet(s3, cfg.bucket, key, {"message": ["m"]}, "2026-02-01")
+    put_descriptor(s3, cfg, "a.json", source="syslog", data_key=key, record_count=1)
 
     assert commit.run(cfg, s3, catalog, pa_fs) == 0
 
@@ -200,7 +205,7 @@ def test_batching_gives_one_snapshot_per_chunk_not_per_file(cfg, s3, catalog, pa
     for i in range(5):
         key = f"syslog/day=2026-01-01/f{i}.parquet"
         write_parquet(s3, cfg.bucket, key, {"message": ["m"]}, "2026-01-01")
-        put_descriptor(s3, cfg, f"f{i}.json", source="syslog", partition=None, data_key=key, record_count=1)
+        put_descriptor(s3, cfg, f"f{i}.json", source="syslog", data_key=key, record_count=1)
 
     assert commit.run(cfg, s3, catalog, pa_fs) == 0
 
@@ -214,7 +219,7 @@ def test_batching_gives_one_snapshot_per_chunk_not_per_file(cfg, s3, catalog, pa
 def test_idempotent_rerun_skips_already_committed_files(cfg, s3, catalog, pa_fs):
     key = "syslog/day=2026-01-01/a.parquet"
     write_parquet(s3, cfg.bucket, key, {"message": ["m1", "m2"]}, "2026-01-01")
-    put_descriptor(s3, cfg, "a.json", source="syslog", partition=None, data_key=key, record_count=2)
+    put_descriptor(s3, cfg, "a.json", source="syslog", data_key=key, record_count=2)
 
     assert commit.run(cfg, s3, catalog, pa_fs) == 0
     tbl = catalog.load_table(("logs", "syslog"))
@@ -224,7 +229,11 @@ def test_idempotent_rerun_skips_already_committed_files(cfg, s3, catalog, pa_fs)
     # Simulate a crash between committing and moving the descriptor: copy the
     # already-committed descriptor back into the queue.
     done_key = cfg.done_prefix + "a.json"
-    s3.copy_object(Bucket=cfg.bucket, Key=cfg.desc_prefix + "a.json", CopySource={"Bucket": cfg.bucket, "Key": done_key})
+    s3.copy_object(
+        Bucket=cfg.bucket,
+        Key=cfg.desc_prefix + "a.json",
+        CopySource={"Bucket": cfg.bucket, "Key": done_key},
+    )
     s3.delete_object(Bucket=cfg.bucket, Key=done_key)
 
     rc = commit.run(cfg, s3, catalog, pa_fs)
@@ -241,15 +250,13 @@ def test_idempotent_rerun_skips_already_committed_files(cfg, s3, catalog, pa_fs)
 def test_permanent_failure_quarantines_only_the_bad_descriptor(cfg, s3, catalog, pa_fs):
     good_key = "syslog/day=2026-01-01/good.parquet"
     write_parquet(s3, cfg.bucket, good_key, {"message": ["m1"]}, "2026-01-01")
-    put_descriptor(s3, cfg, "good.json", source="syslog", partition=None, data_key=good_key, record_count=1)
+    put_descriptor(s3, cfg, "good.json", source="syslog", data_key=good_key, record_count=1)
 
     # Points at a Parquet file that was never written -- pyarrow raises
-    # FileNotFoundError reading its footer, which is_transient says is
+    # FileNotFoundError reading its footer, which should_abort says is
     # permanent (not connectivity).
-    put_descriptor(
-        s3, cfg, "missing.json", source="syslog", partition=None,
-        data_key="syslog/day=2026-01-01/does-not-exist.parquet", record_count=1,
-    )
+    missing_key = "syslog/day=2026-01-01/does-not-exist.parquet"
+    put_descriptor(s3, cfg, "missing.json", source="syslog", data_key=missing_key, record_count=1)
 
     rc = commit.run(cfg, s3, catalog, pa_fs)
 
@@ -264,7 +271,7 @@ def test_permanent_failure_quarantines_only_the_bad_descriptor(cfg, s3, catalog,
 def test_incompatible_schema_in_same_table_quarantines_only_that_file(cfg, s3, catalog, pa_fs):
     key1 = "syslog/day=2026-01-01/a.parquet"
     write_parquet(s3, cfg.bucket, key1, {"message": ["m1"]}, "2026-01-01")
-    put_descriptor(s3, cfg, "a.json", source="syslog", partition=None, data_key=key1, record_count=1)
+    put_descriptor(s3, cfg, "a.json", source="syslog", data_key=key1, record_count=1)
 
     # First run creates the table from a.parquet's schema (message: string).
     assert commit.run(cfg, s3, catalog, pa_fs) == 0
@@ -274,11 +281,11 @@ def test_incompatible_schema_in_same_table_quarantines_only_that_file(cfg, s3, c
     # not bring down a batch containing a good file too.
     key2 = "syslog/day=2026-01-02/b.parquet"
     write_parquet(s3, cfg.bucket, key2, {"message": [123]}, "2026-01-02")
-    put_descriptor(s3, cfg, "b.json", source="syslog", partition=None, data_key=key2, record_count=1)
+    put_descriptor(s3, cfg, "b.json", source="syslog", data_key=key2, record_count=1)
 
     key3 = "syslog/day=2026-01-02/c.parquet"
     write_parquet(s3, cfg.bucket, key3, {"message": ["m3"]}, "2026-01-02")
-    put_descriptor(s3, cfg, "c.json", source="syslog", partition=None, data_key=key3, record_count=1)
+    put_descriptor(s3, cfg, "c.json", source="syslog", data_key=key3, record_count=1)
 
     rc = commit.run(cfg, s3, catalog, pa_fs)
 
@@ -286,13 +293,16 @@ def test_incompatible_schema_in_same_table_quarantines_only_that_file(cfg, s3, c
     tbl = catalog.load_table(("logs", "syslog"))
     assert tbl.scan().to_arrow().num_rows == 2  # a + c, not b
     assert list_keys(s3, cfg, cfg.quarantine_prefix) == [cfg.quarantine_prefix + "b.json"]
-    assert sorted(list_keys(s3, cfg, cfg.done_prefix)) == [cfg.done_prefix + "a.json", cfg.done_prefix + "c.json"]
+    assert sorted(list_keys(s3, cfg, cfg.done_prefix)) == [
+        cfg.done_prefix + "a.json",
+        cfg.done_prefix + "c.json",
+    ]
 
 
 def test_transient_s3_failure_leaves_queue_untouched(cfg, s3, catalog, pa_fs):
     key = "syslog/day=2026-01-01/a.parquet"
     write_parquet(s3, cfg.bucket, key, {"message": ["m1"]}, "2026-01-01")
-    put_descriptor(s3, cfg, "a.json", source="syslog", partition=None, data_key=key, record_count=1)
+    put_descriptor(s3, cfg, "a.json", source="syslog", data_key=key, record_count=1)
 
     unreachable_cfg = commit.Config(**{**cfg.__dict__, "s3_endpoint": "http://127.0.0.1:1"})
     unreachable_s3 = commit.make_s3_client(unreachable_cfg)
@@ -310,7 +320,7 @@ def test_transient_s3_failure_leaves_queue_untouched(cfg, s3, catalog, pa_fs):
 def test_transient_catalog_failure_leaves_queue_and_does_not_quarantine(cfg, s3, catalog, pa_fs):
     key = "syslog/day=2026-01-01/a.parquet"
     write_parquet(s3, cfg.bucket, key, {"message": ["m1"]}, "2026-01-01")
-    put_descriptor(s3, cfg, "a.json", source="syslog", partition=None, data_key=key, record_count=1)
+    put_descriptor(s3, cfg, "a.json", source="syslog", data_key=key, record_count=1)
 
     # First run creates the table normally.
     assert commit.run(cfg, s3, catalog, pa_fs) == 0
@@ -320,7 +330,7 @@ def test_transient_catalog_failure_leaves_queue_and_does_not_quarantine(cfg, s3,
     # conflict/transient REST error at load time.
     key2 = "syslog/day=2026-01-02/b.parquet"
     write_parquet(s3, cfg.bucket, key2, {"message": ["m2"]}, "2026-01-02")
-    put_descriptor(s3, cfg, "b.json", source="syslog", partition=None, data_key=key2, record_count=1)
+    put_descriptor(s3, cfg, "b.json", source="syslog", data_key=key2, record_count=1)
 
     class FlakyCatalog:
         def __init__(self, real):
@@ -354,10 +364,80 @@ def test_existing_unpartitioned_table_gets_day_spec_added_on_load(cfg, s3, catal
     tbl = catalog.create_table(("logs", "syslog"), schema=schema)
     assert tbl.spec().fields == ()
 
-    put_descriptor(s3, cfg, "a.json", source="syslog", partition=None, data_key=key, record_count=1)
+    put_descriptor(s3, cfg, "a.json", source="syslog", data_key=key, record_count=1)
     rc = commit.run(cfg, s3, catalog, pa_fs)
     assert rc == 0
 
     tbl = catalog.load_table(("logs", "syslog"))
     assert len(tbl.spec().fields) == 1
     assert tbl.spec().fields[0].name == "partition_time_day"
+
+
+def test_access_denied_aborts_without_quarantine(cfg, s3, catalog, pa_fs):
+    # moto doesn't enforce credentials by default, so wrap the real client to
+    # raise a genuine botocore ClientError AccessDenied from get_object --
+    # this is what a real bad secret/expired session looks like to commit.py.
+    key = "syslog/day=2026-01-01/a.parquet"
+    write_parquet(s3, cfg.bucket, key, {"message": ["m1"]}, "2026-01-01")
+    put_descriptor(s3, cfg, "a.json", source="syslog", data_key=key, record_count=1)
+
+    class DeniedS3:
+        def __init__(self, real):
+            self._real = real
+
+        def get_object(self, *args, **kwargs):
+            raise ClientError(
+                {
+                    "Error": {"Code": "AccessDenied", "Message": "denied"},
+                    "ResponseMetadata": {"HTTPStatusCode": 403},
+                },
+                "GetObject",
+            )
+
+        def __getattr__(self, item):
+            return getattr(self._real, item)
+
+    rc = commit.run(cfg, DeniedS3(s3), catalog, pa_fs)
+
+    assert rc != 0
+    # A bad credential/config problem hits every descriptor the same way --
+    # it must abort, not quarantine the descriptor that happened to be read
+    # first.
+    assert list_keys(s3, cfg, cfg.desc_prefix) == [cfg.desc_prefix + "a.json"]
+    assert list_keys(s3, cfg, cfg.quarantine_prefix) == []
+    assert list_keys(s3, cfg, cfg.done_prefix) == []
+
+
+def test_half_completed_move_is_finished_on_rerun(cfg, s3, catalog, pa_fs):
+    key = "syslog/day=2026-01-01/a.parquet"
+    write_parquet(s3, cfg.bucket, key, {"message": ["m1", "m2"]}, "2026-01-01")
+    put_descriptor(s3, cfg, "a.json", source="syslog", data_key=key, record_count=2)
+
+    assert commit.run(cfg, s3, catalog, pa_fs) == 0
+    tbl = catalog.load_table(("logs", "syslog"))
+    assert tbl.scan().to_arrow().num_rows == 2
+    snapshots_after_first_run = len(list(tbl.snapshots()))
+
+    # Simulate a crash inside _relocate between its copy and its delete: the
+    # descriptor was copied to DONE_PREFIX but the original under
+    # DESC_PREFIX was never deleted, so it now exists in both places.
+    done_key = cfg.done_prefix + "a.json"
+    s3.copy_object(
+        Bucket=cfg.bucket,
+        Key=cfg.desc_prefix + "a.json",
+        CopySource={"Bucket": cfg.bucket, "Key": done_key},
+    )
+    assert list_keys(s3, cfg, cfg.desc_prefix) == [cfg.desc_prefix + "a.json"]
+    assert list_keys(s3, cfg, cfg.done_prefix) == [done_key]
+
+    rc = commit.run(cfg, s3, catalog, pa_fs)
+    assert rc == 0
+
+    tbl = catalog.load_table(("logs", "syslog"))
+    assert tbl.scan().to_arrow().num_rows == 2, "re-running must not duplicate rows"
+    assert len(list(tbl.snapshots())) == snapshots_after_first_run
+
+    # The half-finished move is completed: nothing left queued, exactly one
+    # copy in DONE_PREFIX.
+    assert list_keys(s3, cfg, cfg.desc_prefix) == []
+    assert list_keys(s3, cfg, cfg.done_prefix) == [done_key]
