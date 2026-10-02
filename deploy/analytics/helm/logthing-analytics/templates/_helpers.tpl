@@ -1,5 +1,5 @@
 {{- define "la.fullname" -}}
-{{- printf "%s-%s" .Release.Name .Chart.Name | trunc 63 | trimSuffix "-" -}}
+{{- printf "%s-%s" .Release.Name .Chart.Name | trunc 40 | trimSuffix "-" -}}
 {{- end -}}
 {{- define "la.labels" -}}
 app.kubernetes.io/name: {{ .Chart.Name }}
@@ -36,15 +36,49 @@ app.kubernetes.io/component: {{ .component }}
 - {name: GARAGE_CAPACITY_BYTES, value: {{ .Values.garage.capacityBytes | quote }}}
 - {name: BOOTSTRAP_TIMEOUT_SECS, value: {{ .Values.bootstrap.timeoutSecs | quote }}}
 {{- end -}}
-{{/* initContainer that blocks on `bootstrap.py wait <target>` */}}
+{{/* initContainer that blocks on `bootstrap.py wait <target>`; only the env that target needs */}}
 {{- define "la.waitFor" -}}
 - name: wait-{{ .target }}
   image: {{ .root.Values.bootstrap.image }}
   command: ["python", "/bootstrap/bootstrap.py", "wait", {{ .target | quote }}]
   env:
-    {{- include "la.bootstrapEnv" .root | nindent 4 }}
+    {{- if eq .target "garage" }}
+    {{- include "la.secretEnv" (dict "root" .root "name" "S3_ACCESS_KEY" "key" "s3-access-key") | nindent 4 }}
+    {{- include "la.secretEnv" (dict "root" .root "name" "GARAGE_ADMIN_TOKEN" "key" "garage-admin-token") | nindent 4 }}
+    - {name: GARAGE_ADMIN_URL, value: "http://{{ include "la.fullname" .root }}-garage:3903"}
+    {{- else }}
+    - {name: LAKEKEEPER_URL, value: "http://{{ include "la.fullname" .root }}-lakekeeper:8181"}
+    {{- end }}
+    - {name: BOOTSTRAP_TIMEOUT_SECS, value: {{ .root.Values.bootstrap.timeoutSecs | quote }}}
   volumeMounts:
     - {name: files, mountPath: /bootstrap/bootstrap.py, subPath: bootstrap.py}
+{{- end -}}
+{{/* initContainer for Hue: wait for Postgres (TCP) and Trino (HTTP /v1/info) */}}
+{{- define "la.waitHue" -}}
+- name: wait-deps
+  image: {{ .Values.bootstrap.image }}
+  command:
+    - python
+    - -c
+    - |
+      import socket, sys, time, urllib.request
+      deadline = time.time() + float(sys.argv[1])
+      def pg():
+          socket.create_connection((sys.argv[2], 5432), 3).close()
+      def trino():
+          assert urllib.request.urlopen(sys.argv[3], timeout=3).status == 200
+      for name, check in (("postgres", pg), ("trino", trino)):
+          while True:
+              try:
+                  check()
+                  break
+              except Exception as e:
+                  if time.time() > deadline:
+                      sys.exit(f"wait-deps: {name} not ready: {e}")
+                  time.sleep(2)
+    - {{ .Values.bootstrap.timeoutSecs | quote }}
+    - {{ include "la.fullname" . }}-postgres
+    - http://{{ include "la.fullname" . }}-trino:8080/v1/info
 {{- end -}}
 {{/* pod volume for the shared files ConfigMap */}}
 {{- define "la.filesVolume" -}}

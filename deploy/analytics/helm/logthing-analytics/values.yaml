@@ -21,18 +21,21 @@ bootstrap:
 postgres:
   image: postgres:17
   storage: 5Gi
-  resources: {}
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
 
 garage:
   image: dxflrs/garage:v2.4.1
   capacityBytes: 10737418240
   metaStorage: 1Gi
   dataStorage: 20Gi
-  resources: {}
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
 
 lakekeeper:
   image: quay.io/lakekeeper/catalog:v0.13.6
-  resources: {}
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
 
 logthing:
   image: ghcr.io/mrmagooey/logthing:0.21.0
@@ -41,12 +44,14 @@ logthing:
     type: ClusterIP
   tcpService:
     type: ClusterIP
-  resources: {}
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
 
 committer:
   image: ghcr.io/mrmagooey/logthing-committer:0.21.0
   schedule: "*/1 * * * *"
-  resources: {}
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
 
 trino:
   image: trinodb/trino:483

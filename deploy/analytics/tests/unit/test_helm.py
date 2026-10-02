@@ -14,8 +14,8 @@ FULL = "lt-logthing-analytics"
 TIMEOUT = 60
 
 
-def render(*sets):
-    args = ["helm", "template", "lt", str(CHART)]
+def render(*sets, release="lt"):
+    args = ["helm", "template", release, str(CHART)]
     for s in sets:
         args += ["--set", s]
     out = subprocess.run(
@@ -57,8 +57,8 @@ def test_expected_resources():
         ("Service", f"{FULL}-lakekeeper"),
         ("Service", f"{FULL}-trino"),
         ("Service", f"{FULL}-hue"),
-        ("Job", f"{FULL}-garage-init"),
-        ("Job", f"{FULL}-lakekeeper-init"),
+        ("Job", f"{FULL}-garage-init-1"),
+        ("Job", f"{FULL}-lakekeeper-init-1"),
         ("Deployment", f"{FULL}-lakekeeper"),
         ("Deployment", f"{FULL}-logthing"),
         ("CronJob", f"{FULL}-committer"),
@@ -104,7 +104,7 @@ def test_wait_init_containers():
         ]
 
     assert waits("Deployment", f"{FULL}-logthing") == ["garage"]
-    assert waits("Job", f"{FULL}-lakekeeper-init") == ["garage"]
+    assert waits("Job", f"{FULL}-lakekeeper-init-1") == ["garage"]
     assert waits("Deployment", f"{FULL}-trino") == ["lakekeeper"]
     assert waits("CronJob", f"{FULL}-committer") == ["lakekeeper"]
 
@@ -136,19 +136,33 @@ def test_garage_uses_image_default_command_like_compose():
 
 
 def test_lakekeeper_env_order_allows_expansion():
-    env = pod_spec(by(render(), "Deployment", f"{FULL}-lakekeeper"))["containers"][0]["env"]
-    names = [e["name"] for e in env]
-    assert names.index("LAKEKEEPER_DB_PASSWORD") < names.index("LAKEKEEPER__PG_DATABASE_URL_READ")
-    assert names.index("LAKEKEEPER_DB_PASSWORD") < names.index("LAKEKEEPER__PG_DATABASE_URL_WRITE")
+    spec = pod_spec(by(render(), "Deployment", f"{FULL}-lakekeeper"))
+    for c in spec["initContainers"] + spec["containers"]:
+        names = [e["name"] for e in c["env"]]
+        pw = names.index("LAKEKEEPER_DB_PASSWORD")
+        assert pw < names.index("LAKEKEEPER__PG_DATABASE_URL_READ"), c["name"]
+        assert pw < names.index("LAKEKEEPER__PG_DATABASE_URL_WRITE"), c["name"]
+
+
+def _secret_refs(docs):
+    refs = set()
+    for d in docs:
+        if d["kind"] not in ("Deployment", "StatefulSet", "Job", "CronJob"):
+            continue
+        spec = pod_spec(d)
+        for c in spec.get("initContainers", []) + spec["containers"]:
+            for e in c.get("env", []):
+                ref = e.get("valueFrom", {}).get("secretKeyRef")
+                if ref:
+                    refs.add(ref["name"])
+    return refs
 
 
 def test_existing_secret_used():
     docs = render("credentials.existingSecret=mine")
     assert not any(d["kind"] == "Secret" for d in docs)
-    refs = re.findall(
-        r"secretKeyRef:\s*\n\s*name: (\S+)", yaml.safe_dump_all(docs, sort_keys=False)
-    )
-    assert refs and set(refs) == {"mine"}
+    assert _secret_refs(docs) == {"mine"}
+    assert _secret_refs(render()) == {f"{FULL}-credentials"}
 
 
 def test_secret_keys_complete():
@@ -273,3 +287,97 @@ def test_rendered_yaml_has_no_duplicate_keys():
         capture_output=True, text=True, check=True, timeout=TIMEOUT,
     ).stdout
     assert list(yaml.load_all(out, Loader=Strict))
+
+
+def test_jobs_are_revisioned_with_ttl_and_stable_component_label():
+    docs = render()
+    for comp in ("garage-init", "lakekeeper-init"):
+        job = by(docs, "Job", f"{FULL}-{comp}-1")
+        assert job["spec"]["ttlSecondsAfterFinished"] == 3600
+        assert job["metadata"]["labels"]["app.kubernetes.io/component"] == comp
+        assert "helm.sh/hook" not in job["metadata"].get("annotations", {})
+
+
+def test_long_release_name_keeps_names_within_limits():
+    docs = render(release="r" * 30)
+    for d in docs:
+        assert len(d["metadata"]["name"]) <= 63, d["metadata"]["name"]
+    cj = next(d for d in docs if d["kind"] == "CronJob")
+    assert len(cj["metadata"]["name"]) <= 52
+
+
+def _annotations(docs, kind, name):
+    return pod_spec_meta(by(docs, kind, name)).get("annotations", {})
+
+
+def pod_spec_meta(doc):
+    if doc["kind"] == "CronJob":
+        return doc["spec"]["jobTemplate"]["spec"]["template"]["metadata"]
+    return doc["spec"]["template"]["metadata"]
+
+
+def test_checksum_annotations():
+    docs = render()
+    for kind, name in [("Deployment", "logthing"), ("Deployment", "trino"),
+                       ("StatefulSet", "garage"), ("StatefulSet", "postgres"),
+                       ("Deployment", "hue")]:
+        a = _annotations(docs, kind, f"{FULL}-{name}")
+        assert "checksum/secret" in a, name
+        assert ("checksum/hue" if name == "hue" else "checksum/files") in a, name
+    docs = render("credentials.existingSecret=mine")
+    assert "checksum/secret" not in _annotations(docs, "Deployment", f"{FULL}-trino")
+
+
+def test_checksum_changes_with_values():
+    a = _annotations(render(), "Deployment", f"{FULL}-hue")["checksum/secret"]
+    b = _annotations(render("credentials.hueDbPassword=other"), "Deployment",
+                     f"{FULL}-hue")["checksum/secret"]
+    assert a != b
+
+
+def test_hue_waits_for_postgres_and_trino():
+    spec = pod_spec(by(render(), "Deployment", f"{FULL}-hue"))
+    init = spec["initContainers"][0]
+    assert init["image"] == "python:3.12-slim"
+    cmd = init["command"]
+    assert f"{FULL}-postgres" in cmd and f"http://{FULL}-trino:8080/v1/info" in cmd
+    assert "600" in cmd
+
+
+def test_exec_probes_have_timeouts():
+    seen = 0
+    for d in render():
+        if d["kind"] not in ("Deployment", "StatefulSet"):
+            continue
+        for c in pod_spec(d)["containers"]:
+            probe = c.get("readinessProbe", {})
+            if "exec" in probe:
+                seen += 1
+                assert probe["timeoutSeconds"] >= 5, d["metadata"]["name"]
+    assert seen == 4
+    trino = pod_spec(by(render(), "Deployment", f"{FULL}-trino"))["containers"][0]
+    assert trino["readinessProbe"]["initialDelaySeconds"] == 20
+
+
+def test_default_requests_set():
+    docs = render()
+    for kind, name in [("StatefulSet", "postgres"), ("StatefulSet", "garage"),
+                       ("Deployment", "lakekeeper"), ("Deployment", "logthing")]:
+        c = pod_spec(by(docs, kind, f"{FULL}-{name}"))["containers"][0]
+        assert c["resources"]["requests"]["memory"], name
+    c = pod_spec(by(docs, "CronJob", f"{FULL}-committer"))["containers"][0]
+    assert c["resources"]["requests"]["cpu"]
+
+
+def test_wait_init_containers_get_minimal_env():
+    docs = render()
+    lk = pod_spec(by(docs, "Deployment", f"{FULL}-trino"))["initContainers"][0]
+    assert {e["name"] for e in lk["env"]} == {"LAKEKEEPER_URL", "BOOTSTRAP_TIMEOUT_SECS"}
+    g = pod_spec(by(docs, "Deployment", f"{FULL}-logthing"))["initContainers"][0]
+    assert {e["name"] for e in g["env"]} == {
+        "GARAGE_ADMIN_URL", "GARAGE_ADMIN_TOKEN", "S3_ACCESS_KEY", "BOOTSTRAP_TIMEOUT_SECS"}
+
+
+def test_committer_active_deadline():
+    cj = by(render(), "CronJob", f"{FULL}-committer")
+    assert cj["spec"]["jobTemplate"]["spec"]["activeDeadlineSeconds"] == 900

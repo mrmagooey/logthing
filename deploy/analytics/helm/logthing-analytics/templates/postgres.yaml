@@ -23,6 +23,11 @@ spec:
     metadata:
       labels:
         {{- include "la.podLabels" (dict "root" . "component" "postgres") | nindent 8 }}
+      annotations:
+        checksum/files: {{ include (print $.Template.BasePath "/configmap-files.yaml") . | sha256sum }}
+        {{- if not .Values.credentials.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
     spec:
       containers:
         - name: postgres
@@ -38,6 +43,7 @@ spec:
             # TCP on purpose: the unix-socket check passes during the init-time temporary server.
             exec:
               command: ["pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "lakekeeper"]
+            timeoutSeconds: 5
             periodSeconds: 5
             failureThreshold: 30
           volumeMounts:

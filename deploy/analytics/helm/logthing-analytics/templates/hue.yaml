@@ -22,7 +22,14 @@ spec:
     metadata:
       labels:
         {{- include "la.podLabels" (dict "root" . "component" "hue") | nindent 8 }}
+      annotations:
+        checksum/hue: {{ include (print $.Template.BasePath "/configmap-hue.yaml") . | sha256sum }}
+        {{- if not .Values.credentials.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
     spec:
+      initContainers:
+        {{- include "la.waitHue" . | nindent 8 }}
       containers:
         - name: hue
           image: {{ .Values.hue.image }}

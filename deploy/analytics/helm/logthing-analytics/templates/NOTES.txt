@@ -1,14 +1,18 @@
 logthing analytics stack installed as {{ include "la.fullname" . }}.
 
-Open Hue:
-  kubectl port-forward svc/{{ include "la.fullname" . }}-hue 8888
-  then browse http://localhost:8888 (the first login creates the admin account).
+Open Hue (the first person to log in becomes the admin):
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "la.fullname" . }}-hue 8888
+  then browse http://localhost:8888
 
 Query Trino directly:
-  kubectl port-forward svc/{{ include "la.fullname" . }}-trino 8080
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "la.fullname" . }}-trino 8080
 
 Tables appear only after the first committer run (CronJob {{ include "la.fullname" . }}-committer,
 schedule "{{ .Values.committer.schedule }}") has seen flushed data.
+
+Uninstalling leaves the PersistentVolumeClaims behind (Postgres roles and Garage keys persist
+in them). To reinstall with different credentials, delete them first:
+  kubectl delete pvc -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }}
 {{- if not .Values.credentials.existingSecret }}
 
 WARNING: Demo credentials in use - set credentials.* or credentials.existingSecret.

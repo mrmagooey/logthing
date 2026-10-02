@@ -32,6 +32,10 @@ spec:
     metadata:
       labels:
         {{- include "la.podLabels" (dict "root" . "component" "lakekeeper") | nindent 8 }}
+      annotations:
+        {{- if not .Values.credentials.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
     spec:
       initContainers:
         # Retries via pod restart if Postgres is not ready yet.
@@ -51,7 +55,8 @@ spec:
           readinessProbe:
             exec:
               command: ["/home/nonroot/lakekeeper", "healthcheck"]
-            periodSeconds: 3
+            timeoutSeconds: 5
+            periodSeconds: 5
             failureThreshold: 15
           {{- with .Values.lakekeeper.resources }}
           resources: {{- toYaml . | nindent 12 }}
