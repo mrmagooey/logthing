@@ -11,5 +11,6 @@ profiling-results/
 committer/.venv/
 # analytics (Python)
 deploy/analytics/.venv/
+deploy/analytics/.env
 __pycache__/
 .pytest_cache/

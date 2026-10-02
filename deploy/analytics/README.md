@@ -32,6 +32,7 @@ override the images at your own risk: `TRINO_IMAGE` / `HUE_IMAGE` (compose) or
   (loopback by default; `ANALYTICS_BIND_ADDR=0.0.0.0` exposes them).
 - logthing ingest ports (514/udp, 601/tcp, 4739/udp, 6343/udp, 47760/tcp) and 5985/tcp listen
   on **all interfaces**.
+- Port 5985 is logthing's HTTP endpoint. Besides `/health`, it accepts unauthenticated plaintext HTTP requests and is published on all interfaces like the other ingest ports; firewall it if the host is reachable from untrusted networks.
 
 ## Credentials
 
