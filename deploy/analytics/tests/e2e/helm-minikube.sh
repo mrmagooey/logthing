@@ -16,6 +16,15 @@ HUE_LOCAL_PORT=28889
 N=40
 MARKER="analytics-e2e-$(date +%s)-$$"
 PY=${PYTHON:-python3}
+# Private kubeconfig: minikube start/delete must never modify the caller's ~/.kube/config.
+# KEEP_CLUSTER=1 needs a stable path so a rerun finds the kept cluster's context.
+if [ "${KEEP_CLUSTER:-}" = 1 ]; then
+  KUBECONFIG=${TMPDIR:-/tmp}/$PROFILE.kubeconfig
+  touch "$KUBECONFIG"
+else
+  KUBECONFIG=$(mktemp)
+fi
+export KUBECONFIG
 K=(kubectl --context "$PROFILE" -n "$NS")
 H=(helm --kube-context "$PROFILE")
 
@@ -26,6 +35,7 @@ cleanup() {
     echo "KEEP_CLUSTER=1: leaving minikube profile $PROFILE running" >&2
   else
     minikube delete -p "$PROFILE" >/dev/null 2>&1 || true
+    rm -f "$KUBECONFIG"
   fi
 }
 trap cleanup EXIT
@@ -38,15 +48,16 @@ dump_logs() {
 }
 
 echo "== [1/7] minikube profile $PROFILE =="
-if ! minikube status -p "$PROFILE" >/dev/null 2>&1; then
-  minikube start -p "$PROFILE" --cpus 6 --memory 12g --driver docker
-fi
+# start is idempotent on a running profile (status exits non-zero against a fresh private kubeconfig).
+minikube start -p "$PROFILE" --cpus 6 --memory 12g --driver docker
+# A kept cluster's context is not in this run's private kubeconfig; (re)write it.
+minikube update-context -p "$PROFILE" >/dev/null
 
 echo "== [2/7] load local override images =="
 for img in "${TRINO_IMAGE:-}" "${HUE_IMAGE:-}"; do
   if [ -n "$img" ] && docker image inspect "$img" >/dev/null 2>&1; then
     # Loading a multi-GB image is slow; skip it when a kept cluster already has it.
-    if ! minikube -p "$PROFILE" image ls 2>/dev/null | grep -qE "(^|/)${img//./\\.}\$"; then
+    if ! minikube -p "$PROFILE" image ls 2>/dev/null | grep -qxF -e "$img" -e "docker.io/$img" -e "docker.io/library/$img"; then
       minikube -p "$PROFILE" image load "$img"
     fi
   fi
@@ -56,7 +67,7 @@ echo "== [3/7] helm install =="
 SETS=(--set logthing.flushIntervalSecs=5)
 [ -z "${TRINO_IMAGE:-}" ] || SETS+=(--set "trino.image=$TRINO_IMAGE")
 [ -z "${HUE_IMAGE:-}" ] || SETS+=(--set "hue.image=$HUE_IMAGE")
-"${H[@]}" install lt "$CHART" --namespace "$NS" --create-namespace --wait --timeout 15m "${SETS[@]}" \
+"${H[@]}" upgrade --install lt "$CHART" --namespace "$NS" --create-namespace --wait --timeout 15m "${SETS[@]}" \
   || { echo "helm install failed" >&2; dump_logs; exit 1; }
 
 echo "== [4/7] wait for init jobs =="
@@ -76,12 +87,14 @@ for i in range($N):
     time.sleep(0.02)
 PYEOF
 )
-"${K[@]}" run sender --rm -i --restart=Never --image=python:3.12-slim -- python -c "$SENDER" \
+"${K[@]}" delete pod sender --ignore-not-found >/dev/null
+timeout 300 "${K[@]}" run sender --rm -i --restart=Never --pod-running-timeout=3m \
+  --image=python:3.12-slim -- python -c "$SENDER" \
   || { echo "sender failed" >&2; exit 1; }
 
 COUNT_SQL="SELECT count(*) FROM iceberg.logs.syslog WHERE message LIKE '%$MARKER%'"
 trino_count() {
-  "${K[@]}" exec "deploy/$FULL-trino" -- trino --output-format TSV --execute "$COUNT_SQL" 2>/dev/null \
+  timeout 30 "${K[@]}" exec "deploy/$FULL-trino" -- trino --output-format TSV --execute "$COUNT_SQL" 2>/dev/null \
     | tr -d '"\r' || true
 }
 
@@ -100,8 +113,12 @@ echo "trino: $N"
 echo "== [7/7] same query through Hue's REST API =="
 "${K[@]}" port-forward "svc/$FULL-hue" "$HUE_LOCAL_PORT:8888" >/dev/null 2>&1 &
 PF_PID=$!
-wait_until 120 "Hue port-forward" curl -fsS "http://127.0.0.1:$HUE_LOCAL_PORT/desktop/debug/is_alive" \
+hue_alive() {
+  kill -0 "$PF_PID" 2>/dev/null && curl -fsS "http://127.0.0.1:$HUE_LOCAL_PORT/desktop/debug/is_alive"
+}
+wait_until 120 "Hue port-forward" hue_alive \
   || { "${K[@]}" logs "deploy/$FULL-hue" --tail 80 >&2 || true; exit 1; }
+# The password is arbitrary: Hue creates the user (as superuser) on first login.
 HUE_COUNT=$(HUE_PASSWORD=e2e-admin-pass "$PY" "$HERE/hue_query.py" "http://127.0.0.1:$HUE_LOCAL_PORT" admin \
   "SELECT count(*) FROM syslog WHERE message LIKE '%$MARKER%'") \
   || { "${K[@]}" logs "deploy/$FULL-hue" --tail 80 >&2 || true; exit 1; }

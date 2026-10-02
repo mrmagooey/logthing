@@ -50,6 +50,8 @@ def run(base, user, password, sql, deadline_secs=60):
         raise RuntimeError(f"login failed at {base}/api/v1/token/auth: {str(login)[:300]}")
     ex = post(f"{base}/api/v1/editor/execute/trino", token,
               form={"statement": sql, "database": "iceberg.logs"})
+    if "handle" not in ex:
+        raise RuntimeError(f"execute returned no handle: {str(ex)[:300]}")
     snippet = {"id": "trino", "type": "trino", "result": {"handle": ex["handle"]}}
     deadline = time.monotonic() + deadline_secs
     last = None
