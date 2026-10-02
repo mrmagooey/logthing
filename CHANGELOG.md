@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file, newest
 first, loosely following [Keep a Changelog](https://keepachangelog.com/).
 This file starts at 0.15.0; earlier releases are not backfilled.
 
+## [Unreleased]
+
+### Added
+
+- `deploy/analytics/` — docker compose and Helm deployments of logthing, Garage (S3),
+  the committer, Lakekeeper (Iceberg REST), Trino and Hue. See
+  `deploy/analytics/README.md`.
+
 ## [0.21.0] - 2026-09-30
 
 ### Added

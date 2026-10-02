@@ -52,6 +52,9 @@ This keeps logthing decoupled from Iceberg's release cadence: the
 committer and catalog can be swapped or upgraded independently, and a
 logthing deploy never blocks on either.
 
+For a ready-to-run docker compose / Helm stack wiring all of this together (plus Trino and
+Hue), see [deploy/analytics/](../deploy/analytics/README.md).
+
 ## Table maintenance
 
 Neither PyIceberg nor `iceberg-rust` currently ships an atomic file-rewrite
