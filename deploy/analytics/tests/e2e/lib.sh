@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared helpers for the analytics e2e scripts. Source, don't execute.
 
 # Exit 1 unless the CPU has AVX2 or both TRINO_IMAGE and HUE_IMAGE are overridden.

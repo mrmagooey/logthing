@@ -33,7 +33,8 @@ HUE_PORT=$HUE_PORT
 ENV
 [ -z "${TRINO_IMAGE:-}" ] || echo "TRINO_IMAGE=$TRINO_IMAGE" >>"$ENVFILE"
 [ -z "${HUE_IMAGE:-}" ] || echo "HUE_IMAGE=$HUE_IMAGE" >>"$ENVFILE"
-# Don't let image/credential overrides from the caller's shell leak in beyond the two above.
+# --env-file means a developer's deploy/analytics/.env is ignored. Variables exported in the
+# caller's shell still take precedence over this file (compose's normal rule).
 DC=(docker compose -p "$PROJECT" --env-file "$ENVFILE" -f "$ANALYTICS/docker-compose.yml")
 
 cleanup() {
@@ -55,6 +56,7 @@ s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 now = time.strftime("%b %e %H:%M:%S")
 for i in range(n):
     s.sendto(f"<134>{now} e2ehost analytics-e2e: {marker} message {i}".encode(), ("127.0.0.1", port))
+    time.sleep(0.02)  # pace sends so the UDP socket buffer is not overrun; never retried
 PYEOF
 
 COUNT_SQL="SELECT count(*) FROM iceberg.logs.syslog WHERE message LIKE '%$MARKER%'"
@@ -78,7 +80,7 @@ echo "== [4/5] Trino count =="
 echo "trino: $N"
 
 echo "== [5/5] same query through Hue's REST API =="
-HUE_COUNT=$("$PY" "$HERE/hue_query.py" "http://127.0.0.1:$HUE_PORT" admin e2e-admin-pass \
+HUE_COUNT=$(HUE_PASSWORD=e2e-admin-pass "$PY" "$HERE/hue_query.py" "http://127.0.0.1:$HUE_PORT" admin \
   "SELECT count(*) FROM syslog WHERE message LIKE '%$MARKER%'") \
   || { dump_logs hue trino; exit 1; }
 [ "$HUE_COUNT" = "$N" ] || { echo "Hue returned $HUE_COUNT, expected $N" >&2; dump_logs hue; exit 1; }
