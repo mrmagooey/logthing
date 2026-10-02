@@ -61,7 +61,7 @@ services:
   garage:
     image: ${GARAGE_IMAGE:-dxflrs/garage:v2.4.1}
     environment:
-      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:-0000000000000000000000000000000000000000000000000000000000000001}
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:-5f0c4d3a9b8e7f6a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b}
       GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-demo-garage-admin-token-change-me}
     volumes:
       - ./helm/logthing-analytics/files/garage.toml:/etc/garage.toml:ro
@@ -179,7 +179,7 @@ services:
       - ./hue.ini:/usr/share/hue/desktop/conf/z-hue-overrides.ini:ro
     environment:
       HUE_DB_PASSWORD: ${HUE_DB_PASSWORD:-demo-hue-change-me}
-      HUE_SECRET_KEY: ${HUE_SECRET_KEY:-demo-hue-secret-key-change-me-0123456789}
+      HUE_SECRET_KEY: ${HUE_SECRET_KEY:-demo-hue-secret-key-change-me-0123456789abcdef}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8888/desktop/debug/is_alive"]
       interval: 10s

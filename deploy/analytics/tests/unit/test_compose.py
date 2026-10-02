@@ -80,3 +80,31 @@ def test_region_and_bucket_consistent(cfg):
     assert env["S3_REGION"] == "garage"
     assert env["DATA_BUCKET"] == "logthing-data"
     assert env["WAREHOUSE"] == "logthing"
+
+
+CREDENTIALS = {
+    "GARAGE_RPC_SECRET": "5f0c4d3a9b8e7f6a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b",
+    "GARAGE_ADMIN_TOKEN": "demo-garage-admin-token-change-me",
+    "S3_ACCESS_KEY": "GK6b9c062a24e5a702c7c53e5b",
+    "S3_SECRET_KEY": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "POSTGRES_PASSWORD": "demo-postgres-change-me",
+    "LAKEKEEPER_DB_PASSWORD": "demo-lakekeeper-change-me",
+    "LAKEKEEPER_ENCRYPTION_KEY": "demo-lakekeeper-encryption-key-change-me",
+    "HUE_DB_PASSWORD": "demo-hue-change-me",
+    "HUE_SECRET_KEY": "demo-hue-secret-key-change-me-0123456789abcdef",
+}
+
+
+def test_env_example_matches_compose_defaults():
+    import re
+
+    compose = (ANALYTICS / "docker-compose.yml").read_text()
+    env = {}
+    for line in (ANALYTICS / ".env.example").read_text().splitlines():
+        m = re.fullmatch(r"([A-Z0-9_]+)=(.*)", line)
+        if m and m.group(1) in CREDENTIALS:
+            env[m.group(1)] = m.group(2)
+    assert env == CREDENTIALS
+    for name, value in CREDENTIALS.items():
+        defaults = set(re.findall(r"\$\{%s:-([^}]*)\}" % name, compose))
+        assert defaults == {value}, name
