@@ -1,0 +1,61 @@
+# logthing config for the analytics stack. Every S3 table omits endpoint/access_key/secret_key:
+# they come from LOGTHING__<SECTION>__S3__{ENDPOINT,ACCESS_KEY,SECRET_KEY} so this file is
+# identical under docker compose and Kubernetes.
+bind_address = "0.0.0.0:5985"
+
+[tls]
+enabled = false
+
+[logging]
+level = "info"
+format = "json"
+
+[metrics]
+enabled = false
+
+[syslog]
+enabled = true
+udp_port = 514
+tcp_port = 601
+parse_dns = false
+
+[syslog.s3]
+bucket = "logthing-data"
+region = "garage"
+prefix = "syslog"
+flush_interval_secs = 60
+
+[ipfix]
+enabled = true
+udp_port = 4739
+
+[ipfix.s3]
+bucket = "logthing-data"
+region = "garage"
+prefix = "ipfix"
+flush_interval_secs = 60
+
+[sflow]
+enabled = true
+udp_port = 6343
+
+[sflow.s3]
+bucket = "logthing-data"
+region = "garage"
+prefix = "sflow"
+flush_interval_secs = 60
+
+[zeek]
+enabled = true
+tcp_port = 47760
+
+[zeek.s3]
+bucket = "logthing-data"
+region = "garage"
+prefix = "zeek"
+flush_interval_secs = 60
+
+[iceberg.s3]
+bucket = "logthing-data"
+region = "garage"
+prefix = "_iceberg_descriptors"
