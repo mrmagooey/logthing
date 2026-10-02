@@ -9,5 +9,8 @@ profiling-results/
 
 # committer (Python)
 committer/.venv/
+# analytics (Python)
+deploy/analytics/.venv/
+deploy/analytics/.env
 __pycache__/
 .pytest_cache/

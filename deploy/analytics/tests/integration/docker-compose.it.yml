@@ -1,0 +1,10 @@
+# Test-only override: publish Garage S3/admin and Lakekeeper on ephemeral loopback ports.
+# The test reads the assigned ports back with `docker compose port`.
+services:
+  garage:
+    ports: !override
+      - "127.0.0.1::3900"
+      - "127.0.0.1::3903"
+  lakekeeper:
+    ports: !override
+      - "127.0.0.1::8181"

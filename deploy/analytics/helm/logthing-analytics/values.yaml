@@ -1,0 +1,71 @@
+# DEMO credentials. Change every value, or set credentials.existingSecret to a Secret with
+# keys: garage-rpc-secret garage-admin-token s3-access-key s3-secret-key postgres-password
+# lakekeeper-db-password lakekeeper-encryption-key hue-db-password hue-secret-key.
+# Passwords must be URL-safe (they are spliced into Postgres connection URLs).
+credentials:
+  existingSecret: ""
+  garageRpcSecret: 5f0c4d3a9b8e7f6a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b
+  garageAdminToken: demo-garage-admin-token-change-me
+  s3AccessKey: GK6b9c062a24e5a702c7c53e5b
+  s3SecretKey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  postgresPassword: demo-postgres-change-me
+  lakekeeperDbPassword: demo-lakekeeper-change-me
+  lakekeeperEncryptionKey: demo-lakekeeper-encryption-key-change-me
+  hueDbPassword: demo-hue-change-me
+  hueSecretKey: demo-hue-secret-key-change-me-0123456789abcdef
+
+bootstrap:
+  image: python:3.12-slim
+  timeoutSecs: 600
+
+postgres:
+  image: postgres:17
+  storage: 5Gi
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+
+garage:
+  image: dxflrs/garage:v2.4.1
+  capacityBytes: 10737418240
+  metaStorage: 1Gi
+  dataStorage: 20Gi
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+
+lakekeeper:
+  image: quay.io/lakekeeper/catalog:v0.13.6
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+
+logthing:
+  image: ghcr.io/mrmagooey/logthing:0.21.0
+  flushIntervalSecs: 60
+  udpService:
+    type: ClusterIP
+  tcpService:
+    type: ClusterIP
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+
+committer:
+  image: ghcr.io/mrmagooey/logthing-committer:0.21.0
+  schedule: "*/1 * * * *"
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+
+trino:
+  image: trinodb/trino:483
+  service:
+    type: ClusterIP
+  resources:
+    requests: {memory: 2Gi}
+    limits: {memory: 4Gi}
+
+hue:
+  image: gethue/hue:20260611-140101
+  service:
+    type: ClusterIP
+  resources:
+    requests: {memory: 1Gi}
+
+storageClassName: ""

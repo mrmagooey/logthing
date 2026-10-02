@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "la.fullname" . }}-files
+  labels: {{- include "la.labels" . | nindent 4 }}
+data:
+  bootstrap.py: |
+    {{- .Files.Get "files/bootstrap.py" | nindent 4 }}
+  garage.toml: |
+    {{- .Files.Get "files/garage.toml" | nindent 4 }}
+  logthing.toml: |
+    {{- .Files.Get "files/logthing.toml" | nindent 4 }}
+  trino-iceberg.properties: |
+    {{- .Files.Get "files/trino-iceberg.properties" | nindent 4 }}
+  postgres-init.sh: |
+    {{- .Files.Get "files/postgres-init.sh" | nindent 4 }}

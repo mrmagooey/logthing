@@ -1,0 +1,205 @@
+# logthing analytics stack: logthing -> Garage (S3) -> committer -> Lakekeeper (Iceberg REST)
+# -> Trino -> Hue. Shared config files live in helm/logthing-analytics/files/ and are used
+# unchanged by the Helm chart. Credentials below are DEMO defaults: override them in .env.
+name: logthing-analytics
+
+x-s3-creds: &s3-creds
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+
+x-lakekeeper-env: &lakekeeper-env
+  LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:-demo-lakekeeper-encryption-key-change-me}
+  LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:-demo-lakekeeper-change-me}@postgres:5432/lakekeeper
+  LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:-demo-lakekeeper-change-me}@postgres:5432/lakekeeper
+  LAKEKEEPER__BASE_URI: http://lakekeeper:8181
+
+x-bootstrap: &bootstrap
+  image: ${BOOTSTRAP_IMAGE:-python:3.12-slim}
+  entrypoint: ["python", "/bootstrap/bootstrap.py"]
+  volumes:
+    - ./helm/logthing-analytics/files/bootstrap.py:/bootstrap/bootstrap.py:ro
+  restart: "no"
+
+x-logthing-s3: &logthing-s3
+  LOGTHING__SYSLOG__S3__ENDPOINT: http://garage:3900
+  LOGTHING__SYSLOG__S3__ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
+  LOGTHING__SYSLOG__S3__SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  LOGTHING__SYSLOG__S3__FLUSH_INTERVAL_SECS: ${LOGTHING_FLUSH_INTERVAL_SECS:-60}
+  LOGTHING__IPFIX__S3__ENDPOINT: http://garage:3900
+  LOGTHING__IPFIX__S3__ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
+  LOGTHING__IPFIX__S3__SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  LOGTHING__IPFIX__S3__FLUSH_INTERVAL_SECS: ${LOGTHING_FLUSH_INTERVAL_SECS:-60}
+  LOGTHING__SFLOW__S3__ENDPOINT: http://garage:3900
+  LOGTHING__SFLOW__S3__ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
+  LOGTHING__SFLOW__S3__SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  LOGTHING__SFLOW__S3__FLUSH_INTERVAL_SECS: ${LOGTHING_FLUSH_INTERVAL_SECS:-60}
+  LOGTHING__ZEEK__S3__ENDPOINT: http://garage:3900
+  LOGTHING__ZEEK__S3__ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
+  LOGTHING__ZEEK__S3__SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  LOGTHING__ZEEK__S3__FLUSH_INTERVAL_SECS: ${LOGTHING_FLUSH_INTERVAL_SECS:-60}
+  LOGTHING__ICEBERG__S3__ENDPOINT: http://garage:3900
+  LOGTHING__ICEBERG__S3__ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
+  LOGTHING__ICEBERG__S3__SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:17}
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-demo-postgres-change-me}
+      LAKEKEEPER_DB_PASSWORD: ${LAKEKEEPER_DB_PASSWORD:-demo-lakekeeper-change-me}
+      HUE_DB_PASSWORD: ${HUE_DB_PASSWORD:-demo-hue-change-me}
+    volumes:
+      - ./helm/logthing-analytics/files/postgres-init.sh:/docker-entrypoint-initdb.d/10-init.sh:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # TCP on purpose: the unix-socket check passes during the init-time temporary server.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d lakekeeper"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  garage:
+    image: ${GARAGE_IMAGE:-dxflrs/garage:v2.4.1}
+    restart: unless-stopped
+    environment:
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:-5f0c4d3a9b8e7f6a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-demo-garage-admin-token-change-me}
+    volumes:
+      - ./helm/logthing-analytics/files/garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+    ports:
+      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${GARAGE_S3_PORT:-3900}:3900"
+
+  garage-init:
+    <<: *bootstrap
+    command: ["garage"]
+    environment:
+      <<: *s3-creds
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-demo-garage-admin-token-change-me}
+    depends_on:
+      garage: {condition: service_healthy}
+
+  lakekeeper-migrate:
+    image: ${LAKEKEEPER_IMAGE:-quay.io/lakekeeper/catalog:v0.13.6}
+    command: ["migrate"]
+    environment: *lakekeeper-env
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+
+  lakekeeper:
+    image: ${LAKEKEEPER_IMAGE:-quay.io/lakekeeper/catalog:v0.13.6}
+    restart: unless-stopped
+    command: ["serve"]
+    environment: *lakekeeper-env
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 3s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+    depends_on:
+      lakekeeper-migrate: {condition: service_completed_successfully}
+    ports:
+      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${LAKEKEEPER_PORT:-8181}:8181"
+
+  lakekeeper-init:
+    <<: *bootstrap
+    command: ["lakekeeper"]
+    environment: *s3-creds
+    depends_on:
+      lakekeeper: {condition: service_healthy}
+      garage-init: {condition: service_completed_successfully}
+
+  logthing:
+    image: ${LOGTHING_IMAGE:-ghcr.io/mrmagooey/logthing:0.21.0}
+    volumes:
+      - ./helm/logthing-analytics/files/logthing.toml:/etc/logthing/config.toml:ro
+    environment: *logthing-s3
+    depends_on:
+      garage-init: {condition: service_completed_successfully}
+    restart: unless-stopped
+    ports:
+      - "${SYSLOG_UDP_PORT:-514}:514/udp"
+      - "${SYSLOG_TCP_PORT:-601}:601/tcp"
+      - "${IPFIX_PORT:-4739}:4739/udp"
+      - "${SFLOW_PORT:-6343}:6343/udp"
+      - "${ZEEK_PORT:-47760}:47760/tcp"
+      - "${LOGTHING_HEALTH_PORT:-5985}:5985/tcp"
+
+  committer:
+    image: ${COMMITTER_IMAGE:-ghcr.io/mrmagooey/logthing-committer:0.21.0}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        # Run in the background so SIGTERM is handled promptly even mid-run. A commit cut
+        # short is safe: descriptors only move after a successful commit (crash-safe).
+        trap 'exit 0' TERM INT
+        while true; do
+          python /app/commit.py & wait $$! || echo "committer: run failed (will retry)"
+          sleep "$${COMMIT_INTERVAL_SECS}" & wait $$!
+        done
+    environment:
+      <<: *s3-creds
+      DATA_BUCKET: logthing-data
+      S3_ENDPOINT: http://garage:3900
+      S3_REGION: garage
+      CATALOG_URI: http://lakekeeper:8181/catalog
+      WAREHOUSE: logthing
+      ICEBERG_NAMESPACE: logs
+      COMMIT_INTERVAL_SECS: ${COMMIT_INTERVAL_SECS:-60}
+    depends_on:
+      lakekeeper-init: {condition: service_completed_successfully}
+    restart: unless-stopped
+
+  trino:
+    image: ${TRINO_IMAGE:-trinodb/trino:483}
+    restart: unless-stopped
+    volumes:
+      - ./helm/logthing-analytics/files/trino-iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+    environment:
+      <<: *s3-creds
+      CATALOG_URI: http://lakekeeper:8181/catalog
+      S3_ENDPOINT: http://garage:3900
+    healthcheck:
+      test: ["CMD", "/usr/lib/trino/bin/health-check"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+    depends_on:
+      lakekeeper-init: {condition: service_completed_successfully}
+    ports:
+      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${TRINO_PORT:-8080}:8080"
+
+  hue:
+    image: ${HUE_IMAGE:-gethue/hue:20260611-140101}
+    restart: unless-stopped
+    volumes:
+      - ./hue.ini:/usr/share/hue/desktop/conf/z-hue-overrides.ini:ro
+    environment:
+      HUE_DB_PASSWORD: ${HUE_DB_PASSWORD:-demo-hue-change-me}
+      HUE_SECRET_KEY: ${HUE_SECRET_KEY:-demo-hue-secret-key-change-me-0123456789abcdef}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8888/desktop/debug/is_alive"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    depends_on:
+      postgres: {condition: service_healthy}
+      trino: {condition: service_healthy}
+    ports:
+      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${HUE_PORT:-8888}:8888"
+
+volumes:
+  pgdata: {}
+  garage-meta: {}
+  garage-data: {}

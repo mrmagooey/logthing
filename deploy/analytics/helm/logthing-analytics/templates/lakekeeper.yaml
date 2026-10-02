@@ -1,0 +1,63 @@
+{{- define "la.lakekeeperEnv" -}}
+{{- include "la.secretEnv" (dict "root" . "name" "LAKEKEEPER_DB_PASSWORD" "key" "lakekeeper-db-password") }}
+{{ include "la.secretEnv" (dict "root" . "name" "LAKEKEEPER__PG_ENCRYPTION_KEY" "key" "lakekeeper-encryption-key") }}
+- name: LAKEKEEPER__PG_DATABASE_URL_READ
+  value: postgresql://lakekeeper:$(LAKEKEEPER_DB_PASSWORD)@{{ include "la.fullname" . }}-postgres:5432/lakekeeper
+- name: LAKEKEEPER__PG_DATABASE_URL_WRITE
+  value: postgresql://lakekeeper:$(LAKEKEEPER_DB_PASSWORD)@{{ include "la.fullname" . }}-postgres:5432/lakekeeper
+- name: LAKEKEEPER__BASE_URI
+  value: http://{{ include "la.fullname" . }}-lakekeeper:8181
+{{- end -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "la.fullname" . }}-lakekeeper
+  labels: {{- include "la.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector: {{- include "la.selector" (dict "root" . "component" "lakekeeper") | nindent 4 }}
+  ports:
+    - {name: http, port: 8181, targetPort: 8181}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "la.fullname" . }}-lakekeeper
+  labels: {{- include "la.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "la.selector" (dict "root" . "component" "lakekeeper") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "la.podLabels" (dict "root" . "component" "lakekeeper") | nindent 8 }}
+      annotations:
+        {{- if not .Values.credentials.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+    spec:
+      initContainers:
+        # Retries via pod restart if Postgres is not ready yet.
+        - name: migrate
+          image: {{ .Values.lakekeeper.image }}
+          args: ["migrate"]
+          env:
+            {{- include "la.lakekeeperEnv" . | nindent 12 }}
+      containers:
+        - name: lakekeeper
+          image: {{ .Values.lakekeeper.image }}
+          args: ["serve"]
+          ports:
+            - {name: http, containerPort: 8181}
+          env:
+            {{- include "la.lakekeeperEnv" . | nindent 12 }}
+          readinessProbe:
+            exec:
+              command: ["/home/nonroot/lakekeeper", "healthcheck"]
+            timeoutSeconds: 5
+            periodSeconds: 5
+            failureThreshold: 15
+          {{- with .Values.lakekeeper.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}

@@ -1,0 +1,33 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "la.fullname" . }}-garage-init-{{ .Release.Revision }}
+  labels:
+    {{- include "la.labels" . | nindent 4 }}
+    app.kubernetes.io/component: garage-init
+spec:
+  # Plain Job, not a hook: hooks + --wait deadlock with the wait initContainers. The name
+  # carries the revision because spec.template is immutable across upgrades.
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 20
+  template:
+    metadata:
+      labels:
+        {{- include "la.podLabels" (dict "root" . "component" "garage-init") | nindent 8 }}
+      annotations:
+        checksum/files: {{ include (print $.Template.BasePath "/configmap-files.yaml") . | sha256sum }}
+        {{- if not .Values.credentials.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: garage-init
+          image: {{ .Values.bootstrap.image }}
+          command: ["python", "/bootstrap/bootstrap.py", "garage"]
+          env:
+            {{- include "la.bootstrapEnv" . | nindent 12 }}
+          volumeMounts:
+            - {name: files, mountPath: /bootstrap/bootstrap.py, subPath: bootstrap.py}
+      volumes:
+        {{- include "la.filesVolume" . | nindent 8 }}
