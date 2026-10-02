@@ -44,6 +44,7 @@ x-logthing-s3: &logthing-s3
 services:
   postgres:
     image: ${POSTGRES_IMAGE:-postgres:17}
+    restart: unless-stopped
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-demo-postgres-change-me}
       LAKEKEEPER_DB_PASSWORD: ${LAKEKEEPER_DB_PASSWORD:-demo-lakekeeper-change-me}
@@ -60,6 +61,7 @@ services:
 
   garage:
     image: ${GARAGE_IMAGE:-dxflrs/garage:v2.4.1}
+    restart: unless-stopped
     environment:
       GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:-5f0c4d3a9b8e7f6a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b}
       GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-demo-garage-admin-token-change-me}
@@ -73,7 +75,7 @@ services:
       timeout: 5s
       retries: 20
     ports:
-      - "${GARAGE_S3_PORT:-3900}:3900"
+      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${GARAGE_S3_PORT:-3900}:3900"
 
   garage-init:
     <<: *bootstrap
@@ -94,6 +96,7 @@ services:
 
   lakekeeper:
     image: ${LAKEKEEPER_IMAGE:-quay.io/lakekeeper/catalog:v0.13.6}
+    restart: unless-stopped
     command: ["serve"]
     environment: *lakekeeper-env
     healthcheck:
@@ -105,7 +108,7 @@ services:
     depends_on:
       lakekeeper-migrate: {condition: service_completed_successfully}
     ports:
-      - "${LAKEKEEPER_PORT:-8181}:8181"
+      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${LAKEKEEPER_PORT:-8181}:8181"
 
   lakekeeper-init:
     <<: *bootstrap
@@ -136,9 +139,11 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
+        # Run in the background so SIGTERM is handled promptly even mid-run. A commit cut
+        # short is safe: descriptors only move after a successful commit (crash-safe).
         trap 'exit 0' TERM INT
         while true; do
-          python /app/commit.py || echo "committer: run failed (will retry)"
+          python /app/commit.py & wait $$! || echo "committer: run failed (will retry)"
           sleep "$${COMMIT_INTERVAL_SECS}" & wait $$!
         done
     environment:
@@ -156,6 +161,7 @@ services:
 
   trino:
     image: ${TRINO_IMAGE:-trinodb/trino:483}
+    restart: unless-stopped
     volumes:
       - ./helm/logthing-analytics/files/trino-iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
     environment:
@@ -171,10 +177,11 @@ services:
     depends_on:
       lakekeeper-init: {condition: service_completed_successfully}
     ports:
-      - "${TRINO_PORT:-8080}:8080"
+      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${TRINO_PORT:-8080}:8080"
 
   hue:
     image: ${HUE_IMAGE:-gethue/hue:20260611-140101}
+    restart: unless-stopped
     volumes:
       - ./hue.ini:/usr/share/hue/desktop/conf/z-hue-overrides.ini:ro
     environment:
@@ -190,7 +197,7 @@ services:
       postgres: {condition: service_healthy}
       trino: {condition: service_healthy}
     ports:
-      - "${HUE_PORT:-8888}:8888"
+      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${HUE_PORT:-8888}:8888"
 
 volumes:
   pgdata: {}

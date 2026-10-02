@@ -1,24 +1,40 @@
 import json
 import os
+import re
+import shutil
+import signal
+import stat
 import subprocess
+import time
 
 import pytest
 
 from conftest import ANALYTICS
 
+if shutil.which("docker") is None:
+    pytest.skip("docker not on PATH", allow_module_level=True)
 
-def compose_config(env=None):
+
+def clean_env():
+    keep = ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONFIG")
+    return {k: os.environ[k] for k in keep if k in os.environ}
+
+
+def compose_config(tmp_path, overrides=None):
+    """Render the compose file hermetically: explicit env file, minimal process env."""
+    env_file = tmp_path / "test.env"
+    env_file.write_text("".join(f"{k}={v}\n" for k, v in (overrides or {}).items()))
     out = subprocess.run(
-        ["docker", "compose", "-f", str(ANALYTICS / "docker-compose.yml"),
-         "config", "--format", "json"],
-        capture_output=True, text=True, check=True, env=env,
+        ["docker", "compose", "--env-file", str(env_file),
+         "-f", str(ANALYTICS / "docker-compose.yml"), "config", "--format", "json"],
+        capture_output=True, text=True, check=True, env=clean_env(),
     )
     return json.loads(out.stdout)
 
 
 @pytest.fixture(scope="module")
-def cfg():
-    return compose_config()
+def cfg(tmp_path_factory):
+    return compose_config(tmp_path_factory.mktemp("compose"))
 
 
 def test_all_services_present(cfg):
@@ -55,9 +71,9 @@ def test_postgres_healthcheck_uses_tcp(cfg):
     assert "-h 127.0.0.1" in " ".join(cfg["services"]["postgres"]["healthcheck"]["test"])
 
 
-def test_compose_credentials_flow_everywhere():
-    env = dict(os.environ, S3_ACCESS_KEY="GKffffffffffffffffffffffff", S3_SECRET_KEY="f" * 64)
-    svc = compose_config(env)["services"]
+def test_compose_credentials_flow_everywhere(tmp_path):
+    overrides = {"S3_ACCESS_KEY": "GKffffffffffffffffffffffff", "S3_SECRET_KEY": "f" * 64}
+    svc = compose_config(tmp_path, overrides)["services"]
     lt = svc["logthing"]["environment"]
     for src in ("SYSLOG", "IPFIX", "SFLOW", "ZEEK", "ICEBERG"):
         assert lt[f"LOGTHING__{src}__S3__ACCESS_KEY"] == "GKffffffffffffffffffffffff"
@@ -67,12 +83,59 @@ def test_compose_credentials_flow_everywhere():
         assert svc[s]["environment"]["S3_SECRET_KEY"] == "f" * 64
 
 
-def test_committer_loop_traps_term(cfg):
+def _run_committer_script(tmp_path, cfg, stub_body, term_after=0.5):
     c = cfg["services"]["committer"]
     assert c["entrypoint"] == ["/bin/sh", "-c"]
-    script = c["command"][0]
-    assert "trap 'exit 0' TERM" in script and "& wait" in script
-    assert "python /app/commit.py" in script
+    stubs = tmp_path / "bin"
+    stubs.mkdir(exist_ok=True)
+    py = stubs / "python"
+    py.write_text(f"#!/bin/sh\n{stub_body}\n")
+    py.chmod(py.stat().st_mode | stat.S_IXUSR)
+    env = {"PATH": f"{stubs}:{os.environ['PATH']}", "COMMIT_INTERVAL_SECS": "30"}
+    proc = subprocess.Popen(["/bin/sh", "-c", c["command"][0]], env=env)
+    time.sleep(term_after)
+    proc.send_signal(signal.SIGTERM)
+    start = time.time()
+    try:
+        rc = proc.wait(timeout=2)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    return rc, time.time() - start
+
+
+def test_committer_exits_on_term_while_python_runs(tmp_path, cfg):
+    rc, _ = _run_committer_script(tmp_path, cfg, "sleep 30")
+    assert rc == 0
+
+
+def test_committer_exits_on_term_while_sleeping(tmp_path, cfg):
+    rc, _ = _run_committer_script(tmp_path, cfg, "exit 0")
+    assert rc == 0
+
+
+def test_committer_script_runs_commit_py(cfg):
+    assert "python /app/commit.py" in cfg["services"]["committer"]["command"][0]
+
+
+def test_bind_mount_sources_exist(cfg):
+    for name, svc in cfg["services"].items():
+        for v in svc.get("volumes", []):
+            if v["type"] == "bind":
+                assert os.path.exists(v["source"]), f"{name}: {v['source']}"
+
+
+def test_non_ingest_ports_default_to_loopback(cfg):
+    for name in ("garage", "lakekeeper", "trino", "hue"):
+        for p in cfg["services"][name]["ports"]:
+            assert p["host_ip"] == "127.0.0.1", name
+    for p in cfg["services"]["logthing"]["ports"]:
+        assert not p.get("host_ip"), p
+
+
+def test_long_running_services_restart(cfg):
+    for name in ("postgres", "garage", "lakekeeper", "trino", "hue", "logthing", "committer"):
+        assert cfg["services"][name]["restart"] == "unless-stopped", name
 
 
 def test_region_and_bucket_consistent(cfg):
@@ -96,8 +159,6 @@ CREDENTIALS = {
 
 
 def test_env_example_matches_compose_defaults():
-    import re
-
     compose = (ANALYTICS / "docker-compose.yml").read_text()
     env = {}
     for line in (ANALYTICS / ".env.example").read_text().splitlines():
