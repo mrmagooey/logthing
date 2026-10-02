@@ -60,7 +60,7 @@ spec:
   volumeClaimTemplates:
     - metadata:
         labels:
-          {{- include "la.labels" $ | nindent 10 }}
+          {{- include "la.stableLabels" $ | nindent 10 }}
         name: data
       spec:
         accessModes: [ReadWriteOnce]

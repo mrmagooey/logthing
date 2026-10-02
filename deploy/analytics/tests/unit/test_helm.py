@@ -399,4 +399,9 @@ def test_volume_claim_templates_carry_instance_label():
     assert sets
     for sts in sets:
         for vct in sts["spec"]["volumeClaimTemplates"]:
+            # immutable field: only stable keys, so appVersion/chart bumps never break upgrades
+            assert set(vct["metadata"]["labels"]) == {
+                "app.kubernetes.io/name",
+                "app.kubernetes.io/instance",
+            }
             assert vct["metadata"]["labels"]["app.kubernetes.io/instance"] == "lt"

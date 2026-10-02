@@ -62,7 +62,7 @@ spec:
   volumeClaimTemplates:
     - metadata:
         labels:
-          {{- include "la.labels" $ | nindent 10 }}
+          {{- include "la.stableLabels" $ | nindent 10 }}
         name: meta
       spec:
         accessModes: [ReadWriteOnce]
@@ -74,7 +74,7 @@ spec:
             storage: {{ .Values.garage.metaStorage }}
     - metadata:
         labels:
-          {{- include "la.labels" $ | nindent 10 }}
+          {{- include "la.stableLabels" $ | nindent 10 }}
         name: data
       spec:
         accessModes: [ReadWriteOnce]
