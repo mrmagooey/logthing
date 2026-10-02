@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "la.fullname" . }}-trino
+  labels: {{- include "la.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.trino.service.type }}
+  selector: {{- include "la.selector" (dict "root" . "component" "trino") | nindent 4 }}
+  ports:
+    - {name: http, port: 8080, targetPort: 8080}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "la.fullname" . }}-trino
+  labels: {{- include "la.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "la.selector" (dict "root" . "component" "trino") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "la.podLabels" (dict "root" . "component" "trino") | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "la.waitFor" (dict "root" . "target" "lakekeeper") | nindent 8 }}
+      containers:
+        - name: trino
+          image: {{ .Values.trino.image }}
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - name: CATALOG_URI
+              value: http://{{ include "la.fullname" . }}-lakekeeper:8181/catalog
+            {{- include "la.s3Env" . | nindent 12 }}
+          readinessProbe:
+            exec:
+              command: ["/usr/lib/trino/bin/health-check"]
+            initialDelaySeconds: 30
+            periodSeconds: 5
+            failureThreshold: 60
+          volumeMounts:
+            - {name: files, mountPath: /etc/trino/catalog/iceberg.properties, subPath: trino-iceberg.properties}
+          {{- with .Values.trino.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        {{- include "la.filesVolume" . | nindent 8 }}

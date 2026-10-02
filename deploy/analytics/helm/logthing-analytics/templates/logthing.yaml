@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "la.fullname" . }}-logthing-udp
+  labels: {{- include "la.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.logthing.udpService.type }}
+  selector: {{- include "la.selector" (dict "root" . "component" "logthing") | nindent 4 }}
+  ports:
+    - {name: syslog-udp, port: 514, targetPort: 514, protocol: UDP}
+    - {name: ipfix, port: 4739, targetPort: 4739, protocol: UDP}
+    - {name: sflow, port: 6343, targetPort: 6343, protocol: UDP}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "la.fullname" . }}-logthing-tcp
+  labels: {{- include "la.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.logthing.tcpService.type }}
+  selector: {{- include "la.selector" (dict "root" . "component" "logthing") | nindent 4 }}
+  ports:
+    - {name: syslog-tcp, port: 601, targetPort: 601, protocol: TCP}
+    - {name: zeek, port: 47760, targetPort: 47760, protocol: TCP}
+    - {name: http, port: 5985, targetPort: 5985, protocol: TCP}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "la.fullname" . }}-logthing
+  labels: {{- include "la.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "la.selector" (dict "root" . "component" "logthing") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "la.podLabels" (dict "root" . "component" "logthing") | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "la.waitFor" (dict "root" . "target" "garage") | nindent 8 }}
+      containers:
+        - name: logthing
+          image: {{ .Values.logthing.image }}
+          ports:
+            - {name: syslog-udp, containerPort: 514, protocol: UDP}
+            - {name: syslog-tcp, containerPort: 601, protocol: TCP}
+            - {name: ipfix, containerPort: 4739, protocol: UDP}
+            - {name: sflow, containerPort: 6343, protocol: UDP}
+            - {name: zeek, containerPort: 47760, protocol: TCP}
+            - {name: http, containerPort: 5985, protocol: TCP}
+          env:
+            {{- range $sec := list "SYSLOG" "IPFIX" "SFLOW" "ZEEK" "ICEBERG" }}
+            - name: LOGTHING__{{ $sec }}__S3__ENDPOINT
+              value: http://{{ include "la.fullname" $ }}-garage:3900
+            {{- include "la.secretEnv" (dict "root" $ "name" (printf "LOGTHING__%s__S3__ACCESS_KEY" $sec) "key" "s3-access-key") | nindent 12 }}
+            {{- include "la.secretEnv" (dict "root" $ "name" (printf "LOGTHING__%s__S3__SECRET_KEY" $sec) "key" "s3-secret-key") | nindent 12 }}
+            {{- if ne $sec "ICEBERG" }}
+            - name: LOGTHING__{{ $sec }}__S3__FLUSH_INTERVAL_SECS
+              value: {{ $.Values.logthing.flushIntervalSecs | quote }}
+            {{- end }}
+            {{- end }}
+          readinessProbe:
+            httpGet: {path: /health, port: 5985}
+            periodSeconds: 5
+          volumeMounts:
+            - {name: files, mountPath: /etc/logthing/config.toml, subPath: logthing.toml}
+          {{- with .Values.logthing.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        {{- include "la.filesVolume" . | nindent 8 }}

@@ -1,0 +1,15 @@
+logthing analytics stack installed as {{ include "la.fullname" . }}.
+
+Open Hue:
+  kubectl port-forward svc/{{ include "la.fullname" . }}-hue 8888
+  then browse http://localhost:8888 (the first login creates the admin account).
+
+Query Trino directly:
+  kubectl port-forward svc/{{ include "la.fullname" . }}-trino 8080
+
+Tables appear only after the first committer run (CronJob {{ include "la.fullname" . }}-committer,
+schedule "{{ .Values.committer.schedule }}") has seen flushed data.
+{{- if not .Values.credentials.existingSecret }}
+
+WARNING: Demo credentials in use - set credentials.* or credentials.existingSecret.
+{{- end }}

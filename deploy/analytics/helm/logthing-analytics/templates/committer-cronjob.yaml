@@ -1,0 +1,37 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "la.fullname" . }}-committer
+  labels: {{- include "la.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.committer.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            {{- include "la.podLabels" (dict "root" . "component" "committer") | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          initContainers:
+            {{- include "la.waitFor" (dict "root" . "target" "lakekeeper") | nindent 12 }}
+          containers:
+            - name: committer
+              image: {{ .Values.committer.image }}
+              env:
+                - {name: DATA_BUCKET, value: logthing-data}
+                {{- include "la.s3Env" . | nindent 16 }}
+                - {name: S3_REGION, value: garage}
+                - name: CATALOG_URI
+                  value: http://{{ include "la.fullname" . }}-lakekeeper:8181/catalog
+                - {name: WAREHOUSE, value: logthing}
+                - {name: ICEBERG_NAMESPACE, value: logs}
+              {{- with .Values.committer.resources }}
+              resources: {{- toYaml . | nindent 16 }}
+              {{- end }}
+          volumes:
+            {{- include "la.filesVolume" . | nindent 12 }}

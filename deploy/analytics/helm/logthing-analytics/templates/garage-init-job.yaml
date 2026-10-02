@@ -1,0 +1,23 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "la.fullname" . }}-garage-init
+  labels: {{- include "la.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 20
+  template:
+    metadata:
+      labels:
+        {{- include "la.podLabels" (dict "root" . "component" "garage-init") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: garage-init
+          image: {{ .Values.bootstrap.image }}
+          command: ["python", "/bootstrap/bootstrap.py", "garage"]
+          env:
+            {{- include "la.bootstrapEnv" . | nindent 12 }}
+          volumeMounts:
+            - {name: files, mountPath: /bootstrap/bootstrap.py, subPath: bootstrap.py}
+      volumes:
+        {{- include "la.filesVolume" . | nindent 8 }}

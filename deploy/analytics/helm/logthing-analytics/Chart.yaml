@@ -1,0 +1,6 @@
+apiVersion: v2
+name: logthing-analytics
+description: logthing -> Garage -> Iceberg (Lakekeeper) -> Trino -> Hue analytics environment
+type: application
+version: 0.1.0
+appVersion: "0.21.0"
