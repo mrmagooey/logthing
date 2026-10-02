@@ -59,6 +59,8 @@ spec:
             defaultMode: 0755
   volumeClaimTemplates:
     - metadata:
+        labels:
+          {{- include "la.labels" $ | nindent 10 }}
         name: data
       spec:
         accessModes: [ReadWriteOnce]

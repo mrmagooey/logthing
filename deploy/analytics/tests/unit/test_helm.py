@@ -390,3 +390,13 @@ def test_garage_capacity_rendered_as_plain_integer():
         job = by(render(*sets), "Job", f"{FULL}-garage-init-1")
         env = {e["name"]: e.get("value") for e in pod_spec(job)["containers"][0]["env"]}
         assert env["GARAGE_CAPACITY_BYTES"] == want
+
+
+def test_volume_claim_templates_carry_instance_label():
+    # `kubectl delete pvc -l app.kubernetes.io/instance=<release>` (docs, NOTES.txt) relies on it.
+    docs = render()
+    sets = [d for d in docs if d["kind"] == "StatefulSet"]
+    assert sets
+    for sts in sets:
+        for vct in sts["spec"]["volumeClaimTemplates"]:
+            assert vct["metadata"]["labels"]["app.kubernetes.io/instance"] == "lt"
