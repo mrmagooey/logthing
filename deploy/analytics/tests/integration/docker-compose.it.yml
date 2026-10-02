@@ -1,0 +1,9 @@
+# Test-only override: publish Garage admin plus S3/Lakekeeper on loopback, on unusual ports.
+services:
+  garage:
+    ports: !override
+      - "127.0.0.1:${IT_GARAGE_S3_PORT:-23900}:3900"
+      - "127.0.0.1:${IT_GARAGE_ADMIN_PORT:-23903}:3903"
+  lakekeeper:
+    ports: !override
+      - "127.0.0.1:${IT_LAKEKEEPER_PORT:-28181}:8181"
