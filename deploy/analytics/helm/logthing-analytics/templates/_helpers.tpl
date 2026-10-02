@@ -33,7 +33,7 @@ app.kubernetes.io/component: {{ .component }}
 {{ include "la.secretEnv" (dict "root" . "name" "GARAGE_ADMIN_TOKEN" "key" "garage-admin-token") }}
 - {name: GARAGE_ADMIN_URL, value: "http://{{ include "la.fullname" . }}-garage:3903"}
 - {name: LAKEKEEPER_URL, value: "http://{{ include "la.fullname" . }}-lakekeeper:8181"}
-- {name: GARAGE_CAPACITY_BYTES, value: {{ .Values.garage.capacityBytes | quote }}}
+- {name: GARAGE_CAPACITY_BYTES, value: {{ .Values.garage.capacityBytes | int64 | quote }}}
 - {name: BOOTSTRAP_TIMEOUT_SECS, value: {{ .Values.bootstrap.timeoutSecs | quote }}}
 {{- end -}}
 {{/* initContainer that blocks on `bootstrap.py wait <target>`; only the env that target needs */}}

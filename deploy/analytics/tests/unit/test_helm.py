@@ -381,3 +381,12 @@ def test_wait_init_containers_get_minimal_env():
 def test_committer_active_deadline():
     cj = by(render(), "CronJob", f"{FULL}-committer")
     assert cj["spec"]["jobTemplate"]["spec"]["activeDeadlineSeconds"] == 900
+
+
+def test_garage_capacity_rendered_as_plain_integer():
+    # Helm parses YAML numbers as float64; a bare `quote` renders 1.073741824e+10, which
+    # bootstrap.py's int() rejects (found on a real cluster).
+    for sets, want in [((), "10737418240"), (("garage.capacityBytes=21474836480",), "21474836480")]:
+        job = by(render(*sets), "Job", f"{FULL}-garage-init-1")
+        env = {e["name"]: e.get("value") for e in pod_spec(job)["containers"][0]["env"]}
+        assert env["GARAGE_CAPACITY_BYTES"] == want
