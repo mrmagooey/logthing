@@ -17,7 +17,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from http.client import HTTPException
 
 
 class Transient(Exception):
@@ -31,9 +32,9 @@ class Fatal(Exception):
 @dataclass
 class Config:
     garage_admin_url: str
-    garage_admin_token: str
+    garage_admin_token: str = field(repr=False)
     access_key: str
-    secret_key: str
+    secret_key: str = field(repr=False)
     bucket: str
     zone: str
     capacity: int
@@ -57,26 +58,40 @@ class Config:
         missing = [k for k in cls.REQUIRED[command] if not env.get(k)]
         if missing:
             raise KeyError(", ".join(missing))
+        try:
+            capacity = int(env.get("GARAGE_CAPACITY_BYTES",
+                                   str(10 * 1024**3)))
+            timeout = float(env.get("BOOTSTRAP_TIMEOUT_SECS", "300"))
+            retry = float(env.get("BOOTSTRAP_RETRY_SECS", "2"))
+        except ValueError as e:
+            raise ValueError(f"invalid configuration: {e}") from e
         return cls(
-            garage_admin_url=env.get("GARAGE_ADMIN_URL", "http://garage:3903").rstrip("/"),
+            garage_admin_url=env.get(
+                "GARAGE_ADMIN_URL",
+                "http://garage:3903").rstrip("/"),
             garage_admin_token=env.get("GARAGE_ADMIN_TOKEN", ""),
             access_key=env.get("S3_ACCESS_KEY", ""),
             secret_key=env.get("S3_SECRET_KEY", ""),
             bucket=env.get("DATA_BUCKET", "logthing-data"),
             zone=env.get("GARAGE_ZONE", "dc1"),
-            capacity=int(env.get("GARAGE_CAPACITY_BYTES", str(10 * 1024**3))),
-            lakekeeper_url=env.get("LAKEKEEPER_URL", "http://lakekeeper:8181").rstrip("/"),
+            capacity=capacity,
+            lakekeeper_url=env.get(
+                "LAKEKEEPER_URL",
+                "http://lakekeeper:8181").rstrip("/"),
             warehouse=env.get("WAREHOUSE", "logthing"),
-            key_prefix=env.get("WAREHOUSE_KEY_PREFIX", "iceberg-warehouse"),
+            key_prefix=env.get(
+                "WAREHOUSE_KEY_PREFIX",
+                "iceberg-warehouse"),
             s3_endpoint=env.get("S3_ENDPOINT", "http://garage:3900"),
             region=env.get("S3_REGION", "garage"),
-            timeout=float(env.get("BOOTSTRAP_TIMEOUT_SECS", "300")),
-            retry=float(env.get("BOOTSTRAP_RETRY_SECS", "2")),
+            timeout=timeout,
+            retry=retry,
         )
 
 
 def http(method, url, token=None, body=None):
-    """Return (status, parsed JSON or None). Raises Transient on connection failure or 5xx."""
+    """Return (status, parsed JSON or None). Raises Transient on connection
+    failure or 5xx."""
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Content-Type", "application/json")
@@ -87,20 +102,26 @@ def http(method, url, token=None, body=None):
             status, raw = resp.status, resp.read()
     except urllib.error.HTTPError as e:
         status, raw = e.code, e.read()
-    except (urllib.error.URLError, OSError) as e:
+    except (urllib.error.URLError, OSError, HTTPException) as e:
         raise Transient(f"{method} {url}: {e}") from e
     try:
         parsed = json.loads(raw) if raw else None
     except ValueError:
         parsed = raw.decode(errors="replace")
+    parsed_str = str(parsed)
+    if len(parsed_str) > 500:
+        parsed_str = parsed_str[:500] + "..."
     if status >= 500:
-        raise Transient(f"{method} {url}: HTTP {status} {parsed}")
+        raise Transient(f"{method} {url}: HTTP {status} {parsed_str}")
     return status, parsed
 
 
 def expect(status, parsed, ok, what):
     if status not in ok:
-        raise Fatal(f"{what}: HTTP {status} {parsed}")
+        parsed_str = str(parsed)
+        if len(parsed_str) > 500:
+            parsed_str = parsed_str[:500] + "..."
+        raise Fatal(f"{what}: HTTP {status} {parsed_str}")
 
 
 def garage(cfg, method, path, body=None):
@@ -115,20 +136,35 @@ def garage_bootstrap(cfg):
     st, layout = garage(cfg, "GET", "/v2/GetClusterLayout")
     expect(st, layout, {200}, "GetClusterLayout")
     if not layout.get("roles"):
-        role = {"id": node_id, "zone": cfg.zone, "capacity": cfg.capacity, "tags": []}
-        st, r = garage(cfg, "POST", "/v2/UpdateClusterLayout", {"roles": [role]})
+        role = {
+            "id": node_id,
+            "zone": cfg.zone,
+            "capacity": cfg.capacity,
+            "tags": []
+        }
+        st, r = garage(cfg, "POST", "/v2/UpdateClusterLayout",
+                       {"roles": [role]})
         expect(st, r, {200}, "UpdateClusterLayout")
-        st, r = garage(cfg, "POST", "/v2/ApplyClusterLayout", {"version": layout["version"] + 1})
+        st, r = garage(cfg, "POST", "/v2/ApplyClusterLayout",
+                       {"version": layout["version"] + 1})
         expect(st, r, {200}, "ApplyClusterLayout")
 
-    key = {"name": "logthing", "accessKeyId": cfg.access_key, "secretAccessKey": cfg.secret_key}
+    key = {
+        "name": "logthing",
+        "accessKeyId": cfg.access_key,
+        "secretAccessKey": cfg.secret_key
+    }
     st, r = garage(cfg, "POST", "/v2/ImportKey", key)
     expect(st, r, {200, 409}, "ImportKey")
 
-    st, r = garage(cfg, "POST", "/v2/CreateBucket", {"globalAlias": cfg.bucket})
+    st, r = garage(cfg, "POST", "/v2/CreateBucket",
+                   {"globalAlias": cfg.bucket})
     expect(st, r, {200, 409}, "CreateBucket")
 
-    bucket_id = _bucket_info(cfg)["id"]
+    bucket_info = _bucket_info(cfg)
+    if not bucket_info:
+        raise Fatal("bucket not found after CreateBucket")
+    bucket_id = bucket_info["id"]
     grant = {
         "bucketId": bucket_id,
         "accessKeyId": cfg.access_key,
@@ -167,8 +203,12 @@ def _warehouses(cfg):
 def lakekeeper_bootstrap(cfg):
     st, r = http("POST", cfg.lakekeeper_url + "/management/v1/bootstrap",
                  body={"accept-terms-of-use": True})
-    # 400 on a catalog that is already bootstrapped.
-    expect(st, r, {200, 204, 400}, "Lakekeeper bootstrap")
+    # 400 on a catalog that is already bootstrapped; check error message.
+    if st == 400:
+        if "bootstrap" not in str(r).lower():
+            raise Fatal(f"Lakekeeper bootstrap: HTTP {st} {r}")
+    elif st not in (200, 204):
+        raise Fatal(f"Lakekeeper bootstrap: HTTP {st} {r}")
     if cfg.warehouse in _warehouses(cfg):
         return
     body = {
@@ -190,7 +230,10 @@ def lakekeeper_bootstrap(cfg):
             "secret-access-key": cfg.secret_key,
         },
     }
-    st, r = http("POST", cfg.lakekeeper_url + "/management/v1/warehouse", body=body)
+    st, r = http(
+        "POST",
+        cfg.lakekeeper_url + "/management/v1/warehouse",
+        body=body)
     expect(st, r, {200, 201, 409}, "create warehouse")
 
 
@@ -216,26 +259,49 @@ def with_retry(fn, cfg, what):
 def main(argv, env):
     command = "-".join(argv)
     actions = {
-        "garage": (garage_bootstrap, lambda c: f"garage at {c.garage_admin_url}"),
-        "lakekeeper": (lakekeeper_bootstrap, lambda c: f"lakekeeper at {c.lakekeeper_url}"),
-        "wait-garage": (garage_ready, lambda c: (
-            f"garage at {c.garage_admin_url}: bucket '{c.bucket}' writable by {c.access_key}")),
-        "wait-lakekeeper": (lakekeeper_ready, lambda c: (
-            f"lakekeeper at {c.lakekeeper_url}: warehouse '{c.warehouse}'")),
+        "garage": (
+            garage_bootstrap,
+            lambda c: f"garage at {c.garage_admin_url}"),
+        "lakekeeper": (
+            lakekeeper_bootstrap,
+            lambda c: f"lakekeeper at {c.lakekeeper_url}"),
+        "wait-garage": (
+            garage_ready,
+            lambda c: (
+                f"garage at {c.garage_admin_url}: bucket '{c.bucket}' "
+                f"writable by {c.access_key}")),
+        "wait-lakekeeper": (
+            lakekeeper_ready,
+            lambda c: (
+                f"lakekeeper at {c.lakekeeper_url}: "
+                f"warehouse '{c.warehouse}'")),
     }
     if command not in actions:
-        print("usage: bootstrap.py garage|lakekeeper|wait garage|wait lakekeeper", file=sys.stderr)
+        msg = ("usage: bootstrap.py garage|lakekeeper|wait garage|"
+               "wait lakekeeper")
+        print(msg, file=sys.stderr)
         return 2
     try:
         cfg = Config.from_env(env, command)
     except KeyError as e:
-        print(f"bootstrap: missing required environment variable(s): {e.args[0]}", file=sys.stderr)
+        print(
+            f"bootstrap: missing required environment variable(s): "
+            f"{e.args[0]}",
+            file=sys.stderr)
+        return 2
+    except ValueError as e:
+        print(f"bootstrap: {e}", file=sys.stderr)
         return 2
     fn, describe = actions[command]
     try:
         with_retry(fn, cfg, describe(cfg))
     except Fatal as e:
         print(f"bootstrap: {command}: {e}", file=sys.stderr)
+        return 1
+    except (KeyError, IndexError, TypeError) as e:
+        print(
+            f"bootstrap: {command}: unexpected response: {e}",
+            file=sys.stderr)
         return 1
     print(f"bootstrap: {command}: ok")
     return 0
