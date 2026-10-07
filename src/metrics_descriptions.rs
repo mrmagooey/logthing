@@ -405,6 +405,28 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
          already reached, labelled by source/stream/field — non-zero here means \
          field_distinct_values is undercounting the true cardinality.",
     ),
+    // ── spool ─────────────────────────────────────────────────────────────
+    (
+        Kind::Gauge,
+        "spool_bytes",
+        "Bytes (Parquet + descriptors) currently held in the durable S3 upload spool.",
+    ),
+    (
+        Kind::Gauge,
+        "spool_entries",
+        "Complete entries currently held in the durable S3 upload spool.",
+    ),
+    (
+        Kind::Counter,
+        "spool_rejected",
+        "Flushes the spool refused (reason=full|io); they fell back to a direct upload.",
+    ),
+    (
+        Kind::Counter,
+        "spool_corrupt",
+        "Spool entries quarantined to corrupt/ at startup (missing file, size or sha256 \
+         mismatch, unknown meta version).",
+    ),
 ];
 
 /// Register `# HELP` text for every metric the crate emits.

@@ -117,6 +117,10 @@ pub struct Config {
     #[serde(default)]
     pub iceberg: IcebergConfig,
 
+    /// Optional durable spool for S3 uploads (`[spool]`).
+    #[serde(default)]
+    pub spool: Option<SpoolConfig>,
+
     #[serde(default)]
     pub aggregate: AggregateConfig,
 }
@@ -1707,6 +1711,7 @@ impl Default for Config {
             hec: HecConfig::default(),
             otlp: OtlpConfig::default(),
             iceberg: IcebergConfig::default(),
+            spool: None,
             aggregate: AggregateConfig::default(),
         }
     }
@@ -1948,6 +1953,21 @@ fn stale_admin_override_warning(dir: &Path) -> Option<String> {
 ///
 /// Also rejects an enabled `[hec]`/`[otlp]` section with no sink (records would be silently
 /// dropped) and `otlp.max_service_partitions = 0`.
+/// Global durable spool for S3 uploads (`[spool]`). See `docs/delivery-semantics.md`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct SpoolConfig {
+    /// Directory holding spooled Parquet files and descriptors (created if missing).
+    pub dir: PathBuf,
+    /// Upper bound on spooled bytes (Parquet + descriptors); beyond it flushes fall back to
+    /// the in-memory retry path. Default 1 GiB.
+    #[serde(default = "default_spool_max_bytes")]
+    pub max_bytes: u64,
+}
+
+fn default_spool_max_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+
 pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
     let mut errors: Vec<String> = Vec::new();
 
@@ -1976,6 +1996,15 @@ pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
 
     if let Err(err) = crate::middleware::parse_allowed_ips(&cfg.security.allowed_ips) {
         errors.push(format!("security.allowed_ips: {err}"));
+    }
+
+    if let Some(spool) = &cfg.spool {
+        if spool.dir.as_os_str().is_empty() {
+            errors.push("spool.dir must not be empty".to_string());
+        }
+        if spool.max_bytes == 0 {
+            errors.push("spool.max_bytes must be greater than 0".to_string());
+        }
     }
 
     // HEC/OTLP accept data over HTTP and answer 200; with no sink every record would be
@@ -2597,6 +2626,29 @@ max_buffer_rows = 50000
 
         let err = validate_config_invariants(&cfg).expect_err("must reject");
         assert!(err.contains("bind_address port cannot be 0"), "got: {err}");
+    }
+
+    #[test]
+    fn spool_section_parses_with_default_max_bytes() {
+        let cfg: Config = toml::from_str("[spool]\ndir = \"/var/spool/lt\"\n").unwrap();
+        let spool = cfg.spool.expect("spool section");
+        assert_eq!(spool.dir, PathBuf::from("/var/spool/lt"));
+        assert_eq!(spool.max_bytes, 1024 * 1024 * 1024);
+        assert!(Config::default().spool.is_none());
+    }
+
+    #[test]
+    fn validate_config_invariants_rejects_spool_zero_max_bytes() {
+        let cfg: Config = toml::from_str("[spool]\ndir = \"/x\"\nmax_bytes = 0\n").unwrap();
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert!(err.contains("spool.max_bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_config_invariants_rejects_empty_spool_dir() {
+        let cfg: Config = toml::from_str("[spool]\ndir = \"\"\n").unwrap();
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert!(err.contains("spool.dir"), "got: {err}");
     }
 
     #[test]
