@@ -125,7 +125,9 @@ impl UploadSink for LocalDiskSink {
         }
         // Persist the rename itself: without a directory fsync a crash can lose the entry
         // even though the file's bytes were synced.
-        tokio::fs::File::open(parent).await?.sync_all().await?;
+        // The file is already visible under its final key, so a failure here must NOT surface
+        // as an upload error: the writer would retry and write a duplicate under a new key.
+        persist_dir_entry(parent, key).await;
         Ok(())
     }
 
@@ -135,6 +137,19 @@ impl UploadSink for LocalDiskSink {
 
     fn location_hint(&self) -> String {
         format!("file://{}", self.root.display())
+    }
+}
+
+/// Fsync `dir` so a just-completed rename survives a crash. Failure is logged and counted
+/// (`local_sink_dir_fsync_errors`), never returned: the rename already happened.
+async fn persist_dir_entry(dir: &Path, key: &str) {
+    let result = async { tokio::fs::File::open(dir).await?.sync_all().await }.await;
+    if let Err(e) = result {
+        tracing::warn!(
+            "LocalDiskSink: directory fsync failed after renaming {key:?} into place \
+             (file is written; durability across a crash is not guaranteed): {e}"
+        );
+        metrics::counter!("local_sink_dir_fsync_errors").increment(1);
     }
 }
 
@@ -231,6 +246,35 @@ mod tests {
             "temp file leaked: {names:?}"
         );
         assert!(dir.path().join("d/x.parquet").is_dir());
+    }
+
+    /// A directory-fsync failure after the rename must be logged and counted, not returned:
+    /// returning Err would make the writer retry and duplicate the object under a new key.
+    #[tokio::test]
+    async fn dir_fsync_failure_after_rename_is_counted_not_returned() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let dir = tempfile::tempdir().unwrap();
+        // Opening a directory that does not exist makes the fsync step fail for real.
+        persist_dir_entry(&dir.path().join("missing"), "k/x.parquet").await;
+        let counted = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(k, ..)| k.key().name() == "local_sink_dir_fsync_errors")
+            .map(|(_, _, _, v)| v);
+        assert_eq!(counted, Some(DebugValue::Counter(1)));
+        // The success path leaves the counter untouched.
+        persist_dir_entry(dir.path(), "k/x.parquet").await;
+        let again = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(k, ..)| k.key().name() == "local_sink_dir_fsync_errors")
+            .map(|(_, _, _, v)| v);
+        assert_eq!(again, Some(DebugValue::Counter(1)));
     }
 
     #[tokio::test]

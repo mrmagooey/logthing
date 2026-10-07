@@ -12,6 +12,7 @@ pub struct S3Sink {
     client: S3Client,
     pub bucket: String,
     pub endpoint: String,
+    object_lock: Option<(crate::config::ObjectLockMode, u32)>,
 }
 
 impl S3Sink {
@@ -49,15 +50,17 @@ impl S3Sink {
 
         let client = S3Client::from_conf(s3_config);
 
+        let object_lock = cfg.object_lock_mode.zip(cfg.object_lock_retain_days);
         info!(
-            "S3Sink initialized: bucket={}, endpoint={}",
-            cfg.bucket, cfg.endpoint
+            "S3Sink initialized: bucket={}, endpoint={}, object_lock={:?}",
+            cfg.bucket, cfg.endpoint, object_lock
         );
 
         Ok(Self {
             client,
             bucket: cfg.bucket.clone(),
             endpoint: cfg.endpoint.clone(),
+            object_lock,
         })
     }
 
@@ -91,24 +94,71 @@ impl S3Sink {
         Ok(bytes)
     }
 
+    /// Configured Object Lock `(mode, retain_days)`, if any.
+    pub fn object_lock(&self) -> Option<(crate::config::ObjectLockMode, u32)> {
+        self.object_lock
+    }
+
+    /// Build the PutObject request. With Object Lock configured it also sets the lock mode,
+    /// retain-until date (`now` + days) and a SHA-256 integrity checksum (S3 requires an
+    /// integrity checksum on Object Lock puts).
+    pub(crate) fn build_put(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        now: std::time::SystemTime,
+    ) -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder {
+        use aws_sdk_s3::types::{ChecksumAlgorithm, ObjectLockMode as Sdk};
+        let mut req = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(body))
+            .content_type("application/octet-stream");
+        if let Some((mode, days)) = self.object_lock {
+            let until = now + std::time::Duration::from_secs(u64::from(days) * 86_400);
+            req = req
+                .object_lock_mode(match mode {
+                    crate::config::ObjectLockMode::Governance => Sdk::Governance,
+                    crate::config::ObjectLockMode::Compliance => Sdk::Compliance,
+                })
+                .object_lock_retain_until_date(aws_sdk_s3::primitives::DateTime::from(until))
+                .checksum_algorithm(ChecksumAlgorithm::Sha256);
+        }
+        req
+    }
+
     /// Upload `body` bytes to `key` in the configured bucket.
     /// Mirrors the put_object logic currently in ParquetS3Forwarder::upload_to_s3,
     /// minus the key-generation and file-read (those remain in the caller).
     pub async fn upload(&self, key: &str, body: Vec<u8>) -> Result<()> {
-        let byte_stream = ByteStream::from(body);
-
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(byte_stream)
-            .content_type("application/octet-stream")
+        self.build_put(key, body, std::time::SystemTime::now())
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("S3 put_object failed for key {}: {}", key, e))?;
+            .map_err(|e| {
+                anyhow::anyhow!(lock_hint_error(
+                    key,
+                    &e.to_string(),
+                    self.object_lock.is_some()
+                ))
+            })?;
 
         info!("Uploaded to S3: s3://{}/{}", self.bucket, key);
         Ok(())
+    }
+}
+
+/// Format a put_object failure, adding an Object Lock hint when a lock is configured.
+fn lock_hint_error(key: &str, cause: &str, lock_configured: bool) -> String {
+    let base = format!("S3 put_object failed for key {key}: {cause}");
+    if lock_configured {
+        format!(
+            "{base} (Object Lock is configured: the bucket must have Object Lock enabled and \
+             the endpoint must support it; Garage does not -- see docs/object-lock.md)"
+        )
+    } else {
+        base
     }
 }
 
@@ -183,6 +233,8 @@ mod tests {
             region: "us-east-1".to_string(),
             access_key: "AKIATEST".to_string(),
             secret_key: "SECRETTEST".to_string(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         };
         let sink = S3Sink::from_connection(&conn).await.expect("constructs");
         let result = sink.upload("some/key.parquet", b"hello".to_vec()).await;
@@ -199,6 +251,8 @@ mod tests {
             region: "us-east-1".to_string(),
             access_key: "AKIATEST".to_string(),
             secret_key: "SECRETTEST".to_string(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         };
         let sink: std::sync::Arc<dyn UploadSink> =
             std::sync::Arc::new(S3Sink::from_connection(&conn).await.expect("constructs"));
@@ -223,6 +277,8 @@ mod tests {
             region: "us-east-1".to_string(),
             access_key: "K".to_string(),
             secret_key: "S".to_string(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         })
         .await
         .unwrap();
@@ -230,5 +286,96 @@ mod tests {
             crate::forwarding::buffered_writer::UploadSink::location_hint(&sink),
             "http://minio:9000/my-bucket"
         );
+    }
+
+    fn conn(mode: Option<crate::config::ObjectLockMode>, days: Option<u32>) -> S3ConnectionConfig {
+        S3ConnectionConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key: "AKIATEST".to_string(),
+            secret_key: "SECRETTEST".to_string(),
+            object_lock_mode: mode,
+            object_lock_retain_days: days,
+        }
+    }
+
+    #[tokio::test]
+    async fn build_put_without_lock_sets_no_lock_or_checksum_params() {
+        let sink = S3Sink::from_connection(&conn(None, None)).await.unwrap();
+        assert_eq!(sink.object_lock(), None);
+        let req = sink.build_put("k", vec![1], std::time::SystemTime::UNIX_EPOCH);
+        let input = req.as_input();
+        assert!(input.get_object_lock_mode().is_none());
+        assert!(input.get_object_lock_retain_until_date().is_none());
+        assert!(input.get_checksum_algorithm().is_none());
+        assert_eq!(input.get_key().as_deref(), Some("k"));
+        assert_eq!(input.get_bucket().as_deref(), Some("test-bucket"));
+    }
+
+    #[tokio::test]
+    async fn build_put_with_lock_sets_mode_retain_until_and_sha256_checksum() {
+        use aws_sdk_s3::types::{ChecksumAlgorithm, ObjectLockMode as Sdk};
+        let sink = S3Sink::from_connection(&conn(
+            Some(crate::config::ObjectLockMode::Compliance),
+            Some(30),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            sink.object_lock(),
+            Some((crate::config::ObjectLockMode::Compliance, 30))
+        );
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let req = sink.build_put("k", vec![1], now);
+        let input = req.as_input();
+        assert_eq!(input.get_object_lock_mode(), &Some(Sdk::Compliance));
+        assert_eq!(
+            input.get_checksum_algorithm(),
+            &Some(ChecksumAlgorithm::Sha256)
+        );
+        let until = input.get_object_lock_retain_until_date().as_ref().unwrap();
+        assert_eq!(until.secs(), 1_000 + 30 * 86_400);
+    }
+
+    #[tokio::test]
+    async fn build_put_maps_governance_mode() {
+        use aws_sdk_s3::types::ObjectLockMode as Sdk;
+        let sink = S3Sink::from_connection(&conn(
+            Some(crate::config::ObjectLockMode::Governance),
+            Some(1),
+        ))
+        .await
+        .unwrap();
+        let req = sink.build_put("k", vec![], std::time::SystemTime::UNIX_EPOCH);
+        assert_eq!(
+            req.as_input().get_object_lock_mode(),
+            &Some(Sdk::Governance)
+        );
+    }
+
+    #[test]
+    fn upload_error_message_names_object_lock_when_configured() {
+        let msg = lock_hint_error("k", "boom", true);
+        assert!(
+            msg.contains("Object Lock") && msg.contains("boom") && msg.contains("k"),
+            "{msg}"
+        );
+        assert!(!lock_hint_error("k", "boom", false).contains("Object Lock"));
+    }
+
+    #[tokio::test]
+    async fn upload_failure_with_lock_configured_carries_the_object_lock_hint() {
+        let sink = S3Sink::from_connection(&conn(
+            Some(crate::config::ObjectLockMode::Governance),
+            Some(1),
+        ))
+        .await
+        .unwrap();
+        let err = sink.upload("some/key", b"x".to_vec()).await.unwrap_err();
+        assert!(err.to_string().contains("Object Lock"), "{err}");
+        let plain = S3Sink::from_connection(&conn(None, None)).await.unwrap();
+        let err = plain.upload("some/key", b"x".to_vec()).await.unwrap_err();
+        assert!(!err.to_string().contains("Object Lock"), "{err}");
     }
 }

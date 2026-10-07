@@ -146,7 +146,7 @@ sufficient to physically remove the superseded files.
 
 If the bucket uses S3 Object Lock, locked objects cannot be deleted until their retention ends,
 so a locked bucket conflicts with erasure for as long as the lock lasts. Choose the lock
-period with that in mind.
+period with that in mind. See [object-lock.md](object-lock.md).
 
 ## Metrics
 

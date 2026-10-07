@@ -50,6 +50,8 @@ Parquet persistence (labelled `source="wef"|"syslog"|"ipfix"|"zeek"|"suricata"|"
 
 - `parquet_s3_records_written`, `parquet_s3_uploads`, `parquet_s3_upload_errors`
 - `parquet_s3_dropped`, `parquet_s3_buffer_dropped` - backpressure drops
+- `local_sink_dir_fsync_errors` - the local-disk sink wrote and renamed a file but the
+  directory fsync failed (the file is present; crash durability is not guaranteed)
 - `parquet_s3_records_skipped` - a record the writer could not convert into a
   batch (schema mismatch, a mapping failure, or an unparsed event), also
   labelled `target`

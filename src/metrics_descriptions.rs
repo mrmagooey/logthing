@@ -306,6 +306,11 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     ),
     (
         Kind::Counter,
+        "local_sink_dir_fsync_errors",
+        "Local-disk sink directory fsyncs that failed after the file was renamed into place.",
+    ),
+    (
+        Kind::Counter,
         "parquet_s3_upload_errors",
         "Parquet object uploads that returned an error.",
     ),

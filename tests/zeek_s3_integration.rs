@@ -29,6 +29,8 @@ fn minio_zeek_config(endpoint: &str) -> ZeekS3Config {
                 .unwrap_or_else(|_| "minioadmin".to_string()),
             secret_key: std::env::var("MINIO_SECRET_KEY")
                 .unwrap_or_else(|_| "minioadmin".to_string()),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         },
         prefix: "zeek".to_string(),
         max_buffer_rows: 1, // flush immediately on first record

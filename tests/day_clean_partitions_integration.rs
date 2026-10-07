@@ -408,6 +408,8 @@ async fn failed_flush_for_one_day_retries_into_that_same_day_not_elsewhere() {
             region: String::new(),
             access_key: String::new(),
             secret_key: String::new(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         },
         prefix: "zeek".to_string(),
         max_buffer_rows: 1,

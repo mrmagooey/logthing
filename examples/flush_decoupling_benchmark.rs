@@ -230,6 +230,8 @@ async fn main() -> anyhow::Result<()> {
             region: String::new(),
             access_key: String::new(),
             secret_key: String::new(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         },
         prefix: "zeek".to_string(),
         max_buffer_rows: cfg.max_buffer_rows,

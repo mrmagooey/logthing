@@ -13,6 +13,25 @@ pub struct S3ConnectionConfig {
     pub region: String,
     pub access_key: String,
     pub secret_key: String,
+    /// S3 Object Lock retention mode applied to every uploaded object. Requires
+    /// `object_lock_retain_days`. The bucket must have Object Lock enabled; startup does not
+    /// probe (a mismatch surfaces as upload errors). See `docs/object-lock.md`.
+    #[serde(default)]
+    pub object_lock_mode: Option<ObjectLockMode>,
+    /// Retention period in days (1..=36500) for `object_lock_mode`.
+    #[serde(default)]
+    pub object_lock_retain_days: Option<u32>,
+}
+
+/// S3 Object Lock retention mode (`object_lock_mode`). Only the two S3 values are accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum ObjectLockMode {
+    /// Retention can be bypassed by principals with `s3:BypassGovernanceRetention`.
+    #[serde(rename = "GOVERNANCE")]
+    Governance,
+    /// Retention cannot be shortened or removed by anyone until it expires.
+    #[serde(rename = "COMPLIANCE")]
+    Compliance,
 }
 
 /// Manual Debug impl for S3ConnectionConfig that masks secret fields so they
@@ -25,6 +44,8 @@ impl std::fmt::Debug for S3ConnectionConfig {
             .field("region", &self.region)
             .field("access_key", &"<redacted>")
             .field("secret_key", &"<redacted>")
+            .field("object_lock_mode", &self.object_lock_mode)
+            .field("object_lock_retain_days", &self.object_lock_retain_days)
             .finish()
     }
 }
@@ -1784,6 +1805,46 @@ fn default_syslog_recv_batch_size() -> usize {
 }
 
 impl Config {
+    /// Every configured shared S3 connection, labelled by its TOML section
+    /// (e.g. `"hec.s3"`), for cross-cutting validation.
+    pub fn s3_connections(&self) -> Vec<(&'static str, &S3ConnectionConfig)> {
+        let mut v: Vec<(&'static str, &S3ConnectionConfig)> = Vec::new();
+        if let Some(s) = &self.syslog.s3 {
+            v.push(("syslog.s3", &s.connection));
+        }
+        if let Some(s) = &self.syslog.structured_s3 {
+            v.push(("syslog.structured_s3", &s.connection));
+        }
+        if let Some(s) = &self.ipfix.s3 {
+            v.push(("ipfix.s3", &s.connection));
+        }
+        if let Some(s) = &self.zeek.s3 {
+            v.push(("zeek.s3", &s.connection));
+        }
+        if let Some(s) = &self.suricata.s3 {
+            v.push(("suricata.s3", &s.connection));
+        }
+        if let Some(s) = &self.wef.s3 {
+            v.push(("wef.s3", &s.connection));
+        }
+        if let Some(s) = &self.hec.s3 {
+            v.push(("hec.s3", &s.connection));
+        }
+        if let Some(s) = &self.otlp.s3 {
+            v.push(("otlp.s3", &s.connection));
+        }
+        if let Some(s) = &self.sflow.s3 {
+            v.push(("sflow.s3", &s.connection));
+        }
+        if let Some(s) = &self.aggregate.s3 {
+            v.push(("aggregate.s3", &s.connection));
+        }
+        if let Some(s) = &self.iceberg.s3 {
+            v.push(("iceberg.s3", &s.connection));
+        }
+        v
+    }
+
     /// Load configuration from files and environment variables.
     ///
     /// Configuration is loaded from the following sources (in order of precedence):
@@ -1937,6 +1998,21 @@ pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
         )
     {
         errors.push(format!("{e:#}"));
+    }
+
+    for (name, conn) in cfg.s3_connections() {
+        match (conn.object_lock_mode, conn.object_lock_retain_days) {
+            (Some(_), None) => errors.push(format!(
+                "{name}: object_lock_mode requires object_lock_retain_days"
+            )),
+            (None, Some(_)) => errors.push(format!(
+                "{name}: object_lock_retain_days requires object_lock_mode (GOVERNANCE or COMPLIANCE)"
+            )),
+            (Some(_), Some(d)) if d == 0 || d > 36_500 => errors.push(format!(
+                "{name}: object_lock_retain_days must be between 1 and 36500, got {d}"
+            )),
+            _ => {}
+        }
     }
 
     if errors.is_empty() {
@@ -2501,6 +2577,10 @@ max_buffer_rows = 50000
 
     #[test]
     fn env_vars_override_bind_ports_for_all_log_types() {
+        // Serialise with the other env-var-driven load tests (they set LOGTHING__* too).
+        let _guard = CONFIG_FILE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // `LOGTHING__<SECTION>__<FIELD>` env vars are process-global, and cargo
         // runs unit tests in this file's binary on multiple threads by
         // default. No other test in this file (or reachable from this test
@@ -2737,6 +2817,8 @@ directory = "/data/suricata"
             region: "us-east-1".to_string(),
             access_key: "SUPERSECRETKEY".to_string(),
             secret_key: "TOPSECRETPASSWORD".to_string(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         };
         let debug_str = format!("{:?}", cfg);
         assert!(
@@ -3093,6 +3175,8 @@ prefix    = "_iceberg_descriptors"
                     region: "us-east-1".to_string(),
                     access_key: "k".to_string(),
                     secret_key: "s".to_string(),
+                    object_lock_mode: None,
+                    object_lock_retain_days: None,
                 },
                 prefix: String::new(),
             }),
@@ -3116,6 +3200,8 @@ prefix    = "_iceberg_descriptors"
                     region: "us-east-1".to_string(),
                     access_key: "k".to_string(),
                     secret_key: "s".to_string(),
+                    object_lock_mode: None,
+                    object_lock_retain_days: None,
                 },
                 prefix: String::new(),
             }),
@@ -3198,6 +3284,9 @@ prefix    = "_iceberg_descriptors"
 
     #[test]
     fn env_vars_override_iceberg_s3_config() {
+        let _guard = CONFIG_FILE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let vars: &[(&str, &str)] = &[
             ("LOGTHING__ICEBERG__S3__ENDPOINT", "http://minio-test:9000"),
             ("LOGTHING__ICEBERG__S3__BUCKET", "env-override-bucket"),
@@ -3666,5 +3755,137 @@ directory = "/tmp/otlp"
         assert_eq!(cfg.otlp.bearer_token.as_deref(), Some("change-me"));
         assert_eq!(cfg.otlp.max_service_partitions, 64);
         validate_config_invariants(&cfg).expect("uncommented example validates");
+    }
+
+    fn hec_s3_toml(extra: &str) -> String {
+        format!(
+            "[hec.s3]\nendpoint=\"http://x\"\nbucket=\"b\"\nregion=\"r\"\n\
+             access_key=\"a\"\nsecret_key=\"s\"\n{extra}"
+        )
+    }
+
+    fn hec_s3_cfg(extra: &str) -> Config {
+        let mut cfg: Config = toml::from_str(&hec_s3_toml(extra)).unwrap();
+        cfg.tls.enabled = false;
+        cfg
+    }
+
+    #[test]
+    fn object_lock_mode_rejects_unknown_string_at_parse_time() {
+        assert!(toml::from_str::<Config>(&hec_s3_toml("object_lock_mode=\"WORM\"\n")).is_err());
+        assert!(
+            toml::from_str::<Config>(&hec_s3_toml("object_lock_mode=\"governance\"\n")).is_err()
+        );
+    }
+
+    #[test]
+    fn object_lock_settings_parse_from_flattened_toml() {
+        let cfg = hec_s3_cfg("object_lock_mode=\"COMPLIANCE\"\nobject_lock_retain_days=30\n");
+        let c = &cfg.hec.s3.as_ref().unwrap().connection;
+        assert_eq!(c.object_lock_mode, Some(ObjectLockMode::Compliance));
+        assert_eq!(c.object_lock_retain_days, Some(30));
+        assert_eq!(validate_config_invariants(&cfg), Ok(()));
+        let c = &hec_s3_cfg("").hec.s3.unwrap().connection;
+        assert_eq!(
+            (c.object_lock_mode, c.object_lock_retain_days),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn validate_config_invariants_rejects_object_lock_mode_without_days_and_zero_days() {
+        let mut cfg = hec_s3_cfg("object_lock_mode=\"GOVERNANCE\"\n");
+        let err = validate_config_invariants(&cfg).expect_err("mode without days");
+        assert!(
+            err.contains("hec.s3") && err.contains("object_lock_retain_days"),
+            "{err}"
+        );
+        cfg.hec
+            .s3
+            .as_mut()
+            .unwrap()
+            .connection
+            .object_lock_retain_days = Some(0);
+        assert!(validate_config_invariants(&cfg).is_err());
+        cfg.hec
+            .s3
+            .as_mut()
+            .unwrap()
+            .connection
+            .object_lock_retain_days = Some(36_501);
+        assert!(validate_config_invariants(&cfg).is_err());
+        cfg.hec
+            .s3
+            .as_mut()
+            .unwrap()
+            .connection
+            .object_lock_retain_days = Some(36_500);
+        assert_eq!(validate_config_invariants(&cfg), Ok(()));
+        cfg.hec
+            .s3
+            .as_mut()
+            .unwrap()
+            .connection
+            .object_lock_retain_days = Some(30);
+        assert_eq!(validate_config_invariants(&cfg), Ok(()));
+    }
+
+    #[test]
+    fn validate_config_invariants_rejects_days_without_mode() {
+        let cfg = hec_s3_cfg("object_lock_retain_days=7\n");
+        let err = validate_config_invariants(&cfg).expect_err("days without mode");
+        assert!(
+            err.contains("hec.s3") && err.contains("object_lock_mode"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn s3_connections_lists_every_configured_section_by_name() {
+        let mut cfg = hec_s3_cfg("");
+        cfg.syslog.s3 = Some(
+            toml::from_str::<SyslogS3Config>(
+                "endpoint=\"e\"\nbucket=\"b\"\nregion=\"r\"\naccess_key=\"a\"\nsecret_key=\"s\"\n",
+            )
+            .unwrap(),
+        );
+        let names: Vec<&str> = cfg.s3_connections().iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["syslog.s3", "hec.s3"]);
+        assert!(Config::default().s3_connections().is_empty());
+    }
+
+    #[test]
+    fn env_vars_cannot_set_object_lock_retain_days_through_flattened_s3_config() {
+        // serde's `flatten` buffers env strings, so the numeric `object_lock_retain_days`
+        // cannot come from `LOGTHING__HEC__S3__OBJECT_LOCK_RETAIN_DAYS`: object lock is
+        // TOML-only (documented in docs/object-lock.md). It must fail loudly at startup, not
+        // be silently ignored. Env vars are process-global; hold the shared config lock (Config::load also reads
+        // logthing.toml from the cwd) and always clean up, even on a failed assertion.
+        let _guard = CONFIG_FILE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let vars: &[(&str, &str)] = &[
+            ("LOGTHING__HEC__ENABLED", "true"),
+            ("LOGTHING__HEC__S3__ENDPOINT", "http://x"),
+            ("LOGTHING__HEC__S3__BUCKET", "b"),
+            ("LOGTHING__HEC__S3__REGION", "r"),
+            ("LOGTHING__HEC__S3__ACCESS_KEY", "a"),
+            ("LOGTHING__HEC__S3__SECRET_KEY", "s"),
+            ("LOGTHING__HEC__S3__OBJECT_LOCK_MODE", "COMPLIANCE"),
+            ("LOGTHING__HEC__S3__OBJECT_LOCK_RETAIN_DAYS", "45"),
+        ];
+        for (k, v) in vars {
+            unsafe { std::env::set_var(k, v) };
+        }
+        let result = std::panic::catch_unwind(|| {
+            let err = Config::load().expect_err("numeric env override must not be ignored");
+            assert!(format!("{err:#}").contains("45"), "{err:#}");
+        });
+        for (k, _) in vars {
+            unsafe { std::env::remove_var(k) };
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 }

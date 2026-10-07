@@ -89,6 +89,21 @@ syslog's bind address is fixed at `0.0.0.0` and has no such override.
 table. Environment overrides are validated the same way: `LOGTHING__HEC__ENABLED=true` with no
 HEC sink configured also fails startup. See [hec.md](hec.md) and [otlp.md](otlp.md).
 
+## Shared S3 connection keys
+
+Every `[<source>.s3]` table (syslog, ipfix, zeek, suricata, wef, hec, otlp, sflow, aggregate,
+iceberg) shares these keys:
+
+| Key | Meaning |
+|-----|---------|
+| `endpoint`, `bucket`, `region` | Target object store |
+| `access_key`, `secret_key` | Credentials (masked in the admin API) |
+| `object_lock_mode` | Optional `"GOVERNANCE"` or `"COMPLIANCE"`; any other string fails startup |
+| `object_lock_retain_days` | Retention in days (1-36500); required with, and only valid with, `object_lock_mode` |
+
+The Object Lock keys are TOML-only (serde cannot read the numeric value from an environment
+variable through the flattened table). See [object-lock.md](object-lock.md).
+
 ## Redaction
 
 `[hec.redaction]` and `[otlp.redaction]` drop, HMAC-hash or mask values before records are

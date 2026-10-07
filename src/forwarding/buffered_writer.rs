@@ -403,6 +403,8 @@ pub(crate) fn unused_s3_connection_placeholder() -> crate::config::S3ConnectionC
         region: String::new(),
         access_key: String::new(),
         secret_key: String::new(),
+        object_lock_mode: None,
+        object_lock_retain_days: None,
     }
 }
 
@@ -3328,6 +3330,8 @@ max_partitions = 128
                 region: "us-east-1".to_string(),
                 access_key: "K".to_string(),
                 secret_key: "S".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             })
             .await
             .unwrap(),
@@ -3343,6 +3347,8 @@ max_partitions = 128
                 region: "us-east-1".to_string(),
                 access_key: "K".to_string(),
                 secret_key: "S".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "test".to_string(),
             max_buffer_rows: max_rows,

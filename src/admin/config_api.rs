@@ -31,6 +31,8 @@ fn redact_s3_connection(conn: &S3ConnectionConfig) -> S3ConnectionConfig {
         region: conn.region.clone(),
         access_key: REDACTED.to_string(),
         secret_key: REDACTED.to_string(),
+        object_lock_mode: conn.object_lock_mode,
+        object_lock_retain_days: conn.object_lock_retain_days,
     }
 }
 
@@ -137,6 +139,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "REAL_ACCESS_KEY".to_string(),
                 secret_key: "REAL_SECRET_KEY".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "syslog".to_string(),
             max_buffer_rows: 10_000,
@@ -358,5 +362,24 @@ mod tests {
                 "{leaked} leaked in TOML: {toml_str}"
             );
         }
+    }
+
+    #[test]
+    fn redacted_config_preserves_object_lock_settings() {
+        use crate::config::{HecS3Config, ObjectLockMode};
+        let mut cfg = Config::default();
+        let mut s3: HecS3Config = toml::from_str(
+            "endpoint=\"http://m\"\nbucket=\"b\"\nregion=\"r\"\n\
+             access_key=\"REAL_AK\"\nsecret_key=\"REAL_SK\"\n",
+        )
+        .unwrap();
+        s3.connection.object_lock_mode = Some(ObjectLockMode::Governance);
+        s3.connection.object_lock_retain_days = Some(365);
+        cfg.hec.s3 = Some(s3);
+        let c = redacted_config(&cfg).hec.s3.unwrap().connection;
+        assert_eq!(c.object_lock_mode, Some(ObjectLockMode::Governance));
+        assert_eq!(c.object_lock_retain_days, Some(365));
+        assert_eq!(c.access_key, REDACTED);
+        assert_eq!(c.secret_key, REDACTED);
     }
 }
