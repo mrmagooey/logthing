@@ -105,7 +105,7 @@ app_logs_landed() {
 assert_app_log_rows() {
   local w
   w=$(_otlp_where)
-  [ "$(sql "SELECT count(*) FROM iceberg.logs.otlp WHERE $w AND severity_number = 9 AND event_uuid IS NOT NULL AND \"time\" IS NOT NULL AND host_name = 'e2ehost' AND json_extract_scalar(attributes, '\$.\"http.route\"') = '/e2e'")" = "$N" ] \
+  [ "$(sql "SELECT count(*) FROM iceberg.logs.otlp WHERE $w AND severity_number = 9 AND event_uuid IS NOT NULL AND \"time\" IS NOT NULL AND host_name = 'e2ehost' AND json_extract_scalar(attributes, '\$[\"http.route\"]') = '/e2e'")" = "$N" ] \
     || { fail "otlp rows missing typed values (service/severity/time/host/attributes)"; return 1; }
   [ "$(sql "SELECT count(distinct event_uuid) FROM iceberg.logs.otlp WHERE $w")" = "$N" ] \
     || { fail "otlp event_uuid not unique"; return 1; }

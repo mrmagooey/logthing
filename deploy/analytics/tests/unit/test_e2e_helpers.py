@@ -310,6 +310,7 @@ def _fake_sql(otlp_count):
     N=5; MARKER=MK
     fail() {{ echo "FAIL: $*" >&2; return 1; }}
     sql() {{ case "$1" in
+      *'$."'*) echo "Invalid JSON path (Trino rejects \$.\"key\")" >&2; return 1;;
       *typeof*) echo "integer/timestamp(6) with time zone";;
       *"count(distinct event_uuid) FROM iceberg.logs.otlp"*) echo {otlp_count};;
       *"count(distinct event_uuid) FROM iceberg.logs.hec"*) echo 5;;
