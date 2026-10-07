@@ -19,7 +19,7 @@ LOGTHING_ADMIN_BIND=0.0.0.0:8443
 ```
 
 Binding to a non-loopback address while the username and password are both the default
-`admin`/`admin` is refused: the admin server fails to start with an error. Set
+`admin`/`admin` is refused: the admin server does not start (logged as an error); the data-plane server keeps running. Set
 `LOGTHING_ADMIN_USER`/`LOGTHING_ADMIN_PASS` (or `LOGTHING_ADMIN_PASS_HASH`) first.
 
 ### 2. HTTPS/TLS Support
@@ -214,7 +214,7 @@ take effect. See the CHANGELOG for the breaking-change details.
 1. **Always use TLS in production** - Set `LOGTHING_ADMIN_TLS_CERT` and `LOGTHING_ADMIN_TLS_KEY`
 2. **Configure IP whitelist** - Restrict access to known admin IPs with `LOGTHING_ADMIN_ALLOWED_IPS`
 3. **Use hashed passwords** - Generate a pre-hashed password with Argon2 for production
-4. **Change default credentials** - The default `admin/admin` is accepted only on a loopback bind; a non-loopback bind with default credentials refuses to start
+4. **Change default credentials** - The default `admin/admin` is accepted only on a loopback bind; a non-loopback bind with default credentials stops the admin server from starting (the data-plane server keeps running)
 5. **Monitor audit logs** - Regularly review the audit log for suspicious activity
 6. **Use a non-default port** - Consider using a non-standard port to reduce automated scans
 

@@ -113,10 +113,13 @@ Run ONE committer per catalog. The committer is not tied to any logthing instanc
 descriptors from the bucket, so one committer serves all instances that share it. Concurrent
 committers are safe but wasteful: each run skips files the table already references (and moves
 their descriptors to the done prefix), and if another committer registers a file between its
-check and its commit, it reloads the table, re-checks and finishes the rest once; commit
-conflicts are retried up to 5 times with backoff, after which the run aborts with the remaining
-descriptors still queued for the next run ([committer/README.md](../committer/README.md)). The
-cost is duplicated listing and footer reads and extra catalog commits, not duplicated rows.
+check and its commit (`add_files` reports the file as already referenced), it reloads the
+table, re-checks and finishes the rest once. A catalog commit conflict (`CommitFailedException`)
+on the append itself is not retried: the run aborts with the remaining descriptors still queued
+and the next run picks them up. Only schema-evolution commits are retried (up to 5 times with
+backoff, then the file is quarantined or the run aborts) ([committer/README.md](../committer/README.md)).
+The cost is duplicated listing and footer reads, aborted runs and extra catalog commits, not
+duplicated rows.
 See [iceberg.md](iceberg.md).
 
 ## Health checks and draining
@@ -124,8 +127,8 @@ See [iceberg.md](iceberg.md).
 - **Liveness.** `GET /health` on the main server returns 200. It sits behind the same
   `security.allowed_ips` check as everything else, so if you set an allowlist, include the
   balancer's address. `GET /metrics` on the metrics port (9090 by default) is also available
-  but is gated by `allowed_ips` too and binds the main server's interface unless
-  `metrics.bind_address` is set.
+  but is gated by `allowed_ips` too and binds the interface (IP) of the main `bind_address`
+  unless `metrics.bind_address` is set.
 - **Shutdown.** On `SIGTERM` or Ctrl-C logthing stops accepting, flushes every writer buffer
   (the writer deadline is 10 s) and exits. With `[spool]` the final flush lands in the spool.
   Zeek and Suricata connections keep a sender alive, so if a sensor is still connected at

@@ -146,9 +146,9 @@ Zeek and Suricata:
 Parquet and Iceberg descriptors:
 
 - `parquet_s3_flushes_in_flight` (gauge) - buffer flushes currently uploading
-- `parquet_s3_partitions_capped` - records routed to the `_overflow` partition because the
+- `parquet_s3_partitions_capped{source,target}` - records routed to the `_overflow` partition because the
   per-writer partition cap was reached
-- `iceberg_descriptor_uploads`, `iceberg_descriptor_upload_errors` - descriptor objects uploaded
+- `iceberg_descriptor_uploads{source}`, `iceberg_descriptor_upload_errors{source}` - descriptor objects uploaded
   alongside a Parquet object / uploads that returned an error
 
 Cardinality watch (`metrics.cardinality_watch`; see [configuration.md](configuration.md)):
