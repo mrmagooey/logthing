@@ -236,3 +236,173 @@ def test_non_numeric_config_is_usage_error(bootstrap, capsys):
 
 def test_unknown_command_is_usage_error(bootstrap):
     assert bootstrap.main(["frobnicate"], {}) == 2
+
+
+class FakeMetabase:
+    """Stateful model of the Metabase API subset bootstrap.py metabase uses."""
+
+    def __init__(self, server, engines=("starburst", "postgres"), db_400s=0, login_429s=0):
+        self.setup_token = "setup-tok"
+        self.admin = None
+        self.dbs = {}
+        self.db_400s = db_400s
+        self.login_429s = login_429s
+        self.setup_bodies = []
+        self.db_bodies = []
+        self.puts = []
+        self.engines = {e: {} for e in engines}
+        r = server.routes
+        r[("GET", "/api/session/properties")] = lambda q, b: (
+            200, {"setup-token": self.setup_token, "engines": self.engines})
+        r[("POST", "/api/setup")] = self.setup
+        r[("POST", "/api/session")] = self.login
+        r[("GET", "/api/database")] = lambda q, b: (
+            200, {"data": [{"id": i, **d} for i, d in self.dbs.items()]})
+        r[("POST", "/api/database")] = self.add_db
+        r[("PUT", "/api/database/1")] = self.put_db
+
+    def setup(self, q, b):
+        self.setup_bodies.append(b)
+        if b["token"] != self.setup_token:
+            return 403, {"message": "invalid token"}
+        self.admin = (b["user"]["email"], b["user"]["password"])
+        self.setup_token = None
+        return 200, {"id": "session-1"}
+
+    def login(self, q, b):
+        if self.login_429s:
+            self.login_429s -= 1
+            return 429, {"message": "Too many attempts"}
+        if self.admin == (b["username"], b["password"]):
+            return 200, {"id": "session-2"}
+        return 401, {"message": "Password did not match stored password."}
+
+    def add_db(self, q, b):
+        self.db_bodies.append(b)
+        if self.db_400s:
+            self.db_400s -= 1
+            return 400, {"message": "Unable to connect to Trino"}
+        self.dbs[len(self.dbs) + 1] = {
+            "name": b["name"], "engine": b["engine"], "details": b["details"]}
+        return 200, {"id": len(self.dbs)}
+
+    def put_db(self, q, b):
+        self.puts.append(b)
+        self.dbs[1]["details"] = b["details"]
+        return 200, {}
+
+
+ADMIN_PW = "AdminPw-123456"
+TRINO_PW = "TrinoMbPw123456"
+PEM_OPTIONS = "SSLTrustStorePath=/tls/ca.pem"
+
+
+def mb_env(url, **extra):
+    env = env_for(url, METABASE_URL=url, METABASE_ADMIN_PASSWORD=ADMIN_PW,
+                  TRINO_METABASE_PASSWORD=TRINO_PW, TRINO_HOST="trino", TRINO_PORT="8443")
+    env.update(extra)
+    return env
+
+
+def test_metabase_first_run_sets_up_admin_then_registers_starburst_database(bootstrap, server):
+    mb = FakeMetabase(server)
+    assert bootstrap.main(["metabase"], mb_env(server.url)) == 0
+    body = mb.setup_bodies[0]
+    assert body["token"] == "setup-tok"
+    assert body["user"]["email"] == "admin@logthing.example"
+    assert body["user"]["password"] == ADMIN_PW
+    assert body["prefs"]["allow_tracking"] is False
+    assert "database" not in body  # /api/setup silently drops a DB whose test fails
+    db = mb.db_bodies[0]
+    assert db["engine"] == "starburst" and db["name"] == "logthing"
+    assert db["details"] == {
+        "host": "trino", "port": 8443, "catalog": "iceberg", "user": "metabase",
+        "password": TRINO_PW, "ssl": True, "additional-options": PEM_OPTIONS}
+    assert "SSLTrustStoreType" not in db["details"]["additional-options"]
+
+
+def test_metabase_second_run_logs_in_and_does_not_set_up_again(bootstrap, server):
+    mb = FakeMetabase(server)
+    assert bootstrap.main(["metabase"], mb_env(server.url)) == 0
+    assert bootstrap.main(["metabase"], mb_env(server.url)) == 0
+    assert len(mb.setup_bodies) == 1 and len(mb.dbs) == 1 and len(mb.puts) == 1
+    assert any(h.get("X-Metabase-Session") == "session-2" for h in server.header_log)
+
+
+def test_metabase_rerun_syncs_a_rotated_trino_password(bootstrap, server):
+    mb = FakeMetabase(server)
+    assert bootstrap.main(["metabase"], mb_env(server.url)) == 0
+    assert bootstrap.main(
+        ["metabase"], mb_env(server.url, TRINO_METABASE_PASSWORD="Rotated-pw-99999")) == 0
+    assert mb.dbs[1]["details"]["password"] == "Rotated-pw-99999"
+
+
+def test_metabase_registers_database_when_setup_exists_without_it(bootstrap, server):
+    mb = FakeMetabase(server)
+    mb.setup_token = None
+    mb.admin = ("admin@logthing.example", ADMIN_PW)
+    assert bootstrap.main(["metabase"], mb_env(server.url)) == 0
+    assert len(mb.dbs) == 1 and mb.dbs[1]["engine"] == "starburst"
+    assert mb.setup_bodies == []
+
+
+def test_metabase_missing_starburst_engine_fails_clearly(bootstrap, server, capsys):
+    FakeMetabase(server, engines=("postgres", "h2"))
+    assert bootstrap.main(["metabase"], mb_env(server.url)) == 1
+    err = capsys.readouterr().err
+    assert "starburst" in err and "postgres" in err
+
+
+def test_metabase_insecure_mode_disables_verification(bootstrap, server):
+    mb = FakeMetabase(server)
+    assert bootstrap.main(["metabase"], mb_env(server.url, TRINO_TLS_MODE="insecure")) == 0
+    assert mb.dbs[1]["details"]["additional-options"] == "SSLVerification=NONE"
+
+
+def test_metabase_invalid_tls_mode_is_a_usage_error(bootstrap, capsys):
+    assert bootstrap.main(["metabase"], mb_env("http://x", TRINO_TLS_MODE="maybe")) == 2
+    assert "TRINO_TLS_MODE" in capsys.readouterr().err
+
+
+def test_metabase_wrong_admin_password_fails_fast(bootstrap, server, capsys):
+    mb = FakeMetabase(server)
+    mb.setup_token = None
+    mb.admin = ("admin@logthing.example", "a-different-password")
+    t = time.monotonic()
+    assert bootstrap.main(["metabase"], mb_env(server.url, BOOTSTRAP_TIMEOUT_SECS="30")) == 1
+    assert time.monotonic() - t < 5
+    assert "METABASE_ADMIN_PASSWORD" in capsys.readouterr().err
+
+
+def test_metabase_database_add_is_retried_until_trino_accepts_the_connection(bootstrap, server):
+    mb = FakeMetabase(server, db_400s=2)
+    assert bootstrap.main(["metabase"], mb_env(server.url)) == 0
+    assert len(mb.db_bodies) == 3 and len(mb.setup_bodies) == 1 and len(mb.dbs) == 1
+
+
+def test_metabase_login_rate_limit_is_retried_until_the_deadline(bootstrap, server):
+    mb = FakeMetabase(server, login_429s=2)
+    mb.setup_token = None
+    mb.admin = ("admin@logthing.example", ADMIN_PW)
+    assert bootstrap.main(["metabase"], mb_env(server.url)) == 0
+    assert len(mb.dbs) == 1
+
+
+def test_metabase_persistent_database_error_times_out_naming_the_cause(bootstrap, server, capsys):
+    mb = FakeMetabase(server, db_400s=10_000)
+    assert bootstrap.main(["metabase"], mb_env(server.url, BOOTSTRAP_TIMEOUT_SECS="0.4")) == 1
+    assert "Unable to connect to Trino" in capsys.readouterr().err
+    assert mb.dbs == {}
+
+
+def test_metabase_unexpected_database_status_fails_loudly(bootstrap, server, capsys):
+    mb = FakeMetabase(server)
+    server.routes[("POST", "/api/database")] = lambda q, b: (403, {"message": "nope"})
+    assert bootstrap.main(["metabase"], mb_env(server.url)) == 1
+    assert "403" in capsys.readouterr().err and mb.dbs == {}
+
+
+def test_metabase_missing_env_is_a_usage_error(bootstrap, capsys):
+    assert bootstrap.main(["metabase"], {}) == 2
+    err = capsys.readouterr().err
+    assert "METABASE_ADMIN_PASSWORD" in err and "TRINO_METABASE_PASSWORD" in err

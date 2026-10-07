@@ -1,16 +1,16 @@
 # logthing analytics stack: logthing -> Garage (S3) -> committer -> Lakekeeper (Iceberg REST)
-# -> Trino -> Hue. Shared config files live in helm/logthing-analytics/files/ and are used
-# unchanged by the Helm chart. Credentials below are DEMO defaults: override them in .env.
+# -> Trino -> Metabase. Shared config files live in helm/logthing-analytics/files/ and are used
+# unchanged by the Helm chart. Secrets are REQUIRED (no defaults): run scripts/gen-analytics-env.sh.
 name: logthing-analytics
 
 x-s3-creds: &s3-creds
-  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
-  S3_SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
 
 x-lakekeeper-env: &lakekeeper-env
-  LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:-demo-lakekeeper-encryption-key-change-me}
-  LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:-demo-lakekeeper-change-me}@postgres:5432/lakekeeper
-  LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:-demo-lakekeeper-change-me}@postgres:5432/lakekeeper
+  LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:?set LAKEKEEPER_ENCRYPTION_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:?set LAKEKEEPER_DB_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}@postgres:5432/lakekeeper
+  LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:?set LAKEKEEPER_DB_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}@postgres:5432/lakekeeper
   LAKEKEEPER__BASE_URI: http://lakekeeper:8181
 
 x-bootstrap: &bootstrap
@@ -22,33 +22,33 @@ x-bootstrap: &bootstrap
 
 x-logthing-s3: &logthing-s3
   LOGTHING__SYSLOG__S3__ENDPOINT: http://garage:3900
-  LOGTHING__SYSLOG__S3__ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
-  LOGTHING__SYSLOG__S3__SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  LOGTHING__SYSLOG__S3__ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  LOGTHING__SYSLOG__S3__SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
   LOGTHING__SYSLOG__S3__FLUSH_INTERVAL_SECS: ${LOGTHING_FLUSH_INTERVAL_SECS:-60}
   LOGTHING__IPFIX__S3__ENDPOINT: http://garage:3900
-  LOGTHING__IPFIX__S3__ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
-  LOGTHING__IPFIX__S3__SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  LOGTHING__IPFIX__S3__ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  LOGTHING__IPFIX__S3__SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
   LOGTHING__IPFIX__S3__FLUSH_INTERVAL_SECS: ${LOGTHING_FLUSH_INTERVAL_SECS:-60}
   LOGTHING__SFLOW__S3__ENDPOINT: http://garage:3900
-  LOGTHING__SFLOW__S3__ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
-  LOGTHING__SFLOW__S3__SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  LOGTHING__SFLOW__S3__ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  LOGTHING__SFLOW__S3__SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
   LOGTHING__SFLOW__S3__FLUSH_INTERVAL_SECS: ${LOGTHING_FLUSH_INTERVAL_SECS:-60}
   LOGTHING__ZEEK__S3__ENDPOINT: http://garage:3900
-  LOGTHING__ZEEK__S3__ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
-  LOGTHING__ZEEK__S3__SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  LOGTHING__ZEEK__S3__ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  LOGTHING__ZEEK__S3__SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
   LOGTHING__ZEEK__S3__FLUSH_INTERVAL_SECS: ${LOGTHING_FLUSH_INTERVAL_SECS:-60}
   LOGTHING__ICEBERG__S3__ENDPOINT: http://garage:3900
-  LOGTHING__ICEBERG__S3__ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
-  LOGTHING__ICEBERG__S3__SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  LOGTHING__ICEBERG__S3__ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  LOGTHING__ICEBERG__S3__SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
 
 services:
   postgres:
     image: ${POSTGRES_IMAGE:-postgres:17}
     restart: unless-stopped
     environment:
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-demo-postgres-change-me}
-      LAKEKEEPER_DB_PASSWORD: ${LAKEKEEPER_DB_PASSWORD:-demo-lakekeeper-change-me}
-      HUE_DB_PASSWORD: ${HUE_DB_PASSWORD:-demo-hue-change-me}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      LAKEKEEPER_DB_PASSWORD: ${LAKEKEEPER_DB_PASSWORD:?set LAKEKEEPER_DB_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      METABASE_DB_PASSWORD: ${METABASE_DB_PASSWORD:?set METABASE_DB_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
     volumes:
       - ./helm/logthing-analytics/files/postgres-init.sh:/docker-entrypoint-initdb.d/10-init.sh:ro
       - pgdata:/var/lib/postgresql/data
@@ -63,8 +63,8 @@ services:
     image: ${GARAGE_IMAGE:-dxflrs/garage:v2.4.1}
     restart: unless-stopped
     environment:
-      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:-5f0c4d3a9b8e7f6a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b}
-      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-demo-garage-admin-token-change-me}
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:?set GARAGE_RPC_SECRET (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:?set GARAGE_ADMIN_TOKEN (run deploy/analytics/scripts/gen-analytics-env.sh)}
     volumes:
       - ./helm/logthing-analytics/files/garage.toml:/etc/garage.toml:ro
       - garage-meta:/var/lib/garage/meta
@@ -82,7 +82,7 @@ services:
     command: ["garage"]
     environment:
       <<: *s3-creds
-      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-demo-garage-admin-token-change-me}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:?set GARAGE_ADMIN_TOKEN (run deploy/analytics/scripts/gen-analytics-env.sh)}
     depends_on:
       garage: {condition: service_healthy}
 
@@ -107,8 +107,6 @@ services:
       start_period: 5s
     depends_on:
       lakekeeper-migrate: {condition: service_completed_successfully}
-    ports:
-      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${LAKEKEEPER_PORT:-8181}:8181"
 
   lakekeeper-init:
     <<: *bootstrap
@@ -159,47 +157,113 @@ services:
       lakekeeper-init: {condition: service_completed_successfully}
     restart: unless-stopped
 
+  certgen:
+    image: ${CERTGEN_IMAGE:-alpine/openssl:3.5.9}
+    entrypoint: ["sh", "/certgen.sh"]
+    environment:
+      OUT_DIR: /tls
+      TLS_OWNER: "1000:1000"
+      # A copy of ca.pem only: what Metabase mounts (it must never see server.pem).
+      CA_COPY_DIR: /ca
+    volumes:
+      - ./scripts/certgen.sh:/certgen.sh:ro
+      - trino-tls:/tls
+      - trino-ca:/ca
+    restart: "no"
+
+  authgen:
+    image: ${AUTHGEN_IMAGE:-httpd:2.4.69-alpine}
+    entrypoint: ["sh", "/authgen.sh"]
+    environment:
+      OUT_DIR: /auth
+      TRINO_USERS: admin:TRINO_ADMIN_PASSWORD,metabase:TRINO_METABASE_PASSWORD
+      TRINO_ADMIN_PASSWORD: ${TRINO_ADMIN_PASSWORD:?set TRINO_ADMIN_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      TRINO_METABASE_PASSWORD: ${TRINO_METABASE_PASSWORD:?set TRINO_METABASE_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
+    volumes:
+      - ./helm/logthing-analytics/files/authgen.sh:/authgen.sh:ro
+      - trino-auth:/auth
+    restart: "no"
+
   trino:
     image: ${TRINO_IMAGE:-trinodb/trino:483}
     restart: unless-stopped
     volumes:
+      - ./helm/logthing-analytics/files/trino-config.properties:/etc/trino/config.properties:ro
+      - ./helm/logthing-analytics/files/trino-password-authenticator.properties:/etc/trino/password-authenticator.properties:ro
       - ./helm/logthing-analytics/files/trino-iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+      - trino-tls:/etc/trino/tls:ro
+      - trino-auth:/etc/trino/auth:ro
     environment:
       <<: *s3-creds
       CATALOG_URI: http://lakekeeper:8181/catalog
       S3_ENDPOINT: http://garage:3900
+      TRINO_SHARED_SECRET: ${TRINO_SHARED_SECRET:?set TRINO_SHARED_SECRET (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      # Read by the trino CLI (healthcheck and `docker compose exec trino trino ...`).
+      TRINO_PASSWORD: ${TRINO_ADMIN_PASSWORD:?set TRINO_ADMIN_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
     healthcheck:
-      test: ["CMD", "/usr/lib/trino/bin/health-check"]
-      interval: 5s
-      timeout: 5s
+      test: ["CMD-SHELL", "trino --server https://localhost:8443 --truststore-path /etc/trino/tls/ca.pem --user admin --password --execute 'SELECT 1' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 20s
       retries: 60
       start_period: 30s
     depends_on:
       lakekeeper-init: {condition: service_completed_successfully}
+      certgen: {condition: service_completed_successfully}
+      authgen: {condition: service_completed_successfully}
+    # 8080 (plain HTTP, internal node traffic only) is deliberately never published.
     ports:
-      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${TRINO_PORT:-8080}:8080"
+      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${TRINO_PORT:-8443}:8443"
 
-  hue:
-    image: ${HUE_IMAGE:-gethue/hue:20260611-140101}
+  metabase:
+    image: ${METABASE_IMAGE:-metabase/metabase:v0.64.1}
     restart: unless-stopped
-    volumes:
-      - ./hue.ini:/usr/share/hue/desktop/conf/z-hue-overrides.ini:ro
     environment:
-      HUE_DB_PASSWORD: ${HUE_DB_PASSWORD:-demo-hue-change-me}
-      HUE_SECRET_KEY: ${HUE_SECRET_KEY:-demo-hue-secret-key-change-me-0123456789abcdef}
+      MB_DB_TYPE: postgres
+      MB_DB_HOST: postgres
+      MB_DB_PORT: "5432"
+      MB_DB_DBNAME: metabase
+      MB_DB_USER: metabase
+      MB_DB_PASS: ${METABASE_DB_PASSWORD:?set METABASE_DB_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      # Encrypts the Trino credentials stored in Metabase's application database.
+      MB_ENCRYPTION_SECRET_KEY: ${METABASE_ENCRYPTION_KEY:?set METABASE_ENCRYPTION_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+    volumes:
+      # Only the public CA (copied by certgen), never the Trino private key in server.pem.
+      - trino-ca:/tls:ro
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8888/desktop/debug/is_alive"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/api/health"]
       interval: 10s
       timeout: 5s
-      retries: 30
+      # First start runs all of Metabase's schema migrations. A slow host needs far more than
+      # the default (e.g. METABASE_HEALTH_RETRIES=180 allows ~30 minutes).
+      retries: ${METABASE_HEALTH_RETRIES:-40}
       start_period: 60s
     depends_on:
       postgres: {condition: service_healthy}
-      trino: {condition: service_healthy}
+      certgen: {condition: service_completed_successfully}
     ports:
-      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${HUE_PORT:-8888}:8888"
+      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${METABASE_PORT:-3000}:3000"
+
+  metabase-init:
+    <<: *bootstrap
+    command: ["metabase"]
+    environment:
+      METABASE_URL: http://metabase:3000
+      METABASE_ADMIN_EMAIL: ${METABASE_ADMIN_EMAIL:-admin@logthing.example}
+      METABASE_ADMIN_PASSWORD: ${METABASE_ADMIN_PASSWORD:?set METABASE_ADMIN_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      TRINO_HOST: trino
+      TRINO_PORT: "8443"
+      TRINO_METABASE_USER: metabase
+      TRINO_METABASE_PASSWORD: ${TRINO_METABASE_PASSWORD:?set TRINO_METABASE_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      TRINO_TLS_MODE: ${METABASE_TRINO_TLS_MODE:-pem}
+      TRINO_CA_PATH: /tls/ca.pem
+    depends_on:
+      metabase: {condition: service_healthy}
+      trino: {condition: service_healthy}
 
 volumes:
+  trino-ca: {}
   pgdata: {}
   garage-meta: {}
   garage-data: {}
+  trino-tls: {}
+  trino-auth: {}

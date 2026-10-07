@@ -8,9 +8,39 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ### Added
 
-- `deploy/analytics/` — docker compose and Helm deployments of logthing, Garage (S3),
-  the committer, Lakekeeper (Iceberg REST), Trino and Hue. See
-  `deploy/analytics/README.md`.
+- `deploy/analytics/` — docker compose and Helm deployments of logthing, Garage (S3), the
+  committer, Lakekeeper (Iceberg REST), Trino and Metabase, plus a dbt-trino project
+  (`deploy/analytics/dbt/`) with OCSF views (network, DNS, authentication, detection finding)
+  and example detection queries. See `deploy/analytics/README.md`.
+- Analytics stack security defaults: secrets are generated and never defaulted
+  (`deploy/analytics/scripts/gen-analytics-env.sh` for compose; `randAlphaNum` + `lookup` in
+  Helm); Trino serves HTTPS on 8443 with password authentication and a generated CA (plain HTTP
+  8080 is not published); Lakekeeper, Postgres and the Garage admin API are not published; Helm
+  ships NetworkPolicies.
+
+### Breaking
+
+- Analytics stack upgrades keep the old PUBLIC demo secrets: Postgres role passwords, the Garage
+  key and the Lakekeeper encryption key persist in volumes/PVCs, and Helm's `lookup` and
+  `--reuse-values` keep the old values (the chart now warns in NOTES.txt). Compose: `down -v`, or
+  hand-write `.env` with the old values and rotate deliberately (a freshly generated `.env` breaks
+  Lakekeeper-to-Postgres auth, the Garage key never applies, stored warehouse credentials fail).
+  Helm: `--reuse-values` fails from a pre-B1 release; use `--reset-then-reuse-values`. See
+  "Upgrading an existing stack" in `deploy/analytics/README.md`. The Helm-generated Trino
+  certificate (825 days) is not renewed automatically.
+
+- Analytics stack, for anyone running it from master before this release: Hue is replaced by
+  Metabase (Hue saved queries are not migrated); compose requires a `.env` (run the generator);
+  Trino moved from unauthenticated `http://:8080` to `https://:8443` (users `admin` and
+  `metabase`); `LAKEKEEPER_PORT`, `HUE_*` and `HUE_IMAGE` are removed; Helm credential keys changed
+  (`hue-*` out, `trino-*` and `metabase-*` in).
+- Analytics stack, published ports (compose, as of master 7b835b9 the loopback ports 8080 for Trino
+  and 8181 for Lakekeeper): Trino plain HTTP 8080 is no longer published (clients must use
+  HTTPS 8443 with a password and the generated CA); Lakekeeper (8181) is no longer published.
+  Postgres and the Garage admin port were never published in compose, so nothing changed there.
+- Analytics Helm chart: NetworkPolicies are now rendered by default (`networkPolicy.enabled`,
+  set `false` to opt out). They can block previously open pod-to-pod access to Lakekeeper,
+  Postgres, the Garage admin API and Trino's plain-HTTP 8080 from pods not listed as peers.
 
 ## [0.21.0] - 2026-09-30
 

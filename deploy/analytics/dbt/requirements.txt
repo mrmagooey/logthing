@@ -1,0 +1,2 @@
+dbt-core==1.11.15
+dbt-trino==1.10.6

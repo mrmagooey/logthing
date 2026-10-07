@@ -1,0 +1,19 @@
+# Connection to the analytics stack's Trino (HTTPS + password). Everything comes from the
+# environment so the same project runs against compose (localhost:8443) and Helm (port-forward).
+#   TRINO_PASSWORD  admin password (.env TRINO_ADMIN_PASSWORD / Secret trino-admin-password)
+#   TRINO_CA_CERT   path to the CA PEM (compose: docker compose exec -T trino cat /etc/trino/tls/ca.pem)
+logthing_analytics:
+  target: trino
+  outputs:
+    trino:
+      type: trino
+      method: ldap
+      http_scheme: https
+      host: "{{ env_var('TRINO_HOST', 'localhost') }}"
+      port: "{{ env_var('TRINO_PORT', '8443') | as_number }}"
+      user: "{{ env_var('TRINO_USER', 'admin') }}"
+      password: "{{ env_var('TRINO_PASSWORD') }}"
+      cert: "{{ env_var('TRINO_CA_CERT') }}"
+      database: iceberg
+      schema: logs
+      threads: 2

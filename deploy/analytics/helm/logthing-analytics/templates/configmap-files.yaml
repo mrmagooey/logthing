@@ -14,3 +14,9 @@ data:
     {{- .Files.Get "files/trino-iceberg.properties" | nindent 4 }}
   postgres-init.sh: |
     {{- .Files.Get "files/postgres-init.sh" | nindent 4 }}
+  authgen.sh: |
+    {{- .Files.Get "files/authgen.sh" | nindent 4 }}
+  trino-config.properties: |
+    {{- .Files.Get "files/trino-config.properties" | nindent 4 }}
+  trino-password-authenticator.properties: |
+    {{- .Files.Get "files/trino-password-authenticator.properties" | nindent 4 }}
