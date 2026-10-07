@@ -1117,6 +1117,21 @@ impl Default for OtlpConfig {
     }
 }
 
+/// Global durable spool for S3 uploads (`[spool]`). See `docs/delivery-semantics.md`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct SpoolConfig {
+    /// Directory holding spooled Parquet files and descriptors (created if missing).
+    pub dir: PathBuf,
+    /// Upper bound on spooled bytes (Parquet + descriptors); beyond it flushes fall back to
+    /// the in-memory retry path. Default 1 GiB.
+    #[serde(default = "default_spool_max_bytes")]
+    pub max_bytes: u64,
+}
+
+fn default_spool_max_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+
 /// Top-level `[iceberg]` config section — emits a small JSON "descriptor"
 /// alongside each Parquet flush from every source, describing the file
 /// for an external Iceberg committer (logthing has no Iceberg library
@@ -1953,21 +1968,6 @@ fn stale_admin_override_warning(dir: &Path) -> Option<String> {
 ///
 /// Also rejects an enabled `[hec]`/`[otlp]` section with no sink (records would be silently
 /// dropped) and `otlp.max_service_partitions = 0`.
-/// Global durable spool for S3 uploads (`[spool]`). See `docs/delivery-semantics.md`.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct SpoolConfig {
-    /// Directory holding spooled Parquet files and descriptors (created if missing).
-    pub dir: PathBuf,
-    /// Upper bound on spooled bytes (Parquet + descriptors); beyond it flushes fall back to
-    /// the in-memory retry path. Default 1 GiB.
-    #[serde(default = "default_spool_max_bytes")]
-    pub max_bytes: u64,
-}
-
-fn default_spool_max_bytes() -> u64 {
-    1024 * 1024 * 1024
-}
-
 pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
     let mut errors: Vec<String> = Vec::new();
 

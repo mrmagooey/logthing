@@ -159,34 +159,56 @@ fn quarantine(dir: &Path, id: &str, reason: &str) {
     let _ = fsync_dir(dir);
 }
 
-/// Validate a committed entry against its files. `Err` carries the quarantine reason.
-fn validate_entry(dir: &Path, id: &str) -> Result<EntryMeta, String> {
-    let raw = std::fs::read(dir.join(format!("{id}.meta"))).map_err(|e| format!("meta: {e}"))?;
-    let meta: EntryMeta = serde_json::from_slice(&raw).map_err(|e| format!("meta parse: {e}"))?;
+/// Why [`validate_entry`] did not accept an entry.
+enum Invalid {
+    /// The entry is genuinely bad (missing file, size/hash mismatch, bad meta): quarantine it.
+    Corrupt(String),
+    /// A transient I/O error (EIO, EMFILE, permissions): leave the entry in place.
+    Transient(String),
+}
+
+/// Read a required file: NotFound is corruption, any other error is transient.
+fn read_required(path: &Path, what: &str) -> Result<Vec<u8>, Invalid> {
+    std::fs::read(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => Invalid::Corrupt(format!("{what} missing")),
+        _ => Invalid::Transient(format!("{what} unreadable: {e}")),
+    })
+}
+
+/// Validate a committed entry against its files.
+fn validate_entry(dir: &Path, id: &str) -> Result<EntryMeta, Invalid> {
+    let raw = read_required(&dir.join(format!("{id}.meta")), "meta")?;
+    let meta: EntryMeta =
+        serde_json::from_slice(&raw).map_err(|e| Invalid::Corrupt(format!("meta parse: {e}")))?;
     if meta.version != META_VERSION {
-        return Err(format!("unknown meta version {}", meta.version));
+        return Err(Invalid::Corrupt(format!(
+            "unknown meta version {}",
+            meta.version
+        )));
     }
-    let parquet = std::fs::read(dir.join(format!("{id}.parquet")))
-        .map_err(|e| format!("parquet missing/unreadable: {e}"))?;
+    let parquet = read_required(&dir.join(format!("{id}.parquet")), "parquet")?;
     if parquet.len() as u64 != meta.parquet_bytes {
-        return Err(format!(
+        return Err(Invalid::Corrupt(format!(
             "parquet length {} != {}",
             parquet.len(),
             meta.parquet_bytes
-        ));
+        )));
     }
     if hex::encode(Sha256::digest(&parquet)) != meta.sha256 {
-        return Err("parquet sha256 mismatch".into());
+        return Err(Invalid::Corrupt("parquet sha256 mismatch".into()));
     }
     if meta.descriptor_key.is_some() {
         let len = std::fs::metadata(dir.join(format!("{id}.json")))
-            .map_err(|e| format!("descriptor missing/unreadable: {e}"))?
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => Invalid::Corrupt("descriptor missing".into()),
+                _ => Invalid::Transient(format!("descriptor unreadable: {e}")),
+            })?
             .len();
         if len != meta.descriptor_bytes {
-            return Err(format!(
+            return Err(Invalid::Corrupt(format!(
                 "descriptor length {len} != {}",
                 meta.descriptor_bytes
-            ));
+            )));
         }
     }
     Ok(meta)
@@ -245,7 +267,10 @@ impl Spool {
                         },
                     );
                 }
-                Err(reason) => quarantine(&dir, &id, &reason),
+                Err(Invalid::Corrupt(reason)) => quarantine(&dir, &id, &reason),
+                Err(Invalid::Transient(reason)) => {
+                    error!(entry = %id, %reason, "spool entry unreadable; left in place, retried on next open");
+                }
             }
         }
         let _ = fsync_dir(&dir);
@@ -298,32 +323,34 @@ impl Spool {
         }
 
         let id = new_entry_id();
-        let meta = EntryMeta {
-            version: META_VERSION,
-            sink_id: sink_id.to_owned(),
-            key: key.to_owned(),
-            descriptor_key: descriptor.map(|d| d.key.clone()),
-            parquet_bytes: body.len() as u64,
-            descriptor_bytes: desc_len,
-            sha256: hex::encode(Sha256::digest(body)),
-        };
         let dir = self.dir.clone();
-        let (id2, meta2) = (id.clone(), meta.clone());
-        let (parquet, desc) = (body.to_vec(), descriptor.map(|d| d.body.clone()));
+        let (id2, sink_id, key) = (id.clone(), sink_id.to_owned(), key.to_owned());
+        let (body, descriptor) = (body.to_vec(), descriptor.cloned());
         let res = tokio::task::spawn_blocking(move || {
-            write_entry_blocking(&dir, &id2, &meta2, &parquet, desc.as_deref())
+            let meta = EntryMeta {
+                version: META_VERSION,
+                sink_id,
+                key,
+                descriptor_key: descriptor.as_ref().map(|d| d.key.clone()),
+                parquet_bytes: body.len() as u64,
+                descriptor_bytes: desc_len,
+                sha256: hex::encode(Sha256::digest(&body)),
+            };
+            let desc = descriptor.as_ref().map(|d| d.body.as_slice());
+            write_entry_blocking(&dir, &id2, &meta, &body, desc).map(|()| meta)
         })
         .await;
-        let err = match res {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(e.to_string()),
-            Err(e) => Some(format!("spool write task failed: {e}")),
+        let (meta, err) = match res {
+            Ok(Ok(meta)) => (Some(meta), None),
+            Ok(Err(e)) => (None, Some(e.to_string())),
+            Err(e) => (None, Some(format!("spool write task failed: {e}"))),
         };
-        if let Some(msg) = err {
+        let Some(meta) = meta else {
+            let msg = err.unwrap_or_default();
             self.bytes.fetch_sub(total, Ordering::SeqCst);
             counter!("spool_rejected", "reason" => "io").increment(1);
             return Err(SpoolReject::Io(msg));
-        }
+        };
 
         let entries = {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -822,5 +849,35 @@ mod tests {
         spool.register("x", s3.clone(), None).unwrap();
         assert!(spool.register("x", s3.clone(), None).is_err());
         spool.register("y", s3, None).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_open_leaves_entry_in_place_on_transient_read_error() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .unwrap()
+            .stdout
+            == b"0\n"
+        {
+            return; // root ignores file modes; the error cannot be provoked
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let id = seed_entry(dir.path(), false).await;
+        let pq = dir.path().join(format!("{id}.parquet"));
+        std::fs::set_permissions(&pq, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let s = Spool::open(&cfg(dir.path(), 1 << 20)).unwrap();
+        std::fs::set_permissions(&pq, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(s.pending_entries(), 0);
+        assert!(corrupt_names(dir.path()).is_empty());
+        assert_eq!(counter(&snap, "spool_corrupt", None), 0);
+        assert!(pq.exists() && dir.path().join(format!("{id}.meta")).exists());
+        // next open, now readable, loads it
+        let again = Spool::open(&cfg(dir.path(), 1 << 20)).unwrap();
+        assert_eq!(again.pending_entries(), 1);
     }
 }
