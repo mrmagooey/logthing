@@ -377,3 +377,17 @@ def test_build_local_images_tag_changes_with_dirty_tree_content(tmp_path):
     assert tag() != d1
     (repo / "new.txt").write_text("untracked")
     assert tag() != d1
+
+
+def test_dedup_step_runs_after_the_metabase_otlp_count_in_both_scripts():
+    # assert_staging_dedup inserts a duplicate raw otlp row, so the Metabase count must come first.
+    for name in ("compose.sh", "helm-minikube.sh"):
+        text = (ANALYTICS / "tests" / "e2e" / name).read_text()
+        call = text.index("assert_staging_dedup ||")
+        assert text.index("Metabase otlp count") < call, name
+
+
+def test_helm_app_sender_takes_tokens_from_the_secret_not_argv():
+    text = (ANALYTICS / "tests" / "e2e" / "helm-minikube.sh").read_text()
+    assert "secretKeyRef" in text and "--env=" not in text
+    assert 'fail "Secret $FULL-credentials has no key' in text

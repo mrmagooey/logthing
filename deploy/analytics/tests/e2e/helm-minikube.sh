@@ -147,13 +147,40 @@ timeout 300 "${K[@]}" run zeeksender --rm -i --restart=Never --pod-running-timeo
   || { echo "zeek sender failed" >&2; exit 1; }
 
 echo "== [5b/9] send $N OTLP records and $N HEC events with the generated tokens =="
-HEC_TOKEN=$("${K[@]}" get secret "$FULL-credentials" -o jsonpath='{.data.hec-token}' | base64 -d)
-OTLP_BEARER_TOKEN=$("${K[@]}" get secret "$FULL-credentials" -o jsonpath='{.data.otlp-bearer-token}' | base64 -d)
+secret_key() {
+  local v
+  v=$("${K[@]}" get secret "$FULL-credentials" -o jsonpath="{.data.$1}" | base64 -d) || v=
+  [ -n "$v" ] || fail "Secret $FULL-credentials has no key $1"
+}
+secret_key hec-token; secret_key otlp-bearer-token
 "${K[@]}" delete pod appsender --ignore-not-found >/dev/null
-timeout 300 "${K[@]}" run appsender --rm -i --restart=Never --pod-running-timeout=3m \
-  --image=python:3.12-slim --env="HEC_TOKEN=$HEC_TOKEN" --env="OTLP_BEARER_TOKEN=$OTLP_BEARER_TOKEN" \
-  -- python -c "$(cat "$HERE/send_app_logs.py")" "http://$FULL-logthing-tcp:5985" "$MARKER" "$N" \
-  || { echo "app log sender failed" >&2; dump_logs; exit 1; }
+# Tokens reach the pod through secretKeyRef, so they never appear in the pod spec or local argv.
+"${K[@]}" apply -f - >/dev/null <<YEOF || fail "could not create appsender pod"
+apiVersion: v1
+kind: Pod
+metadata: {name: appsender}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: appsender
+      image: python:3.12-slim
+      command: [python, -c]
+      args:
+        - |
+$(sed 's/^/          /' "$HERE/send_app_logs.py")
+        - http://$FULL-logthing-tcp:5985
+        - $MARKER
+        - "$N"
+      env:
+        - name: HEC_TOKEN
+          valueFrom: {secretKeyRef: {name: $FULL-credentials, key: hec-token}}
+        - name: OTLP_BEARER_TOKEN
+          valueFrom: {secretKeyRef: {name: $FULL-credentials, key: otlp-bearer-token}}
+YEOF
+"${K[@]}" wait --for=jsonpath='{.status.phase}'=Succeeded pod/appsender --timeout=300s \
+  || { echo "app log sender failed" >&2; "${K[@]}" logs appsender >&2 || true; dump_logs; exit 1; }
+"${K[@]}" logs appsender
+"${K[@]}" delete pod appsender --ignore-not-found >/dev/null
 
 COUNT_SQL="SELECT count(*) FROM iceberg.logs.syslog WHERE message LIKE '%$MARKER%'"
 trino_count() {
@@ -211,7 +238,6 @@ dbt_ok "$rc" "$DBT_OUT" \
   || { echo "dbt build failed (exit $rc or ERROR>0 in summary)" >&2
        "${K[@]}" logs "deploy/$FULL-trino" --tail 80 >&2 || true; exit 1; }
 echo "dbt: build ok"
-assert_staging_dedup || { dump_logs; exit 1; }
 
 echo "== [8b/9] OCSF views and detection analyses over the Zeek rows =="
 [ "$(sql "SELECT count(*) FROM iceberg.logs.ocsf_network_activity WHERE metadata_correlation_uid = '$MARKER' AND class_uid = 4001 AND src_endpoint_ip = '10.20.30.40' AND dst_endpoint_port = 443 AND connection_info_protocol_num = 6")" = 1 ] \
@@ -248,5 +274,8 @@ OTLP_MB=$(METABASE_PASSWORD="$MB_PW" "$PY" "$HERE/metabase_query.py" \
   || { "${K[@]}" logs "deploy/$FULL-metabase" --tail 80 >&2 || true; exit 1; }
 [ "$OTLP_MB" = "$N" ] || { echo "Metabase otlp count $OTLP_MB, expected $N" >&2; exit 1; }
 echo "metabase otlp: $OTLP_MB"
+# Last: it inserts a duplicate raw otlp row, which would break the Metabase count above.
+assert_staging_dedup || { dump_logs; exit 1; }
+echo "staging: stg_otlp/stg_hec = $N, duplicate event_uuid deduped"
 
 echo "Analytics Helm E2E PASSED"
