@@ -62,7 +62,7 @@ history or reproducible tests. When it is set the analyses also apply an upper b
 - `detect_auth_bruteforce` uses 10-minute *tumbling* windows: a burst that straddles a window
   boundary is split and may stay below the threshold in both halves (a sliding window would be
   more precise).
-- `detect_rare_outbound_port` needs history: until about ~8 days of baseline exist, nearly every
+- `detect_rare_outbound_port` needs history: until ~8 days of baseline exist, nearly every
   port looks "new", so expect noise on a fresh lake. Ports are not keyed by protocol (tcp/443 and
   udp/443 are the same port) and "outbound" means towards the responder.
 

@@ -25,6 +25,13 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   Trino moved from unauthenticated `http://:8080` to `https://:8443` (users `admin` and
   `metabase`); `LAKEKEEPER_PORT`, `HUE_*` and `HUE_IMAGE` are removed; Helm credential keys changed
   (`hue-*` out, `trino-*` and `metabase-*` in).
+- Analytics stack, published ports (compose, as of master 7b835b9 the loopback ports 8080 for Trino
+  and 8181 for Lakekeeper): Trino plain HTTP 8080 is no longer published (clients must use
+  HTTPS 8443 with a password and the generated CA); Lakekeeper (8181) is no longer published.
+  Postgres and the Garage admin port were never published in compose, so nothing changed there.
+- Analytics Helm chart: NetworkPolicies are now rendered by default (`networkPolicy.enabled`,
+  set `false` to opt out). They can block previously open pod-to-pod access to Lakekeeper,
+  Postgres, the Garage admin API and Trino's plain-HTTP 8080 from pods not listed as peers.
 
 ## [0.21.0] - 2026-09-30
 

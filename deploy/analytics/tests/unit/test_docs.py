@@ -6,12 +6,11 @@ README = (ANALYTICS / "README.md").read_text()
 
 
 def tracked_text_files():
-    roots = [ANALYTICS / "docker-compose.yml", ANALYTICS / ".env.example"]
-    roots += [p for p in (CHART / "templates").iterdir()]
-    roots += [p for p in (CHART / "files").iterdir()]
-    roots += [CHART / "values.yaml", CHART / "Chart.yaml"]
-    roots += [p for p in (ANALYTICS / "tests" / "e2e").iterdir() if p.is_file()]
-    roots += [p for p in (ANALYTICS / "scripts").iterdir()]
+    roots = [ANALYTICS / "docker-compose.yml", ANALYTICS / ".env.example", CHART / "values.yaml",
+             CHART / "Chart.yaml"]
+    for d in (CHART / "templates", CHART / "files", ANALYTICS / "tests" / "e2e",
+              ANALYTICS / "scripts"):
+        roots += [p for p in d.rglob("*") if "__pycache__" not in p.parts]
     return [p for p in roots if p.is_file()]
 
 
@@ -41,7 +40,8 @@ def test_readme_covers_every_b1_behaviour():
 
 def test_readme_documents_credentials_and_isolation_caveats():
     assert "no default secrets" in README.lower()
-    assert "not** tested" in README or "not tested" in README
+    assert re.search(r"NetworkPolicies are enforced only by CNIs.*?Enforcement is \*\*not\*\* tested",
+                     README, re.DOTALL)
 
 
 def test_dbt_readme_documents_detection_caveats_and_runtime_setup():
