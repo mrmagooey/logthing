@@ -35,7 +35,10 @@ start without AVX2.
   exposed Metabase port could claim the admin account. Compose publishes it on loopback by
   default; keep `ANALYTICS_BIND_ADDR` at `127.0.0.1` until `metabase-init` has exited 0, and only
   then widen it (the risk exists only when it is non-loopback).
-- Port 5985 is logthing's HTTP endpoint. Besides `/health`, it accepts unauthenticated plaintext HTTP requests and is published on all interfaces like the other ingest ports; firewall it if the host is reachable from untrusted networks.
+- Port 5985 is logthing's HTTP endpoint. It serves `/health` (open) and the token-protected OTLP
+  (`/v1/logs`) and HEC (`/services/collector/event`) routes over plaintext HTTP, and is published on
+  all interfaces like the other ingest ports. The tokens are therefore cleartext on the wire: front
+  it with a TLS-terminating proxy, and firewall it, if the host is reachable from untrusted networks.
 
 ## Network isolation
 
@@ -72,6 +75,10 @@ There are no default secrets.
   Regenerating (`--force`) or editing credentials after the first start needs
   `docker compose down -v` (it **deletes all data**) because Postgres roles and the Garage key are
   created from them on first start.
+- **Ingest tokens:** `HEC_TOKEN` and `OTLP_BEARER_TOKEN` (compose, generated into `.env`; compose
+  refuses to start if either is missing or empty, because an empty token would disable
+  authentication) and `hec-token` / `otlp-bearer-token` (Helm Secret keys, `credentials.hecToken` /
+  `credentials.otlpBearerToken`). See "Sending application logs".
 - **Helm:** leave `credentials.*` empty and the chart generates random values on first install and
   keeps them on `helm upgrade` (read back from the live Secret with `lookup`). Set a value to pin
   it, or `credentials.existingSecret` for your own Secret. `helm template` cannot see the live
@@ -215,6 +222,8 @@ As with compose, tables appear 1-2 minutes after data arrives (the committer is 
   - `metabase-db-password`
   - `metabase-encryption-key`
   - `metabase-admin-password`
+  - `hec-token`
+  - `otlp-bearer-token`
 - **Trino TLS:** the chart generates a private CA and certificate into Secret `<fullname>-trino-tls` (kept across upgrades by `lookup` regardless of expiry; the server certificate is valid for 825 days and the CA for 10 years, and nothing renews it automatically since Helm cannot parse x509. Before it expires, delete the Secret, `helm upgrade`, then restart Trino and Metabase; or supply `trino.tls.existingSecret`). Provide your own with `trino.tls.existingSecret` (keys `ca.pem` and `server.pem`). The Service exposes only HTTPS 8443.
   **GitOps:** a lookup-less render (`helm template | kubectl apply`, Argo CD, Flux) cannot read the
   live Secret, so it would regenerate the CA and certificate on every render. Set
@@ -251,6 +260,40 @@ kubectl exec -n <ns> <release>-logthing-analytics-postgres-0 -- psql -U postgres
 ```
 
 With `credentials.existingSecret`, add the three `metabase-*` keys to your Secret first.
+
+## Sending application logs (OTLP and HEC)
+
+> **Version warning:** the default image pins in this stack are 0.21.0, which predates the typed
+> OTLP table and HEC columns. The app-log features need logthing and committer **>= 0.22.0**. Until
+> the stack pins are bumped at release, set `LOGTHING_IMAGE` / `COMMITTER_IMAGE` (compose) or the
+> chart's image values to 0.22.0 or locally built images. With 0.21.0, OTLP rows land in the old
+> `hec` table and `stg_otlp` stays empty.
+
+logthing accepts application logs on port 5985 (plaintext HTTP, so the tokens are cleartext on the
+wire; front it with TLS if untrusted networks can reach it):
+
+| Protocol | Endpoint | Header | Token | Iceberg table |
+|----------|----------|--------|-------|---------------|
+| OTLP/HTTP | `POST /v1/logs` | `Authorization: Bearer <token>` | `OTLP_BEARER_TOKEN` / `otlp-bearer-token` | `iceberg.logs.otlp` |
+| Splunk HEC | `POST /services/collector/event` | `Authorization: Splunk <token>` | `HEC_TOKEN` / `hec-token` | `iceberg.logs.hec` |
+
+Read the tokens from `.env` (compose: `set -a; . deploy/analytics/.env; set +a`) or, for Helm, from
+the credentials Secret, e.g.
+`kubectl get secret -n <ns> <release>-logthing-analytics-credentials -o jsonpath='{.data.hec-token}' | base64 -d`
+(and `otlp-bearer-token`; port-forward `svc/<release>-logthing-analytics-logthing-tcp 5985`).
+
+```bash
+curl -sS -X POST http://localhost:5985/services/collector/event \
+  -H "Authorization: Splunk $HEC_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"event":{"message":"hello"},"sourcetype":"app","host":"h1"}'
+curl -sS -X POST http://localhost:5985/v1/logs \
+  -H "Authorization: Bearer $OTLP_BEARER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"demo"}}]},"scopeLogs":[{"logRecords":[{"severityNumber":9,"body":{"stringValue":"hello"}}]}]}]}'
+```
+
+Rows are queryable after the flush interval plus the committer interval (about 2 minutes by
+default). Exporter configuration (OpenTelemetry Collector `otlphttp`, SDK env vars, gzip, 503
+backpressure): see `docs/otlp.md`; HEC details: `docs/hec.md`.
 
 ## dbt and detections
 

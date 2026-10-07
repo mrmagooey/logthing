@@ -51,3 +51,12 @@ def test_dbt_readme_documents_detection_caveats_and_runtime_setup():
         assert needle in text, needle
     cron = text[text.index("cron every"):]
     assert "TRINO_PASSWORD" in cron and "TRINO_USER" in cron and "TRINO_PORT" in cron
+
+
+def test_readme_documents_sending_app_logs():
+    for needle in ("Sending application logs", "HEC_TOKEN", "OTLP_BEARER_TOKEN", "/v1/logs",
+                   "/services/collector/event", "Authorization: Splunk", "Authorization: Bearer",
+                   "docs/otlp.md", "hec-token", "otlp-bearer-token", "0.22.0"):
+        assert needle in README, needle
+    assert "unauthenticated plaintext HTTP" not in README
+    assert "cleartext" in README.lower()  # tokens cross the wire unencrypted: front with TLS

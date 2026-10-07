@@ -10,6 +10,14 @@ Query Trino (HTTPS + password; user admin, password in Secret {{ include "la.sec
   From your machine: kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "la.fullname" . }}-trino 8443
   and trust the CA in Secret {{ include "la.trinoTlsSecret" . }} key ca.pem.
 
+Send application logs (plaintext HTTP; front with TLS if untrusted networks can reach it):
+  endpoint http://{{ include "la.fullname" . }}-logthing-tcp:5985  (POST /v1/logs, POST /services/collector/event)
+  kubectl get secret -n {{ .Release.Namespace }} {{ include "la.secretName" . }} -o jsonpath='{.data.otlp-bearer-token}' | base64 -d   # Authorization: Bearer
+  kubectl get secret -n {{ .Release.Namespace }} {{ include "la.secretName" . }} -o jsonpath='{.data.hec-token}' | base64 -d   # Authorization: Splunk
+{{- if .Values.credentials.existingSecret }}
+  With credentials.existingSecret, add the keys hec-token and otlp-bearer-token to your Secret first.
+{{- end }}
+
 Tables appear only after the first committer run (CronJob {{ include "la.fullname" . }}-committer,
 schedule "{{ .Values.committer.schedule }}") has seen flushed data.
 

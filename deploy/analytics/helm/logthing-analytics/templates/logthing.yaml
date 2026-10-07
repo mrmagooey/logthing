@@ -56,7 +56,7 @@ spec:
             - {name: zeek, containerPort: 47760, protocol: TCP}
             - {name: http, containerPort: 5985, protocol: TCP}
           env:
-            {{- range $sec := list "SYSLOG" "IPFIX" "SFLOW" "ZEEK" "ICEBERG" }}
+            {{- range $sec := list "SYSLOG" "IPFIX" "SFLOW" "ZEEK" "HEC" "OTLP" "ICEBERG" }}
             - name: LOGTHING__{{ $sec }}__S3__ENDPOINT
               value: http://{{ include "la.fullname" $ }}-garage:3900
             {{- include "la.secretEnv" (dict "root" $ "name" (printf "LOGTHING__%s__S3__ACCESS_KEY" $sec) "key" "s3-access-key") | nindent 12 }}
@@ -66,6 +66,8 @@ spec:
               value: {{ $.Values.logthing.flushIntervalSecs | quote }}
             {{- end }}
             {{- end }}
+            {{- include "la.secretEnv" (dict "root" . "name" "LOGTHING__HEC__TOKEN" "key" "hec-token") | nindent 12 }}
+            {{- include "la.secretEnv" (dict "root" . "name" "LOGTHING__OTLP__BEARER_TOKEN" "key" "otlp-bearer-token") | nindent 12 }}
           readinessProbe:
             httpGet: {path: /health, port: 5985}
             periodSeconds: 5

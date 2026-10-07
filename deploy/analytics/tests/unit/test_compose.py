@@ -306,3 +306,29 @@ def test_internal_services_are_never_published(cfg):
     assert {p["target"] for p in cfg["services"]["garage"]["ports"]} == {3900}
     published = {p["target"] for s in cfg["services"].values() for p in s.get("ports", [])}
     assert not published & {5432, 8181, 3901, 3903, 8080}, published
+
+
+def test_logthing_has_otlp_and_hec_sinks_and_generated_tokens(tmp_path):
+    svc = compose_config(tmp_path, {"HEC_TOKEN": "HecTok1234567890abcdefgh",
+                                    "OTLP_BEARER_TOKEN": "OtlpTok1234567890abcdefg"})["services"]
+    env = svc["logthing"]["environment"]
+    assert env["LOGTHING__HEC__TOKEN"] == "HecTok1234567890abcdefgh"
+    assert env["LOGTHING__OTLP__BEARER_TOKEN"] == "OtlpTok1234567890abcdefg"
+    for sec in ("HEC", "OTLP", "SYSLOG"):
+        assert env[f"LOGTHING__{sec}__S3__ENDPOINT"] == "http://garage:3900"
+        assert env[f"LOGTHING__{sec}__S3__ACCESS_KEY"] and env[f"LOGTHING__{sec}__S3__SECRET_KEY"]
+        assert env[f"LOGTHING__{sec}__S3__FLUSH_INTERVAL_SECS"] == "60"
+
+
+@pytest.mark.parametrize("var", ["HEC_TOKEN", "OTLP_BEARER_TOKEN"])
+@pytest.mark.parametrize("mode", ["missing", "empty"])
+def test_missing_or_empty_ingest_token_fails_rendering(tmp_path, var, mode):
+    env = generated_env(tmp_path / "gen.env")
+    if mode == "missing":
+        del env[var]
+    else:
+        env[var] = ""
+    f = tmp_path / "t.env"
+    f.write_text("".join(f"{k}={v}\n" for k, v in env.items()))
+    r = run_config(f)
+    assert r.returncode != 0 and var in r.stderr

@@ -3,7 +3,7 @@
 # existingSecret to a Secret with these keys: garage-rpc-secret garage-admin-token
 # s3-access-key s3-secret-key postgres-password lakekeeper-db-password
 # lakekeeper-encryption-key trino-admin-password trino-metabase-password
-# trino-shared-secret metabase-db-password metabase-encryption-key metabase-admin-password.
+# trino-shared-secret metabase-db-password metabase-encryption-key metabase-admin-password hec-token otlp-bearer-token.
 # Values must be URL-safe ([A-Za-z0-9._~-]): they are spliced into Postgres URLs. The Garage key
 # id must be GK + 24 lowercase hex, its secret 64 lowercase hex.
 credentials:
@@ -21,6 +21,8 @@ credentials:
   metabaseDbPassword: ""
   metabaseEncryptionKey: ""
   metabaseAdminPassword: ""
+  hecToken: ""
+  otlpBearerToken: ""
 
 bootstrap:
   image: python:3.12-slim
