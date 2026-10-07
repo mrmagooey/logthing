@@ -896,7 +896,8 @@ pub struct HecConfig {
     /// Maximum distinct `sourcetype` partitions before overflow (default: 64).
     #[serde(default = "default_hec_max_sourcetype_partitions")]
     pub max_sourcetype_partitions: usize,
-    /// Optional S3 persistence. `None` → records are accepted but not stored.
+    /// Optional S3 persistence. At least one of `s3`/`local` is required when `[hec]` is
+    /// enabled (validated at startup).
     #[serde(default)]
     pub s3: Option<HecS3Config>,
     /// Optional local-disk persistence. `None` → not persisted to local disk.
@@ -1826,6 +1827,9 @@ fn stale_admin_override_warning(dir: &Path) -> Option<String> {
 /// `security.allowed_ips` is parsed here and again in `main.rs`, where
 /// `IpWhitelist::new` needs the parsed networks anyway. Both fail fast and
 /// agree; the duplication is deliberate, not an oversight.
+///
+/// Also rejects an enabled `[hec]`/`[otlp]` section with no sink (records would be silently
+/// dropped) and `otlp.max_service_partitions = 0`.
 pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
     let mut errors: Vec<String> = Vec::new();
 
@@ -1854,6 +1858,33 @@ pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
 
     if let Err(err) = crate::middleware::parse_allowed_ips(&cfg.security.allowed_ips) {
         errors.push(format!("security.allowed_ips: {err}"));
+    }
+
+    // HEC/OTLP accept data over HTTP and answer 200; with no sink every record would be
+    // silently discarded. Fail loudly at startup instead.
+    if cfg.hec.enabled && cfg.hec.s3.is_none() && cfg.hec.local.is_none() {
+        errors.push(
+            "[hec] enabled = true but no sink configured: add [hec.s3] or [hec.local] \
+             (see docs/hec.md#migration)"
+                .to_string(),
+        );
+    }
+    // The [otlp] section is inert without the `otlp` Cargo feature (route never mounted).
+    if cfg!(feature = "otlp") && cfg.otlp.enabled {
+        if cfg.otlp.s3.is_none() && cfg.otlp.local.is_none() {
+            errors.push(
+                "[otlp] enabled = true but no sink configured: add [otlp.s3] or [otlp.local] \
+                 (OTLP no longer writes to [hec] sinks since 0.22.0; see docs/otlp.md#migration)"
+                    .to_string(),
+            );
+        }
+        if cfg.otlp.max_service_partitions == 0 {
+            errors.push(
+                "[otlp] max_service_partitions must be greater than 0 (0 would let any exporter \
+                 mint unbounded service partitions)"
+                    .to_string(),
+            );
+        }
     }
 
     if errors.is_empty() {
@@ -3402,5 +3433,103 @@ directory = "/tmp/otlp"
         assert_eq!(local.prefix, "otlp");
         assert_eq!(local.flush_interval_secs, 900);
         assert_eq!(local.channel_capacity, s3.channel_capacity);
+    }
+
+    fn sink_dir() -> Option<GenericLocalConfig> {
+        Some(GenericLocalConfig {
+            directory: std::path::PathBuf::from("/tmp/x"),
+            prefix: "hec".to_string(),
+            flush_threshold_bytes: 1,
+            flush_interval_secs: 1,
+            channel_capacity: 1,
+            max_buffer_rows: 1,
+        })
+    }
+
+    #[cfg(feature = "otlp")]
+    fn otlp_sink_dir() -> Option<OtlpLocalConfig> {
+        Some(OtlpLocalConfig {
+            directory: std::path::PathBuf::from("/tmp/o"),
+            prefix: "otlp".to_string(),
+            flush_threshold_bytes: 1,
+            flush_interval_secs: 1,
+            channel_capacity: 1,
+            max_buffer_rows: 1,
+        })
+    }
+
+    /// A config that passes every invariant except the sink rules under test.
+    fn valid_base() -> Config {
+        let mut cfg = Config::default();
+        cfg.tls.enabled = false;
+        cfg
+    }
+
+    #[test]
+    fn validate_base_config_is_valid() {
+        assert_eq!(validate_config_invariants(&valid_base()), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_hec_enabled_without_sink() {
+        let mut cfg = valid_base();
+        cfg.hec.enabled = true;
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert!(
+            err.contains(
+                "[hec] enabled = true but no sink configured: add [hec.s3] or [hec.local] \
+                 (see docs/hec.md#migration)"
+            ),
+            "{err}"
+        );
+        cfg.hec.local = sink_dir();
+        assert_eq!(validate_config_invariants(&cfg), Ok(()));
+    }
+
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn validate_rejects_otlp_enabled_without_sink() {
+        const MSG: &str = "[otlp] enabled = true but no sink configured: add [otlp.s3] or \
+                           [otlp.local] (OTLP no longer writes to [hec] sinks since 0.22.0; \
+                           see docs/otlp.md#migration)";
+        let mut cfg = valid_base();
+        cfg.otlp.enabled = true;
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert!(err.contains(MSG), "{err}");
+        // A configured HEC sink must NOT satisfy OTLP (the old, silent-drop shape).
+        cfg.hec.enabled = true;
+        cfg.hec.local = sink_dir();
+        let err = validate_config_invariants(&cfg).expect_err("hec sink must not count");
+        assert!(err.contains(MSG), "{err}");
+        cfg.otlp.local = otlp_sink_dir();
+        assert_eq!(validate_config_invariants(&cfg), Ok(()));
+    }
+
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn validate_rejects_zero_otlp_max_service_partitions() {
+        let mut cfg = valid_base();
+        cfg.otlp.enabled = true;
+        cfg.otlp.local = otlp_sink_dir();
+        assert_eq!(validate_config_invariants(&cfg), Ok(()));
+        cfg.otlp.max_service_partitions = 0;
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert!(
+            err.contains(
+                "[otlp] max_service_partitions must be greater than 0 (0 would let any \
+                 exporter mint unbounded service partitions)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_ignores_sinks_of_disabled_sections() {
+        // Nothing enabled, nothing to validate.
+        assert_eq!(validate_config_invariants(&valid_base()), Ok(()));
+        // A disabled OTLP section with a zero cap is inert.
+        let mut cfg = valid_base();
+        cfg.otlp.max_service_partitions = 0;
+        assert_eq!(validate_config_invariants(&cfg), Ok(()));
     }
 }

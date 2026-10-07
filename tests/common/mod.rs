@@ -6,6 +6,7 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Every `*.parquet` file under `dir`, sorted.
@@ -70,4 +71,120 @@ pub fn str_col<'a>(batch: &'a RecordBatch, name: &str) -> &'a StringArray {
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap_or_else(|| panic!("column {name} is not Utf8"))
+}
+
+/// Ask the OS for a free localhost TCP port (released immediately; small race is accepted,
+/// same trade-off the other e2e tests make).
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn write_cfg(dir: &Path, toml: &str) {
+    std::fs::write(dir.join("logthing.toml"), toml).expect("write logthing.toml");
+}
+
+/// Run the binary with `toml` as `./logthing.toml` in a fresh temp dir and wait for it to exit
+/// (use for configs that must be rejected at startup). Returns (status, stderr).
+pub fn run_to_exit(
+    bin: &str,
+    toml: &str,
+    envs: &[(&str, &str)],
+) -> (std::process::ExitStatus, String) {
+    let dir = tempfile::tempdir().unwrap();
+    write_cfg(dir.path(), toml);
+    let mut cmd = Command::new(bin);
+    cmd.current_dir(dir.path()).stdin(Stdio::null());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn logthing");
+    (
+        out.status,
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A running logthing process; killed and reaped on drop.
+pub struct Proc {
+    child: Child,
+    pub http_port: u16,
+    pub dir: tempfile::TempDir,
+}
+
+impl Proc {
+    /// Spawn the binary. `toml` may contain the placeholders `{HTTP}` and `{DIR}`, replaced by
+    /// the chosen HTTP port and the process temp dir (sinks should live under `{DIR}`).
+    pub fn spawn(bin: &str, toml: &str, envs: &[(&str, &str)]) -> Proc {
+        let dir = tempfile::tempdir().unwrap();
+        let http_port = free_port();
+        let toml = toml
+            .replace("{HTTP}", &http_port.to_string())
+            .replace("{DIR}", &dir.path().display().to_string());
+        write_cfg(dir.path(), &toml);
+        let mut cmd = Command::new(bin);
+        cmd.current_dir(dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(
+                std::fs::File::create(dir.path().join("stdout.log")).unwrap(),
+            ))
+            .stderr(Stdio::from(
+                std::fs::File::create(dir.path().join("stderr.log")).unwrap(),
+            ));
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let child = cmd.spawn().expect("spawn logthing");
+        Proc {
+            child,
+            http_port,
+            dir,
+        }
+    }
+
+    /// Base URL of the HTTP listener.
+    pub fn base(&self) -> String {
+        format!("http://127.0.0.1:{}", self.http_port)
+    }
+
+    /// Poll `/health` until it answers 200 (panics with the child's logs on timeout or exit).
+    pub async fn wait_healthy(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(r) = reqwest::get(format!("{}/health", self.base())).await
+                && r.status().is_success()
+            {
+                return;
+            }
+            if let Some(st) = self.child.try_wait().unwrap() {
+                panic!("logthing exited early ({st}); stderr:\n{}", self.logs());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "logthing never became healthy:\n{}",
+                self.logs()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// stdout+stderr captured so far.
+    pub fn logs(&self) -> String {
+        let read = |n: &str| std::fs::read_to_string(self.dir.path().join(n)).unwrap_or_default();
+        format!(
+            "--- stdout ---\n{}\n--- stderr ---\n{}",
+            read("stdout.log"),
+            read("stderr.log")
+        )
+    }
+}
+
+impl Drop for Proc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }

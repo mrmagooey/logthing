@@ -89,7 +89,11 @@ enabled = false
 [hec]
 enabled = true
 token = "e2e-token"
+
+[hec.local]
+directory = "{dir}/hec"
 "#,
+        dir = tmp.path().display(),
     );
     std::fs::write(tmp.path().join("logthing.toml"), toml).expect("write logthing.toml");
 

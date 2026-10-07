@@ -364,7 +364,10 @@ write_config() {
                 echo "[$CONFIG_SECTION]"; echo 'enabled = true'
                 echo "tcp_port = $PORT"; echo 'bind_address = "0.0.0.0"' ;;
             http)
-                echo '[hec]'; echo 'enabled = true'; echo 'token = ""' ;;
+                echo '[hec]'; echo 'enabled = true'; echo 'token = ""'
+                if [ "$SHAPE" != "real" ]; then
+                    echo '[hec.local]'; echo "directory = \"$LOCAL_DIR\""
+                fi ;;
         esac
 
         if [ "$SHAPE" = "real" ]; then
