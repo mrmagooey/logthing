@@ -119,6 +119,30 @@ timeout 300 "${K[@]}" run sender --rm -i --restart=Never --pod-running-timeout=3
   --image=python:3.12-slim -- python -c "$SENDER" \
   || { echo "sender failed" >&2; exit 1; }
 
+ZEEK_SENDER=$(cat <<PYEOF
+import json, socket, time
+ts = time.time()
+recs = [
+    {"_path": "conn", "ts": ts, "uid": "$MARKER", "id.orig_h": "10.20.30.40", "id.orig_p": 51234,
+     "id.resp_h": "198.51.100.9", "id.resp_p": 443, "proto": "tcp", "service": "ssl",
+     "duration": 1.5, "orig_bytes": 100, "resp_bytes": 2000, "conn_state": "SF",
+     "history": "ShADadFf", "orig_pkts": 4, "resp_pkts": 6},
+    {"_path": "dns", "ts": ts, "uid": "$MARKER", "id.orig_h": "10.20.30.40", "id.orig_p": 53211,
+     "id.resp_h": "10.20.30.1", "id.resp_p": 53, "proto": "udp", "trans_id": 4242,
+     "query": "$MARKER.example.test", "qtype_name": "A", "qclass_name": "C_INTERNET",
+     "rcode_name": "NOERROR", "answers": ["192.0.2.10"]},
+]
+s = socket.create_connection(("$FULL-logthing-tcp", 47760), 10)
+for r in recs:
+    s.sendall((json.dumps(r) + "\n").encode())
+s.close()
+PYEOF
+)
+"${K[@]}" delete pod zeeksender --ignore-not-found >/dev/null
+timeout 300 "${K[@]}" run zeeksender --rm -i --restart=Never --pod-running-timeout=3m \
+  --image=python:3.12-slim -- python -c "$ZEEK_SENDER" \
+  || { echo "zeek sender failed" >&2; exit 1; }
+
 COUNT_SQL="SELECT count(*) FROM iceberg.logs.syslog WHERE message LIKE '%$MARKER%'"
 trino_count() {
   timeout 30 "${K[@]}" exec "deploy/$FULL-trino" -- "${TRINO_CLI[@]}" --output-format TSV --execute "$COUNT_SQL" 2>/dev/null \
@@ -135,6 +159,12 @@ until [ "$(trino_count)" = "$N" ]; do
   fi
   sleep 5
 done
+sql() {
+  timeout 60 "${K[@]}" exec "deploy/$FULL-trino" -- "${TRINO_CLI[@]}" --output-format TSV --execute "$1" | tr -d '"\r'
+}
+zeek_landed() { [ "$(sql "SELECT count(*) FROM iceberg.logs.$1 WHERE uid = '$MARKER'")" = 1 ]; }
+wait_until 300 "zeek_conn row" zeek_landed zeek_conn || { dump_logs; exit 1; }
+wait_until 300 "zeek_dns row" zeek_landed zeek_dns || { dump_logs; exit 1; }
 echo "trino: $N"
 
 echo "== [7/9] Trino security through a port-forward: HTTPS + password negatives =="
@@ -167,6 +197,24 @@ dbt_ok "$rc" "$DBT_OUT" \
   || { echo "dbt build failed (exit $rc or ERROR>0 in summary)" >&2
        "${K[@]}" logs "deploy/$FULL-trino" --tail 80 >&2 || true; exit 1; }
 echo "dbt: build ok"
+
+echo "== [8b/9] OCSF views and detection analyses over the Zeek rows =="
+fail() { echo "FAIL: $*" >&2; "${K[@]}" logs "deploy/$FULL-trino" --tail 80 >&2 || true; exit 1; }
+[ "$(sql "SELECT count(*) FROM iceberg.logs.ocsf_network_activity WHERE metadata_correlation_uid = '$MARKER' AND class_uid = 4001 AND src_endpoint_ip = '10.20.30.40' AND dst_endpoint_port = 443 AND connection_info_protocol_num = 6")" = 1 ] \
+  || fail "ocsf_network_activity did not map the Zeek conn record"
+[ "$(sql "SELECT count(*) FROM iceberg.logs.ocsf_dns_activity WHERE metadata_correlation_uid = '$MARKER' AND query_hostname = '$MARKER.example.test' AND activity_id = 2")" = 1 ] \
+  || fail "ocsf_dns_activity did not map the Zeek dns record"
+env TRINO_HOST=localhost TRINO_PORT="$TRINO_LOCAL_PORT" TRINO_USER=admin \
+  TRINO_PASSWORD="$ADMIN_PW" TRINO_CA_CERT="$CA" DBT_SEND_ANONYMOUS_USAGE_STATS=false \
+  "$DBT" --log-path "$DBT_WORK/logs" compile --project-dir "$ANALYTICS/dbt" \
+  --profiles-dir "$ANALYTICS/dbt" --target-path "$DBT_WORK/target" >/dev/null || fail "dbt compile failed"
+analyses=0
+for f in "$DBT_WORK"/target/compiled/logthing_analytics/analyses/*.sql; do
+  sql "$(cat "$f")" >/dev/null || fail "analysis $(basename "$f") failed to execute"
+  analyses=$((analyses + 1))
+done
+[ "$analyses" = 3 ] || fail "expected 3 compiled analyses, found $analyses"
+echo "ocsf: network + dns mapped; $analyses analyses executed"
 
 echo "== [9/9] same query through Metabase's API =="
 "${K[@]}" port-forward "svc/$FULL-metabase" "$MB_LOCAL_PORT:3000" >/dev/null 2>&1 &

@@ -21,7 +21,9 @@ with alerts as (
 
 select
     coalesce(
-        try(cast(parse_datetime(ts_raw, 'yyyy-MM-dd''T''HH:mm:ss.SSSSSSZ') as timestamp(6) with time zone)),
+        try(cast(from_iso8601_timestamp_nanos(
+            regexp_replace(ts_raw, '([+-][0-9]{2})([0-9]{2})$', '$1:$2'))
+            as timestamp(6) with time zone)),
         received_at) as "time",
     2 as category_uid,
     'Findings' as category_name,

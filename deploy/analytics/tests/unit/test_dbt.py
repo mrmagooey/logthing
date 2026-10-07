@@ -167,3 +167,46 @@ def test_wef_field_regex_handles_quote_styles_and_absence(xml, want):
 def test_wef_field_turns_blank_and_dash_into_null():
     text = (DBT_DIR / "macros" / "wef_field.sql").read_text()
     assert "nullif(nullif(trim(" in text and "'-'" in text
+
+
+ANALYSES = {"detect_auth_bruteforce": "ocsf_authentication",
+            "detect_suricata_high_severity": "ocsf_detection_finding",
+            "detect_rare_outbound_port": "ocsf_network_activity"}
+
+
+def test_three_detection_analyses_read_only_ocsf_views(manifest):
+    found = nodes(manifest, "analysis")
+    assert set(found) == set(ANALYSES)
+    for name, model in ANALYSES.items():
+        assert found[name]["depends_on"]["nodes"] == [f"model.logthing_analytics.{model}"], name
+        text = (DBT_DIR / "analyses" / f"{name}.sql").read_text()
+        assert "iceberg.logs" not in text and "source(" not in text, name
+
+
+def test_detection_thresholds_are_dbt_vars():
+    text = "".join((DBT_DIR / "analyses" / f"{n}.sql").read_text() for n in ANALYSES)
+    for var in ("bruteforce_threshold", "suricata_min_severity_id", "rare_port_max_connections"):
+        assert f"var('{var}'" in text, var
+
+
+def test_detections_take_their_reference_time_from_one_pinned_macro_never_the_wall_clock():
+    for n in ANALYSES:
+        text = (DBT_DIR / "analyses" / f"{n}.sql").read_text()
+        assert "current_timestamp" not in text and not re.search(r"(?<!detection_)now\(\)", text), n
+        assert "detection_now()" in text, n
+    macro = (DBT_DIR / "macros" / "detection_now.sql").read_text()
+    assert "var('detection_as_of'" in macro and "current_timestamp" in macro
+
+
+def test_readme_documents_scope_decisions():
+    text = (DBT_DIR / "README.md").read_text()
+    for needle in ("pySigma", "syslog", "raw_xml", "dbt run", "CronJob", "stg_otlp",
+                   "detection_as_of", "TextQueryBackend", "2026-10-06"):
+        assert needle in text, needle
+
+
+def test_zeek_protocol_number_is_mapped_from_the_name_in_the_network_view():
+    text = (DBT_DIR / "models" / "ocsf" / "ocsf_network_activity.sql").read_text()
+    assert "cast(null as integer) as connection_info_protocol_num" not in text.split("ipfix as")[0]
+    unit = (DBT_DIR / "models" / "ocsf" / "unit_tests.yml").read_text()
+    assert "connection_info_protocol_num: 6" in unit and "connection_info_protocol_num: 58" in unit

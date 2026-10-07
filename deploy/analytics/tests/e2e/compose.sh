@@ -13,6 +13,7 @@ DBT_WORK=$(mktemp -d)
 PROJECT="lt-e2e-$$"
 # Non-default host ports so a developer's running stack does not collide.
 SYSLOG_UDP_PORT=25514
+ZEEK_PORT=47761
 TRINO_PORT=28443
 METABASE_PORT=23000
 N=40
@@ -32,7 +33,7 @@ SYSLOG_UDP_PORT=$SYSLOG_UDP_PORT
 SYSLOG_TCP_PORT=25601
 IPFIX_PORT=24739
 SFLOW_PORT=26343
-ZEEK_PORT=47761
+ZEEK_PORT=$ZEEK_PORT
 LOGTHING_HEALTH_PORT=25985
 GARAGE_S3_PORT=23901
 TRINO_PORT=$TRINO_PORT
@@ -66,10 +67,10 @@ fail() { echo "FAIL: $*" >&2; dump_logs trino; exit 1; }
 TRINO_CLI=(trino --server https://localhost:8443 --truststore-path /etc/trino/tls/ca.pem
            --user admin --password)
 
-echo "== [1/7] up (project $PROJECT) =="
+echo "== [1/8] up (project $PROJECT) =="
 timeout "$UP_TIMEOUT_SECS" "${DC[@]}" up -d --wait || { echo "stack failed to become healthy" >&2; dump_logs; exit 1; }
 
-echo "== [2/7] Trino security: HTTPS + password, negative tests =="
+echo "== [2/8] Trino security: HTTPS + password, negative tests =="
 "${DC[@]}" exec -T trino cat /etc/trino/tls/ca.pem >"$CA"
 trino_security_checks "https://localhost:$TRINO_PORT" "$CA" "$TRINO_ADMIN_PASSWORD" \
   || { dump_logs trino; exit 1; }
@@ -91,7 +92,7 @@ fi
 "${DC[@]}" ps --format json | "$PY" "$HERE/published_ports.py" || fail "an internal port is published to the host"
 echo "isolation: lakekeeper, postgres and garage admin are not published"
 
-echo "== [3/7] send $N syslog messages ($MARKER) =="
+echo "== [3/8] send $N syslog messages ($MARKER) =="
 "$PY" - "$SYSLOG_UDP_PORT" "$N" "$MARKER" <<'PYEOF'
 import socket, sys, time
 port, n, marker = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
@@ -102,13 +103,33 @@ for i in range(n):
     time.sleep(0.02)  # pace sends so the UDP socket buffer is not overrun; never retried
 PYEOF
 
+"$PY" - "$ZEEK_PORT" "$MARKER" <<'PYEOF'
+import json, socket, sys, time
+port, marker = int(sys.argv[1]), sys.argv[2]
+ts = time.time()
+recs = [
+    {"_path": "conn", "ts": ts, "uid": marker, "id.orig_h": "10.20.30.40", "id.orig_p": 51234,
+     "id.resp_h": "198.51.100.9", "id.resp_p": 443, "proto": "tcp", "service": "ssl",
+     "duration": 1.5, "orig_bytes": 100, "resp_bytes": 2000, "conn_state": "SF",
+     "history": "ShADadFf", "orig_pkts": 4, "resp_pkts": 6},
+    {"_path": "dns", "ts": ts, "uid": marker, "id.orig_h": "10.20.30.40", "id.orig_p": 53211,
+     "id.resp_h": "10.20.30.1", "id.resp_p": 53, "proto": "udp", "trans_id": 4242,
+     "query": f"{marker}.example.test", "qtype_name": "A", "qclass_name": "C_INTERNET",
+     "rcode_name": "NOERROR", "answers": ["192.0.2.10"]},
+]
+s = socket.create_connection(("127.0.0.1", port), 10)
+for r in recs:
+    s.sendall((json.dumps(r) + "\n").encode())
+s.close()
+PYEOF
+
 COUNT_SQL="SELECT count(*) FROM iceberg.logs.syslog WHERE message LIKE '%$MARKER%'"
 trino_count() {
   "${DC[@]}" exec -T trino "${TRINO_CLI[@]}" --output-format TSV --execute "$COUNT_SQL" 2>/dev/null \
     | tr -d '"\r' || true
 }
 
-echo "== [4/7] wait (<=300s) for committer to land rows in iceberg.logs.syslog =="
+echo "== [4/8] wait (<=300s) for committer to land rows in iceberg.logs.syslog =="
 deadline=$(( $(date +%s) + 300 ))
 until [ "$(trino_count)" = "$N" ]; do
   if [ "$(date +%s)" -ge "$deadline" ]; then
@@ -119,18 +140,23 @@ until [ "$(trino_count)" = "$N" ]; do
   sleep 5
 done
 
-echo "== [5/7] Trino count =="
+sql() { "${DC[@]}" exec -T trino "${TRINO_CLI[@]}" --output-format TSV --execute "$1" | tr -d '"\r'; }
+zeek_landed() { [ "$(sql "SELECT count(*) FROM iceberg.logs.$1 WHERE uid = '$MARKER'")" = 1 ]; }
+wait_until 300 "zeek_conn row" zeek_landed zeek_conn || { dump_logs committer logthing; exit 1; }
+wait_until 300 "zeek_dns row" zeek_landed zeek_dns || { dump_logs committer logthing; exit 1; }
+
+echo "== [5/8] Trino count =="
 [ "$(trino_count)" = "$N" ] || { echo "Trino count mismatch" >&2; exit 1; }
 echo "trino: $N"
 
-echo "== [6/7] same query through Metabase's API (Trino over TLS) =="
+echo "== [6/8] same query through Metabase's API (Trino over TLS) =="
 MB_COUNT=$(METABASE_PASSWORD=$(envval METABASE_ADMIN_PASSWORD) "$PY" "$HERE/metabase_query.py" \
   "http://127.0.0.1:$METABASE_PORT" admin@logthing.example "$COUNT_SQL") \
   || { dump_logs metabase metabase-init trino; exit 1; }
 [ "$MB_COUNT" = "$N" ] || { echo "Metabase returned $MB_COUNT, expected $N" >&2; dump_logs metabase; exit 1; }
 echo "metabase: $MB_COUNT"
 
-echo "== [7/7] dbt build (staging views + tests) against Trino over TLS =="
+echo "== [7/8] dbt build (staging views + tests) against Trino over TLS =="
 rc=0; DBT_OUT=$(run_dbt build 2>&1) || rc=$?
 printf '%s\n' "$DBT_OUT"
 dbt_ok "$rc" "$DBT_OUT" || { echo "dbt build failed (exit $rc or ERROR>0 in summary)" >&2; dump_logs trino; exit 1; }
@@ -138,5 +164,19 @@ dbt_ok "$rc" "$DBT_OUT" || { echo "dbt build failed (exit $rc or ERROR>0 in summ
      --execute "SELECT count(*) FROM iceberg.logs.stg_wef" | tr -d '"\r')" = 0 ] \
   || fail "stg_wef should be empty: this stack sends no WEF data"
 echo "dbt: build ok"
+
+echo "== [8/8] OCSF views and detection analyses over the Zeek rows =="
+[ "$(sql "SELECT count(*) FROM iceberg.logs.ocsf_network_activity WHERE metadata_correlation_uid = '$MARKER' AND class_uid = 4001 AND src_endpoint_ip = '10.20.30.40' AND dst_endpoint_port = 443 AND connection_info_protocol_num = 6")" = 1 ] \
+  || fail "ocsf_network_activity did not map the Zeek conn record"
+[ "$(sql "SELECT count(*) FROM iceberg.logs.ocsf_dns_activity WHERE metadata_correlation_uid = '$MARKER' AND query_hostname = '$MARKER.example.test' AND activity_id = 2")" = 1 ] \
+  || fail "ocsf_dns_activity did not map the Zeek dns record"
+run_dbt compile >/dev/null || fail "dbt compile failed"
+analyses=0
+for f in "$DBT_WORK"/target/compiled/logthing_analytics/analyses/*.sql; do
+  sql "$(cat "$f")" >/dev/null || fail "analysis $(basename "$f") failed to execute"
+  analyses=$((analyses + 1))
+done
+[ "$analyses" = 3 ] || fail "expected 3 compiled analyses, found $analyses"
+echo "ocsf: network + dns mapped; $analyses analyses executed"
 
 echo "Analytics compose E2E PASSED"

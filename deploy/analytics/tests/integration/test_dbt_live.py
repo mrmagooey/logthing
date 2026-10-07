@@ -4,10 +4,14 @@ The tests in this module are ORDERED and share one stack: the first builds again
 the second seeds tables, the third proves views must be rebuilt to see them.
 """
 import json
+import os
+import re
+from datetime import datetime, timedelta, timezone
 
 import pytest
+import yaml
 
-from stack import Stack, dbt_failure, require_dbt, require_docker, require_trino, run_dbt
+from stack import DBT_DIR, Stack, dbt_failure, require_dbt, require_docker, require_trino, run_dbt
 
 pytestmark = pytest.mark.integration
 require_docker()
@@ -97,7 +101,7 @@ def seed(s):
 def dbt_stack(tmp_path_factory):
     s = Stack(tmp_path_factory.mktemp("dbt"))
     try:
-        s.up("trino", timeout=900)
+        s.up("trino", timeout=int(os.environ.get("UP_TIMEOUT_SECS", "900")))
         yield s
     finally:
         s.down()
@@ -141,7 +145,9 @@ def test_rebuild_is_idempotent(dbt_stack):
 def test_full_build_runs_unit_tests_and_schema_tests(dbt_stack):
     r = run_dbt(dbt_stack, "build")
     assert dbt_failure(r) is None, dbt_failure(r)
-    assert "unit_test" in r.stdout  # the dbt unit tests really ran
+    declared = yaml.safe_load((DBT_DIR / "models" / "ocsf" / "unit_tests.yml").read_text())
+    ran = re.findall(r"START unit_test ", r.stdout)
+    assert len(ran) == len(declared["unit_tests"]) > 0, (len(ran), r.stdout[-3000:])
 
 
 def tsv(stack, sql):
@@ -165,9 +171,9 @@ def test_seeded_rows_land_in_ocsf_network_activity(dbt_stack):
 def test_seeded_rows_land_in_ocsf_dns_and_detection_views(dbt_stack):
     assert tsv(dbt_stack, "SELECT query_hostname, activity_id, rcode FROM "
                           "iceberg.logs.ocsf_dns_activity") == [("example.test", "2", "NOERROR")]
-    assert tsv(dbt_stack, "SELECT finding_info_title, severity_id, dst_endpoint_ip FROM "
-                          "iceberg.logs.ocsf_detection_finding") == [
-        ("ET SCAN test", "4", "198.51.100.7")]
+    assert tsv(dbt_stack, "SELECT finding_info_title, severity_id, dst_endpoint_ip, "
+                          'CAST("time" AS varchar) FROM iceberg.logs.ocsf_detection_finding') == [
+        ("ET SCAN test", "4", "198.51.100.7", "2026-10-01 12:00:00.123456 UTC")]  # microseconds kept
 
 
 def test_required_ocsf_columns_are_never_null_on_real_rows(dbt_stack):
@@ -178,3 +184,76 @@ def test_required_ocsf_columns_are_never_null_on_real_rows(dbt_stack):
             "OR category_uid IS NULL OR activity_id IS NULL OR type_uid IS NULL "
             "OR severity_id IS NULL OR metadata_product_name IS NULL")
         assert nulls == "0", view
+
+
+# The detections take a pinned reference time (dbt var detection_as_of), never the wall clock.
+# The seeded 2026-10-01 rows are 4 days old at AS_OF, so they form the port baseline and sit
+# outside every one-day window; only the rows inserted below, one hour before AS_OF, can fire.
+AS_OF = datetime(2026, 10, 5, 12, 0, 0, tzinfo=timezone.utc)
+PIN = ["--vars", '{detection_as_of: "2026-10-05T12:00:00Z"}']
+
+
+def lit(dt):
+    return "TIMESTAMP '" + dt.strftime("%Y-%m-%d %H:%M:%S") + " UTC'"
+
+
+def failed_logon(i, when):
+    xml = ('<Event><EventData><Data Name="TargetUserName">user%d</Data>'
+           '<Data Name="TargetDomainName">CONTOSO</Data><Data Name="LogonType">3</Data>'
+           '<Data Name="IpAddress">203.0.113.9</Data></EventData></Event>' % i)
+    blob = json.dumps({"raw_xml": xml, "parsed": {
+        "event_id": 4625, "computer": "WS01.contoso.com",
+        "time_created": when.strftime("%Y-%m-%dT%H:%M:%SZ")}})
+    return f"(4625, {lit(when)}, 'ws01', 'sub', {q(blob)}, {lit(when)})"
+
+
+def analysis(stack, name):
+    compiled = (stack.envfile.parent / "dbttarget" / "compiled" / "logthing_analytics"
+                / "analyses" / f"{name}.sql")
+    return [tuple(line.split("\t")) for line in stack.trino(compiled.read_text()).splitlines()
+            if line]
+
+
+def test_analyses_compile_and_fire_on_fresh_seeded_activity(dbt_stack):
+    fresh = AS_OF - timedelta(hours=1)
+    dbt_stack.trino("INSERT INTO iceberg.logs.wef VALUES "
+                    + ", ".join(failed_logon(i, fresh) for i in range(12)))
+    alert = json.dumps({"timestamp": fresh.strftime("%Y-%m-%dT%H:%M:%S.000000+0000"),
+                        "src_ip": "10.0.0.66", "dest_ip": "198.51.100.77", "dest_port": 445,
+                        "proto": "TCP", "alert": {"signature": "ET EXPLOIT test",
+                                                  "signature_id": 2024000, "severity": 1}})
+    dbt_stack.trino(f"INSERT INTO iceberg.logs.suricata VALUES ('alert', {lit(fresh)}, "
+                    f"'10.0.0.66', {q(alert)}, {lit(fresh)})")
+    dbt_stack.trino("INSERT INTO iceberg.logs.zeek_conn VALUES "
+                    f"({lit(fresh)}, 'C99', '10.0.0.5', 52000, '203.0.113.77', 31337, 'tcp', NULL, "
+                    f"0.5, 10, 20, 'SF', 'ShAD', 1, 1, '{{}}', {lit(fresh)})")
+    r = run_dbt(dbt_stack, "compile", *PIN)
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr
+
+    brute = analysis(dbt_stack, "detect_auth_bruteforce")
+    assert [(row[0], row[2], row[3]) for row in brute] == [("203.0.113.9", "12", "12")]
+    assert [(row[0], row[1]) for row in analysis(dbt_stack, "detect_suricata_high_severity")] == [
+        ("198.51.100.77", "1")]
+    assert [(row[0], row[1]) for row in analysis(dbt_stack, "detect_rare_outbound_port")] == [
+        ("31337", "1")]
+
+
+def test_detection_threshold_variable_is_honoured(dbt_stack):
+    r = run_dbt(dbt_stack, "compile", "--vars",
+                '{detection_as_of: "2026-10-05T12:00:00Z", bruteforce_threshold: 13}')
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr
+    assert analysis(dbt_stack, "detect_auth_bruteforce") == []
+
+
+def test_pinned_reference_time_excludes_activity_outside_the_window(dbt_stack):
+    far_future = '{detection_as_of: "2027-01-01T00:00:00Z"}'
+    r = run_dbt(dbt_stack, "compile", "--vars", far_future)
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr
+    for name in ("detect_auth_bruteforce", "detect_suricata_high_severity"):
+        assert analysis(dbt_stack, name) == [], name
+
+
+def test_second_full_build_is_idempotent(dbt_stack):
+    for _ in range(2):
+        r = run_dbt(dbt_stack, "build")
+        assert dbt_failure(r) is None, dbt_failure(r)

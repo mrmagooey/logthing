@@ -196,9 +196,18 @@ def test_e2e_scripts_run_dbt_build_and_check_the_summary():
 
 
 def test_e2e_scripts_include_the_metabase_step_and_no_hue():
-    for name, marker in (("compose.sh", "[6/7]"), ("helm-minikube.sh", "[9/9]")):
+    for name, marker in (("compose.sh", "[6/8]"), ("helm-minikube.sh", "[9/9]")):
         text = (ANALYTICS / "tests" / "e2e" / name).read_text()
         assert marker in text and "metabase_query.py" in text, name
     assert "published_ports.py" in (ANALYTICS / "tests" / "e2e" / "compose.sh").read_text()
     helm = (ANALYTICS / "tests" / "e2e" / "helm-minikube.sh").read_text()
     assert "$FULL-trino-tls" in helm and "metabase-init" in helm
+
+
+def test_e2e_scripts_send_zeek_and_execute_every_compiled_analysis():
+    for name in ("compose.sh", "helm-minikube.sh"):
+        text = (ANALYTICS / "tests" / "e2e" / name).read_text()
+        for needle in ('"_path": "conn"', '"_path": "dns"', "ocsf_network_activity",
+                       "ocsf_dns_activity", "compiled/logthing_analytics/analyses",
+                       '[ "$analyses" = 3 ]', "connection_info_protocol_num = 6"):
+            assert needle in text, (name, needle)

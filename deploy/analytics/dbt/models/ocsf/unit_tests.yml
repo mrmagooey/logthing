@@ -42,6 +42,7 @@ unit_tests:
           metadata_log_name: 'zeek_conn'
           src_endpoint_ip: '10.0.0.5'
           dst_endpoint_port: 443
+          connection_info_protocol_num: 6
           connection_info_protocol_name: 'tcp'
           traffic_bytes: 2100
           metadata_correlation_uid: 'Cabc'
@@ -51,6 +52,7 @@ unit_tests:
           metadata_log_name: 'ipfix'
           src_endpoint_ip: '10.0.0.6'
           dst_endpoint_port: 53
+          connection_info_protocol_num: 17
           connection_info_protocol_name: 'udp'
           traffic_bytes: 500
           metadata_correlation_uid: null
@@ -60,6 +62,7 @@ unit_tests:
           metadata_log_name: 'sflow_flow'
           src_endpoint_ip: '10.0.0.7'
           dst_endpoint_port: 80
+          connection_info_protocol_num: 6
           connection_info_protocol_name: 'tcp'
           traffic_bytes: null
           metadata_correlation_uid: null
@@ -104,6 +107,69 @@ unit_tests:
       rows:
         - time: '2026-10-01 12:05:00 UTC'
           connection_info_protocol_name: 'icmp'
+
+  - name: network_activity_zeek_protocol_number_comes_from_the_protocol_name
+    model: ocsf_network_activity
+    given:
+      - input: ref('stg_zeek_conn')
+        format: sql
+        rows: |
+          select cast('2026-10-01 12:00:00 UTC' as timestamp(6) with time zone) as ts,
+                 cast('P1' as varchar) as uid, cast('10.0.0.5' as varchar) as id_orig_h,
+                 cast(1 as integer) as id_orig_p, cast('10.0.0.6' as varchar) as id_resp_h,
+                 cast(2 as integer) as id_resp_p, cast('icmp' as varchar) as proto,
+                 cast(null as double) as duration, cast(null as bigint) as orig_bytes,
+                 cast(null as bigint) as resp_bytes, cast(null as bigint) as orig_pkts,
+                 cast(null as bigint) as resp_pkts,
+                 cast('2026-10-01 12:00:01 UTC' as timestamp(6) with time zone) as partition_time
+          union all
+          select cast('2026-10-01 12:00:00 UTC' as timestamp(6) with time zone), 'P2', '::1', 1,
+                 '::2', 2, 'icmp6', null, null, null, null, null,
+                 cast('2026-10-01 12:00:01 UTC' as timestamp(6) with time zone)
+          union all
+          select cast('2026-10-01 12:00:00 UTC' as timestamp(6) with time zone), 'P3', '10.0.0.5',
+                 1, '10.0.0.6', 2, 'UDP', null, null, null, null, null,
+                 cast('2026-10-01 12:00:01 UTC' as timestamp(6) with time zone)
+          union all
+          select cast('2026-10-01 12:00:00 UTC' as timestamp(6) with time zone), 'P4', '10.0.0.5',
+                 1, '10.0.0.6', 2, 'unknown_transport', null, null, null, null, null,
+                 cast('2026-10-01 12:00:01 UTC' as timestamp(6) with time zone)
+      - input: ref('stg_ipfix')
+        format: sql
+        rows: |
+          select cast(null as timestamp(6) with time zone) as export_time,
+                 cast(null as timestamp(6) with time zone) as flow_start,
+                 cast(null as timestamp(6) with time zone) as flow_end,
+                 cast(null as varchar) as src_addr, cast(null as varchar) as dst_addr,
+                 cast(null as integer) as src_port, cast(null as integer) as dst_port,
+                 cast(null as integer) as ip_protocol, cast(null as bigint) as octet_delta_count,
+                 cast(null as bigint) as packet_delta_count,
+                 cast(null as timestamp(6) with time zone) as partition_time
+          where false
+      - input: ref('stg_sflow_flow')
+        format: sql
+        rows: |
+          select cast(null as timestamp(6) with time zone) as received_at,
+                 cast(null as varchar) as src_addr, cast(null as varchar) as dst_addr,
+                 cast(null as integer) as src_port, cast(null as integer) as dst_port,
+                 cast(null as integer) as ip_protocol,
+                 cast(null as timestamp(6) with time zone) as partition_time
+          where false
+    expect:
+      format: dict
+      rows:
+        - metadata_correlation_uid: 'P1'
+          connection_info_protocol_num: 1
+          connection_info_protocol_name: 'icmp'
+        - metadata_correlation_uid: 'P2'
+          connection_info_protocol_num: 58
+          connection_info_protocol_name: 'icmp6'
+        - metadata_correlation_uid: 'P3'
+          connection_info_protocol_num: 17
+          connection_info_protocol_name: 'udp'
+        - metadata_correlation_uid: 'P4'
+          connection_info_protocol_num: null
+          connection_info_protocol_name: 'unknown_transport'
 
   - name: dns_activity_distinguishes_query_from_response
     model: ocsf_dns_activity
@@ -268,7 +334,7 @@ unit_tests:
           dst_endpoint_port: 22
           connection_info_protocol_name: 'tcp'
           disposition_name: 'allowed'
-          time: '2026-10-01 12:00:00.123 UTC'
+          time: '2026-10-01 12:00:00.123456 UTC'
         - class_uid: 2004
           type_uid: 200401
           finding_info_title: 'ET MISC'

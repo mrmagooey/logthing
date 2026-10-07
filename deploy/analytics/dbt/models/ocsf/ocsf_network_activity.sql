@@ -11,7 +11,7 @@ with zeek as (
         id_orig_p as src_endpoint_port,
         id_resp_h as dst_endpoint_ip,
         id_resp_p as dst_endpoint_port,
-        cast(null as integer) as connection_info_protocol_num,
+        {{ ip_protocol_num('proto') }} as connection_info_protocol_num,
         lower(proto) as connection_info_protocol_name,
         resp_bytes as traffic_bytes_in,
         orig_bytes as traffic_bytes_out,
