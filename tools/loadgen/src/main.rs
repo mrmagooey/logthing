@@ -1,19 +1,16 @@
 //! `loadgen` -- wire-format load generator for a live `logthing` instance.
 //!
-//! Every format is implemented except `otlp`: `syslog-udp`, `zeek-tcp`,
-//! `ipfix-udp`, `suricata-tcp`, `sflow-udp`, `hec-http`, `generic-http`.
-//! `otlp` remains deferred: it needs `opentelemetry-proto`/`prost`-generated
-//! protobuf message types to build real `ExportLogsServiceRequest` bodies,
-//! meaningfully more setup than any other subcommand, and `hec-http` is a
-//! hard prerequisite for it since HEC and OTLP share `GenericSink`'s exact
-//! writer path -- running both against the same config isolates protobuf-
-//! decode cost specifically, a comparison lost if `otlp` ships without a
-//! `hec-http` baseline already in place.
+//! Every format is implemented: `syslog-udp`, `zeek-tcp`, `ipfix-udp`, `suricata-tcp`,
+//! `sflow-udp`, `hec-http`, `generic-http`, `otlp-http`. The three HTTP subcommands treat
+//! `503` as backpressure (see `backpressure`) and report it separately from errors.
 
+mod backpressure;
 mod generic_http;
 mod hec_http;
 mod ipfix_udp;
+mod otlp_http;
 mod pacing;
+mod pii;
 mod sflow_udp;
 mod suricata_tcp;
 mod syslog_udp;
@@ -49,6 +46,8 @@ enum Command {
     /// Send generic NDJSON records over HTTP (`/ingest`) at a paced,
     /// concurrent rate.
     GenericHttp(generic_http::GenericHttpArgs),
+    /// Send OTLP/HTTP protobuf logs (`/v1/logs`) at a paced, concurrent rate.
+    OtlpHttp(otlp_http::OtlpHttpArgs),
 }
 
 #[tokio::main]
@@ -62,5 +61,6 @@ async fn main() -> anyhow::Result<()> {
         Command::SflowUdp(args) => sflow_udp::run(args).await,
         Command::HecHttp(args) => hec_http::run(args).await,
         Command::GenericHttp(args) => generic_http::run(args).await,
+        Command::OtlpHttp(args) => otlp_http::run(args).await,
     }
 }

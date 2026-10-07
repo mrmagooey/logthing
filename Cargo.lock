@@ -2641,9 +2641,13 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "flate2",
  "logthing",
+ "opentelemetry-proto",
+ "prost",
  "reqwest",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower 0.4.13",
 ]

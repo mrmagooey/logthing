@@ -33,6 +33,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 
+use crate::backpressure::{Backpressure, SendOutcome, send_with_retry};
 use crate::pacing::tick_record_count;
 
 #[derive(Args, Debug)]
@@ -78,6 +79,19 @@ pub struct HecHttpArgs {
     /// newlines, so a batch is newline-joined JSON objects.
     #[arg(long, default_value_t = 1)]
     pub events_per_request: usize,
+
+    /// Retries of a 503-answered request (backpressure) before it is abandoned.
+    #[arg(long, default_value_t = 5)]
+    pub max_retries: u32,
+
+    /// gzip-compress request bodies (`Content-Encoding: gzip`).
+    #[arg(long)]
+    pub gzip: bool,
+
+    /// Add PII-shaped fields (`password`, `headers.authorization`, `user.email`, `note`) to
+    /// each event so redaction rules have work to do.
+    #[arg(long)]
+    pub pii_fields: bool,
 }
 
 /// Shared, cheaply-cloned state every in-flight request task needs.
@@ -92,6 +106,10 @@ struct HecCtx {
     errors: Arc<AtomicU64>,
     auth_failed: Arc<AtomicBool>,
     events_per_request: usize,
+    bp: Arc<Backpressure>,
+    max_retries: u32,
+    gzip: bool,
+    pii: bool,
 }
 
 pub async fn run(args: HecHttpArgs) -> anyhow::Result<()> {
@@ -118,6 +136,10 @@ pub async fn run(args: HecHttpArgs) -> anyhow::Result<()> {
         errors: Arc::new(AtomicU64::new(0)),
         auth_failed: Arc::new(AtomicBool::new(false)),
         events_per_request: args.events_per_request.max(1),
+        bp: Arc::new(Backpressure::default()),
+        max_retries: args.max_retries,
+        gzip: args.gzip,
+        pii: args.pii_fields,
     };
     let batch = ctx.events_per_request as u64;
 
@@ -177,6 +199,8 @@ pub async fn run(args: HecHttpArgs) -> anyhow::Result<()> {
         );
     }
 
+    println!("{}", ctx.bp.summary("hec-http", args.max_retries));
+
     if ctx.auth_failed.load(Ordering::Relaxed) {
         anyhow::bail!(
             "loadgen hec-http: aborted -- server rejected requests with 401 Unauthorized; \
@@ -206,18 +230,36 @@ async fn spawn_request(ctx: &HecCtx, tasks: &mut JoinSet<()>, n: u64) {
     let ctx = ctx.clone();
     tasks.spawn(async move {
         let _permit = permit;
-        let body = build_batch_body(n, ctx.events_per_request, &ctx.sourcetype);
-        let mut req = ctx.client.post(ctx.url.as_ref()).body(body);
-        if !ctx.token.is_empty() {
-            req = req.header("Authorization", format!("Splunk {}", ctx.token));
-        }
-        match req.send().await {
-            Ok(resp) if is_accepted(resp.status()) => {
+        let plain = build_batch_body(n, ctx.events_per_request, &ctx.sourcetype, ctx.pii);
+        // Compress ONCE; retries resend identical bytes.
+        let body: Vec<u8> = if ctx.gzip {
+            match crate::otlp_http::gzip(plain.as_bytes()) {
+                Ok(b) => b,
+                Err(e) => {
+                    ctx.errors.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("loadgen hec-http: gzip failed: {e:#}");
+                    return;
+                }
+            }
+        } else {
+            plain.into_bytes()
+        };
+        let build = || {
+            let mut req = ctx.client.post(ctx.url.as_ref()).body(body.clone());
+            if !ctx.token.is_empty() {
+                req = req.header("Authorization", format!("Splunk {}", ctx.token));
+            }
+            if ctx.gzip {
+                req = req.header("Content-Encoding", "gzip");
+            }
+            req
+        };
+        match send_with_retry(build, &ctx.bp, ctx.max_retries).await {
+            SendOutcome::Accepted => {
                 ctx.sent
                     .fetch_add(ctx.events_per_request as u64, Ordering::Relaxed);
             }
-            Ok(resp) => {
-                let status = resp.status();
+            SendOutcome::Rejected(status) => {
                 ctx.errors.fetch_add(1, Ordering::Relaxed);
                 if status == StatusCode::UNAUTHORIZED {
                     ctx.auth_failed.store(true, Ordering::Relaxed);
@@ -227,18 +269,16 @@ async fn spawn_request(ctx: &HecCtx, tasks: &mut JoinSet<()>, n: u64) {
                     );
                 }
             }
-            Err(e) => {
+            SendOutcome::Abandoned => {
+                ctx.errors.fetch_add(1, Ordering::Relaxed);
+                eprintln!("loadgen hec-http: request abandoned (503 after all retries)");
+            }
+            SendOutcome::TransportError(e) => {
                 ctx.errors.fetch_add(1, Ordering::Relaxed);
                 eprintln!("loadgen hec-http: request error: {e:#}");
             }
         }
     });
-}
-
-/// Only a 2xx response counts as an accepted ("sent") record -- a 4xx/5xx
-/// must be counted as an error instead, never inflating the achieved rate.
-fn is_accepted(status: StatusCode) -> bool {
-    status.is_success()
 }
 
 /// Build one Splunk HEC event envelope for the event ingest route. No
@@ -247,10 +287,17 @@ fn is_accepted(status: StatusCode) -> bool {
 ///
 /// `n` seeds `seq` and `src_ip` so consecutive events are genuinely
 /// distinct records, not the same event repeated N times.
+#[cfg(test)]
 fn build_event_json(n: u64, sourcetype: &str) -> Value {
+    build_event_json_with(n, sourcetype, false)
+}
+
+/// As [`build_event_json`]; with `pii` the event also carries the `crate::pii` fields
+/// (`password`, `headers`, `user`, `note`) merged into the `event` object.
+fn build_event_json_with(n: u64, sourcetype: &str, pii: bool) -> Value {
     let now = chrono::Utc::now();
     let epoch = now.timestamp() as f64 + f64::from(now.timestamp_subsec_micros()) / 1e6;
-    json!({
+    let mut v = json!({
         "time": epoch,
         "host": "loadgen-host",
         "sourcetype": sourcetype,
@@ -260,19 +307,26 @@ fn build_event_json(n: u64, sourcetype: &str) -> Value {
             "seq": n,
             "src_ip": format!("10.0.{}.{}", (n / 256) % 256, n % 256),
         }
-    })
+    });
+    if pii
+        && let (Some(ev), Value::Object(extra)) =
+            (v["event"].as_object_mut(), crate::pii::pii_fields(n))
+    {
+        ev.extend(extra);
+    }
+    v
 }
 
 /// Build a batch of `count` HEC event envelopes starting at sequence
 /// `start`, newline-joined. `/services/collector/event` splits the body on
 /// `\n`, so this is what a multi-event request body looks like on the wire.
-fn build_batch_body(start: u64, count: usize, sourcetype: &str) -> String {
+fn build_batch_body(start: u64, count: usize, sourcetype: &str, pii: bool) -> String {
     let mut body = String::with_capacity(count * 160);
     for i in 0..count as u64 {
         if i > 0 {
             body.push('\n');
         }
-        body.push_str(&build_event_json(start + i, sourcetype).to_string());
+        body.push_str(&build_event_json_with(start + i, sourcetype, pii).to_string());
     }
     body
 }
@@ -316,19 +370,6 @@ mod tests {
     fn default_sourcetype_used_when_missing() {
         let value = build_event_json(1, "loadgen");
         assert_eq!(value["sourcetype"], "loadgen");
-    }
-
-    /// A non-2xx response (unauthorized, bad request, server error) must
-    /// never be classified as accepted -- this is the pure predicate the
-    /// achieved-rate counter is gated on.
-    #[test]
-    fn is_accepted_only_true_for_2xx() {
-        assert!(is_accepted(StatusCode::OK));
-        assert!(is_accepted(StatusCode::from_u16(204).unwrap()));
-        assert!(!is_accepted(StatusCode::UNAUTHORIZED));
-        assert!(!is_accepted(StatusCode::BAD_REQUEST));
-        assert!(!is_accepted(StatusCode::PAYLOAD_TOO_LARGE));
-        assert!(!is_accepted(StatusCode::INTERNAL_SERVER_ERROR));
     }
 
     // ---------------------------------------------------------------- //
@@ -402,7 +443,7 @@ mod tests {
     /// distinct.
     #[test]
     fn batch_body_has_one_json_object_per_line() {
-        let body = build_batch_body(100, 4, "loadgen");
+        let body = build_batch_body(100, 4, "loadgen", false);
         let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
         assert_eq!(lines.len(), 4);
         let mut seqs = Vec::new();
@@ -418,9 +459,50 @@ mod tests {
     /// record would inflate the achieved rate by the batch factor.
     #[test]
     fn batch_body_parses_as_count_records_by_logthings_own_parser() {
-        let body = build_batch_body(0, 8, "loadgen");
+        let body = build_batch_body(0, 8, "loadgen", false);
         let records = logthing::ingest::parse_hec_event_body(body.as_bytes(), "loadgen")
             .expect("batch body must parse");
         assert_eq!(records.len(), 8);
+    }
+
+    #[test]
+    fn pii_event_still_parses_with_logthings_own_hec_parser() {
+        let line = build_event_json_with(42, "t", true).to_string();
+        let recs = logthing::ingest::parse_hec_event_body(line.as_bytes(), "t").unwrap();
+        assert_eq!(recs[0].fields["user"]["email"], "user42@example.com");
+        assert!(recs[0].fields["password"].is_string());
+        assert!(
+            recs[0].fields["msg"].is_string(),
+            "pii must not displace base fields"
+        );
+    }
+
+    /// The router the server mounts HEC routes with accepts a gzip body built the way
+    /// `--gzip` builds it.
+    #[tokio::test]
+    async fn gzip_batch_is_accepted_by_the_real_hec_handler() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::{Extension, Router};
+        use logthing::config::Config;
+        use logthing::ingest::decompress::post_gzip;
+        use logthing::ingest::{IngestState, handle_hec_event};
+        use tower::ServiceExt;
+
+        let mut cfg = Config::default();
+        cfg.hec.token = "t".to_string();
+        let router = Router::new()
+            .route("/services/collector/event", post_gzip(handle_hec_event))
+            .layer(Extension(Arc::new(tokio::sync::RwLock::new(cfg))))
+            .layer(Extension(IngestState::default()));
+        let gz = crate::otlp_http::gzip(build_batch_body(0, 5, "x", true).as_bytes()).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/services/collector/event")
+            .header("Authorization", "Splunk t")
+            .header("Content-Encoding", "gzip")
+            .body(Body::from(gz))
+            .unwrap();
+        assert_eq!(router.oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 }

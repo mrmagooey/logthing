@@ -15,6 +15,10 @@ serde_json = "1.0"
 # rustls-tls, no native-tls) -- reused rather than re-picked so this crate
 # doesn't drag in a second TLS stack.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Same pins as the root crate's optional OTLP deps (Cargo.toml) so there is one prost.
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "with-serde", "logs"] }
+prost = "0.14"
+flate2 = "1"
 
 [dev-dependencies]
 # For the in-process integration tests that drive generated request bodies
@@ -22,3 +26,4 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # matching the harness shape `src/server/mod.rs`'s own HEC route tests use.
 axum = { version = "0.7", features = ["macros"] }
 tower = { version = "0.4", features = ["util"] }
+tempfile = "3.9"

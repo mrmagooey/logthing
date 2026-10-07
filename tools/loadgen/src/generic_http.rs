@@ -31,6 +31,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 
+use crate::backpressure::{Backpressure, SendOutcome, send_with_retry};
 use crate::pacing::tick_record_count;
 
 #[derive(Args, Debug)]
@@ -74,6 +75,10 @@ pub struct GenericHttpArgs {
     /// newline-joined JSON objects.
     #[arg(long, default_value_t = 1)]
     pub events_per_request: usize,
+
+    /// Retries of a 503-answered request (backpressure) before it is abandoned.
+    #[arg(long, default_value_t = 5)]
+    pub max_retries: u32,
 }
 
 /// Shared, cheaply-cloned state every in-flight request task needs.
@@ -87,6 +92,8 @@ struct GenericCtx {
     errors: Arc<AtomicU64>,
     auth_failed: Arc<AtomicBool>,
     events_per_request: usize,
+    bp: Arc<Backpressure>,
+    max_retries: u32,
 }
 
 pub async fn run(args: GenericHttpArgs) -> anyhow::Result<()> {
@@ -112,6 +119,8 @@ pub async fn run(args: GenericHttpArgs) -> anyhow::Result<()> {
         errors: Arc::new(AtomicU64::new(0)),
         auth_failed: Arc::new(AtomicBool::new(false)),
         events_per_request: args.events_per_request.max(1),
+        bp: Arc::new(Backpressure::default()),
+        max_retries: args.max_retries,
     };
     let batch = ctx.events_per_request as u64;
 
@@ -169,6 +178,8 @@ pub async fn run(args: GenericHttpArgs) -> anyhow::Result<()> {
         );
     }
 
+    println!("{}", ctx.bp.summary("generic-http", args.max_retries));
+
     if ctx.auth_failed.load(Ordering::Relaxed) {
         anyhow::bail!(
             "loadgen generic-http: aborted -- server rejected requests with 401 Unauthorized; \
@@ -199,17 +210,19 @@ async fn spawn_request(ctx: &GenericCtx, tasks: &mut JoinSet<()>, n: u64) {
     tasks.spawn(async move {
         let _permit = permit;
         let body = build_batch_body(n, ctx.events_per_request);
-        let mut req = ctx.client.post(ctx.url.as_ref()).body(body);
-        if !ctx.token.is_empty() {
-            req = req.header("Authorization", format!("Splunk {}", ctx.token));
-        }
-        match req.send().await {
-            Ok(resp) if is_accepted(resp.status()) => {
+        let build = || {
+            let mut req = ctx.client.post(ctx.url.as_ref()).body(body.clone());
+            if !ctx.token.is_empty() {
+                req = req.header("Authorization", format!("Splunk {}", ctx.token));
+            }
+            req
+        };
+        match send_with_retry(build, &ctx.bp, ctx.max_retries).await {
+            SendOutcome::Accepted => {
                 ctx.sent
                     .fetch_add(ctx.events_per_request as u64, Ordering::Relaxed);
             }
-            Ok(resp) => {
-                let status = resp.status();
+            SendOutcome::Rejected(status) => {
                 ctx.errors.fetch_add(1, Ordering::Relaxed);
                 if status == StatusCode::UNAUTHORIZED {
                     ctx.auth_failed.store(true, Ordering::Relaxed);
@@ -219,18 +232,16 @@ async fn spawn_request(ctx: &GenericCtx, tasks: &mut JoinSet<()>, n: u64) {
                     );
                 }
             }
-            Err(e) => {
+            SendOutcome::Abandoned => {
+                ctx.errors.fetch_add(1, Ordering::Relaxed);
+                eprintln!("loadgen generic-http: request abandoned (503 after all retries)");
+            }
+            SendOutcome::TransportError(e) => {
                 ctx.errors.fetch_add(1, Ordering::Relaxed);
                 eprintln!("loadgen generic-http: request error: {e:#}");
             }
         }
     });
-}
-
-/// Only a 2xx response counts as an accepted ("sent") record -- a 4xx/5xx
-/// must be counted as an error instead, never inflating the achieved rate.
-fn is_accepted(status: StatusCode) -> bool {
-    status.is_success()
 }
 
 /// Build one NDJSON record for `/ingest`. No envelope wrapper -- the whole
@@ -290,16 +301,6 @@ mod tests {
         let b = build_record_json(2);
         assert_ne!(a["seq"], b["seq"]);
         assert_ne!(a["src_ip"], b["src_ip"]);
-    }
-
-    /// A non-2xx response must never be classified as accepted -- the pure
-    /// predicate the achieved-rate counter is gated on.
-    #[test]
-    fn is_accepted_only_true_for_2xx() {
-        assert!(is_accepted(StatusCode::OK));
-        assert!(!is_accepted(StatusCode::UNAUTHORIZED));
-        assert!(!is_accepted(StatusCode::BAD_REQUEST));
-        assert!(!is_accepted(StatusCode::INTERNAL_SERVER_ERROR));
     }
 
     // ---------------------------------------------------------------- //
