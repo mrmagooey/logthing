@@ -147,7 +147,6 @@ def test_staging_builds_against_an_empty_lake(dbt_stack):
     assert staging_types(dbt_stack) == OTLP_HEC_TYPES  # typed NULL views, not untyped
 
 
-
 def test_views_built_before_a_table_existed_stay_empty_until_rebuilt(dbt_stack):
     seed(dbt_stack)
     assert dbt_stack.trino("SELECT count(*) FROM iceberg.logs.wef") == "1"

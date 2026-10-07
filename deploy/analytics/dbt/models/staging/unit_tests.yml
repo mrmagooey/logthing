@@ -35,6 +35,31 @@ unit_tests:
         - {event_uuid: u1, body: first copy}
         - {event_uuid: u2, body: other event}
 
+  - name: stg_otlp_breaks_received_at_and_partition_time_ties_on_time
+    model: stg_otlp
+    given:
+      - input: ref('stg_otlp_typed')
+        format: sql
+        rows: |
+          select * from (values
+            ('u3', timestamp '2026-10-01 11:00:05 UTC', null,
+             timestamp '2026-10-01 12:00:01 UTC', 9, 'INFO', 'later time',
+             'svc', null, null, null, null, null, null, null, null, null, null, '{}', '{}',
+             timestamp '2026-10-01 12:00:01 UTC'),
+            ('u3', timestamp '2026-10-01 11:00:01 UTC', null,
+             timestamp '2026-10-01 12:00:01 UTC', 9, 'INFO', 'earlier time',
+             'svc', null, null, null, null, null, null, null, null, null, null, '{}', '{}',
+             timestamp '2026-10-01 12:00:01 UTC')
+          ) as t("event_uuid", "time", "observed_time", "received_at", "severity_number",
+                 "severity_text", "body", "service_name", "service_namespace",
+                 "service_instance_id", "host_name", "peer_addr", "trace_id", "span_id",
+                 "flags", "event_name", "scope_name", "scope_version",
+                 "resource_attributes", "attributes", "partition_time")
+    expect:
+      format: dict
+      rows:
+        - {event_uuid: u3, body: earlier time}
+
   - name: stg_hec_dedups_but_keeps_every_legacy_null_uuid_row
     model: stg_hec
     given:

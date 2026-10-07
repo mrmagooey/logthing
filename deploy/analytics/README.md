@@ -319,6 +319,7 @@ Test commands (unit, integration, e2e) are listed in the root [AGENTS.md](../../
 Integration and e2e tests need Docker. On a CPU without AVX2 set `TRINO_IMAGE=trinodb/trino:470`.
 `helm-minikube.sh` also needs minikube and loads a locally present `TRINO_IMAGE` into the cluster.
 
+- `compose.sh` builds the logthing and committer images from the checkout (slow: compiles Rust; set `LOGTHING_IMAGE`/`COMMITTER_IMAGE` to reuse built ones) and covers syslog, Zeek, OTLP and HEC ingest with the generated tokens, typed rows, dbt staging dedup, and Metabase over `otlp`.
 - The e2e scripts refuse to run on a non-AVX2 CPU unless `TRINO_IMAGE` is overridden. `compose.sh` uses non-default host ports; run one at a time.
 - `helm-minikube.sh` uses its own minikube profile `lt-analytics-e2e` and a private
   `KUBECONFIG` (it never touches `~/.kube/config`). `KEEP_CLUSTER=1` keeps the cluster; a cold

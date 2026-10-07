@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end: compose stack up -> syslog into logthing -> committer -> Trino (HTTPS + password) and Metabase see the rows.
+# End-to-end: compose stack up -> syslog, Zeek, OTLP and HEC into logthing -> committer -> Trino (HTTPS + password) and Metabase see the rows.
 # Requires Docker and an AVX2-capable CPU (or a TRINO_IMAGE override such as trinodb/trino:470).
 set -euo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -16,6 +16,7 @@ cleanup() {
 }
 trap cleanup EXIT
 DBT_WORK=$(mktemp -d)
+build_local_images   # logthing + committer from THIS checkout (A1 code); set LOGTHING_IMAGE/COMMITTER_IMAGE to skip
 
 PROJECT="lt-e2e-$$"
 # Non-default host ports so a developer's running stack does not collide.
@@ -23,6 +24,7 @@ SYSLOG_UDP_PORT=25514
 ZEEK_PORT=47761
 TRINO_PORT=28443
 METABASE_PORT=23000
+HTTP_PORT=25985
 N=40
 MARKER="analytics-e2e-$(date +%s)-$$"
 PY=${PYTHON:-python3}
@@ -41,14 +43,17 @@ SYSLOG_TCP_PORT=25601
 IPFIX_PORT=24739
 SFLOW_PORT=26343
 ZEEK_PORT=$ZEEK_PORT
-LOGTHING_HEALTH_PORT=25985
+LOGTHING_HEALTH_PORT=$HTTP_PORT
 GARAGE_S3_PORT=23901
 TRINO_PORT=$TRINO_PORT
 METABASE_PORT=$METABASE_PORT
 ENV
+printf 'LOGTHING_IMAGE=%s\nCOMMITTER_IMAGE=%s\n' "$LOGTHING_IMAGE" "$COMMITTER_IMAGE" >>"$ENVFILE"
 [ -z "${TRINO_IMAGE:-}" ] || echo "TRINO_IMAGE=$TRINO_IMAGE" >>"$ENVFILE"
 envval() { grep "^$1=" "$ENVFILE" | cut -d= -f2-; }
 TRINO_ADMIN_PASSWORD=$(envval TRINO_ADMIN_PASSWORD)
+HEC_TOKEN=$(envval HEC_TOKEN)
+OTLP_BEARER_TOKEN=$(envval OTLP_BEARER_TOKEN)
 CA=$(mktemp)
 # --env-file means a developer's deploy/analytics/.env is ignored. Variables exported in the
 # caller's shell still take precedence over this file (compose's normal rule).
@@ -123,6 +128,11 @@ for r in recs:
 s.close()
 PYEOF
 
+echo "== [3b/8] send $N OTLP records and $N HEC events with the generated tokens ($MARKER) =="
+HEC_TOKEN=$HEC_TOKEN OTLP_BEARER_TOKEN=$OTLP_BEARER_TOKEN \
+  "$PY" "$HERE/send_app_logs.py" "http://127.0.0.1:$HTTP_PORT" "$MARKER" "$N" \
+  || { dump_logs logthing; exit 1; }
+
 COUNT_SQL="SELECT count(*) FROM iceberg.logs.syslog WHERE message LIKE '%$MARKER%'"
 trino_count() {
   "${DC[@]}" exec -T trino "${TRINO_CLI[@]}" --output-format TSV --execute "$COUNT_SQL" 2>/dev/null \
@@ -145,6 +155,11 @@ zeek_landed() { [ "$(sql "SELECT count(*) FROM iceberg.logs.$1 WHERE uid = '$MAR
 wait_until 300 "zeek_conn row" zeek_landed zeek_conn || { dump_logs committer logthing; exit 1; }
 wait_until 300 "zeek_dns row" zeek_landed zeek_dns || { dump_logs committer logthing; exit 1; }
 
+echo "== [4b/8] wait (<=300s) for OTLP and HEC rows, assert typed columns =="
+wait_until 300 "otlp + hec rows" app_logs_landed || { dump_logs committer logthing; exit 1; }
+assert_app_log_rows || { dump_logs committer logthing; exit 1; }
+echo "otlp: $N typed rows; hec: $N rows with event_uuid"
+
 echo "== [5/8] Trino count =="
 [ "$(trino_count)" = "$N" ] || { echo "Trino count mismatch" >&2; exit 1; }
 echo "trino: $N"
@@ -155,6 +170,12 @@ MB_COUNT=$(METABASE_PASSWORD=$(envval METABASE_ADMIN_PASSWORD) "$PY" "$HERE/meta
   || { dump_logs metabase metabase-init trino; exit 1; }
 [ "$MB_COUNT" = "$N" ] || { echo "Metabase returned $MB_COUNT, expected $N" >&2; dump_logs metabase; exit 1; }
 echo "metabase: $MB_COUNT"
+OTLP_MB=$(METABASE_PASSWORD=$(envval METABASE_ADMIN_PASSWORD) "$PY" "$HERE/metabase_query.py" \
+  "http://127.0.0.1:$METABASE_PORT" admin@logthing.example \
+  "SELECT count(*) FROM iceberg.logs.otlp WHERE $(_otlp_where)") \
+  || { dump_logs metabase trino; exit 1; }
+[ "$OTLP_MB" = "$N" ] || { echo "Metabase otlp count $OTLP_MB, expected $N" >&2; exit 1; }
+echo "metabase otlp: $OTLP_MB"
 
 echo "== [7/8] dbt build (staging views + tests) against Trino over TLS =="
 rc=0; DBT_OUT=$(run_dbt build 2>&1) || rc=$?
@@ -164,6 +185,8 @@ dbt_ok "$rc" "$DBT_OUT" || { echo "dbt build failed (exit $rc or ERROR>0 in summ
      --execute "SELECT count(*) FROM iceberg.logs.stg_wef" | tr -d '"\r')" = 0 ] \
   || fail "stg_wef should be empty: this stack sends no WEF data"
 echo "dbt: build ok"
+assert_staging_dedup || { dump_logs trino; exit 1; }
+echo "staging: stg_otlp/stg_hec = $N, duplicate event_uuid deduped"
 
 echo "== [8/8] OCSF views and detection analyses over the Zeek rows =="
 [ "$(sql "SELECT count(*) FROM iceberg.logs.ocsf_network_activity WHERE metadata_correlation_uid = '$MARKER' AND class_uid = 4001 AND src_endpoint_ip = '10.20.30.40' AND dst_endpoint_port = 443 AND connection_info_protocol_num = 6")" = 1 ] \
