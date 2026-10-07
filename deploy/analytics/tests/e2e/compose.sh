@@ -17,7 +17,7 @@ PY=${PYTHON:-python3}
 
 # Hermetic config: an explicit env file means a developer's deploy/analytics/.env is ignored.
 ENVFILE=$(mktemp)
-"$ANALYTICS/scripts/gen-analytics-env.sh" --force "$ENVFILE" 2>/dev/null
+"$ANALYTICS/scripts/gen-analytics-env.sh" --force "$ENVFILE"
 cat >>"$ENVFILE" <<ENV
 LOGTHING_FLUSH_INTERVAL_SECS=5
 COMMIT_INTERVAL_SECS=10

@@ -53,6 +53,25 @@ def test_refuses_to_overwrite_without_force(tmp_path):
     assert stat.S_IMODE(out.stat().st_mode) == 0o600
 
 
-def test_unknown_option_exits_2(tmp_path):
+def test_unknown_option_exits_2():
     r = subprocess.run(["bash", str(GEN_ENV), "--bogus"], capture_output=True, text=True)
     assert r.returncode == 2
+
+
+def test_failing_openssl_fails_loudly_and_keeps_existing_file(tmp_path):
+    out = tmp_path / "a.env"
+    generated_env(out)
+    before = out.read_bytes()
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "openssl").write_text("#!/bin/sh\nexit 1\n")
+    (fake / "openssl").chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake}:{os.environ['PATH']}"}
+    r = subprocess.run(["bash", str(GEN_ENV), "--force", str(out)], capture_output=True,
+                       text=True, env=env)
+    assert r.returncode != 0
+    assert out.read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith("a.env")] == ["a.env"]
+    fresh = tmp_path / "new.env"
+    r = subprocess.run(["bash", str(GEN_ENV), str(fresh)], capture_output=True, text=True, env=env)
+    assert r.returncode != 0 and not fresh.exists()

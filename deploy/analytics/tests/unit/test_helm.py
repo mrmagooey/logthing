@@ -474,7 +474,9 @@ def test_checksum_secret_is_stable_across_renders_with_generated_secrets():
     a, b = render(), render()
     for kind, name in (("Deployment", "logthing"), ("Deployment", "hue"),
                        ("Deployment", "trino"), ("StatefulSet", "postgres"),
-                       ("StatefulSet", "garage"), ("Deployment", "lakekeeper")):
+                       ("StatefulSet", "garage"), ("Deployment", "lakekeeper"),
+                       ("CronJob", "committer"), ("Job", "garage-init-1"),
+                       ("Job", "lakekeeper-init-1")):
         full = f"{FULL}-{name}"
         assert (_annotations(a, kind, full)["checksum/secret"]
                 == _annotations(b, kind, full)["checksum/secret"]), name
