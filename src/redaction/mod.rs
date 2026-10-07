@@ -4,6 +4,12 @@
 //! `Arc`. Handlers call it immediately after parse/map and BEFORE
 //! `crate::ingest::assign_event_uuids` and enqueue, so unredacted values never reach the
 //! channel, the spool, or disk. Semantics are documented in `docs/redaction.md`.
+//!
+//! Fail closed: an `@body.<path>` drop/hash rule cannot be applied to an OTLP body that starts
+//! with `{`/`[` but does not parse as JSON (too deeply nested, trailing comma, NaN, ...). Rather
+//! than let the value through unredacted, the WHOLE body is replaced by `[REDACTED]` and
+//! `redactions_applied{rule="body_unparseable"}` is incremented. Plain-text bodies (not
+//! JSON-looking) are left alone by `@body.<path>` rules.
 
 use std::sync::Arc;
 
@@ -54,6 +60,9 @@ pub struct RedactionCounts {
     pub hashed: u64,
     /// Regex matches replaced by `[REDACTED]`.
     pub masked: u64,
+    /// JSON-looking OTLP bodies that failed to parse while an `@body.<path>` drop/hash rule was
+    /// configured; the whole body was replaced by `[REDACTED]` (fail closed).
+    pub body_unparseable: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +99,14 @@ impl std::fmt::Debug for Redactor {
             .field("key", &self.key.as_ref().map(|_| "<redacted>"))
             .finish()
     }
+}
+
+fn is_env_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn validate_path(section: &str, rule: &str, path: &str) -> anyhow::Result<()> {
@@ -154,6 +171,10 @@ impl Redactor {
             .iter()
             .map(|p| parse_target(kind, &section, "drop_fields", p))
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut seen = std::collections::HashSet::new();
+        if let Some(dup) = cfg.hash_fields.iter().find(|p| !seen.insert(p.as_str())) {
+            bail!("{section}.hash_fields: duplicate path {dup:?} (a value would be hashed twice)");
+        }
         let hashes = cfg
             .hash_fields
             .iter()
@@ -193,6 +214,14 @@ impl Redactor {
                 .as_deref()
                 .filter(|n| !n.is_empty())
                 .with_context(|| format!("{section}: hash_fields requires hash_key_env"))?;
+            // Never echo the value: an operator may have pasted the key itself here.
+            if !is_env_identifier(name) {
+                bail!(
+                    "{section}: hash_key_env is not a valid environment variable name \
+                     (expected letters, digits and underscores, not starting with a digit); \
+                     it must be the NAME of the variable, not the key"
+                );
+            }
             let value = env(name).with_context(|| {
                 format!("{section}: hash_key_env names {name}, which is not set in the environment")
             })?;
@@ -242,7 +271,12 @@ impl Redactor {
 
     fn emit(&self, c: RedactionCounts) -> RedactionCounts {
         let source = self.kind.label();
-        for (rule, n) in [("drop", c.dropped), ("hash", c.hashed), ("mask", c.masked)] {
+        for (rule, n) in [
+            ("drop", c.dropped),
+            ("hash", c.hashed),
+            ("mask", c.masked),
+            ("body_unparseable", c.body_unparseable),
+        ] {
             if n > 0 {
                 metrics::counter!("redactions_applied", "source" => source, "rule" => rule)
                     .increment(n);
@@ -295,8 +329,10 @@ impl Redactor {
                     }
                 }
                 Target::Column(_, Some(sub)) => {
-                    c.dropped +=
-                        edit_json_body(&mut rec.body, |v| apply_path(v, sub, &PathOp::Drop));
+                    match edit_json_body(&mut rec.body, |v| apply_path(v, sub, &PathOp::Drop)) {
+                        Some(n) => c.dropped += n,
+                        None => c.body_unparseable += fail_closed_body(&mut rec.body),
+                    }
                 }
             }
         }
@@ -315,8 +351,11 @@ impl Redactor {
                     }
                 }
                 Target::Column(_, Some(sub)) => {
-                    c.hashed +=
-                        edit_json_body(&mut rec.body, |v| apply_path(v, sub, &PathOp::Hash(self)));
+                    match edit_json_body(&mut rec.body, |v| apply_path(v, sub, &PathOp::Hash(self)))
+                    {
+                        Some(n) => c.hashed += n,
+                        None => c.body_unparseable += fail_closed_body(&mut rec.body),
+                    }
                 }
             }
         }
@@ -427,22 +466,28 @@ fn mask_str(s: &mut String, re: &Regex, replacement: &str) -> u64 {
 }
 
 /// Parse `body` as JSON when it looks like an object/array, run `f`, and re-serialize only
-/// when `f` reported a change (so an unchanged body stays byte-identical).
-fn edit_json_body(body: &mut Option<String>, f: impl FnOnce(&mut Value) -> u64) -> u64 {
+/// when `f` reported a change (so an unchanged body stays byte-identical). Returns `Some(0)`
+/// for an absent or plain-text body and `None` when the body looks like JSON but does not
+/// parse (the caller must fail closed).
+fn edit_json_body(body: &mut Option<String>, f: impl FnOnce(&mut Value) -> u64) -> Option<u64> {
     let Some(text) = body.as_deref() else {
-        return 0;
+        return Some(0);
     };
     if !matches!(text.trim_start().as_bytes().first(), Some(b'{' | b'[')) {
-        return 0;
+        return Some(0);
     }
-    let Ok(mut v) = serde_json::from_str::<Value>(text) else {
-        return 0;
-    };
+    let mut v = serde_json::from_str::<Value>(text).ok()?;
     let n = f(&mut v);
     if n > 0 {
         *body = Some(v.to_string());
     }
-    n
+    Some(n)
+}
+
+/// Replace an unredactable body wholesale; returns the count to add.
+fn fail_closed_body(body: &mut Option<String>) -> u64 {
+    *body = Some(MASK_REPLACEMENT.to_string());
+    1
 }
 
 /// Mask a body: JSON bodies are masked leaf-wise, plain-text bodies as a whole string.
@@ -452,7 +497,7 @@ fn mask_body(body: &mut Option<String>, re: &Regex) -> u64 {
             && serde_json::from_str::<Value>(t).is_ok()
     });
     if is_json {
-        edit_json_body(body, |v| mask_value(v, re))
+        edit_json_body(body, |v| mask_value(v, re)).unwrap_or(0)
     } else if let Some(s) = body.as_mut() {
         mask_str(s, re, MASK_REPLACEMENT)
     } else {
@@ -920,5 +965,71 @@ mod tests {
     fn test_redactor_kind_labels() {
         assert_eq!(RedactorKind::Hec.label(), "hec");
         assert_eq!(RedactorKind::Otlp.label(), "otlp");
+    }
+
+    fn body_rule_redactor() -> Redactor {
+        otlp(&["@body.card"], &[], &[])
+    }
+
+    #[test]
+    fn test_otlp_body_path_fails_closed_on_too_deep_json() {
+        let r = body_rule_redactor();
+        let mut rec = otlp_rec();
+        let deep = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+        rec.body = Some(deep);
+        let c = r.redact_otlp(&mut rec);
+        assert_eq!(rec.body.as_deref(), Some("[REDACTED]"));
+        assert_eq!(c.body_unparseable, 1);
+        assert_eq!(c.dropped, 0);
+    }
+
+    #[test]
+    fn test_otlp_body_path_fails_closed_on_trailing_comma_for_drop_and_hash() {
+        for r in [body_rule_redactor(), otlp(&[], &["@body.card"], &[])] {
+            let mut rec = otlp_rec();
+            rec.body = Some(r#"  {"card": "4111", "msg": "hi",}"#.into());
+            let c = r.redact_otlp(&mut rec);
+            assert_eq!(rec.body.as_deref(), Some("[REDACTED]"));
+            assert_eq!(c.body_unparseable, 1);
+        }
+    }
+
+    #[test]
+    fn test_otlp_body_path_only_rules_leave_plain_text_body_unchanged() {
+        let r = body_rule_redactor();
+        let mut rec = otlp_rec();
+        rec.body = Some("not json {card: 4111".into());
+        let c = r.redact_otlp(&mut rec);
+        assert_eq!(rec.body.as_deref(), Some("not json {card: 4111"));
+        assert_eq!(c, RedactionCounts::default());
+    }
+
+    #[test]
+    fn test_compile_rejects_non_identifier_hash_key_env_without_echoing_it() {
+        let secret = "0123456789abcdef-pasted key!";
+        let mut c = cfg(&[], &["e"], &[]);
+        c.hash_key_env = Some(secret.to_string());
+        let e = Redactor::compile_with_env(&c, RedactorKind::Hec, &|_| Some(KEY.into()))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("hash_key_env"), "{e}");
+        assert!(
+            !e.contains(secret) && !e.contains("pasted"),
+            "value echoed: {e}"
+        );
+        c.hash_key_env = Some("1BAD".to_string());
+        assert!(Redactor::compile_with_env(&c, RedactorKind::Hec, &|_| Some(KEY.into())).is_err());
+    }
+
+    #[test]
+    fn test_compile_rejects_duplicate_hash_fields_naming_the_path() {
+        let e = Redactor::compile_with_env(
+            &cfg(&[], &["email", "ip", "email"], &[]),
+            RedactorKind::Hec,
+            &env,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("duplicate") && e.contains("\"email\""), "{e}");
     }
 }

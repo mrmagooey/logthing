@@ -258,7 +258,11 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     (
         Kind::Counter,
         "redactions_applied",
-        "Values redacted by rule type (drop, hash, mask) and ingest source (hec, otlp).",
+        concat!(
+            "Values redacted by rule type (drop, hash, mask, body_unparseable) and ingest source ",
+            "(hec, otlp). body_unparseable counts OTLP bodies that looked like JSON but did not ",
+            "parse while an @body.<path> rule was set; the whole body was replaced."
+        ),
     ),
     (
         Kind::Counter,
