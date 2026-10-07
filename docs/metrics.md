@@ -28,6 +28,9 @@ Per-source ingest counters:
 - `syslog_messages_received`, `ipfix_datagrams_received`, `ipfix_flows_decoded`,
   `sflow_datagrams_received`, `suricata_records_received`, `hec_events_received`,
   `otlp_logs_received`
+- `redactions_applied{source,rule}` - values changed by `[hec.redaction]` / `[otlp.redaction]`;
+  `source` is `hec` or `otlp`, `rule` is `drop`, `hash`, `mask` or `body_unparseable` (a JSON-looking
+  OTLP body that could not be parsed was replaced wholesale, fail closed). See [redaction.md](redaction.md)
 - `hec_events_dropped` - HEC/NDJSON records not enqueued: one per failed
   per-sink `try_send` (full or closed; with both an S3 and a local sink one record can
   count twice), plus the records of a request never

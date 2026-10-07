@@ -210,6 +210,17 @@ mod tests {
     // /config/reload all return) must mask the three ingest shared-secret
     // tokens the same way it masks S3 credentials.
     #[test]
+    fn redacted_config_keeps_hash_key_env_name_and_masks_nothing_else_in_redaction() {
+        let mut cfg = Config::default();
+        cfg.hec.redaction.hash_key_env = Some("LOGTHING_HASH_KEY".to_string());
+        cfg.hec.redaction.hash_fields = vec!["email".to_string()];
+        let out = redacted_config(&cfg);
+        assert_eq!(out.hec.redaction, cfg.hec.redaction);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.contains("LOGTHING_HASH_KEY"));
+    }
+
+    #[test]
     fn redacted_config_masks_ingest_tokens() {
         let mut cfg = Config::default();
         cfg.hec.token = "REAL_HEC_TOKEN".to_string();

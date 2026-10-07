@@ -89,6 +89,21 @@ syslog's bind address is fixed at `0.0.0.0` and has no such override.
 table. Environment overrides are validated the same way: `LOGTHING__HEC__ENABLED=true` with no
 HEC sink configured also fails startup. See [hec.md](hec.md) and [otlp.md](otlp.md).
 
+## Redaction
+
+`[hec.redaction]` and `[otlp.redaction]` drop, HMAC-hash or mask values before records are
+enqueued (off by default). Both tables take the same keys; full semantics, key rotation and
+erasure procedure are in [redaction.md](redaction.md).
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `drop_fields` | list of paths | `[]` | Remove these paths (OTLP also `@body`, `@host_name`, `@peer_addr`). |
+| `hash_fields` | list of paths | `[]` | Replace with lowercase-hex HMAC-SHA256. Needs `hash_key_env`. |
+| `hash_key_env` | string | unset | NAME of the environment variable holding the HMAC key (16+ bytes). |
+| `mask_patterns` | list of regexes | `[]` | Matches inside string values become `[REDACTED]`. |
+
+Invalid rules fail startup, but only for sections that are enabled.
+
 ## Running
 
 ```bash

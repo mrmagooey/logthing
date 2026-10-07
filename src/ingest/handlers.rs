@@ -166,6 +166,16 @@ fn dispatch_generic_batch(
     Ok(())
 }
 
+/// Apply the HEC redactor (if configured) to every parsed record. Must run BEFORE
+/// `assign_event_uuids` and before dispatch so unredacted data never reaches a channel.
+fn redact_generic_records(ingest: &IngestState, records: &mut [crate::ingest::GenericRecord]) {
+    if let Some(r) = &ingest.hec_redactor {
+        for rec in records.iter_mut() {
+            r.redact_generic(rec);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // POST /services/collector/event
 // ---------------------------------------------------------------------------
@@ -199,7 +209,8 @@ pub async fn handle_hec_event(
         Ok(r) => r,
         Err(e) => return hec_parse_error(&e.to_string()),
     };
-    // Identity is assigned after parse (and, in a later phase, after redaction).
+    // Identity is assigned after parse and after redaction.
+    redact_generic_records(&ingest, &mut records);
     assign_event_uuids(&mut records);
 
     metrics::counter!("hec_events_received").increment(records.len() as u64);
@@ -243,6 +254,7 @@ pub async fn handle_hec_raw(
         Ok(r) => r,
         Err(e) => return hec_parse_error(&e.to_string()),
     };
+    redact_generic_records(&ingest, std::slice::from_mut(&mut record));
     assign_event_uuids(std::slice::from_mut(&mut record));
 
     metrics::counter!("hec_events_received").increment(1);
@@ -286,6 +298,7 @@ pub async fn handle_ndjson(
         Ok(r) => r,
         Err(e) => return hec_parse_error(&e.to_string()),
     };
+    redact_generic_records(&ingest, &mut records);
     assign_event_uuids(&mut records);
 
     metrics::counter!("hec_events_received").increment(records.len() as u64);
@@ -901,5 +914,107 @@ mod tests {
             })
             .sum();
         assert_eq!(dropped, 2, "record 2 hit Full, record 3 never offered");
+    }
+
+    // --- Redaction wiring ---
+
+    fn hec_redactor(cfg: crate::config::RedactionConfig) -> Arc<crate::redaction::Redactor> {
+        Arc::new(
+            crate::redaction::Redactor::compile_with_env(
+                &cfg,
+                crate::redaction::RedactorKind::Hec,
+                &|n| (n == "K").then(|| "0123456789abcdef".to_string()),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn redacting_ingest(
+        cfg: crate::config::RedactionConfig,
+    ) -> (
+        IngestState,
+        tokio::sync::mpsc::Receiver<crate::ingest::GenericRecord>,
+    ) {
+        let (mut ingest, rx) = stalled_ingest(16);
+        ingest.hec_redactor = Some(hec_redactor(cfg));
+        (ingest, rx)
+    }
+
+    #[tokio::test]
+    async fn hec_event_redacts_before_enqueue_and_still_assigns_uuid() {
+        let (ingest, mut rx) = redacting_ingest(crate::config::RedactionConfig {
+            drop_fields: vec!["pw".into()],
+            hash_fields: vec!["email".into()],
+            hash_key_env: Some("K".into()),
+            mask_patterns: vec![],
+        });
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .oneshot(post(
+                "/services/collector/event",
+                r#"{"event":{"email":"a@b.co","pw":"x"},"sourcetype":"t"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rec = rx.recv().await.unwrap();
+        assert!(rec.fields.get("pw").is_none(), "{}", rec.fields);
+        let email = rec.fields["email"].as_str().unwrap();
+        assert_eq!(email.len(), 64, "{email}");
+        assert!(email.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(email, "a@b.co");
+        let id = rec.event_uuid.expect("uuid assigned after redaction");
+        assert_eq!(uuid::Uuid::parse_str(&id).unwrap().get_version_num(), 7);
+    }
+
+    #[tokio::test]
+    async fn hec_raw_redacts_masked_pattern_before_enqueue() {
+        let (ingest, mut rx) = redacting_ingest(crate::config::RedactionConfig {
+            mask_patterns: vec![r"secret=\w+".into()],
+            ..Default::default()
+        });
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .oneshot(post("/services/collector/raw", "login secret=abc"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rec = rx.recv().await.unwrap();
+        assert_eq!(rec.fields, serde_json::json!({"raw": "login [REDACTED]"}));
+        assert!(rec.event_uuid.is_some());
+    }
+
+    #[tokio::test]
+    async fn ndjson_redacts_dropped_field_on_every_line() {
+        let (ingest, mut rx) = redacting_ingest(crate::config::RedactionConfig {
+            drop_fields: vec!["token".into()],
+            ..Default::default()
+        });
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .oneshot(post(
+                "/ingest",
+                "{\"token\":\"t1\",\"keep\":1}\n{\"token\":\"t2\",\"keep\":2}\n",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        for keep in [1, 2] {
+            let rec = rx.recv().await.unwrap();
+            assert_eq!(rec.fields, serde_json::json!({"keep": keep}));
+            assert!(rec.event_uuid.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn hec_without_redactor_leaves_records_untouched() {
+        let (ingest, mut rx) = stalled_ingest(4);
+        assert!(ingest.hec_redactor.is_none());
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        app.oneshot(post("/ingest", "{\"pw\":\"x\"}\n"))
+            .await
+            .unwrap();
+        let rec = rx.recv().await.unwrap();
+        assert_eq!(rec.fields, serde_json::json!({"pw": "x"}));
     }
 }

@@ -641,11 +641,31 @@ impl Server {
             }
         }
 
+        // Same condition as config validation: rules in a disabled section are ignored.
+        let hec_redactor = if config.hec.enabled {
+            crate::redaction::Redactor::compile_optional(
+                &config.hec.redaction,
+                crate::redaction::RedactorKind::Hec,
+            )?
+        } else {
+            None
+        };
+        let otlp_redactor = if cfg!(feature = "otlp") && config.otlp.enabled {
+            crate::redaction::Redactor::compile_optional(
+                &config.otlp.redaction,
+                crate::redaction::RedactorKind::Otlp,
+            )?
+        } else {
+            None
+        };
+
         let ingest_state = IngestState {
             generic_s3: generic_s3_handler,
             generic_local: generic_local_handler,
             otlp_s3: otlp_s3_handler,
             otlp_local: otlp_local_handler,
+            hec_redactor,
+            otlp_redactor,
         };
 
         Ok(Self {
@@ -4585,6 +4605,42 @@ event_parsers:
         }
 
         #[tokio::test]
+        async fn handle_otlp_logs_redacts_attributes_before_enqueue_and_before_uuid() {
+            let redactor = crate::redaction::Redactor::compile_with_env(
+                &crate::config::RedactionConfig {
+                    mask_patterns: vec!["e2e test message".to_string()],
+                    drop_fields: vec!["@peer_addr".to_string()],
+                    ..Default::default()
+                },
+                crate::redaction::RedactorKind::Otlp,
+                &|_| None,
+            )
+            .unwrap();
+            let (h, mut rx) = stalled_otlp_handle(16);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                otlp_redactor: Some(Arc::new(redactor)),
+                ..Default::default()
+            })
+            .await;
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(make_proto_request().encode_to_vec()))
+                    .unwrap(),
+            );
+            assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+            let rec = rx.recv().await.unwrap();
+            assert_eq!(rec.body.as_deref(), Some("[REDACTED]"));
+            assert_eq!(rec.peer_addr, None, "typed column dropped");
+            assert_eq!(rec.service_name.as_deref(), Some("test-svc"));
+            let id = rec.event_uuid.expect("uuid assigned after redaction");
+            assert_eq!(uuid::Uuid::parse_str(&id).unwrap().get_version_num(), 7);
+        }
+
+        #[tokio::test]
         async fn handle_otlp_logs_never_writes_to_hec_sinks() {
             // Regression for "OTLP rides [hec] sinks": the generic channel must stay empty.
             let (tx, mut generic_rx) = tokio::sync::mpsc::channel(16);
@@ -5674,8 +5730,13 @@ pub async fn handle_otlp_logs(
     // ── Map, assign ids, route to the OTLP sinks ─────────────────────────
     let source_host = addr.ip().to_string();
     let mut records = crate::server::otlp::map_otlp_request(req, source_host);
-    // ORDERING: identity is assigned AFTER mapping (and, in a later phase, after redaction),
-    // as its own step, never inside the mapper.
+    // ORDERING: redaction runs after mapping and BEFORE identity assignment, so unredacted
+    // values never reach a channel, the spool, or disk and the id never depends on them.
+    if let Some(r) = &ingest.otlp_redactor {
+        for rec in records.iter_mut() {
+            r.redact_otlp(rec);
+        }
+    }
     crate::ingest::assign_event_uuids(&mut records);
     let count = records.len() as u64;
     match dispatch_otlp_records(&ingest, records) {
