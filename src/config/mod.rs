@@ -19,8 +19,31 @@ pub struct S3ConnectionConfig {
     #[serde(default)]
     pub object_lock_mode: Option<ObjectLockMode>,
     /// Retention period in days (1..=36500) for `object_lock_mode`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_u32_or_string")]
     pub object_lock_retain_days: Option<u32>,
+}
+
+/// Accepts a number or a numeric string. serde's `flatten` buffers environment-variable values
+/// as strings, so `LOGTHING__<SECTION>__S3__OBJECT_LOCK_RETAIN_DAYS=45` needs this to load.
+fn de_u32_or_string<'de, D>(d: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        N(u32),
+        S(String),
+    }
+    match Option::<NumOrStr>::deserialize(d)? {
+        None => Ok(None),
+        Some(NumOrStr::N(n)) => Ok(Some(n)),
+        Some(NumOrStr::S(s)) => s.trim().parse::<u32>().map(Some).map_err(|e| {
+            serde::de::Error::custom(format!(
+                "object_lock_retain_days must be a whole number of days, got {s:?}: {e}"
+            ))
+        }),
+    }
 }
 
 /// S3 Object Lock retention mode (`object_lock_mode`). Only the two S3 values are accepted.
@@ -2006,7 +2029,8 @@ pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
                 "{name}: object_lock_mode requires object_lock_retain_days"
             )),
             (None, Some(_)) => errors.push(format!(
-                "{name}: object_lock_retain_days requires object_lock_mode (GOVERNANCE or COMPLIANCE)"
+                "{name}: object_lock_retain_days requires object_lock_mode \
+                 (GOVERNANCE or COMPLIANCE)"
             )),
             (Some(_), Some(d)) if d == 0 || d > 36_500 => errors.push(format!(
                 "{name}: object_lock_retain_days must be between 1 and 36500, got {d}"
@@ -3855,11 +3879,8 @@ directory = "/tmp/otlp"
     }
 
     #[test]
-    fn env_vars_cannot_set_object_lock_retain_days_through_flattened_s3_config() {
-        // serde's `flatten` buffers env strings, so the numeric `object_lock_retain_days`
-        // cannot come from `LOGTHING__HEC__S3__OBJECT_LOCK_RETAIN_DAYS`: object lock is
-        // TOML-only (documented in docs/object-lock.md). It must fail loudly at startup, not
-        // be silently ignored. Env vars are process-global; hold the shared config lock (Config::load also reads
+    fn env_vars_override_object_lock_settings_through_flattened_s3_config() {
+        // Env vars are process-global; hold the shared config lock (Config::load also reads
         // logthing.toml from the cwd) and always clean up, even on a failed assertion.
         let _guard = CONFIG_FILE_TEST_LOCK
             .lock()
@@ -3878,14 +3899,39 @@ directory = "/tmp/otlp"
             unsafe { std::env::set_var(k, v) };
         }
         let result = std::panic::catch_unwind(|| {
-            let err = Config::load().expect_err("numeric env override must not be ignored");
-            assert!(format!("{err:#}").contains("45"), "{err:#}");
+            let cfg = Config::load().expect("config loads with object lock env overrides");
+            let c = &cfg.hec.s3.as_ref().expect("hec.s3 from env").connection;
+            assert_eq!(c.object_lock_mode, Some(ObjectLockMode::Compliance));
+            assert_eq!(c.object_lock_retain_days, Some(45));
         });
         for (k, _) in vars {
             unsafe { std::env::remove_var(k) };
         }
         if let Err(e) = result {
             std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    fn object_lock_retain_days_accepts_numeric_string_and_rejects_non_numeric() {
+        let c = &hec_s3_cfg("object_lock_retain_days=\"45\"\n")
+            .hec
+            .s3
+            .unwrap()
+            .connection;
+        assert_eq!(c.object_lock_retain_days, Some(45));
+        for bad in ["\"abc\"", "\"\"", "\"-1\""] {
+            let err =
+                toml::from_str::<Config>(&hec_s3_toml(&format!("object_lock_retain_days={bad}\n")))
+                    .expect_err(bad);
+            assert!(
+                err.to_string().contains("object_lock_retain_days"),
+                "{bad}: {err}"
+            );
+        }
+        for bad in ["-1", "1.5"] {
+            let toml = hec_s3_toml(&format!("object_lock_retain_days={bad}\n"));
+            assert!(toml::from_str::<Config>(&toml).is_err(), "{bad}");
         }
     }
 }

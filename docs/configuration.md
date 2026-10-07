@@ -99,10 +99,10 @@ iceberg) shares these keys:
 | `endpoint`, `bucket`, `region` | Target object store |
 | `access_key`, `secret_key` | Credentials (masked in the admin API) |
 | `object_lock_mode` | Optional `"GOVERNANCE"` or `"COMPLIANCE"`; any other string fails startup |
-| `object_lock_retain_days` | Retention in days (1-36500); required with, and only valid with, `object_lock_mode` |
+| `object_lock_retain_days` | Retention in days (1-36500); set together with `object_lock_mode` |
 
-The Object Lock keys are TOML-only (serde cannot read the numeric value from an environment
-variable through the flattened table). See [object-lock.md](object-lock.md).
+The Object Lock keys also work as environment overrides (`LOGTHING__HEC__S3__OBJECT_LOCK_MODE`,
+`...OBJECT_LOCK_RETAIN_DAYS`). See [object-lock.md](object-lock.md).
 
 ## Redaction
 

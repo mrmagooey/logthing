@@ -128,7 +128,7 @@ async fn upload_with_lock_sets_retention_checksum_and_blocks_delete() {
 }
 
 #[tokio::test]
-async fn upload_with_lock_to_non_lock_bucket_reports_object_lock_hint_or_succeeds() {
+async fn upload_with_lock_to_non_lock_bucket_reports_object_lock_hint() {
     let Ok(endpoint) = std::env::var("MINIO_ENDPOINT") else {
         eprintln!("MINIO_ENDPOINT not set — skipping object_lock integration test");
         return;
@@ -151,19 +151,9 @@ async fn upload_with_lock_to_non_lock_bucket_reports_object_lock_hint_or_succeed
             );
             assert!(msg.contains("plain/test.bin"), "error lacks the key: {msg}");
         }
-        Ok(()) => {
-            // The endpoint accepted lock headers on a non-lock bucket: the object must exist.
-            let head = tokio::time::timeout(
-                T,
-                s3.head_object()
-                    .bucket(&bucket)
-                    .key("plain/test.bin")
-                    .send(),
-            )
-            .await
-            .expect("head timed out")
-            .expect("object written");
-            assert_eq!(head.content_length(), Some(1));
-        }
+        Ok(()) => panic!(
+            "endpoint accepted Object Lock headers on a bucket without Object Lock: the \
+             retention would be silently unenforced"
+        ),
     }
 }

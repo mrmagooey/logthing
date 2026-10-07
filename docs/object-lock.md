@@ -22,24 +22,24 @@ object_lock_retain_days = 365     # 1..=36500
 
 - Both keys must be set together; one without the other fails startup, as does a mode other
   than `GOVERNANCE` / `COMPLIANCE` or a retention outside 1-36500 days.
-- These keys are **TOML-only**. Because the S3 table is flattened into each sink's table, the
-  environment loader hands the numeric `object_lock_retain_days` to serde as a string and
-  startup fails (loudly) with `invalid type: string "45", expected u32`. Set them in
-  `logthing.toml`.
+- Both keys can also be set from the environment, e.g.
+  `LOGTHING__HEC__S3__OBJECT_LOCK_MODE=COMPLIANCE` and
+  `LOGTHING__HEC__S3__OBJECT_LOCK_RETAIN_DAYS=45` (a non-numeric retention fails startup).
 
 ## The bucket must have Object Lock enabled
 
 Create the bucket with Object Lock enabled (this also enables versioning).
-Startup does **not** probe the bucket. If it is not lock-enabled (or the endpoint does not support Object
-Lock) uploads fail with an error naming Object Lock, and the writer's normal failure path
-applies: nothing is dropped.
+Startup does **not** probe the bucket. If it is not lock-enabled (or the endpoint does not
+support Object Lock) uploads fail with an error naming Object Lock, and the writer's normal failure
+path applies: nothing is dropped.
 
 **Garage does not support Object Lock. AWS S3 and MinIO do.**
 
 ## Checksum
 
 S3 requires an integrity checksum on Object Lock puts, so with a lock configured logthing sends
-`checksum_algorithm = SHA256` on every PutObject. Without a lock no checksum parameter is sent.
+`checksum_algorithm = SHA256` on every PutObject. Without a lock, logthing sets no checksum
+parameter.
 
 ## GOVERNANCE vs COMPLIANCE
 
@@ -64,5 +64,6 @@ integrity guarantee.
 ```bash
 aws s3api head-object --bucket logs-locked --key hec/.../file.parquet --checksum-mode ENABLED
 # shows ObjectLockMode, ObjectLockRetainUntilDate and ChecksumSHA256 (base64)
-aws s3 cp s3://logs-locked/hec/.../file.parquet - | sha256sum   # compare with the descriptor sha256 (hex)
+# compare with the descriptor sha256 (hex):
+aws s3 cp s3://logs-locked/hec/.../file.parquet - | sha256sum
 ```

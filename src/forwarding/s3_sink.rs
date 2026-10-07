@@ -139,7 +139,7 @@ impl S3Sink {
             .map_err(|e| {
                 anyhow::anyhow!(lock_hint_error(
                     key,
-                    &e.to_string(),
+                    &aws_sdk_s3::error::DisplayErrorContext(&e).to_string(),
                     self.object_lock.is_some()
                 ))
             })?;
