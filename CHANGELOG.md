@@ -30,6 +30,10 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 - The default HEC `channel_capacity` is about 43% smaller (the per-record budget rose from 1024
   to 1792 bytes to cover the new envelope columns). Set `channel_capacity` explicitly if you
   relied on the old default; a full channel now answers 503.
+- Analytics stack now enables HEC and OTLP ingest on port 5985. Compose requires `HEC_TOKEN` and
+  `OTLP_BEARER_TOKEN` (regenerate `.env` or add them to an existing one). Helm
+  `credentials.existingSecret` needs the new keys `hec-token` and `otlp-bearer-token`; a
+  `require-tokens` init container fails the logthing pod on an empty token.
 - Analytics stack image pins moved to 0.22.0 for both logthing and the committer, in lockstep
   with the crate version. If you override `LOGTHING_IMAGE` / `COMMITTER_IMAGE` or the Helm image
   values, move both to 0.22.0 together.
@@ -72,7 +76,9 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 - `deploy/analytics/` — docker compose and Helm deployments of logthing, Garage (S3), the
   committer, Lakekeeper (Iceberg REST), Trino and Metabase, plus a dbt-trino project
   (`deploy/analytics/dbt/`) with OCSF views (network, DNS, authentication, detection finding)
-  and example detection queries. See `deploy/analytics/README.md`.
+  and example detection queries. The stack also carries the OTLP/HEC application-log pipeline,
+  with `stg_otlp` and `stg_hec` dedup staging models (dedup on `event_uuid`). See
+  `deploy/analytics/README.md`.
 - Analytics stack security defaults: secrets are generated and never defaulted
   (`deploy/analytics/scripts/gen-analytics-env.sh` for compose; `randAlphaNum` + `lookup` in
   Helm); Trino serves HTTPS on 8443 with password authentication and a generated CA (plain HTTP

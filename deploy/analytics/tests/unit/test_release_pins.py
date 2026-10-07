@@ -5,8 +5,11 @@ from pathlib import Path
 ANALYTICS = Path(__file__).resolve().parents[2]
 ROOT = ANALYTICS.parents[1]
 
-# "since 0.22.0" (any case) but not an IP-like run such as "since 10.0.0.5" / "from 10.0.0.5".
-SINCE_RE = re.compile(r"(?<![\w.])[Ss]ince (\d+\.\d+\.\d+)(?![\d.]*\d)(?!\.\d)")
+# "since/from/before 0.22.0" (any case) but not an IP-like run such as "from 10.0.0.5".
+SINCE_RE = re.compile(
+    r"(?<![\w.])(?:[Ss]ince|[Ff]rom|[Bb]efore) (\d+\.\d+\.\d+)(?![\d.]*\d)(?!\.\d)"
+)
+FIRST_SHIPPED = (0, 22, 0)  # the release that introduced the strings; never decreases
 
 
 def cargo_version() -> str:
@@ -68,17 +71,21 @@ def test_since_regex_ignores_ip_like_and_prose_matches():
     assert SINCE_RE.findall("a since-boot window, since a deployment") == []
     assert SINCE_RE.findall("sinks since 0.22.0; see") == ["0.22.0"]
     assert SINCE_RE.findall("Since 0.22.0 OTLP has") == ["0.22.0"]
+    assert SINCE_RE.findall("Before 0.22.0, OTLP; from 0.22.0 on") == ["0.22.0", "0.22.0"]
 
 
-def test_since_version_strings_do_not_exceed_and_include_the_release_version():
-    """'since X.Y.Z' strings in code and docs must not name a version newer than the crate, and
-    the newest one must be the version being released (they were written as 0.22.0)."""
+def test_version_strings_never_exceed_the_crate_version():
+    """'since/from/before X.Y.Z' strings in code and docs must not name a version newer than the
+    crate, and the 0.22.0 strings written for this feature must still be present."""
     v = cargo_version()
     found = set()
-    for base in ("src", "docs", "logthing.toml", "tests"):
+    for base in ("src", "docs", "logthing.toml", "tests", "deploy/analytics"):
         root = ROOT / base
         files = [root] if root.is_file() else [
-            f for f in root.rglob("*") if f.suffix in {".rs", ".md", ".toml"}
+            f for f in root.rglob("*")
+            if f.is_file() and ".venv" not in f.parts
+            and f.suffix in {".rs", ".md", ".toml", ".yml", ".yaml", ".sql", ".py"}
+            and f.name != "test_release_pins.py"
         ]
         for f in files:
             for ver in SINCE_RE.findall(f.read_text()):
@@ -86,4 +93,4 @@ def test_since_version_strings_do_not_exceed_and_include_the_release_version():
     cur = tuple(int(x) for x in v.split("."))
     assert found, "expected at least one 'since X.Y.Z' string"
     assert max(found) <= cur, f"strings reference a version newer than {v}: {sorted(found)}"
-    assert max(found) == cur, f"no 'since {v}' string found; newest is {max(found)}"
+    assert max(found) >= FIRST_SHIPPED, f"the {FIRST_SHIPPED} strings vanished: {sorted(found)}"
