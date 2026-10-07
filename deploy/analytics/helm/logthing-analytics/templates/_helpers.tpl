@@ -98,3 +98,39 @@ app.kubernetes.io/version: {{ .root.Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .root.Release.Service }}
 {{ include "la.selector" . }}
 {{- end -}}
+
+{{/*
+Resolve one credential: explicit value > value already stored in the live Secret (lookup, so
+`helm upgrade` never rotates what Postgres/Garage persisted) > freshly generated.
+Args: root, key (Secret key), field (values name, for the error), value (explicit), gen.
+`helm template` has no cluster, so lookup is empty there and every render generates new values:
+pin credentials.* (or existingSecret) for GitOps.
+*/}}
+{{- define "la.cred" -}}
+{{- $key := .key -}}
+{{- $v := "" -}}
+{{- if .value -}}
+{{- $v = toString .value -}}
+{{- else -}}
+{{- with lookup "v1" "Secret" .root.Release.Namespace (printf "%s-credentials" (include "la.fullname" .root)) -}}
+{{- with .data -}}
+{{- if hasKey . $key -}}{{- $v = index . $key | b64dec -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not $v -}}{{- $v = .gen -}}{{- end -}}
+{{- end -}}
+{{- if not (regexMatch "^[A-Za-z0-9._~-]+$" $v) -}}
+{{- fail (printf "credentials.%s must be URL-safe ([A-Za-z0-9._~-]); it is spliced into connection URLs" .field) -}}
+{{- end -}}
+{{- $v -}}
+{{- end -}}
+
+{{/*
+Pod-roll checksum for the credentials. Hashes only the values the user sets (credentials.*),
+never the generated/looked-up ones: those are random per render (and invisible to
+`helm template`), so hashing the rendered Secret would roll every pod on every `helm upgrade`.
+Generated values never change after first install by design, so they need no roll trigger.
+*/}}
+{{- define "la.credsum" -}}
+{{- omit .Values.credentials "existingSecret" | toJson | sha256sum -}}
+{{- end -}}

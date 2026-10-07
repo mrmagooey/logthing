@@ -25,7 +25,7 @@ override the images at your own risk: `TRINO_IMAGE` / `HUE_IMAGE` (compose) or
 
 **Security**
 
-- **Credentials are demo values.** Change them before the first start (see below).
+- **Credentials are generated, never defaulted.** Compose refuses to start without `.env`; Helm generates random secrets (see Credentials).
 - **Lakekeeper and Trino have no authentication.** Keep them on a private network.
 - **The first person to log in to Hue becomes admin.** Log in right away.
 - Garage S3, Lakekeeper, Trino and Hue bind to `${ANALYTICS_BIND_ADDR:-127.0.0.1}` in compose
@@ -36,14 +36,24 @@ override the images at your own risk: `TRINO_IMAGE` / `HUE_IMAGE` (compose) or
 
 ## Credentials
 
-Change them in `.env` (compose) or `values.yaml` (Helm) **before the first start**. Postgres
-roles (lakekeeper/hue passwords) and Garage keys are created on first start and persist in
-volumes/PVCs; changing them later means wiping that state, which **deletes all data**:
+There are no default secrets.
 
-- compose: `docker compose down -v` deletes all data.
-- Helm: `kubectl delete pvc -l app.kubernetes.io/instance=<release> -n <ns>` deletes all data.
+- **compose:** `deploy/analytics/scripts/gen-analytics-env.sh` writes `.env` (mode 600) with random
+  values; `docker compose up` fails with a message naming any variable that is missing or empty.
+  Regenerating (`--force`) or editing credentials after the first start needs
+  `docker compose down -v` (it **deletes all data**) because Postgres roles and the Garage key are
+  created from them on first start.
+- **Helm:** leave `credentials.*` empty and the chart generates random values on first install and
+  keeps them on `helm upgrade` (read back from the live Secret with `lookup`). Set a value to pin
+  it, or `credentials.existingSecret` for your own Secret. `helm template` cannot see the live
+  Secret and renders fresh values each time: pin credentials (or use `existingSecret`) when
+  applying with GitOps tools. Reinstalling after `helm uninstall` needs the PVCs deleted
+  (`kubectl delete pvc -n <ns> -l app.kubernetes.io/instance=<release>`, deletes all data) unless
+  you supply `existingSecret` with the original values.
 
-Passwords must be URL-safe (they are spliced into Postgres connection URLs).
+Passwords must be URL-safe (`[A-Za-z0-9._~-]`, they are spliced into Postgres URLs); the chart
+fails the render otherwise. The Garage key id must be `GK` + 24 hex characters and its secret
+64 hex characters.
 
 ## Docker compose
 
@@ -51,7 +61,7 @@ All commands run from `deploy/analytics`.
 
 ```bash
 cd deploy/analytics
-cp .env.example .env     # edit credentials first
+scripts/gen-analytics-env.sh   # writes .env with random secrets
 docker compose up -d
 docker compose ps        # wait: init services (garage-init, lakekeeper-migrate,
                          # lakekeeper-init) "Exited (0)", the rest running/healthy
@@ -110,7 +120,6 @@ As with compose, tables appear 1-2 minutes after data arrives (the committer is 
   - `lakekeeper-encryption-key`
   - `hue-db-password`
   - `hue-secret-key`
-- **GitOps:** nothing is generated at render time, so `helm template` output is complete.
 - **logthing Services:** two are created, `<fullname>-logthing-udp` (514, 4739, 6343) and
   `<fullname>-logthing-tcp` (601, 47760, 5985), because mixed-protocol LoadBalancers are
   poorly supported. Set `logthing.udpService.type` / `logthing.tcpService.type` (default

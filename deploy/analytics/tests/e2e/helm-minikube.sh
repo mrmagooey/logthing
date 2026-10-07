@@ -70,6 +70,13 @@ SETS=(--set logthing.flushIntervalSecs=5)
 "${H[@]}" upgrade --install lt "$CHART" --namespace "$NS" --create-namespace --wait --timeout 15m "${SETS[@]}" \
   || { echo "helm install failed" >&2; dump_logs; exit 1; }
 
+echo "== [3b/7] helm upgrade keeps generated credentials (lookup persistence) =="
+secret_hash() { "${K[@]}" get secret "$FULL-credentials" -o jsonpath='{.data}' | sha256sum | cut -d' ' -f1; }
+BEFORE=$(secret_hash)
+"${H[@]}" upgrade lt "$CHART" --namespace "$NS" --reuse-values --wait --timeout 15m \
+  || { echo "helm upgrade failed" >&2; dump_logs; exit 1; }
+[ "$(secret_hash)" = "$BEFORE" ] || { echo "credentials Secret changed across helm upgrade" >&2; exit 1; }
+
 echo "== [4/7] wait for init jobs =="
 # Job names carry the release revision, so select by label.
 for c in garage-init lakekeeper-init; do

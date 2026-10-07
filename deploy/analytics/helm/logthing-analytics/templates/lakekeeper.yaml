@@ -34,7 +34,7 @@ spec:
         {{- include "la.podLabels" (dict "root" . "component" "lakekeeper") | nindent 8 }}
       annotations:
         {{- if not .Values.credentials.existingSecret }}
-        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        checksum/secret: {{ include "la.credsum" . }}
         {{- end }}
     spec:
       initContainers:

@@ -24,6 +24,20 @@ def render(*sets, release="lt"):
     return [d for d in yaml.safe_load_all(out) if d]
 
 
+def render_fails(*sets):
+    with pytest.raises(subprocess.CalledProcessError) as exc:
+        render(*sets)
+    return exc.value.stderr
+
+
+def notes(*sets):
+    args = ["helm", "install", "lt", str(CHART), "--dry-run=client"]
+    for s in sets:
+        args += ["--set", s]
+    out = subprocess.run(args, capture_output=True, text=True, check=True, timeout=TIMEOUT).stdout
+    return out.split("NOTES:", 1)[1]
+
+
 def by(docs, kind, name):
     return next(d for d in docs if d["kind"] == kind and d["metadata"]["name"] == name)
 
@@ -405,3 +419,62 @@ def test_volume_claim_templates_carry_instance_label():
                 "app.kubernetes.io/instance",
             }
             assert vct["metadata"]["labels"]["app.kubernetes.io/instance"] == "lt"
+
+
+HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def test_generated_credentials_have_required_shapes():
+    d = by(render(), "Secret", f"{FULL}-credentials")["stringData"]
+    assert re.fullmatch(r"GK[0-9a-f]{24}", d["s3-access-key"])
+    assert HEX64.fullmatch(d["s3-secret-key"]) and HEX64.fullmatch(d["garage-rpc-secret"])
+    for k in ("garage-admin-token", "postgres-password", "lakekeeper-db-password",
+              "lakekeeper-encryption-key", "hue-db-password", "hue-secret-key"):
+        assert re.fullmatch(r"[A-Za-z0-9]{32,}", d[k]), k
+
+
+def test_no_demo_credentials_remain():
+    text = str(by(render(), "Secret", f"{FULL}-credentials")["stringData"])
+    assert "demo" not in text and "change-me" not in text
+    values = (CHART / "values.yaml").read_text()
+    assert "demo" not in values and "change-me" not in values and "GK6b9c" not in values
+
+
+def test_two_renders_generate_different_secrets():
+    a = by(render(), "Secret", f"{FULL}-credentials")["stringData"]
+    b = by(render(), "Secret", f"{FULL}-credentials")["stringData"]
+    assert all(a[k] != b[k] for k in a)
+
+
+def test_explicit_credential_wins_over_generation():
+    d = by(render("credentials.postgresPassword=abc123"), "Secret",
+           f"{FULL}-credentials")["stringData"]
+    assert d["postgres-password"] == "abc123"
+
+
+def test_non_url_safe_password_fails_render():
+    err = render_fails("credentials.lakekeeperDbPassword=a/b@c")
+    assert "lakekeeperDbPassword" in err and "URL-safe" in err
+
+
+def test_notes_describe_generated_credentials():
+    text = notes()
+    assert "Demo credentials" not in text
+    assert f"{FULL}-credentials" in text and "kubectl get secret" in text
+    assert f"{FULL}-credentials" not in notes("credentials.existingSecret=mine")
+
+
+def test_checksum_secret_is_stable_across_renders_with_generated_secrets():
+    # The generated Secret differs per render (see test_two_renders_generate_different_secrets),
+    # but the pod-roll checksum must not, or every `helm upgrade` would roll every pod.
+    # LIMITATION: `helm template` has no cluster so `lookup` returns empty and the lookup
+    # persistence path itself cannot be exercised here; it is covered by helm-minikube.sh step 3b
+    # (secret unchanged across `helm upgrade`). This test pins the checksum independence from
+    # whatever the Secret resolved to, which is what makes the lookup path roll-free.
+    a, b = render(), render()
+    for kind, name in (("Deployment", "logthing"), ("Deployment", "hue"),
+                       ("Deployment", "trino"), ("StatefulSet", "postgres"),
+                       ("StatefulSet", "garage"), ("Deployment", "lakekeeper")):
+        full = f"{FULL}-{name}"
+        assert (_annotations(a, kind, full)["checksum/secret"]
+                == _annotations(b, kind, full)["checksum/secret"]), name

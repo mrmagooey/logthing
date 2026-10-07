@@ -11,9 +11,14 @@ Tables appear only after the first committer run (CronJob {{ include "la.fullnam
 schedule "{{ .Values.committer.schedule }}") has seen flushed data.
 
 Uninstalling leaves the PersistentVolumeClaims behind (Postgres roles and Garage keys persist
-in them). To reinstall with different credentials, delete them first:
+in them) but deletes the generated credentials Secret. Delete the PVCs before reinstalling
+unless you supply credentials.existingSecret with the original values:
   kubectl delete pvc -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }}
 {{- if not .Values.credentials.existingSecret }}
 
-WARNING: Demo credentials in use - set credentials.* or credentials.existingSecret.
+Credentials were generated (or taken from credentials.*) and stored in Secret
+{{ include "la.fullname" . }}-credentials. They persist across `helm upgrade`. Read one with:
+  kubectl get secret -n {{ .Release.Namespace }} {{ include "la.fullname" . }}-credentials -o jsonpath='{.data.postgres-password}' | base64 -d
+`helm template` cannot read the live Secret, so rendered manifests contain fresh random values:
+pin credentials.* or use credentials.existingSecret when applying with GitOps tooling.
 {{- end }}

@@ -1,16 +1,16 @@
 # logthing analytics stack: logthing -> Garage (S3) -> committer -> Lakekeeper (Iceberg REST)
 # -> Trino -> Hue. Shared config files live in helm/logthing-analytics/files/ and are used
-# unchanged by the Helm chart. Credentials below are DEMO defaults: override them in .env.
+# unchanged by the Helm chart. Secrets are REQUIRED (no defaults): run scripts/gen-analytics-env.sh.
 name: logthing-analytics
 
 x-s3-creds: &s3-creds
-  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
-  S3_SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
 
 x-lakekeeper-env: &lakekeeper-env
-  LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:-demo-lakekeeper-encryption-key-change-me}
-  LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:-demo-lakekeeper-change-me}@postgres:5432/lakekeeper
-  LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:-demo-lakekeeper-change-me}@postgres:5432/lakekeeper
+  LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:?set LAKEKEEPER_ENCRYPTION_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:?set LAKEKEEPER_DB_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}@postgres:5432/lakekeeper
+  LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:?set LAKEKEEPER_DB_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}@postgres:5432/lakekeeper
   LAKEKEEPER__BASE_URI: http://lakekeeper:8181
 
 x-bootstrap: &bootstrap
@@ -22,33 +22,33 @@ x-bootstrap: &bootstrap
 
 x-logthing-s3: &logthing-s3
   LOGTHING__SYSLOG__S3__ENDPOINT: http://garage:3900
-  LOGTHING__SYSLOG__S3__ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
-  LOGTHING__SYSLOG__S3__SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  LOGTHING__SYSLOG__S3__ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  LOGTHING__SYSLOG__S3__SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
   LOGTHING__SYSLOG__S3__FLUSH_INTERVAL_SECS: ${LOGTHING_FLUSH_INTERVAL_SECS:-60}
   LOGTHING__IPFIX__S3__ENDPOINT: http://garage:3900
-  LOGTHING__IPFIX__S3__ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
-  LOGTHING__IPFIX__S3__SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  LOGTHING__IPFIX__S3__ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  LOGTHING__IPFIX__S3__SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
   LOGTHING__IPFIX__S3__FLUSH_INTERVAL_SECS: ${LOGTHING_FLUSH_INTERVAL_SECS:-60}
   LOGTHING__SFLOW__S3__ENDPOINT: http://garage:3900
-  LOGTHING__SFLOW__S3__ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
-  LOGTHING__SFLOW__S3__SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  LOGTHING__SFLOW__S3__ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  LOGTHING__SFLOW__S3__SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
   LOGTHING__SFLOW__S3__FLUSH_INTERVAL_SECS: ${LOGTHING_FLUSH_INTERVAL_SECS:-60}
   LOGTHING__ZEEK__S3__ENDPOINT: http://garage:3900
-  LOGTHING__ZEEK__S3__ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
-  LOGTHING__ZEEK__S3__SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  LOGTHING__ZEEK__S3__ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  LOGTHING__ZEEK__S3__SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
   LOGTHING__ZEEK__S3__FLUSH_INTERVAL_SECS: ${LOGTHING_FLUSH_INTERVAL_SECS:-60}
   LOGTHING__ICEBERG__S3__ENDPOINT: http://garage:3900
-  LOGTHING__ICEBERG__S3__ACCESS_KEY: ${S3_ACCESS_KEY:-GK6b9c062a24e5a702c7c53e5b}
-  LOGTHING__ICEBERG__S3__SECRET_KEY: ${S3_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  LOGTHING__ICEBERG__S3__ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  LOGTHING__ICEBERG__S3__SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
 
 services:
   postgres:
     image: ${POSTGRES_IMAGE:-postgres:17}
     restart: unless-stopped
     environment:
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-demo-postgres-change-me}
-      LAKEKEEPER_DB_PASSWORD: ${LAKEKEEPER_DB_PASSWORD:-demo-lakekeeper-change-me}
-      HUE_DB_PASSWORD: ${HUE_DB_PASSWORD:-demo-hue-change-me}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      LAKEKEEPER_DB_PASSWORD: ${LAKEKEEPER_DB_PASSWORD:?set LAKEKEEPER_DB_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      HUE_DB_PASSWORD: ${HUE_DB_PASSWORD:?set HUE_DB_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
     volumes:
       - ./helm/logthing-analytics/files/postgres-init.sh:/docker-entrypoint-initdb.d/10-init.sh:ro
       - pgdata:/var/lib/postgresql/data
@@ -63,8 +63,8 @@ services:
     image: ${GARAGE_IMAGE:-dxflrs/garage:v2.4.1}
     restart: unless-stopped
     environment:
-      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:-5f0c4d3a9b8e7f6a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b}
-      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-demo-garage-admin-token-change-me}
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:?set GARAGE_RPC_SECRET (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:?set GARAGE_ADMIN_TOKEN (run deploy/analytics/scripts/gen-analytics-env.sh)}
     volumes:
       - ./helm/logthing-analytics/files/garage.toml:/etc/garage.toml:ro
       - garage-meta:/var/lib/garage/meta
@@ -82,7 +82,7 @@ services:
     command: ["garage"]
     environment:
       <<: *s3-creds
-      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-demo-garage-admin-token-change-me}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:?set GARAGE_ADMIN_TOKEN (run deploy/analytics/scripts/gen-analytics-env.sh)}
     depends_on:
       garage: {condition: service_healthy}
 
@@ -185,8 +185,8 @@ services:
     volumes:
       - ./hue.ini:/usr/share/hue/desktop/conf/z-hue-overrides.ini:ro
     environment:
-      HUE_DB_PASSWORD: ${HUE_DB_PASSWORD:-demo-hue-change-me}
-      HUE_SECRET_KEY: ${HUE_SECRET_KEY:-demo-hue-secret-key-change-me-0123456789abcdef}
+      HUE_DB_PASSWORD: ${HUE_DB_PASSWORD:?set HUE_DB_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      HUE_SECRET_KEY: ${HUE_SECRET_KEY:?set HUE_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8888/desktop/debug/is_alive"]
       interval: 10s

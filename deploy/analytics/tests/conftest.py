@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import pathlib
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -67,3 +68,17 @@ def server():
     s = FakeServer()
     yield s
     s.close()
+
+
+GEN_ENV = ANALYTICS / "scripts" / "gen-analytics-env.sh"
+
+
+def generated_env(path):
+    """Run the real generator into `path` (must not exist) and return its KEY=VALUE pairs."""
+    subprocess.run(["bash", str(GEN_ENV), str(path)], check=True, capture_output=True)
+    out = {}
+    for line in pathlib.Path(path).read_text().splitlines():
+        if line and not line.startswith("#"):
+            key, value = line.split("=", 1)
+            out[key] = value
+    return out

@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from conftest import ANALYTICS
+from conftest import ANALYTICS, generated_env
 
 if shutil.which("docker") is None:
     pytest.skip("docker not on PATH", allow_module_level=True)
@@ -20,15 +20,22 @@ def clean_env():
     return {k: os.environ[k] for k in keep if k in os.environ}
 
 
-def compose_config(tmp_path, overrides=None):
-    """Render the compose file hermetically: explicit env file, minimal process env."""
-    env_file = tmp_path / "test.env"
-    env_file.write_text("".join(f"{k}={v}\n" for k, v in (overrides or {}).items()))
-    out = subprocess.run(
+def run_config(env_file):
+    return subprocess.run(
         ["docker", "compose", "--env-file", str(env_file),
          "-f", str(ANALYTICS / "docker-compose.yml"), "config", "--format", "json"],
-        capture_output=True, text=True, check=True, env=clean_env(),
+        capture_output=True, text=True, env=clean_env(),
     )
+
+
+def compose_config(tmp_path, overrides=None):
+    """Render the compose file hermetically: generated secrets + overrides, minimal process env."""
+    env = generated_env(tmp_path / "gen.env")
+    env.update(overrides or {})
+    env_file = tmp_path / "test.env"
+    env_file.write_text("".join(f"{k}={v}\n" for k, v in env.items()))
+    out = run_config(env_file)
+    assert out.returncode == 0, out.stderr
     return json.loads(out.stdout)
 
 
@@ -145,27 +152,42 @@ def test_region_and_bucket_consistent(cfg):
     assert env["WAREHOUSE"] == "logthing"
 
 
-CREDENTIALS = {
-    "GARAGE_RPC_SECRET": "5f0c4d3a9b8e7f6a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b",
-    "GARAGE_ADMIN_TOKEN": "demo-garage-admin-token-change-me",
-    "S3_ACCESS_KEY": "GK6b9c062a24e5a702c7c53e5b",
-    "S3_SECRET_KEY": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-    "POSTGRES_PASSWORD": "demo-postgres-change-me",
-    "LAKEKEEPER_DB_PASSWORD": "demo-lakekeeper-change-me",
-    "LAKEKEEPER_ENCRYPTION_KEY": "demo-lakekeeper-encryption-key-change-me",
-    "HUE_DB_PASSWORD": "demo-hue-change-me",
-    "HUE_SECRET_KEY": "demo-hue-secret-key-change-me-0123456789abcdef",
-}
+def required_vars():
+    return set(re.findall(r"\$\{([A-Z0-9_]+):\?", (ANALYTICS / "docker-compose.yml").read_text()))
 
 
-def test_env_example_matches_compose_defaults():
-    compose = (ANALYTICS / "docker-compose.yml").read_text()
+def test_env_example_lists_every_required_var_with_an_empty_value():
     env = {}
     for line in (ANALYTICS / ".env.example").read_text().splitlines():
         m = re.fullmatch(r"([A-Z0-9_]+)=(.*)", line)
-        if m and m.group(1) in CREDENTIALS:
+        if m:
             env[m.group(1)] = m.group(2)
-    assert env == CREDENTIALS
-    for name, value in CREDENTIALS.items():
-        defaults = set(re.findall(r"\$\{%s:-([^}]*)\}" % name, compose))
-        assert defaults == {value}, name
+    required = required_vars()
+    assert required, "compose declares no required variables"
+    assert required <= set(env)
+    assert all(env[k] == "" for k in required)
+
+
+def test_no_required_secret_has_a_public_default():
+    compose = (ANALYTICS / "docker-compose.yml").read_text()
+    for name in required_vars():
+        assert not re.search(r"\$\{%s:-" % name, compose), name
+    assert "demo" not in compose.lower() and "change-me" not in compose
+
+
+def test_missing_required_var_fails_with_an_actionable_message(tmp_path):
+    env = generated_env(tmp_path / "gen.env")
+    del env["S3_SECRET_KEY"]
+    env_file = tmp_path / "partial.env"
+    env_file.write_text("".join(f"{k}={v}\n" for k, v in env.items()))
+    out = run_config(env_file)
+    assert out.returncode != 0
+    assert "S3_SECRET_KEY" in out.stderr and "gen-analytics-env.sh" in out.stderr
+
+
+def test_empty_required_var_is_rejected(tmp_path):
+    env = generated_env(tmp_path / "gen.env")
+    env["POSTGRES_PASSWORD"] = ""
+    env_file = tmp_path / "empty.env"
+    env_file.write_text("".join(f"{k}={v}\n" for k, v in env.items()))
+    assert run_config(env_file).returncode != 0
