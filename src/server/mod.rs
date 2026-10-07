@@ -4,6 +4,7 @@ pub mod otlp;
 use crate::config::Config;
 use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::ingest::IngestState;
+use crate::ingest::decompress::post_gzip;
 use crate::ingest::handlers::{handle_hec_event, handle_hec_raw, handle_ndjson};
 use crate::middleware::{IpWhitelist, ip_whitelist_middleware};
 use crate::models::WindowsEvent;
@@ -776,9 +777,9 @@ impl Server {
         // protected routes.
         if self.config.hec.enabled {
             protected_router = protected_router
-                .route("/services/collector/event", post(handle_hec_event))
-                .route("/services/collector/raw", post(handle_hec_raw))
-                .route("/ingest", post(handle_ndjson));
+                .route("/services/collector/event", post_gzip(handle_hec_event))
+                .route("/services/collector/raw", post_gzip(handle_hec_raw))
+                .route("/ingest", post_gzip(handle_ndjson));
         }
 
         // OTLP log ingest route — registered ONLY when the `otlp` feature is
@@ -789,7 +790,7 @@ impl Server {
         // and body-limit middleware as the other protected routes.
         #[cfg(feature = "otlp")]
         if self.config.otlp.enabled {
-            protected_router = protected_router.route("/v1/logs", post(handle_otlp_logs));
+            protected_router = protected_router.route("/v1/logs", post_gzip(handle_otlp_logs));
         }
 
         // Shared in-flight body-byte budget (see `BODY_BYTE_BUDGET`), constructed
@@ -810,6 +811,9 @@ impl Server {
         let protected_router = protected_router
             .layer(axum::Extension(self.ingest_state.clone()))
             .layer(axum::Extension(self.state.config.clone()))
+            // For routes wrapped by `post_gzip` this limit applies to the DECOMPRESSED stream
+            // (the `Bytes` extractor wraps whatever body the route hands it);
+            // `body_budget_middleware` below still charges WIRE bytes.
             .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE))
             .layer(middleware::from_fn_with_state(
                 body_budget,
@@ -3745,6 +3749,148 @@ event_parsers:
         let addr: SocketAddr = "127.0.0.1:40000".parse().unwrap();
         req.extensions_mut().insert(ConnectInfo(addr));
         req
+    }
+
+    fn gz(data: &[u8]) -> Vec<u8> {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+        let mut e = GzEncoder::new(Vec::new(), Compression::fast());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    async fn router_with_hec_and_otlp() -> axum::Router {
+        let mut config = Config::default();
+        config.hec.enabled = true;
+        #[cfg(feature = "otlp")]
+        {
+            config.otlp.enabled = true;
+        }
+        let server = build_server(config).await;
+        server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds")
+    }
+
+    async fn post_status(
+        router: &axum::Router,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> StatusCode {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+        let mut b = HttpRequest::builder().method("POST").uri(uri);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let req = with_connect_info(b.body(Body::from(body)).unwrap());
+        router.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn create_router_accepts_gzip_on_hec_event_and_ndjson_routes() {
+        let router = router_with_hec_and_otlp().await;
+        for (uri, body) in [
+            (
+                "/services/collector/event",
+                br#"{"event":{"k":1}}"#.to_vec(),
+            ),
+            ("/ingest", b"{\"k\":1}\n".to_vec()),
+        ] {
+            let st = post_status(&router, uri, &[("content-encoding", "gzip")], gz(&body)).await;
+            assert_eq!(st, StatusCode::OK, "{uri}");
+        }
+    }
+
+    #[cfg(feature = "otlp")]
+    #[tokio::test]
+    async fn create_router_accepts_gzip_otlp_protobuf_and_json() {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use prost::Message as _;
+        let router = router_with_hec_and_otlp().await;
+        let req = ExportLogsServiceRequest::default();
+        for (ct, body) in [
+            ("application/x-protobuf", req.encode_to_vec()),
+            ("application/json", serde_json::to_vec(&req).unwrap()),
+        ] {
+            let st = post_status(
+                &router,
+                "/v1/logs",
+                &[("content-type", ct), ("content-encoding", "gzip")],
+                gz(&body),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{ct}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_router_gzip_bomb_over_max_body_size_is_413() {
+        let router = router_with_hec_and_otlp().await;
+        // MAX_BODY_SIZE + 1 zero bytes: ~64 KiB on the wire.
+        let bomb = gz(&vec![0u8; MAX_BODY_SIZE + 1]);
+        assert!(bomb.len() < 1024 * 1024);
+        let st = post_status(
+            &router,
+            "/services/collector/raw",
+            &[("content-encoding", "gzip")],
+            bomb,
+        )
+        .await;
+        assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn create_router_unsupported_encoding_on_hec_is_415() {
+        let router = router_with_hec_and_otlp().await;
+        for enc in ["br", "deflate", "gzip, gzip"] {
+            let st = post_status(
+                &router,
+                "/services/collector/event",
+                &[("content-encoding", enc)],
+                b"x".to_vec(),
+            )
+            .await;
+            assert_eq!(st, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{enc}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_router_syslog_and_wef_routes_do_not_decompress_gzip() {
+        let router = router_with_hec_and_otlp().await;
+        let syslog = "<134>Jan 15 10:30:45 dns-server named[1234]: query";
+        let events = r#"<Envelope><Body><Events><Event><System><Provider>Security</Provider>
+            <EventID>4624</EventID><Level>4</Level><TimeCreated>2024-01-01T00:00:00Z</TimeCreated>
+            <Computer>host</Computer></System></Event></Events></Body></Envelope>"#;
+        for (uri, valid) in [("/syslog", syslog), ("/wsman/events", events)] {
+            // Control: the plain payload is accepted.
+            let plain = post_status(&router, uri, &[], valid.as_bytes().to_vec()).await;
+            assert_eq!(plain, StatusCode::OK, "{uri} control");
+            // gzip of the same payload is NOT decoded: the handler sees undecodable bytes.
+            let zipped = post_status(
+                &router,
+                uri,
+                &[("content-encoding", "gzip")],
+                gz(valid.as_bytes()),
+            )
+            .await;
+            assert_eq!(
+                zipped,
+                StatusCode::BAD_REQUEST,
+                "{uri} gzip must not be decoded"
+            );
+            // An encoding the layer would 415 is not 415 here either: plain body still OK.
+            let br = post_status(
+                &router,
+                uri,
+                &[("content-encoding", "br")],
+                valid.as_bytes().to_vec(),
+            )
+            .await;
+            assert_eq!(br, StatusCode::OK, "{uri} br ignored, not 415");
+        }
     }
 
     /// With `hec.enabled = false` (the default), the three HEC routes must NOT

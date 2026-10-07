@@ -5,6 +5,7 @@
 //! `GenericSink` is the `ParquetSink` adapter that persists these records
 //! to S3 partitioned by `sourcetype`.
 
+pub mod decompress;
 pub mod handlers;
 pub mod parse;
 

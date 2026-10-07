@@ -44,6 +44,14 @@ Payloads are free-form, so no keys are promoted out of `fields`; extract them in
 `json_extract_scalar(fields, '$.user')`. The four new columns were appended in 0.22.0; the
 committer adds them to an existing `hec` table automatically (older rows read NULL).
 
+## Compression
+
+All three routes accept `Content-Encoding: gzip` (also `x-gzip`, case-insensitive). The
+DECOMPRESSED body is capped at 64 MiB: a larger one gets `413`. Any other encoding
+(`deflate`, `br`, `zstd`, stacked encodings) gets `415`; a corrupt gzip stream gets `400`.
+The server's in-flight body-memory budget charges the compressed (wire) size. WEF and syslog
+routes do not decompress request bodies.
+
 ## Migration
 
 Nothing to change in `[hec]` unless it relied on having no sink: that now fails startup. Add

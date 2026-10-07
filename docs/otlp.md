@@ -34,6 +34,10 @@ directory = "/var/lib/logthing/otlp"
 | JSON | `Content-Type: application/json` (OTLP/JSON, camelCase) is accepted |
 | gRPC (port 4317) | **Not supported yet.** Use `otlphttp`. |
 
+Request bodies may be gzip-compressed (`Content-Encoding: gzip`), for both protobuf and JSON.
+The decompressed size is capped at 64 MiB (`413` beyond that); any other `Content-Encoding`
+gets `415`; a corrupt gzip stream gets `400`.
+
 ## Columns
 
 One Iceberg table `otlp` (all services), partitioned by `day(partition_time)`.

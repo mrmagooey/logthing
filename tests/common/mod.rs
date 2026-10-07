@@ -101,11 +101,29 @@ pub fn run_to_exit(
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let out = cmd.output().expect("spawn logthing");
-    (
-        out.status,
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
+    let stdout = dir.path().join("stdout.log");
+    let stderr = dir.path().join("stderr.log");
+    cmd.stdout(Stdio::from(std::fs::File::create(&stdout).unwrap()))
+        .stderr(Stdio::from(std::fs::File::create(&stderr).unwrap()));
+    let mut child = cmd.spawn().expect("spawn logthing");
+    // Never hang the test run: a config that should be rejected but starts serving would
+    // otherwise block forever.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(st) = child.try_wait().expect("try_wait") {
+            break st;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "process did not exit (validation regression?); stderr so far:\n{}",
+                std::fs::read_to_string(&stderr).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    (status, std::fs::read_to_string(&stderr).unwrap_or_default())
 }
 
 /// A running logthing process; killed and reaped on drop.
