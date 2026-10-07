@@ -22,12 +22,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-/// Run loadgen with `args`, panicking if it does not exit within `limit`. Returns (success, stdout).
-fn run_loadgen(args: Vec<String>, limit: Duration) -> (bool, String) {
+/// Run loadgen with `args`, panicking if it does not exit within `limit`. Returns (success, stdout, stderr).
+fn run_loadgen(args: Vec<String>, limit: Duration) -> (bool, String, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_loadgen"))
         .args(&args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn loadgen");
     let deadline = Instant::now() + limit;
@@ -48,10 +48,17 @@ fn run_loadgen(args: Vec<String>, limit: Duration) -> (bool, String) {
         .unwrap()
         .read_to_string(&mut out)
         .unwrap();
-    (status.success(), out)
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    (status.success(), out, err)
 }
 
-async fn run_async(args: &[&str], limit: Duration) -> (bool, String) {
+async fn run_async(args: &[&str], limit: Duration) -> (bool, String, String) {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     tokio::task::spawn_blocking(move || run_loadgen(args, limit))
         .await
@@ -159,7 +166,7 @@ async fn otlp_http_gzip_run_against_real_logthing_router_succeeds() {
         .with_state(state);
     let port = serve(app).await.to_string();
 
-    let (ok, out) = run_async(
+    let (ok, out, err) = run_async(
         &[
             "otlp-http",
             "--port",
@@ -180,20 +187,23 @@ async fn otlp_http_gzip_run_against_real_logthing_router_succeeds() {
         Duration::from_secs(30),
     )
     .await;
-    assert!(ok, "loadgen failed:\n{out}");
+    assert!(ok, "loadgen failed:\nstdout:\n{out}\nstderr:\n{err}");
     assert!(
         out.contains("backpressure: 0 503 responses, 0 requests abandoned"),
-        "{out}"
+        "stdout:\n{out}\nstderr:\n{err}"
     );
     let n = sent_records(&out);
-    assert!(n > 0 && n.is_multiple_of(10), "sent {n}\n{out}");
+    assert!(
+        n > 0 && n.is_multiple_of(10),
+        "sent {n}\nstdout:\n{out}\nstderr:\n{err}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn hec_http_503_is_retried_and_counted_separately_from_errors() {
     let (port, oks) = stub(5).await;
     let port = port.to_string();
-    let (ok, out) = run_async(
+    let (ok, out, err) = run_async(
         &[
             "hec-http",
             "--port",
@@ -210,15 +220,15 @@ async fn hec_http_503_is_retried_and_counted_separately_from_errors() {
         Duration::from_secs(30),
     )
     .await;
-    assert!(ok, "loadgen failed:\n{out}");
+    assert!(ok, "loadgen failed:\nstdout:\n{out}\nstderr:\n{err}");
     assert!(
         out.contains("backpressure: 5 503 responses, 0 requests abandoned"),
-        "{out}"
+        "stdout:\n{out}\nstderr:\n{err}"
     );
     let n = sent_records(&out);
     assert!(oks.load(Ordering::SeqCst) > 0);
-    assert_eq!(n, 5 * oks.load(Ordering::SeqCst) as u64, "{out}");
-    assert!(!out.contains("requests rejected"), "{out}");
+    assert_eq!(n, 5 * oks.load(Ordering::SeqCst) as u64, "{out}\n{err}");
+    assert!(!out.contains("requests rejected"), "{out}\n{err}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -229,7 +239,7 @@ async fn permanent_503_run_finishes_and_reports_abandoned() {
         post(|| async { (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "0")], "") }),
     );
     let port = serve(app).await.to_string();
-    let (ok, out) = run_async(
+    let (ok, out, err) = run_async(
         &[
             "otlp-http",
             "--port",
@@ -244,13 +254,48 @@ async fn permanent_503_run_finishes_and_reports_abandoned() {
         Duration::from_secs(20),
     )
     .await;
-    assert!(ok, "loadgen failed:\n{out}");
+    assert!(ok, "loadgen failed:\nstdout:\n{out}\nstderr:\n{err}");
     let (throttled, abandoned) = backpressure_counts(&out);
-    assert!(abandoned > 0, "{out}");
+    assert!(abandoned > 0, "{out}\n{err}");
     assert_eq!(
         throttled,
         abandoned * 2,
-        "1 try + 1 retry per abandoned request: {out}"
+        "1 try + 1 retry per abandoned request: {out}\n{err}"
     );
-    assert_eq!(sent_records(&out), 0, "{out}");
+    assert_eq!(sent_records(&out), 0, "{out}\n{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn permanent_503_with_huge_retry_budget_stops_at_run_deadline() {
+    // 1 s run + 2 s grace: with Retry-After: 1 and a million allowed retries, only the
+    // run-level cutoff can end this in time.
+    let app = Router::new().route(
+        "/v1/logs",
+        post(|| async { (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "1")], "") }),
+    );
+    let port = serve(app).await.to_string();
+    let started = Instant::now();
+    let (ok, out, err) = run_async(
+        &[
+            "otlp-http",
+            "--port",
+            &port,
+            "--max-retries",
+            "1000000",
+            "--target-rate",
+            "5",
+            "--duration-secs",
+            "1",
+        ],
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(ok, "loadgen failed:\nstdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "run took {:?}\n{out}\n{err}",
+        started.elapsed()
+    );
+    let (throttled, abandoned) = backpressure_counts(&out);
+    assert!(abandoned > 0 && throttled > abandoned, "{out}\n{err}");
 }

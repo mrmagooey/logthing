@@ -27,16 +27,29 @@ sum_proc_net_udp_drops() {
 # figure to mean anything. A prior run read zeek achieving 15,283/s against
 # a 20,000/s target as a generator ceiling; on TCP that signature is equally
 # consistent with server backpressure. This harness refuses to call either
-# one a ceiling.
+# one a ceiling. The one exception: when the generator observed 503s (HTTP
+# backpressure from the server's full writer channel) AND fell under the floor,
+# that IS server pushback -- the verdict is FAIL-BACKPRESSURE, a real ceiling,
+# not GENERATOR-LIMITED.
 ACHIEVED_FLOOR_PCT="${ACHIEVED_FLOOR_PCT:-99}"
 
+# Pure parsers for loadgen's summary line, e.g.
+#   loadgen hec-http: backpressure: 12 503 responses, 3 requests abandoned after 5 retries
+# Always print a number (0 when the line is absent, e.g. UDP/TCP formats).
+parse_throttled() { printf '%s\n' "$1" | sed -n 's/.*backpressure: \([0-9]\{1,\}\) 503 responses.*/\1/p' | tail -1 | grep . || echo 0; }
+parse_abandoned() { printf '%s\n' "$1" | sed -n 's/.*503 responses, \([0-9]\{1,\}\) requests abandoned.*/\1/p' | tail -1 | grep . || echo 0; }
+
+# classify_run achieved target loss budget [throttled]; throttled = 503 responses seen (default 0).
 classify_run() {
-    local achieved="$1" target="$2" loss="$3" budget="$4"
+    local achieved="$1" target="$2" loss="$3" budget="$4" throttled="${5:-0}"
     if [ "$target" != "0" ]; then
         local ok
         ok="$(awk -v a="$achieved" -v t="$target" -v f="$ACHIEVED_FLOOR_PCT" \
               'BEGIN { print (a >= t * f / 100) ? 1 : 0 }')"
-        if [ "$ok" != "1" ]; then echo "GENERATOR-LIMITED"; return 0; fi
+        if [ "$ok" != "1" ]; then
+            if [ "$throttled" -gt 0 ]; then echo "FAIL-BACKPRESSURE"; else echo "GENERATOR-LIMITED"; fi
+            return 0
+        fi
     fi
     if [ "$(awk -v l="$loss" -v b="$budget" 'BEGIN { print (l <= b) ? 1 : 0 }')" = "1" ]; then
         echo "PASS"
@@ -55,11 +68,11 @@ classify_run() {
 # gate, and the gate now looks at the median achieved rate and median loss,
 # both describing the same set of runs.
 classify_rate() {
-    local achieveds="$1" losses="$2" target="$3" budget="$4"
+    local achieveds="$1" losses="$2" target="$3" budget="$4" throttled="${5:-0}"
     local med_ach med
     med_ach="$(printf '%s' "$achieveds" | grep -v '^$' | median_of)"
     med="$(printf '%s' "$losses" | grep -v '^$' | median_of)"
-    classify_run "$med_ach" "$target" "$med" "$budget"
+    classify_run "$med_ach" "$target" "$med" "$budget" "$throttled"
 }
 
 BISECT_RESOLUTION="${BISECT_RESOLUTION:-1000}"
@@ -85,6 +98,9 @@ RAMP_MAX="${RAMP_MAX:-500000}"
 # harness exists to never print. Four outcomes, each meaning something
 # different: PASS/FAIL-LOSS drive the search, GENERATOR-LIMITED and
 # HARD-FAILURE both abort it, and neither collapses into CEILING.
+# FAIL-BACKPRESSURE (the server answered 503) is a genuine server-side failure
+# of the rate, so it deliberately takes the default `*)` branch below, exactly
+# like FAIL-LOSS: it drives the search and is a valid ceiling.
 ramp() {
     local rate="$1" last_pass=0 first_fail=0 verdict
 
@@ -161,8 +177,12 @@ resolve_format() {
             SUB="generic-http"; PORT=5985; TRANSPORT=http
             RECV_METRIC="hec_events_received"; DROP_METRIC=""
             SOURCE_LABEL="hec"; CONFIG_SECTION="hec" ;;
+        otlp)
+            SUB="otlp-http"; PORT=5985; TRANSPORT=http
+            RECV_METRIC="otlp_logs_received"; DROP_METRIC=""
+            SOURCE_LABEL="otlp"; CONFIG_SECTION="otlp" ;;
         *)
-            echo "FATAL: unknown FORMAT '${FORMAT:-}' (want one of: syslog ipfix sflow zeek suricata hec generic)" >&2
+            echo "FATAL: unknown FORMAT '${FORMAT:-}' (want one of: syslog ipfix sflow zeek suricata hec generic otlp)" >&2
             return 1 ;;
     esac
     [ -n "$port_override" ] && PORT="$port_override"
@@ -172,8 +192,10 @@ resolve_format() {
 if [ "${SELFTEST:-0}" != "1" ]; then
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$REPO/target/release/logthing"
-LOADGEN="$REPO/target/release/loadgen"
+# CARGO_TARGET_DIR (git worktrees share one target dir) overrides <repo>/target.
+TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target}"
+BIN="$TARGET_DIR/release/logthing"
+LOADGEN="$TARGET_DIR/release/loadgen"
 FORMAT="${FORMAT:-ipfix}"
 SHAPE="${SHAPE:-real}"
 # Unset by default -> ramp mode (see the RATE-set/unset branch near the end
@@ -207,6 +229,22 @@ GEN_PROCS="${GEN_PROCS:-1}"
 LOSS_BUDGET="${LOSS_BUDGET:-0.1}"
 
 resolve_format || exit 1
+
+REDACTION="${REDACTION:-0}"; GZIP="${GZIP:-0}"; PII_FIELDS="${PII_FIELDS:-0}"
+[ "$REDACTION" = "1" ] && PII_FIELDS=1
+if [ "$GZIP" = "1" ] && [ "$FORMAT" = "generic" ]; then
+    echo "FATAL: GZIP=1 is not supported for FORMAT=generic (generic-http has no --gzip)"; exit 1
+fi
+if [ "$REDACTION" = "1" ] && [ "$TRANSPORT" != "http" ]; then
+    echo "FATAL: REDACTION=1 needs an HTTP format (hec, otlp); FORMAT=$FORMAT is $TRANSPORT"; exit 1
+fi
+# Throwaway key for the redaction hash rule; at least 16 bytes, never a real secret.
+export LOGTHING_HASH_KEY="${LOGTHING_HASH_KEY:-harness-throwaway-hash-key-0123456789abcdef}"
+
+# Every shape needs a run long enough to settle; real additionally needs two flushes.
+if [ "$DURATION" -lt 10 ]; then
+    echo "FATAL: DURATION must be >= 10 (got $DURATION)"; exit 1
+fi
 
 [ -x "$BIN" ]     || { echo "FATAL: $BIN missing. cargo build --release --bin logthing"; exit 1; }
 [ -x "$LOADGEN" ] || { echo "FATAL: $LOADGEN missing. cargo build --release -p loadgen"; exit 1; }
@@ -364,11 +402,24 @@ write_config() {
                 echo "[$CONFIG_SECTION]"; echo 'enabled = true'
                 echo "tcp_port = $PORT"; echo 'bind_address = "0.0.0.0"' ;;
             http)
-                echo '[hec]'; echo 'enabled = true'; echo 'token = ""'
+                echo "[$CONFIG_SECTION]"; echo 'enabled = true'
+                if [ "$CONFIG_SECTION" = "hec" ]; then echo 'token = ""'; fi
                 if [ "$SHAPE" != "real" ]; then
-                    echo '[hec.local]'; echo "directory = \"$LOCAL_DIR\""
+                    echo "[$CONFIG_SECTION.local]"; echo "directory = \"$LOCAL_DIR\""
                 fi ;;
         esac
+
+        # Realistic rule set (drop + hash + mask); TOML literal strings keep the regex
+        # backslashes.
+        if [ "$TRANSPORT" = "http" ] && [ "$REDACTION" = "1" ]; then
+            cat <<EOF
+[$CONFIG_SECTION.redaction]
+drop_fields   = ["password", "headers.authorization"]
+hash_fields   = ["user.email"]
+hash_key_env  = "LOGTHING_HASH_KEY"
+mask_patterns = ['\b\d{3}-\d{2}-\d{4}\b', 'secret=\w+']
+EOF
+        fi
 
         if [ "$SHAPE" = "real" ]; then
             # flush_interval_secs defaults to 900s and flush_threshold_bytes
@@ -420,7 +471,10 @@ run_generator() {
     local rate="$1" secs="$2"
     local extra=""
     case "$FORMAT" in
-        hec|generic) extra="--events-per-request ${EVENTS_PER_REQUEST:-1} --concurrency ${CONCURRENCY:-64}" ;;
+        hec|generic|otlp)
+            extra="--events-per-request ${EVENTS_PER_REQUEST:-1} --concurrency ${CONCURRENCY:-64}"
+            [ "$GZIP" = "1" ] && [ "$FORMAT" != "generic" ] && extra="$extra --gzip"
+            [ "$PII_FIELDS" = "1" ] && [ "$FORMAT" != "generic" ] && extra="$extra --pii-fields" ;;
         syslog)      [ "${STRUCTURED:-0}" = "1" ] && extra="--structured" ;;
     esac
     local n="${GEN_PROCS:-1}"
@@ -499,7 +553,7 @@ run_generator() {
     # per-process output is echoed first (for FATAL-path debugging); the
     # synthesized totals are echoed last so parse_sent/parse_achieved's
     # `tail -1` picks up the aggregate instead of one process's numbers.
-    local total_sent=0 total_ach=0 content s a
+    local total_sent=0 total_ach=0 total_thr=0 total_aband=0 content s a
     for out_file in $out_files; do
         content="$(cat "$out_file")"
         echo "$content"
@@ -507,10 +561,13 @@ run_generator() {
         a="$(parse_achieved "$content")"
         [ -n "$s" ] && total_sent=$((total_sent + s))
         [ -n "$a" ] && total_ach="$(awk -v x="$total_ach" -v y="$a" 'BEGIN{printf "%.4f", x+y}')"
+        total_thr=$((total_thr + $(parse_throttled "$content")))
+        total_aband=$((total_aband + $(parse_abandoned "$content")))
         rm -f "$out_file"
     done
     echo "sent $total_sent records in ${secs}s (GEN_PROCS=$n)"
     echo "achieved rate: $total_ach"
+    echo "backpressure: $total_thr 503 responses, $total_aband requests abandoned (GEN_PROCS=$n)"
     return "$gen_rc"
 }
 
@@ -571,6 +628,8 @@ run_one() {
     # before its `return 1`, so the caller never has to infer "hard failure"
     # from an empty/unset variable.
     RUN_VERDICT=""
+    RUN_THROTTLED=0
+    RUN_ABANDONED=0
     start_server "$run_id"
 
     SOCK_DROPS_BEFORE="$(socket_rcvbuf_drops)"
@@ -597,6 +656,12 @@ run_one() {
     fi
     ACHIEVED="$(parse_achieved "$LOADGEN_OUT")"
     ACHIEVED="${ACHIEVED:-n/a}"
+    # 503s come from the same captured output as offered/achieved (LOADGEN_OUT), so they
+    # survive fixed-RATE mode's stdout redirect: measure_rate reads RUN_THROTTLED and
+    # RUN_ABANDONED after each run (run_one is not called in a subshell).
+    RUN_THROTTLED="$(parse_throttled "$LOADGEN_OUT")"
+    RUN_ABANDONED="$(parse_abandoned "$LOADGEN_OUT")"
+    echo "# run $run_id: 503s=$RUN_THROTTLED abandoned=$RUN_ABANDONED"
 
     if [ "$SHAPE" = "real" ]; then
         # Poll the writer's own counter to stability so the drop counters
@@ -670,7 +735,7 @@ run_one() {
     BUFFER_DROPS_INT="${BUFFER_DROPS%.*}"
     TOTAL_DROPS=$((KERNEL_FOR_TOTAL + WRITER_DROPS_INT + BUFFER_DROPS_INT))
     TOTAL_LOSS_PCT="$(awk -v d="$TOTAL_DROPS" -v o="$OFFERED" 'BEGIN{ if (o==0) print 0; else printf "%.4f", (d/o)*100 }')"
-    VERDICT="$(classify_run "$ACHIEVED" "$rate" "$TOTAL_LOSS_PCT" "$LOSS_BUDGET")"
+    VERDICT="$(classify_run "$ACHIEVED" "$rate" "$TOTAL_LOSS_PCT" "$LOSS_BUDGET" "$RUN_THROTTLED")"
 
     echo -e "$run_id\t$FORMAT\t$SHAPE\t$OFFERED\t$ACHIEVED\t$RECEIVED\t$KERNEL_DROPS\t$WRITER_DROPS\t$BUFFER_DROPS\t$WRITTEN\t$KERNEL_LOSS_PCT\t$TOTAL_LOSS_PCT\t$GEN_CORES\t$SRV_CORES\t$VERDICT"
 
@@ -706,7 +771,7 @@ run_one() {
 # cannot be trusted at all -- so it keeps poisoning the rate immediately,
 # same as before.
 measure_rate() {
-    local rate="$1" i losses="" achieveds=""
+    local rate="$1" i losses="" achieveds="" throttled_total=0 abandoned_total=0
     echo "# --- rate=$rate ---" >&2
     DROPS_LIST=""
     WRITER_DROPS_LIST=""
@@ -719,6 +784,8 @@ measure_rate() {
         run_one "$i" "$rate" >&2 || { echo "$RUN_VERDICT" >&2; echo "$RUN_VERDICT"; return 0; }
         losses="$losses"$'\n'"$RUN_LOSS"
         achieveds="$achieveds"$'\n'"$RUN_ACHIEVED"
+        throttled_total=$((throttled_total + RUN_THROTTLED))
+        abandoned_total=$((abandoned_total + RUN_ABANDONED))
     done
 
     local med min max med_ach
@@ -755,8 +822,10 @@ measure_rate() {
     fi
 
     echo "# rate=$rate median_loss=${med}% median_achieved=${med_ach}" >&2
+    # stderr: fixed-rate mode discards this function's stdout.
+    echo "503 total: $throttled_total (abandoned: $abandoned_total)" >&2
     local verdict
-    verdict="$(classify_rate "$achieveds" "$losses" "$rate" "$LOSS_BUDGET")"
+    verdict="$(classify_rate "$achieveds" "$losses" "$rate" "$LOSS_BUDGET" "$throttled_total")"
     # Echoed to stderr too, alongside the per-run rows and the summary line
     # above, so fixed-rate mode -- which redirects this function's stdout to
     # /dev/null below -- still shows the rate-level verdict somewhere. The
@@ -818,6 +887,10 @@ if [ "${SELFTEST:-0}" = "1" ]; then
     check "resolve sflow recv"    "$(FORMAT=sflow    resolve_format && echo "$RECV_METRIC")"  "sflow_datagrams_received"
     check "resolve syslog struct" "$(FORMAT=syslog STRUCTURED=1 resolve_format && echo "$SOURCE_LABEL")" "structured_syslog"
     check "resolve syslog plain"  "$(FORMAT=syslog STRUCTURED=0 resolve_format && echo "$SOURCE_LABEL")" "syslog"
+    check "resolve otlp sub"   "$(FORMAT=otlp resolve_format && echo "$SUB")"          "otlp-http"
+    check "resolve otlp recv"  "$(FORMAT=otlp resolve_format && echo "$RECV_METRIC")"  "otlp_logs_received"
+    check "resolve otlp label" "$(FORMAT=otlp resolve_format && echo "$SOURCE_LABEL")" "otlp"
+    check "resolve otlp sect"  "$(FORMAT=otlp resolve_format && echo "$CONFIG_SECTION")" "otlp"
     check "resolve unknown rc"    "$(FORMAT=nope resolve_format >/dev/null 2>&1; echo $?)"    "1"
     # target 20000, 99% floor = 19800
     check "classify pass"        "$(classify_run 19999 20000 0.05 0.1)" "PASS"
@@ -829,6 +902,18 @@ if [ "${SELFTEST:-0}" = "1" ]; then
     check "gen limit beats loss" "$(classify_run 15283 20000 9.90 0.1)" "GENERATOR-LIMITED"
     check "classify exact budget" "$(classify_run 20000 20000 0.10 0.1)" "PASS"
     check "unbounded target"     "$(classify_run 12796 0 0.00 0.1)"     "PASS"
+
+    # 503s observed + achieved under the floor => the server pushed back (a ceiling), not a slow generator.
+    check "classify backpressure" "$(classify_run 15000 20000 0.00 0.1 42)" "FAIL-BACKPRESSURE"
+    check "classify gen limited without 503s" "$(classify_run 15000 20000 0.00 0.1 0)" "GENERATOR-LIMITED"
+    check "classify default throttled arg" "$(classify_run 15000 20000 0.00 0.1)" "GENERATOR-LIMITED"
+    check "classify pass with some 503s absorbed" "$(classify_run 19999 20000 0.00 0.1 42)" "PASS"
+    check "classify_rate passes throttled through" \
+        "$(classify_rate "$(printf '%s\n' 15000 15100 15200)" "$(printf '%s\n' 0 0 0)" 20000 0.1 7)" "FAIL-BACKPRESSURE"
+    check "parse_throttled" "$(parse_throttled 'loadgen hec-http: backpressure: 12 503 responses, 3 requests abandoned after 5 retries')" "12"
+    check "parse_abandoned" "$(parse_abandoned 'loadgen hec-http: backpressure: 12 503 responses, 3 requests abandoned after 5 retries')" "3"
+    check "parse_throttled absent" "$(parse_throttled 'nothing here')" "0"
+    check "parse_abandoned absent" "$(parse_abandoned 'nothing here')" "0"
 
     # classify_rate is what measure_rate actually calls for its one verdict
     # per rate: a lone GENERATOR-LIMITED run among RUNS must not poison the
@@ -895,6 +980,11 @@ if [ "${SELFTEST:-0}" = "1" ]; then
     }
     RESULT="$(BISECT_RESOLUTION=1000 ramp 5000)"
     check "ramp aborts on hard failure during bisection" "$RESULT" "HARD-FAILURE 30000"
+
+    # FAIL-BACKPRESSURE must act like FAIL-LOSS in the search (a ceiling), never abort.
+    measure_rate() { TRIED="$TRIED $1"; [ "$1" -le 26000 ] && echo "PASS" || echo "FAIL-BACKPRESSURE"; }
+    RESULT="$(BISECT_RESOLUTION=1000 ramp 5000)"
+    check "ramp treats FAIL-BACKPRESSURE as a ceiling" "$RESULT" "CEILING 25625"
 
     [ "$fail" -eq 0 ] && echo "SELFTEST PASS" || echo "SELFTEST FAIL"
     exit "$fail"

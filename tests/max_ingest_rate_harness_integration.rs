@@ -2,8 +2,9 @@
 //!
 //! The harness's pure logic is covered by its own `SELFTEST=1` mode; this
 //! test covers the parts that only appear when it drives a real server:
-//! that a run produces a verdict at all, and that it leaves the two TRACKED
-//! config files untouched (the defect its predecessor shipped with).
+//! that a run produces a verdict at all, that it leaves the two TRACKED
+//! config files untouched (the defect its predecessor shipped with), and that
+//! the OTLP + gzip + redaction path starts a real server and reports 503s.
 //!
 //! Both tests below invoke the harness against a real server on fixed ports
 //! (see `start_server`/`METRICS_PORT` in the script) and must never run
@@ -37,109 +38,143 @@ fn harness_selftest_passes() {
     );
 }
 
-/// One short real run: a verdict is emitted, and both tracked config files
-/// come back byte-identical. Requires release binaries; skips (rather than
-/// fails) if they are absent, so `cargo test` on a fresh checkout is green.
-///
-/// Uses `SHAPE=real` (not `trivial`): the property under test -- that
-/// `logthing.admin.toml` is moved aside and restored -- only has teeth when
-/// the run actually exercises the writer/config path the harness built that
-/// dance for. `DURATION=10` (not the brief's original `3`): the harness now
-/// hard-rejects real-shape runs shorter than twice its local-sink
-/// `flush_interval_secs` (5s), so 3s aborts in milliseconds with a `FATAL`
-/// before ever starting a server. 10s is the minimum that clears the guard.
-///
-/// `RATE=1000` (fixed-rate mode, not a ramp) matters for a second, less
-/// obvious reason: in fixed-rate mode the harness sends `measure_rate`'s
-/// own stdout to `/dev/null` (per-run table rows go to stderr instead --
-/// see the harness's own comment above `measure_rate`). `measure_rate`
-/// duplicates the rate-level aggregate verdict to stderr for exactly this
-/// reason, so it lands somewhere visible in fixed-rate mode instead of
-/// being silently discarded along with the rest of that redirected stdout.
-/// The aggregate verdict therefore appears only in stderr here, never in
-/// stdout -- the check below looks for it as a standalone line in stderr
-/// (see `find_aggregate_verdict` below), not merely for verdict vocabulary
-/// anywhere in the combined output, since per-run table rows also end in a
-/// verdict column and would otherwise make this assertion pass even if the
-/// aggregate line were swallowed again.
-#[test]
-fn short_run_emits_a_verdict_and_restores_tracked_configs() {
-    let root = repo_root();
-    if !root.join("target/release/logthing").exists()
-        || !root.join("target/release/loadgen").exists()
-    {
-        eprintln!("skipping: release binaries not built");
-        return;
+const VERDICT_TOKENS: [&str; 5] = [
+    "PASS",
+    "FAIL-LOSS",
+    "FAIL-BACKPRESSURE",
+    "GENERATOR-LIMITED",
+    "HARD-FAILURE",
+];
+
+/// Run the harness with `envs`; returns (exit ok, stdout, stderr).
+fn run_harness(root: &std::path::Path, envs: &[(&str, &str)]) -> (bool, String, String) {
+    let mut cmd = Command::new("bash");
+    cmd.arg("scripts/max-ingest-rate.sh").current_dir(root);
+    for (k, v) in envs {
+        cmd.env(k, v);
     }
-
-    let before_main = std::fs::read(root.join("logthing.toml")).expect("read logthing.toml");
-    let before_admin = std::fs::read(root.join("logthing.admin.toml")).ok();
-
-    let out = Command::new("bash")
-        .arg("scripts/max-ingest-rate.sh")
-        .env("FORMAT", "ipfix")
-        .env("SHAPE", "real")
-        .env("RATE", "1000")
-        .env("DURATION", "10")
-        .env("RUNS", "2")
-        .current_dir(&root)
-        .output()
-        .expect("run harness");
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let combined = format!("{stdout}{stderr}");
-    assert!(
+    let out = cmd.output().expect("run harness");
+    (
         out.status.success(),
-        "harness exited {:?}:\n{stdout}\n{stderr}",
-        out.status.code()
-    );
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
 
-    // measure_rate prints the rate-level AGGREGATE verdict as a bare,
-    // standalone line on stderr (`echo "$verdict" >&2` in the harness) --
-    // unlike the per-run table rows, which are tab-separated and end in a
-    // verdict column but are never *just* the token on their own line.
-    // Matching on that shape verifies the aggregate verdict specifically:
-    // if the harness ever went back to only writing it to the stdout that
-    // fixed-rate mode redirects to /dev/null (the bug this test guards
-    // against), this line-shaped search would find nothing even though the
-    // per-run rows still carry the same PASS/FAIL-LOSS/etc vocabulary --
-    // whereas a plain substring search over combined output would keep
-    // passing "incidentally" on those per-run rows alone.
-    let verdict_tokens = ["PASS", "FAIL-LOSS", "GENERATOR-LIMITED", "HARD-FAILURE"];
-    let aggregate_verdict = stderr
+/// measure_rate prints the rate-level AGGREGATE verdict as a bare, standalone line on
+/// stderr; per-run table rows are tab-separated and never just the token on their own.
+fn aggregate_verdict(stderr: &str) -> Option<&str> {
+    stderr
         .lines()
         .map(str::trim)
         .rev()
-        .find(|&l| verdict_tokens.contains(&l));
+        .find(|&l| VERDICT_TOKENS.contains(&l))
+}
+
+/// Two sequential real runs (one test only: fixed ports, so real-server runs must never
+/// overlap). Requires release binaries; their absence FAILS the test with the build
+/// commands -- a silently green test that ran nothing is worse than a red one.
+///
+/// Run 1: ipfix, `SHAPE=real`, fixed `RATE=1000`, `DURATION=10` (the harness rejects real
+/// runs shorter than twice its 5s flush interval, and any DURATION under 10). Fixed-rate
+/// mode discards `measure_rate`'s stdout, so the aggregate verdict is asserted as a
+/// standalone stderr line (see `aggregate_verdict`), not as vocabulary anywhere in the
+/// combined output, which per-run rows would satisfy even if the aggregate were swallowed.
+///
+/// Run 2: `FORMAT=otlp GZIP=1 REDACTION=1`: proves `[otlp.local]` + `[otlp.redaction]`
+/// are accepted by the real server (a `hash_key_env` / missing-sink error would make the
+/// harness FATAL "server did not start") and that the `503 total:` line is emitted.
+///
+/// HARD-FAILURE is a verdict token but never an acceptable outcome here: it means the
+/// measurement broke, not that a rate was measured.
+#[test]
+fn short_run_emits_a_verdict_and_restores_tracked_configs() {
+    let root = repo_root();
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| root.join("target"));
     assert!(
-        aggregate_verdict.is_some(),
+        target.join("release/logthing").exists() && target.join("release/loadgen").exists(),
+        "release binaries are required: run `cargo build --release --bin logthing && \
+         cargo build --release -p loadgen` first (this test must not pass without them)"
+    );
+
+    let before_main = std::fs::read(root.join("logthing.toml")).expect("read logthing.toml");
+    let before_admin = std::fs::read(root.join("logthing.admin.toml")).ok();
+    let assert_configs_restored = |label: &str| {
+        assert_eq!(
+            before_main,
+            std::fs::read(root.join("logthing.toml")).expect("logthing.toml still exists"),
+            "{label}: harness must restore logthing.toml byte-for-byte"
+        );
+        assert_eq!(
+            before_admin,
+            std::fs::read(root.join("logthing.admin.toml")).ok(),
+            "{label}: harness must restore logthing.admin.toml if present (the predecessor rm'd it)"
+        );
+    };
+
+    // ---- run 1: ipfix, fixed rate ----
+    let (ok, stdout, stderr) = run_harness(
+        &root,
+        &[
+            ("FORMAT", "ipfix"),
+            ("SHAPE", "real"),
+            ("RATE", "1000"),
+            ("DURATION", "10"),
+            ("RUNS", "2"),
+        ],
+    );
+    let combined = format!("{stdout}{stderr}");
+    assert!(ok, "ipfix harness failed:\n{combined}");
+    let verdict = aggregate_verdict(&stderr);
+    assert!(
+        verdict.is_some(),
         "no standalone aggregate verdict line in stderr (only per-run table rows?):\n{combined}"
     );
-
-    // HARD-FAILURE is a real verdict token (server wouldn't start, the
-    // /proc/net/snmp reconciliation disagreed, the writer-liveness check
-    // fired) so it counts for "a verdict was emitted" -- but it is not an
-    // acceptable *outcome* for this test. It means the measurement itself
-    // broke, not that a rate was measured; letting the test pass on it
-    // would hollow it out exactly where it matters most (this is the one
-    // test that exercises the real server, so it is the one place that can
-    // catch this class of failure). Fail loudly instead.
     assert_ne!(
-        aggregate_verdict,
+        verdict,
         Some("HARD-FAILURE"),
-        "harness reported HARD-FAILURE (an infrastructure failure, not a measurement) \
-         on a run that was expected to succeed:\n{combined}"
+        "ipfix run hard-failed:\n{combined}"
     );
+    assert_configs_restored("after ipfix run");
 
-    assert_eq!(
-        before_main,
-        std::fs::read(root.join("logthing.toml")).expect("logthing.toml still exists"),
-        "harness must restore logthing.toml byte-for-byte"
+    // ---- run 2: otlp + gzip + redaction ----
+    let (ok, stdout, stderr) = run_harness(
+        &root,
+        &[
+            ("FORMAT", "otlp"),
+            ("GZIP", "1"),
+            ("REDACTION", "1"),
+            ("EVENTS_PER_REQUEST", "20"),
+            ("RATE", "2000"),
+            ("DURATION", "10"),
+            ("RUNS", "1"),
+        ],
     );
-    assert_eq!(
-        before_admin,
-        std::fs::read(root.join("logthing.admin.toml")).ok(),
-        "harness must restore logthing.admin.toml if present (the predecessor rm'd it unconditionally)"
+    let combined = format!("{stdout}{stderr}");
+    assert!(ok, "otlp harness failed:\n{combined}");
+    let verdict = aggregate_verdict(&stderr);
+    assert!(
+        verdict.is_some(),
+        "no standalone aggregate verdict line in otlp run stderr:\n{combined}"
     );
+    assert_ne!(
+        verdict,
+        Some("HARD-FAILURE"),
+        "otlp run hard-failed:\n{combined}"
+    );
+    assert!(
+        stderr.contains("503 total:"),
+        "otlp run stderr lacks the `503 total:` line:\n{combined}"
+    );
+    assert!(
+        stderr.contains("# run 1: 503s="),
+        "otlp run lacks the per-run `# run <id>: 503s=` line:\n{combined}"
+    );
+    assert!(
+        !combined.contains("hash_key_env") && !combined.contains("server did not start"),
+        "server rejected the redaction config:\n{combined}"
+    );
+    assert_configs_restored("after otlp run");
 }

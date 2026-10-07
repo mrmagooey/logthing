@@ -23,7 +23,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 
-use crate::backpressure::{Backpressure, SendOutcome, send_with_retry};
+use crate::backpressure::{Backpressure, RETRY_GRACE, SendOutcome, send_with_retry};
 use crate::pacing::tick_record_count;
 
 /// Arguments for `loadgen otlp-http`.
@@ -80,6 +80,8 @@ struct OtlpCtx {
     gzip: bool,
     pii: bool,
     max_retries: u32,
+    /// Run end plus [`RETRY_GRACE`]: 503 retries stop after this.
+    deadline: Instant,
 }
 
 /// Run the generator until `--duration-secs` elapses, then drain and print the summary lines.
@@ -109,6 +111,7 @@ pub async fn run(args: OtlpHttpArgs) -> anyhow::Result<()> {
         gzip: args.gzip,
         pii: args.pii_fields,
         max_retries: args.max_retries,
+        deadline: Instant::now() + Duration::from_secs(args.duration_secs) + RETRY_GRACE,
     };
     let batch = ctx.events_per_request as u64;
 
@@ -219,7 +222,7 @@ async fn spawn_request(ctx: &OtlpCtx, tasks: &mut JoinSet<()>, n: u64) {
             }
             req
         };
-        match send_with_retry(build, &ctx.bp, ctx.max_retries).await {
+        match send_with_retry(build, &ctx.bp, ctx.max_retries, ctx.deadline).await {
             SendOutcome::Accepted => {
                 ctx.sent
                     .fetch_add(ctx.events_per_request as u64, Ordering::Relaxed);

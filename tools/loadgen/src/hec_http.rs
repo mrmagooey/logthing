@@ -33,7 +33,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 
-use crate::backpressure::{Backpressure, SendOutcome, send_with_retry};
+use crate::backpressure::{Backpressure, RETRY_GRACE, SendOutcome, send_with_retry};
 use crate::pacing::tick_record_count;
 
 #[derive(Args, Debug)]
@@ -108,6 +108,8 @@ struct HecCtx {
     events_per_request: usize,
     bp: Arc<Backpressure>,
     max_retries: u32,
+    /// Run end plus [`RETRY_GRACE`]: 503 retries stop after this.
+    deadline: Instant,
     gzip: bool,
     pii: bool,
 }
@@ -137,6 +139,7 @@ pub async fn run(args: HecHttpArgs) -> anyhow::Result<()> {
         auth_failed: Arc::new(AtomicBool::new(false)),
         events_per_request: args.events_per_request.max(1),
         bp: Arc::new(Backpressure::default()),
+        deadline: Instant::now() + Duration::from_secs(args.duration_secs) + RETRY_GRACE,
         max_retries: args.max_retries,
         gzip: args.gzip,
         pii: args.pii_fields,
@@ -254,7 +257,7 @@ async fn spawn_request(ctx: &HecCtx, tasks: &mut JoinSet<()>, n: u64) {
             }
             req
         };
-        match send_with_retry(build, &ctx.bp, ctx.max_retries).await {
+        match send_with_retry(build, &ctx.bp, ctx.max_retries, ctx.deadline).await {
             SendOutcome::Accepted => {
                 ctx.sent
                     .fetch_add(ctx.events_per_request as u64, Ordering::Relaxed);

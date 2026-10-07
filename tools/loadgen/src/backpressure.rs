@@ -11,12 +11,16 @@ use reqwest::{
     header::{HeaderMap, RETRY_AFTER},
 };
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Sleep used when `Retry-After` is missing or not an integer number of seconds.
 pub const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// Upper bound on any single `Retry-After` sleep, so a hostile or buggy value cannot stall a run.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// How long past `--duration-secs` a 503-answered request may keep retrying before it is
+/// abandoned, so a permanently-503ing server cannot stretch a run to `max_retries` seconds.
+pub const RETRY_GRACE: Duration = Duration::from_secs(2);
 
 /// Run-wide counters for backpressure, shared by all in-flight request tasks.
 #[derive(Debug, Default)]
@@ -66,11 +70,14 @@ pub fn retry_after_delay(headers: &HeaderMap) -> Duration {
 }
 
 /// Send the request built by `build` (called once per attempt, so the body is re-sent
-/// identically), retrying 503s up to `max_retries` times, sleeping per `Retry-After`.
+/// identically), retrying 503s up to `max_retries` times, sleeping per `Retry-After`. Once
+/// `deadline` (the run's end plus [`RETRY_GRACE`]) has passed, a 503 is abandoned instead of
+/// retried.
 pub async fn send_with_retry(
     build: impl Fn() -> RequestBuilder,
     bp: &Backpressure,
     max_retries: u32,
+    deadline: Instant,
 ) -> SendOutcome {
     let mut attempt = 0u32;
     loop {
@@ -86,7 +93,7 @@ pub async fn send_with_retry(
             return SendOutcome::Rejected(status);
         }
         bp.throttled.fetch_add(1, Ordering::Relaxed);
-        if attempt >= max_retries {
+        if attempt >= max_retries || Instant::now() >= deadline {
             bp.abandoned.fetch_add(1, Ordering::Relaxed);
             return SendOutcome::Abandoned;
         }
@@ -155,6 +162,10 @@ mod tests {
         (addr, seen)
     }
 
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(3600)
+    }
+
     fn post(addr: SocketAddr) -> impl Fn() -> reqwest::RequestBuilder {
         let c = reqwest::Client::new();
         move || c.post(format!("http://{addr}/x")).body("b")
@@ -164,7 +175,7 @@ mod tests {
     async fn two_503s_then_200_is_accepted_and_counted_as_throttled() {
         let (addr, seen) = stub(vec![503, 503, 200]).await;
         let bp = Backpressure::default();
-        let out = send_with_retry(post(addr), &bp, 5).await;
+        let out = send_with_retry(post(addr), &bp, 5, far()).await;
         assert!(matches!(out, SendOutcome::Accepted));
         assert_eq!(bp.throttled.load(Ordering::Relaxed), 2);
         assert_eq!(bp.abandoned.load(Ordering::Relaxed), 0);
@@ -175,7 +186,7 @@ mod tests {
     async fn permanent_503_is_abandoned_after_max_retries_without_hanging() {
         let (addr, seen) = stub(vec![503]).await;
         let bp = Backpressure::default();
-        let out = send_with_retry(post(addr), &bp, 2).await;
+        let out = send_with_retry(post(addr), &bp, 2, far()).await;
         assert!(matches!(out, SendOutcome::Abandoned));
         assert_eq!(bp.throttled.load(Ordering::Relaxed), 3); // 1 try + 2 retries
         assert_eq!(bp.abandoned.load(Ordering::Relaxed), 1);
@@ -187,7 +198,7 @@ mod tests {
         for code in [400u16, 401, 413, 415, 500] {
             let (addr, seen) = stub(vec![code]).await;
             let bp = Backpressure::default();
-            let out = send_with_retry(post(addr), &bp, 5).await;
+            let out = send_with_retry(post(addr), &bp, 5, far()).await;
             assert!(
                 matches!(out, SendOutcome::Rejected(s) if s.as_u16() == code),
                 "{code}"
@@ -195,5 +206,29 @@ mod tests {
             assert_eq!(bp.throttled.load(Ordering::Relaxed), 0, "{code}");
             assert_eq!(seen.load(Ordering::SeqCst), 1, "{code}");
         }
+    }
+
+    #[tokio::test]
+    async fn retries_stop_once_the_run_deadline_has_passed() {
+        let (addr, seen) = stub(vec![503]).await;
+        let bp = Backpressure::default();
+        // max_retries is huge; only the (already expired) deadline can stop the loop.
+        let out = send_with_retry(post(addr), &bp, 1_000_000, Instant::now()).await;
+        assert!(matches!(out, SendOutcome::Abandoned));
+        assert_eq!(bp.throttled.load(Ordering::Relaxed), 1);
+        assert_eq!(bp.abandoned.load(Ordering::Relaxed), 1);
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retries_continue_until_deadline_then_stop() {
+        let (addr, seen) = stub(vec![503]).await;
+        let bp = Backpressure::default();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        // Retry-After: 0 means a tight retry loop; it must still end at the deadline.
+        let out = send_with_retry(post(addr), &bp, 1_000_000, deadline).await;
+        assert!(matches!(out, SendOutcome::Abandoned));
+        assert!(seen.load(Ordering::SeqCst) > 1);
+        assert!(Instant::now() >= deadline);
     }
 }
