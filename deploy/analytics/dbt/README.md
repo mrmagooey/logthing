@@ -37,7 +37,32 @@ the table exists.
 OCSF dotted attributes are flattened with underscores (`src_endpoint.ip` -> `src_endpoint_ip`,
 `metadata.product.name` -> `metadata_product_name`). Required columns carry `not_null` tests.
 **Syslog has no OCSF model** (no natural OCSF class); `syslog`, `structured_syslog`, `sflow_counter`
-and `hec` are declared as sources only. `stg_otlp` and `stg_hec` arrive with the OTLP/HEC work.
+are declared as sources only.
+
+### stg_otlp and stg_hec
+
+`otlp` is one typed table for every OTLP service (21 columns, `docs/otlp.md`); `hec` has 10
+columns (`sourcetype`, `host`, `time`, `received_at`, `fields`, `partition_time` plus `event_uuid`,
+`source`, `index`, `indexed_fields` from 0.22.0). `stg_otlp_typed` and `stg_hec_typed` are typed
+passthroughs; `stg_otlp` and `stg_hec` sit on top and keep one row per `event_uuid` (the earliest
+`received_at` wins). The sinks are at-least-once, so a replayed batch can land the same event twice
+with the same `event_uuid`.
+
+They are views, not incremental models: an incremental model would be a dbt-managed Iceberg table
+inside the committer's namespace, `merge` through Lakekeeper, and a second copy that can drift from
+the source, for no benefit at current volume. Revisit when the dedup scan gets slow.
+
+Rows with a NULL `event_uuid` (legacy HEC rows written before 0.22.0) have no identity, so all of
+them are kept. Client retries mint new uuids and therefore cannot be deduplicated. Columns missing
+from a not-yet-evolved `hec` table read NULL (`source_or_empty` fills them), so `stg_hec` works
+before the committer has evolved the table.
+
+Attributes are JSON strings:
+
+```sql
+select json_extract_scalar(attributes, '$."http.route"') from stg_otlp;
+select json_extract_scalar(fields, '$.user') from stg_hec;
+```
 
 **WEF fields come from `raw_xml`.** The `wef.event_data` column is the serialized event JSON; its
 `parsed.data` is always null, so TargetUserName, IpAddress, LogonType... are read from the XML in

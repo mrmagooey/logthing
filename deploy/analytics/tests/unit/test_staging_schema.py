@@ -26,6 +26,8 @@ RUST_SCHEMAS = {
     "suricata": ("src/suricata/schema.rs", "envelope_schema"),
     "syslog": ("src/forwarding/syslog_s3.rs", "SYSLOG_SCHEMA"),
     "structured_syslog": ("src/forwarding/structured_syslog_s3.rs", "STRUCTURED_SYSLOG_SCHEMA"),
+    "otlp": ("src/forwarding/otlp_s3.rs", "otlp_schema"),
+    "hec": ("src/forwarding/generic_s3.rs", "generic_schema"),
 }
 WIDTH_RANK = {"integer": 1, "bigint": 2}
 TS = "timestamp(6) with time zone"
@@ -65,6 +67,8 @@ def _split_args(args):
 
 def trino_type(arrow):
     arrow = re.sub(r"\s+", " ", arrow)
+    if arrow == "ts_type()":
+        return TS
     if arrow == "DataType::Utf8":
         return "varchar"
     if arrow == "DataType::Float64":
@@ -88,7 +92,12 @@ def rust_columns(table):
     v = text.index("vec![", s)
     block = text[v + 4:_balanced(text, v + 4)]
     cols = {}
-    for fm in re.finditer(r"Field::new\(", block):
+    # One pass over both forms so declaration order is preserved: `Field::new(...)` and the
+    # otlp schema's `utf8("name", nullable)` closure helper.
+    for fm in re.finditer(r'Field::new\(|\butf8\(\s*"(\w+)"\s*,\s*(true|false)\s*\)', block):
+        if fm.group(1):
+            cols[fm.group(1)] = ("varchar", fm.group(2) == "true")
+            continue
         end = _balanced(block, fm.end() - 1)
         name, dtype, nullable = _split_args(block[fm.end():end - 1])
         cols[name.strip('"')] = (trino_type(dtype), nullable == "true")
@@ -101,7 +110,8 @@ def staging_columns():
     for path in sorted(STAGING_DIR.glob("*.sql")):
         text = path.read_text()
         m = re.search(r"source_or_empty\('logthing', '(\w+)', \{(.*?)\}\)", text, re.S)
-        assert m, path.name
+        if not m:
+            continue
         found[m.group(1)] = dict(re.findall(r"'(\w+)':\s*'([^']+)'", m.group(2)))
     return found
 
@@ -121,7 +131,8 @@ def test_rust_schema_is_parsed(table):
 
 def test_every_staging_column_exists_in_the_rust_schema_with_a_compatible_type():
     staging = staging_columns()
-    assert set(staging) == {"wef", "zeek_conn", "zeek_dns", "ipfix", "sflow_flow", "suricata"}
+    assert set(staging) == {"wef", "zeek_conn", "zeek_dns", "ipfix", "sflow_flow", "suricata", "otlp",
+                            "hec"}
     problems = []
     for table, cols in staging.items():
         actual = rust_columns(table)
@@ -138,3 +149,28 @@ def test_compatibility_rule_allows_widening_only():
     assert compatible("bigint", "integer") and compatible("integer", "integer")
     assert not compatible("integer", "bigint")
     assert not compatible("varchar", "integer") and not compatible("bigint", "double")
+
+
+def test_otlp_and_hec_schemas_have_the_documented_column_counts_and_nullability():
+    otlp, hec = rust_columns("otlp"), rust_columns("hec")
+    assert len(otlp) == 21 and otlp["event_uuid"] == ("varchar", False)
+    assert otlp["severity_number"] == ("integer", True) and otlp["flags"][0] == "integer"
+    assert list(otlp) == [
+        "event_uuid", "time", "observed_time", "received_at", "severity_number",
+        "severity_text", "body", "service_name", "service_namespace", "service_instance_id",
+        "host_name", "peer_addr", "trace_id", "span_id", "flags", "event_name", "scope_name",
+        "scope_version", "resource_attributes", "attributes", "partition_time"]
+    assert len(hec) == 10 and hec["event_uuid"] == ("varchar", True)  # null on pre-0.22 rows
+    assert list(hec)[:6] == ["sourcetype", "host", "time", "received_at", "fields",
+                             "partition_time"]
+
+
+def test_dedup_models_list_exactly_the_typed_models_columns_in_order():
+    for table in ("otlp", "hec"):
+        typed = re.search(r"source_or_empty\('logthing', '%s', \{(.*?)\}\)" % table,
+                          (STAGING_DIR / f"stg_{table}_typed.sql").read_text(), re.S)
+        typed_cols = re.findall(r"'(\w+)':", typed.group(1))
+        dedup = (STAGING_DIR / f"stg_{table}.sql").read_text()
+        dedup_cols = re.findall(r"'(\w+)'", re.search(r"\[(.*?)\]", dedup, re.S).group(1))
+        assert dedup_cols == typed_cols and "ref('stg_%s_typed')" % table in dedup
+        assert typed_cols == list(rust_columns(table))

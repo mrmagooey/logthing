@@ -16,9 +16,10 @@ DBT_BIN = Path(sys.executable).parent / "dbt"
 pytestmark = pytest.mark.skipif(not DBT_BIN.exists(), reason="dbt is not installed in this venv")
 
 SOURCE_TABLES = {"wef", "syslog", "structured_syslog", "zeek_conn", "zeek_dns", "ipfix",
-                 "sflow_flow", "sflow_counter", "suricata", "hec"}
+                 "sflow_flow", "sflow_counter", "suricata", "hec", "otlp"}
 STAGING = {"stg_wef": "wef", "stg_zeek_conn": "zeek_conn", "stg_zeek_dns": "zeek_dns",
-           "stg_ipfix": "ipfix", "stg_sflow_flow": "sflow_flow", "stg_suricata": "suricata"}
+           "stg_ipfix": "ipfix", "stg_sflow_flow": "sflow_flow", "stg_suricata": "suricata",
+           "stg_otlp_typed": "otlp", "stg_hec_typed": "hec"}
 
 
 @pytest.fixture(scope="module")
@@ -47,8 +48,9 @@ def test_sources_cover_every_table_the_stack_creates(manifest):
 
 def test_staging_models_exist_and_are_views(manifest):
     models = nodes(manifest, "model")
-    assert {n for n in models if n.startswith("stg_")} == set(STAGING)
-    for name in STAGING:
+    expected = set(STAGING) | {"stg_otlp", "stg_hec"}
+    assert {n for n in models if n.startswith("stg_")} == expected
+    for name in expected:
         assert models[name]["config"]["materialized"] == "view", name
 
 
@@ -57,6 +59,28 @@ def test_each_staging_model_reads_exactly_one_source(manifest):
     for name, table in STAGING.items():
         assert models[name]["depends_on"]["nodes"] == [
             f"source.logthing_analytics.logthing.{table}"], name
+
+
+def test_dedup_models_read_only_their_typed_model_and_are_unit_tested(manifest):
+    models = nodes(manifest, "model")
+    for name in ("stg_otlp", "stg_hec"):
+        assert models[name]["depends_on"]["nodes"] == [
+            f"model.logthing_analytics.{name}_typed"], name
+        assert models[name]["config"]["materialized"] == "view"
+    unit = {u["name"]: u for u in manifest["unit_tests"].values()}
+    assert {"stg_otlp_keeps_one_row_per_event_uuid",
+            "stg_hec_dedups_but_keeps_every_legacy_null_uuid_row"} <= set(unit)
+
+
+def test_dedup_models_have_unique_event_uuid_tests(manifest):
+    tests = [n for n in nodes(manifest, "test").values()
+             if n.get("test_metadata", {}).get("name") == "unique"]
+    assert {t["attached_node"].split(".")[-1] for t in tests} >= {"stg_otlp", "stg_hec"}
+
+
+def test_source_or_empty_fills_columns_missing_from_an_existing_table():
+    text = (DBT_DIR / "macros" / "source_or_empty.sql").read_text()
+    assert "get_columns_in_relation" in text and "cast(null as" in text
 
 
 def test_staging_models_have_not_null_tests(manifest):
@@ -129,7 +153,7 @@ def test_every_ocsf_model_has_a_unit_test_and_wef_covers_a_4624_blob(manifest):
     by_model = {}
     for t in manifest["unit_tests"].values():
         by_model.setdefault(t["model"], []).append(t)
-    assert set(by_model) == set(OCSF)
+    assert {m for m in by_model if m.startswith("ocsf_")} == set(OCSF)
     auth = by_model["ocsf_authentication"]
     blobs = " ".join(str(g.get("rows")) for t in auth for g in t["given"])
     assert "4624" in blobs and "TargetUserName" in blobs and "raw_xml" in blobs

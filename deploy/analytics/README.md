@@ -121,6 +121,9 @@ upgrading in place keeps the old values working and keeps them public. Rotate th
 - **`--reuse-values` fails** when upgrading a pre-B1 release (the new values are nil in the old
   release). Use `helm upgrade --reset-then-reuse-values` (Helm 3.14+) or no `--reuse-values` with
   your values file.
+- **Adding `hecToken` / `otlpBearerToken`:** the credentials Secret gains two keys, which changes
+  its checksum annotation, so the first `helm upgrade` to this release rolls the pods that carry
+  it once. Expected, not a fault.
 
 ## Docker compose
 

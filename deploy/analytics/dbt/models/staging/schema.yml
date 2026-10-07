@@ -37,3 +37,30 @@ models:
         data_tests: [not_null]
       - name: payload
         data_tests: [not_null]
+  - name: stg_otlp_typed
+    description: Typed passthrough of logs.otlp (empty when the table does not exist yet). May contain duplicate event_uuid rows; use stg_otlp.
+    columns:
+      - name: received_at
+        data_tests: [not_null]
+  - name: stg_hec_typed
+    description: Typed passthrough of logs.hec. Columns added in 0.22.0 are NULL on older rows or when the committer has not evolved the table yet. Use stg_hec.
+    columns:
+      - name: sourcetype
+        data_tests: [not_null]
+  - name: stg_otlp
+    description: logs.otlp with one row per event_uuid (earliest received_at wins).
+    columns:
+      - name: event_uuid
+        data_tests: [not_null, unique]
+      - name: partition_time
+        data_tests: [not_null]
+  - name: stg_hec
+    description: logs.hec with one row per non-NULL event_uuid; legacy rows with NULL event_uuid are all kept.
+    columns:
+      - name: event_uuid
+        data_tests:
+          - unique:
+              config:
+                where: "event_uuid is not null"
+      - name: partition_time
+        data_tests: [not_null]

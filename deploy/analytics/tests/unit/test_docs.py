@@ -60,3 +60,10 @@ def test_readme_documents_sending_app_logs():
         assert needle in README, needle
     assert "unauthenticated plaintext HTTP" not in README
     assert "cleartext" in README.lower()  # tokens cross the wire unencrypted: front with TLS
+
+
+def test_dbt_readme_documents_stg_otlp_and_stg_hec_decisions():
+    text = (ANALYTICS / "dbt" / "README.md").read_text()
+    for needle in ("stg_otlp", "stg_hec", "event_uuid", "earliest", "not incremental",
+                   "legacy", "NULL"):
+        assert needle in text, needle
