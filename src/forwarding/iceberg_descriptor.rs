@@ -55,6 +55,10 @@ pub struct IcebergDescriptor {
     pub file_format: String,
     pub record_count: u64,
     pub file_size_in_bytes: u64,
+    /// Lowercase-hex SHA-256 of the exact Parquet bytes uploaded. A corruption /
+    /// consistency check only: it sits beside the data, so it is NOT tamper evidence
+    /// (see docs/object-lock.md).
+    pub sha256: String,
     /// `"s3"` or `"local"` — same value as `UploadSink::target_label()`
     /// for the sink that wrote the described Parquet file.
     pub storage_target: String,
@@ -128,11 +132,21 @@ mod tests {
             file_format: "PARQUET".to_string(),
             record_count: 42,
             file_size_in_bytes: 1024,
+            sha256: SAMPLE_SHA256.to_string(),
             storage_target: "s3".to_string(),
             schema_version: "deadbeef".to_string(),
             written_at: "2026-07-10T12:00:00Z".parse().unwrap(),
             column_stats,
         }
+    }
+
+    const SAMPLE_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    #[test]
+    fn test_descriptor_json_contains_sha256_field() {
+        let d = sample_descriptor();
+        let v: serde_json::Value = serde_json::from_slice(&d.to_json_bytes().unwrap()).unwrap();
+        assert_eq!(v["sha256"], SAMPLE_SHA256);
     }
 
     #[test]

@@ -23,6 +23,23 @@ use crate::forwarding::drop_log::{DropKind, DropLogThrottles, DropSite};
 // UploadSink trait
 // ---------------------------------------------------------------------------
 
+/// What a sink did with a flushed file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadDisposition {
+    /// The bytes are at their destination now; the caller still owns descriptor delivery.
+    Delivered,
+    /// The sink durably accepted file + descriptor and now owns delivery of both.
+    Spooled,
+}
+
+/// A serialized Iceberg descriptor and its (prefix-less) key, handed to the sink so a
+/// spooling sink can persist it next to the Parquet bytes.
+#[derive(Debug, Clone)]
+pub struct DescriptorPayload {
+    pub key: String,
+    pub body: Vec<u8>,
+}
+
 /// A destination for encoded Parquet bytes. Implemented by `S3Sink` (existing)
 /// and `LocalDiskSink` (local-disk target). `PartitionedParquetWriter` is
 /// generic over this trait so any source can persist to either destination
@@ -53,6 +70,21 @@ pub trait UploadSink: Send + Sync {
     /// external reader which bucket/directory a file lives in — different
     /// sources may point at different buckets).
     fn location_hint(&self) -> String;
+
+    /// Upload `body` at `key`, optionally with the serialized descriptor that
+    /// describes it. The default delegates to [`UploadSink::upload`] and reports
+    /// `Delivered` (the caller then uploads the descriptor); a spooling sink
+    /// overrides this to persist both and return `Spooled`.
+    async fn upload_with_descriptor(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        descriptor: Option<DescriptorPayload>,
+    ) -> anyhow::Result<UploadDisposition> {
+        let _ = descriptor;
+        self.upload(key, body).await?;
+        Ok(UploadDisposition::Delivered)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1611,7 +1643,7 @@ async fn encode_and_upload(
     let to_concat: Vec<arrow_array::RecordBatch> = batches.iter().map(|(b, _)| b.clone()).collect();
     let schema_for_encode = schema.clone();
     let encode_result = tokio::task::spawn_blocking(
-        move || -> anyhow::Result<(Vec<u8>, parquet::format::FileMetaData)> {
+        move || -> anyhow::Result<(Vec<u8>, parquet::format::FileMetaData, String)> {
             use parquet::arrow::ArrowWriter;
             use parquet::basic::{Compression, ZstdLevel};
             use parquet::file::properties::WriterProperties;
@@ -1625,13 +1657,15 @@ async fn encode_and_upload(
                 ArrowWriter::try_new(&mut buf, schema_for_encode.clone(), Some(props))?;
             writer.write(&batch)?;
             let file_metadata = writer.close()?;
-            Ok((buf, file_metadata))
+            use sha2::Digest;
+            let sha256 = hex::encode(sha2::Sha256::digest(&buf));
+            Ok((buf, file_metadata, sha256))
         },
     )
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"));
 
-    let (merged, file_metadata) = match encode_result.and_then(|r| r) {
+    let (merged, file_metadata, sha256) = match encode_result.and_then(|r| r) {
         Ok(pair) => pair,
         Err(e) => {
             return FlushOutcome::Failure {
@@ -1658,26 +1692,49 @@ async fn encode_and_upload(
     let target = s3.target_label();
     let body_len = merged.len();
 
-    match s3.upload(&s3_key, merged).await {
-        Ok(()) => {
+    // Build + serialize the descriptor BEFORE the upload so a spooling sink can persist it
+    // with the Parquet bytes. A serialization failure is logged and counted exactly as the
+    // old post-upload path did, and never blocks the Parquet upload.
+    let descriptor_payload = descriptor_sink.as_ref().and_then(|_| {
+        let descriptor = build_descriptor(
+            source,
+            partition_seg,
+            s3.location_hint(),
+            &s3_key,
+            row_count as u64,
+            body_len as u64,
+            &sha256,
+            target,
+            &schema,
+            &file_metadata,
+        );
+        match descriptor.to_json_bytes() {
+            Ok(body) => Some(DescriptorPayload {
+                key: crate::forwarding::iceberg_descriptor::build_descriptor_key("", &s3_key),
+                body,
+            }),
+            Err(e) => {
+                tracing::warn!(source, "iceberg descriptor serialization failed: {e}");
+                metrics::counter!("iceberg_descriptor_upload_errors", "source" => source)
+                    .increment(1);
+                None
+            }
+        }
+    });
+
+    match s3
+        .upload_with_descriptor(&s3_key, merged, descriptor_payload.clone())
+        .await
+    {
+        Ok(disposition) => {
             metrics::counter!("parquet_s3_records_written", "source" => source, "target" => target)
                 .increment(row_count as u64);
-            metrics::counter!("parquet_s3_uploads", "source" => source, "target" => target)
-                .increment(1);
-
-            if let Some(descriptor_sink) = descriptor_sink {
-                let descriptor = build_descriptor(
-                    source,
-                    partition_seg,
-                    s3.location_hint(),
-                    &s3_key,
-                    row_count as u64,
-                    body_len as u64,
-                    target,
-                    &schema,
-                    &file_metadata,
-                );
-                upload_descriptor(descriptor_sink, descriptor, &s3_key, source).await;
+            if disposition == UploadDisposition::Delivered {
+                metrics::counter!("parquet_s3_uploads", "source" => source, "target" => target)
+                    .increment(1);
+                if let (Some(sink), Some(payload)) = (descriptor_sink, descriptor_payload) {
+                    upload_descriptor_bytes(sink, payload, source).await;
+                }
             }
             FlushOutcome::Success { key }
         }
@@ -1705,6 +1762,7 @@ fn build_descriptor(
     relative_key: &str,
     record_count: u64,
     file_size_in_bytes: u64,
+    sha256: &str,
     storage_target: &'static str,
     schema: &arrow_schema::Schema,
     file_metadata: &parquet::format::FileMetaData,
@@ -1759,6 +1817,7 @@ fn build_descriptor(
         file_format: "PARQUET".to_string(),
         record_count,
         file_size_in_bytes,
+        sha256: sha256.to_string(),
         storage_target: storage_target.to_string(),
         schema_version: schema_version(schema),
         written_at: chrono::Utc::now(),
@@ -1770,31 +1829,17 @@ fn build_descriptor(
 /// never returns an error to the caller. A descriptor-sink outage must
 /// never fail, retry, or hard-cap the core Parquet-writing path.
 ///
-/// `relative_key` is the Parquet file's own relative key (e.g.
-/// `zeek/conn/year=2026/month=07/day=10/abc.parquet`) — NOT
-/// `descriptor.file_path`, which is already fully-qualified (see
-/// `build_descriptor` above) and would be the wrong thing to upload the
-/// descriptor itself under. The descriptor sink's own configured `prefix`
-/// (from `IcebergDescriptorS3Config`/`IcebergDescriptorLocalConfig`) is
-/// applied transparently by `descriptor_sink` itself — see
-/// `build_iceberg_descriptor_sink`/`PrefixedUploadSink` below — so this
-/// function always derives the key with an empty prefix.
-async fn upload_descriptor(
+/// `payload` is already serialized by `encode_and_upload`; its key is the Parquet
+/// file's own relative key with the `.json` suffix and an empty prefix. The descriptor
+/// sink's own configured `prefix` (from `IcebergDescriptorS3Config`/
+/// `IcebergDescriptorLocalConfig`) is applied transparently by `descriptor_sink` itself
+/// -- see `build_iceberg_descriptor_sink`/`PrefixedUploadSink`.
+async fn upload_descriptor_bytes(
     descriptor_sink: Arc<dyn UploadSink>,
-    descriptor: crate::forwarding::iceberg_descriptor::IcebergDescriptor,
-    relative_key: &str,
+    payload: DescriptorPayload,
     source: &'static str,
 ) {
-    let key = crate::forwarding::iceberg_descriptor::build_descriptor_key("", relative_key);
-    let bytes = match descriptor.to_json_bytes() {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(source, "iceberg descriptor serialization failed: {e}");
-            metrics::counter!("iceberg_descriptor_upload_errors", "source" => source).increment(1);
-            return;
-        }
-    };
-    match descriptor_sink.upload(&key, bytes).await {
+    match descriptor_sink.upload(&payload.key, payload.body).await {
         Ok(()) => {
             metrics::counter!("iceberg_descriptor_uploads", "source" => source).increment(1);
         }
@@ -4829,6 +4874,7 @@ secret_key  = "SECRET"
             "path/to/file.parquet",
             3,
             buf.len() as u64,
+            "abc123",
             "test_target",
             &schema,
             &file_metadata,
@@ -4960,6 +5006,176 @@ secret_key  = "SECRET"
             descriptor_calls[0].1 > 0,
             "descriptor body must be non-empty"
         );
+    }
+
+    type EventLog = Arc<std::sync::Mutex<Vec<&'static str>>>;
+    type Uploads = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+    type CapturedCalls = Arc<std::sync::Mutex<Captured>>;
+
+    /// Default-`upload_with_descriptor` sink (plain sink) that logs ordering events and keeps
+    /// the exact bytes it received.
+    struct LoggingSink {
+        label: &'static str,
+        events: EventLog,
+        uploads: Uploads,
+    }
+
+    #[async_trait::async_trait]
+    impl UploadSink for LoggingSink {
+        async fn upload(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push(self.label);
+            self.uploads.lock().unwrap().push((key.to_string(), body));
+            Ok(())
+        }
+        fn target_label(&self) -> &'static str {
+            "recording"
+        }
+        fn location_hint(&self) -> String {
+            "recording://test".to_string()
+        }
+    }
+
+    type Captured = Vec<(String, Vec<u8>, Option<DescriptorPayload>)>;
+
+    /// Spooling-style sink: overrides `upload_with_descriptor`, records everything, and
+    /// reports `Spooled`.
+    struct DescriptorCapturingSink {
+        calls: CapturedCalls,
+        plain_uploads: Arc<std::sync::Mutex<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl UploadSink for DescriptorCapturingSink {
+        async fn upload(&self, _key: &str, _body: Vec<u8>) -> anyhow::Result<()> {
+            *self.plain_uploads.lock().unwrap() += 1;
+            Ok(())
+        }
+        fn target_label(&self) -> &'static str {
+            "recording"
+        }
+        fn location_hint(&self) -> String {
+            "recording://test".to_string()
+        }
+        async fn upload_with_descriptor(
+            &self,
+            key: &str,
+            body: Vec<u8>,
+            descriptor: Option<DescriptorPayload>,
+        ) -> anyhow::Result<UploadDisposition> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((key.to_string(), body, descriptor));
+            Ok(UploadDisposition::Spooled)
+        }
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
+
+    fn capturing_sink() -> (
+        Arc<dyn UploadSink>,
+        CapturedCalls,
+        Arc<std::sync::Mutex<usize>>,
+    ) {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plain = Arc::new(std::sync::Mutex::new(0usize));
+        let sink: Arc<dyn UploadSink> = Arc::new(DescriptorCapturingSink {
+            calls: calls.clone(),
+            plain_uploads: plain.clone(),
+        });
+        (sink, calls, plain)
+    }
+
+    #[tokio::test]
+    async fn flush_with_spooling_sink_skips_writer_descriptor_upload_and_passes_payload() {
+        let (s3, calls, plain) = capturing_sink();
+        let events: EventLog = Arc::default();
+        let descriptor_uploads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let descriptor_sink: Arc<dyn UploadSink> = Arc::new(LoggingSink {
+            label: "descriptor",
+            events: events.clone(),
+            uploads: descriptor_uploads.clone(),
+        });
+        let (cfg, policy) = test_config(1_000_000);
+        let mut w = PartitionedParquetWriter::with_source_stats(
+            MockSink,
+            s3,
+            cfg,
+            policy,
+            Arc::new(crate::stats::SourceHourlyStats::default()),
+            Some(descriptor_sink),
+        );
+        w.push("hello".to_string()).await.unwrap();
+        w.flush_all().await.unwrap();
+
+        assert!(
+            descriptor_uploads.lock().unwrap().is_empty(),
+            "a Spooled disposition means the sink owns descriptor delivery"
+        );
+        assert_eq!(*plain.lock().unwrap(), 0, "plain upload must not be used");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (key, bytes, descriptor) = &calls[0];
+        assert!(key.ends_with(".parquet"));
+        let payload = descriptor.as_ref().expect("descriptor payload passed");
+        assert!(payload.key.ends_with(".json"), "key: {}", payload.key);
+        let v: serde_json::Value = serde_json::from_slice(&payload.body).unwrap();
+        assert_eq!(v["sha256"], sha256_hex(bytes));
+        assert_eq!(v["file_size_in_bytes"], bytes.len() as u64);
+        assert_eq!(v["record_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn flush_with_plain_sink_still_uploads_descriptor_after_parquet() {
+        let events: EventLog = Arc::default();
+        let parquet_uploads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let descriptor_uploads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s3: Arc<dyn UploadSink> = Arc::new(LoggingSink {
+            label: "parquet",
+            events: events.clone(),
+            uploads: parquet_uploads.clone(),
+        });
+        let descriptor_sink: Arc<dyn UploadSink> = Arc::new(LoggingSink {
+            label: "descriptor",
+            events: events.clone(),
+            uploads: descriptor_uploads.clone(),
+        });
+        let (cfg, policy) = test_config(1_000_000);
+        let mut w = PartitionedParquetWriter::with_source_stats(
+            MockSink,
+            s3,
+            cfg,
+            policy,
+            Arc::new(crate::stats::SourceHourlyStats::default()),
+            Some(descriptor_sink),
+        );
+        w.push("hello".to_string()).await.unwrap();
+        w.flush_all().await.unwrap();
+
+        assert_eq!(*events.lock().unwrap(), vec!["parquet", "descriptor"]);
+        let parquet = parquet_uploads.lock().unwrap();
+        let descriptors = descriptor_uploads.lock().unwrap();
+        assert_eq!(parquet.len(), 1);
+        assert_eq!(descriptors.len(), 1);
+        let v: serde_json::Value = serde_json::from_slice(&descriptors[0].1).unwrap();
+        assert_eq!(v["sha256"], sha256_hex(&parquet[0].1));
+        assert_eq!(v["file_size_in_bytes"], parquet[0].1.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn flush_without_descriptor_sink_passes_none() {
+        let (s3, calls, _plain) = capturing_sink();
+        let (cfg, policy) = test_config(1_000_000);
+        let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
+        w.push("hello".to_string()).await.unwrap();
+        w.flush_all().await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].2.is_none(), "no descriptor sink -> no payload");
     }
 
     #[tokio::test]

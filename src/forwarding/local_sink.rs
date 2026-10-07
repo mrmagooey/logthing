@@ -5,7 +5,8 @@
 //! (`{prefix}/{partition}/year=/month=/day=/{uuid}.parquet`, produced by
 //! `buffered_writer::build_key`). Writes are atomic: bytes land in a
 //! same-directory temp file first, then are renamed into place, so a
-//! concurrent reader scanning the directory never observes a partial file.
+//! concurrent reader scanning the directory never observes a partial file. The
+//! temp file is fsynced before the rename and the directory is fsynced after it.
 
 use crate::forwarding::buffered_writer::UploadSink;
 use std::path::{Component, Path, PathBuf};
@@ -108,8 +109,23 @@ impl UploadSink for LocalDiskSink {
             .into_owned();
         let tmp_path = parent.join(format!(".{}.tmp-{file_name}", uuid::Uuid::new_v4()));
 
-        tokio::fs::write(&tmp_path, &body).await?;
-        tokio::fs::rename(&tmp_path, &dest).await?;
+        use tokio::io::AsyncWriteExt;
+        // On any failure after the temp file exists, remove it so no partial file lingers.
+        let write_result: std::io::Result<()> = async {
+            let mut file = tokio::fs::File::create(&tmp_path).await?;
+            file.write_all(&body).await?;
+            file.sync_all().await?;
+            drop(file);
+            tokio::fs::rename(&tmp_path, &dest).await
+        }
+        .await;
+        if let Err(e) = write_result {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e.into());
+        }
+        // Persist the rename itself: without a directory fsync a crash can lose the entry
+        // even though the file's bytes were synced.
+        tokio::fs::File::open(parent).await?.sync_all().await?;
         Ok(())
     }
 
@@ -171,6 +187,50 @@ mod tests {
             vec!["f.parquet".to_string()],
             "no stray .tmp file: {entries:?}"
         );
+    }
+
+    /// Durability is verified behaviourally, not by observing fsync (which is not reliably
+    /// observable in-process): the file appears only via atomic rename, so after `upload`
+    /// returns the directory holds exactly the final file with exact content and no temp.
+    #[tokio::test]
+    async fn upload_leaves_no_temp_files_and_content_is_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = LocalDiskSink::new(dir.path().to_path_buf()).await.unwrap();
+        let body: Vec<u8> = (0..=255u8).cycle().take(100_000).collect();
+
+        sink.upload("a/b/x.parquet", body.clone()).await.unwrap();
+
+        let names: Vec<String> = std::fs::read_dir(dir.path().join("a/b"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["x.parquet".to_string()]);
+        assert_eq!(
+            std::fs::read(dir.path().join("a/b/x.parquet")).unwrap(),
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_failure_removes_temp_file_and_exposes_no_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = LocalDiskSink::new(dir.path().to_path_buf()).await.unwrap();
+        // A directory occupies the destination name, so the final rename must fail.
+        std::fs::create_dir_all(dir.path().join("d/x.parquet")).unwrap();
+
+        let result = sink.upload("d/x.parquet", b"payload".to_vec()).await;
+
+        assert!(result.is_err(), "rename onto a directory must fail");
+        let names: Vec<String> = std::fs::read_dir(dir.path().join("d"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["x.parquet".to_string()],
+            "temp file leaked: {names:?}"
+        );
+        assert!(dir.path().join("d/x.parquet").is_dir());
     }
 
     #[tokio::test]
