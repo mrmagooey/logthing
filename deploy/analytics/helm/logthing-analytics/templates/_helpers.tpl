@@ -140,3 +140,18 @@ Generated values never change after first install by design, so they need no rol
     - {{ .Values.bootstrap.timeoutSecs | quote }}
     - {{ include "la.fullname" . }}-postgres
 {{- end -}}
+{{/*
+Keys of the credentials Secret whose resolved value (explicit or looked up from the live Secret)
+is a public demo literal shipped by the pre-B1 chart. Space-separated, empty when none.
+*/}}
+{{- define "la.demoCreds" -}}
+{{- $root := . -}}
+{{- $demo := dict "garage-rpc-secret" "5f0c4d3a9b8e7f6a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b" "garage-admin-token" "demo-garage-admin-token-change-me" "s3-access-key" "GK6b9c062a24e5a702c7c53e5b" "s3-secret-key" "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" "postgres-password" "demo-postgres-change-me" "lakekeeper-db-password" "demo-lakekeeper-change-me" "lakekeeper-encryption-key" "demo-lakekeeper-encryption-key-change-me" -}}
+{{- $fields := dict "garage-rpc-secret" "garageRpcSecret" "garage-admin-token" "garageAdminToken" "s3-access-key" "s3AccessKey" "s3-secret-key" "s3SecretKey" "postgres-password" "postgresPassword" "lakekeeper-db-password" "lakekeeperDbPassword" "lakekeeper-encryption-key" "lakekeeperEncryptionKey" -}}
+{{- $bad := list -}}
+{{- range $key, $lit := $demo -}}
+{{- $v := include "la.cred" (dict "root" $root "key" $key "field" (get $fields $key) "value" (get $root.Values.credentials (get $fields $key)) "gen" "unset") -}}
+{{- if eq $v $lit -}}{{- $bad = append $bad $key -}}{{- end -}}
+{{- end -}}
+{{- join " " (sortAlpha $bad) -}}
+{{- end -}}

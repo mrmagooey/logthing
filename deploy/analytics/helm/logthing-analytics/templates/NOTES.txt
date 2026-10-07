@@ -25,3 +25,11 @@ Credentials were generated (or taken from credentials.*) and stored in Secret
 `helm template` cannot read the live Secret, so rendered manifests contain fresh random values:
 pin credentials.* or use credentials.existingSecret when applying with GitOps tooling.
 {{- end }}
+{{- $demo := include "la.demoCreds" . }}
+{{- if and (not .Values.credentials.existingSecret) $demo }}
+
+WARNING: these credentials are the PUBLIC demo values shipped by a pre-B1 chart version: {{ $demo }}
+Anyone who has read the repository knows them. This release was upgraded from (or pinned to) the
+old defaults, and Postgres roles, the Garage key and the Lakekeeper encryption key persist. Rotate
+them: see "Upgrading an existing stack" in deploy/analytics/README.md.
+{{- end }}

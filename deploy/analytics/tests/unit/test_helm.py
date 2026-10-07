@@ -539,6 +539,22 @@ def test_notes_describe_generated_credentials():
     assert f"{FULL}-credentials" not in notes("credentials.existingSecret=mine")
 
 
+def test_notes_warn_on_pre_b1_demo_credentials():
+    text = notes("credentials.postgresPassword=demo-postgres-change-me",
+                 "credentials.s3AccessKey=GK6b9c062a24e5a702c7c53e5b")
+    assert "WARNING" in text and "PUBLIC demo values" in text
+    assert "postgres-password" in text and "s3-access-key" in text
+    assert "lakekeeper-encryption-key" not in text
+    assert "Upgrading an existing stack" in text
+
+
+def test_notes_do_not_warn_for_generated_or_custom_credentials():
+    assert "WARNING" not in notes()
+    assert "WARNING" not in notes("credentials.postgresPassword=something-else-entirely")
+    assert "WARNING" not in notes("credentials.existingSecret=mine",
+                                  "credentials.postgresPassword=demo-postgres-change-me")
+
+
 def test_checksum_secret_is_stable_across_renders_with_generated_secrets():
     # The generated Secret differs per render (see test_two_renders_generate_different_secrets),
     # but the pod-roll checksum must not, or every `helm upgrade` would roll every pod.

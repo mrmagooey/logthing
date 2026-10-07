@@ -20,6 +20,15 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ### Breaking
 
+- Analytics stack upgrades keep the old PUBLIC demo secrets: Postgres role passwords, the Garage
+  key and the Lakekeeper encryption key persist in volumes/PVCs, and Helm's `lookup` and
+  `--reuse-values` keep the old values (the chart now warns in NOTES.txt). Compose: `down -v`, or
+  hand-write `.env` with the old values and rotate deliberately (a freshly generated `.env` breaks
+  Lakekeeper-to-Postgres auth, the Garage key never applies, stored warehouse credentials fail).
+  Helm: `--reuse-values` fails from a pre-B1 release; use `--reset-then-reuse-values`. See
+  "Upgrading an existing stack" in `deploy/analytics/README.md`. The Helm-generated Trino
+  certificate (825 days) is not renewed automatically.
+
 - Analytics stack, for anyone running it from master before this release: Hue is replaced by
   Metabase (Hue saved queries are not migrated); compose requires a `.env` (run the generator);
   Trino moved from unauthenticated `http://:8080` to `https://:8443` (users `admin` and

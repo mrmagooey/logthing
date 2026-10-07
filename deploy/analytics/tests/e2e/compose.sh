@@ -8,6 +8,13 @@ ANALYTICS=$(cd -- "$HERE/../.." && pwd)
 preflight_cpu
 DBT=${DBT:-$ANALYTICS/.venv/bin/dbt}
 [ -x "$DBT" ] || { echo "dbt not found at $DBT: run $ANALYTICS/.venv/bin/pip install -r $ANALYTICS/tests/requirements.txt (or set DBT=)" >&2; exit 1; }
+ENVFILE=""; CA=""; DBT_WORK=""
+cleanup() {
+  [ -z "${DC:-}" ] || "${DC[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  rm -f "$ENVFILE" "$CA"
+  [ -z "$DBT_WORK" ] || rm -rf "$DBT_WORK"
+}
+trap cleanup EXIT
 DBT_WORK=$(mktemp -d)
 
 PROJECT="lt-e2e-$$"
@@ -25,7 +32,7 @@ UP_TIMEOUT_SECS=${UP_TIMEOUT_SECS:-540}
 
 # Hermetic config: an explicit env file means a developer's deploy/analytics/.env is ignored.
 ENVFILE=$(mktemp)
-"$ANALYTICS/scripts/gen-analytics-env.sh" --force "$ENVFILE" 2>/dev/null
+"$ANALYTICS/scripts/gen-analytics-env.sh" --force "$ENVFILE"
 cat >>"$ENVFILE" <<ENV
 LOGTHING_FLUSH_INTERVAL_SECS=5
 COMMIT_INTERVAL_SECS=10
@@ -53,13 +60,6 @@ run_dbt() {
     "$DBT" --log-path "$DBT_WORK/logs" "$@" --project-dir "$ANALYTICS/dbt" \
     --profiles-dir "$ANALYTICS/dbt" --target-path "$DBT_WORK/target"
 }
-
-cleanup() {
-  "${DC[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-  rm -f "$ENVFILE" "$CA"
-  rm -rf "$DBT_WORK"
-}
-trap cleanup EXIT
 
 dump_logs() { "${DC[@]}" logs --no-color --tail 80 "$@" >&2 || true; }
 fail() { echo "FAIL: $*" >&2; dump_logs trino; exit 1; }

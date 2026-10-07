@@ -31,6 +31,10 @@ start without AVX2.
   (loopback by default; `ANALYTICS_BIND_ADDR=0.0.0.0` exposes them).
 - logthing ingest ports (514/udp, 601/tcp, 4739/udp, 6343/udp, 47760/tcp) and 5985/tcp listen
   on **all interfaces**.
+- Metabase first-visitor race: until `metabase-init` finishes `/api/setup`, the first visitor to an
+  exposed Metabase port could claim the admin account. Compose publishes it on loopback by
+  default; keep `ANALYTICS_BIND_ADDR` at `127.0.0.1` until `metabase-init` has exited 0, and only
+  then widen it (the risk exists only when it is non-loopback).
 - Port 5985 is logthing's HTTP endpoint. Besides `/health`, it accepts unauthenticated plaintext HTTP requests and is published on all interfaces like the other ingest ports; firewall it if the host is reachable from untrusted networks.
 
 ## Network isolation
@@ -79,6 +83,37 @@ There are no default secrets.
 Passwords must be URL-safe (`[A-Za-z0-9._~-]`, they are spliced into Postgres URLs); the chart
 fails the render otherwise. The Garage key id must be `GK` + 24 hex characters and its secret
 64 hex characters.
+
+### Upgrading an existing stack
+
+Releases before this one shipped **public default secrets** (in `docker-compose.yml` and the chart's
+`values.yaml`; see `git show 7b835b9:deploy/analytics/docker-compose.yml`). Postgres role passwords,
+the Garage S3 key and the Lakekeeper encryption key are persisted inside the volumes/PVCs, so
+upgrading in place keeps the old values working and keeps them public. Rotate them deliberately.
+
+- **compose, simplest:** `docker compose down -v` (**deletes all data**), run
+  `scripts/gen-analytics-env.sh --force`, `docker compose up -d`.
+- **compose, keeping data:** do not just generate a new `.env`: Lakekeeper could no longer log in to
+  Postgres, Garage's key import answers 409 for an existing key (treated as success, so the new
+  key never applies) and stored warehouse credentials could not be decrypted with a new
+  `LAKEKEEPER_ENCRYPTION_KEY`. Instead hand-write `.env` with the OLD default values for
+  `POSTGRES_PASSWORD`, `LAKEKEEPER_DB_PASSWORD`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`,
+  `GARAGE_RPC_SECRET`, `GARAGE_ADMIN_TOKEN` and `LAKEKEEPER_ENCRYPTION_KEY` (take them from the
+  git command above) and add only the new variables (`TRINO_*`, `METABASE_*`; the generator
+  output is a template). Then rotate: `ALTER ROLE` for `postgres` and `lakekeeper` via
+  `docker compose exec postgres psql -U postgres`, then update `.env`; `garage key delete` the old
+  key and re-run `garage-init` with a new key; the Lakekeeper encryption key has no in-place
+  rotation (it needs a fresh Lakekeeper database, i.e. a fresh install).
+- **Helm:** the `lookup` keeps whatever the existing `<fullname>-credentials` Secret holds, and
+  explicit old values in your values file win, so an upgraded release still uses the old demo
+  secrets. NOTES.txt prints a WARNING naming each demo credential still in use. Rotate the same
+  persisted secrets: `ALTER ROLE` (`postgres`, `lakekeeper`) with
+  `kubectl exec -n <ns> <fullname>-postgres-0 -- psql -U postgres`, `garage key delete` plus a
+  re-run of the garage-init Job for the S3 key, a fresh install for the Lakekeeper encryption key;
+  then set the new values in `credentials.*` (or the Secret) and `helm upgrade`.
+- **`--reuse-values` fails** when upgrading a pre-B1 release (the new values are nil in the old
+  release). Use `helm upgrade --reset-then-reuse-values` (Helm 3.14+) or no `--reuse-values` with
+  your values file.
 
 ## Docker compose
 
@@ -180,7 +215,7 @@ As with compose, tables appear 1-2 minutes after data arrives (the committer is 
   - `metabase-db-password`
   - `metabase-encryption-key`
   - `metabase-admin-password`
-- **Trino TLS:** the chart generates a private CA and certificate into Secret `<fullname>-trino-tls` (kept across upgrades; delete it and upgrade to rotate, then restart Trino). Provide your own with `trino.tls.existingSecret` (keys `ca.pem` and `server.pem`). The Service exposes only HTTPS 8443.
+- **Trino TLS:** the chart generates a private CA and certificate into Secret `<fullname>-trino-tls` (kept across upgrades by `lookup` regardless of expiry; the server certificate is valid for 825 days and the CA for 10 years, and nothing renews it automatically since Helm cannot parse x509. Before it expires, delete the Secret, `helm upgrade`, then restart Trino and Metabase; or supply `trino.tls.existingSecret`). Provide your own with `trino.tls.existingSecret` (keys `ca.pem` and `server.pem`). The Service exposes only HTTPS 8443.
   **GitOps:** a lookup-less render (`helm template | kubectl apply`, Argo CD, Flux) cannot read the
   live Secret, so it would regenerate the CA and certificate on every render. Set
   `trino.tls.existingSecret` (and pin `credentials.*` or `credentials.existingSecret`) for those.
