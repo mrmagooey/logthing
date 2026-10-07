@@ -329,11 +329,11 @@ bind_address = "0.0.0.0"   # env: LOGTHING__SFLOW__BIND_ADDRESS
 #
 # Redaction (HEC and OTLP only; off by default). See docs/redaction.md.
 # hash_fields needs hash_key_env, the NAME of an environment variable holding an HMAC key
-# (>= 16 bytes); startup fails if it is unset, so those two lines are shown indented below.
+# (>= 16 bytes); startup fails if it is unset.
 # [hec.redaction]
 # drop_fields = ["password", "headers.authorization"]
-#   hash_fields = ["user.email"]
-#   hash_key_env = "LOGTHING_HASH_KEY"
+# hash_fields = ["user.email"]
+# hash_key_env = "LOGTHING_HASH_KEY"
 # mask_patterns = ['\d{3}-\d{2}-\d{4}']
 # [otlp.redaction]
 # drop_fields = ["@peer_addr"]

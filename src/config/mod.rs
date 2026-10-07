@@ -3830,6 +3830,18 @@ directory = "/tmp/otlp"
         assert!(cfg.otlp.enabled && cfg.otlp.local.is_some());
         assert_eq!(cfg.otlp.bearer_token.as_deref(), Some("change-me"));
         assert_eq!(cfg.otlp.max_service_partitions, 64);
+        assert_eq!(
+            cfg.hec.redaction.hash_fields,
+            vec!["user.email".to_string()]
+        );
+        assert_eq!(
+            cfg.hec.redaction.hash_key_env.as_deref(),
+            Some("LOGTHING_HASH_KEY")
+        );
+        // Validation compiles the redactor, which needs the key env var; edition-2024 tests
+        // cannot set env safely, so clear the hash settings after asserting them above.
+        cfg.hec.redaction.hash_fields.clear();
+        cfg.hec.redaction.hash_key_env = None;
         validate_config_invariants(&cfg).expect("uncommented example validates");
     }
 
