@@ -1367,9 +1367,11 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         match outcome {
             FlushOutcome::Success { key } => {
                 // Rows that crossed `max_rows`/`max_bytes` while this flush was in
-                // flight were refused a second flush by `try_flush_partition_async`
-                // and would otherwise wait for the next push or tick (up to ~2x the
-                // flush interval). Flush them as soon as the slot frees up.
+                // flight were refused a second flush by `try_flush_partition_async`.
+                // Flush them as soon as the slot frees up. Rows still below the
+                // thresholds stay in memory until the next trigger (periodic tick or
+                // arriving record), up to one flush interval; see
+                // docs/delivery-semantics.md.
                 let over_threshold = self
                     .buffers
                     .get_mut(&key)

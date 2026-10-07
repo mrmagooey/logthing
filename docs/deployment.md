@@ -43,6 +43,15 @@ receive_buffer_bytes = 0   # 0 = leave SO_RCVBUF alone; omit for the 4 MiB defau
 
 TCP syslog is unaffected — `SO_RCVBUF` here applies only to the UDP arm.
 
+## Spool volume
+
+If you enable `[spool]` (see [delivery-semantics.md](delivery-semantics.md#spool)), `spool.dir`
+must be on durable local storage and dedicated to logthing, and sized for `max_bytes`. Under
+Docker, mount a volume at that path. On Kubernetes, mount a PersistentVolumeClaim at
+`spool.dir`: an `emptyDir` is deleted when the pod is rescheduled, which loses every spooled
+entry not yet uploaded and so voids the spool's guarantee. A pod restart on the same node keeps
+an `emptyDir`, a reschedule does not.
+
 ## Security Considerations
 
 1. **Use TLS**: Always enable TLS in production

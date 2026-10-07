@@ -75,9 +75,13 @@ const MAX_CONCURRENT_EVENT_PROCESSING: usize = 16;
 ///
 /// - **Input-side / attacker ceiling: ~1 GiB.** `BudgetedBody` (below)
 ///   charges every request's ACTUAL streamed bytes as they arrive, so this
-///   is a hard ceiling on raw buffered-body bytes regardless of how many of
+///   is a hard ceiling on buffered-body bytes regardless of how many of
 ///   the 10,000 connection slots an attacker fills, what protocol version
-///   they use, or what headers they send (or omit). Payloads that are
+///   they use, or what headers they send (or omit). Gzip routes
+///   (HEC/NDJSON/OTLP, via `post_gzip`) are charged twice against the same
+///   budget and release scope: once for the wire bytes and again for the
+///   decoded bytes, so the budget bounds decompressed buffering too and a
+///   tiny gzip bomb cannot sidestep it. Payloads that are
 ///   never valid, parseable records — the attacker case — stay at this
 ///   scale, since they never reach the amplification below.
 /// - **Realistic legitimate peak: ~14 GiB, not 1 GiB.** The permit is held
@@ -862,7 +866,8 @@ impl Server {
             .layer(axum::Extension(self.state.config.clone()))
             // For routes wrapped by `post_gzip` this limit applies to the DECOMPRESSED stream
             // (the `Bytes` extractor wraps whatever body the route hands it);
-            // `body_budget_middleware` below still charges WIRE bytes.
+            // `body_budget_middleware` below charges the WIRE bytes, and `post_gzip`
+            // routes charge the decoded bytes again against the same budget.
             .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE))
             .layer(middleware::from_fn_with_state(
                 body_budget,

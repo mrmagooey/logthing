@@ -11,6 +11,29 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 - `deploy/analytics/` — docker compose and Helm deployments of logthing, Garage (S3),
   the committer, Lakekeeper (Iceberg REST), Trino and Hue. See
   `deploy/analytics/README.md`.
+- Redaction for HEC and OTLP records: `[hec.redaction]` / `[otlp.redaction]` with
+  `drop_fields`, `hash_fields` (HMAC-SHA256, key from the env var named by `hash_key_env`) and
+  `mask_patterns`, applied before the record is enqueued. See `docs/redaction.md`.
+- `[spool]` (`dir`, `max_bytes`): every S3 flush is committed to local disk (tmp, fsync, rename)
+  and uploaded in the background with backoff, replayed on startup. See
+  `docs/delivery-semantics.md`.
+- Iceberg descriptors gain an additive `sha256` field (hex digest of the Parquet file).
+- S3 Object Lock: `object_lock_mode` (`GOVERNANCE` / `COMPLIANCE`) and `object_lock_retain_days`
+  on every S3 sink, with `checksum_algorithm = SHA256` on puts. See `docs/object-lock.md`.
+- Local-disk sinks fsync the file and its directory before reporting success.
+- New metrics: `redactions_applied{source,rule}`, `spool_bytes`, `spool_entries`,
+  `spool_unreadable`, `spool_rejected{reason}`, `spool_uploaded{sink}`,
+  `spool_upload_errors{sink}`, `spool_corrupt`, `local_sink_dir_fsync_errors`.
+
+### Changed
+
+- `parquet_s3_uploads` no longer increments for spooled files; see `spool_uploaded`.
+
+### Fixed
+
+- Buffered writer: rows that cross `max_buffer_rows` / `flush_threshold_bytes` while a flush is
+  in flight are now flushed as soon as that flush completes, instead of waiting for the next
+  tick or record.
 
 ## [0.21.0] - 2026-09-30
 

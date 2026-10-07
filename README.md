@@ -15,6 +15,9 @@ A high-performance log ingestion server written in Rust. Receives Windows Event 
 - **DNS Log Parsing**: Automatic parsing of BIND, Unbound, and PowerDNS query logs
 - **Generic Event Parser**: YAML-configurable parsing for specific Windows event codes
 - **Parquet Storage**: Aggregate events into Parquet files and store in S3-compatible storage or on local disk
+- **Redaction**: Drop, HMAC-hash or mask fields in HEC and OTLP records before they are stored — see [docs/redaction.md](docs/redaction.md)
+- **Durable Spool**: Optional on-disk spool in front of S3 uploads that survives outages and restarts, with documented per-source delivery guarantees — see [docs/delivery-semantics.md](docs/delivery-semantics.md)
+- **S3 Object Lock**: Write-once retention (GOVERNANCE/COMPLIANCE) for uploaded Parquet and descriptors — see [docs/object-lock.md](docs/object-lock.md)
 - **Iceberg Descriptor Output**: Optional per-file JSON descriptors (row count, stats, location) for an external Apache Iceberg committer
 - **Log Aggregation**: Optionally count records as they arrive, grouped by configured columns, writing an SQL `GROUP BY`-style table to Parquet instead of the raw rows — cuts noisy streams down to their useful summary
 - **TLS/SSL Encryption**: Secure connections with certificate support
@@ -172,6 +175,9 @@ repository conventions.
 - [docs/iceberg.md](docs/iceberg.md) — Iceberg descriptor output and a suggested committer/catalog deployment pattern
 - [committer/README.md](committer/README.md) — the shipped Iceberg descriptor committer (container image, configuration, end-to-end test)
 - [deploy/analytics/README.md](deploy/analytics/README.md) — ready-to-run docker compose / Helm analytics stack (Garage, committer, Lakekeeper, Trino, Hue)
+- [docs/redaction.md](docs/redaction.md) — HEC/OTLP redaction rules (drop, hash, mask), key handling, deleting data by subject
+- [docs/delivery-semantics.md](docs/delivery-semantics.md) — per-source delivery guarantees, shutdown behaviour and the on-disk spool
+- [docs/object-lock.md](docs/object-lock.md) — S3 Object Lock configuration, bucket requirements and limits
 - [docs/deployment.md](docs/deployment.md) — host tuning for UDP ingest and security considerations
 - [docs/metrics.md](docs/metrics.md) — Prometheus metrics and the full API endpoint list
 - [docs/admin.md](docs/admin.md) — read-only admin web interface
