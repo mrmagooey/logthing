@@ -93,7 +93,7 @@ def verify_hec(cat, marker: str) -> None:
     assert {"event_uuid", "source", "index", "indexed_fields"} <= cols, cols
     # The table was CREATED from a legacy-shaped file (run.sh seeds one first), so the new
     # columns can only be there because the committer evolved the schema.
-    assert len(table.metadata.schemas) >= 2, "expected schema evolution to have created a new schema"
+    assert len(table.metadata.schemas) >= 2, "expected schema evolution to create a new schema"
     rows = table.scan().to_arrow().to_pylist()
     legacy = [r for r in rows if "legacy-row" in r["fields"]]
     fresh = [r for r in rows if marker in r["fields"]]
@@ -102,7 +102,7 @@ def verify_hec(cat, marker: str) -> None:
     assert uuid.UUID(fresh[0]["event_uuid"]).version == 7
     assert fresh[0]["source"] == "committer-e2e" and fresh[0]["index"] == "main"
     assert json.loads(fresh[0]["indexed_fields"]) == {"env": "e2e"}
-    print(f"OK: hec evolved ({len(table.metadata.schemas)} schemas), legacy row NULL, new row typed")
+    print(f"OK: hec evolved ({len(table.metadata.schemas)} schemas), legacy NULL, new row typed")
 
 
 def verify_otlp(cat, marker: str) -> None:

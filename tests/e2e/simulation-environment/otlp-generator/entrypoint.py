@@ -76,7 +76,8 @@ def post(payload, token, expect):
 
 def main():
     wait_for_server()
-    post(request("svc-a", [log_record(f"a-{i}", 9, "INFO", trace=True) for i in range(3)]), TOKEN, 200)
+    a_records = [log_record(f"a-{i}", 9, "INFO", trace=True) for i in range(3)]
+    post(request("svc-a", a_records), TOKEN, 200)
     post(request("Svc B", [log_record(f"b-{i}", 13, "WARN") for i in range(2)]), TOKEN, 200)
     post(request(None, [log_record("no-resource", 9, "INFO")]), TOKEN, 200)
     post(request("svc-a", [log_record("rejected", 9, "INFO")]), "wrong-token", 401)

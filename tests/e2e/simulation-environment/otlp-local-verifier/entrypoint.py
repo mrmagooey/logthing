@@ -59,7 +59,13 @@ def main():
         files, tables = load()
     rows = sum(t.num_rows for t in tables)
     if rows < EXPECTED_ROWS:
-        fail(f"expected >= {EXPECTED_ROWS} rows, got {rows} across {len(files)} file(s)")
+        fail(f"expected {EXPECTED_ROWS} rows, got {rows} across {len(files)} file(s)")
+    # Settle one full flush interval (5s in the sim config) so a late double-write is seen.
+    time.sleep(7)
+    files, tables = load()
+    rows = sum(t.num_rows for t in tables)
+    if rows != EXPECTED_ROWS:
+        fail(f"expected exactly {EXPECTED_ROWS} rows, got {rows} (duplicates or extras)")
 
     dirs = {os.path.relpath(f, os.path.join(LOCAL_DIR, "otlp")).split(os.sep)[0] for f in files}
     for want in ("svc_a", "svc_b", "unknown"):
@@ -84,6 +90,9 @@ def main():
     if any(uuid.UUID(i).version != 7 for i in ids):
         fail("event_uuid must be UUIDv7")
 
+    bodies = [r["body"] for r in all_rows]
+    if len(set(bodies)) != len(bodies):
+        fail(f"duplicate record bodies: {sorted(bodies)}")
     by_body = {r["body"]: r for r in all_rows}
     a0 = by_body.get("a-0") or fail("record a-0 missing")
     if (a0["service_name"], a0["severity_number"], a0["severity_text"]) != ("svc-a", 9, "INFO"):
