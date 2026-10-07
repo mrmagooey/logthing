@@ -10,7 +10,7 @@ use axum::{
     Router,
     body::Bytes,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::put,
 };
@@ -22,10 +22,13 @@ use std::sync::{
 
 /// Recorded `(key, body)` pairs.
 type Puts = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+/// Recorded `(key, request headers)` of every PUT that reached the handler, failed or not.
+type Headers = Arc<Mutex<Vec<(String, Vec<(String, String)>)>>>;
 
 #[derive(Clone)]
 struct Shared {
     puts: Puts,
+    headers: Headers,
     failing: Arc<AtomicBool>,
     requests: Arc<AtomicUsize>,
 }
@@ -40,17 +43,22 @@ pub struct FakeS3 {
 async fn put_object(
     State(s): State<Shared>,
     Path(path): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
     s.requests.fetch_add(1, Ordering::SeqCst);
-    if s.failing.load(Ordering::SeqCst) {
-        return (StatusCode::SERVICE_UNAVAILABLE, "down").into_response();
-    }
-    // path = "<bucket>/<key>"; path-style addressing.
     let key = path
         .split_once('/')
         .map_or(path.as_str(), |(_, k)| k)
         .to_string();
+    let hs = headers
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    s.headers.lock().unwrap().push((key.clone(), hs));
+    if s.failing.load(Ordering::SeqCst) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "down").into_response();
+    }
     s.puts.lock().unwrap().push((key, body.to_vec()));
     (StatusCode::OK, [("ETag", "\"fake\"")]).into_response()
 }
@@ -59,6 +67,7 @@ impl FakeS3 {
     pub async fn start() -> FakeS3 {
         let shared = Shared {
             puts: Arc::default(),
+            headers: Arc::default(),
             failing: Arc::new(AtomicBool::new(false)),
             requests: Arc::default(),
         };
@@ -99,6 +108,16 @@ impl FakeS3 {
     /// Every successful put as `(key, body)`.
     pub fn puts(&self) -> Vec<(String, Vec<u8>)> {
         self.shared.puts.lock().unwrap().clone()
+    }
+
+    /// Request headers (lowercased names) of the most recent PUT of `key`, successful or not.
+    pub fn put_headers(&self, key: &str) -> Vec<(String, String)> {
+        let hs = self.shared.headers.lock().unwrap();
+        hs.iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, h)| h.clone())
+            .unwrap_or_default()
     }
 
     /// Number of successful puts.

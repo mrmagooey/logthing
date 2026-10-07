@@ -104,6 +104,18 @@ iceberg) shares these keys:
 The Object Lock keys also work as environment overrides (`LOGTHING__HEC__S3__OBJECT_LOCK_MODE`,
 `...OBJECT_LOCK_RETAIN_DAYS`). See [object-lock.md](object-lock.md).
 
+## Spool
+
+`[spool]` persists every S3 flush to local disk before it is uploaded, so an S3 outage or a
+restart no longer loses flushed data. Off by default.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `dir` | path | required | Spool directory. Created if missing. Must be **dedicated**: startup deletes unmarked `*.tmp`, `*.parquet` and `*.json` files in it. |
+| `max_bytes` | integer | 1 GiB | Cap on spooled bytes; must be > 0. Beyond it flushes fall back to a direct upload. |
+
+Semantics, limits and metrics are in [delivery-semantics.md](delivery-semantics.md).
+
 ## Redaction
 
 `[hec.redaction]` and `[otlp.redaction]` drop, HMAC-hash or mask values before records are

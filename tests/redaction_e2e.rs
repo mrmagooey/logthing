@@ -52,7 +52,7 @@ async fn test_hec_redaction_applies_over_real_http() {
     .expect("request timed out")
     .unwrap();
     assert_eq!(resp.status(), 200);
-    let dir = p.dir.path().join("hec");
+    let dir = p.dir().join("hec");
     let batches = common::wait_for_rows(&dir, 1, Duration::from_secs(20)).await;
     let fields: serde_json::Value =
         serde_json::from_str(common::str_col(&batches[0], "fields").value(0)).unwrap();
@@ -90,7 +90,7 @@ async fn test_hec_raw_and_ndjson_redaction_over_real_http() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    let dir = p.dir.path().join("hec");
+    let dir = p.dir().join("hec");
     let batches = common::wait_for_rows(&dir, 2, Duration::from_secs(20)).await;
     let mut all: Vec<serde_json::Value> = batches
         .iter()
@@ -200,7 +200,7 @@ async fn test_otlp_redaction_applies_over_real_http() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    let dir = p.dir.path().join("otlp");
+    let dir = p.dir().join("otlp");
     let batches = common::wait_for_rows(&dir, 1, Duration::from_secs(20)).await;
     let b = &batches[0];
     assert_eq!(common::str_col(b, "body").value(0), "my [REDACTED]");
