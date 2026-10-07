@@ -30,7 +30,7 @@ directory = "/var/lib/logthing/otlp"
 | Exporter | Configuration |
 |---|---|
 | OpenTelemetry Collector | `otlphttp` exporter, `endpoint: http://logthing:5985`, `compression: gzip` (logs path `/v1/logs` is appended automatically) |
-| OTel SDKs | `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, `OTEL_EXPORTER_OTLP_ENDPOINT=http://logthing:5985` (gzip is the SDK default for HTTP exporters) |
+| OTel SDKs | `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, `OTEL_EXPORTER_OTLP_ENDPOINT=http://logthing:5985`; set `OTEL_EXPORTER_OTLP_COMPRESSION=gzip` to compress |
 | JSON | `Content-Type: application/json` (OTLP/JSON, camelCase) is accepted |
 | gRPC (port 4317) | **Not supported yet.** Use `otlphttp`. |
 

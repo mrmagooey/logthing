@@ -26,6 +26,7 @@ use tower_http::decompression::RequestDecompressionLayer;
 /// legacy alias `x-gzip` to `gzip` (tower-http only matches the exact lowercase bytes
 /// `gzip`). Anything it still does not recognise (`deflate`, `br`, `gzip, gzip`, ...) is
 /// answered with 415 by the layer.
+/// Only the first `Content-Encoding` header line is considered (matching tower-http).
 pub async fn normalize_content_encoding(mut req: Request, next: Next) -> Response {
     let canonical = req
         .headers()

@@ -108,7 +108,6 @@ aws-credential-types = "1.1"
 
 # Additional utilities
 tempfile = "3.9"
-flate2 = "1"
 bytes = "1.5"
 regex = "1.10"
 async-trait = "0.1"
