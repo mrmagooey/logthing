@@ -13,6 +13,7 @@ where activity_id = 1
   and status_id = 2
   and src_endpoint_ip is not null
   and "time" > {{ detection_now() }} - interval '1' day
+  {{ detection_upper_bound() }}
 group by 1, 2
 having count(*) >= {{ var('bruteforce_threshold', 10) }}
 order by failures desc

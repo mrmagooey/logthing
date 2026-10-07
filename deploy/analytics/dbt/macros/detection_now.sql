@@ -7,3 +7,11 @@ from_iso8601_timestamp('{{ var("detection_as_of") }}')
 current_timestamp
 {%- endif -%}
 {%- endmacro %}
+
+{# Upper bound on "time", applied ONLY when detection_as_of is set (a true replay must not see
+   events after the pinned instant). Live runs stay unbounded. #}
+{% macro detection_upper_bound() -%}
+{%- if var('detection_as_of', none) is not none -%}
+and "time" <= {{ detection_now() }}
+{%- endif -%}
+{%- endmacro %}

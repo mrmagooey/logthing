@@ -9,6 +9,7 @@ with recent as (
         min(dst_endpoint_ip) as example_destination
     from {{ ref('ocsf_network_activity') }}
     where "time" > {{ detection_now() }} - interval '1' day
+      {{ detection_upper_bound() }}
       and dst_endpoint_port is not null
     group by 1
 ),

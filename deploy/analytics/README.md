@@ -217,6 +217,14 @@ kubectl exec -n <ns> <release>-logthing-analytics-postgres-0 -- psql -U postgres
 
 With `credentials.existingSecret`, add the three `metabase-*` keys to your Secret first.
 
+## dbt and detections
+
+The [dbt/](dbt/) directory is a dbt-trino project over the Iceberg tables: typed staging views, four
+flattened OCSF views (network, DNS, authentication, detection finding), three example detection
+queries (`analyses/`) and schema plus unit tests; run it with `dbt build`. Syslog has no OCSF model
+and there is no pySigma backend for Trino, so Sigma rules are not converted. Setup, scheduling and
+caveats: [dbt/README.md](dbt/README.md).
+
 ## Tables and maintenance
 
 - Table naming (`syslog`, `zeek_<stream>`, `sflow_<partition>`, ...): see
@@ -227,6 +235,8 @@ With `credentials.existingSecret`, add the three `metabase-*` keys to your Secre
 ## Development
 
 Test commands (unit, integration, e2e) are listed in the root [AGENTS.md](../../AGENTS.md).
+Integration and e2e tests need Docker. On a CPU without AVX2 set `TRINO_IMAGE=trinodb/trino:470`.
+`helm-minikube.sh` also needs minikube and loads a locally present `TRINO_IMAGE` into the cluster.
 
 - The e2e scripts refuse to run on a non-AVX2 CPU unless `TRINO_IMAGE` is overridden. `compose.sh` uses non-default host ports; run one at a time.
 - `helm-minikube.sh` uses its own minikube profile `lt-analytics-e2e` and a private

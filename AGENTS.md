@@ -25,8 +25,9 @@ This document explains how automated or semi-automated agents should interact wi
 | Committer tests | `committer/.venv/bin/pytest committer/tests --ignore=committer/tests/e2e` |
 | Committer E2E test | `committer/tests/e2e/run.sh` (requires Docker) |
 | Analytics unit tests | `deploy/analytics/.venv/bin/pytest -c deploy/analytics/tests/pytest.ini deploy/analytics/tests/unit` |
-| Analytics integration test | `deploy/analytics/.venv/bin/pytest -c deploy/analytics/tests/pytest.ini deploy/analytics/tests/integration -m integration` (requires Docker) |
-| Analytics E2E (compose) | `deploy/analytics/tests/e2e/compose.sh` (requires Docker + AVX2 CPU) |
+| Analytics integration test | `deploy/analytics/.venv/bin/pytest -c deploy/analytics/tests/pytest.ini deploy/analytics/tests/integration -m integration` (requires Docker; Trino tests need AVX2 or `TRINO_IMAGE`) |
+| Analytics E2E (compose) | `deploy/analytics/tests/e2e/compose.sh` (requires Docker + AVX2 CPU, or `TRINO_IMAGE=trinodb/trino:470`) |
+| Analytics dbt build | `deploy/analytics/.venv/bin/dbt build --project-dir deploy/analytics/dbt --profiles-dir deploy/analytics/dbt` (needs `TRINO_PASSWORD`, `TRINO_CA_CERT`; see `deploy/analytics/dbt/README.md`) |
 | Analytics E2E (Helm) | `deploy/analytics/tests/e2e/helm-minikube.sh` (requires minikube + AVX2 CPU) |
 
 **Example - run a specific test:**
@@ -146,6 +147,7 @@ src/
   zeek/         # Zeek NDJSON ingestion
 committer/  # Python Iceberg committer (separate image)
 deploy/analytics/  # Compose + Helm analytics stack (Garage, Lakekeeper, Trino, Metabase)
+deploy/analytics/dbt/  # dbt-trino project: staging, OCSF views, detection analyses
 ```
 
 Note: `src/lib.rs` is the crate's module root (the crate is both a library and a binary); `src/main.rs` is the binary entry point only.

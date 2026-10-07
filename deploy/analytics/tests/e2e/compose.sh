@@ -177,6 +177,8 @@ for f in "$DBT_WORK"/target/compiled/logthing_analytics/analyses/*.sql; do
   analyses=$((analyses + 1))
 done
 [ "$analyses" = 3 ] || fail "expected 3 compiled analyses, found $analyses"
+rare=$(sql "$(cat "$DBT_WORK"/target/compiled/logthing_analytics/analyses/detect_rare_outbound_port.sql)")
+printf '%s\n' "$rare" | awk -F'\t' '$1 == 443 { found = 1 } END { exit !found }' || fail "detect_rare_outbound_port did not return port 443 on the fresh lake: $rare"
 echo "ocsf: network + dns mapped; $analyses analyses executed"
 
 echo "Analytics compose E2E PASSED"

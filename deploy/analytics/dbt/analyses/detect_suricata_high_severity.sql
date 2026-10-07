@@ -10,5 +10,6 @@ select
 from {{ ref('ocsf_detection_finding') }}
 where severity_id >= {{ var('suricata_min_severity_id', 4) }}
   and "time" > {{ detection_now() }} - interval '1' day
+  {{ detection_upper_bound() }}
 group by 1
 order by alerts desc

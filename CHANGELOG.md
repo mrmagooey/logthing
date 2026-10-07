@@ -8,9 +8,23 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ### Added
 
-- `deploy/analytics/` — docker compose and Helm deployments of logthing, Garage (S3),
-  the committer, Lakekeeper (Iceberg REST), Trino and Hue. See
-  `deploy/analytics/README.md`.
+- `deploy/analytics/` — docker compose and Helm deployments of logthing, Garage (S3), the
+  committer, Lakekeeper (Iceberg REST), Trino and Metabase, plus a dbt-trino project
+  (`deploy/analytics/dbt/`) with OCSF views (network, DNS, authentication, detection finding)
+  and example detection queries. See `deploy/analytics/README.md`.
+- Analytics stack security defaults: secrets are generated and never defaulted
+  (`deploy/analytics/scripts/gen-analytics-env.sh` for compose; `randAlphaNum` + `lookup` in
+  Helm); Trino serves HTTPS on 8443 with password authentication and a generated CA (plain HTTP
+  8080 is not published); Lakekeeper, Postgres and the Garage admin API are not published; Helm
+  ships NetworkPolicies.
+
+### Breaking
+
+- Analytics stack, for anyone running it from master before this release: Hue is replaced by
+  Metabase (Hue saved queries are not migrated); compose requires a `.env` (run the generator);
+  Trino moved from unauthenticated `http://:8080` to `https://:8443` (users `admin` and
+  `metabase`); `LAKEKEEPER_PORT`, `HUE_*` and `HUE_IMAGE` are removed; Helm credential keys changed
+  (`hue-*` out, `trino-*` and `metabase-*` in).
 
 ## [0.21.0] - 2026-09-30
 

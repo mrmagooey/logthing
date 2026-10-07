@@ -7,12 +7,13 @@ four flattened OCSF 1.3 views and three example detections.
 
 ```bash
 deploy/analytics/.venv/bin/pip install -r deploy/analytics/tests/requirements.txt   # pins dbt-core 1.11.15, dbt-trino 1.10.6
+export PATH=$PWD/deploy/analytics/.venv/bin:$PATH   # or call .venv/bin/dbt explicitly
 cd deploy/analytics/dbt
 # compose: extract the generated CA once
 docker compose -f ../docker-compose.yml exec -T trino cat /etc/trino/tls/ca.pem > trino-ca.pem
 export TRINO_HOST=localhost TRINO_PORT=8443 TRINO_USER=admin
 export TRINO_PASSWORD=<TRINO_ADMIN_PASSWORD from .env> TRINO_CA_CERT=$PWD/trino-ca.pem
-dbt build            # views, schema tests and dbt unit tests
+dbt build            # (.venv/bin/dbt) views, schema tests and dbt unit tests
 dbt compile          # compiles analyses/ to target/compiled/logthing_analytics/analyses/
 ```
 Helm: `kubectl port-forward svc/<release>-logthing-analytics-trino 8443` and read the CA with
@@ -53,16 +54,30 @@ malformed JSON/XML yields NULLs (the row's `time` falls back to the receipt time
 
 "Last day" is relative to the wall clock by default. Set `detection_as_of` (ISO 8601, e.g.
 `--vars '{detection_as_of: "2026-10-05T12:00:00Z"}'`) to pin the reference time, for replaying
-history or reproducible tests.
+history or reproducible tests. When it is set the analyses also apply an upper bound
+(`"time" <= detection_as_of`) so a replay never sees events after the pinned instant; live runs
+(variable unset) are unbounded above.
+
+**Caveats.**
+- `detect_auth_bruteforce` uses 10-minute *tumbling* windows: a burst that straddles a window
+  boundary is split and may stay below the threshold in both halves (a sliding window would be
+  more precise).
+- `detect_rare_outbound_port` needs history: until about ~8 days of baseline exist, nearly every
+  port looks "new", so expect noise on a fresh lake. Ports are not keyed by protocol (tcp/443 and
+  udp/443 are the same port) and "outbound" means towards the responder.
 
 dbt compiles analyses but never runs them. Schedule them yourself: compile, then run the SQL with
 any Trino client over HTTPS with the CA, e.g. cron every 10 minutes:
 
 ```bash
-cd /opt/logthing/deploy/analytics/dbt && dbt compile -q --vars '{bruteforce_threshold: 20}' && \
+# needs in the environment: TRINO_HOST TRINO_PORT (8443) TRINO_USER TRINO_PASSWORD TRINO_CA_CERT
+# (dbt profile) and, for the CLI, the CA as a truststore plus the password via TRINO_PASSWORD
+export TRINO_HOST=trino.example TRINO_PORT=8443 TRINO_USER=admin TRINO_PASSWORD=... \
+       TRINO_CA_CERT=/etc/ssl/trino-ca.pem
+cd /opt/logthing/deploy/analytics/dbt && /opt/logthing/deploy/analytics/.venv/bin/dbt compile -q --vars '{bruteforce_threshold: 20}' && \
 for f in target/compiled/logthing_analytics/analyses/detect_*.sql; do
-  trino --server https://trino.example:8443 --truststore-path /etc/ssl/trino-ca.pem --user admin \
-        --password --execute "$(cat "$f")"
+  trino --server "https://$TRINO_HOST:$TRINO_PORT" --truststore-path "$TRINO_CA_CERT" \
+        --user "$TRINO_USER" --password --execute "$(cat "$f")"
 done
 ```
 or the same two commands in a Kubernetes `CronJob` whose image contains dbt (`pip install -r

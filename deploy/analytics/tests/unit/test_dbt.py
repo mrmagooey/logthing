@@ -207,6 +207,24 @@ def test_readme_documents_scope_decisions():
 
 def test_zeek_protocol_number_is_mapped_from_the_name_in_the_network_view():
     text = (DBT_DIR / "models" / "ocsf" / "ocsf_network_activity.sql").read_text()
-    assert "cast(null as integer) as connection_info_protocol_num" not in text.split("ipfix as")[0]
+    assert "ip_protocol_num" in text
     unit = (DBT_DIR / "models" / "ocsf" / "unit_tests.yml").read_text()
     assert "connection_info_protocol_num: 6" in unit and "connection_info_protocol_num: 58" in unit
+
+
+def _render_bound(variables):
+    from jinja2 import Environment
+    src = (DBT_DIR / "macros" / "detection_now.sql").read_text()
+    env = Environment()
+    tmpl = env.from_string(src + "{{ detection_upper_bound() }}",
+                           globals={"var": lambda k, d=None: variables.get(k, d)})
+    return tmpl.render().strip()
+
+
+def test_detection_as_of_adds_an_upper_bound_only_when_set():
+    assert _render_bound({}) == ""
+    bound = _render_bound({"detection_as_of": "2026-10-05T12:00:00Z"})
+    assert bound == 'and "time" <= from_iso8601_timestamp(\'2026-10-05T12:00:00Z\')'
+    for n in ANALYSES:
+        text = (DBT_DIR / "analyses" / f"{n}.sql").read_text()
+        assert "detection_upper_bound()" in text, n
