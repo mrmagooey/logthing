@@ -2097,8 +2097,8 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
     /// line.
     ///
     /// `site` is passed by the caller rather than derived from this handle
-    /// because OTLP and HEC/NDJSON share the same `ParquetWriterHandle`
-    /// instances; keying by handle alone would let one mute the other.
+    /// so throttling is per call site (HEC, OTLP, ...) rather than per handle,
+    /// and one site's drop burst cannot mute another's first-occurrence line.
     pub fn drop_log_due(&self, site: DropSite, kind: DropKind) -> Option<u64> {
         self.drop_log.check(site, kind)
     }

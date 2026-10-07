@@ -82,6 +82,7 @@ mod otlp_e2e {
             otlp: OtlpConfig {
                 enabled: true,
                 bearer_token,
+                ..Default::default()
             },
             ..Default::default()
         };

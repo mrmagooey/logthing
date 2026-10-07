@@ -925,6 +925,66 @@ impl Default for HecConfig {
     }
 }
 
+fn default_otlp_s3_prefix() -> String {
+    "otlp".to_string()
+}
+/// Bounded channel depth for OTLP sinks, from the shared per-channel budget and the measured
+/// `OtlpRecord` footprint (`channel_budget::OTLP_RECORD_BYTES`).
+fn default_otlp_channel_capacity() -> usize {
+    crate::forwarding::channel_budget::capacity_for(
+        crate::forwarding::channel_budget::OTLP_RECORD_BYTES,
+    )
+}
+fn default_otlp_max_service_partitions() -> usize {
+    64
+}
+
+/// Per-source S3 persistence config for OTLP ingest (`[otlp.s3]`). Mirrors `HecS3Config` with
+/// OTLP-specific defaults (`prefix = "otlp"`, OTLP channel sizing).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OtlpS3Config {
+    /// Shared S3 connection fields (flattened: `[otlp.s3]\nendpoint = ...`).
+    #[serde(flatten)]
+    pub connection: S3ConnectionConfig,
+    /// S3 key prefix, slash-free (default: `"otlp"`).
+    #[serde(default = "default_otlp_s3_prefix")]
+    pub prefix: String,
+    /// Flush when estimated buffer bytes exceeds this (default: 100 MiB).
+    #[serde(default = "default_hec_flush_bytes")]
+    pub flush_threshold_bytes: usize,
+    /// Flush after this many seconds regardless (default: 900).
+    #[serde(default = "default_hec_flush_secs")]
+    pub flush_interval_secs: u64,
+    /// Bounded channel capacity (default derived from `OTLP_RECORD_BYTES`).
+    #[serde(default = "default_otlp_channel_capacity")]
+    pub channel_capacity: usize,
+    /// Maximum buffered rows before the hard cap (default: 100_000).
+    #[serde(default = "default_hec_max_buffer_rows")]
+    pub max_buffer_rows: usize,
+}
+
+/// Per-source local-disk persistence config for OTLP ingest (`[otlp.local]`). Independent of `s3`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OtlpLocalConfig {
+    /// Root directory Parquet files are written under (created if missing).
+    pub directory: PathBuf,
+    /// Key prefix, slash-free (default: `"otlp"`).
+    #[serde(default = "default_otlp_s3_prefix")]
+    pub prefix: String,
+    /// Flush when estimated buffer bytes exceeds this (default: 100 MiB).
+    #[serde(default = "default_hec_flush_bytes")]
+    pub flush_threshold_bytes: usize,
+    /// Flush after this many seconds regardless (default: 900).
+    #[serde(default = "default_hec_flush_secs")]
+    pub flush_interval_secs: u64,
+    /// Bounded channel capacity (default derived from `OTLP_RECORD_BYTES`).
+    #[serde(default = "default_otlp_channel_capacity")]
+    pub channel_capacity: usize,
+    /// Maximum buffered rows before the hard cap (default: 100_000).
+    #[serde(default = "default_hec_max_buffer_rows")]
+    pub max_buffer_rows: usize,
+}
+
 /// Top-level [otlp] config section (OTLP/HTTP log ingest).
 /// Only present when the `otlp` Cargo feature is enabled; always compiled
 /// into Config so the TOML surface is consistent (the field is inert when
@@ -944,6 +1004,18 @@ pub struct OtlpConfig {
     /// fixed at startup and changing it requires a restart.
     #[serde(default)]
     pub bearer_token: Option<String>,
+
+    /// Maximum distinct `service.name` path partitions before `_overflow` (default: 64).
+    /// The `service_name` COLUMN always holds the raw value; the partition is only a
+    /// file-grouping key. Must be > 0 (validated at startup).
+    #[serde(default = "default_otlp_max_service_partitions")]
+    pub max_service_partitions: usize,
+    /// Optional S3 persistence (`[otlp.s3]`). OTLP no longer uses `[hec]` sinks.
+    #[serde(default)]
+    pub s3: Option<OtlpS3Config>,
+    /// Optional local-disk persistence (`[otlp.local]`). Independent of `s3`.
+    #[serde(default)]
+    pub local: Option<OtlpLocalConfig>,
 }
 
 fn default_otlp_enabled() -> bool {
@@ -955,6 +1027,9 @@ impl Default for OtlpConfig {
         Self {
             enabled: default_otlp_enabled(),
             bearer_token: None,
+            max_service_partitions: default_otlp_max_service_partitions(),
+            s3: None,
+            local: None,
         }
     }
 }
@@ -3291,5 +3366,41 @@ secret_key = "minioadmin"
             2,
             "expected exactly two warnings; got {warnings:?}"
         );
+    }
+
+    #[test]
+    fn otlp_config_defaults_and_sink_tables_parse() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(!cfg.otlp.enabled);
+        assert_eq!(cfg.otlp.max_service_partitions, 64);
+        assert!(cfg.otlp.s3.is_none() && cfg.otlp.local.is_none());
+
+        let cfg: Config = toml::from_str(
+            r#"
+[otlp]
+enabled = true
+max_service_partitions = 8
+[otlp.s3]
+endpoint = "http://localhost:9000"
+bucket = "b"
+region = "us-east-1"
+access_key = "k"
+secret_key = "s"
+[otlp.local]
+directory = "/tmp/otlp"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.otlp.max_service_partitions, 8);
+        let s3 = cfg.otlp.s3.unwrap();
+        assert_eq!(s3.prefix, "otlp");
+        assert_eq!(
+            s3.channel_capacity,
+            capacity_for(crate::forwarding::channel_budget::OTLP_RECORD_BYTES)
+        );
+        let local = cfg.otlp.local.unwrap();
+        assert_eq!(local.prefix, "otlp");
+        assert_eq!(local.flush_interval_secs, 900);
+        assert_eq!(local.channel_capacity, s3.channel_capacity);
     }
 }

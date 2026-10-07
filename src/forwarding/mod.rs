@@ -7,6 +7,7 @@ pub mod generic_s3;
 pub mod iceberg_descriptor;
 pub mod ipfix_s3;
 pub mod local_sink;
+pub mod otlp_s3;
 pub mod parquet_s3;
 pub mod s3_sink;
 pub mod sflow_s3;

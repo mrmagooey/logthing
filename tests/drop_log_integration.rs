@@ -109,24 +109,16 @@ fn a_second_line_after_the_interval_reports_the_accumulated_total() {
     );
 }
 
-/// A real production call site: `GenericS3Handler`, the same
-/// `ParquetWriterHandle<GenericSink>` that `IngestState.generic_s3` holds,
-/// which both the HEC/NDJSON ingest routes (`ingest/handlers.rs`) and the
-/// OTLP ingest route (`server/mod.rs`) send through.
+/// A real production handle (`GenericS3Handler`, the `ParquetWriterHandle<GenericSink>` that
+/// `IngestState.generic_s3` holds) with two different `DropSite`s keyed against it.
 ///
-/// This does not drive the full HTTP handlers end-to-end — standing up the
-/// axum router, HEC auth tokens, and request bodies for both routes is
-/// machinery orthogonal to what this throttle needs covered. Per the review
-/// note allowing a direct-handle substitute when driving the full handlers
-/// is impractical, this instead constructs the same `GenericS3Handler` type
-/// production code builds (mirroring the construction `generic_s3.rs`'s own
-/// tests use), fills its channel with real `try_send` calls until one
-/// returns `Full`, and then calls `drop_log_due` with both `DropSite::Hec`
-/// and `DropSite::Otlp` against that one real, shared handle — the exact
-/// shape of the production hazard (an OTLP burst muting HEC's line, or vice
-/// versa) that keying by `DropSite` rather than by handle exists to prevent.
+/// The throttle table is keyed by `(DropSite, DropKind)`, so one handle reporting for two
+/// sites must keep their first-occurrence lines independent. HEC and OTLP now own separate
+/// handles, so this uses `Hec` and `Otlp` only as two arbitrary distinct sites. The test
+/// fills the channel with real `try_send` calls until one returns `Full`, then calls
+/// `drop_log_due` for both sites.
 #[tokio::test(flavor = "current_thread")]
-async fn hec_and_otlp_share_a_real_handle_without_muting_each_other() {
+async fn distinct_drop_sites_on_one_handle_do_not_mute_each_other() {
     use logthing::config::S3ConnectionConfig;
     use logthing::forwarding::buffered_writer::{
         BufferedWriterConfig, FlushPolicy, LiveInterval, ParquetWriterHandle,
@@ -197,18 +189,17 @@ async fn hec_and_otlp_share_a_real_handle_without_muting_each_other() {
         "expected try_send to return Full after flooding a channel_capacity=4 handle"
     );
 
-    // Both DropSite::Hec and DropSite::Otlp keyed against the SAME handle —
-    // exactly the production scenario. Each must log on its own first
+    // Two sites keyed against the same handle: each must log on its own first
     // occurrence; neither may mute the other.
     assert_eq!(
         handle.drop_log_due(DropSite::Hec, DropKind::Full),
         Some(1),
-        "HEC's first drop on the shared handle must log"
+        "the first drop for the Hec site must log"
     );
     assert_eq!(
         handle.drop_log_due(DropSite::Otlp, DropKind::Full),
         Some(1),
-        "OTLP's first drop on the SAME shared handle must also log — an OTLP burst must not mute \
-         HEC's first-occurrence line, or vice versa"
+        "the first drop for the Otlp site on the SAME handle must also log — one site's burst must \
+         not mute another site's first-occurrence line"
     );
 }

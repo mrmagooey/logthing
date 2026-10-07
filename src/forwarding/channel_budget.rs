@@ -29,12 +29,13 @@
 //! `.local`, and `structured_s3` when `parse_payloads` is on).
 //!
 //! A deployment with every source enabled and every destination configured
-//! therefore has 15 channels — zeek 2, suricata 2, syslog 3, sflow 2, ipfix 2,
-//! HEC/OTLP 2 (OTLP shares HEC's handles), WEF 2 — for a **~1.46 GiB**
-//! worst-case ceiling, not 100 MiB and not 700 MiB. One exception: WEF queues
-//! `Arc<WindowsEvent>` and clones the same `Arc` into both of its channels, so
-//! its two channels share one set of pointees and the true WEF worst case is
-//! ~100 MiB rather than 200 MiB, putting the realistic ceiling at ~1.37 GiB.
+//! therefore has 17 channels — zeek 2, suricata 2, syslog 3, sflow 2, ipfix 2,
+//! HEC 2, OTLP 2 (its own `ParquetWriterHandle<OtlpSink>`s), WEF 2 — for a
+//! **~1.66 GiB** worst-case ceiling, not 100 MiB and not 700 MiB. One exception:
+//! WEF queues `Arc<WindowsEvent>` and clones the same `Arc` into both of its
+//! channels, so its two channels share one set of pointees and the true WEF
+//! worst case is ~100 MiB rather than 200 MiB, putting the realistic ceiling at
+//! ~1.56 GiB.
 //!
 //! That is a ceiling, not a reservation (see `CHANNEL_BUDGET_BYTES`): only
 //! Zeek and Suricata apply backpressure and so are the only channels *designed*
@@ -49,7 +50,7 @@
 /// list of 32-slot blocks, not a ring buffer sized to capacity, so a channel
 /// starts life holding exactly one block — 32 B of header plus
 /// `32 * size_of::<T>()` — and allocates another only per 32 records actually
-/// queued. All 15 channels of a fully-configured deployment come to ~50 KB at
+/// queued. All 17 channels of a fully-configured deployment come to ~50 KB at
 /// startup. Only Zeek and Suricata apply backpressure, so only those two are
 /// designed to dwell near capacity under sustained load.
 ///
@@ -163,10 +164,15 @@ pub const ZEEK_RECORD_BYTES: usize = 2560;
 /// not, and each nested object costs a BTreeMap node of its own.
 pub const SURICATA_RECORD_BYTES: usize = 4608;
 
-/// Measured heap footprint of one `GenericRecord` (HEC/NDJSON, OTLP): 1625
+/// Measured heap footprint of one `GenericRecord` (HEC/NDJSON): 1625
 /// bytes measured for a representative HEC event carrying the `event_uuid`,
 /// `source`, `index` and `indexed_fields` envelope columns, rounded up to 1792.
 pub const GENERIC_RECORD_BYTES: usize = 1792;
+
+/// Measured heap footprint of one `OtlpRecord` carrying a representative trace-correlated
+/// log line (8 resource attrs, 5 log attrs): 2257 bytes measured, rounded up to 2304.
+/// Most of it is the two JSON attribute maps' BTreeMap nodes.
+pub const OTLP_RECORD_BYTES: usize = 2304;
 
 /// Measured heap footprint of one `SyslogMessage`: 697 bytes measured for a
 /// representative RFC 5424 message with structured data, rounded up to 768.
@@ -458,6 +464,60 @@ mod tests {
             + record.index.as_ref().map_or(0, |s| s.capacity())
             + record.indexed_fields.as_ref().map_or(0, json_heap_bytes);
         assert_within_2x(measured, GENERIC_RECORD_BYTES, "GenericRecord");
+    }
+
+    #[test]
+    fn measured_otlp_record_bytes_matches_constant() {
+        use crate::forwarding::otlp_s3::OtlpRecord;
+        let s = |v: &str| Some(v.to_string());
+        let record = OtlpRecord {
+            event_uuid: Some(crate::ingest::new_event_uuid()),
+            time: Some(chrono::Utc::now()),
+            observed_time: Some(chrono::Utc::now()),
+            received_at: chrono::Utc::now(),
+            severity_number: Some(9),
+            severity_text: s("INFO"),
+            body: s("request 8812 completed successfully in 42ms"),
+            service_name: s("checkout-service"),
+            service_namespace: s("shop"),
+            service_instance_id: s("checkout-7d9f8b-xk2lp"),
+            host_name: s("node-17.example.com"),
+            peer_addr: s("10.42.7.19"),
+            trace_id: s("0af7651916cd43dd8448eb211c80319c"),
+            span_id: s("b7ad6b7169203331"),
+            flags: Some(1),
+            event_name: s("http.request.completed"),
+            scope_name: s("io.opentelemetry.instrumentation.http"),
+            scope_version: s("1.32.0"),
+            resource_attributes: serde_json::json!({
+                "service.name": "checkout-service", "service.namespace": "shop",
+                "service.instance.id": "checkout-7d9f8b-xk2lp", "host.name": "node-17.example.com",
+                "k8s.pod.name": "checkout-7d9f8b-xk2lp", "k8s.namespace.name": "prod",
+                "telemetry.sdk.language": "java", "telemetry.sdk.version": "1.32.0"
+            }),
+            attributes: serde_json::json!({
+                "http.method": "GET", "http.route": "/api/v1/cart", "http.status_code": 200,
+                "user.tier": "gold", "retry": false
+            }),
+        };
+        let cap = |o: &Option<String>| o.as_ref().map_or(0, |s| s.capacity());
+        let measured = std::mem::size_of::<OtlpRecord>()
+            + cap(&record.event_uuid)
+            + cap(&record.severity_text)
+            + cap(&record.body)
+            + cap(&record.service_name)
+            + cap(&record.service_namespace)
+            + cap(&record.service_instance_id)
+            + cap(&record.host_name)
+            + cap(&record.peer_addr)
+            + cap(&record.trace_id)
+            + cap(&record.span_id)
+            + cap(&record.event_name)
+            + cap(&record.scope_name)
+            + cap(&record.scope_version)
+            + json_heap_bytes(&record.resource_attributes)
+            + json_heap_bytes(&record.attributes);
+        assert_within_2x(measured, OTLP_RECORD_BYTES, "OtlpRecord");
     }
 
     #[test]
@@ -766,6 +826,7 @@ mod tests {
             ("zeek", ZEEK_RECORD_BYTES),
             ("suricata", SURICATA_RECORD_BYTES),
             ("generic", GENERIC_RECORD_BYTES),
+            ("otlp", OTLP_RECORD_BYTES),
             ("syslog", SYSLOG_MESSAGE_BYTES),
             ("sflow", SFLOW_RECORD_BYTES),
             ("ipfix", IPFIX_DATAGRAM_BYTES),

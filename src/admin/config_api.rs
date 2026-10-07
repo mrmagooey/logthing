@@ -90,6 +90,9 @@ pub fn redacted_config(cfg: &Config) -> Config {
     if let Some(ref mut s3) = out.hec.s3 {
         s3.connection = redact_s3_connection(&s3.connection);
     }
+    if let Some(ref mut s3) = out.otlp.s3 {
+        s3.connection = redact_s3_connection(&s3.connection);
+    }
     if let Some(ref mut s3) = out.sflow.s3 {
         s3.connection = redact_s3_connection(&s3.connection);
     }
@@ -276,14 +279,15 @@ mod tests {
         cfg.suricata.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
         cfg.wef.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
         cfg.hec.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
+        cfg.otlp.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
         cfg.sflow.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
         cfg.aggregate.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
         cfg.iceberg.s3 = Some(serde_json::from_value(conn).unwrap());
     }
 
     /// Every S3-bearing config section must be redacted, not just the three that
-    /// were originally covered. This test enumerates all ten so that adding an
-    /// eleventh section without redacting it fails here.
+    /// were originally covered. This test enumerates all eleven so that adding a
+    /// twelfth section without redacting it fails here.
     #[test]
     fn redacted_config_masks_every_s3_section() {
         const SENTINEL_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
@@ -303,5 +307,45 @@ mod tests {
             !json.contains(SENTINEL_SECRET),
             "a plaintext secret_key survived redaction: {json}"
         );
+    }
+
+    /// `[otlp.s3]` credentials must be masked in the admin config view/export, while the
+    /// non-secret connection fields and the `[otlp.local]` directory survive.
+    #[test]
+    fn redacted_config_masks_otlp_s3_credentials() {
+        let mut cfg = Config::default();
+        cfg.otlp.s3 = Some(
+            serde_json::from_value(serde_json::json!({
+                "endpoint": "http://minio:9000",
+                "bucket": "otlp-logs",
+                "region": "us-east-1",
+                "access_key": "REAL_OTLP_ACCESS",
+                "secret_key": "REAL_OTLP_SECRET",
+            }))
+            .unwrap(),
+        );
+        cfg.otlp.local = Some(
+            serde_json::from_value(serde_json::json!({"directory": "/var/lib/otlp"})).unwrap(),
+        );
+
+        let out = redacted_config(&cfg);
+        let s3 = out.otlp.s3.as_ref().expect("otlp.s3 present");
+        assert_eq!(s3.connection.access_key, REDACTED);
+        assert_eq!(s3.connection.secret_key, REDACTED);
+        assert_eq!(s3.connection.bucket, "otlp-logs");
+        assert_eq!(
+            out.otlp.local.as_ref().unwrap().directory,
+            std::path::PathBuf::from("/var/lib/otlp")
+        );
+
+        let json = serde_json::to_string(&out).unwrap();
+        let toml_str = toml::to_string(&out).unwrap();
+        for leaked in ["REAL_OTLP_ACCESS", "REAL_OTLP_SECRET"] {
+            assert!(!json.contains(leaked), "{leaked} leaked in JSON: {json}");
+            assert!(
+                !toml_str.contains(leaked),
+                "{leaked} leaked in TOML: {toml_str}"
+            );
+        }
     }
 }
