@@ -1918,6 +1918,9 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
         // Capture the source/target labels before `sink`/`s3` are moved into the task.
         let source = sink.source();
         let target = s3.target_label();
+        // With `[spool]` configured, S3 flushes go through the durable spool (no-op otherwise,
+        // and for local sinks).
+        let s3 = crate::forwarding::spool::wrap_for_writer(s3, descriptor_sink.clone(), source);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<S::Record>(capacity);
         // Clone the live-interval handle before `policy` is moved into the
         // writer below, so both the writer (flush-age comparisons) and this

@@ -1,6 +1,8 @@
 //! Shared helpers for tests that read the Parquet a local sink wrote.
 #![allow(dead_code)]
 
+pub mod fake_s3;
+
 use arrow::array::StringArray;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -60,6 +62,20 @@ pub async fn wait_for_rows(dir: &Path, min_rows: usize, timeout: Duration) -> Ve
             dir.display()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Poll `f` every 20 ms until it returns true or `deadline` elapses; returns the last result.
+pub async fn wait_until(deadline: Duration, mut f: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + deadline;
+    loop {
+        if f() {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 

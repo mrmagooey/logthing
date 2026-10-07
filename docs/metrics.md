@@ -60,6 +60,24 @@ Parquet persistence (labelled `source="wef"|"syslog"|"ipfix"|"zeek"|"suricata"|"
 Aggregation: `aggregate_records_consumed`, `aggregate_rows_emitted`, `aggregate_groups`,
 `aggregate_overflow_records`.
 
+Durable spool (only when `[spool]` is configured):
+
+- `spool_bytes`, `spool_entries` (gauges) - Parquet + descriptor bytes and complete entries
+  currently waiting for upload
+- `spool_unreadable` (gauge) - entries skipped at startup because a file could not be read
+  (EIO, permissions); left on disk, counted in `spool_bytes`, retried on the next start
+- `spool_rejected{reason=full|io}` - flushes the spool refused (cap reached / write failed);
+  they fell back to a direct upload and, if that failed, to the in-memory retry
+- `spool_uploaded{sink}` - entries delivered (Parquet then descriptor) and removed
+- `spool_upload_errors{sink}` - failed background upload attempts; the entry stays and is
+  retried with exponential backoff (1 s doubling to 60 s)
+- `spool_corrupt` - entries quarantined to `<spool dir>/corrupt/` (missing file, size or
+  sha256 mismatch, unknown meta version)
+
+Suggested alerts: `spool_entries > 0` for 15 minutes (S3 or the descriptor destination is
+unreachable), `increase(spool_rejected_total[5m]) > 0` (spool full or disk problem),
+`increase(spool_corrupt_total[1h]) > 0`.
+
 Listener health: `listener_accept_errors` (labelled `protocol="syslog_tcp"|"zeek"|"suricata"`)
 - TCP accept errors on that listener; a persistent condition (e.g. fd
   exhaustion) pauses that listener's accept loop for 1s per error instead of

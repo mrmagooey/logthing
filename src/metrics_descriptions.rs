@@ -422,6 +422,23 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
         "Flushes the spool refused (reason=full|io); they fell back to a direct upload.",
     ),
     (
+        Kind::Gauge,
+        "spool_unreadable",
+        "Spool entries skipped at startup because a file could not be read (EIO, permissions); \
+         left on disk, counted in spool_bytes, retried on the next start.",
+    ),
+    (
+        Kind::Counter,
+        "spool_uploaded",
+        "Spool entries delivered to S3 (Parquet and descriptor) and removed, labelled by sink.",
+    ),
+    (
+        Kind::Counter,
+        "spool_upload_errors",
+        "Failed background uploads of spool entries, labelled by sink; the entry stays and is \
+         retried with exponential backoff.",
+    ),
+    (
         Kind::Counter,
         "spool_corrupt",
         "Spool entries quarantined to corrupt/ at startup (missing file, size or sha256 \

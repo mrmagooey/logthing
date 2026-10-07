@@ -386,6 +386,11 @@ impl Server {
         ip_whitelist: IpWhitelist,
         wef_cardinality_watchers: Vec<Arc<CardinalityWatcher>>,
     ) -> anyhow::Result<Self> {
+        // Idempotent: `main` normally installed the spool already. The uploader is spawned
+        // by `main` once every writer has registered.
+        if let Some(cfg) = config.spool.as_ref() {
+            crate::forwarding::spool::init_global(cfg)?;
+        }
         #[cfg(feature = "kerberos-auth")]
         {
             if config.security.kerberos.enabled {
