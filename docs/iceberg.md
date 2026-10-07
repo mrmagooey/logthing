@@ -11,6 +11,11 @@ both `iceberg.s3` and `iceberg.local` simultaneously is a startup error —
 unlike other sources, the descriptor sink supports exactly one
 destination.
 
+The descriptor carries `sha256`, the lowercase-hex SHA-256 of the exact Parquet bytes
+that were uploaded, next to `file_size_in_bytes`. It is a corruption / consistency check
+only: it is stored beside the data it describes, so it is NOT tamper evidence. The bundled
+committer ignores fields it does not use, so it is unaffected.
+
 ## Suggested deployment pattern
 
 logthing only ever writes Parquet + descriptor files — it never talks to

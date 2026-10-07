@@ -28,6 +28,10 @@ Per-source ingest counters:
 - `syslog_messages_received`, `ipfix_datagrams_received`, `ipfix_flows_decoded`,
   `sflow_datagrams_received`, `suricata_records_received`, `hec_events_received`,
   `otlp_logs_received`
+- `redactions_applied{source,rule}` - values changed by `[hec.redaction]` /
+  `[otlp.redaction]`; `source` is `hec` or `otlp`, `rule` is `drop`, `hash`, `mask` or
+  `body_unparseable` (a JSON-looking OTLP body that could not be parsed was replaced
+  wholesale, fail closed). See [redaction.md](redaction.md)
 - `hec_events_dropped` - HEC/NDJSON records not enqueued: one per failed
   per-sink `try_send` (full or closed; with both an S3 and a local sink one record can
   count twice), plus the records of a request never
@@ -45,8 +49,13 @@ Per-source ingest counters:
 
 Parquet persistence (labelled `source="wef"|"syslog"|"ipfix"|"zeek"|"suricata"|"sflow"|"hec"|"otlp"`):
 
-- `parquet_s3_records_written`, `parquet_s3_uploads`, `parquet_s3_upload_errors`
+- `parquet_s3_records_written`, `parquet_s3_uploads`, `parquet_s3_upload_errors`.
+  `parquet_s3_records_written` counts rows that are durable, including rows only committed to
+  the spool (disposition `Spooled`, not yet in S3); `parquet_s3_uploads` counts direct
+  deliveries only, so with `[spool]` it stops tracking flushes (see `spool_uploaded`)
 - `parquet_s3_dropped`, `parquet_s3_buffer_dropped` - backpressure drops
+- `local_sink_dir_fsync_errors` - the local-disk sink wrote and renamed a file but the
+  directory fsync failed (the file is present; crash durability is not guaranteed)
 - `parquet_s3_records_skipped` - a record the writer could not convert into a
   batch (schema mismatch, a mapping failure, or an unparsed event), also
   labelled `target`
@@ -54,6 +63,25 @@ Parquet persistence (labelled `source="wef"|"syslog"|"ipfix"|"zeek"|"suricata"|"
 
 Aggregation: `aggregate_records_consumed`, `aggregate_rows_emitted`, `aggregate_groups`,
 `aggregate_overflow_records`.
+
+Durable spool (only when `[spool]` is configured):
+
+- `spool_bytes`, `spool_entries` (gauges) - Parquet + descriptor bytes and complete entries
+  currently waiting for upload
+- `spool_unreadable` (gauge) - entries skipped at startup because a file could not be read
+  (EIO, permissions); left on disk, counted in `spool_bytes`, retried on the next start
+- `spool_rejected{reason=full|io}` - flushes the spool refused (cap reached / write failed);
+  they fell back to a direct upload and, if that failed, to the in-memory retry
+- `spool_uploaded{sink}` - entries delivered (Parquet then descriptor) and removed
+- `spool_upload_errors{sink}` - failed background upload attempts; the entry stays and is
+  retried with exponential backoff (1 s doubling to 60 s)
+- `spool_corrupt` - entries quarantined to `<spool dir>/corrupt/` (missing file, size or
+  sha256 mismatch, unknown meta version), either at the startup scan or at upload time
+  (a file damaged while the process was running)
+
+Suggested alerts: `spool_entries > 0` for 15 minutes (S3 or the descriptor destination is
+unreachable), `increase(spool_rejected_total[5m]) > 0` (spool full or disk problem),
+`increase(spool_corrupt_total[1h]) > 0`.
 
 Listener health: `listener_accept_errors` (labelled `protocol="syslog_tcp"|"zeek"|"suricata"`)
 - TCP accept errors on that listener; a persistent condition (e.g. fd

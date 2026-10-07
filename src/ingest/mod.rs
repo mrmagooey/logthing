@@ -83,10 +83,10 @@ pub fn new_event_uuid() -> String {
 
 /// Give every record in `records` a fresh `event_uuid`.
 ///
-/// ORDERING CONTRACT: handlers call this as a SEPARATE step AFTER parsing/mapping and (in a
-/// later phase) after redaction, and BEFORE `try_send`. Redaction must therefore never see or
-/// depend on the id, and the id must never be derived from redacted-away content. Do not fold
-/// id generation into the parsers.
+/// ORDERING CONTRACT: handlers call this as a SEPARATE step AFTER parsing/mapping AND AFTER
+/// redaction (`IngestState::{hec,otlp}_redactor`), and BEFORE `try_send`. Redaction must
+/// therefore never see or depend on the id, and the id must never be derived from
+/// redacted-away content. Do not fold id generation into the parsers.
 pub fn assign_event_uuids<R: EventUuid>(records: &mut [R]) {
     for r in records.iter_mut() {
         r.set_event_uuid(new_event_uuid());
@@ -112,6 +112,10 @@ pub struct IngestState {
     /// OTLP local-disk handler. `None` when `[otlp.local]` is absent or construction failed.
     /// Independent of `otlp_s3`.
     pub otlp_local: Option<crate::forwarding::otlp_s3::OtlpHandler>,
+    /// Compiled `[hec.redaction]`; `None` when no rule is configured.
+    pub hec_redactor: Option<std::sync::Arc<crate::redaction::Redactor>>,
+    /// Compiled `[otlp.redaction]`; `None` when no rule is configured.
+    pub otlp_redactor: Option<std::sync::Arc<crate::redaction::Redactor>>,
 }
 
 /// Validate an `Authorization` header value against the configured HEC token.

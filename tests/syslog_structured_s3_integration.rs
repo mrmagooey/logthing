@@ -27,6 +27,8 @@ fn minio_cfg(endpoint: &str, prefix: &str) -> SyslogS3Config {
                 .unwrap_or_else(|_| "minioadmin".to_string()),
             secret_key: std::env::var("MINIO_SECRET_KEY")
                 .unwrap_or_else(|_| "minioadmin".to_string()),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         },
         prefix: prefix.to_string(),
         max_buffer_rows: 1, // flush on first record

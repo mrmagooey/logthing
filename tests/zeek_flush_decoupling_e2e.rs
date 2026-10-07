@@ -108,6 +108,8 @@ async fn zeek_tcp_ingest_does_not_drop_records_at_the_channel_during_a_slow_flus
             region: String::new(),
             access_key: String::new(),
             secret_key: String::new(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         },
         prefix: "zeek".to_string(),
         max_buffer_rows: 1,

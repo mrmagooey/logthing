@@ -134,6 +134,8 @@ async fn distinct_drop_sites_on_one_handle_do_not_mute_each_other() {
         region: "us-east-1".to_string(),
         access_key: "AKIATEST".to_string(),
         secret_key: "SECRETTEST".to_string(),
+        object_lock_mode: None,
+        object_lock_retain_days: None,
     };
     // `from_connection` only validates config shape; it never dials the
     // endpoint, so an unreachable address (127.0.0.1:1) is fine — nothing in

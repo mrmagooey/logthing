@@ -75,9 +75,13 @@ const MAX_CONCURRENT_EVENT_PROCESSING: usize = 16;
 ///
 /// - **Input-side / attacker ceiling: ~1 GiB.** `BudgetedBody` (below)
 ///   charges every request's ACTUAL streamed bytes as they arrive, so this
-///   is a hard ceiling on raw buffered-body bytes regardless of how many of
+///   is a hard ceiling on buffered-body bytes regardless of how many of
 ///   the 10,000 connection slots an attacker fills, what protocol version
-///   they use, or what headers they send (or omit). Payloads that are
+///   they use, or what headers they send (or omit). Gzip routes
+///   (HEC/NDJSON/OTLP, via `post_gzip`) are charged twice against the same
+///   budget and release scope: once for the wire bytes and again for the
+///   decoded bytes, so the budget bounds decompressed buffering too and a
+///   tiny gzip bomb cannot sidestep it. Payloads that are
 ///   never valid, parseable records — the attacker case — stay at this
 ///   scale, since they never reach the amplification below.
 /// - **Realistic legitimate peak: ~14 GiB, not 1 GiB.** The permit is held
@@ -386,6 +390,11 @@ impl Server {
         ip_whitelist: IpWhitelist,
         wef_cardinality_watchers: Vec<Arc<CardinalityWatcher>>,
     ) -> anyhow::Result<Self> {
+        // Idempotent: `main` normally installed the spool already. The uploader is spawned
+        // by `main` once every writer has registered.
+        if let Some(cfg) = config.spool.as_ref() {
+            crate::forwarding::spool::init_global(cfg)?;
+        }
         #[cfg(feature = "kerberos-auth")]
         {
             if config.security.kerberos.enabled {
@@ -641,11 +650,31 @@ impl Server {
             }
         }
 
+        // Same condition as config validation: rules in a disabled section are ignored.
+        let hec_redactor = if config.hec.enabled {
+            crate::redaction::Redactor::compile_optional(
+                &config.hec.redaction,
+                crate::redaction::RedactorKind::Hec,
+            )?
+        } else {
+            None
+        };
+        let otlp_redactor = if cfg!(feature = "otlp") && config.otlp.enabled {
+            crate::redaction::Redactor::compile_optional(
+                &config.otlp.redaction,
+                crate::redaction::RedactorKind::Otlp,
+            )?
+        } else {
+            None
+        };
+
         let ingest_state = IngestState {
             generic_s3: generic_s3_handler,
             generic_local: generic_local_handler,
             otlp_s3: otlp_s3_handler,
             otlp_local: otlp_local_handler,
+            hec_redactor,
+            otlp_redactor,
         };
 
         Ok(Self {
@@ -837,7 +866,8 @@ impl Server {
             .layer(axum::Extension(self.state.config.clone()))
             // For routes wrapped by `post_gzip` this limit applies to the DECOMPRESSED stream
             // (the `Bytes` extractor wraps whatever body the route hands it);
-            // `body_budget_middleware` below still charges WIRE bytes.
+            // `body_budget_middleware` below charges the WIRE bytes, and `post_gzip`
+            // routes charge the decoded bytes again against the same budget.
             .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE))
             .layer(middleware::from_fn_with_state(
                 body_budget,
@@ -4585,6 +4615,42 @@ event_parsers:
         }
 
         #[tokio::test]
+        async fn handle_otlp_logs_redacts_attributes_before_enqueue_and_before_uuid() {
+            let redactor = crate::redaction::Redactor::compile_with_env(
+                &crate::config::RedactionConfig {
+                    mask_patterns: vec!["e2e test message".to_string()],
+                    drop_fields: vec!["@peer_addr".to_string()],
+                    ..Default::default()
+                },
+                crate::redaction::RedactorKind::Otlp,
+                &|_| None,
+            )
+            .unwrap();
+            let (h, mut rx) = stalled_otlp_handle(16);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                otlp_redactor: Some(Arc::new(redactor)),
+                ..Default::default()
+            })
+            .await;
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(make_proto_request().encode_to_vec()))
+                    .unwrap(),
+            );
+            assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+            let rec = rx.recv().await.unwrap();
+            assert_eq!(rec.body.as_deref(), Some("[REDACTED]"));
+            assert_eq!(rec.peer_addr, None, "typed column dropped");
+            assert_eq!(rec.service_name.as_deref(), Some("test-svc"));
+            let id = rec.event_uuid.expect("uuid assigned after redaction");
+            assert_eq!(uuid::Uuid::parse_str(&id).unwrap().get_version_num(), 7);
+        }
+
+        #[tokio::test]
         async fn handle_otlp_logs_never_writes_to_hec_sinks() {
             // Regression for "OTLP rides [hec] sinks": the generic channel must stay empty.
             let (tx, mut generic_rx) = tokio::sync::mpsc::channel(16);
@@ -5658,12 +5724,20 @@ pub async fn handle_otlp_logs(
     let req: ExportLogsServiceRequest =
         if ct.starts_with("application/x-protobuf") || ct.starts_with("application/protobuf") {
             ExportLogsServiceRequest::decode(body.as_ref()).map_err(|e| {
+                // prost's message names fields/lengths only, never payload bytes.
                 warn!("OTLP protobuf decode error from {}: {e}", addr.ip());
                 StatusCode::BAD_REQUEST
             })?
         } else if ct.starts_with("application/json") {
             serde_json::from_slice::<ExportLogsServiceRequest>(&body).map_err(|e| {
-                warn!("OTLP JSON decode error from {}: {e}", addr.ip());
+                // serde messages can quote the offending value; log category and position only.
+                warn!(
+                    "OTLP JSON decode error from {}: {:?} error at line {} column {}",
+                    addr.ip(),
+                    e.classify(),
+                    e.line(),
+                    e.column()
+                );
                 StatusCode::BAD_REQUEST
             })?
         } else {
@@ -5674,8 +5748,13 @@ pub async fn handle_otlp_logs(
     // ── Map, assign ids, route to the OTLP sinks ─────────────────────────
     let source_host = addr.ip().to_string();
     let mut records = crate::server::otlp::map_otlp_request(req, source_host);
-    // ORDERING: identity is assigned AFTER mapping (and, in a later phase, after redaction),
-    // as its own step, never inside the mapper.
+    // ORDERING: redaction runs after mapping and BEFORE identity assignment, so unredacted
+    // values never reach a channel, the spool, or disk and the id never depends on them.
+    if let Some(r) = &ingest.otlp_redactor {
+        for rec in records.iter_mut() {
+            r.redact_otlp(rec);
+        }
+    }
     crate::ingest::assign_event_uuids(&mut records);
     let count = records.len() as u64;
     match dispatch_otlp_records(&ingest, records) {

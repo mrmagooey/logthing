@@ -60,6 +60,8 @@ fn test_config() -> (BufferedWriterConfig, FlushPolicy) {
             region: "us-east-1".to_string(),
             access_key: "K".to_string(),
             secret_key: "S".to_string(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         },
         prefix: "test".to_string(),
         max_buffer_rows: 1_000_000, // nothing flushes on its own; test flushes explicitly

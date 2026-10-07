@@ -771,6 +771,8 @@ mod tests {
             region: "us-east-1".to_string(),
             access_key: "KEY".to_string(),
             secret_key: "SECRET".to_string(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         };
         let s3 = Arc::new(S3Sink::from_connection(&conn).await.expect("constructs"));
         let cfg = SyslogS3Config {
@@ -810,6 +812,8 @@ mod tests {
                     region: "us-east-1".to_string(),
                     access_key: "K".to_string(),
                     secret_key: "S".to_string(),
+                    object_lock_mode: None,
+                    object_lock_retain_days: None,
                 },
             )
             .await
@@ -822,6 +826,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "K".to_string(),
                 secret_key: "S".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "structured_syslog".to_string(),
             max_buffer_rows: 1_000,

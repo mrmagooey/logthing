@@ -1,6 +1,8 @@
 //! Shared helpers for tests that read the Parquet a local sink wrote.
 #![allow(dead_code)]
 
+pub mod fake_s3;
+
 use arrow::array::StringArray;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -60,6 +62,20 @@ pub async fn wait_for_rows(dir: &Path, min_rows: usize, timeout: Duration) -> Ve
             dir.display()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Poll `f` every 20 ms until it returns true or `deadline` elapses; returns the last result.
+pub async fn wait_until(deadline: Duration, mut f: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + deadline;
+    loop {
+        if f() {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -130,15 +146,25 @@ pub fn run_to_exit(
 pub struct Proc {
     child: Child,
     pub http_port: u16,
-    pub dir: tempfile::TempDir,
+    dir: Option<tempfile::TempDir>,
 }
 
 impl Proc {
     /// Spawn the binary. `toml` may contain the placeholders `{HTTP}` and `{DIR}`, replaced by
     /// the chosen HTTP port and the process temp dir (sinks should live under `{DIR}`).
     pub fn spawn(bin: &str, toml: &str, envs: &[(&str, &str)]) -> Proc {
-        let dir = tempfile::tempdir().unwrap();
-        let http_port = free_port();
+        Self::spawn_in(bin, toml, envs, tempfile::tempdir().unwrap(), free_port())
+    }
+
+    /// [`Proc::spawn`] in an existing directory (e.g. one handed over by [`Proc::into_dir`]),
+    /// so a restarted process sees the first process's files, spool included.
+    pub fn spawn_in(
+        bin: &str,
+        toml: &str,
+        envs: &[(&str, &str)],
+        dir: tempfile::TempDir,
+        http_port: u16,
+    ) -> Proc {
         let toml = toml
             .replace("{HTTP}", &http_port.to_string())
             .replace("{DIR}", &dir.path().display().to_string());
@@ -159,7 +185,45 @@ impl Proc {
         Proc {
             child,
             http_port,
-            dir,
+            dir: Some(dir),
+        }
+    }
+
+    /// The process temp dir.
+    pub fn dir(&self) -> &Path {
+        self.dir.as_ref().expect("dir taken").path()
+    }
+
+    /// Hand the temp dir to the caller (for a restart). Kills and reaps the child first
+    /// unless it has already exited.
+    pub fn into_dir(mut self) -> tempfile::TempDir {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        self.dir.take().expect("dir taken")
+    }
+
+    /// Send SIGTERM (`kill -TERM <pid>`, as `sigterm_graceful_shutdown_e2e` does) and wait up
+    /// to `timeout` for a graceful exit; panics with the logs on timeout.
+    pub fn terminate(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let pid = self.child.id();
+        let st = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .expect("run kill(1)");
+        assert!(st.success(), "kill -TERM {pid} failed");
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(st) = self.child.try_wait().expect("try_wait") {
+                return st;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "logthing {pid} did not exit within {timeout:?} of SIGTERM:\n{}",
+                self.logs()
+            );
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -191,7 +255,7 @@ impl Proc {
 
     /// stdout+stderr captured so far.
     pub fn logs(&self) -> String {
-        let read = |n: &str| std::fs::read_to_string(self.dir.path().join(n)).unwrap_or_default();
+        let read = |n: &str| std::fs::read_to_string(self.dir().join(n)).unwrap_or_default();
         format!(
             "--- stdout ---\n{}\n--- stderr ---\n{}",
             read("stdout.log"),

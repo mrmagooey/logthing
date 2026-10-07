@@ -137,6 +137,8 @@ async fn records_pushed_during_a_slow_flush_are_not_dropped_at_the_channel() {
             region: String::new(),
             access_key: String::new(),
             secret_key: String::new(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         },
         prefix: "zeek".to_string(),
         max_buffer_rows: 1, // flush on every single push
@@ -305,6 +307,8 @@ async fn flush_task_panic_during_steady_state_logs_source_and_target() {
             region: String::new(),
             access_key: String::new(),
             secret_key: String::new(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         },
         prefix: "zeek".to_string(),
         max_buffer_rows: 1, // flush on every push
@@ -379,6 +383,8 @@ async fn channel_and_buffer_gauges_appear_after_a_tick() {
             region: String::new(),
             access_key: String::new(),
             secret_key: String::new(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         },
         prefix: "zeek".to_string(),
         max_buffer_rows: 1_000_000, // nothing flushes on its own during this test

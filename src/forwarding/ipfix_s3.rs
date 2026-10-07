@@ -583,6 +583,8 @@ mod tests {
             region: "us-east-1".to_string(),
             access_key: "AKIATEST".to_string(),
             secret_key: "SECRETTEST".to_string(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         };
         Arc::new(S3Sink::from_connection(&conn).await.expect("constructs"))
     }
@@ -1145,6 +1147,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "AKIATEST".to_string(),
                 secret_key: "SECRETTEST".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "ipfix".to_string(),
             max_buffer_rows: max_rows,
@@ -1203,6 +1207,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "AKIATEST".to_string(),
                 secret_key: "SECRETTEST".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "ipfix".to_string(),
             flush_threshold_bytes: 1, // flush on every push so background task stalls on S3
@@ -1291,6 +1297,8 @@ mod tests {
                     region: "us-east-1".to_string(),
                     access_key: "AKIATEST".to_string(),
                     secret_key: "SECRETTEST".to_string(),
+                    object_lock_mode: None,
+                    object_lock_retain_days: None,
                 },
                 prefix: "ipfix".to_string(),
                 flush_threshold_bytes: 1, // flush on every push so background task stalls on S3
@@ -1355,6 +1363,8 @@ mod tests {
                     region: "us-east-1".to_string(),
                     access_key: "AKIATEST".to_string(),
                     secret_key: "SECRETTEST".to_string(),
+                    object_lock_mode: None,
+                    object_lock_retain_days: None,
                 },
                 prefix: "ipfix".to_string(),
                 flush_threshold_bytes: usize::MAX, // prevent flush so channel never stalls
@@ -1424,6 +1434,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "minioadmin".to_string(),
                 secret_key: "minioadmin".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "ipfix".to_string(),
             flush_threshold_bytes: 1, // force immediate flush
@@ -1533,6 +1545,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "K".to_string(),
                 secret_key: "S".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "ipfix".to_string(),
             max_buffer_rows: 1_000,
@@ -1853,6 +1867,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "AKIATEST".to_string(),
                 secret_key: "SECRETTEST".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "ipfix".to_string(),
             flush_threshold_bytes: 1,

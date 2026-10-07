@@ -326,3 +326,31 @@ bind_address = "0.0.0.0"   # env: LOGTHING__SFLOW__BIND_ADDRESS
 # max_service_partitions = 64
 # [otlp.local]
 # directory = "/data/otlp"
+#
+# Redaction (HEC and OTLP only; off by default). See docs/redaction.md.
+# hash_fields needs hash_key_env, the NAME of an environment variable holding an HMAC key
+# (>= 16 bytes); startup fails if it is unset.
+# [hec.redaction]
+# drop_fields = ["password", "headers.authorization"]
+# hash_fields = ["user.email"]
+# hash_key_env = "LOGTHING_HASH_KEY"
+# mask_patterns = ['\d{3}-\d{2}-\d{4}']
+# [otlp.redaction]
+# drop_fields = ["@peer_addr"]
+#
+# Durable on-disk spool in front of every S3 sink (off by default). The directory must be
+# dedicated to logthing. See docs/delivery-semantics.md.
+# [spool]
+# dir = "/var/lib/logthing/spool"
+# max_bytes = 10737418240
+#
+# S3 Object Lock (any S3 sink; the bucket must be created with Object Lock enabled; not
+# supported by Garage). See docs/object-lock.md.
+# [hec.s3]
+# endpoint = "https://s3.ap-southeast-2.amazonaws.com"
+# bucket = "logs-locked"
+# region = "ap-southeast-2"
+# access_key = "..."
+# secret_key = "..."
+# object_lock_mode = "GOVERNANCE"   # or "COMPLIANCE"
+# object_lock_retain_days = 365

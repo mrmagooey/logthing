@@ -150,6 +150,8 @@ async fn zeek_tcp_client_is_backpressured_rather_than_dropped() {
             region: String::new(),
             access_key: String::new(),
             secret_key: String::new(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         },
         prefix: "zeek".to_string(),
         max_buffer_rows: 100_000,

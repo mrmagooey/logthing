@@ -65,6 +65,13 @@ de-duplicated). Size the channel with `channel_capacity` in `[hec.s3]`/`[hec.loc
 `hec_events_dropped` counts records that were not enqueued. A closed channel (writer gone) is
 still answered 200 with a counted drop, since a retry cannot help.
 
+## Redaction
+
+Optional `[hec.redaction]` rules drop, HMAC-hash or mask values in `fields` after parsing and
+before the record gets its `event_uuid` and is enqueued, on `/services/collector/event`,
+`/services/collector/raw` (where the body is `fields.raw`) and `/ingest`. See
+[redaction.md](redaction.md).
+
 ## Migration
 
 Nothing to change in `[hec]` unless it relied on having no sink: that now fails startup. Add

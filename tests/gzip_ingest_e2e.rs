@@ -82,7 +82,7 @@ async fn gzip_hec_event_and_ndjson_are_decoded_and_persisted() {
         .unwrap();
     assert_eq!(r.status(), 200);
 
-    let dir = p.dir.path().join("out").join("hec");
+    let dir = p.dir().join("out").join("hec");
     let batches = common::wait_for_rows(&dir, 3, Duration::from_secs(20)).await;
     let all = column_values(&batches, "fields").join("\n");
     for m in ["gzip-hec-event", "gzip-ndjson-1", "gzip-ndjson-2"] {
@@ -143,7 +143,7 @@ async fn gzip_otlp_protobuf_and_json_are_decoded_and_persisted() {
         .unwrap();
     assert_eq!(json.status(), 200);
 
-    let dir = p.dir.path().join("out").join("otlp");
+    let dir = p.dir().join("out").join("otlp");
     let batches = common::wait_for_rows(&dir, 2, Duration::from_secs(20)).await;
     let mut bodies = column_values(&batches, "body");
     bodies.sort();

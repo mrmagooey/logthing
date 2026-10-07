@@ -733,6 +733,8 @@ mod tests {
             region: "us-east-1".to_string(),
             access_key: "K".to_string(),
             secret_key: "S".to_string(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         };
         let s3 = Arc::new(S3Sink::from_connection(&conn).await.unwrap());
         let bwc = BufferedWriterConfig {

@@ -24,6 +24,7 @@ This document explains how automated or semi-automated agents should interact wi
 | Fuzz (nightly) | `scripts/fuzz.sh <target|all> [secs]` |
 | Committer tests | `committer/.venv/bin/pytest committer/tests --ignore=committer/tests/e2e` |
 | Committer E2E test | `committer/tests/e2e/run.sh` (requires Docker) |
+| Object Lock integration test | `MINIO_ENDPOINT=http://host:9000 [MINIO_ACCESS_KEY=.. MINIO_SECRET_KEY=..] cargo test --test object_lock_integration` (skips when `MINIO_ENDPOINT` is unset) |
 | Analytics unit tests | `deploy/analytics/.venv/bin/pytest -c deploy/analytics/tests/pytest.ini deploy/analytics/tests/unit` |
 | Analytics integration test | `deploy/analytics/.venv/bin/pytest -c deploy/analytics/tests/pytest.ini deploy/analytics/tests/integration -m integration` (requires Docker; Trino tests need AVX2 or `TRINO_IMAGE`) |
 | Analytics E2E (compose) | `deploy/analytics/tests/e2e/compose.sh` (requires Docker + AVX2 CPU, or `TRINO_IMAGE=trinodb/trino:470`) |
@@ -142,6 +143,7 @@ src/
   models/       # Data structures
   parser/       # Event parsing logic
   protocol/     # WEF protocol handlers
+  redaction/    # HEC/OTLP drop/hash/mask rules
   server/       # HTTP server implementation (OTLP handler + mapper in otlp.rs)
   stats/        # Metrics and statistics
   syslog/       # Syslog listener
@@ -150,6 +152,8 @@ committer/  # Python Iceberg committer (separate image)
 deploy/analytics/  # Compose + Helm analytics stack (Garage, Lakekeeper, Trino, Metabase)
 deploy/analytics/dbt/  # dbt-trino project: staging, OCSF views, detection analyses
 ```
+
+Delivery guarantees per source (spool, shutdown, fsync) are documented in `docs/delivery-semantics.md`.
 
 Note: `src/lib.rs` is the crate's module root (the crate is both a library and a binary); `src/main.rs` is the binary entry point only.
 

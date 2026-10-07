@@ -50,6 +50,12 @@ enqueued prefix with different `event_uuid`s. `otlp_events_dropped` counts recor
 not enqueued; `otlp_logs_received` counts only enqueued records. A closed channel (writer gone)
 is still answered 200 with a counted drop. WEF is unchanged (200 and a counted drop).
 
+## Redaction
+
+Optional `[otlp.redaction]` rules drop, HMAC-hash or mask attribute values, and (with `@body`,
+`@host_name`, `@peer_addr`) typed columns, after mapping and before `event_uuid` assignment and
+enqueue. See [redaction.md](redaction.md).
+
 ## Columns
 
 One Iceberg table `otlp` (all services), partitioned by `day(partition_time)`.

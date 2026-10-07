@@ -106,6 +106,8 @@ async fn flush_count_tracks_real_bytes_not_batch_count() {
             region: String::new(),
             access_key: String::new(),
             secret_key: String::new(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         },
         prefix: "test".to_string(),
         max_buffer_rows: 1_000_000, // hard cap must never be the thing that fires here
@@ -209,6 +211,8 @@ async fn buffer_dropped_stays_zero_under_real_byte_accounting() {
             region: String::new(),
             access_key: String::new(),
             secret_key: String::new(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         },
         prefix: "test".to_string(),
         max_buffer_rows: 1_000_000,

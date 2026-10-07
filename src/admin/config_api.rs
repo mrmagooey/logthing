@@ -31,6 +31,8 @@ fn redact_s3_connection(conn: &S3ConnectionConfig) -> S3ConnectionConfig {
         region: conn.region.clone(),
         access_key: REDACTED.to_string(),
         secret_key: REDACTED.to_string(),
+        object_lock_mode: conn.object_lock_mode,
+        object_lock_retain_days: conn.object_lock_retain_days,
     }
 }
 
@@ -137,6 +139,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "REAL_ACCESS_KEY".to_string(),
                 secret_key: "REAL_SECRET_KEY".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "syslog".to_string(),
             max_buffer_rows: 10_000,
@@ -209,6 +213,17 @@ mod tests {
     // A3: redacted_config (what GET /config, /config/export, and
     // /config/reload all return) must mask the three ingest shared-secret
     // tokens the same way it masks S3 credentials.
+    #[test]
+    fn redacted_config_keeps_hash_key_env_name_and_masks_nothing_else_in_redaction() {
+        let mut cfg = Config::default();
+        cfg.hec.redaction.hash_key_env = Some("LOGTHING_HASH_KEY".to_string());
+        cfg.hec.redaction.hash_fields = vec!["email".to_string()];
+        let out = redacted_config(&cfg);
+        assert_eq!(out.hec.redaction, cfg.hec.redaction);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.contains("LOGTHING_HASH_KEY"));
+    }
+
     #[test]
     fn redacted_config_masks_ingest_tokens() {
         let mut cfg = Config::default();
@@ -347,5 +362,24 @@ mod tests {
                 "{leaked} leaked in TOML: {toml_str}"
             );
         }
+    }
+
+    #[test]
+    fn redacted_config_preserves_object_lock_settings() {
+        use crate::config::{HecS3Config, ObjectLockMode};
+        let mut cfg = Config::default();
+        let mut s3: HecS3Config = toml::from_str(
+            "endpoint=\"http://m\"\nbucket=\"b\"\nregion=\"r\"\n\
+             access_key=\"REAL_AK\"\nsecret_key=\"REAL_SK\"\n",
+        )
+        .unwrap();
+        s3.connection.object_lock_mode = Some(ObjectLockMode::Governance);
+        s3.connection.object_lock_retain_days = Some(365);
+        cfg.hec.s3 = Some(s3);
+        let c = redacted_config(&cfg).hec.s3.unwrap().connection;
+        assert_eq!(c.object_lock_mode, Some(ObjectLockMode::Governance));
+        assert_eq!(c.object_lock_retain_days, Some(365));
+        assert_eq!(c.access_key, REDACTED);
+        assert_eq!(c.secret_key, REDACTED);
     }
 }

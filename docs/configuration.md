@@ -89,6 +89,48 @@ syslog's bind address is fixed at `0.0.0.0` and has no such override.
 table. Environment overrides are validated the same way: `LOGTHING__HEC__ENABLED=true` with no
 HEC sink configured also fails startup. See [hec.md](hec.md) and [otlp.md](otlp.md).
 
+## Shared S3 connection keys
+
+Every `[<source>.s3]` table (syslog, ipfix, zeek, suricata, wef, hec, otlp, sflow, aggregate,
+iceberg) shares these keys:
+
+| Key | Meaning |
+|-----|---------|
+| `endpoint`, `bucket`, `region` | Target object store |
+| `access_key`, `secret_key` | Credentials (masked in the admin API) |
+| `object_lock_mode` | Optional `"GOVERNANCE"` or `"COMPLIANCE"`; any other string fails startup |
+| `object_lock_retain_days` | Retention in days (1-36500); set together with `object_lock_mode` |
+
+The Object Lock keys also work as environment overrides (`LOGTHING__HEC__S3__OBJECT_LOCK_MODE`,
+`...OBJECT_LOCK_RETAIN_DAYS`). See [object-lock.md](object-lock.md).
+
+## Spool
+
+`[spool]` persists every S3 flush to local disk before it is uploaded, so an S3 outage or a
+restart no longer loses flushed data. Off by default.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `dir` | path | required | Spool directory. Created if missing. Must be **dedicated**: startup deletes unmarked `*.tmp`, `*.parquet` and `*.json` files in it. |
+| `max_bytes` | integer | 1 GiB | Cap on spooled bytes; must be > 0. Beyond it flushes fall back to a direct upload. |
+
+Semantics, limits and metrics are in [delivery-semantics.md](delivery-semantics.md).
+
+## Redaction
+
+`[hec.redaction]` and `[otlp.redaction]` drop, HMAC-hash or mask values before records are
+enqueued (off by default). Both tables take the same keys; full semantics, key rotation and
+erasure procedure are in [redaction.md](redaction.md).
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `drop_fields` | list of paths | `[]` | Remove these paths (OTLP also `@body`, `@host_name`, `@peer_addr`). |
+| `hash_fields` | list of paths | `[]` | Replace with lowercase-hex HMAC-SHA256. Needs `hash_key_env`. |
+| `hash_key_env` | string | unset | NAME of the environment variable holding the HMAC key (16+ bytes). |
+| `mask_patterns` | list of regexes | `[]` | Matches inside string values become `[REDACTED]`. |
+
+Invalid rules fail startup, but only for sections that are enabled.
+
 ## Running
 
 ```bash

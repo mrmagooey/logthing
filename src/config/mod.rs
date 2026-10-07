@@ -13,6 +13,48 @@ pub struct S3ConnectionConfig {
     pub region: String,
     pub access_key: String,
     pub secret_key: String,
+    /// S3 Object Lock retention mode applied to every uploaded object. Requires
+    /// `object_lock_retain_days`. The bucket must have Object Lock enabled; startup does not
+    /// probe (a mismatch surfaces as upload errors). See `docs/object-lock.md`.
+    #[serde(default)]
+    pub object_lock_mode: Option<ObjectLockMode>,
+    /// Retention period in days (1..=36500) for `object_lock_mode`.
+    #[serde(default, deserialize_with = "de_u32_or_string")]
+    pub object_lock_retain_days: Option<u32>,
+}
+
+/// Accepts a number or a numeric string. serde's `flatten` buffers environment-variable values
+/// as strings, so `LOGTHING__<SECTION>__S3__OBJECT_LOCK_RETAIN_DAYS=45` needs this to load.
+fn de_u32_or_string<'de, D>(d: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        N(u32),
+        S(String),
+    }
+    match Option::<NumOrStr>::deserialize(d)? {
+        None => Ok(None),
+        Some(NumOrStr::N(n)) => Ok(Some(n)),
+        Some(NumOrStr::S(s)) => s.trim().parse::<u32>().map(Some).map_err(|e| {
+            serde::de::Error::custom(format!(
+                "object_lock_retain_days must be a whole number of days, got {s:?}: {e}"
+            ))
+        }),
+    }
+}
+
+/// S3 Object Lock retention mode (`object_lock_mode`). Only the two S3 values are accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum ObjectLockMode {
+    /// Retention can be bypassed by principals with `s3:BypassGovernanceRetention`.
+    #[serde(rename = "GOVERNANCE")]
+    Governance,
+    /// Retention cannot be shortened or removed by anyone until it expires.
+    #[serde(rename = "COMPLIANCE")]
+    Compliance,
 }
 
 /// Manual Debug impl for S3ConnectionConfig that masks secret fields so they
@@ -25,6 +67,8 @@ impl std::fmt::Debug for S3ConnectionConfig {
             .field("region", &self.region)
             .field("access_key", &"<redacted>")
             .field("secret_key", &"<redacted>")
+            .field("object_lock_mode", &self.object_lock_mode)
+            .field("object_lock_retain_days", &self.object_lock_retain_days)
             .finish()
     }
 }
@@ -72,6 +116,10 @@ pub struct Config {
 
     #[serde(default)]
     pub iceberg: IcebergConfig,
+
+    /// Optional durable spool for S3 uploads (`[spool]`).
+    #[serde(default)]
+    pub spool: Option<SpoolConfig>,
 
     #[serde(default)]
     pub aggregate: AggregateConfig,
@@ -877,6 +925,32 @@ pub struct GenericLocalConfig {
     pub max_buffer_rows: usize,
 }
 
+/// Redaction rules for one ingest surface (`[hec.redaction]` / `[otlp.redaction]`).
+/// See `docs/redaction.md` for exact semantics.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct RedactionConfig {
+    /// Dotted paths removed from the record (OTLP: `@body`, `@host_name`, `@peer_addr` address
+    /// typed columns).
+    #[serde(default)]
+    pub drop_fields: Vec<String>,
+    /// Dotted paths replaced by the lowercase-hex HMAC-SHA256 of the value.
+    #[serde(default)]
+    pub hash_fields: Vec<String>,
+    /// NAME of the environment variable holding the HMAC key (not the key itself).
+    #[serde(default)]
+    pub hash_key_env: Option<String>,
+    /// Regexes applied to every string leaf; each match becomes `[REDACTED]`.
+    #[serde(default)]
+    pub mask_patterns: Vec<String>,
+}
+
+impl RedactionConfig {
+    /// True when no rule is configured (redaction is then skipped entirely).
+    pub fn is_empty(&self) -> bool {
+        self.drop_fields.is_empty() && self.hash_fields.is_empty() && self.mask_patterns.is_empty()
+    }
+}
+
 /// Top-level `[hec]` config section.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct HecConfig {
@@ -905,6 +979,9 @@ pub struct HecConfig {
     /// case records are written to both.
     #[serde(default)]
     pub local: Option<GenericLocalConfig>,
+    /// Redaction rules (`[hec.redaction]`), applied after parse and before enqueue.
+    #[serde(default)]
+    pub redaction: RedactionConfig,
 }
 
 fn default_hec_enabled() -> bool {
@@ -922,6 +999,7 @@ impl Default for HecConfig {
             max_sourcetype_partitions: default_hec_max_sourcetype_partitions(),
             s3: None,
             local: None,
+            redaction: RedactionConfig::default(),
         }
     }
 }
@@ -1017,6 +1095,9 @@ pub struct OtlpConfig {
     /// Optional local-disk persistence (`[otlp.local]`). Independent of `s3`.
     #[serde(default)]
     pub local: Option<OtlpLocalConfig>,
+    /// Redaction rules (`[otlp.redaction]`), applied after mapping and before enqueue.
+    #[serde(default)]
+    pub redaction: RedactionConfig,
 }
 
 fn default_otlp_enabled() -> bool {
@@ -1031,8 +1112,24 @@ impl Default for OtlpConfig {
             max_service_partitions: default_otlp_max_service_partitions(),
             s3: None,
             local: None,
+            redaction: RedactionConfig::default(),
         }
     }
+}
+
+/// Global durable spool for S3 uploads (`[spool]`). See `docs/delivery-semantics.md`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct SpoolConfig {
+    /// Directory holding spooled Parquet files and descriptors (created if missing).
+    pub dir: PathBuf,
+    /// Upper bound on spooled bytes (Parquet + descriptors); beyond it flushes fall back to
+    /// the in-memory retry path. Default 1 GiB.
+    #[serde(default = "default_spool_max_bytes")]
+    pub max_bytes: u64,
+}
+
+fn default_spool_max_bytes() -> u64 {
+    1024 * 1024 * 1024
 }
 
 /// Top-level `[iceberg]` config section — emits a small JSON "descriptor"
@@ -1629,6 +1726,7 @@ impl Default for Config {
             hec: HecConfig::default(),
             otlp: OtlpConfig::default(),
             iceberg: IcebergConfig::default(),
+            spool: None,
             aggregate: AggregateConfig::default(),
         }
     }
@@ -1750,6 +1848,46 @@ fn default_syslog_recv_batch_size() -> usize {
 }
 
 impl Config {
+    /// Every configured shared S3 connection, labelled by its TOML section
+    /// (e.g. `"hec.s3"`), for cross-cutting validation.
+    pub fn s3_connections(&self) -> Vec<(&'static str, &S3ConnectionConfig)> {
+        let mut v: Vec<(&'static str, &S3ConnectionConfig)> = Vec::new();
+        if let Some(s) = &self.syslog.s3 {
+            v.push(("syslog.s3", &s.connection));
+        }
+        if let Some(s) = &self.syslog.structured_s3 {
+            v.push(("syslog.structured_s3", &s.connection));
+        }
+        if let Some(s) = &self.ipfix.s3 {
+            v.push(("ipfix.s3", &s.connection));
+        }
+        if let Some(s) = &self.zeek.s3 {
+            v.push(("zeek.s3", &s.connection));
+        }
+        if let Some(s) = &self.suricata.s3 {
+            v.push(("suricata.s3", &s.connection));
+        }
+        if let Some(s) = &self.wef.s3 {
+            v.push(("wef.s3", &s.connection));
+        }
+        if let Some(s) = &self.hec.s3 {
+            v.push(("hec.s3", &s.connection));
+        }
+        if let Some(s) = &self.otlp.s3 {
+            v.push(("otlp.s3", &s.connection));
+        }
+        if let Some(s) = &self.sflow.s3 {
+            v.push(("sflow.s3", &s.connection));
+        }
+        if let Some(s) = &self.aggregate.s3 {
+            v.push(("aggregate.s3", &s.connection));
+        }
+        if let Some(s) = &self.iceberg.s3 {
+            v.push(("iceberg.s3", &s.connection));
+        }
+        v
+    }
+
     /// Load configuration from files and environment variables.
     ///
     /// Configuration is loaded from the following sources (in order of precedence):
@@ -1860,6 +1998,15 @@ pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
         errors.push(format!("security.allowed_ips: {err}"));
     }
 
+    if let Some(spool) = &cfg.spool {
+        if spool.dir.as_os_str().is_empty() {
+            errors.push("spool.dir must not be empty".to_string());
+        }
+        if spool.max_bytes == 0 {
+            errors.push("spool.max_bytes must be greater than 0".to_string());
+        }
+    }
+
     // HEC/OTLP accept data over HTTP and answer 200; with no sink every record would be
     // silently discarded. Fail loudly at startup instead.
     if cfg.hec.enabled && cfg.hec.s3.is_none() && cfg.hec.local.is_none() {
@@ -1884,6 +2031,40 @@ pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
                  mint unbounded service partitions)"
                     .to_string(),
             );
+        }
+    }
+
+    if cfg.hec.enabled
+        && let Err(e) = crate::redaction::Redactor::compile_optional(
+            &cfg.hec.redaction,
+            crate::redaction::RedactorKind::Hec,
+        )
+    {
+        errors.push(format!("{e:#}"));
+    }
+    if cfg!(feature = "otlp")
+        && cfg.otlp.enabled
+        && let Err(e) = crate::redaction::Redactor::compile_optional(
+            &cfg.otlp.redaction,
+            crate::redaction::RedactorKind::Otlp,
+        )
+    {
+        errors.push(format!("{e:#}"));
+    }
+
+    for (name, conn) in cfg.s3_connections() {
+        match (conn.object_lock_mode, conn.object_lock_retain_days) {
+            (Some(_), None) => errors.push(format!(
+                "{name}: object_lock_mode requires object_lock_retain_days"
+            )),
+            (None, Some(_)) => errors.push(format!(
+                "{name}: object_lock_retain_days requires object_lock_mode \
+                 (GOVERNANCE or COMPLIANCE)"
+            )),
+            (Some(_), Some(d)) if d == 0 || d > 36_500 => errors.push(format!(
+                "{name}: object_lock_retain_days must be between 1 and 36500, got {d}"
+            )),
+            _ => {}
         }
     }
 
@@ -2448,7 +2629,34 @@ max_buffer_rows = 50000
     }
 
     #[test]
+    fn spool_section_parses_with_default_max_bytes() {
+        let cfg: Config = toml::from_str("[spool]\ndir = \"/var/spool/lt\"\n").unwrap();
+        let spool = cfg.spool.expect("spool section");
+        assert_eq!(spool.dir, PathBuf::from("/var/spool/lt"));
+        assert_eq!(spool.max_bytes, 1024 * 1024 * 1024);
+        assert!(Config::default().spool.is_none());
+    }
+
+    #[test]
+    fn validate_config_invariants_rejects_spool_zero_max_bytes() {
+        let cfg: Config = toml::from_str("[spool]\ndir = \"/x\"\nmax_bytes = 0\n").unwrap();
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert!(err.contains("spool.max_bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_config_invariants_rejects_empty_spool_dir() {
+        let cfg: Config = toml::from_str("[spool]\ndir = \"\"\n").unwrap();
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert!(err.contains("spool.dir"), "got: {err}");
+    }
+
+    #[test]
     fn env_vars_override_bind_ports_for_all_log_types() {
+        // Serialise with the other env-var-driven load tests (they set LOGTHING__* too).
+        let _guard = CONFIG_FILE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // `LOGTHING__<SECTION>__<FIELD>` env vars are process-global, and cargo
         // runs unit tests in this file's binary on multiple threads by
         // default. No other test in this file (or reachable from this test
@@ -2685,6 +2893,8 @@ directory = "/data/suricata"
             region: "us-east-1".to_string(),
             access_key: "SUPERSECRETKEY".to_string(),
             secret_key: "TOPSECRETPASSWORD".to_string(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         };
         let debug_str = format!("{:?}", cfg);
         assert!(
@@ -3041,6 +3251,8 @@ prefix    = "_iceberg_descriptors"
                     region: "us-east-1".to_string(),
                     access_key: "k".to_string(),
                     secret_key: "s".to_string(),
+                    object_lock_mode: None,
+                    object_lock_retain_days: None,
                 },
                 prefix: String::new(),
             }),
@@ -3064,6 +3276,8 @@ prefix    = "_iceberg_descriptors"
                     region: "us-east-1".to_string(),
                     access_key: "k".to_string(),
                     secret_key: "s".to_string(),
+                    object_lock_mode: None,
+                    object_lock_retain_days: None,
                 },
                 prefix: String::new(),
             }),
@@ -3146,6 +3360,9 @@ prefix    = "_iceberg_descriptors"
 
     #[test]
     fn env_vars_override_iceberg_s3_config() {
+        let _guard = CONFIG_FILE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let vars: &[(&str, &str)] = &[
             ("LOGTHING__ICEBERG__S3__ENDPOINT", "http://minio-test:9000"),
             ("LOGTHING__ICEBERG__S3__BUCKET", "env-override-bucket"),
@@ -3466,6 +3683,49 @@ directory = "/tmp/otlp"
     }
 
     #[test]
+    fn validate_config_invariants_rejects_bad_redaction_regex_when_hec_enabled() {
+        let mut cfg = valid_base();
+        cfg.hec.enabled = true;
+        cfg.hec.local = sink_dir();
+        cfg.hec.redaction.mask_patterns = vec!["(".to_string()];
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert!(err.contains("hec.redaction"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_config_invariants_rejects_hash_fields_without_key_env_var() {
+        let mut cfg = valid_base();
+        cfg.hec.enabled = true;
+        cfg.hec.local = sink_dir();
+        cfg.hec.redaction.hash_fields = vec!["email".to_string()];
+        cfg.hec.redaction.hash_key_env = Some("LOGTHING_TEST_SURELY_UNSET_KEY".to_string());
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert!(err.contains("LOGTHING_TEST_SURELY_UNSET_KEY"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_config_invariants_ignores_redaction_when_hec_disabled() {
+        let mut cfg = valid_base();
+        cfg.hec.redaction.mask_patterns = vec!["(".to_string()];
+        assert_eq!(validate_config_invariants(&cfg), Ok(()));
+    }
+
+    #[test]
+    fn redaction_section_parses_from_toml() {
+        let cfg: Config = toml::from_str(
+            "[hec.redaction]\ndrop_fields=[\"a.b\"]\nhash_fields=[\"e\"]\n\
+             hash_key_env=\"K\"\nmask_patterns=[\"x\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.hec.redaction.drop_fields, vec!["a.b"]);
+        assert_eq!(cfg.hec.redaction.hash_fields, vec!["e"]);
+        assert_eq!(cfg.hec.redaction.hash_key_env.as_deref(), Some("K"));
+        assert_eq!(cfg.hec.redaction.mask_patterns, vec!["x"]);
+        assert!(!cfg.hec.redaction.is_empty());
+        assert!(cfg.otlp.redaction.is_empty());
+    }
+
+    #[test]
     fn validate_base_config_is_valid() {
         assert_eq!(validate_config_invariants(&valid_base()), Ok(()));
     }
@@ -3570,6 +3830,172 @@ directory = "/tmp/otlp"
         assert!(cfg.otlp.enabled && cfg.otlp.local.is_some());
         assert_eq!(cfg.otlp.bearer_token.as_deref(), Some("change-me"));
         assert_eq!(cfg.otlp.max_service_partitions, 64);
+        assert_eq!(
+            cfg.hec.redaction.hash_fields,
+            vec!["user.email".to_string()]
+        );
+        assert_eq!(
+            cfg.hec.redaction.hash_key_env.as_deref(),
+            Some("LOGTHING_HASH_KEY")
+        );
+        // Validation compiles the redactor, which needs the key env var; edition-2024 tests
+        // cannot set env safely, so clear the hash settings after asserting them above.
+        cfg.hec.redaction.hash_fields.clear();
+        cfg.hec.redaction.hash_key_env = None;
         validate_config_invariants(&cfg).expect("uncommented example validates");
+    }
+
+    fn hec_s3_toml(extra: &str) -> String {
+        format!(
+            "[hec.s3]\nendpoint=\"http://x\"\nbucket=\"b\"\nregion=\"r\"\n\
+             access_key=\"a\"\nsecret_key=\"s\"\n{extra}"
+        )
+    }
+
+    fn hec_s3_cfg(extra: &str) -> Config {
+        let mut cfg: Config = toml::from_str(&hec_s3_toml(extra)).unwrap();
+        cfg.tls.enabled = false;
+        cfg
+    }
+
+    #[test]
+    fn object_lock_mode_rejects_unknown_string_at_parse_time() {
+        assert!(toml::from_str::<Config>(&hec_s3_toml("object_lock_mode=\"WORM\"\n")).is_err());
+        assert!(
+            toml::from_str::<Config>(&hec_s3_toml("object_lock_mode=\"governance\"\n")).is_err()
+        );
+    }
+
+    #[test]
+    fn object_lock_settings_parse_from_flattened_toml() {
+        let cfg = hec_s3_cfg("object_lock_mode=\"COMPLIANCE\"\nobject_lock_retain_days=30\n");
+        let c = &cfg.hec.s3.as_ref().unwrap().connection;
+        assert_eq!(c.object_lock_mode, Some(ObjectLockMode::Compliance));
+        assert_eq!(c.object_lock_retain_days, Some(30));
+        assert_eq!(validate_config_invariants(&cfg), Ok(()));
+        let c = &hec_s3_cfg("").hec.s3.unwrap().connection;
+        assert_eq!(
+            (c.object_lock_mode, c.object_lock_retain_days),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn validate_config_invariants_rejects_object_lock_mode_without_days_and_zero_days() {
+        let mut cfg = hec_s3_cfg("object_lock_mode=\"GOVERNANCE\"\n");
+        let err = validate_config_invariants(&cfg).expect_err("mode without days");
+        assert!(
+            err.contains("hec.s3") && err.contains("object_lock_retain_days"),
+            "{err}"
+        );
+        cfg.hec
+            .s3
+            .as_mut()
+            .unwrap()
+            .connection
+            .object_lock_retain_days = Some(0);
+        assert!(validate_config_invariants(&cfg).is_err());
+        cfg.hec
+            .s3
+            .as_mut()
+            .unwrap()
+            .connection
+            .object_lock_retain_days = Some(36_501);
+        assert!(validate_config_invariants(&cfg).is_err());
+        cfg.hec
+            .s3
+            .as_mut()
+            .unwrap()
+            .connection
+            .object_lock_retain_days = Some(36_500);
+        assert_eq!(validate_config_invariants(&cfg), Ok(()));
+        cfg.hec
+            .s3
+            .as_mut()
+            .unwrap()
+            .connection
+            .object_lock_retain_days = Some(30);
+        assert_eq!(validate_config_invariants(&cfg), Ok(()));
+    }
+
+    #[test]
+    fn validate_config_invariants_rejects_days_without_mode() {
+        let cfg = hec_s3_cfg("object_lock_retain_days=7\n");
+        let err = validate_config_invariants(&cfg).expect_err("days without mode");
+        assert!(
+            err.contains("hec.s3") && err.contains("object_lock_mode"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn s3_connections_lists_every_configured_section_by_name() {
+        let mut cfg = hec_s3_cfg("");
+        cfg.syslog.s3 = Some(
+            toml::from_str::<SyslogS3Config>(
+                "endpoint=\"e\"\nbucket=\"b\"\nregion=\"r\"\naccess_key=\"a\"\nsecret_key=\"s\"\n",
+            )
+            .unwrap(),
+        );
+        let names: Vec<&str> = cfg.s3_connections().iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["syslog.s3", "hec.s3"]);
+        assert!(Config::default().s3_connections().is_empty());
+    }
+
+    #[test]
+    fn env_vars_override_object_lock_settings_through_flattened_s3_config() {
+        // Env vars are process-global; hold the shared config lock (Config::load also reads
+        // logthing.toml from the cwd) and always clean up, even on a failed assertion.
+        let _guard = CONFIG_FILE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let vars: &[(&str, &str)] = &[
+            ("LOGTHING__HEC__ENABLED", "true"),
+            ("LOGTHING__HEC__S3__ENDPOINT", "http://x"),
+            ("LOGTHING__HEC__S3__BUCKET", "b"),
+            ("LOGTHING__HEC__S3__REGION", "r"),
+            ("LOGTHING__HEC__S3__ACCESS_KEY", "a"),
+            ("LOGTHING__HEC__S3__SECRET_KEY", "s"),
+            ("LOGTHING__HEC__S3__OBJECT_LOCK_MODE", "COMPLIANCE"),
+            ("LOGTHING__HEC__S3__OBJECT_LOCK_RETAIN_DAYS", "45"),
+        ];
+        for (k, v) in vars {
+            unsafe { std::env::set_var(k, v) };
+        }
+        let result = std::panic::catch_unwind(|| {
+            let cfg = Config::load().expect("config loads with object lock env overrides");
+            let c = &cfg.hec.s3.as_ref().expect("hec.s3 from env").connection;
+            assert_eq!(c.object_lock_mode, Some(ObjectLockMode::Compliance));
+            assert_eq!(c.object_lock_retain_days, Some(45));
+        });
+        for (k, _) in vars {
+            unsafe { std::env::remove_var(k) };
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    fn object_lock_retain_days_accepts_numeric_string_and_rejects_non_numeric() {
+        let c = &hec_s3_cfg("object_lock_retain_days=\"45\"\n")
+            .hec
+            .s3
+            .unwrap()
+            .connection;
+        assert_eq!(c.object_lock_retain_days, Some(45));
+        for bad in ["\"abc\"", "\"\"", "\"-1\""] {
+            let err =
+                toml::from_str::<Config>(&hec_s3_toml(&format!("object_lock_retain_days={bad}\n")))
+                    .expect_err(bad);
+            assert!(
+                err.to_string().contains("object_lock_retain_days"),
+                "{bad}: {err}"
+            );
+        }
+        for bad in ["-1", "1.5"] {
+            let toml = hec_s3_toml(&format!("object_lock_retain_days={bad}\n"));
+            assert!(toml::from_str::<Config>(&toml).is_err(), "{bad}");
+        }
     }
 }

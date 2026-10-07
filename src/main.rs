@@ -132,6 +132,14 @@ async fn async_main() -> anyhow::Result<()> {
         logthing::server::install_metrics_recorder();
     }
 
+    // Durable spool (optional). Installed after the Prometheus recorder (so the startup
+    // gauges and `spool_corrupt` are recorded) and before any writer exists, so every S3
+    // writer is wrapped. The uploader starts only after ALL writers have registered (below).
+    let spool = match config.spool.as_ref() {
+        Some(cfg) => Some(logthing::forwarding::spool::init_global(cfg)?),
+        None => None,
+    };
+
     // -----------------------------------------------------------------------
     // Build the aggregator (optional). Rules are validated up front: a bad
     // rule means a noisy stream would keep flowing unaggregated, so a config
@@ -854,6 +862,10 @@ async fn async_main() -> anyhow::Result<()> {
     )
     .await?;
 
+    // Every writer (including WEF/HEC/OTLP, created inside `Server::new`) has registered its
+    // sink with the spool by now, so replay can start.
+    let spool_uploader = spool.as_ref().map(|s| s.spawn_uploader());
+
     // Gap-b: Extract the WEF→S3 Parquet worker handle BEFORE the server is
     // consumed by run_tls, so we can await it during the shutdown sequence.
     let wef_worker_handles = server.take_wef_worker_handles();
@@ -951,6 +963,7 @@ async fn async_main() -> anyhow::Result<()> {
     all_writer_handles.extend(hec_worker_handles);
 
     let total = all_writer_handles.len();
+    let writers_started = std::time::Instant::now();
     let completed = await_handles_with_deadline(all_writer_handles, Duration::from_secs(10)).await;
     if completed < total {
         // Say *how much*, not just "some". The unfinished writers are still
@@ -969,6 +982,23 @@ async fn async_main() -> anyhow::Result<()> {
             completed,
             total,
         );
+    }
+
+    // Final flushes have landed in the spool (local fsync, fast) even if S3 is down. Give
+    // the uploader whatever remains of the shutdown deadline (at least 2 s), then leave the
+    // rest for replay on the next start.
+    if let (Some(uploader), Some(spool)) = (spool_uploader, spool.as_ref()) {
+        uploader.shutdown().await;
+        let budget = Duration::from_secs(10)
+            .saturating_sub(writers_started.elapsed())
+            .max(Duration::from_secs(2));
+        let left = spool.drain(budget).await;
+        if left > 0 {
+            warn!(
+                entries = left,
+                "spool not fully drained at shutdown; replays on next start"
+            );
+        }
     }
 
     info!("Shutdown complete");
