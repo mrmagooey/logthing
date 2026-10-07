@@ -85,3 +85,85 @@ def test_dbt_dependencies_are_pinned_exactly():
     assert {"dbt-core==1.11.15", "dbt-trino==1.10.6"} <= lines
     reqs = (ANALYTICS / "tests" / "requirements.txt").read_text()
     assert "-r ../dbt/requirements.txt" in reqs
+
+
+OCSF = {"ocsf_network_activity": 4001, "ocsf_dns_activity": 4003,
+        "ocsf_authentication": 3002, "ocsf_detection_finding": 2004}
+REQUIRED = ["time", "category_uid", "class_uid", "activity_id", "type_uid", "severity_id",
+            "metadata_product_name"]
+
+
+def test_ocsf_models_exist_and_read_only_staging_models(manifest):
+    models = nodes(manifest, "model")
+    assert {n for n in models if n.startswith("ocsf_")} == set(OCSF)
+    for name in OCSF:
+        deps = models[name]["depends_on"]["nodes"]
+        assert deps and all(d.startswith("model.logthing_analytics.stg_") for d in deps), name
+
+
+def test_every_ocsf_model_has_not_null_tests_on_the_required_columns(manifest):
+    tests = [n for n in nodes(manifest, "test").values()
+             if n.get("test_metadata", {}).get("name") == "not_null"]
+    for model in OCSF:
+        cols = {t["column_name"] for t in tests if t["attached_node"].endswith(f".{model}")}
+        assert set(REQUIRED) <= cols, (model, set(REQUIRED) - cols)
+
+
+def test_class_uid_is_pinned_per_model(manifest):
+    tests = [n for n in nodes(manifest, "test").values()
+             if n.get("test_metadata", {}).get("name") == "accepted_values"
+             and n["column_name"] == "class_uid"]
+
+    def values(t):
+        kw = t["test_metadata"]["kwargs"]
+        return kw.get("arguments", kw)["values"]
+
+    pinned = {t["attached_node"].split(".")[-1]: values(t) for t in tests}
+    assert pinned == {m: [uid] for m, uid in OCSF.items()}
+    for t in tests:  # integer values must not be rendered as quoted strings
+        kw = t["test_metadata"]["kwargs"]
+        assert kw.get("arguments", kw)["quote"] is False
+
+
+def test_every_ocsf_model_has_a_unit_test_and_wef_covers_a_4624_blob(manifest):
+    by_model = {}
+    for t in manifest["unit_tests"].values():
+        by_model.setdefault(t["model"], []).append(t)
+    assert set(by_model) == set(OCSF)
+    auth = by_model["ocsf_authentication"]
+    blobs = " ".join(str(g.get("rows")) for t in auth for g in t["given"])
+    assert "4624" in blobs and "TargetUserName" in blobs and "raw_xml" in blobs
+    assert "not json at all" in blobs  # malformed JSON row
+    assert "''TargetDomainName''" in blobs  # single-quoted attribute style
+
+
+def test_ocsf_models_document_the_wef_extraction_limit(manifest):
+    desc = nodes(manifest, "model")["ocsf_authentication"]["description"]
+    assert "raw_xml" in desc and "NULL" in desc
+
+
+def _wef_regex(name):
+    text = (DBT_DIR / "macros" / "wef_field.sql").read_text()
+    sql = re.search(r"regexp_extract\(\{\{ xml_col \}\}, '((?:[^']|'')*)', 1\)", text).group(1)
+    return re.compile(sql.replace("''", "'").replace("{{ name }}", name))
+
+
+@pytest.mark.parametrize("xml,want", [
+    ('<Data Name="TargetUserName">john.doe</Data>', "john.doe"),
+    ("<Data Name='TargetUserName'>john.doe</Data>", "john.doe"),
+    ('<Data Name="TargetUserName" Foo="1">x y</Data>', "x y"),
+    ('<Data Name="TargetUserName"></Data>', ""),
+    ('<Data Name="Other">v</Data>', None),
+    ('<Data Name="TargetUserName"/><Data Name="X">v</Data>', None),
+    ('<Data Name="TargetUserName" />\n<Data Name="X">v</Data>', None),
+    ('<Data Name="XTargetUserName">v</Data>', None),
+    ("not xml at all", None),
+])
+def test_wef_field_regex_handles_quote_styles_and_absence(xml, want):
+    m = _wef_regex("TargetUserName").search(xml)
+    assert (m.group(1) if m else None) == want
+
+
+def test_wef_field_turns_blank_and_dash_into_null():
+    text = (DBT_DIR / "macros" / "wef_field.sql").read_text()
+    assert "nullif(nullif(trim(" in text and "'-'" in text

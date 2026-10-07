@@ -1,0 +1,54 @@
+version: 2
+
+models:
+  - name: ocsf_network_activity
+    description: OCSF 1.3 Network Activity (4001), flattened. Zeek conn, IPFIX, sFlow flow samples.
+    columns:
+      - {name: time, data_tests: [not_null]}
+      - {name: category_uid, data_tests: [not_null]}
+      - name: class_uid
+        data_tests: [not_null, {accepted_values: {arguments: {values: [4001], quote: false}}}]
+      - {name: activity_id, data_tests: [not_null]}
+      - {name: type_uid, data_tests: [not_null]}
+      - {name: severity_id, data_tests: [not_null]}
+      - {name: metadata_product_name, data_tests: [not_null]}
+  - name: ocsf_dns_activity
+    description: OCSF 1.3 DNS Activity (4003), flattened. Zeek dns.log.
+    columns:
+      - {name: time, data_tests: [not_null]}
+      - {name: category_uid, data_tests: [not_null]}
+      - name: class_uid
+        data_tests: [not_null, {accepted_values: {arguments: {values: [4003], quote: false}}}]
+      - {name: activity_id, data_tests: [not_null]}
+      - {name: type_uid, data_tests: [not_null]}
+      - {name: severity_id, data_tests: [not_null]}
+      - {name: metadata_product_name, data_tests: [not_null]}
+  - name: ocsf_authentication
+    description: >
+      OCSF 1.3 Authentication (3002), flattened. WEF 4624/4625/4634/4648.
+      Limitation: logthing persists only the serialized WindowsEvent JSON, whose parsed fields are
+      not populated, so user_name, user_domain, actor_user_name, logon_type_id, src_endpoint_*,
+      and status_detail are extracted from the event XML (`raw_xml`) with a regular expression
+      (macros/wef_field.sql). Both attribute quote styles are handled; a field that is missing,
+      blank or "-", or an event whose JSON or XML is malformed, yields NULL rather than an error.
+      Events other than the four logon IDs are excluded.
+    columns:
+      - {name: time, data_tests: [not_null]}
+      - {name: category_uid, data_tests: [not_null]}
+      - name: class_uid
+        data_tests: [not_null, {accepted_values: {arguments: {values: [3002], quote: false}}}]
+      - {name: activity_id, data_tests: [not_null]}
+      - {name: type_uid, data_tests: [not_null]}
+      - {name: severity_id, data_tests: [not_null]}
+      - {name: metadata_product_name, data_tests: [not_null]}
+  - name: ocsf_detection_finding
+    description: OCSF 1.3 Detection Finding (2004), flattened. Suricata alerts.
+    columns:
+      - {name: time, data_tests: [not_null]}
+      - {name: category_uid, data_tests: [not_null]}
+      - name: class_uid
+        data_tests: [not_null, {accepted_values: {arguments: {values: [2004], quote: false}}}]
+      - {name: activity_id, data_tests: [not_null]}
+      - {name: type_uid, data_tests: [not_null]}
+      - {name: severity_id, data_tests: [not_null]}
+      - {name: metadata_product_name, data_tests: [not_null]}

@@ -14,6 +14,8 @@ require_docker()
 require_trino()
 require_dbt()
 
+# CREATE below mirrors what the committer produces: pyiceberg maps Arrow integers of <= 32 bits to
+# Iceberg int (Trino integer), so the staging casts to bigint are real widenings.
 STAGING = ["stg_wef", "stg_zeek_conn", "stg_zeek_dns", "stg_ipfix", "stg_sflow_flow",
            "stg_suricata"]
 TS = "TIMESTAMP '2026-10-01 12:00:00 UTC'"
@@ -36,7 +38,7 @@ WEF_4624 = json.dumps({
 })
 
 CREATE = {
-    "wef": '(event_id bigint, "timestamp" timestamp(6) with time zone, source_host varchar, '
+    "wef": '(event_id integer, "timestamp" timestamp(6) with time zone, source_host varchar, '
            "subscription_id varchar, event_data varchar, partition_time timestamp(6) with time zone)",
     "zeek_conn": "(ts timestamp(6) with time zone, uid varchar, id_orig_h varchar, "
                  "id_orig_p integer, id_resp_h varchar, id_resp_p integer, proto varchar, "
@@ -48,17 +50,17 @@ CREATE = {
                 "trans_id integer, query varchar, qtype_name varchar, qclass_name varchar, "
                 "rcode_name varchar, answers varchar, _extra varchar, "
                 "partition_time timestamp(6) with time zone)",
-    "ipfix": "(observation_domain_id bigint, template_id integer, protocol_version integer, "
+    "ipfix": "(observation_domain_id integer, template_id integer, protocol_version integer, "
              "exporter varchar, export_time timestamp(6) with time zone, src_addr varchar, "
              "dst_addr varchar, src_port integer, dst_port integer, ip_protocol integer, "
              "octet_delta_count bigint, packet_delta_count bigint, "
              "flow_start timestamp(6) with time zone, flow_end timestamp(6) with time zone, "
-             "tcp_flags integer, input_interface bigint, output_interface bigint, extra varchar, "
+             "tcp_flags integer, input_interface integer, output_interface integer, extra varchar, "
              "partition_time timestamp(6) with time zone)",
     "sflow_flow": "(sample_type varchar, exporter varchar, received_at timestamp(6) with time zone, "
                   "src_addr varchar, dst_addr varchar, src_port integer, dst_port integer, "
-                  "ip_protocol integer, sampling_rate bigint, input_ifindex bigint, "
-                  "output_ifindex bigint, extra varchar, partition_time timestamp(6) with time zone)",
+                  "ip_protocol integer, sampling_rate integer, input_ifindex integer, "
+                  "output_ifindex integer, extra varchar, partition_time timestamp(6) with time zone)",
     "suricata": "(event_type varchar, received_at timestamp(6) with time zone, src_ip varchar, "
                 "payload varchar, partition_time timestamp(6) with time zone)",
 }
@@ -134,3 +136,45 @@ def test_rebuild_is_idempotent(dbt_stack):
     for _ in range(2):
         r = run_dbt(dbt_stack, "build", "--select", "staging")
         assert dbt_failure(r) is None, dbt_failure(r)
+
+
+def test_full_build_runs_unit_tests_and_schema_tests(dbt_stack):
+    r = run_dbt(dbt_stack, "build")
+    assert dbt_failure(r) is None, dbt_failure(r)
+    assert "unit_test" in r.stdout  # the dbt unit tests really ran
+
+
+def tsv(stack, sql):
+    return [tuple(line.split("\t")) for line in stack.trino(sql).splitlines()]
+
+
+def test_seeded_rows_land_in_ocsf_authentication(dbt_stack):
+    rows = tsv(dbt_stack, "SELECT user_name, user_domain, logon_type_id, src_endpoint_ip, type_uid, "
+                          "dst_endpoint_hostname FROM iceberg.logs.ocsf_authentication")
+    assert rows == [("john.doe", "CONTOSO", "3", "192.168.1.100", "300201", "WS01.contoso.com")]
+
+
+def test_seeded_rows_land_in_ocsf_network_activity(dbt_stack):
+    rows = tsv(dbt_stack, "SELECT metadata_log_name, src_endpoint_ip, dst_endpoint_port, "
+                          "connection_info_protocol_name FROM iceberg.logs.ocsf_network_activity "
+                          "ORDER BY 1")
+    assert rows == [("ipfix", "10.0.0.6", "53", "udp"), ("sflow_flow", "10.0.0.7", "80", "tcp"),
+                    ("zeek_conn", "10.0.0.5", "443", "tcp")]
+
+
+def test_seeded_rows_land_in_ocsf_dns_and_detection_views(dbt_stack):
+    assert tsv(dbt_stack, "SELECT query_hostname, activity_id, rcode FROM "
+                          "iceberg.logs.ocsf_dns_activity") == [("example.test", "2", "NOERROR")]
+    assert tsv(dbt_stack, "SELECT finding_info_title, severity_id, dst_endpoint_ip FROM "
+                          "iceberg.logs.ocsf_detection_finding") == [
+        ("ET SCAN test", "4", "198.51.100.7")]
+
+
+def test_required_ocsf_columns_are_never_null_on_real_rows(dbt_stack):
+    for view in ("ocsf_network_activity", "ocsf_dns_activity", "ocsf_authentication",
+                 "ocsf_detection_finding"):
+        nulls = dbt_stack.trino(
+            f'SELECT count(*) FROM iceberg.logs.{view} WHERE "time" IS NULL OR class_uid IS NULL '
+            "OR category_uid IS NULL OR activity_id IS NULL OR type_uid IS NULL "
+            "OR severity_id IS NULL OR metadata_product_name IS NULL")
+        assert nulls == "0", view
