@@ -123,8 +123,8 @@ services use `restart: unless-stopped`.
 
 Trino listens on https://localhost:8443 with a private CA generated into the `trino-tls` volume.
 The admin password is `TRINO_ADMIN_PASSWORD` in `.env`. Trino's plain-HTTP port 8080 is used only
-for its own internal traffic inside the container and is never published. Trino's HTTP port 8080
-is gone for clients; use `https://...:8443` (default host port 8443; `TRINO_PORT`).
+for its own internal traffic inside the container and is never published, so clients must use
+`https://...:8443` (default host port 8443; `TRINO_PORT`).
 
 ```bash
 # Inside the container (the CLI reads TRINO_PASSWORD, which compose sets to the admin password):

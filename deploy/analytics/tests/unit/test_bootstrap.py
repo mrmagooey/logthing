@@ -241,11 +241,12 @@ def test_unknown_command_is_usage_error(bootstrap):
 class FakeMetabase:
     """Stateful model of the Metabase API subset bootstrap.py metabase uses."""
 
-    def __init__(self, server, engines=("starburst", "postgres"), db_400s=0):
+    def __init__(self, server, engines=("starburst", "postgres"), db_400s=0, login_429s=0):
         self.setup_token = "setup-tok"
         self.admin = None
         self.dbs = {}
         self.db_400s = db_400s
+        self.login_429s = login_429s
         self.setup_bodies = []
         self.db_bodies = []
         self.puts = []
@@ -269,6 +270,9 @@ class FakeMetabase:
         return 200, {"id": "session-1"}
 
     def login(self, q, b):
+        if self.login_429s:
+            self.login_429s -= 1
+            return 429, {"message": "Too many attempts"}
         if self.admin == (b["username"], b["password"]):
             return 200, {"id": "session-2"}
         return 401, {"message": "Password did not match stored password."}
@@ -374,6 +378,14 @@ def test_metabase_database_add_is_retried_until_trino_accepts_the_connection(boo
     mb = FakeMetabase(server, db_400s=2)
     assert bootstrap.main(["metabase"], mb_env(server.url)) == 0
     assert len(mb.db_bodies) == 3 and len(mb.setup_bodies) == 1 and len(mb.dbs) == 1
+
+
+def test_metabase_login_rate_limit_is_retried_until_the_deadline(bootstrap, server):
+    mb = FakeMetabase(server, login_429s=2)
+    mb.setup_token = None
+    mb.admin = ("admin@logthing.example", ADMIN_PW)
+    assert bootstrap.main(["metabase"], mb_env(server.url)) == 0
+    assert len(mb.dbs) == 1
 
 
 def test_metabase_persistent_database_error_times_out_naming_the_cause(bootstrap, server, capsys):

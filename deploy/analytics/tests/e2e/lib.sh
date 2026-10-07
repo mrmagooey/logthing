@@ -55,3 +55,9 @@ wait_until() {
     sleep 3
   done
 }
+
+# dbt_ok <exit_code> <output>: dbt succeeded only if it exited 0 AND its summary line reports
+# ERROR=0. (Never test "ERROR absent": the summary itself is "Done. PASS=6 WARN=0 ERROR=0 ...".)
+dbt_ok() {
+  [ "$1" = 0 ] && printf '%s\n' "$2" | grep -Eq 'Done\. PASS=[0-9]+ WARN=[0-9]+ ERROR=0 '
+}

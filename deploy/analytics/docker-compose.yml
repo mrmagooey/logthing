@@ -233,8 +233,9 @@ services:
       test: ["CMD", "curl", "-fsS", "http://localhost:3000/api/health"]
       interval: 10s
       timeout: 5s
-      # First start runs all of Metabase's schema migrations; allow ~30 minutes on a slow host.
-      retries: 180
+      # First start runs all of Metabase's schema migrations. A slow host needs far more than
+      # the default (e.g. METABASE_HEALTH_RETRIES=180 allows ~30 minutes).
+      retries: ${METABASE_HEALTH_RETRIES:-40}
       start_period: 60s
     depends_on:
       postgres: {condition: service_healthy}

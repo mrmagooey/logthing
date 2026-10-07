@@ -1,0 +1,39 @@
+version: 2
+
+models:
+  - name: stg_wef
+    description: Typed passthrough of logs.wef (empty when the table does not exist yet).
+    columns:
+      - name: event_id
+        data_tests: [not_null]
+      - name: received_at
+        data_tests: [not_null]
+      - name: event_data
+        data_tests: [not_null]
+  - name: stg_zeek_conn
+    description: Typed passthrough of logs.zeek_conn.
+    columns:
+      - name: partition_time
+        data_tests: [not_null]
+  - name: stg_zeek_dns
+    description: Typed passthrough of logs.zeek_dns.
+    columns:
+      - name: partition_time
+        data_tests: [not_null]
+  - name: stg_ipfix
+    description: Typed passthrough of logs.ipfix.
+    columns:
+      - name: export_time
+        data_tests: [not_null]
+  - name: stg_sflow_flow
+    description: Typed passthrough of logs.sflow_flow.
+    columns:
+      - name: received_at
+        data_tests: [not_null]
+  - name: stg_suricata
+    description: Typed passthrough of logs.suricata (payload is the EVE JSON object).
+    columns:
+      - name: event_type
+        data_tests: [not_null]
+      - name: payload
+        data_tests: [not_null]

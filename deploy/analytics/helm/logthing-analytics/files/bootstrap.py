@@ -304,6 +304,8 @@ def _mb_login(cfg):
         raise Fatal(
             f"Metabase admin login failed (HTTP {st}): METABASE_ADMIN_PASSWORD / "
             f"METABASE_ADMIN_EMAIL do not match the admin created at first setup")
+    if st == 429:
+        raise Transient(f"metabase login rate-limited: HTTP 429 {_short(r)}")
     expect(st, r, {200}, "metabase login")
     return r["id"]
 

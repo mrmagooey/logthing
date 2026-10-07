@@ -1,3 +1,4 @@
+import json
 import os
 import ssl
 import subprocess
@@ -6,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from conftest import ANALYTICS
+from conftest import ANALYTICS, load_metabase_query
 
 LIB = ANALYTICS / "tests" / "e2e" / "lib.sh"
 CERTGEN = ANALYTICS / "scripts" / "certgen.sh"
@@ -33,6 +34,19 @@ def test_preflight_accepts_trino_override_alone(tmp_path):
     r = preflight(tmp_path, "fpu sse2", TRINO_IMAGE="trinodb/trino:470")
     assert r.returncode == 0
     assert "does NOT verify the default Trino image" in r.stderr
+
+
+def dbt_ok(code, output):
+    return subprocess.run(["bash", "-c", f'. {LIB}; dbt_ok "$1" "$2"', "x", str(code), output],
+                          capture_output=True).returncode == 0
+
+
+def test_dbt_ok_requires_exit_zero_and_a_summary_with_error_zero():
+    done = "Done. PASS=12 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=12"
+    assert dbt_ok(0, f"noise\n12:00:00  {done}\n")
+    assert not dbt_ok(1, done)
+    assert not dbt_ok(0, "Done. PASS=11 WARN=0 ERROR=1 SKIP=0 NO-OP=0 TOTAL=12")
+    assert not dbt_ok(0, "")  # exit 0 without a summary is not a pass
 
 
 def test_preflight_no_longer_mentions_hue():
@@ -101,7 +115,6 @@ def test_security_helper_fails_when_the_admin_password_is_rejected(tls_server):
     assert r.returncode != 0 and "valid credentials" in r.stderr
 
 
-from conftest import load_metabase_query
 
 
 def mb_routes(server, engines=("starburst",), dataset=None):
@@ -158,7 +171,6 @@ OK_ROWS = [_row("garage", 3900, 3900), _row("lakekeeper", 8181, 0), _row("postgr
 
 
 def test_published_ports_accepts_ndjson_and_a_json_array():
-    import json
     assert ports_run("\n".join(json.dumps(r) for r in OK_ROWS)).returncode == 0
     assert ports_run(json.dumps(OK_ROWS)).returncode == 0
 
@@ -170,7 +182,6 @@ def test_published_ports_rejects_an_empty_listing_in_either_format():
 
 
 def test_published_ports_flags_internal_ports_in_either_format():
-    import json
     bad = OK_ROWS + [_row("lakekeeper", 8181, 18181)]
     for text in (json.dumps(bad), "\n".join(json.dumps(r) for r in bad)):
         r = ports_run(text)
@@ -178,8 +189,14 @@ def test_published_ports_flags_internal_ports_in_either_format():
     assert ports_run(json.dumps(OK_ROWS + [_row("trino", 8080, 8080)])).returncode != 0
 
 
+def test_e2e_scripts_run_dbt_build_and_check_the_summary():
+    for name in ("compose.sh", "helm-minikube.sh"):
+        text = (ANALYTICS / "tests" / "e2e" / name).read_text()
+        assert "dbt_ok" in text and " build " in text + " ", name
+
+
 def test_e2e_scripts_include_the_metabase_step_and_no_hue():
-    for name, marker in (("compose.sh", "[6/6]"), ("helm-minikube.sh", "[8/8]")):
+    for name, marker in (("compose.sh", "[6/7]"), ("helm-minikube.sh", "[9/9]")):
         text = (ANALYTICS / "tests" / "e2e" / name).read_text()
         assert marker in text and "metabase_query.py" in text, name
     assert "published_ports.py" in (ANALYTICS / "tests" / "e2e" / "compose.sh").read_text()

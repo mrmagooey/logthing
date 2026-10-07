@@ -2,6 +2,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 
 import pytest
 import yaml
@@ -35,16 +36,16 @@ def notes(*sets):
     """Render NOTES.txt hermetically: `helm install --dry-run` can need a live cluster and
     `helm template` drops notes, so render a copy of the chart that exposes the notes text as a
     ConfigMap value."""
-    import tempfile
     with tempfile.TemporaryDirectory() as d:
         chart = shutil.copytree(CHART, f"{d}/chart")
-        text = open(f"{chart}/templates/NOTES.txt").read()
+        with open(f"{chart}/templates/NOTES.txt") as f:
+            text = f.read()
         os.remove(f"{chart}/templates/NOTES.txt")
-        open(f"{chart}/templates/_notes.tpl", "w").write(
-            '{{- define "notes" -}}' + text + "{{- end -}}")
-        open(f"{chart}/templates/notes.yaml", "w").write(
-            'apiVersion: v1\nkind: ConfigMap\nmetadata: {name: notes}\ndata:\n'
-            '  notes: |\n    {{- include "notes" . | nindent 4 }}\n')
+        with open(f"{chart}/templates/_notes.tpl", "w") as f:
+            f.write('{{- define "notes" -}}' + text + "{{- end -}}")
+        with open(f"{chart}/templates/notes.yaml", "w") as f:
+            f.write('apiVersion: v1\nkind: ConfigMap\nmetadata: {name: notes}\ndata:\n'
+                    '  notes: |\n    {{- include "notes" . | nindent 4 }}\n')
         args = ["helm", "template", "lt", chart, "--show-only", "templates/notes.yaml"]
         for s in sets:
             args += ["--set", s]
@@ -364,7 +365,6 @@ def _decode(secret, key):
 
 def test_trino_tls_secret_is_a_valid_ca_signed_cert():
     import os
-    import tempfile
     secret = by(render(), "Secret", f"{FULL}-trino-tls")
     assert set(secret["data"]) == {"ca.pem", "server.pem"}
     server, ca = _decode(secret, "server.pem"), _decode(secret, "ca.pem")

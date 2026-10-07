@@ -1,8 +1,11 @@
 """Shared helper for integration tests that drive the real compose stack (needs Docker)."""
 import os
+import re
 import shutil
 import subprocess
+import sys
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -80,3 +83,56 @@ class Stack:
 
     def down(self):
         self.compose("down", "-v", "--remove-orphans", check=False)
+
+
+DBT_BIN = Path(sys.executable).parent / "dbt"
+DBT_DIR = ANALYTICS / "dbt"
+# `dbt build` ends with "Done. PASS=6 WARN=0 ERROR=0 SKIP=0 ...": the word ERROR is always present.
+DBT_SUMMARY = re.compile(r"Done\. PASS=\d+ WARN=\d+ ERROR=(\d+) ")
+
+
+def require_dbt():
+    if not DBT_BIN.exists():
+        pytest.skip("dbt not installed in this venv (pip install -r tests/requirements.txt)",
+                    allow_module_level=True)
+
+
+def dbt_failure(result):
+    """None when dbt exited 0 AND its summary reports ERROR=0; else a message for the assert."""
+    m = DBT_SUMMARY.search(result.stdout)
+    if result.returncode == 0 and m and m.group(1) == "0":
+        return None
+    return f"dbt failed (exit {result.returncode}):\n{result.stdout}{result.stderr}"
+
+
+def _trino(self, sql, timeout=300):
+    """Run SQL through the in-container Trino CLI (HTTPS, admin); return TSV stdout, unquoted."""
+    out = self.exec("trino", "trino", "--server", "https://localhost:8443",
+                    "--truststore-path", "/etc/trino/tls/ca.pem", "--user", "admin", "--password",
+                    "--output-format", "TSV", "--execute", sql, timeout=timeout).stdout
+    return out.replace('"', "").strip()
+
+
+def _trino_ca(self):
+    ca = self.envfile.parent / "trino-ca.pem"
+    if not ca.exists():
+        ca.write_text(self.exec("trino", "cat", "/etc/trino/tls/ca.pem").stdout)
+    return ca
+
+
+Stack.trino = _trino
+Stack.trino_ca = _trino_ca
+
+
+def run_dbt(stack, *args, timeout=900, extra_env=None):
+    """Run dbt on the host against the stack's published Trino port (HTTPS, admin, generated CA)."""
+    work = stack.envfile.parent
+    env = {"PATH": os.environ["PATH"], "HOME": str(work), "TRINO_HOST": "localhost",
+           "TRINO_PORT": stack.port("trino", 8443), "TRINO_USER": "admin",
+           "TRINO_PASSWORD": stack.env["TRINO_ADMIN_PASSWORD"],
+           "TRINO_CA_CERT": str(stack.trino_ca()), "DBT_SEND_ANONYMOUS_USAGE_STATS": "false"}
+    env.update(extra_env or {})
+    return subprocess.run(
+        [str(DBT_BIN), "--log-path", str(work / "dbtlogs"), *args, "--project-dir", str(DBT_DIR),
+         "--profiles-dir", str(DBT_DIR), "--target-path", str(work / "dbttarget")],
+        env=env, capture_output=True, text=True, timeout=timeout)

@@ -7,6 +7,9 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ANALYTICS=$(cd -- "$HERE/../.." && pwd)
 . "$HERE/lib.sh"
 preflight_cpu
+DBT=${DBT:-$ANALYTICS/.venv/bin/dbt}
+[ -x "$DBT" ] || { echo "dbt not found at $DBT: run $ANALYTICS/.venv/bin/pip install -r $ANALYTICS/tests/requirements.txt (or set DBT=)" >&2; exit 1; }
+DBT_WORK=$(mktemp -d)
 
 PROFILE=${MINIKUBE_PROFILE:-lt-analytics-e2e}
 NS=analytics
@@ -38,6 +41,7 @@ cleanup() {
   [ -z "$PF_PID" ] || kill "$PF_PID" 2>/dev/null || true
   [ -z "$MB_PF_PID" ] || kill "$MB_PF_PID" 2>/dev/null || true
   rm -f "$CA"
+  rm -rf "$DBT_WORK"
   if [ "${KEEP_CLUSTER:-}" = 1 ]; then
     echo "KEEP_CLUSTER=1: leaving minikube profile $PROFILE running" >&2
   else
@@ -54,13 +58,13 @@ dump_logs() {
   "${K[@]}" logs "deploy/$FULL-logthing" --tail 80 >&2 || true
 }
 
-echo "== [1/8] minikube profile $PROFILE =="
+echo "== [1/9] minikube profile $PROFILE =="
 # start is idempotent on a running profile (status exits non-zero against a fresh private kubeconfig).
 minikube start -p "$PROFILE" --cpus 6 --memory 12g --driver docker
 # A kept cluster's context is not in this run's private kubeconfig; (re)write it.
 minikube update-context -p "$PROFILE" >/dev/null
 
-echo "== [2/8] load local override images =="
+echo "== [2/9] load local override images =="
 for img in "${TRINO_IMAGE:-}"; do
   if [ -n "$img" ] && docker image inspect "$img" >/dev/null 2>&1; then
     # Loading a multi-GB image is slow; skip it when a kept cluster already has it.
@@ -70,13 +74,13 @@ for img in "${TRINO_IMAGE:-}"; do
   fi
 done
 
-echo "== [3/8] helm install =="
+echo "== [3/9] helm install =="
 SETS=(--set logthing.flushIntervalSecs=5)
 [ -z "${TRINO_IMAGE:-}" ] || SETS+=(--set "trino.image=$TRINO_IMAGE")
 "${H[@]}" upgrade --install lt "$CHART" --namespace "$NS" --create-namespace --wait --timeout 15m "${SETS[@]}" \
   || { echo "helm install failed" >&2; dump_logs; exit 1; }
 
-echo "== [3b/8] helm upgrade keeps generated credentials (lookup persistence) =="
+echo "== [3b/9] helm upgrade keeps generated credentials (lookup persistence) =="
 secret_hash() {
   for s in "$FULL-credentials" "$FULL-trino-tls"; do
     "${K[@]}" get secret "$s" -o jsonpath='{.data}'
@@ -88,19 +92,19 @@ BEFORE=$(secret_hash)
 [ "$(secret_hash)" = "$BEFORE" ] \
   || { echo "credentials or Trino TLS Secret changed across helm upgrade" >&2; exit 1; }
 
-echo "== [3c/8] NetworkPolicies exist (enforcement is NOT tested: minikube's default CNI is not verified to enforce them) =="
+echo "== [3c/9] NetworkPolicies exist (enforcement is NOT tested: minikube's default CNI is not verified to enforce them) =="
 for p in lakekeeper postgres garage trino; do
   "${K[@]}" get networkpolicy "$FULL-$p" >/dev/null || { echo "missing NetworkPolicy $FULL-$p" >&2; exit 1; }
 done
 
-echo "== [4/8] wait for init jobs =="
+echo "== [4/9] wait for init jobs =="
 # Job names carry the release revision, so select by label.
 for c in garage-init lakekeeper-init metabase-init; do
   "${K[@]}" wait --for=condition=complete job -l "app.kubernetes.io/component=$c" --timeout 10m \
     || { echo "job $c did not complete" >&2; "${K[@]}" logs -l "app.kubernetes.io/component=$c" --tail 80 >&2 || true; exit 1; }
 done
 
-echo "== [5/8] send $N syslog messages ($MARKER) =="
+echo "== [5/9] send $N syslog messages ($MARKER) =="
 SENDER=$(cat <<PYEOF
 import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -121,7 +125,7 @@ trino_count() {
     | tr -d '"\r' || true
 }
 
-echo "== [6/8] wait (<=300s) for committer to land rows in iceberg.logs.syslog =="
+echo "== [6/9] wait (<=300s) for committer to land rows in iceberg.logs.syslog =="
 deadline=$(( $(date +%s) + 300 ))
 until [ "$(trino_count)" = "$N" ]; do
   if [ "$(date +%s)" -ge "$deadline" ]; then
@@ -133,7 +137,7 @@ until [ "$(trino_count)" = "$N" ]; do
 done
 echo "trino: $N"
 
-echo "== [7/8] Trino security through a port-forward: HTTPS + password negatives =="
+echo "== [7/9] Trino security through a port-forward: HTTPS + password negatives =="
 "${K[@]}" port-forward "svc/$FULL-trino" "$TRINO_LOCAL_PORT:8443" >/dev/null 2>&1 &
 PF_PID=$!
 "${K[@]}" get secret "$FULL-trino-tls" -o jsonpath='{.data.ca\.pem}' | base64 -d >"$CA"
@@ -152,7 +156,19 @@ if "${K[@]}" exec "deploy/$FULL-trino" -- env TRINO_PASSWORD=wrong "${TRINO_CLI[
   echo "Trino CLI accepted a wrong password" >&2; exit 1
 fi
 
-echo "== [8/8] same query through Metabase's API =="
+echo "== [8/9] dbt build through the Trino port-forward =="
+rc=0
+DBT_OUT=$(env TRINO_HOST=localhost TRINO_PORT="$TRINO_LOCAL_PORT" TRINO_USER=admin \
+  TRINO_PASSWORD="$ADMIN_PW" TRINO_CA_CERT="$CA" DBT_SEND_ANONYMOUS_USAGE_STATS=false \
+  "$DBT" --log-path "$DBT_WORK/logs" build --project-dir "$ANALYTICS/dbt" \
+  --profiles-dir "$ANALYTICS/dbt" --target-path "$DBT_WORK/target" 2>&1) || rc=$?
+printf '%s\n' "$DBT_OUT"
+dbt_ok "$rc" "$DBT_OUT" \
+  || { echo "dbt build failed (exit $rc or ERROR>0 in summary)" >&2
+       "${K[@]}" logs "deploy/$FULL-trino" --tail 80 >&2 || true; exit 1; }
+echo "dbt: build ok"
+
+echo "== [9/9] same query through Metabase's API =="
 "${K[@]}" port-forward "svc/$FULL-metabase" "$MB_LOCAL_PORT:3000" >/dev/null 2>&1 &
 MB_PF_PID=$!
 mb_alive() { kill -0 "$MB_PF_PID" 2>/dev/null && curl -fsS "http://127.0.0.1:$MB_LOCAL_PORT/api/health"; }
