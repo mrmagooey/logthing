@@ -238,8 +238,10 @@ fi
 if [ "$REDACTION" = "1" ] && [ "$TRANSPORT" != "http" ]; then
     echo "FATAL: REDACTION=1 needs an HTTP format (hec, otlp); FORMAT=$FORMAT is $TRANSPORT"; exit 1
 fi
-# Throwaway key for the redaction hash rule; at least 16 bytes, never a real secret.
-export LOGTHING_HASH_KEY="${LOGTHING_HASH_KEY:-harness-throwaway-hash-key-0123456789abcdef}"
+# Throwaway key for the redaction hash rule, random per invocation (32 hex chars, >= 16
+# bytes); never a real secret. Set LOGTHING_HASH_KEY to override.
+LOGTHING_HASH_KEY="${LOGTHING_HASH_KEY:-$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
+export LOGTHING_HASH_KEY
 
 # Every shape needs a run long enough to settle; real additionally needs two flushes.
 if [ "$DURATION" -lt 10 ]; then

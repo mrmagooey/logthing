@@ -72,8 +72,12 @@ fn aggregate_verdict(stderr: &str) -> Option<&str> {
 }
 
 /// Two sequential real runs (one test only: fixed ports, so real-server runs must never
-/// overlap). Requires release binaries; their absence FAILS the test with the build
-/// commands -- a silently green test that ran nothing is worse than a red one.
+/// overlap). `#[ignore]`d because plain `cargo test` (CI builds debug only) has no release
+/// binaries; run it explicitly with
+/// `cargo build --release --bin logthing && cargo build --release -p loadgen &&
+/// cargo test --test max_ingest_rate_harness_integration -- --ignored --test-threads=1`.
+/// Once explicitly run, missing release binaries FAIL it with the build commands -- an
+/// explicit `--ignored` run can never silently pass without having run anything.
 ///
 /// Run 1: ipfix, `SHAPE=real`, fixed `RATE=1000`, `DURATION=10` (the harness rejects real
 /// runs shorter than twice its 5s flush interval, and any DURATION under 10). Fixed-rate
@@ -88,6 +92,7 @@ fn aggregate_verdict(stderr: &str) -> Option<&str> {
 /// HARD-FAILURE is a verdict token but never an acceptable outcome here: it means the
 /// measurement broke, not that a rate was measured.
 #[test]
+#[ignore = "needs release builds; run: cargo build --release --bin logthing && cargo build --release -p loadgen && cargo test --test max_ingest_rate_harness_integration -- --ignored --test-threads=1"]
 fn short_run_emits_a_verdict_and_restores_tracked_configs() {
     let root = repo_root();
     let target = std::env::var_os("CARGO_TARGET_DIR")
