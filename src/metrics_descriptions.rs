@@ -441,8 +441,8 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     (
         Kind::Counter,
         "spool_corrupt",
-        "Spool entries quarantined to corrupt/ at startup (missing file, size or sha256 \
-         mismatch, unknown meta version).",
+        "Spool entries quarantined to corrupt/ (missing file, size or sha256 mismatch, \
+         unknown meta version), at the startup scan or at upload time.",
     ),
 ];
 

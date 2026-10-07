@@ -338,7 +338,7 @@ async fn test_restart_replays_complete_entries_and_discards_partial_tmp() {
             body: b"{\"sha256\":\"x\"}".to_vec(),
         };
         spool
-            .commit("hec.s3", "hec/x.parquet", &payload, Some(&d))
+            .commit("hec.s3", "hec/x.parquet", payload.clone(), Some(&d))
             .await
             .unwrap();
         assert_eq!(spool.pending_entries(), 1);

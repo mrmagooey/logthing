@@ -30,7 +30,7 @@ pub fn parse_hec_event_body(
             continue;
         }
         let obj: serde_json::Value = serde_json::from_str(line)
-            .map_err(|e| anyhow::anyhow!("HEC envelope JSON parse error: {e}"))?;
+            .map_err(|e| anyhow::Error::new(e).context("HEC envelope JSON parse error"))?;
 
         let event = obj
             .get("event")
@@ -119,8 +119,8 @@ pub fn parse_ndjson_body(
         if line.is_empty() {
             continue;
         }
-        let fields: serde_json::Value =
-            serde_json::from_str(line).map_err(|e| anyhow::anyhow!("NDJSON parse error: {e}"))?;
+        let fields: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| anyhow::Error::new(e).context("NDJSON parse error"))?;
 
         records.push(GenericRecord {
             sourcetype: default_sourcetype.to_string(),

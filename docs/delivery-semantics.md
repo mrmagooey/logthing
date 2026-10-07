@@ -78,8 +78,17 @@ directory fsynced again. An entry exists only once its `.meta` does, so a crash 
 committed entry with missing data. Deletion removes the `.meta` first.
 
 **Uploader.** For each entry: PUT the Parquet, then the descriptor, always under the **same
-keys** on every attempt; the entry is deleted only after the descriptor PUT succeeds.
-Failures retry with exponential backoff, 1 s doubling to 60 s (`spool_upload_errors`).
+keys**; the entry is deleted only after the descriptor PUT succeeds. Once the Parquet PUT has
+succeeded, retries (after a descriptor failure) upload only the descriptor, so a descriptor
+outage does not re-PUT the Parquet each time; this is remembered in memory only, so a restart
+in the middle of retries may PUT the Parquet once more. Failures retry with exponential
+backoff, 1 s doubling to 60 s (`spool_upload_errors`).
+
+**Concurrency.** Up to 4 entries upload at the same time, in the steady-state uploader and in
+the shutdown drain. Entries are started oldest first; one entry is never attempted twice at
+once; within an entry the Parquet always precedes the descriptor. Backoff is per entry. A
+drain of K entries against a slow sink takes about ceil(K/4) attempt durations instead of K,
+and the drain deadline still bounds every started attempt.
 
 **Startup replay.** On start the spool directory is scanned and every committed entry is
 uploaded. Entries whose files are missing, whose size or sha256 does not match the `.meta`, or
@@ -128,5 +137,6 @@ an application-level id carried in the event, never on `event_uuid`.
 ## Object Lock interplay
 
 On a bucket with Object Lock, every upload creates a new locked object version, so a replayed
-entry adds a new version (and a new retention period) rather than overwriting. See
+entry adds a new version (and a new retention period) rather than overwriting. A restart
+while a descriptor upload is failing may re-PUT the Parquet once. See
 [object-lock.md](object-lock.md).

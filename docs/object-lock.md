@@ -52,6 +52,20 @@ parameter.
 Retention applies per object version. If the spool replays an upload, the re-upload creates a
 new locked version under the same key, each with its own retain-until date.
 
+## Do not lock the descriptor bucket or prefix
+
+Enable Object Lock on the data bucket only. The Iceberg committer moves descriptors by
+copy-then-delete, so a locked descriptor bucket or prefix makes the delete fail and the
+descriptor is never finalised.
+
+## Replays and restarts
+
+Within a running process the spool does not re-PUT a Parquet file whose PUT already
+succeeded: if only the descriptor PUT fails, retries upload the descriptor alone, so a
+descriptor outage does not create a locked Parquet version per retry. This is in memory only:
+a restart in the middle of such retries may PUT the Parquet once more (one extra locked
+version).
+
 ## Integrity: Object Lock, not the descriptor checksum
 
 Iceberg descriptors carry a `sha256` of the Parquet bytes (see [iceberg.md](iceberg.md)). It is

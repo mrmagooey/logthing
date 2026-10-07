@@ -8,9 +8,12 @@
 //! `.meta` is removed first on delete, so a crash never leaves a committed entry whose
 //! data is missing.
 //!
-//! The uploader delivers entries one at a time, oldest first, retrying with exponential
-//! backoff. Every attempt re-uploads under the SAME keys (idempotent), so a crash between the
-//! Parquet and descriptor PUTs just repeats both on replay. Entries are independent and new
+//! The uploader delivers up to [`MAX_CONCURRENT_UPLOADS`] entries at once, scheduling oldest
+//! first and retrying with exponential backoff; one entry is never attempted twice at the
+//! same time. Every attempt uses the SAME keys (idempotent). Within a running process the
+//! Parquet PUT is not repeated once it succeeded (only the descriptor is retried), so a
+//! descriptor outage does not pile up locked object versions; a restart forgets that and may
+//! PUT the Parquet once more. Entries are independent and new
 //! flushes interleave with replay; Iceberg registration is set-based, so order is irrelevant.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -22,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use async_trait::async_trait;
+use futures::stream::{FuturesUnordered, StreamExt};
 use metrics::{counter, gauge};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -35,6 +39,9 @@ const META_VERSION: u32 = 1;
 const CORRUPT_DIR: &str = "corrupt";
 /// Upper bound for one upload attempt (Parquet + descriptor).
 const UPLOAD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Upper bound on entries uploading at the same time, for both the steady-state uploader and
+/// the shutdown drain.
+const MAX_CONCURRENT_UPLOADS: usize = 4;
 
 /// Why [`Spool::commit`] refused an entry.
 #[derive(Debug)]
@@ -62,6 +69,24 @@ struct Pending {
     meta: EntryMeta,
     attempts: u32,
     next_attempt: Instant,
+    /// The Parquet PUT succeeded in this process; retries upload only the descriptor, so a
+    /// failing descriptor does not create a new (Object Lock) version of the Parquet per
+    /// retry. In memory only: a restart resets it (one possible extra Parquet PUT).
+    parquet_done: bool,
+    /// An attempt is running; no second attempt may start for this entry.
+    in_flight: bool,
+}
+
+impl Pending {
+    fn new(meta: EntryMeta) -> Self {
+        Self {
+            meta,
+            attempts: 0,
+            next_attempt: Instant::now(),
+            parquet_done: false,
+            in_flight: false,
+        }
+    }
 }
 
 /// Where entries of one sink go.
@@ -94,14 +119,7 @@ impl Shared {
     fn insert(&self, id: String, meta: EntryMeta) {
         let entries = {
             let mut pending = self.lock();
-            pending.insert(
-                id,
-                Pending {
-                    meta,
-                    attempts: 0,
-                    next_attempt: Instant::now(),
-                },
-            );
+            pending.insert(id, Pending::new(meta));
             pending.len()
         };
         self.publish(entries);
@@ -121,6 +139,39 @@ impl Shared {
             pending.len()
         };
         self.publish(entries);
+    }
+}
+
+/// Exclusive right to attempt one entry; released on drop (also when the attempt future is
+/// cancelled), so an entry can never be stuck "in flight".
+struct Claim<'a> {
+    shared: &'a Shared,
+    id: String,
+    parquet_done: bool,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        if let Some(p) = self.shared.lock().get_mut(&self.id) {
+            p.in_flight = false;
+        }
+    }
+}
+
+impl Shared {
+    /// Claim `id` for an attempt unless it is gone or already being attempted.
+    fn claim(&self, id: &str) -> Option<Claim<'_>> {
+        let mut pending = self.lock();
+        let p = pending.get_mut(id)?;
+        if p.in_flight {
+            return None;
+        }
+        p.in_flight = true;
+        Some(Claim {
+            shared: self,
+            id: id.to_owned(),
+            parquet_done: p.parquet_done,
+        })
     }
 }
 
@@ -327,14 +378,7 @@ impl Spool {
             match validate_entry(&dir, &id) {
                 Ok(meta) => {
                     total += meta.parquet_bytes + meta.descriptor_bytes;
-                    pending.insert(
-                        id,
-                        Pending {
-                            meta,
-                            attempts: 0,
-                            next_attempt: Instant::now(),
-                        },
-                    );
+                    pending.insert(id, Pending::new(meta));
                 }
                 Err(Invalid::Corrupt(reason)) => quarantine(&dir, &id, &reason),
                 Err(Invalid::Transient(reason)) => {
@@ -396,16 +440,31 @@ impl Spool {
         &self,
         sink_id: &str,
         key: &str,
-        body: &[u8],
+        body: impl Into<Vec<u8>>,
         descriptor: Option<&DescriptorPayload>,
     ) -> Result<(), SpoolReject> {
+        self.commit_owned(sink_id, key, body.into(), descriptor)
+            .await
+            .map_err(|(reject, _body)| reject)
+    }
+
+    /// [`Spool::commit`] taking ownership of `body` and handing it back with the rejection,
+    /// so a caller that falls through to a direct upload does not need a copy up front. The
+    /// body is `None` only when the blocking write task panicked and took it with it.
+    pub(crate) async fn commit_owned(
+        &self,
+        sink_id: &str,
+        key: &str,
+        body: Vec<u8>,
+        descriptor: Option<&DescriptorPayload>,
+    ) -> Result<(), (SpoolReject, Option<Vec<u8>>)> {
         let desc_len = descriptor.map_or(0, |d| d.body.len()) as u64;
         let total = body.len() as u64 + desc_len;
         let prev = self.shared.bytes.fetch_add(total, Ordering::SeqCst);
         if prev.saturating_add(total) > self.max_bytes {
             self.shared.bytes.fetch_sub(total, Ordering::SeqCst);
             counter!("spool_rejected", "reason" => "full").increment(1);
-            return Err(SpoolReject::Full);
+            return Err((SpoolReject::Full, Some(body)));
         }
 
         // The blocking closure owns the whole post-reservation bookkeeping (insert into
@@ -415,7 +474,7 @@ impl Spool {
         let dir = self.dir.clone();
         let shared = self.shared.clone();
         let (sink_id, key) = (sink_id.to_owned(), key.to_owned());
-        let (body, descriptor) = (body.to_vec(), descriptor.cloned());
+        let descriptor = descriptor.cloned();
         let res = tokio::task::spawn_blocking(move || {
             let meta = EntryMeta {
                 version: META_VERSION,
@@ -434,22 +493,25 @@ impl Spool {
                 }
                 Err(e) => {
                     shared.bytes.fetch_sub(total, Ordering::SeqCst);
-                    Err(e.to_string())
+                    Err((e.to_string(), body))
                 }
             }
         })
         .await;
         match res {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(msg)) => {
+            Ok(Err((msg, body))) => {
                 counter!("spool_rejected", "reason" => "io").increment(1);
-                Err(SpoolReject::Io(msg))
+                Err((SpoolReject::Io(msg), Some(body)))
             }
             Err(e) => {
                 // The closure panicked before settling the reservation.
                 self.shared.bytes.fetch_sub(total, Ordering::SeqCst);
                 counter!("spool_rejected", "reason" => "io").increment(1);
-                Err(SpoolReject::Io(format!("spool write task failed: {e}")))
+                Err((
+                    SpoolReject::Io(format!("spool write task failed: {e}")),
+                    None,
+                ))
             }
         }
     }
@@ -478,19 +540,29 @@ impl Spool {
         UploaderHandle { stop, join }
     }
 
-    /// One immediate attempt per pending entry (ignoring backoff), oldest first, until every
-    /// entry was tried or `budget` elapses. Returns the number of entries still pending.
+    /// One immediate attempt per pending entry (ignoring backoff), oldest first, up to
+    /// [`MAX_CONCURRENT_UPLOADS`] at a time, until every entry was tried or `budget` elapses.
+    /// Returns the number of entries still pending.
     pub async fn drain(&self, budget: Duration) -> usize {
         let deadline = Instant::now() + budget;
         let ids: Vec<String> = self.shared.lock().keys().cloned().collect();
-        for id in ids {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            self.attempt(&id, remaining.min(UPLOAD_ATTEMPT_TIMEOUT))
-                .await;
-        }
+        futures::stream::iter(ids)
+            .map(|id| async move {
+                // Evaluated when the attempt actually starts, so entries that only get a
+                // slot after the deadline are skipped and every started attempt is bounded
+                // by what is left of the budget.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return;
+                }
+                if let Some(claim) = self.shared.claim(&id) {
+                    self.attempt(claim, remaining.min(UPLOAD_ATTEMPT_TIMEOUT))
+                        .await;
+                }
+            })
+            .buffer_unordered(MAX_CONCURRENT_UPLOADS)
+            .collect::<()>()
+            .await;
         self.pending_entries()
     }
 
@@ -501,43 +573,54 @@ impl Spool {
             .min(self.backoff_cap)
     }
 
-    fn next_due(&self) -> Due {
+    /// The oldest entry that is due and not already being attempted (claimed for the caller),
+    /// else when the earliest not-running entry becomes due.
+    fn next_due(&self) -> Due<'_> {
         let now = Instant::now();
-        let pending = self.shared.lock();
         let mut earliest: Option<Instant> = None;
-        for (id, p) in pending.iter() {
-            if p.next_attempt <= now {
-                return Due::Now(id.clone());
+        let mut due: Option<String> = None;
+        {
+            let pending = self.shared.lock();
+            for (id, p) in pending.iter() {
+                if p.in_flight {
+                    continue;
+                }
+                if p.next_attempt <= now {
+                    due = Some(id.clone());
+                    break;
+                }
+                earliest = Some(earliest.map_or(p.next_attempt, |e| e.min(p.next_attempt)));
             }
-            earliest = Some(earliest.map_or(p.next_attempt, |e| e.min(p.next_attempt)));
+        }
+        if let Some(claim) = due.and_then(|id| self.shared.claim(&id)) {
+            return Due::Now(claim);
         }
         earliest.map_or(Due::Idle, Due::At)
     }
 
     async fn run_uploader(&self, mut stop: watch::Receiver<bool>) {
+        // A stop request drops `running`, cancelling in-flight attempts: safe, because
+        // uploads are idempotent, all bookkeeping happens in blocking closures and each
+        // attempt's `Claim` is released on drop.
+        let mut running = FuturesUnordered::new();
         while !*stop.borrow() {
-            match self.next_due() {
-                Due::Now(id) => {
-                    // A stop request cancels an in-flight attempt: safe, because uploads are
-                    // idempotent and all bookkeeping happens in blocking closures.
-                    tokio::select! {
-                        () = self.attempt(&id, UPLOAD_ATTEMPT_TIMEOUT) => {}
-                        r = stop.changed() => if r.is_err() { break },
+            let mut wake_at: Option<Instant> = None;
+            while running.len() < MAX_CONCURRENT_UPLOADS {
+                match self.next_due() {
+                    Due::Now(claim) => running.push(self.attempt(claim, UPLOAD_ATTEMPT_TIMEOUT)),
+                    Due::At(t) => {
+                        wake_at = Some(t);
+                        break;
                     }
+                    Due::Idle => break,
                 }
-                Due::At(t) => {
-                    tokio::select! {
-                        () = self.shared.notify.notified() => {}
-                        () = tokio::time::sleep_until(t.into()) => {}
-                        r = stop.changed() => if r.is_err() { break },
-                    }
-                }
-                Due::Idle => {
-                    tokio::select! {
-                        () = self.shared.notify.notified() => {}
-                        r = stop.changed() => if r.is_err() { break },
-                    }
-                }
+            }
+            tokio::select! {
+                Some(()) = running.next(), if !running.is_empty() => {}
+                () = self.shared.notify.notified() => {}
+                () = tokio::time::sleep_until(wake_at.unwrap_or_else(Instant::now).into()),
+                    if wake_at.is_some() => {}
+                r = stop.changed() => if r.is_err() { break },
             }
         }
     }
@@ -560,8 +643,9 @@ impl Spool {
         }
     }
 
-    /// One delivery attempt of entry `id`, bounded by `limit`.
-    async fn attempt(&self, id: &str, limit: Duration) {
+    /// One delivery attempt of the claimed entry, bounded by `limit`.
+    async fn attempt(&self, claim: Claim<'_>, limit: Duration) {
+        let id = claim.id.as_str();
         let Some(meta) = self.shared.lock().get(id).map(|p| p.meta.clone()) else {
             return;
         };
@@ -614,9 +698,14 @@ impl Spool {
         };
 
         let upload = async {
-            s3.upload(&meta.key, parquet)
-                .await
-                .context("parquet upload")?;
+            if !claim.parquet_done {
+                s3.upload(&meta.key, parquet)
+                    .await
+                    .context("parquet upload")?;
+                if let Some(p) = self.shared.lock().get_mut(id) {
+                    p.parquet_done = true;
+                }
+            }
             if let Some(dkey) = &meta.descriptor_key {
                 match (&descriptor, desc_bytes) {
                     (Some(d), Some(bytes)) => {
@@ -654,8 +743,8 @@ impl Spool {
 }
 
 /// What the uploader loop should do next.
-enum Due {
-    Now(String),
+enum Due<'a> {
+    Now(Claim<'a>),
     At(Instant),
     Idle,
 }
@@ -756,6 +845,10 @@ fn wrap_with(
         return s3;
     }
     let sink_id = format!("{source}.s3");
+    // LATENT TRAP: ids are `<source>.s3`, so a second S3 writer for the same source would hit
+    // the duplicate-id error below and silently run unspooled (a direct upload with no
+    // durability). Today exactly one S3 writer exists per source; if that changes, the id
+    // must also carry something per-writer (and stay stable across restarts for replay).
     if let Err(e) = spool.register(&sink_id, s3.clone(), descriptor) {
         warn!(sink_id, "spool: {e}; this sink will not be spooled");
         return s3;
@@ -831,14 +924,17 @@ impl UploadSink for SpoolingUploadSink {
     ) -> anyhow::Result<UploadDisposition> {
         match self
             .spool
-            .commit(&self.sink_id, key, &body, descriptor.as_ref())
+            .commit_owned(&self.sink_id, key, body, descriptor.as_ref())
             .await
         {
             Ok(()) => Ok(UploadDisposition::Spooled),
-            Err(reject) => {
+            Err((reject, body)) => {
                 if should_log_now() {
                     warn!(sink = %self.sink_id, ?reject, "spool refused entry; uploading directly");
                 }
+                // `None` only if the write task panicked and consumed the body: report the
+                // failure so the writer requeues its rows (the pre-spool failure path).
+                let body = body.ok_or_else(|| anyhow::anyhow!("spool write task failed"))?;
                 self.inner.upload(key, body).await?;
                 Ok(UploadDisposition::Delivered)
             }
@@ -851,7 +947,7 @@ mod tests {
     use super::*;
     use crate::forwarding::buffered_writer::{DescriptorPayload, UploadDisposition, UploadSink};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
     type Uploads = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
     type Events = Arc<Mutex<Vec<String>>>;
@@ -866,6 +962,12 @@ mod tests {
         fail_next: Arc<AtomicUsize>,
         events: Events,
         calls: Arc<Mutex<Vec<(Instant, String)>>>,
+        /// Sleep this long (ms) inside every upload.
+        delay_ms: Arc<AtomicU64>,
+        /// Keys being uploaded right now; `dup` is set if one is entered twice at once.
+        active: Arc<Mutex<HashSet<String>>>,
+        dup: Arc<AtomicBool>,
+        max_active: Arc<AtomicUsize>,
     }
 
     /// A sink plus the handles tests use to observe and script it.
@@ -875,6 +977,9 @@ mod tests {
         fail: Arc<AtomicBool>,
         fail_next: Arc<AtomicUsize>,
         calls: Arc<Mutex<Vec<(Instant, String)>>>,
+        delay_ms: Arc<AtomicU64>,
+        dup: Arc<AtomicBool>,
+        max_active: Arc<AtomicUsize>,
     }
 
     impl Mem {
@@ -887,8 +992,15 @@ mod tests {
                 fail_next: Arc::default(),
                 events,
                 calls: Arc::default(),
+                delay_ms: Arc::default(),
+                active: Arc::default(),
+                dup: Arc::default(),
+                max_active: Arc::default(),
             };
             Mem {
+                delay_ms: m.delay_ms.clone(),
+                dup: m.dup.clone(),
+                max_active: m.max_active.clone(),
                 uploads: m.uploads.clone(),
                 fail: m.fail.clone(),
                 fail_next: m.fail_next.clone(),
@@ -931,6 +1043,19 @@ mod tests {
                 .fail_next
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok();
+            let delay = self.delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                let n = {
+                    let mut a = self.active.lock().unwrap();
+                    if !a.insert(key.to_string()) {
+                        self.dup.store(true, Ordering::SeqCst);
+                    }
+                    a.len()
+                };
+                self.max_active.fetch_max(n, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                self.active.lock().unwrap().remove(key);
+            }
             if scripted || self.fail.load(Ordering::SeqCst) {
                 anyhow::bail!("injected failure");
             }
@@ -1030,7 +1155,7 @@ mod tests {
     async fn test_commit_without_descriptor_writes_no_json() {
         let dir = tempfile::tempdir().unwrap();
         let spool = Spool::open(&cfg(dir.path(), 1 << 20)).unwrap();
-        spool.commit("s", "k", b"abc", None).await.unwrap();
+        spool.commit("s", "k", b"abc".to_vec(), None).await.unwrap();
         let names = sorted_names(dir.path());
         assert_eq!(names.len(), 2, "{names:?}");
         assert!(names.iter().any(|n| n.ends_with(".parquet")));
@@ -1042,7 +1167,7 @@ mod tests {
     async fn test_commit_rejects_full_without_writing_or_leaking_reservation() {
         let dir = tempfile::tempdir().unwrap();
         let spool = Spool::open(&cfg(dir.path(), 10)).unwrap();
-        let r = spool.commit("s", "k", &[0u8; 11], None).await;
+        let r = spool.commit("s", "k", vec![0u8; 11], None).await;
         assert!(matches!(r, Err(SpoolReject::Full)));
         assert!(sorted_names(dir.path()).is_empty());
         assert_eq!(spool.pending_bytes(), 0);
@@ -1056,7 +1181,7 @@ mod tests {
         let path = dir.path().join("spool");
         let spool = Spool::open(&cfg(&path, 1 << 20)).unwrap();
         std::fs::remove_dir_all(&path).unwrap();
-        let r = spool.commit("s", "k", b"x", None).await;
+        let r = spool.commit("s", "k", b"x".to_vec(), None).await;
         assert!(matches!(r, Err(SpoolReject::Io(_))), "{r:?}");
         assert_eq!(spool.pending_bytes(), 0);
         assert_eq!(spool.pending_entries(), 0);
@@ -1071,10 +1196,10 @@ mod tests {
         let path = dir.path().join("spool");
         let spool = Spool::open(&cfg(&path, 5)).unwrap();
         assert_eq!(counter(&snap, "spool_rejected", None), 0);
-        let _ = spool.commit("s", "k", &[0u8; 6], None).await;
+        let _ = spool.commit("s", "k", vec![0u8; 6], None).await;
         assert_eq!(counter(&snap, "spool_rejected", Some("full")), 1);
         std::fs::remove_dir_all(&path).unwrap();
-        let _ = spool.commit("s", "k", b"x", None).await;
+        let _ = spool.commit("s", "k", b"x".to_vec(), None).await;
         assert_eq!(counter(&snap, "spool_rejected", Some("io")), 1);
         assert_eq!(counter(&snap, "spool_rejected", None), 2);
     }
@@ -1380,8 +1505,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_uploader_keeps_entry_when_descriptor_upload_fails_then_retries_both_with_same_keys()
-     {
+    async fn test_uploader_keeps_entry_when_descriptor_upload_fails_then_retries_descriptor_only() {
         let dir = tempfile::tempdir().unwrap();
         let spool = fast_spool(dir.path());
         let events = Events::default();
@@ -1412,11 +1536,9 @@ mod tests {
             .iter()
             .map(|c| c.1.clone())
             .collect();
-        assert_eq!(s3_calls, vec!["hec/a.parquet", "hec/a.parquet"]);
+        assert_eq!(s3_calls, vec!["hec/a.parquet"], "parquet is not re-PUT");
         assert_eq!(ds_calls, vec!["a.json", "a.json"]);
-        let ups = s3.uploads.lock().unwrap();
-        assert_eq!(ups.len(), 2);
-        assert_eq!(ups[0], ups[1], "same key and identical bytes on the retry");
+        assert_eq!(s3.uploads.lock().unwrap().len(), 1);
         assert_eq!(
             ds.keys(),
             vec!["a.json"],
@@ -1432,7 +1554,7 @@ mod tests {
         let s3 = Mem::build("s3", "p", Events::default());
         s3.fail_next.store(5, Ordering::SeqCst);
         spool.register("s", s3.sink.clone(), None).unwrap();
-        spool.commit("s", "k", b"x", None).await.unwrap();
+        spool.commit("s", "k", b"x".to_vec(), None).await.unwrap();
         let up = spool.spawn_uploader();
         assert!(wait_for(|| spool.pending_entries() == 0).await);
         up.shutdown().await;
@@ -1465,7 +1587,10 @@ mod tests {
             Duration::from_millis(100),
         )
         .unwrap();
-        spool.commit("ghost.s3", "k", b"x", None).await.unwrap();
+        spool
+            .commit("ghost.s3", "k", b"x".to_vec(), None)
+            .await
+            .unwrap();
         let up = spool.spawn_uploader();
         tokio::time::sleep(Duration::from_millis(300)).await;
         up.shutdown().await;
@@ -1481,7 +1606,10 @@ mod tests {
         let spool = fast_spool(dir.path());
         let s3 = Mem::build("s3", "p", Events::default());
         spool.register("s", s3.sink.clone(), None).unwrap();
-        spool.commit("s", "k", b"PAR1", None).await.unwrap();
+        spool
+            .commit("s", "k", b"PAR1".to_vec(), None)
+            .await
+            .unwrap();
         let pq = sorted_names(dir.path())
             .into_iter()
             .find(|n| n.ends_with(".parquet"))
@@ -1512,8 +1640,8 @@ mod tests {
         let s3 = Mem::build("s3", "p", Events::default());
         s3.fail.store(true, Ordering::SeqCst);
         spool.register("s", s3.sink.clone(), None).unwrap();
-        spool.commit("s", "k1", b"1", None).await.unwrap();
-        spool.commit("s", "k2", b"2", None).await.unwrap();
+        spool.commit("s", "k1", b"1".to_vec(), None).await.unwrap();
+        spool.commit("s", "k2", b"2".to_vec(), None).await.unwrap();
         let started = Instant::now();
         assert_eq!(spool.drain(Duration::from_millis(200)).await, 2);
         assert_eq!(spool.drain(Duration::from_millis(200)).await, 2);
@@ -1535,7 +1663,7 @@ mod tests {
         let spool = fast_spool(dir.path());
         let s3 = Mem::build("s3", "p", Events::default());
         spool.register("s", s3.sink.clone(), None).unwrap();
-        spool.commit("s", "k", b"x", None).await.unwrap();
+        spool.commit("s", "k", b"x".to_vec(), None).await.unwrap();
         assert_eq!(spool.drain(Duration::ZERO).await, 1);
         assert!(s3.calls.lock().unwrap().is_empty());
     }
@@ -1558,7 +1686,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let spool = fast_spool(dir.path());
         spool.register("s", Arc::new(Hang), None).unwrap();
-        spool.commit("s", "k", b"x", None).await.unwrap();
+        spool.commit("s", "k", b"x".to_vec(), None).await.unwrap();
         let up = spool.spawn_uploader();
         tokio::time::sleep(Duration::from_millis(100)).await;
         tokio::time::timeout(Duration::from_secs(2), up.shutdown())
@@ -1574,7 +1702,11 @@ mod tests {
         let spool = fast_spool(dir.path());
         // Zero timeout: the commit future is polled once (starting the blocking write) and
         // then dropped while the write is in flight.
-        let r = tokio::time::timeout(Duration::ZERO, spool.commit("s", "k", b"abcd", None)).await;
+        let r = tokio::time::timeout(
+            Duration::ZERO,
+            spool.commit("s", "k", b"abcd".to_vec(), None),
+        )
+        .await;
         drop(r);
         assert!(wait_for(|| spool.pending_entries() == 1).await);
         assert_eq!(spool.pending_bytes(), 4);
@@ -1587,7 +1719,11 @@ mod tests {
         let path = dir.path().join("spool");
         let spool = Spool::open(&cfg(&path, 1 << 20)).unwrap();
         std::fs::remove_dir_all(&path).unwrap();
-        let r = tokio::time::timeout(Duration::ZERO, spool.commit("s", "k", b"abcd", None)).await;
+        let r = tokio::time::timeout(
+            Duration::ZERO,
+            spool.commit("s", "k", b"abcd".to_vec(), None),
+        )
+        .await;
         drop(r);
         assert!(wait_for(|| spool.pending_bytes() == 0).await);
         assert_eq!(spool.pending_entries(), 0);
@@ -1603,7 +1739,10 @@ mod tests {
         let s3 = Mem::build("s3", "p", Events::default());
         s3.fail_next.store(1, Ordering::SeqCst);
         spool.register("hec.s3", s3.sink.clone(), None).unwrap();
-        spool.commit("hec.s3", "k", b"x", None).await.unwrap();
+        spool
+            .commit("hec.s3", "k", b"x".to_vec(), None)
+            .await
+            .unwrap();
         assert_eq!(spool.drain(Duration::from_secs(5)).await, 1);
         assert_eq!(counter(&snap, "spool_upload_errors", Some("hec.s3")), 1);
         assert_eq!(counter(&snap, "spool_uploaded", None), 0);
@@ -1631,5 +1770,115 @@ mod tests {
         // already registered id: falls back to the input
         let again = wrap_with(Some(spool), s3.clone(), None, "hec");
         assert!(Arc::ptr_eq(&again, &s3));
+    }
+
+    #[tokio::test]
+    async fn test_descriptor_failures_do_not_repeat_the_parquet_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = fast_spool(dir.path());
+        let s3 = Mem::build("s3", "parquet", Events::default());
+        let ds = Mem::build("s3", "descriptor", Events::default());
+        ds.fail_next.store(3, Ordering::SeqCst);
+        spool
+            .register("hec.s3", s3.sink.clone(), Some(ds.sink.clone()))
+            .unwrap();
+        spool
+            .commit("hec.s3", "hec/a.parquet", b"PAR1", Some(&desc("a.json")))
+            .await
+            .unwrap();
+        let up = spool.spawn_uploader();
+        assert!(wait_for(|| spool.pending_entries() == 0).await);
+        up.shutdown().await;
+        assert_eq!(s3.calls.lock().unwrap().len(), 1, "exactly one parquet PUT");
+        assert_eq!(ds.calls.lock().unwrap().len(), 4, "3 failures + 1 success");
+        assert_eq!(ds.keys(), vec!["a.json"]);
+    }
+
+    async fn drain_fixture(k: usize, delay_ms: u64) -> (Arc<Spool>, Mem, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = fast_spool(dir.path());
+        let s3 = Mem::build("s3", "p", Events::default());
+        s3.delay_ms.store(delay_ms, Ordering::SeqCst);
+        spool.register("s", s3.sink.clone(), None).unwrap();
+        for i in 0..k {
+            spool
+                .commit("s", &format!("k{i:02}"), b"x", None)
+                .await
+                .unwrap();
+        }
+        (spool, s3, dir)
+    }
+
+    // Real time (not paused): the blocking file loads would let a paused clock auto-advance.
+    #[tokio::test]
+    async fn test_drain_runs_entries_concurrently_in_bounded_waves() {
+        let (spool, s3, _dir) = drain_fixture(8, 300).await;
+        let t0 = Instant::now();
+        let left = spool.drain(Duration::from_secs(30)).await;
+        let took = t0.elapsed();
+        assert_eq!(left, 0);
+        // ceil(8 / 4) = 2 waves of 300 ms; serial would be 2400 ms.
+        assert!(took >= Duration::from_millis(590), "{took:?}");
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert_eq!(s3.max_active.load(Ordering::SeqCst), MAX_CONCURRENT_UPLOADS);
+        assert!(!s3.dup.load(Ordering::SeqCst), "an entry ran twice at once");
+        assert_eq!(s3.keys().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_drain_starts_oldest_first_and_honours_deadline() {
+        let (spool, s3, _dir) = drain_fixture(9, 2000).await;
+        // The budget ends while the first wave is in flight: the 4 oldest are tried (and cut
+        // off at the deadline), the rest never start.
+        let t0 = Instant::now();
+        let left = spool.drain(Duration::from_millis(300)).await;
+        assert!(t0.elapsed() < Duration::from_millis(1500));
+        let mut calls: Vec<String> = s3
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.1.clone())
+            .collect();
+        calls.sort();
+        assert_eq!(calls, vec!["k00", "k01", "k02", "k03"]);
+        assert_eq!(left, 9);
+    }
+
+    #[tokio::test]
+    async fn test_uploader_runs_entries_concurrently_without_duplicates() {
+        let (spool, s3, _dir) = drain_fixture(8, 300).await;
+        let t0 = Instant::now();
+        let up = spool.spawn_uploader();
+        assert!(wait_for(|| spool.pending_entries() == 0).await);
+        let took = t0.elapsed();
+        up.shutdown().await;
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert_eq!(s3.max_active.load(Ordering::SeqCst), MAX_CONCURRENT_UPLOADS);
+        assert!(!s3.dup.load(Ordering::SeqCst), "an entry ran twice at once");
+        assert_eq!(s3.keys().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_drain_and_uploader_never_attempt_the_same_entry_twice() {
+        let (spool, s3, _dir) = drain_fixture(3, 300).await;
+        let up = spool.spawn_uploader();
+        assert!(wait_for(|| s3.calls.lock().unwrap().len() == 3).await);
+        // The uploader has all three in flight; a concurrent drain must skip them.
+        spool.drain(Duration::from_secs(10)).await;
+        up.shutdown().await;
+        assert!(!s3.dup.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_commit_owned_hands_the_body_back_when_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Spool::open(&cfg(dir.path(), 4)).unwrap();
+        let (reject, body) = spool
+            .commit_owned("s", "k", b"too large".to_vec(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(reject, SpoolReject::Full));
+        assert_eq!(body.as_deref(), Some(&b"too large"[..]));
     }
 }

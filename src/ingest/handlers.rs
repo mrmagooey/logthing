@@ -71,9 +71,30 @@ fn hec_auth_error() -> Response {
         .into_response()
 }
 
-fn hec_parse_error(msg: &str) -> Response {
+/// Describe a parse failure WITHOUT any of the payload: serde errors can quote the offending
+/// value (`invalid type: string "alice@example.com"`), and logs must never carry record
+/// contents (they bypass redaction). Only the error category and position survive.
+pub(crate) fn sanitized_parse_error(e: &anyhow::Error) -> String {
+    for cause in e.chain() {
+        if let Some(je) = cause.downcast_ref::<serde_json::Error>() {
+            return format!(
+                "JSON {:?} error at line {} column {}",
+                je.classify(),
+                je.line(),
+                je.column()
+            );
+        }
+    }
+    if e.chain().any(|c| c.is::<std::str::Utf8Error>()) {
+        return "body is not valid UTF-8".to_string();
+    }
+    // Remaining errors are our own fixed strings (e.g. "missing required 'event' key").
+    e.to_string()
+}
+
+fn hec_parse_error(e: &anyhow::Error) -> Response {
     metrics::counter!("hec_parse_errors").increment(1);
-    tracing::warn!("HEC parse error: {}", msg);
+    tracing::warn!("HEC parse error: {}", sanitized_parse_error(e));
     (
         StatusCode::BAD_REQUEST,
         Json(json!({"text": "Invalid data format", "code": 6})),
@@ -207,7 +228,7 @@ pub async fn handle_hec_event(
     let default_st = params.sourcetype.as_deref().unwrap_or(DEFAULT_SOURCETYPE);
     let mut records = match parse_hec_event_body(&body, default_st) {
         Ok(r) => r,
-        Err(e) => return hec_parse_error(&e.to_string()),
+        Err(e) => return hec_parse_error(&e),
     };
     // Identity is assigned after parse and after redaction.
     redact_generic_records(&ingest, &mut records);
@@ -252,7 +273,7 @@ pub async fn handle_hec_raw(
     let st = params.sourcetype.as_deref().unwrap_or(DEFAULT_SOURCETYPE);
     let mut record = match parse_hec_raw_body(&body, st) {
         Ok(r) => r,
-        Err(e) => return hec_parse_error(&e.to_string()),
+        Err(e) => return hec_parse_error(&e),
     };
     redact_generic_records(&ingest, std::slice::from_mut(&mut record));
     assign_event_uuids(std::slice::from_mut(&mut record));
@@ -296,7 +317,7 @@ pub async fn handle_ndjson(
     let st = params.sourcetype.as_deref().unwrap_or(DEFAULT_SOURCETYPE);
     let mut records = match parse_ndjson_body(&body, st) {
         Ok(r) => r,
-        Err(e) => return hec_parse_error(&e.to_string()),
+        Err(e) => return hec_parse_error(&e),
     };
     redact_generic_records(&ingest, &mut records);
     assign_event_uuids(&mut records);
@@ -312,6 +333,29 @@ pub async fn handle_ndjson(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sanitized_parse_error_never_contains_payload_values() {
+        // serde's own message quotes the value; the sanitised one must not.
+        let raw = serde_json::from_str::<u32>("\"alice@example.com\"").unwrap_err();
+        assert!(raw.to_string().contains("alice@example.com"), "premise");
+        let err = anyhow::Error::new(raw).context("NDJSON parse error");
+        let msg = sanitized_parse_error(&err);
+        assert!(!msg.contains("alice"), "{msg}");
+        assert!(!msg.contains("example.com"), "{msg}");
+        assert!(msg.contains("line 1"), "{msg}");
+    }
+
+    #[test]
+    fn test_parse_helpers_errors_sanitise_without_payload_text() {
+        let body = b"{\"event\": \"ok\"}\n{\"event\": \"ssn 123-45-6789\" oops}";
+        let e = crate::ingest::parse::parse_hec_event_body(body, "st").unwrap_err();
+        let msg = sanitized_parse_error(&e);
+        assert!(!msg.contains("123-45-6789"), "{msg}");
+        let e = crate::ingest::parse::parse_ndjson_body(b"{\"a\": \"ssn 123-45-6789\" x}", "st")
+            .unwrap_err();
+        assert!(!sanitized_parse_error(&e).contains("123-45-6789"));
+    }
     use axum::{
         body::Body,
         http::{Request, StatusCode},

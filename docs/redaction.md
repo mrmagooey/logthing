@@ -75,7 +75,13 @@ needs a restart.
 - **Hash input:** a string value is hashed as its raw UTF-8 bytes (so the pseudonym of
   `alice@example.com` is `HMAC-SHA256(key, "alice@example.com")`). Any other JSON value
   (number, bool, object, array) is hashed as its canonical JSON text: compact, object keys
-  sorted. JSON null is left as null. Each array element is hashed separately.
+  sorted. JSON null is left as null. A whole array or object found at the final path key is
+  hashed as one canonical JSON text (one pseudonym); arrays are only walked element by element
+  while the path is still being traversed (e.g. `items.sku` over an array of objects hashes each
+  object's `sku`).
+- **Parse-error logs:** HEC / NDJSON / OTLP parse and decode failures are logged with the error
+  category and line/column only. Logs never include record contents (they would bypass
+  redaction).
 - **Order:** drop, then hash, then mask. Masks therefore see hash output; a pattern broad
   enough to match 64 hex characters would mask a pseudonym.
 - **Mask scope:** masks apply to string values only. Object keys and non-string leaves

@@ -5724,12 +5724,20 @@ pub async fn handle_otlp_logs(
     let req: ExportLogsServiceRequest =
         if ct.starts_with("application/x-protobuf") || ct.starts_with("application/protobuf") {
             ExportLogsServiceRequest::decode(body.as_ref()).map_err(|e| {
+                // prost's message names fields/lengths only, never payload bytes.
                 warn!("OTLP protobuf decode error from {}: {e}", addr.ip());
                 StatusCode::BAD_REQUEST
             })?
         } else if ct.starts_with("application/json") {
             serde_json::from_slice::<ExportLogsServiceRequest>(&body).map_err(|e| {
-                warn!("OTLP JSON decode error from {}: {e}", addr.ip());
+                // serde messages can quote the offending value; log category and position only.
+                warn!(
+                    "OTLP JSON decode error from {}: {:?} error at line {} column {}",
+                    addr.ip(),
+                    e.classify(),
+                    e.line(),
+                    e.column()
+                );
                 StatusCode::BAD_REQUEST
             })?
         } else {

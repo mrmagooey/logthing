@@ -84,9 +84,9 @@ pub fn new_event_uuid() -> String {
 /// Give every record in `records` a fresh `event_uuid`.
 ///
 /// ORDERING CONTRACT: handlers call this as a SEPARATE step AFTER parsing/mapping AND AFTER
-/// redaction (`IngestState::{hec,otlp}_redactor`), and BEFORE `try_send`. Redaction must therefore never see or
-/// depend on the id, and the id must never be derived from redacted-away content. Do not fold
-/// id generation into the parsers.
+/// redaction (`IngestState::{hec,otlp}_redactor`), and BEFORE `try_send`. Redaction must
+/// therefore never see or depend on the id, and the id must never be derived from
+/// redacted-away content. Do not fold id generation into the parsers.
 pub fn assign_event_uuids<R: EventUuid>(records: &mut [R]) {
     for r in records.iter_mut() {
         r.set_event_uuid(new_event_uuid());
