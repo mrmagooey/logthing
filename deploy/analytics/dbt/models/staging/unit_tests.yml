@@ -60,6 +60,8 @@ unit_tests:
     expect:
       format: dict
       rows:
+        # Every row names the same keys: dbt's dict format builds one SELECT per row and
+        # Trino's UNION ALL rejects rows with differing column counts.
         - {sourcetype: app, event_uuid: h-1, index: main, fields: '{"m":"a"}'}
-        - {sourcetype: old, fields: '{"m":"legacy1"}'}
-        - {sourcetype: old, fields: '{"m":"legacy2"}'}
+        - {sourcetype: old, event_uuid: null, index: null, fields: '{"m":"legacy1"}'}
+        - {sourcetype: old, event_uuid: null, index: null, fields: '{"m":"legacy2"}'}

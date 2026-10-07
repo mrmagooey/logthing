@@ -131,8 +131,8 @@ def test_rust_schema_is_parsed(table):
 
 def test_every_staging_column_exists_in_the_rust_schema_with_a_compatible_type():
     staging = staging_columns()
-    assert set(staging) == {"wef", "zeek_conn", "zeek_dns", "ipfix", "sflow_flow", "suricata", "otlp",
-                            "hec"}
+    assert set(staging) == {
+        "wef", "zeek_conn", "zeek_dns", "ipfix", "sflow_flow", "suricata", "otlp", "hec"}
     problems = []
     for table, cols in staging.items():
         actual = rust_columns(table)

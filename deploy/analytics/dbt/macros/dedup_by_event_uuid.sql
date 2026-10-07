@@ -1,5 +1,5 @@
 {#
-  One row per event_uuid: the earliest-received copy wins (then the earliest partition_time).
+  One row per event_uuid: the earliest-received copy wins (then the earliest partition_time, then "time" so ties are deterministic).
   Rows whose event_uuid is NULL (HEC rows written before 0.22.0) are all kept: they have no
   identity to dedup on, and `partition by` would otherwise collapse them into one row.
   `columns` must list every column of `relation` (Trino has no SELECT * EXCEPT); a pytest
@@ -13,7 +13,7 @@ select
 from (
     select *,
         row_number() over (
-            partition by event_uuid order by received_at, partition_time
+            partition by event_uuid order by received_at, partition_time, "time"
         ) as dedup_rn
     from {{ relation }}
 ) as ranked

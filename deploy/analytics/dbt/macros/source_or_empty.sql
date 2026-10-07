@@ -18,6 +18,8 @@ select
 {%- endfor %}
 where false
 {%- elif execute -%}
+{#- Intentional: a requested column absent from the table is NULL-filled, not an error. A typo in
+    a model's column list is caught by the staging/Rust-schema parity pytest, not here. -#}
 {%- set existing = adapter.get_columns_in_relation(rel) | map(attribute='name') | map('lower') | list -%}
 select
 {%- for name, type in columns.items() %}

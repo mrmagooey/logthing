@@ -21,7 +21,13 @@ require_dbt()
 # CREATE below mirrors what the committer produces: pyiceberg maps Arrow integers of <= 32 bits to
 # Iceberg int (Trino integer), so the staging casts to bigint are real widenings.
 STAGING = ["stg_wef", "stg_zeek_conn", "stg_zeek_dns", "stg_ipfix", "stg_sflow_flow",
-           "stg_suricata"]
+           "stg_suricata", "stg_otlp_typed", "stg_hec_typed", "stg_otlp", "stg_hec"]
+TZ6 = "timestamp(6) with time zone"
+# Types the OTLP/HEC staging views must expose whether the lake is empty or populated.
+OTLP_HEC_TYPES = {"stg_otlp.severity_number": "integer", "stg_otlp.flags": "bigint",
+                  "stg_otlp.time": TZ6, "stg_otlp.event_uuid": "varchar",
+                  "stg_hec.index": "varchar", "stg_hec.indexed_fields": "varchar",
+                  "stg_hec.time": TZ6}
 TS = "TIMESTAMP '2026-10-01 12:00:00 UTC'"
 
 
@@ -67,6 +73,18 @@ CREATE = {
                   "output_ifindex integer, extra varchar, partition_time timestamp(6) with time zone)",
     "suricata": "(event_type varchar, received_at timestamp(6) with time zone, src_ip varchar, "
                 "payload varchar, partition_time timestamp(6) with time zone)",
+    "otlp": "(event_uuid varchar, \"time\" timestamp(6) with time zone, "
+            "observed_time timestamp(6) with time zone, received_at timestamp(6) with time zone, "
+            "severity_number integer, severity_text varchar, body varchar, service_name varchar, "
+            "service_namespace varchar, service_instance_id varchar, host_name varchar, "
+            "peer_addr varchar, trace_id varchar, span_id varchar, flags bigint, "
+            "event_name varchar, scope_name varchar, scope_version varchar, "
+            "resource_attributes varchar, attributes varchar, "
+            "partition_time timestamp(6) with time zone)",
+    # LEGACY 6-column hec table, as it exists before the committer evolves it.
+    "hec": "(sourcetype varchar, host varchar, \"time\" timestamp(6) with time zone, "
+           "received_at timestamp(6) with time zone, fields varchar, "
+           "partition_time timestamp(6) with time zone)",
 }
 
 INSERT = {
@@ -87,6 +105,9 @@ INSERT = {
                                           "severity": 1, "category": "Attempted Recon",
                                           "action": "allowed"}}))
                 + f", {TS})",
+    "otlp": f"VALUES ('u1', {TS}, NULL, {TS}, 9, 'INFO', 'first', 'svc', NULL, NULL, 'h', "
+            f"'10.0.0.9', NULL, NULL, NULL, NULL, 'scope', '1', '{{}}', '{{}}', {TS})",
+    "hec": f"VALUES ('app', 'h1', {TS}, {TS}, '{{\"m\":\"legacy\"}}', {TS})",
 }
 
 
@@ -107,6 +128,15 @@ def dbt_stack(tmp_path_factory):
         s.down()
 
 
+def staging_types(stack):
+    out = stack.trino(
+        "SELECT table_name || '.' || column_name, data_type FROM iceberg.information_schema.columns "
+        "WHERE table_schema = 'logs' AND ((table_name = 'stg_otlp' AND column_name IN "
+        "('severity_number','flags','time','event_uuid')) OR "
+        "(table_name = 'stg_hec' AND column_name IN ('index','indexed_fields','time')))")
+    return dict(line.split("\t") for line in out.splitlines())
+
+
 def test_staging_builds_against_an_empty_lake(dbt_stack):
     r = run_dbt(dbt_stack, "build", "--select", "staging")
     assert dbt_failure(r) is None, dbt_failure(r)
@@ -114,6 +144,8 @@ def test_staging_builds_against_an_empty_lake(dbt_stack):
     assert sorted(shown) == sorted(STAGING)
     for name in STAGING:
         assert dbt_stack.trino(f"SELECT count(*) FROM iceberg.logs.{name}") == "0", name
+    assert staging_types(dbt_stack) == OTLP_HEC_TYPES  # typed NULL views, not untyped
+
 
 
 def test_views_built_before_a_table_existed_stay_empty_until_rebuilt(dbt_stack):
@@ -145,13 +177,60 @@ def test_rebuild_is_idempotent(dbt_stack):
 def test_full_build_runs_unit_tests_and_schema_tests(dbt_stack):
     r = run_dbt(dbt_stack, "build")
     assert dbt_failure(r) is None, dbt_failure(r)
-    declared = yaml.safe_load((DBT_DIR / "models" / "ocsf" / "unit_tests.yml").read_text())
+    declared = [t["name"] for sub in ("ocsf", "staging") for t in yaml.safe_load(
+        (DBT_DIR / "models" / sub / "unit_tests.yml").read_text())["unit_tests"]]
     ran = re.findall(r"START unit_test ", r.stdout)
-    assert len(ran) == len(declared["unit_tests"]) > 0, (len(ran), r.stdout[-3000:])
+    assert len(ran) == len(declared) > 0, (len(ran), r.stdout[-3000:])
+    for name in ("stg_otlp_keeps_one_row_per_event_uuid",
+                 "stg_hec_dedups_but_keeps_every_legacy_null_uuid_row"):
+        assert name in declared and name in r.stdout, name
 
 
 def tsv(stack, sql):
     return [tuple(line.split("\t")) for line in stack.trino(sql).splitlines()]
+
+
+def test_legacy_hec_table_without_new_columns_builds_with_null_event_uuid(dbt_stack):
+    # seed() created hec with only the 6 pre-0.22 columns, like an un-evolved committer table.
+    # (Stack.trino strips trailing tabs, so count NULLs per column rather than compare rows.)
+    assert dbt_stack.trino("SELECT count(*) FROM iceberg.logs.hec") == "1"
+    assert dbt_stack.trino("SELECT sourcetype FROM iceberg.logs.stg_hec") == "app"
+    for col in ("event_uuid", "source", '"index"', "indexed_fields"):
+        assert dbt_stack.trino(
+            f"SELECT count(*) FROM iceberg.logs.stg_hec WHERE {col} IS NULL") == "1", col
+
+
+def test_stg_otlp_and_stg_hec_dedup_after_committer_style_evolution(dbt_stack):
+    s = dbt_stack
+    # The committer's additive evolution, then retried rows with duplicate event_uuid.
+    for col in ("event_uuid", "source", '"index"', "indexed_fields"):
+        s.trino(f"ALTER TABLE iceberg.logs.hec ADD COLUMN {col} varchar")
+    s.trino("INSERT INTO iceberg.logs.hec VALUES "
+            f"('app','h1',{TS},{TS},'{{\"m\":\"a\"}}',{TS},'h-1','src','main','{{\"env\":\"e2e\"}}'),"
+            f"('app','h1',{TS},TIMESTAMP '2026-10-01 12:00:09 UTC','{{\"m\":\"a-dup\"}}',{TS},"
+            "'h-1','src','main','{}'),"
+            f"('app','h1',{TS},{TS},'{{\"m\":\"b\"}}',{TS},'h-2','src','main','{{}}')")
+    s.trino("INSERT INTO iceberg.logs.otlp VALUES "
+            f"('u1', {TS}, NULL, TIMESTAMP '2026-10-01 12:00:09 UTC', 9, 'INFO', 'retry copy', "
+            f"'svc', NULL, NULL, 'h', NULL, NULL, NULL, NULL, NULL, NULL, NULL, '{{}}', '{{}}', {TS}),"
+            f"('u2', {TS}, NULL, {TS}, 17, 'ERROR', 'second', 'svc', NULL, NULL, 'h', NULL, "
+            f"'0af7651916cd43dd8448eb211c80319c', 'b7ad6b7169203331', 1, NULL, NULL, NULL, "
+            f"'{{}}', '{{}}', {TS})")
+    r = run_dbt(s, "build", "--select", "staging")
+    assert dbt_failure(r) is None, dbt_failure(r)
+    assert s.trino("SELECT count(*) FROM iceberg.logs.otlp") == "3"
+    assert s.trino("SELECT count(*) FROM iceberg.logs.stg_otlp") == "2"
+    assert s.trino("SELECT body FROM iceberg.logs.stg_otlp WHERE event_uuid = 'u1'") == "first"
+    assert s.trino("SELECT count(*) FROM iceberg.logs.hec") == "4"
+    # 1 legacy NULL-uuid row kept + h-1 once + h-2
+    assert s.trino("SELECT count(*) FROM iceberg.logs.stg_hec") == "3"
+    assert s.trino("SELECT count(*) FROM iceberg.logs.stg_hec WHERE event_uuid IS NULL") == "1"
+    assert s.trino("SELECT json_extract_scalar(fields, '$.m') FROM iceberg.logs.stg_hec "
+                   "WHERE event_uuid = 'h-1'") == "a"
+
+
+def test_otlp_and_hec_staging_columns_are_typed_on_real_rows(dbt_stack):
+    assert staging_types(dbt_stack) == OTLP_HEC_TYPES
 
 
 def test_seeded_rows_land_in_ocsf_authentication(dbt_stack):
