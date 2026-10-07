@@ -743,3 +743,17 @@ def test_logthing_gets_hec_and_otlp_sinks_and_token_secret_refs():
 def test_notes_say_how_to_read_the_ingest_tokens():
     text = notes()
     assert "hec-token" in text and "otlp-bearer-token" in text
+
+
+def test_require_tokens_init_container_guards_empty_tokens():
+    for sets in ((), ("credentials.existingSecret=mine",)):
+        docs = render(*sets)
+        secret = "mine" if sets else f"{FULL}-credentials"
+        init = {c["name"]: c for c in pod_spec(by(docs, "Deployment", f"{FULL}-logthing"))
+                ["initContainers"]}["require-tokens"]
+        refs = {e["name"]: e for e in init["env"]}
+        assert set(refs) == {"HEC_TOKEN", "OTLP_BEARER_TOKEN"}
+        for name, key in (("HEC_TOKEN", "hec-token"), ("OTLP_BEARER_TOKEN", "otlp-bearer-token")):
+            assert "value" not in refs[name]
+            assert refs[name]["valueFrom"]["secretKeyRef"] == {"name": secret, "key": key}
+        assert "exit 1" in " ".join(init["command"])

@@ -15,7 +15,8 @@ Send application logs (plaintext HTTP; front with TLS if untrusted networks can 
   kubectl get secret -n {{ .Release.Namespace }} {{ include "la.secretName" . }} -o jsonpath='{.data.otlp-bearer-token}' | base64 -d   # Authorization: Bearer
   kubectl get secret -n {{ .Release.Namespace }} {{ include "la.secretName" . }} -o jsonpath='{.data.hec-token}' | base64 -d   # Authorization: Splunk
 {{- if .Values.credentials.existingSecret }}
-  With credentials.existingSecret, add the keys hec-token and otlp-bearer-token to your Secret first.
+  With credentials.existingSecret, add the keys hec-token and otlp-bearer-token to your Secret first,
+  non-empty: the logthing pod's require-tokens initContainer refuses to start if either is empty.
 {{- end }}
 
 Tables appear only after the first committer run (CronJob {{ include "la.fullname" . }}-committer,

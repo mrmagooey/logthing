@@ -67,3 +67,12 @@ def test_dbt_readme_documents_stg_otlp_and_stg_hec_decisions():
     for needle in ("stg_otlp", "stg_hec", "event_uuid", "earliest", "not incremental",
                    "legacy", "NULL"):
         assert needle in text, needle
+
+
+def test_readme_existing_secret_keys_match_chart_secret():
+    chart_keys = set(re.findall(r"(?m)^  ([a-z0-9-]+): \{\{ include \"la.cred\"",
+                                (CHART / "templates" / "secret.yaml").read_text()))
+    assert "hec-token" in chart_keys and "otlp-bearer-token" in chart_keys
+    start = README.index("`credentials.existingSecret` naming a")
+    block = README[start:README.index("- **Trino TLS:**", start)]
+    assert set(re.findall(r"(?m)^  - `([a-z0-9-]+)`$", block)) == chart_keys

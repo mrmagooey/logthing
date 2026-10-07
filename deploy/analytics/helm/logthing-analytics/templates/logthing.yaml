@@ -45,6 +45,24 @@ spec:
     spec:
       initContainers:
         {{- include "la.waitFor" (dict "root" . "target" "garage") | nindent 8 }}
+        # Refuse to start with an empty token: logthing only warns and would then serve the
+        # HEC / OTLP endpoints unauthenticated (possible with credentials.existingSecret).
+        - name: require-tokens
+          image: {{ .Values.bootstrap.image }}
+          command:
+            - sh
+            - -c
+            - |
+              for v in HEC_TOKEN OTLP_BEARER_TOKEN; do
+                eval "val=\$$v"
+                if [ -z "$val" ]; then
+                  echo "ERROR: Secret key for $v (hec-token / otlp-bearer-token) is empty; refusing to start logthing with unauthenticated HEC/OTLP endpoints" >&2
+                  exit 1
+                fi
+              done
+          env:
+            {{- include "la.secretEnv" (dict "root" . "name" "HEC_TOKEN" "key" "hec-token") | nindent 12 }}
+            {{- include "la.secretEnv" (dict "root" . "name" "OTLP_BEARER_TOKEN" "key" "otlp-bearer-token") | nindent 12 }}
       containers:
         - name: logthing
           image: {{ .Values.logthing.image }}

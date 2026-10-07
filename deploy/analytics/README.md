@@ -227,6 +227,10 @@ As with compose, tables appear 1-2 minutes after data arrives (the committer is 
   - `metabase-admin-password`
   - `hec-token`
   - `otlp-bearer-token`
+  The logthing pod has a `require-tokens` initContainer that reads `hec-token` and
+  `otlp-bearer-token` and fails (the pod never starts) if either is missing or empty, because
+  logthing would otherwise serve HEC/OTLP unauthenticated. Without these two keys in your Secret
+  the pod sits in `CreateContainerConfigError`; with them empty it sits in `Init:Error`.
 - **Trino TLS:** the chart generates a private CA and certificate into Secret `<fullname>-trino-tls` (kept across upgrades by `lookup` regardless of expiry; the server certificate is valid for 825 days and the CA for 10 years, and nothing renews it automatically since Helm cannot parse x509. Before it expires, delete the Secret, `helm upgrade`, then restart Trino and Metabase; or supply `trino.tls.existingSecret`). Provide your own with `trino.tls.existingSecret` (keys `ca.pem` and `server.pem`). The Service exposes only HTTPS 8443.
   **GitOps:** a lookup-less render (`helm template | kubectl apply`, Argo CD, Flux) cannot read the
   live Secret, so it would regenerate the CA and certificate on every render. Set
@@ -262,7 +266,8 @@ kubectl exec -n <ns> <release>-logthing-analytics-postgres-0 -- psql -U postgres
   -c "CREATE USER metabase WITH PASSWORD '<metabase-db-password>'" -c "CREATE DATABASE metabase OWNER metabase"
 ```
 
-With `credentials.existingSecret`, add the three `metabase-*` keys to your Secret first.
+With `credentials.existingSecret`, add the three `metabase-*` keys to your Secret first (the full key
+list is under Credentials; `hec-token` and `otlp-bearer-token` are required too).
 
 ## Sending application logs (OTLP and HEC)
 
