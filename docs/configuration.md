@@ -82,6 +82,13 @@ port: `LOGTHING__SYSLOG__UDP_PORT`, `LOGTHING__SYSLOG__TCP_PORT`,
 `LOGTHING__<SECTION>__BIND_ADDRESS` to change which interface they listen on;
 syslog's bind address is fixed at `0.0.0.0` and has no such override.
 
+## HEC and OTLP require a sink
+
+`[hec] enabled = true` needs `[hec.s3]` or `[hec.local]`, and `[otlp] enabled = true` needs
+`[otlp.s3]` or `[otlp.local]`. Without one, startup fails with a message naming the missing
+table. Environment overrides are validated the same way: `LOGTHING__HEC__ENABLED=true` with no
+HEC sink configured also fails startup. See [hec.md](hec.md) and [otlp.md](otlp.md).
+
 ## Running
 
 ```bash

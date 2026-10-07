@@ -34,6 +34,9 @@ directory = "/var/lib/logthing/otlp"
 | JSON | `Content-Type: application/json` (OTLP/JSON, camelCase) is accepted |
 | gRPC (port 4317) | **Not supported yet.** Use `otlphttp`. |
 
+OTLP/JSON: send enum fields as integers (`"severityNumber": 9`); enum-name strings such as
+`SEVERITY_NUMBER_INFO` are not accepted by the current decoder.
+
 Request bodies may be gzip-compressed (`Content-Encoding: gzip`), for both protobuf and JSON.
 The decompressed size is capped at 64 MiB (`413` beyond that); any other `Content-Encoding`
 gets `415`; a corrupt gzip stream gets `400`.

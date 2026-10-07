@@ -10,8 +10,8 @@ A high-performance log ingestion server written in Rust. Receives Windows Event 
 - **Zeek NDJSON Support**: TCP NDJSON listener for Zeek network security monitor logs; per-stream typed Parquet schemas with S3 persistence
 - **Suricata EVE JSON Support**: TCP NDJSON listener for Suricata EVE JSON records; S3 Parquet persistence
 - **sFlow Support**: UDP listener for sFlow v5 flow and counter samples; S3 Parquet persistence
-- **HEC Ingest**: Splunk HTTP Event Collector-compatible endpoints (`/services/collector/event`, `/services/collector/raw`, `/ingest`)
-- **OTLP Logs Support**: `POST /v1/logs` OTLP/HTTP log ingest (protobuf or JSON); built when the `otlp` Cargo feature is enabled
+- **HEC Ingest**: Splunk HTTP Event Collector-compatible endpoints (`/services/collector/event`, `/services/collector/raw`, `/ingest`); typed envelope columns (`source`, `index`, `indexed_fields`) and a UUIDv7 `event_uuid`; gzip request bodies; `503` backpressure when the writer is saturated — see [docs/hec.md](docs/hec.md)
+- **OTLP Logs Support**: `POST /v1/logs` OTLP/HTTP log ingest (protobuf or JSON, gzip accepted) into its own typed Parquet/Iceberg table (`service_name`, severity, `trace_id`, `span_id`, `body`, attributes); built when the `otlp` Cargo feature is enabled (default); gRPC (4317) is not supported yet — see [docs/otlp.md](docs/otlp.md)
 - **DNS Log Parsing**: Automatic parsing of BIND, Unbound, and PowerDNS query logs
 - **Generic Event Parser**: YAML-configurable parsing for specific Windows event codes
 - **Parquet Storage**: Aggregate events into Parquet files and store in S3-compatible storage or on local disk
@@ -166,6 +166,8 @@ repository conventions.
 - [docs/syslog.md](docs/syslog.md) — syslog listener, HTTP endpoint, DNS log parsing, and syslog S3 persistence
 - [docs/ipfix.md](docs/ipfix.md) — IPFIX/NetFlow ingestion and S3 persistence
 - [docs/zeek.md](docs/zeek.md) — Zeek NDJSON ingestion, typed per-stream schemas, and S3 persistence
+- [docs/hec.md](docs/hec.md) — HEC/NDJSON ingest, columns, gzip, backpressure, migration
+- [docs/otlp.md](docs/otlp.md) — OTLP/HTTP log ingest, typed schema, service partitions, exporter setup, migration
 - [docs/aggregation.md](docs/aggregation.md) — log aggregation rules and output schema
 - [docs/iceberg.md](docs/iceberg.md) — Iceberg descriptor output and a suggested committer/catalog deployment pattern
 - [committer/README.md](committer/README.md) — the shipped Iceberg descriptor committer (container image, configuration, end-to-end test)

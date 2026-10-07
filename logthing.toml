@@ -307,3 +307,22 @@ bind_address = "0.0.0.0"   # env: LOGTHING__SFLOW__BIND_ADDRESS
 # source = "zeek"
 # stream = "dns"
 # group_by = ["query", "id.orig_h"]
+
+# HEC (Splunk HTTP Event Collector) and NDJSON ingest. Disabled by default.
+# Enabling it REQUIRES a sink ([hec.s3] and/or [hec.local]); otherwise startup fails.
+# See docs/hec.md.
+# [hec]
+# enabled = true
+# token = "change-me"
+# [hec.local]
+# directory = "/data/hec"
+#
+# OTLP/HTTP logs (POST /v1/logs). Disabled by default. Since 0.22.0 OTLP has its OWN sinks and no
+# longer writes to [hec] sinks; enabling it REQUIRES [otlp.s3] and/or [otlp.local].
+# See docs/otlp.md (including the Migration section).
+# [otlp]
+# enabled = true
+# bearer_token = "change-me"
+# max_service_partitions = 64
+# [otlp.local]
+# directory = "/data/otlp"

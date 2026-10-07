@@ -3532,4 +3532,44 @@ directory = "/tmp/otlp"
         cfg.otlp.max_service_partitions = 0;
         assert_eq!(validate_config_invariants(&cfg), Ok(()));
     }
+
+    fn example_config_text() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("logthing.toml");
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn repo_example_config_still_parses_and_validates() {
+        let cfg: Config =
+            toml::from_str(&example_config_text()).expect("example logthing.toml parses");
+        validate_config_invariants(&cfg).expect("example logthing.toml validates");
+        // The shipped HEC/OTLP blocks are commented out, so neither is enabled.
+        assert!(!cfg.hec.enabled);
+        assert!(!cfg.otlp.enabled);
+    }
+
+    /// The commented HEC/OTLP blocks in the example file are documentation users uncomment;
+    /// uncommenting exactly the TOML lines (not the prose) must give a valid, enabled config.
+    #[test]
+    fn repo_example_config_hec_otlp_blocks_parse_when_uncommented() {
+        let text = example_config_text();
+        let start = text
+            .find("# [hec]")
+            .expect("example has the commented [hec] block");
+        let toml_lines: String = text[start..]
+            .lines()
+            .filter_map(|l| l.strip_prefix("# "))
+            .filter(|l| {
+                l.starts_with('[') || l.split_once(" = ").is_some_and(|(k, _)| !k.contains(' '))
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let mut cfg: Config = toml::from_str(&toml_lines).expect("uncommented blocks parse");
+        cfg.tls.enabled = false; // the fragment has no [tls]; only HEC/OTLP are under test
+        assert!(cfg.hec.enabled && cfg.hec.local.is_some());
+        assert!(cfg.otlp.enabled && cfg.otlp.local.is_some());
+        assert_eq!(cfg.otlp.bearer_token.as_deref(), Some("change-me"));
+        assert_eq!(cfg.otlp.max_service_partitions, 64);
+        validate_config_invariants(&cfg).expect("uncommented example validates");
+    }
 }

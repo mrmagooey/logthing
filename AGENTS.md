@@ -134,13 +134,14 @@ use crate::models::WindowsEvent;
 src/
   admin/        # Admin API and hot-reload
   config/       # Configuration loading
-  forwarding/   # Parquet/S3 and local-disk sinks
+  forwarding/   # Parquet/S3 and local-disk sinks (incl. otlp_s3.rs typed OTLP sink)
+  ingest/        # HEC / NDJSON ingest, event_uuid assignment, gzip request decoding
   ipfix/        # IPFIX / NetFlow flow ingestion
   middleware/   # HTTP middleware
   models/       # Data structures
   parser/       # Event parsing logic
   protocol/     # WEF protocol handlers
-  server/       # HTTP server implementation
+  server/       # HTTP server implementation (OTLP handler + mapper in otlp.rs)
   stats/        # Metrics and statistics
   syslog/       # Syslog listener
   zeek/         # Zeek NDJSON ingestion

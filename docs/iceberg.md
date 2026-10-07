@@ -43,6 +43,11 @@ logthing ──writes──▶ Parquet files   (existing [<source>.s3]/[<source>
   from the descriptor JSON's stats instead of re-reading each Parquet
   footer — remains a valid path if `add_files`'s per-file footer read ever
   becomes the bottleneck, but nothing in this repo builds it today.
+
+  The committer evolves tables additively: when a new logthing release appends columns
+  (for example the `hec` table's `event_uuid`), files carrying them are committed after
+  `union_by_name`, older rows read NULL; a type change quarantines the file. OTLP files all land
+  in one `otlp` table regardless of the per-service Parquet path segment.
 - **Catalog**: [Lakekeeper](https://github.com/lakekeeper/lakekeeper) (a
   single-binary, no-JVM, self-hosted REST catalog) for self-hosted/dev
   deployments; AWS Glue Data Catalog for AWS deployments — both require
