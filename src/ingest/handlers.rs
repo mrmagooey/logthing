@@ -12,7 +12,8 @@
 //! 2. Parse the body with the appropriate helper.
 //! 3. Increment metrics counters.
 //! 4. If `ingest.generic_s3` is `Some`, call `try_send` for each record.
-//! 5. Return the HEC canonical success envelope or an error response.
+//! 5. Return the HEC canonical success envelope or an error response; `503` (`code 9`,
+//!    `Retry-After: 1`) when a writer channel is full.
 
 use crate::config::Config;
 use crate::forwarding::drop_log::{DropKind, DropSite};
@@ -20,6 +21,7 @@ use crate::ingest::{
     IngestState, assign_event_uuids, check_hec_token,
     parse::{parse_hec_event_body, parse_hec_raw_body, parse_ndjson_body},
 };
+use axum::http::header::RETRY_AFTER;
 use axum::{
     Json,
     body::Bytes,
@@ -48,6 +50,16 @@ const DEFAULT_SOURCETYPE: &str = "generic";
 
 fn hec_success() -> Response {
     (StatusCode::OK, Json(json!({"text": "Success", "code": 0}))).into_response()
+}
+
+/// 503 sent when a writer channel is full: HEC "Server is busy" (code 9) plus `Retry-After`.
+fn hec_busy() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(RETRY_AFTER, "1")],
+        Json(json!({"text": "Server is busy", "code": 9})),
+    )
+        .into_response()
 }
 
 fn hec_auth_error() -> Response {
@@ -88,12 +100,14 @@ fn dispatch_generic_record(
     ingest: &IngestState,
     record: crate::ingest::GenericRecord,
     context: &str,
-) {
+) -> bool {
+    let mut full = false;
     if let Some(ref handler) = ingest.generic_s3
         && let Err(e) = handler.try_send(record.clone())
     {
         metrics::counter!("hec_events_dropped").increment(1);
         let kind = DropKind::from(&e);
+        full |= matches!(kind, DropKind::Full);
         if let Some(dropped_total) = handler.drop_log_due(DropSite::Hec, kind) {
             match kind {
                 DropKind::Full => {
@@ -110,6 +124,7 @@ fn dispatch_generic_record(
     {
         metrics::counter!("hec_events_dropped").increment(1);
         let kind = DropKind::from(&e);
+        full |= matches!(kind, DropKind::Full);
         if let Some(dropped_total) = handler.drop_log_due(DropSite::Hec, kind) {
             match kind {
                 DropKind::Full => {
@@ -121,6 +136,34 @@ fn dispatch_generic_record(
             }
         }
     }
+    full
+}
+
+/// Offer a request's records in order, STOPPING at the first one that meets a full channel.
+///
+/// "Overloaded" means `try_send` returned `Full` on ANY configured sink (instantaneous, no
+/// averaging); a record accepted by one sink and rejected by the other is also a 503
+/// (at-least-once toward the client). `Err(n)` = `n` records (the full one plus those never
+/// offered) were not accepted and the request must be answered 503. Records already enqueued
+/// stay enqueued: a client retry re-sends them and they get NEW `event_uuid`s (retries cannot
+/// be de-duplicated). A `Closed` channel (writer gone) is counted and logged but does not cause
+/// an `Err`: retrying against a dead writer cannot help, so the request is still answered 200.
+fn dispatch_generic_batch(
+    ingest: &IngestState,
+    records: Vec<crate::ingest::GenericRecord>,
+    context: &str,
+) -> Result<(), usize> {
+    let total = records.len();
+    for (i, record) in records.into_iter().enumerate() {
+        if dispatch_generic_record(ingest, record, context) {
+            let never_offered = total - i - 1;
+            if never_offered > 0 {
+                metrics::counter!("hec_events_dropped").increment(never_offered as u64);
+            }
+            return Err(total - i);
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -161,10 +204,9 @@ pub async fn handle_hec_event(
 
     metrics::counter!("hec_events_received").increment(records.len() as u64);
 
-    for rec in records {
-        dispatch_generic_record(&ingest, rec, "1 record");
+    if dispatch_generic_batch(&ingest, records, "1 record").is_err() {
+        return hec_busy();
     }
-
     hec_success()
 }
 
@@ -205,8 +247,9 @@ pub async fn handle_hec_raw(
 
     metrics::counter!("hec_events_received").increment(1);
 
-    dispatch_generic_record(&ingest, record, "raw record");
-
+    if dispatch_generic_batch(&ingest, vec![record], "raw record").is_err() {
+        return hec_busy();
+    }
     hec_success()
 }
 
@@ -247,10 +290,9 @@ pub async fn handle_ndjson(
 
     metrics::counter!("hec_events_received").increment(records.len() as u64);
 
-    for rec in records {
-        dispatch_generic_record(&ingest, rec, "1 NDJSON record");
+    if dispatch_generic_batch(&ingest, records, "1 NDJSON record").is_err() {
+        return hec_busy();
     }
-
     hec_success()
 }
 
@@ -696,5 +738,168 @@ mod tests {
             let rec = rx.recv().await.unwrap();
             assert!(rec.event_uuid.is_some(), "{uri} must assign event_uuid");
         }
+    }
+
+    fn stalled_ingest(
+        capacity: usize,
+    ) -> (
+        IngestState,
+        tokio::sync::mpsc::Receiver<crate::ingest::GenericRecord>,
+    ) {
+        use crate::forwarding::buffered_writer::ParquetWriterHandle;
+        use crate::forwarding::generic_s3::GenericSink;
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        (
+            IngestState {
+                generic_s3: Some(ParquetWriterHandle::<GenericSink>::for_test(
+                    tx, "hec", "test",
+                )),
+                ..Default::default()
+            },
+            rx,
+        )
+    }
+
+    fn post(uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn hec_event_full_channel_returns_503_code_9_with_retry_after() {
+        let (ingest, mut rx) = stalled_ingest(1);
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let ok = app
+            .clone()
+            .oneshot(post("/services/collector/event", r#"{"event":"one"}"#))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let busy = app
+            .oneshot(post("/services/collector/event", r#"{"event":"two"}"#))
+            .await
+            .unwrap();
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(busy.headers().get("retry-after").unwrap(), "1");
+        assert_eq!(
+            body_json(busy).await,
+            serde_json::json!({"text": "Server is busy", "code": 9})
+        );
+        assert!(rx.try_recv().is_ok(), "first record stayed enqueued");
+        assert!(rx.try_recv().is_err(), "rejected record was not enqueued");
+    }
+
+    #[tokio::test]
+    async fn hec_event_partial_batch_stops_at_first_full_and_returns_503() {
+        let (ingest, mut rx) = stalled_ingest(2);
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .oneshot(post(
+                "/services/collector/event",
+                "{\"event\":1}\n{\"event\":2}\n{\"event\":3}\n{\"event\":4}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(
+            n, 2,
+            "the prefix that fit stays enqueued; the rest is never offered"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_and_ndjson_full_channel_return_503() {
+        for (uri, body) in [
+            ("/services/collector/raw", "plain"),
+            ("/ingest", "{\"a\":1}\n"),
+        ] {
+            let (ingest, _rx) = stalled_ingest(1);
+            let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+            assert_eq!(
+                app.clone().oneshot(post(uri, body)).await.unwrap().status(),
+                StatusCode::OK
+            );
+            let busy = app.oneshot(post(uri, body)).await.unwrap();
+            assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            assert_eq!(busy.headers().get("retry-after").unwrap(), "1");
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_channel_keeps_returning_200() {
+        let (ingest, rx) = stalled_ingest(1);
+        drop(rx); // writer gone
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .oneshot(post("/services/collector/event", r#"{"event":"x"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn hec_one_sink_full_other_ok_is_503() {
+        use crate::forwarding::buffered_writer::ParquetWriterHandle;
+        use crate::forwarding::generic_s3::GenericSink;
+        let (full_tx, _full_rx) = tokio::sync::mpsc::channel(1);
+        let (roomy_tx, mut roomy_rx) = tokio::sync::mpsc::channel(16);
+        let ingest = IngestState {
+            generic_s3: Some(ParquetWriterHandle::<GenericSink>::for_test(
+                full_tx, "hec", "s3",
+            )),
+            generic_local: Some(ParquetWriterHandle::<GenericSink>::for_test(
+                roomy_tx, "hec", "local",
+            )),
+            ..Default::default()
+        };
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let uri = "/services/collector/event";
+        assert_eq!(
+            app.clone()
+                .oneshot(post(uri, r#"{"event":1}"#))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let busy = app.oneshot(post(uri, r#"{"event":2}"#)).await.unwrap();
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(roomy_rx.try_recv().is_ok());
+        assert!(roomy_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn hec_events_dropped_counts_full_and_never_offered_records() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let (ingest, _rx) = stalled_ingest(1);
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .oneshot(post(
+                "/services/collector/event",
+                "{\"event\":1}\n{\"event\":2}\n{\"event\":3}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let dropped: u64 = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == "hec_events_dropped")
+            .map(|(_, _, _, v)| match v {
+                metrics_util::debugging::DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(dropped, 2, "record 2 hit Full, record 3 never offered");
     }
 }

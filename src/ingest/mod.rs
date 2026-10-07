@@ -186,6 +186,8 @@ mod tests {
         let state = IngestState::default();
         assert!(state.generic_s3.is_none());
         assert!(state.generic_local.is_none());
+        assert!(state.otlp_s3.is_none());
+        assert!(state.otlp_local.is_none());
     }
 
     #[test]
@@ -194,6 +196,8 @@ mod tests {
         let cloned = state.clone();
         assert!(cloned.generic_s3.is_none());
         assert!(cloned.generic_local.is_none());
+        assert!(cloned.otlp_s3.is_none());
+        assert!(cloned.otlp_local.is_none());
     }
 
     #[test]

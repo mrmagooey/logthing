@@ -28,8 +28,14 @@ Per-source ingest counters:
 - `syslog_messages_received`, `ipfix_datagrams_received`, `ipfix_flows_decoded`,
   `sflow_datagrams_received`, `suricata_records_received`, `hec_events_received`,
   `otlp_logs_received`
-- `otlp_events_dropped` - OTLP records not enqueued because a writer channel was
-  full or closed
+- `hec_events_dropped` - HEC/NDJSON records not enqueued: one per failed
+  per-sink `try_send` (full or closed), plus the records of a request never
+  offered after the first full channel. A full channel is answered with HTTP 503
+- `otlp_events_dropped` - OTLP records not enqueued: one per failed per-sink
+  `try_send` (full or closed; with both an S3 and a local sink one record can
+  count twice), plus the records of a request never offered after the first full
+  channel. A full channel is answered with HTTP 503. `otlp_logs_received` counts
+  only records that were enqueued
 - Decode/parse failures: `ipfix_decode_errors`, `sflow_decode_errors`,
   `suricata_parse_errors`, `hec_parse_errors`, `wef_xml_parse_errors` - a WEF
   batch's XML failed to parse past a given event; that event is kept as its

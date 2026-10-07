@@ -52,6 +52,19 @@ DECOMPRESSED body is capped at 64 MiB: a larger one gets `413`. Any other encodi
 The server's in-flight body-memory budget charges the compressed (wire) size. WEF and syslog
 routes do not decompress request bodies.
 
+## Backpressure
+
+When the writer channel is full (the sink cannot keep up), HEC, raw and NDJSON requests get
+`503 Service Unavailable` with `Retry-After: 1` and the HEC body
+`{"text":"Server is busy","code":9}`; Splunk-compatible clients treat this as retryable.
+"Full" means the bounded channel was full at the instant of `try_send` (no averaging) on any
+configured sink. If a request carries several events and some were enqueued before the channel
+filled, the whole request is still answered 503 and the already-enqueued events stay enqueued,
+so a client retry duplicates them (with different `event_uuid`s; client retries cannot be
+de-duplicated). Size the channel with `channel_capacity` in `[hec.s3]`/`[hec.local]`.
+`hec_events_dropped` counts records that were not enqueued. A closed channel (writer gone) is
+still answered 200 with a counted drop, since a retry cannot help.
+
 ## Migration
 
 Nothing to change in `[hec]` unless it relied on having no sink: that now fails startup. Add

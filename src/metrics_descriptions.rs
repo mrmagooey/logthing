@@ -221,7 +221,7 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     (
         Kind::Counter,
         "hec_events_dropped",
-        "HEC events dropped because a forwarding channel was full or closed.",
+        "HEC records not enqueued: per failed sink send (full or closed) plus records never offered after a full channel (request answered 503).",
     ),
     (
         Kind::Counter,
@@ -236,12 +236,12 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     (
         Kind::Counter,
         "otlp_logs_received",
-        "OTLP log records accepted by the logs endpoint.",
+        "OTLP log records accepted (enqueued) by the logs endpoint.",
     ),
     (
         Kind::Counter,
         "otlp_events_dropped",
-        "OTLP log records not enqueued on at least one OTLP writer channel (full or closed).",
+        "OTLP records not enqueued: per failed sink send (full or closed; two sinks can count one record twice) plus records never offered after a full channel (request answered 503).",
     ),
     (
         Kind::Counter,

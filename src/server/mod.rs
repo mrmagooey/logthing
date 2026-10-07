@@ -1564,6 +1564,47 @@ mod tests {
         assert!(!value["powerdns"].as_array().unwrap().is_empty());
     }
 
+    /// WEF is deliberately UNCHANGED by the 503 backpressure work: a full writer channel is a
+    /// counted drop and the request is still answered 200 (the WEF protocol has its own
+    /// redelivery semantics).
+    #[tokio::test]
+    async fn handle_events_full_wef_channel_still_returns_200() {
+        use crate::forwarding::buffered_writer::ParquetWriterHandle;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let state = Arc::new(AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            throughput: Arc::new(ThroughputStats::new()),
+            wef_cardinality_watchers: Vec::new(),
+            parser: WefParser::new(),
+            event_parser: None,
+            parquet_s3_sender: Some(ParquetWriterHandle::for_test(tx, "wef", "s3")),
+            parquet_local_sender: None,
+        });
+        let event = |id: u32| {
+            format!(
+                "<Event><System><Provider>Security</Provider><EventID>{id}</EventID>\
+                 <Level>4</Level><TimeCreated>2024-01-01T00:00:00Z</TimeCreated>\
+                 <Computer>host</Computer></System></Event>"
+            )
+        };
+        let body = Bytes::from(format!(
+            "<Envelope><Body><Events>{}{}{}</Events></Body></Envelope>",
+            event(4624),
+            event(4625),
+            event(4634)
+        ));
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let response = handle_events(State(state), ConnectInfo(addr), body)
+            .await
+            .expect("events accepted");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_ok());
+        assert!(
+            rx.try_recv().is_err(),
+            "capacity 1: the rest were dropped, not 503'd"
+        );
+    }
+
     #[tokio::test]
     async fn handle_events_accepts_valid_payload() {
         let state = default_state().await;
@@ -4457,31 +4498,162 @@ event_parsers:
             );
         }
 
+        fn otlp_request_with_records(n: usize) -> Vec<u8> {
+            let mut req = make_proto_request();
+            let template = req.resource_logs[0].scope_logs[0].log_records[0].clone();
+            req.resource_logs[0].scope_logs[0].log_records = vec![template; n];
+            req.encode_to_vec()
+        }
+
+        fn otlp_post(body: Vec<u8>) -> HttpRequest<Body> {
+            super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        }
+
         #[tokio::test]
-        async fn handle_otlp_logs_full_channel_counts_drop_and_still_returns_200() {
+        async fn handle_otlp_logs_full_channel_returns_503_with_retry_after() {
             let (h, mut rx) = stalled_otlp_handle(1);
             let app = build_otlp_app_with_ingest(IngestState {
                 otlp_local: Some(h),
                 ..Default::default()
             })
             .await;
-            let mut req = make_proto_request();
-            let rec = req.resource_logs[0].scope_logs[0].log_records[0].clone();
-            req.resource_logs[0].scope_logs[0].log_records = vec![rec.clone(), rec.clone(), rec];
-            let request = super::with_connect_info(
-                HttpRequest::builder()
-                    .method("POST")
-                    .uri("/v1/logs")
-                    .header("content-type", "application/x-protobuf")
-                    .body(Body::from(req.encode_to_vec()))
-                    .unwrap(),
-            );
-            assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+            let ok = app
+                .clone()
+                .oneshot(otlp_post(otlp_request_with_records(1)))
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), StatusCode::OK);
+            let busy = app
+                .oneshot(otlp_post(otlp_request_with_records(1)))
+                .await
+                .unwrap();
+            assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(busy.headers().get("retry-after").unwrap(), "1");
             assert!(rx.try_recv().is_ok());
-            assert!(
-                rx.try_recv().is_err(),
-                "capacity 1: the other two were dropped"
-            );
+            assert!(rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn handle_otlp_logs_partial_batch_is_503_and_prefix_stays_enqueued() {
+            let (h, mut rx) = stalled_otlp_handle(2);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_s3: Some(h),
+                ..Default::default()
+            })
+            .await;
+            let resp = app
+                .oneshot(otlp_post(otlp_request_with_records(5)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let mut ids = std::collections::HashSet::new();
+            while let Ok(r) = rx.try_recv() {
+                ids.insert(r.event_uuid.unwrap());
+            }
+            assert_eq!(ids.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn handle_otlp_logs_closed_channel_still_200() {
+            let (h, rx) = stalled_otlp_handle(1);
+            drop(rx);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                ..Default::default()
+            })
+            .await;
+            let resp = app
+                .oneshot(otlp_post(otlp_request_with_records(1)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn handle_otlp_logs_one_sink_full_other_ok_is_503() {
+            let (full, _full_rx) = stalled_otlp_handle(1);
+            let (roomy, mut roomy_rx) = stalled_otlp_handle(16);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_s3: Some(full),
+                otlp_local: Some(roomy),
+                ..Default::default()
+            })
+            .await;
+            let ok = app
+                .clone()
+                .oneshot(otlp_post(otlp_request_with_records(1)))
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), StatusCode::OK);
+            let busy = app
+                .oneshot(otlp_post(otlp_request_with_records(1)))
+                .await
+                .unwrap();
+            assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+            // The roomy sink accepted both (at-least-once toward the client).
+            assert!(roomy_rx.try_recv().is_ok());
+            assert!(roomy_rx.try_recv().is_ok());
+        }
+
+        fn counter_value(snapshotter: &metrics_util::debugging::Snapshotter, name: &str) -> u64 {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter(|(k, ..)| k.key().name() == name)
+                .map(|(_, _, _, v)| match v {
+                    metrics_util::debugging::DebugValue::Counter(c) => c,
+                    _ => 0,
+                })
+                .sum()
+        }
+
+        #[tokio::test]
+        async fn otlp_logs_received_counts_only_enqueued_records_on_503() {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let (h, _rx) = stalled_otlp_handle(2);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                ..Default::default()
+            })
+            .await;
+            let resp = app
+                .oneshot(otlp_post(otlp_request_with_records(5)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(counter_value(&snapshotter, "otlp_logs_received"), 2);
+            // record 3 hit Full, records 4 and 5 were never offered
+            assert_eq!(counter_value(&snapshotter, "otlp_events_dropped"), 3);
+        }
+
+        #[tokio::test]
+        async fn otlp_logs_received_counts_all_records_on_success() {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let (h, _rx) = stalled_otlp_handle(8);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                ..Default::default()
+            })
+            .await;
+            let resp = app
+                .oneshot(otlp_post(otlp_request_with_records(3)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(counter_value(&snapshotter, "otlp_logs_received"), 3);
+            assert_eq!(counter_value(&snapshotter, "otlp_events_dropped"), 0);
         }
 
         #[tokio::test]
@@ -5364,8 +5536,19 @@ pub async fn handle_otlp_logs(
     // as its own step, never inside the mapper.
     crate::ingest::assign_event_uuids(&mut records);
     let count = records.len() as u64;
-    let rejected_full = dispatch_otlp_records(&ingest, records);
-    metrics::counter!("otlp_logs_received").increment(count - rejected_full);
+    match dispatch_otlp_records(&ingest, records) {
+        Ok(()) => {
+            metrics::counter!("otlp_logs_received").increment(count);
+        }
+        Err(rejected) => {
+            metrics::counter!("otlp_logs_received").increment(count - rejected);
+            return Ok(Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(axum::http::header::RETRY_AFTER, "1")
+                .body(axum::body::Body::empty())
+                .unwrap());
+        }
+    }
 
     // ── Respond in the same encoding as the request ───────────────────────
     let (resp_bytes, response_ct) = if ct.starts_with("application/json") {
@@ -5411,16 +5594,18 @@ fn offer_otlp(
     }
 }
 
-/// Try-send every record to every configured OTLP sink. Returns how many records hit a FULL
-/// channel on at least one sink (a closed channel is logged and counted but not returned: the
-/// writer is gone, retrying cannot help).
+/// Try-send every record to every configured OTLP sink, STOPPING at the first record that hits
+/// a full channel ("full" = `Full` on ANY configured sink, instantaneous). `Err(n)` = `n`
+/// records (the full one plus those never offered) were not accepted: answer 503. Records
+/// already enqueued stay enqueued (a retry duplicates them with new `event_uuid`s). Closed
+/// channels are logged/counted but do not cause an `Err` (retrying a dead writer cannot help).
 #[cfg(feature = "otlp")]
 fn dispatch_otlp_records(
     ingest: &IngestState,
     records: Vec<crate::forwarding::otlp_s3::OtlpRecord>,
-) -> u64 {
-    let mut full_rejected = 0u64;
-    for record in records {
+) -> Result<(), u64> {
+    let total = records.len() as u64;
+    for (i, record) in records.into_iter().enumerate() {
         let full = match (&ingest.otlp_s3, &ingest.otlp_local) {
             (Some(s3), Some(local)) => {
                 let a = offer_otlp(s3, record.clone(), "s3");
@@ -5432,8 +5617,12 @@ fn dispatch_otlp_records(
             (None, None) => false,
         };
         if full {
-            full_rejected += 1;
+            let never_offered = total - i as u64 - 1;
+            if never_offered > 0 {
+                metrics::counter!("otlp_events_dropped").increment(never_offered);
+            }
+            return Err(total - i as u64);
         }
     }
-    full_rejected
+    Ok(())
 }

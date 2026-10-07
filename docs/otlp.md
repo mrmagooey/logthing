@@ -38,6 +38,15 @@ Request bodies may be gzip-compressed (`Content-Encoding: gzip`), for both proto
 The decompressed size is capped at 64 MiB (`413` beyond that); any other `Content-Encoding`
 gets `415`; a corrupt gzip stream gets `400`.
 
+## Backpressure
+
+When the writer channel is full logthing answers `503 Service Unavailable` with
+`Retry-After: 1` (empty body); OTLP exporters retry 503 automatically. If part of a request was
+enqueued before the channel filled, the whole request is rejected and the retry duplicates the
+enqueued prefix with different `event_uuid`s. `otlp_events_dropped` counts records that were
+not enqueued; `otlp_logs_received` counts only enqueued records. A closed channel (writer gone)
+is still answered 200 with a counted drop. WEF is unchanged (200 and a counted drop).
+
 ## Columns
 
 One Iceberg table `otlp` (all services), partitioned by `day(partition_time)`.
