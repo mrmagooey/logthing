@@ -10,7 +10,8 @@ use chrono::{DateTime, TimeZone, Utc};
 /// Parse one or more newline-delimited HEC event envelopes.
 ///
 /// Each line must be a JSON object with at minimum an `"event"` key.
-/// Optional keys: `"time"` (Unix epoch float), `"host"`, `"sourcetype"`.
+/// Optional keys: `"time"` (Unix epoch float), `"host"`, `"sourcetype"`, `"source"`, `"index"`
+/// and `"fields"`.
 /// Blank / whitespace-only lines are skipped.
 ///
 /// Returns an error if any non-blank line fails to parse as JSON or is

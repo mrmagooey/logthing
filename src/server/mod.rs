@@ -134,6 +134,26 @@ struct BudgetedBody {
     held: Arc<std::sync::Mutex<Vec<OwnedSemaphorePermit>>>,
 }
 
+/// Handles to the request's body-budget charge, stashed in the request extensions by
+/// `body_budget_middleware` so a route that DECODES its body (`post_gzip`) can charge the
+/// decoded bytes against the same budget and the same `held` release scope.
+#[derive(Clone)]
+pub(crate) struct BodyBudgetHandles {
+    budget: Arc<Semaphore>,
+    held: Arc<std::sync::Mutex<Vec<OwnedSemaphorePermit>>>,
+}
+
+impl BodyBudgetHandles {
+    /// Wrap `body` so every frame is charged against the shared budget (see `BudgetedBody`).
+    pub(crate) fn charge(&self, body: Body) -> Body {
+        Body::new(BudgetedBody {
+            inner: body,
+            budget: self.budget.clone(),
+            held: self.held.clone(),
+        })
+    }
+}
+
 impl HttpBody for BudgetedBody {
     type Data = Bytes;
     type Error = axum::Error;
@@ -255,7 +275,11 @@ async fn body_budget_middleware(
     }
 
     let held = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
+    parts.extensions.insert(BodyBudgetHandles {
+        budget: budget.clone(),
+        held: held.clone(),
+    });
     let budgeted = BudgetedBody {
         inner: body,
         budget,
@@ -2455,6 +2479,124 @@ event_parsers:
         assert!(
             accepted >= 1,
             "at least some of the {REQUESTS} requests should still be admitted"
+        );
+    }
+
+    /// Router with a gzip route behind `body_budget_middleware` and a small budget; the handler
+    /// reports the budget still available while it holds the extracted body, then sleeps so
+    /// concurrent requests overlap.
+    fn gzip_budget_router(
+        budget: Arc<Semaphore>,
+        seen_available: Arc<std::sync::Mutex<Vec<usize>>>,
+    ) -> Router {
+        let probe = budget.clone();
+        Router::new()
+            .route(
+                "/gz",
+                post_gzip(move |_body: Bytes| {
+                    let probe = probe.clone();
+                    let seen = seen_available.clone();
+                    async move {
+                        seen.lock().unwrap().push(probe.available_permits());
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        (StatusCode::OK, "ok")
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                budget,
+                body_budget_middleware,
+            ))
+    }
+
+    fn gzip_request(plain_len: usize) -> (axum::http::Request<Body>, usize) {
+        use std::io::Write;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        e.write_all(&vec![0u8; plain_len]).unwrap();
+        let wire = e.finish().unwrap();
+        let wire_len = wire.len();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/gz")
+            .header("content-encoding", "gzip")
+            .body(Body::from(wire))
+            .unwrap();
+        (req, wire_len)
+    }
+
+    /// Decompressed bytes (not just the tiny wire bytes) are charged against the budget: while
+    /// the handler holds a 512 KiB decoded body, at least 512 KiB of the 1 MiB budget is gone.
+    #[tokio::test]
+    async fn gzip_decompressed_bytes_are_charged_to_body_budget() {
+        use tower::ServiceExt;
+        const PLAIN: usize = 512 * 1024;
+        let budget = Arc::new(Semaphore::new(1024 * 1024));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = gzip_budget_router(budget.clone(), seen.clone());
+
+        let (req, wire_len) = gzip_request(PLAIN);
+        assert!(
+            wire_len < 4096,
+            "test premise: wire body is tiny ({wire_len})"
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let available = seen.lock().unwrap()[0];
+        assert!(
+            available <= 1024 * 1024 - PLAIN,
+            "decoded bytes must be charged: {available} permits still free, wire was {wire_len}"
+        );
+        assert_eq!(
+            budget.available_permits(),
+            1024 * 1024,
+            "every charged permit is released once the request ends"
+        );
+    }
+
+    /// Concurrent decompression bombs: each wire body is tiny (so wire-only charging admits all
+    /// of them) but 6 x 512 KiB decoded exceeds the 1 MiB budget. Some must be rejected (400
+    /// body-read failure, or the 503 fast path) and the peak decoded bytes held by admitted
+    /// handlers must never exceed the budget.
+    #[tokio::test]
+    async fn gzip_concurrent_decompression_bombs_hit_body_budget() {
+        use tower::ServiceExt;
+        const PLAIN: usize = 512 * 1024;
+        const BUDGET: usize = 1024 * 1024;
+        let budget = Arc::new(Semaphore::new(BUDGET));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = gzip_budget_router(budget.clone(), seen.clone());
+
+        let mut tasks = Vec::new();
+        for _ in 0..6 {
+            let router = router.clone();
+            tasks.push(tokio::spawn(async move {
+                let (req, _) = gzip_request(PLAIN);
+                router.oneshot(req).await.unwrap().status()
+            }));
+        }
+        let mut ok = 0;
+        let mut rejected = 0;
+        for t in tasks {
+            match t.await.unwrap() {
+                StatusCode::OK => ok += 1,
+                StatusCode::BAD_REQUEST | StatusCode::SERVICE_UNAVAILABLE => rejected += 1,
+                other => panic!("unexpected status {other}"),
+            }
+        }
+        assert!(ok >= 1, "at least one bomb fits the budget");
+        assert!(
+            rejected >= 1,
+            "6 x 512 KiB decoded must overflow the 1 MiB budget (ok={ok}, rejected={rejected})"
+        );
+        assert!(
+            ok * PLAIN <= BUDGET,
+            "admitted decoded bytes ({ok} x {PLAIN}) exceed the budget"
+        );
+        assert_eq!(
+            budget.available_permits(),
+            BUDGET,
+            "all permits released afterwards"
         );
     }
 

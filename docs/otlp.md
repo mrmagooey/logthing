@@ -139,3 +139,5 @@ secret_key = "..."
 
 Historic OTLP rows stay in the `hec` table (`sourcetype = 'otlp'`); new rows go to the
 `otlp` table. The committer evolves existing Iceberg tables additively, so no manual DDL is needed.
+
+Upgrade the committer before logthing: an old committer quarantines the new-shaped files.

@@ -221,7 +221,10 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     (
         Kind::Counter,
         "hec_events_dropped",
-        "HEC records not enqueued: per failed sink send (full or closed) plus records never offered after a full channel (request answered 503).",
+        concat!(
+            "HEC records not enqueued: one per failed per-sink send (full or closed) plus ",
+            "records never offered after the first full channel (request answered 503)."
+        ),
     ),
     (
         Kind::Counter,
@@ -241,7 +244,11 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     (
         Kind::Counter,
         "otlp_events_dropped",
-        "OTLP records not enqueued: per failed sink send (full or closed; two sinks can count one record twice) plus records never offered after a full channel (request answered 503).",
+        concat!(
+            "OTLP records not enqueued: one per failed per-sink send (full or closed; with two ",
+            "sinks one record can count twice) plus records never offered after the first full ",
+            "channel (request answered 503)."
+        ),
     ),
     (
         Kind::Counter,

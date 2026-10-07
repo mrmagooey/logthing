@@ -69,3 +69,8 @@ still answered 200 with a counted drop, since a retry cannot help.
 
 Nothing to change in `[hec]` unless it relied on having no sink: that now fails startup. Add
 `[hec.s3]` or `[hec.local]`. OTLP no longer uses `[hec]` sinks; see `docs/otlp.md#migration`.
+
+- Upgrade the committer before logthing: an old committer quarantines the new-shaped files.
+- The per-record size used to turn `channel_capacity` into a memory budget grew (1024 to 1792
+  bytes), so the default capacity is now about 43% smaller. A full channel answers 503, so if
+  you relied on the old default, set `channel_capacity` explicitly in `[hec.s3]`/`[hec.local]`.

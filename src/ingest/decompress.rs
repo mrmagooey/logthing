@@ -2,7 +2,10 @@
 //!
 //! Layering contract: `body_budget_middleware` is an OUTER layer on the whole protected router,
 //! so it sees (and charges) the compressed WIRE bytes. `post_gzip` wraps ONE route in a
-//! `RequestDecompressionLayer`; the handler's `Bytes` extractor then reads the DECOMPRESSED
+//! `RequestDecompressionLayer`, and an innermost `charge_decompressed` layer charges the
+//! DECOMPRESSED frames against the same body-byte budget (a request whose body was gzip-decoded
+//! is marked by `normalize_content_encoding`); when the budget runs dry the body stream errors
+//! (400) instead of buffering. The handler's `Bytes` extractor then reads the DECOMPRESSED
 //! stream through `http_body_util::Limited` configured by the router-wide `DefaultBodyLimit`
 //! (`MAX_BODY_SIZE`), so a gzip bomb is cut off while streaming and answered with 413
 //! (`Content-Length` is stripped by the decompressor, so nothing is enforced up front).
@@ -12,6 +15,7 @@
 //! spaces) is decoded; anything else (`deflate`, `br`, `zstd`, `gzip, gzip`, garbage) is 415;
 //! a corrupt gzip stream is 400; a decompressed size over the limit is 413.
 
+use crate::server::BodyBudgetHandles;
 use axum::{
     extract::Request,
     handler::Handler,
@@ -21,6 +25,23 @@ use axum::{
     routing::{MethodRouter, post},
 };
 use tower_http::decompression::RequestDecompressionLayer;
+
+/// Request-extension marker: the client declared `gzip`, so the layer below decodes the body.
+#[derive(Clone, Copy, Debug)]
+struct GzipDecoded;
+
+/// Innermost layer of `post_gzip`: charge the decompressed frames against the shared body-byte
+/// budget. A no-op when the request was not gzip-decoded (already charged as wire bytes) or no
+/// budget is installed (unit-test routers).
+async fn charge_decompressed(mut req: Request, next: Next) -> Response {
+    if req.extensions().get::<GzipDecoded>().is_some()
+        && let Some(handles) = req.extensions().get::<BodyBudgetHandles>().cloned()
+    {
+        let body = std::mem::take(req.body_mut());
+        *req.body_mut() = handles.charge(body);
+    }
+    next.run(req).await
+}
 
 /// Canonicalise `Content-Encoding` before tower-http inspects it: trim, lowercase, and map the
 /// legacy alias `x-gzip` to `gzip` (tower-http only matches the exact lowercase bytes
@@ -40,6 +61,9 @@ pub async fn normalize_content_encoding(mut req: Request, next: Next) -> Respons
                 lowered
             }
         });
+    if canonical.as_deref() == Some("gzip") {
+        req.extensions_mut().insert(GzipDecoded);
+    }
     if let Some(value) = canonical.and_then(|c| HeaderValue::from_str(&c).ok()) {
         req.headers_mut().insert(header::CONTENT_ENCODING, value);
     }
@@ -56,7 +80,9 @@ where
     S: Clone + Send + Sync + 'static,
 {
     post(handler)
-        // Inner: decode (and 415 anything it cannot decode).
+        // Innermost: charge the decoded bytes against the body budget.
+        .layer::<_, std::convert::Infallible>(middleware::from_fn(charge_decompressed))
+        // Decode (and 415 anything it cannot decode).
         .layer(RequestDecompressionLayer::new())
         // Outer: normalise the header first.
         .layer(middleware::from_fn(normalize_content_encoding))

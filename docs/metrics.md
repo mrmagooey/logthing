@@ -29,7 +29,8 @@ Per-source ingest counters:
   `sflow_datagrams_received`, `suricata_records_received`, `hec_events_received`,
   `otlp_logs_received`
 - `hec_events_dropped` - HEC/NDJSON records not enqueued: one per failed
-  per-sink `try_send` (full or closed), plus the records of a request never
+  per-sink `try_send` (full or closed; with both an S3 and a local sink one record can
+  count twice), plus the records of a request never
   offered after the first full channel. A full channel is answered with HTTP 503
 - `otlp_events_dropped` - OTLP records not enqueued: one per failed per-sink
   `try_send` (full or closed; with both an S3 and a local sink one record can
