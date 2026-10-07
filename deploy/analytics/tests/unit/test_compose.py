@@ -200,7 +200,7 @@ def test_bind_mount_sources_exist(cfg):
 
 
 def test_non_ingest_ports_default_to_loopback(cfg):
-    for name in ("garage", "lakekeeper", "trino"):
+    for name in ("garage", "trino"):
         for p in cfg["services"][name]["ports"]:
             assert p["host_ip"] == "127.0.0.1", name
     for p in cfg["services"]["logthing"]["ports"]:
@@ -258,3 +258,15 @@ def test_empty_required_var_is_rejected(tmp_path):
     env_file = tmp_path / "empty.env"
     env_file.write_text("".join(f"{k}={v}\n" for k, v in env.items()))
     assert run_config(env_file).returncode != 0
+
+
+PUBLISHING = {"logthing", "garage", "trino", "metabase"}
+
+
+def test_internal_services_are_never_published(cfg):
+    for name, svc in cfg["services"].items():
+        if name not in PUBLISHING:
+            assert not svc.get("ports"), f"{name} must not publish ports"
+    assert {p["target"] for p in cfg["services"]["garage"]["ports"]} == {3900}
+    published = {p["target"] for s in cfg["services"].values() for p in s.get("ports", [])}
+    assert not published & {5432, 8181, 3901, 3903, 8080}, published

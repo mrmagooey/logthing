@@ -7,7 +7,7 @@
 #      TLS_DAYS  server certificate lifetime in days (default 825)
 #      TLS_OWNER optional uid:gid to chown the outputs to (Trino runs as 1000:1000)
 # Writes ca.pem (clients trust this) and server.pem (certificate + PKCS#8 key, mode 600).
-# Idempotent: an existing certificate with more than 30 days left is kept, so clients that
+# Idempotent: an existing certificate that ca.pem verifies and has more than 30 days left is kept, so clients that
 # already trust ca.pem keep working. The CA key is discarded after signing.
 # Exits non-zero (loudly) if openssl is missing or any generation step fails.
 set -eu
@@ -18,7 +18,8 @@ DAYS=${TLS_DAYS:-825}
 mkdir -p "$OUT_DIR"
 cd "$OUT_DIR"
 if [ -s server.pem ] && [ -s ca.pem ] \
-   && openssl x509 -in server.pem -noout -checkend 2592000 >/dev/null 2>&1; then
+   && openssl x509 -in server.pem -noout -checkend 2592000 >/dev/null 2>&1 \
+   && openssl verify -CAfile ca.pem server.pem >/dev/null 2>&1; then
   echo "certgen: existing certificate still valid, keeping it"
   exit 0
 fi

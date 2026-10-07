@@ -106,8 +106,6 @@ services:
       start_period: 5s
     depends_on:
       lakekeeper-migrate: {condition: service_completed_successfully}
-    ports:
-      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${LAKEKEEPER_PORT:-8181}:8181"
 
   lakekeeper-init:
     <<: *bootstrap

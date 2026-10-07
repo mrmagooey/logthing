@@ -110,3 +110,20 @@ def test_ca_and_chain_pass_strict_verification(tmp_path):
     subprocess.run(
         ["openssl", "verify", "-x509_strict", "-CAfile", str(tmp_path / "ca.pem"),
          str(tmp_path / "server.pem")], check=True, capture_output=True)
+
+
+def test_regenerates_when_ca_and_server_cert_do_not_match(tmp_path):
+    # A mismatched pair (e.g. ca.pem from another run) is still unexpired but untrusted.
+    a, b = tmp_path / "a", tmp_path / "b"
+    run(a)
+    run(b)
+    (a / "ca.pem").write_bytes((b / "ca.pem").read_bytes())
+    r = subprocess.run(
+        ["openssl", "verify", "-CAfile", str(a / "ca.pem"), str(a / "server.pem")],
+        capture_output=True)
+    assert r.returncode != 0
+    out = run(a).stdout
+    assert "keeping" not in out
+    subprocess.run(
+        ["openssl", "verify", "-CAfile", str(a / "ca.pem"), str(a / "server.pem")],
+        check=True, capture_output=True)

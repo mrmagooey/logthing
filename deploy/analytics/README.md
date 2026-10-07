@@ -25,12 +25,38 @@ start without AVX2.
 **Security**
 
 - **Credentials are generated, never defaulted.** Compose refuses to start without `.env`; Helm generates random secrets (see Credentials).
-- **Trino is HTTPS + password only** (users `admin` and `metabase`, private CA generated at first start). Lakekeeper has no authentication: keep it on a private network (it is published on loopback by default; it will stop being published in a later change).
-- Garage S3, Lakekeeper and Trino bind to `${ANALYTICS_BIND_ADDR:-127.0.0.1}` in compose
+- **Trino is HTTPS + password only** (users `admin` and `metabase`, private CA generated at first start). Lakekeeper has no authentication, so it is not published (see Network isolation).
+- Garage S3 and Trino bind to `${ANALYTICS_BIND_ADDR:-127.0.0.1}` in compose
   (loopback by default; `ANALYTICS_BIND_ADDR=0.0.0.0` exposes them).
 - logthing ingest ports (514/udp, 601/tcp, 4739/udp, 6343/udp, 47760/tcp) and 5985/tcp listen
   on **all interfaces**.
 - Port 5985 is logthing's HTTP endpoint. Besides `/health`, it accepts unauthenticated plaintext HTTP requests and is published on all interfaces like the other ingest ports; firewall it if the host is reachable from untrusted networks.
+
+## Network isolation
+
+Lakekeeper has no authentication, so it is isolated instead:
+
+- **compose:** Lakekeeper, Postgres and the Garage admin API (3903) are never published to the
+  host (a unit test asserts it). Only Garage S3 (3900) and Trino (8443) bind to
+  `ANALYTICS_BIND_ADDR`, loopback by default.
+- **Helm:** `networkPolicy.enabled` (default `true`) renders ingress NetworkPolicies:
+  Lakekeeper accepts traffic only from the committer, Trino and the bootstrap Job; Postgres only
+  from Lakekeeper and Metabase; the Garage admin API only from the bootstrap Jobs and logthing's
+  startup wait; Trino accepts only 8443/TCP (its plain-HTTP 8080 is reachable from no other pod);
+  Garage S3 stays open (logthing and external writers use the Garage key).
+- NetworkPolicies are enforced only by CNIs that implement them (Calico, Cilium, ...).
+  Enforcement is **not** tested: the `helm-minikube.sh` e2e only checks that the objects exist,
+  and minikube's default CNI is not verified to enforce them.
+- Trino and Metabase are protected by authentication, not by NetworkPolicy.
+
+### Production: authenticating Lakekeeper
+
+Isolation is the reference-stack posture. For production run Lakekeeper with OIDC: set
+`LAKEKEEPER__OPENID_PROVIDER_URI` (and `LAKEKEEPER__OPENID_AUDIENCE`) plus an authorization
+backend (see the Lakekeeper documentation). Every client then needs a token: Trino
+(`iceberg.rest-catalog.security=OAUTH2` with `iceberg.rest-catalog.oauth2.*`), the committer
+(PyIceberg catalog properties `credential` / `oauth2-server-uri`; the committer configuration for
+this is not shipped here) and `bootstrap.py`. None of this is wired in this stack.
 
 ## Credentials
 
@@ -70,7 +96,7 @@ docker compose ps        # wait: init services (garage-init, lakekeeper-migrate,
 | logthing syslog | 514/udp, 601/tcp |
 | logthing IPFIX / sFlow | 4739/udp, 6343/udp |
 | logthing Zeek / health | 47760/tcp, 5985/tcp |
-| Garage S3 / Lakekeeper | 3900 / 8181 |
+| Garage S3 | 3900 |
 | Trino (HTTPS) | 8443 |
 
 Every host port can be changed with a variable listed in `.env.example`. Long-running

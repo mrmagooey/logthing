@@ -28,7 +28,6 @@ SFLOW_PORT=26343
 ZEEK_PORT=47761
 LOGTHING_HEALTH_PORT=25985
 GARAGE_S3_PORT=23901
-LAKEKEEPER_PORT=28182
 TRINO_PORT=$TRINO_PORT
 ENV
 [ -z "${TRINO_IMAGE:-}" ] || echo "TRINO_IMAGE=$TRINO_IMAGE" >>"$ENVFILE"
@@ -69,6 +68,20 @@ esac
 if "${DC[@]}" exec -T -e TRINO_PASSWORD=wrong trino "${TRINO_CLI[@]}" --execute 'SELECT 1' >/dev/null 2>&1; then
   fail "Trino CLI accepted a wrong password"
 fi
+# Isolation: Lakekeeper, Postgres and the Garage admin API must not be published to the host.
+# (Use Publishers from `ps`: `compose port` exits 0 with "invalid IP:0" when unpublished.)
+"${DC[@]}" ps --format json | python3 -c '
+import json, sys
+rows = [json.loads(l) for l in sys.stdin.read().splitlines() if l.strip()]
+bad = []
+for r in rows:
+    for p in r.get("Publishers") or []:
+        if p.get("PublishedPort") and (r["Service"] in ("lakekeeper", "postgres")
+                or p.get("TargetPort") in (3901, 3903, 5432, 8181, 8080)):
+            bad.append((r["Service"], p["TargetPort"], p["PublishedPort"]))
+sys.exit("published internal ports: %s" % bad if bad else 0)
+' || fail "an internal port is published to the host"
+echo "isolation: lakekeeper, postgres and garage admin are not published"
 
 echo "== [3/5] send $N syslog messages ($MARKER) =="
 "$PY" - "$SYSLOG_UDP_PORT" "$N" "$MARKER" <<'PYEOF'

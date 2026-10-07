@@ -75,3 +75,7 @@ trino:
     limits: {memory: 4Gi}
 
 storageClassName: ""
+networkPolicy:
+  # Ingress isolation for Lakekeeper (no authentication), Postgres, the Garage admin API and
+  # Trino's plain-HTTP port. Only enforced by CNIs that implement NetworkPolicy (Calico, Cilium, ...).
+  enabled: true

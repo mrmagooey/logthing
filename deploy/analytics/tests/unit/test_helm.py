@@ -352,7 +352,7 @@ def test_trino_tls_secret_is_a_valid_ca_signed_cert():
     assert "BEGIN CERTIFICATE" in server and "PRIVATE KEY" in server
     assert "PRIVATE KEY" not in ca
     if not shutil.which("openssl"):
-        return
+        pytest.skip("openssl not available")
     with tempfile.TemporaryDirectory() as d:
         open(os.path.join(d, "server.pem"), "w").write(server)
         open(os.path.join(d, "ca.pem"), "w").write(ca)
@@ -528,3 +528,89 @@ def test_checksum_secret_is_stable_across_renders_with_generated_secrets():
         full = f"{FULL}-{name}"
         assert (_annotations(a, kind, full)["checksum/secret"]
                 == _annotations(b, kind, full)["checksum/secret"]), name
+
+
+LABEL = "app.kubernetes.io/component"
+
+
+def policies(*sets, release="lt"):
+    return {d["metadata"]["name"]: d for d in render(*sets, release=release)
+            if d["kind"] == "NetworkPolicy"}
+
+
+def peers(rule):
+    return {p["podSelector"]["matchLabels"][LABEL] for p in rule["from"]}
+
+
+def ports(rule):
+    return [(p["protocol"], p["port"]) for p in rule["ports"]]
+
+
+def test_network_policies_rendered_by_default_and_ingress_only():
+    pol = policies()
+    assert set(pol) == {f"{FULL}-lakekeeper", f"{FULL}-postgres", f"{FULL}-garage",
+                        f"{FULL}-trino"}
+    for p in pol.values():
+        assert p["spec"]["policyTypes"] == ["Ingress"]
+
+
+def test_lakekeeper_reachable_only_from_committer_trino_and_bootstrap():
+    spec = policies()[f"{FULL}-lakekeeper"]["spec"]
+    assert spec["podSelector"]["matchLabels"][LABEL] == "lakekeeper"
+    (rule,) = spec["ingress"]
+    assert peers(rule) == {"committer", "trino", "lakekeeper-init"}
+    assert ports(rule) == [("TCP", 8181)]
+
+
+def test_postgres_reachable_only_from_lakekeeper_and_metabase():
+    spec = policies()[f"{FULL}-postgres"]["spec"]
+    assert spec["podSelector"]["matchLabels"][LABEL] == "postgres"
+    (rule,) = spec["ingress"]
+    assert peers(rule) == {"lakekeeper", "metabase"}
+    assert ports(rule) == [("TCP", 5432)]
+
+
+def test_garage_s3_open_rpc_self_only_admin_bootstrap_only():
+    spec = policies()[f"{FULL}-garage"]["spec"]
+    by_port = {ports(r)[0][1]: r for r in spec["ingress"]}
+    assert set(by_port) == {3900, 3901, 3903}
+    assert "from" not in by_port[3900]                      # S3 stays default-allow
+    assert peers(by_port[3901]) == {"garage"}
+    # logthing's wait-garage initContainer polls the admin API, so it must be allowed too
+    assert peers(by_port[3903]) == {"garage-init", "lakekeeper-init", "logthing"}
+
+
+def test_trino_only_https_reachable_from_other_workloads():
+    # Rule chosen: the policy allows ingress on 8443/TCP only (from any source: clients and
+    # Metabase); 8080 is not listed, so no other pod can reach it. Trino's own discovery and
+    # internal traffic use localhost:8080 inside the pod, which NetworkPolicy never filters.
+    spec = policies()[f"{FULL}-trino"]["spec"]
+    assert spec["podSelector"]["matchLabels"][LABEL] == "trino"
+    (rule,) = spec["ingress"]
+    assert "from" not in rule
+    assert ports(rule) == [("TCP", 8443)]
+
+
+def test_policies_are_scoped_to_the_release():
+    for p in policies(release="other").values():
+        selectors = [p["spec"]["podSelector"]["matchLabels"]]
+        selectors += [x["podSelector"]["matchLabels"] for r in p["spec"]["ingress"]
+                      for x in r.get("from", [])]
+        assert all(s["app.kubernetes.io/instance"] == "other" for s in selectors)
+
+
+def test_policy_selectors_match_real_pod_labels():
+    docs = render()
+    pod_components = set()
+    for d in docs:
+        if d["kind"] in ("Deployment", "StatefulSet", "Job", "CronJob"):
+            pod_components.add(pod_spec_meta(d)["labels"][LABEL])
+    for p in policies().values():
+        used = {p["spec"]["podSelector"]["matchLabels"][LABEL]}
+        used |= {x["podSelector"]["matchLabels"][LABEL] for r in p["spec"]["ingress"]
+                 for x in r.get("from", [])}
+        assert used <= pod_components | {"metabase"}, used - pod_components
+
+
+def test_network_policy_can_be_disabled():
+    assert policies("networkPolicy.enabled=false") == {}

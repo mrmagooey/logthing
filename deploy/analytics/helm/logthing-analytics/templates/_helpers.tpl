@@ -111,3 +111,11 @@ Generated values never change after first install by design, so they need no rol
 {{- define "la.trinoTlsSecret" -}}
 {{- .Values.trino.tls.existingSecret | default (printf "%s-trino-tls" (include "la.fullname" .)) -}}
 {{- end -}}
+{{/* NetworkPolicy peers: pods of this release whose component label is in .components */}}
+{{- define "la.npPeers" -}}
+{{- $root := .root }}
+{{- range .components }}
+- podSelector:
+    matchLabels: {{- include "la.selector" (dict "root" $root "component" .) | nindent 8 }}
+{{- end }}
+{{- end -}}

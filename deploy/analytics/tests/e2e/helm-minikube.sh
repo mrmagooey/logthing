@@ -80,6 +80,11 @@ BEFORE=$(secret_hash)
   || { echo "helm upgrade failed" >&2; dump_logs; exit 1; }
 [ "$(secret_hash)" = "$BEFORE" ] || { echo "credentials Secret changed across helm upgrade" >&2; exit 1; }
 
+echo "== [3c/7] NetworkPolicies exist (enforcement is NOT tested: minikube's default CNI is not verified to enforce them) =="
+for p in lakekeeper postgres garage trino; do
+  "${K[@]}" get networkpolicy "$FULL-$p" >/dev/null || { echo "missing NetworkPolicy $FULL-$p" >&2; exit 1; }
+done
+
 echo "== [4/7] wait for init jobs =="
 # Job names carry the release revision, so select by label.
 for c in garage-init lakekeeper-init; do

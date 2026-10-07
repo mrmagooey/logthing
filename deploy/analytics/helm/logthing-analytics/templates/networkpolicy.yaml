@@ -1,0 +1,66 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $fn := include "la.fullname" . }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-lakekeeper
+  labels: {{- include "la.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "la.selector" (dict "root" . "component" "lakekeeper") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from: {{- include "la.npPeers" (dict "root" . "components" (list "committer" "trino" "lakekeeper-init")) | nindent 8 }}
+      ports:
+        - {protocol: TCP, port: 8181}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-postgres
+  labels: {{- include "la.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "la.selector" (dict "root" . "component" "postgres") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from: {{- include "la.npPeers" (dict "root" . "components" (list "lakekeeper" "metabase")) | nindent 8 }}
+      ports:
+        - {protocol: TCP, port: 5432}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-garage
+  labels: {{- include "la.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "la.selector" (dict "root" . "component" "garage") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    # S3 stays open: logthing and any external writer authenticate with the Garage key.
+    - ports:
+        - {protocol: TCP, port: 3900}
+    - from: {{- include "la.npPeers" (dict "root" . "components" (list "garage")) | nindent 8 }}
+      ports:
+        - {protocol: TCP, port: 3901}
+    # Admin API: the bootstrap Jobs, plus logthing's wait-garage initContainer.
+    - from: {{- include "la.npPeers" (dict "root" . "components" (list "garage-init" "lakekeeper-init" "logthing")) | nindent 8 }}
+      ports:
+        - {protocol: TCP, port: 3903}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-trino
+  labels: {{- include "la.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "la.selector" (dict "root" . "component" "trino") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    # Only HTTPS (password auth) is reachable. Plain-HTTP 8080 is not listed, so no other pod
+    # can reach it; Trino's own localhost:8080 discovery traffic is never filtered.
+    - ports:
+        - {protocol: TCP, port: 8443}
+{{- end }}
