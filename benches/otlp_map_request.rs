@@ -1,5 +1,5 @@
 //! Criterion micro-benchmark: baseline cost of `otlp::map_otlp_request` --
-//! the protobuf-struct -> `GenericRecord` mapping layer that OTLP log
+//! the protobuf-struct -> `OtlpRecord` mapping layer that OTLP log
 //! ingest feeds into the shared writer path (see
 //! `generic_hec_to_record_batch.rs` for that shared writer-path cost).
 //! `map_otlp_request` itself has never been measured.

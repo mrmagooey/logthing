@@ -197,9 +197,10 @@ pub fn hec(data: &[u8]) -> usize {
         1 => parse_hec_raw_body(body, "fuzz").map(|r| vec![r]),
         _ => parse_ndjson_body(body, "fuzz"),
     };
-    let Ok(records) = records else {
+    let Ok(mut records) = records else {
         return 0;
     };
+    crate::ingest::assign_event_uuids(&mut records);
     for rec in &records {
         map_record(&GenericSink, rec);
     }
@@ -222,9 +223,11 @@ pub fn otlp(data: &[u8]) -> usize {
     let Some(req) = req else {
         return 0;
     };
-    let records = crate::server::otlp::map_otlp_request(req, "192.0.2.1".to_string());
+    let mut records = crate::server::otlp::map_otlp_request(req, "192.0.2.1".to_string());
+    // Mirror the production handler: ids are assigned after mapping.
+    crate::ingest::assign_event_uuids(&mut records);
     for rec in &records {
-        map_record(&GenericSink, rec);
+        map_record(&crate::forwarding::otlp_s3::OtlpSink, rec);
     }
     records.len()
 }

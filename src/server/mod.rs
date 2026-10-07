@@ -4947,7 +4947,7 @@ async fn handle_syslog_examples() -> Json<serde_json::Value> {
 #[cfg(feature = "otlp")]
 pub async fn handle_otlp_logs(
     State(app_state): State<Arc<AppState>>,
-    axum::extract::Extension(ingest): axum::extract::Extension<IngestState>,
+    axum::extract::Extension(_ingest): axum::extract::Extension<IngestState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
@@ -5005,52 +5005,11 @@ pub async fn handle_otlp_logs(
             return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
         };
 
-    // ── Map to GenericRecords ─────────────────────────────────────────────
+    // ── Map (INTERIM: Task 4 routes these to the OTLP sinks) ──────────────
     let source_host = addr.ip().to_string();
     let records = crate::server::otlp::map_otlp_request(req, source_host);
     let count = records.len() as u64;
-
-    // ── Route through generic S3 handler ─────────────────────────────────
-    // try_send is non-blocking; channel full / closed → warn and drop,
-    // mirroring the HEC handler pattern in src/ingest/handlers.rs.
-    for record in records {
-        if let Some(ref handler) = ingest.generic_s3
-            && let Err(e) = handler.try_send(record.clone())
-        {
-            let kind = DropKind::from(&e);
-            if let Some(dropped_total) = handler.drop_log_due(DropSite::Otlp, kind) {
-                match kind {
-                    DropKind::Full => {
-                        warn!(
-                            dropped_total,
-                            "OTLP generic_s3 channel full, dropping record"
-                        );
-                    }
-                    DropKind::Closed => {
-                        error!(dropped_total, "OTLP generic_s3 channel closed");
-                    }
-                }
-            }
-        }
-        if let Some(ref handler) = ingest.generic_local
-            && let Err(e) = handler.try_send(record)
-        {
-            let kind = DropKind::from(&e);
-            if let Some(dropped_total) = handler.drop_log_due(DropSite::Otlp, kind) {
-                match kind {
-                    DropKind::Full => {
-                        warn!(
-                            dropped_total,
-                            "OTLP generic_local channel full, dropping record"
-                        );
-                    }
-                    DropKind::Closed => {
-                        error!(dropped_total, "OTLP generic_local channel closed");
-                    }
-                }
-            }
-        }
-    }
+    drop(records);
 
     metrics::counter!("otlp_logs_received").increment(count);
 
