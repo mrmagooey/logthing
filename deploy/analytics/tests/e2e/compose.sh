@@ -174,7 +174,7 @@ OTLP_MB=$(METABASE_PASSWORD=$(envval METABASE_ADMIN_PASSWORD) "$PY" "$HERE/metab
   "http://127.0.0.1:$METABASE_PORT" admin@logthing.example \
   "SELECT count(*) FROM iceberg.logs.otlp WHERE $(_otlp_where)") \
   || { dump_logs metabase trino; exit 1; }
-[ "$OTLP_MB" = "$N" ] || { echo "Metabase otlp count $OTLP_MB, expected $N" >&2; exit 1; }
+[ "$OTLP_MB" = "$N" ] || { echo "Metabase otlp count $OTLP_MB, expected $N" >&2; dump_logs metabase; exit 1; }
 echo "metabase otlp: $OTLP_MB"
 
 echo "== [7/8] dbt build (staging views + tests) against Trino over TLS =="

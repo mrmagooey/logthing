@@ -65,6 +65,9 @@ def test_e2e_scripts_parse_and_share_one_security_helper():
     compose = (ANALYTICS / "tests" / "e2e" / "compose.sh").read_text()
     assert "send_app_logs.py" in compose and "assert_app_log_rows" in compose
     assert "assert_staging_dedup" in compose and "build_local_images" in compose
+    helm = (ANALYTICS / "tests" / "e2e" / "helm-minikube.sh").read_text()
+    assert "send_app_logs.py" in helm and "assert_app_log_rows" in helm
+    assert "assert_staging_dedup" in helm and "build_local_images" in helm
 
 
 @pytest.fixture

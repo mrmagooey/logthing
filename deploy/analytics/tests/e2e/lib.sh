@@ -74,7 +74,7 @@ build_local_images() {
     root=$(cd "$ANALYTICS/../.." && pwd)
     tag=$(git -C "$root" rev-parse --short HEAD)
     if [ -n "$(git -C "$root" status --porcelain -- . ':!.codegraph')" ]; then
-      h=$({ git -C "$root" diff HEAD -- . ':!.codegraph'
+      h=$({ git -C "$root" diff --binary HEAD -- . ':!.codegraph'
             git -C "$root" ls-files -o --exclude-standard -z -- . ':!.codegraph' \
               | (cd "$root" && xargs -0 -r sha256sum); } | sha256sum | cut -c1-12)
       tag=$tag-dirty-$h

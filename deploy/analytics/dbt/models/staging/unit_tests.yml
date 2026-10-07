@@ -55,6 +55,15 @@ unit_tests:
             ('u3', timestamp '2026-10-01 11:00:01 UTC', null,
              timestamp '2026-10-01 12:00:01 UTC', 9, 'INFO', 'earlier time',
              'svc', null, null, null, null, null, null, null, null, null, null, '{}', '{}',
+             timestamp '2026-10-01 12:00:01 UTC'),
+            -- u4 lists the earlier-time row FIRST so the result cannot depend on input order.
+            ('u4', timestamp '2026-10-01 11:00:01 UTC', null,
+             timestamp '2026-10-01 12:00:01 UTC', 9, 'INFO', 'earlier time listed first',
+             'svc', null, null, null, null, null, null, null, null, null, null, '{}', '{}',
+             timestamp '2026-10-01 12:00:01 UTC'),
+            ('u4', timestamp '2026-10-01 11:00:05 UTC', null,
+             timestamp '2026-10-01 12:00:01 UTC', 9, 'INFO', 'later time listed second',
+             'svc', null, null, null, null, null, null, null, null, null, null, '{}', '{}',
              timestamp '2026-10-01 12:00:01 UTC')
           ) as t("event_uuid", "time", "observed_time", "received_at", "severity_number",
                  "severity_text", "body", "service_name", "service_namespace",
@@ -65,6 +74,7 @@ unit_tests:
       format: dict
       rows:
         - {event_uuid: u3, body: earlier time}
+        - {event_uuid: u4, body: earlier time listed first}
 
   - name: stg_hec_dedups_but_keeps_every_legacy_null_uuid_row
     model: stg_hec

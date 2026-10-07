@@ -60,7 +60,7 @@ before the committer has evolved the table.
 Attributes are JSON strings:
 
 ```sql
-select json_extract_scalar(attributes, '$."http.route"') from stg_otlp;
+select json_extract_scalar(attributes, '$["http.route"]') from stg_otlp;
 select json_extract_scalar(fields, '$.user') from stg_hec;
 ```
 
