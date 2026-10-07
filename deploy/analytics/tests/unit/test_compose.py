@@ -48,6 +48,7 @@ def test_all_services_present(cfg):
     assert set(cfg["services"]) == {
         "postgres", "garage", "garage-init", "lakekeeper-migrate", "lakekeeper",
         "lakekeeper-init", "logthing", "committer", "certgen", "authgen", "trino",
+        "metabase", "metabase-init",
     }
 
 
@@ -60,6 +61,7 @@ def test_pinned_default_images(cfg):
     assert img["certgen"] == "alpine/openssl:3.5.9"
     assert img["authgen"] == "httpd:2.4.69-alpine"
     assert img["lakekeeper"] == "quay.io/lakekeeper/catalog:v0.13.6"
+    assert img["metabase"] == "metabase/metabase:v0.64.1"
 
 
 def test_ordering(cfg):
@@ -76,6 +78,9 @@ def test_ordering(cfg):
         "certgen": "service_completed_successfully",
         "authgen": "service_completed_successfully",
     }
+    assert dep("metabase") == {"postgres": "service_healthy",
+                               "certgen": "service_completed_successfully"}
+    assert dep("metabase-init") == {"metabase": "service_healthy", "trino": "service_healthy"}
 
 
 def test_trino_publishes_only_https_never_the_plain_http_port(cfg):
@@ -104,6 +109,36 @@ def test_only_trino_mounts_the_tls_volume_with_the_server_key(cfg):
         sources = {v.get("source") for v in svc.get("volumes", [])}
         if name not in ("trino", "certgen"):
             assert "trino-tls" not in sources, name
+
+
+def test_metabase_uses_postgres_app_db_and_trusts_the_generated_ca(tmp_path):
+    svc = compose_config(tmp_path, {"METABASE_DB_PASSWORD": "MbDbPw1234567890",
+                                    "TRINO_METABASE_PASSWORD": "TrinoMb1234567890"})["services"]
+    env = svc["metabase"]["environment"]
+    assert (env["MB_DB_TYPE"], env["MB_DB_HOST"], env["MB_DB_DBNAME"], env["MB_DB_USER"]) == (
+        "postgres", "postgres", "metabase", "metabase")
+    assert env["MB_DB_PASS"] == "MbDbPw1234567890" and env["MB_ENCRYPTION_SECRET_KEY"]
+    assert svc["postgres"]["environment"]["METABASE_DB_PASSWORD"] == "MbDbPw1234567890"
+    assert [(p["target"], p["host_ip"]) for p in svc["metabase"]["ports"]] == [
+        (3000, "127.0.0.1")]
+    init = svc["metabase-init"]["environment"]
+    assert init["TRINO_METABASE_PASSWORD"] == "TrinoMb1234567890"
+    assert svc["authgen"]["environment"]["TRINO_METABASE_PASSWORD"] == "TrinoMb1234567890"
+    assert (init["TRINO_PORT"], init["TRINO_TLS_MODE"], init["TRINO_CA_PATH"]) == (
+        "8443", "pem", "/tls/ca.pem")
+    assert "/api/health" in " ".join(svc["metabase"]["healthcheck"]["test"])
+    assert svc["metabase-init"]["restart"] == "no"
+
+
+def test_metabase_mounts_only_the_ca_never_the_trino_private_key(cfg):
+    mb = cfg["services"]["metabase"]
+    assert [(v["source"], v["target"], v["read_only"]) for v in mb["volumes"]] == [
+        ("trino-ca", "/tls", True)]
+    # certgen publishes a copy of ca.pem (only) into the trino-ca volume
+    certgen = cfg["services"]["certgen"]
+    assert certgen["environment"]["CA_COPY_DIR"] == "/ca"
+    assert {(v["source"], v["target"]) for v in certgen["volumes"] if v["type"] == "volume"} == {
+        ("trino-tls", "/tls"), ("trino-ca", "/ca")}
 
 
 def test_trino_password_env_matches_authgen_admin_secret(tmp_path):
@@ -200,7 +235,7 @@ def test_bind_mount_sources_exist(cfg):
 
 
 def test_non_ingest_ports_default_to_loopback(cfg):
-    for name in ("garage", "trino"):
+    for name in ("garage", "trino", "metabase"):
         for p in cfg["services"][name]["ports"]:
             assert p["host_ip"] == "127.0.0.1", name
     for p in cfg["services"]["logthing"]["ports"]:
@@ -208,7 +243,8 @@ def test_non_ingest_ports_default_to_loopback(cfg):
 
 
 def test_long_running_services_restart(cfg):
-    for name in ("postgres", "garage", "lakekeeper", "trino", "logthing", "committer"):
+    for name in ("postgres", "garage", "lakekeeper", "trino", "metabase", "logthing",
+                 "committer"):
         assert cfg["services"][name]["restart"] == "unless-stopped", name
 
 

@@ -1,5 +1,5 @@
 # logthing analytics stack: logthing -> Garage (S3) -> committer -> Lakekeeper (Iceberg REST)
-# -> Trino. Shared config files live in helm/logthing-analytics/files/ and are used
+# -> Trino -> Metabase. Shared config files live in helm/logthing-analytics/files/ and are used
 # unchanged by the Helm chart. Secrets are REQUIRED (no defaults): run scripts/gen-analytics-env.sh.
 name: logthing-analytics
 
@@ -48,6 +48,7 @@ services:
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
       LAKEKEEPER_DB_PASSWORD: ${LAKEKEEPER_DB_PASSWORD:?set LAKEKEEPER_DB_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      METABASE_DB_PASSWORD: ${METABASE_DB_PASSWORD:?set METABASE_DB_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
     volumes:
       - ./helm/logthing-analytics/files/postgres-init.sh:/docker-entrypoint-initdb.d/10-init.sh:ro
       - pgdata:/var/lib/postgresql/data
@@ -162,9 +163,12 @@ services:
     environment:
       OUT_DIR: /tls
       TLS_OWNER: "1000:1000"
+      # A copy of ca.pem only: what Metabase mounts (it must never see server.pem).
+      CA_COPY_DIR: /ca
     volumes:
       - ./scripts/certgen.sh:/certgen.sh:ro
       - trino-tls:/tls
+      - trino-ca:/ca
     restart: "no"
 
   authgen:
@@ -210,7 +214,53 @@ services:
     ports:
       - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${TRINO_PORT:-8443}:8443"
 
+  metabase:
+    image: ${METABASE_IMAGE:-metabase/metabase:v0.64.1}
+    restart: unless-stopped
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_HOST: postgres
+      MB_DB_PORT: "5432"
+      MB_DB_DBNAME: metabase
+      MB_DB_USER: metabase
+      MB_DB_PASS: ${METABASE_DB_PASSWORD:?set METABASE_DB_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      # Encrypts the Trino credentials stored in Metabase's application database.
+      MB_ENCRYPTION_SECRET_KEY: ${METABASE_ENCRYPTION_KEY:?set METABASE_ENCRYPTION_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+    volumes:
+      # Only the public CA (copied by certgen), never the Trino private key in server.pem.
+      - trino-ca:/tls:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      # First start runs all of Metabase's schema migrations; allow ~30 minutes on a slow host.
+      retries: 180
+      start_period: 60s
+    depends_on:
+      postgres: {condition: service_healthy}
+      certgen: {condition: service_completed_successfully}
+    ports:
+      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${METABASE_PORT:-3000}:3000"
+
+  metabase-init:
+    <<: *bootstrap
+    command: ["metabase"]
+    environment:
+      METABASE_URL: http://metabase:3000
+      METABASE_ADMIN_EMAIL: ${METABASE_ADMIN_EMAIL:-admin@logthing.example}
+      METABASE_ADMIN_PASSWORD: ${METABASE_ADMIN_PASSWORD:?set METABASE_ADMIN_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      TRINO_HOST: trino
+      TRINO_PORT: "8443"
+      TRINO_METABASE_USER: metabase
+      TRINO_METABASE_PASSWORD: ${TRINO_METABASE_PASSWORD:?set TRINO_METABASE_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      TRINO_TLS_MODE: ${METABASE_TRINO_TLS_MODE:-pem}
+      TRINO_CA_PATH: /tls/ca.pem
+    depends_on:
+      metabase: {condition: service_healthy}
+      trino: {condition: service_healthy}
+
 volumes:
+  trino-ca: {}
   pgdata: {}
   garage-meta: {}
   garage-data: {}

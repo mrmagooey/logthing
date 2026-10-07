@@ -31,6 +31,7 @@ class FakeServer:
     def __init__(self):
         self.routes = {}
         self.calls = []
+        self.header_log = []
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -43,6 +44,7 @@ class FakeServer:
                 raw = self.rfile.read(length) if length else b""
                 body = json.loads(raw) if raw else None
                 outer.calls.append((self.command, url.path, body, self.headers.get("Authorization")))
+                outer.header_log.append(dict(self.headers))
                 fn = outer.routes.get((self.command, url.path))
                 status, obj = fn(parse_qs(url.query), body) if fn else (404, {"code": "NotFound"})
                 data = b"" if obj is None else json.dumps(obj).encode()
@@ -52,7 +54,7 @@ class FakeServer:
                 self.end_headers()
                 self.wfile.write(data)
 
-            do_GET = do_POST = _handle
+            do_GET = do_POST = do_PUT = _handle
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
@@ -82,3 +84,13 @@ def generated_env(path):
             key, value = line.split("=", 1)
             out[key] = value
     return out
+
+
+E2E = ANALYTICS / "tests" / "e2e"
+
+
+def load_metabase_query():
+    spec = importlib.util.spec_from_file_location("metabase_query", E2E / "metabase_query.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod

@@ -169,7 +169,7 @@ repository conventions.
 - [docs/aggregation.md](docs/aggregation.md) — log aggregation rules and output schema
 - [docs/iceberg.md](docs/iceberg.md) — Iceberg descriptor output and a suggested committer/catalog deployment pattern
 - [committer/README.md](committer/README.md) — the shipped Iceberg descriptor committer (container image, configuration, end-to-end test)
-- [deploy/analytics/README.md](deploy/analytics/README.md) — ready-to-run docker compose / Helm analytics stack (Garage, committer, Lakekeeper, Trino, Hue)
+- [deploy/analytics/README.md](deploy/analytics/README.md) — ready-to-run docker compose / Helm analytics stack (Garage, committer, Lakekeeper, Trino, Metabase)
 - [docs/deployment.md](docs/deployment.md) — host tuning for UDP ingest and security considerations
 - [docs/metrics.md](docs/metrics.md) — Prometheus metrics and the full API endpoint list
 - [docs/admin.md](docs/admin.md) — read-only admin web interface

@@ -6,9 +6,12 @@
 #      TLS_SANS  subjectAltName list (default DNS:trino,DNS:localhost,IP:127.0.0.1)
 #      TLS_DAYS  server certificate lifetime in days (default 825)
 #      TLS_OWNER optional uid:gid to chown the outputs to (Trino runs as 1000:1000)
+#      CA_COPY_DIR optional second directory that receives a copy of ca.pem ONLY, so clients
+#                (Metabase) can mount the public CA without ever seeing server.pem
 # Writes ca.pem (clients trust this) and server.pem (certificate + PKCS#8 key, mode 600).
-# Idempotent: an existing certificate that ca.pem verifies and has more than 30 days left is kept, so clients that
-# already trust ca.pem keep working. The CA key is discarded after signing.
+# Idempotent: an existing certificate that ca.pem verifies and has more than 30 days left is
+# kept, so clients that already trust ca.pem keep working. The CA key is discarded after
+# signing.
 # Exits non-zero (loudly) if openssl is missing or any generation step fails.
 set -eu
 command -v openssl >/dev/null 2>&1 || { echo "certgen: openssl not found in PATH" >&2; exit 127; }
@@ -17,9 +20,18 @@ SANS=${TLS_SANS:-DNS:trino,DNS:localhost,IP:127.0.0.1}
 DAYS=${TLS_DAYS:-825}
 mkdir -p "$OUT_DIR"
 cd "$OUT_DIR"
+# Publish the public CA (never the key) for clients; atomic so readers never see a partial file.
+copy_ca() {
+  [ -n "${CA_COPY_DIR:-}" ] || return 0
+  mkdir -p "$CA_COPY_DIR"
+  cp "$OUT_DIR/ca.pem" "$CA_COPY_DIR/.ca.pem.tmp"
+  chmod 644 "$CA_COPY_DIR/.ca.pem.tmp"
+  mv -f "$CA_COPY_DIR/.ca.pem.tmp" "$CA_COPY_DIR/ca.pem"
+}
 if [ -s server.pem ] && [ -s ca.pem ] \
    && openssl x509 -in server.pem -noout -checkend 2592000 >/dev/null 2>&1 \
    && openssl verify -CAfile ca.pem server.pem >/dev/null 2>&1; then
+  copy_ca
   echo "certgen: existing certificate still valid, keeping it"
   exit 0
 fi
@@ -45,4 +57,5 @@ chmod 600 server.pem
 if [ -n "${TLS_OWNER:-}" ]; then chown "$TLS_OWNER" server.pem ca.pem; fi
 mv -f server.pem "$OUT_DIR/server.pem"
 mv -f ca.pem "$OUT_DIR/ca.pem"
+copy_ca
 echo "certgen: wrote $OUT_DIR/ca.pem and $OUT_DIR/server.pem (SANs: $SANS)"

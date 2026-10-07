@@ -99,3 +99,89 @@ def test_security_helper_fails_when_the_admin_password_is_rejected(tls_server):
     url, ca = tls_server
     r = run_checks(url, ca, "not-the-password")
     assert r.returncode != 0 and "valid credentials" in r.stderr
+
+
+from conftest import load_metabase_query
+
+
+def mb_routes(server, engines=("starburst",), dataset=None):
+    server.routes[("GET", "/api/session/properties")] = lambda q, b: (
+        200, {"engines": {e: {} for e in engines}})
+    server.routes[("POST", "/api/session")] = lambda q, b: (
+        (200, {"id": "s1"}) if b["password"] == "pw" else (401, {"message": "bad"}))
+    server.routes[("GET", "/api/database")] = lambda q, b: (
+        200, {"data": [{"id": 1, "engine": "postgres"}, {"id": 7, "engine": "starburst"}]})
+    server.routes[("POST", "/api/dataset")] = dataset or (
+        lambda q, b: (202, {"status": "completed", "data": {"rows": [[b["database"]]]}}))
+
+
+def test_metabase_query_uses_the_starburst_database(server):
+    mb_routes(server)
+    assert load_metabase_query().run(server.url, "a@b.c", "pw", "select 1") == 7
+    assert any(c[1] == "/api/dataset" and c[2]["native"]["query"] == "select 1"
+               for c in server.calls)
+
+
+def test_metabase_query_requires_the_starburst_driver(server):
+    mb_routes(server, engines=("postgres",))
+    with pytest.raises(RuntimeError, match="starburst"):
+        load_metabase_query().run(server.url, "a@b.c", "pw", "select 1")
+
+
+def test_metabase_query_login_failure_is_reported(server):
+    mb_routes(server)
+    with pytest.raises(RuntimeError, match="login failed"):
+        load_metabase_query().run(server.url, "a@b.c", "wrong", "select 1")
+
+
+def test_metabase_query_retries_failures_then_times_out_with_the_error(server, monkeypatch):
+    mb_routes(server, dataset=lambda q, b: (202, {"status": "failed", "error": "trino starting"}))
+    mod = load_metabase_query()
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+    with pytest.raises(TimeoutError, match="trino starting"):
+        mod.run(server.url, "a@b.c", "pw", "select 1", deadline_secs=0)
+
+
+PORTS = ANALYTICS / "tests" / "e2e" / "published_ports.py"
+
+
+def ports_run(text):
+    return subprocess.run(["python3", str(PORTS)], input=text, capture_output=True, text=True)
+
+
+def _row(service, target, published=None):
+    return {"Service": service, "Publishers": [{"TargetPort": target, "PublishedPort": published}]}
+
+
+OK_ROWS = [_row("garage", 3900, 3900), _row("lakekeeper", 8181, 0), _row("postgres", 5432, 0),
+           _row("metabase", 3000, 3000)]
+
+
+def test_published_ports_accepts_ndjson_and_a_json_array():
+    import json
+    assert ports_run("\n".join(json.dumps(r) for r in OK_ROWS)).returncode == 0
+    assert ports_run(json.dumps(OK_ROWS)).returncode == 0
+
+
+def test_published_ports_rejects_an_empty_listing_in_either_format():
+    for text in ("", "[]", "\n"):
+        r = ports_run(text)
+        assert r.returncode != 0 and "vacuous" in r.stderr, text
+
+
+def test_published_ports_flags_internal_ports_in_either_format():
+    import json
+    bad = OK_ROWS + [_row("lakekeeper", 8181, 18181)]
+    for text in (json.dumps(bad), "\n".join(json.dumps(r) for r in bad)):
+        r = ports_run(text)
+        assert r.returncode != 0 and "lakekeeper" in r.stderr
+    assert ports_run(json.dumps(OK_ROWS + [_row("trino", 8080, 8080)])).returncode != 0
+
+
+def test_e2e_scripts_include_the_metabase_step_and_no_hue():
+    for name, marker in (("compose.sh", "[6/6]"), ("helm-minikube.sh", "[8/8]")):
+        text = (ANALYTICS / "tests" / "e2e" / name).read_text()
+        assert marker in text and "metabase_query.py" in text, name
+    assert "published_ports.py" in (ANALYTICS / "tests" / "e2e" / "compose.sh").read_text()
+    helm = (ANALYTICS / "tests" / "e2e" / "helm-minikube.sh").read_text()
+    assert "$FULL-trino-tls" in helm and "metabase-init" in helm

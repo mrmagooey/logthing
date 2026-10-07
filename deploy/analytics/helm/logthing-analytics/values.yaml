@@ -3,7 +3,7 @@
 # existingSecret to a Secret with these keys: garage-rpc-secret garage-admin-token
 # s3-access-key s3-secret-key postgres-password lakekeeper-db-password
 # lakekeeper-encryption-key trino-admin-password trino-metabase-password
-# trino-shared-secret.
+# trino-shared-secret metabase-db-password metabase-encryption-key metabase-admin-password.
 # Values must be URL-safe ([A-Za-z0-9._~-]): they are spliced into Postgres URLs. The Garage key
 # id must be GK + 24 lowercase hex, its secret 64 lowercase hex.
 credentials:
@@ -18,6 +18,9 @@ credentials:
   trinoAdminPassword: ""
   trinoMetabasePassword: ""
   trinoSharedSecret: ""
+  metabaseDbPassword: ""
+  metabaseEncryptionKey: ""
+  metabaseAdminPassword: ""
 
 bootstrap:
   image: python:3.12-slim
@@ -74,8 +77,21 @@ trino:
     requests: {memory: 2Gi}
     limits: {memory: 4Gi}
 
+metabase:
+  image: metabase/metabase:v0.64.1
+  adminEmail: admin@logthing.example
+  # pem: verify Trino's certificate against the generated CA. insecure: skip verification
+  # (private network only).
+  trinoTlsMode: pem
+  service:
+    type: ClusterIP
+  resources:
+    requests: {memory: 1Gi}
+    limits: {memory: 2Gi}
+
 storageClassName: ""
 networkPolicy:
   # Ingress isolation for Lakekeeper (no authentication), Postgres, the Garage admin API and
-  # Trino's plain-HTTP port. Only enforced by CNIs that implement NetworkPolicy (Calico, Cilium, ...).
+  # Trino's plain-HTTP port. Only enforced by CNIs that implement NetworkPolicy (Calico,
+  # Cilium, ...).
   enabled: true

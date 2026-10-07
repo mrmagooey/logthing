@@ -145,7 +145,7 @@ src/
   syslog/       # Syslog listener
   zeek/         # Zeek NDJSON ingestion
 committer/  # Python Iceberg committer (separate image)
-deploy/analytics/  # Compose + Helm analytics stack (Garage, Lakekeeper, Trino, Hue)
+deploy/analytics/  # Compose + Helm analytics stack (Garage, Lakekeeper, Trino, Metabase)
 ```
 
 Note: `src/lib.rs` is the crate's module root (the crate is both a library and a binary); `src/main.rs` is the binary entry point only.

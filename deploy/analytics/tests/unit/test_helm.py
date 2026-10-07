@@ -1,3 +1,4 @@
+import os
 import re
 import shutil
 import subprocess
@@ -31,11 +32,25 @@ def render_fails(*sets):
 
 
 def notes(*sets):
-    args = ["helm", "install", "lt", str(CHART), "--dry-run=client"]
-    for s in sets:
-        args += ["--set", s]
-    out = subprocess.run(args, capture_output=True, text=True, check=True, timeout=TIMEOUT).stdout
-    return out.split("NOTES:", 1)[1]
+    """Render NOTES.txt hermetically: `helm install --dry-run` can need a live cluster and
+    `helm template` drops notes, so render a copy of the chart that exposes the notes text as a
+    ConfigMap value."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        chart = shutil.copytree(CHART, f"{d}/chart")
+        text = open(f"{chart}/templates/NOTES.txt").read()
+        os.remove(f"{chart}/templates/NOTES.txt")
+        open(f"{chart}/templates/_notes.tpl", "w").write(
+            '{{- define "notes" -}}' + text + "{{- end -}}")
+        open(f"{chart}/templates/notes.yaml", "w").write(
+            'apiVersion: v1\nkind: ConfigMap\nmetadata: {name: notes}\ndata:\n'
+            '  notes: |\n    {{- include "notes" . | nindent 4 }}\n')
+        args = ["helm", "template", "lt", chart, "--show-only", "templates/notes.yaml"]
+        for s in sets:
+            args += ["--set", s]
+        out = subprocess.run(args, capture_output=True, text=True, check=True,
+                             timeout=TIMEOUT).stdout
+        return yaml.safe_load(out)["data"]["notes"]
 
 
 def by(docs, kind, name):
@@ -70,6 +85,9 @@ def test_expected_resources():
         ("Service", f"{FULL}-garage"),
         ("Service", f"{FULL}-lakekeeper"),
         ("Service", f"{FULL}-trino"),
+        ("Service", f"{FULL}-metabase"),
+        ("Deployment", f"{FULL}-metabase"),
+        ("Job", f"{FULL}-metabase-init-1"),
         ("Job", f"{FULL}-garage-init-1"),
         ("Job", f"{FULL}-lakekeeper-init-1"),
         ("Deployment", f"{FULL}-lakekeeper"),
@@ -184,6 +202,7 @@ def test_secret_keys_complete():
         "garage-rpc-secret", "garage-admin-token", "s3-access-key", "s3-secret-key",
         "postgres-password", "lakekeeper-db-password", "lakekeeper-encryption-key",
         "trino-admin-password", "trino-metabase-password", "trino-shared-secret",
+        "metabase-db-password", "metabase-encryption-key", "metabase-admin-password",
     }
 
 
@@ -199,7 +218,7 @@ def test_helm_secret_refs_everywhere():
     assert {"GARAGE_RPC_SECRET", "GARAGE_ADMIN_TOKEN"} <= env_names(
         docs, "StatefulSet", f"{FULL}-garage"
     )
-    assert {"POSTGRES_PASSWORD", "LAKEKEEPER_DB_PASSWORD"} <= env_names(
+    assert {"POSTGRES_PASSWORD", "LAKEKEEPER_DB_PASSWORD", "METABASE_DB_PASSWORD"} <= env_names(
         docs, "StatefulSet", f"{FULL}-postgres"
     )
 
@@ -247,7 +266,7 @@ def test_default_images_pinned():
         "postgres:17", "dxflrs/garage:v2.4.1", "python:3.12-slim",
         "quay.io/lakekeeper/catalog:v0.13.6", "ghcr.io/mrmagooey/logthing:0.21.0",
         "ghcr.io/mrmagooey/logthing-committer:0.21.0", "trinodb/trino:483",
-        "httpd:2.4.69-alpine",
+        "httpd:2.4.69-alpine", "metabase/metabase:v0.64.1",
     }
 
 
@@ -294,7 +313,7 @@ def test_rendered_yaml_has_no_duplicate_keys():
 
 def test_jobs_are_revisioned_with_ttl_and_stable_component_label():
     docs = render()
-    for comp in ("garage-init", "lakekeeper-init"):
+    for comp in ("garage-init", "lakekeeper-init", "metabase-init"):
         job = by(docs, "Job", f"{FULL}-{comp}-1")
         assert job["spec"]["ttlSecondsAfterFinished"] == 3600
         assert job["metadata"]["labels"]["app.kubernetes.io/component"] == comp
@@ -477,7 +496,8 @@ def test_generated_credentials_have_required_shapes():
     assert HEX64.fullmatch(d["s3-secret-key"]) and HEX64.fullmatch(d["garage-rpc-secret"])
     for k in ("garage-admin-token", "postgres-password", "lakekeeper-db-password",
               "lakekeeper-encryption-key", "trino-admin-password", "trino-metabase-password",
-              "trino-shared-secret"):
+              "trino-shared-secret", "metabase-db-password", "metabase-encryption-key",
+              "metabase-admin-password"):
         assert re.fullmatch(r"[A-Za-z0-9]{32,}", d[k]), k
 
 
@@ -505,6 +525,13 @@ def test_non_url_safe_password_fails_render():
     assert "lakekeeperDbPassword" in err and "URL-safe" in err
 
 
+def test_notes_point_at_metabase_and_https_trino():
+    text = notes()
+    assert "metabase-admin-password" in text and "svc/lt-logthing-analytics-metabase" in text
+    assert "svc/lt-logthing-analytics-trino 8443" in text and "https://localhost:8443" in text
+    assert "Hue" not in text
+
+
 def test_notes_describe_generated_credentials():
     text = notes()
     assert "Demo credentials" not in text
@@ -524,7 +551,8 @@ def test_checksum_secret_is_stable_across_renders_with_generated_secrets():
                        ("Deployment", "trino"), ("StatefulSet", "postgres"),
                        ("StatefulSet", "garage"), ("Deployment", "lakekeeper"),
                        ("CronJob", "committer"), ("Job", "garage-init-1"),
-                       ("Job", "lakekeeper-init-1")):
+                       ("Job", "lakekeeper-init-1"), ("Deployment", "metabase"),
+                       ("Job", "metabase-init-1")):
         full = f"{FULL}-{name}"
         assert (_annotations(a, kind, full)["checksum/secret"]
                 == _annotations(b, kind, full)["checksum/secret"]), name
@@ -609,8 +637,58 @@ def test_policy_selectors_match_real_pod_labels():
         used = {p["spec"]["podSelector"]["matchLabels"][LABEL]}
         used |= {x["podSelector"]["matchLabels"][LABEL] for r in p["spec"]["ingress"]
                  for x in r.get("from", [])}
-        assert used <= pod_components | {"metabase"}, used - pod_components
+        assert used <= pod_components, used - pod_components
 
 
 def test_network_policy_can_be_disabled():
     assert policies("networkPolicy.enabled=false") == {}
+
+
+def _env_map(container):
+    return {e["name"]: e.get("value") or e["valueFrom"]["secretKeyRef"]["key"]
+            for e in container["env"]}
+
+
+def test_metabase_deployment_wiring():
+    spec = pod_spec(by(render(), "Deployment", f"{FULL}-metabase"))
+    wait = spec["initContainers"][0]
+    assert wait["name"] == "wait-postgres" and f"{FULL}-postgres" in wait["command"]
+    c = spec["containers"][0]
+    env = _env_map(c)
+    assert env["MB_DB_TYPE"] == "postgres" and env["MB_DB_HOST"] == f"{FULL}-postgres"
+    assert env["MB_DB_DBNAME"] == "metabase" and env["MB_DB_USER"] == "metabase"
+    assert env["MB_DB_PASS"] == "metabase-db-password"
+    assert env["MB_ENCRYPTION_SECRET_KEY"] == "metabase-encryption-key"
+    assert c["readinessProbe"]["httpGet"] == {"path": "/api/health", "port": 3000}
+    # only the CA is mounted: never Trino's private key
+    tls = next(v for v in spec["volumes"] if v["name"] == "tls")["secret"]
+    assert tls["items"] == [{"key": "ca.pem", "path": "ca.pem"}]
+    assert tls["secretName"] == f"{FULL}-trino-tls"
+    assert [(m["mountPath"], m["readOnly"]) for m in c["volumeMounts"]] == [("/tls", True)]
+
+
+def test_metabase_tls_secret_follows_trino_existing_secret():
+    spec = pod_spec(by(render("trino.tls.existingSecret=mytls"), "Deployment",
+                       f"{FULL}-metabase"))
+    assert next(v for v in spec["volumes"] if v["name"] == "tls")["secret"]["secretName"] == "mytls"
+
+
+def test_metabase_init_job_env_and_modes():
+    job = by(render(), "Job", f"{FULL}-metabase-init-1")
+    c = pod_spec(job)["containers"][0]
+    assert c["command"] == ["python", "/bootstrap/bootstrap.py", "metabase"]
+    env = _env_map(c)
+    assert env["METABASE_URL"] == f"http://{FULL}-metabase:3000"
+    assert env["TRINO_HOST"] == f"{FULL}-trino" and env["TRINO_PORT"] == "8443"
+    assert env["METABASE_ADMIN_PASSWORD"] == "metabase-admin-password"
+    assert env["TRINO_METABASE_PASSWORD"] == "trino-metabase-password"
+    assert env["TRINO_TLS_MODE"] == "pem" and env["TRINO_CA_PATH"] == "/tls/ca.pem"
+    job2 = by(render("metabase.trinoTlsMode=insecure"), "Job", f"{FULL}-metabase-init-1")
+    assert _env_map(pod_spec(job2)["containers"][0])["TRINO_TLS_MODE"] == "insecure"
+
+
+def test_postgres_policy_selects_the_real_metabase_pods():
+    docs = render()
+    assert pod_spec_meta(by(docs, "Deployment", f"{FULL}-metabase"))["labels"][LABEL] == "metabase"
+    (rule,) = policies()[f"{FULL}-postgres"]["spec"]["ingress"]
+    assert "metabase" in peers(rule)

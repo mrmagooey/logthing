@@ -1,5 +1,9 @@
 logthing analytics stack installed as {{ include "la.fullname" . }}.
 
+Open Metabase (admin {{ .Values.metabase.adminEmail }}, password in Secret {{ include "la.secretName" . }} key metabase-admin-password):
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "la.fullname" . }}-metabase 3000
+  then browse http://localhost:3000 (the Trino database "logthing" is already registered)
+
 Query Trino (HTTPS + password; user admin, password in Secret {{ include "la.secretName" . }} key trino-admin-password):
   kubectl exec -n {{ .Release.Namespace }} deploy/{{ include "la.fullname" . }}-trino -- \
     trino --server https://localhost:8443 --truststore-path /etc/trino/tls/ca.pem --user admin --password --execute 'SHOW TABLES FROM iceberg.logs'

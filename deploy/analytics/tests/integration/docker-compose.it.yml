@@ -1,4 +1,4 @@
-# Test-only override: publish Garage S3/admin, Lakekeeper and Trino HTTPS on ephemeral loopback ports.
+# Test-only override: publish Garage S3/admin, Lakekeeper, Trino HTTPS and Metabase on ephemeral loopback ports.
 # The test reads the assigned ports back with `docker compose port`.
 services:
   garage:
@@ -11,3 +11,6 @@ services:
   trino:
     ports: !override
       - "127.0.0.1::8443"
+  metabase:
+    ports: !override
+      - "127.0.0.1::3000"

@@ -119,3 +119,24 @@ Generated values never change after first install by design, so they need no rol
     matchLabels: {{- include "la.selector" (dict "root" $root "component" .) | nindent 8 }}
 {{- end }}
 {{- end -}}
+{{/* initContainer for Metabase: wait for Postgres (TCP) */}}
+{{- define "la.waitPostgres" -}}
+- name: wait-postgres
+  image: {{ .Values.bootstrap.image }}
+  command:
+    - python
+    - -c
+    - |
+      import socket, sys, time
+      deadline = time.time() + float(sys.argv[1])
+      while True:
+          try:
+              socket.create_connection((sys.argv[2], 5432), 3).close()
+              break
+          except OSError as e:
+              if time.time() > deadline:
+                  sys.exit(f"wait-postgres: {sys.argv[2]}:5432 not ready: {e}")
+              time.sleep(2)
+    - {{ .Values.bootstrap.timeoutSecs | quote }}
+    - {{ include "la.fullname" . }}-postgres
+{{- end -}}

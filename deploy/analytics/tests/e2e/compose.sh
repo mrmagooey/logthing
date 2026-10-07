@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end: compose stack up -> syslog into logthing -> committer -> Trino (HTTPS + password) sees the rows.
+# End-to-end: compose stack up -> syslog into logthing -> committer -> Trino (HTTPS + password) and Metabase see the rows.
 # Requires Docker and an AVX2-capable CPU (or a TRINO_IMAGE override such as trinodb/trino:470).
 set -euo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -11,6 +11,7 @@ PROJECT="lt-e2e-$$"
 # Non-default host ports so a developer's running stack does not collide.
 SYSLOG_UDP_PORT=25514
 TRINO_PORT=28443
+METABASE_PORT=23000
 N=40
 MARKER="analytics-e2e-$(date +%s)-$$"
 PY=${PYTHON:-python3}
@@ -29,6 +30,7 @@ ZEEK_PORT=47761
 LOGTHING_HEALTH_PORT=25985
 GARAGE_S3_PORT=23901
 TRINO_PORT=$TRINO_PORT
+METABASE_PORT=$METABASE_PORT
 ENV
 [ -z "${TRINO_IMAGE:-}" ] || echo "TRINO_IMAGE=$TRINO_IMAGE" >>"$ENVFILE"
 envval() { grep "^$1=" "$ENVFILE" | cut -d= -f2-; }
@@ -50,10 +52,10 @@ fail() { echo "FAIL: $*" >&2; dump_logs trino; exit 1; }
 TRINO_CLI=(trino --server https://localhost:8443 --truststore-path /etc/trino/tls/ca.pem
            --user admin --password)
 
-echo "== [1/5] up (project $PROJECT) =="
-timeout 540 "${DC[@]}" up -d --wait || { echo "stack failed to become healthy" >&2; dump_logs; exit 1; }
+echo "== [1/6] up (project $PROJECT) =="
+timeout 2400 "${DC[@]}" up -d --wait || { echo "stack failed to become healthy" >&2; dump_logs; exit 1; }
 
-echo "== [2/5] Trino security: HTTPS + password, negative tests =="
+echo "== [2/6] Trino security: HTTPS + password, negative tests =="
 "${DC[@]}" exec -T trino cat /etc/trino/tls/ca.pem >"$CA"
 trino_security_checks "https://localhost:$TRINO_PORT" "$CA" "$TRINO_ADMIN_PASSWORD" \
   || { dump_logs trino; exit 1; }
@@ -70,20 +72,12 @@ if "${DC[@]}" exec -T -e TRINO_PASSWORD=wrong trino "${TRINO_CLI[@]}" --execute 
 fi
 # Isolation: Lakekeeper, Postgres and the Garage admin API must not be published to the host.
 # (Use Publishers from `ps`: `compose port` exits 0 with "invalid IP:0" when unpublished.)
-"${DC[@]}" ps --format json | python3 -c '
-import json, sys
-rows = [json.loads(l) for l in sys.stdin.read().splitlines() if l.strip()]
-bad = []
-for r in rows:
-    for p in r.get("Publishers") or []:
-        if p.get("PublishedPort") and (r["Service"] in ("lakekeeper", "postgres")
-                or p.get("TargetPort") in (3901, 3903, 5432, 8181, 8080)):
-            bad.append((r["Service"], p["TargetPort"], p["PublishedPort"]))
-sys.exit("published internal ports: %s" % bad if bad else 0)
-' || fail "an internal port is published to the host"
+# `ps --format json` is NDJSON or one array depending on the compose version; the helper
+# handles both and refuses an empty listing.
+"${DC[@]}" ps --format json | "$PY" "$HERE/published_ports.py" || fail "an internal port is published to the host"
 echo "isolation: lakekeeper, postgres and garage admin are not published"
 
-echo "== [3/5] send $N syslog messages ($MARKER) =="
+echo "== [3/6] send $N syslog messages ($MARKER) =="
 "$PY" - "$SYSLOG_UDP_PORT" "$N" "$MARKER" <<'PYEOF'
 import socket, sys, time
 port, n, marker = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
@@ -100,7 +94,7 @@ trino_count() {
     | tr -d '"\r' || true
 }
 
-echo "== [4/5] wait (<=300s) for committer to land rows in iceberg.logs.syslog =="
+echo "== [4/6] wait (<=300s) for committer to land rows in iceberg.logs.syslog =="
 deadline=$(( $(date +%s) + 300 ))
 until [ "$(trino_count)" = "$N" ]; do
   if [ "$(date +%s)" -ge "$deadline" ]; then
@@ -111,8 +105,15 @@ until [ "$(trino_count)" = "$N" ]; do
   sleep 5
 done
 
-echo "== [5/5] Trino count =="
+echo "== [5/6] Trino count =="
 [ "$(trino_count)" = "$N" ] || { echo "Trino count mismatch" >&2; exit 1; }
 echo "trino: $N"
+
+echo "== [6/6] same query through Metabase's API (Trino over TLS) =="
+MB_COUNT=$(METABASE_PASSWORD=$(envval METABASE_ADMIN_PASSWORD) "$PY" "$HERE/metabase_query.py" \
+  "http://127.0.0.1:$METABASE_PORT" admin@logthing.example "$COUNT_SQL") \
+  || { dump_logs metabase metabase-init trino; exit 1; }
+[ "$MB_COUNT" = "$N" ] || { echo "Metabase returned $MB_COUNT, expected $N" >&2; dump_logs metabase; exit 1; }
+echo "metabase: $MB_COUNT"
 
 echo "Analytics compose E2E PASSED"

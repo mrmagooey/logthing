@@ -127,3 +127,14 @@ def test_regenerates_when_ca_and_server_cert_do_not_match(tmp_path):
     subprocess.run(
         ["openssl", "verify", "-CAfile", str(a / "ca.pem"), str(a / "server.pem")],
         check=True, capture_output=True)
+
+
+def test_ca_copy_dir_receives_only_the_public_ca(tmp_path):
+    out, ca = tmp_path / "out", tmp_path / "ca"
+    run(out, CA_COPY_DIR=str(ca))
+    assert [p.name for p in ca.iterdir()] == ["ca.pem"]
+    assert (ca / "ca.pem").read_bytes() == (out / "ca.pem").read_bytes()
+    assert (ca / "ca.pem").stat().st_mode & 0o777 == 0o644
+    (ca / "ca.pem").unlink()
+    run(out, CA_COPY_DIR=str(ca))  # idempotent run (cert kept) still restores the copy
+    assert (ca / "ca.pem").read_bytes() == (out / "ca.pem").read_bytes()
