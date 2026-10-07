@@ -240,6 +240,11 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     ),
     (
         Kind::Counter,
+        "otlp_events_dropped",
+        "OTLP log records not enqueued on at least one OTLP writer channel (full or closed).",
+    ),
+    (
+        Kind::Counter,
         "otlp_auth_failures",
         "OTLP requests rejected for a missing or incorrect token.",
     ),

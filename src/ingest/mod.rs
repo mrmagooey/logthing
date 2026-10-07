@@ -97,9 +97,6 @@ pub fn assign_event_uuids<R: EventUuid>(records: &mut [R]) {
 /// Injected as `.layer(axum::Extension(ingest_state))` on the protected router.
 /// Cloning is O(1): `GenericS3Handler` is a `ParquetWriterHandle<_>` which
 /// wraps an `Arc<tokio::sync::mpsc::Sender<_>>`.
-///
-/// # Extension point
-/// Unit 5 will add `pub otlp_s3: Option<OtlpS3Handler>` here.
 #[derive(Clone, Default)]
 pub struct IngestState {
     /// Generic S3 handler for HEC / NDJSON ingest routes.
@@ -109,7 +106,11 @@ pub struct IngestState {
     /// `None` when `[hec.local]` is absent or construction failed.
     /// Independent of `generic_s3` — both may be `Some` simultaneously.
     pub generic_local: Option<GenericS3Handler>,
-    // Unit 5: pub otlp_s3: Option<OtlpS3Handler>,
+    /// OTLP S3 handler. `None` when `[otlp.s3]` is absent or construction failed.
+    pub otlp_s3: Option<crate::forwarding::otlp_s3::OtlpHandler>,
+    /// OTLP local-disk handler. `None` when `[otlp.local]` is absent or construction failed.
+    /// Independent of `otlp_s3`.
+    pub otlp_local: Option<crate::forwarding::otlp_s3::OtlpHandler>,
 }
 
 /// Validate an `Authorization` header value against the configured HEC token.
@@ -188,10 +189,7 @@ mod tests {
 
     #[test]
     fn ingest_state_is_clone() {
-        let state = IngestState {
-            generic_s3: None,
-            generic_local: None,
-        };
+        let state = IngestState::default();
         let cloned = state.clone();
         assert!(cloned.generic_s3.is_none());
         assert!(cloned.generic_local.is_none());

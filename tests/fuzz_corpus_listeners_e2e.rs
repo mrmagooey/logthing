@@ -129,12 +129,13 @@ directory = "{out}/suricata"
 [hec]
 enabled = true
 token = "fuzz-e2e"
-# Also the sink for OTLP: IngestState is built from hec.{{s3,local}} only.
 [hec.local]
 directory = "{out}/hec"
 
 [otlp]
 enabled = true
+[otlp.local]
+directory = "{out}/otlp"
 "#,
         http = p.http,
         metrics = p.metrics,

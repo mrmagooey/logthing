@@ -28,6 +28,8 @@ Per-source ingest counters:
 - `syslog_messages_received`, `ipfix_datagrams_received`, `ipfix_flows_decoded`,
   `sflow_datagrams_received`, `suricata_records_received`, `hec_events_received`,
   `otlp_logs_received`
+- `otlp_events_dropped` - OTLP records not enqueued because a writer channel was
+  full or closed
 - Decode/parse failures: `ipfix_decode_errors`, `sflow_decode_errors`,
   `suricata_parse_errors`, `hec_parse_errors`, `wef_xml_parse_errors` - a WEF
   batch's XML failed to parse past a given event; that event is kept as its

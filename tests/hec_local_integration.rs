@@ -413,8 +413,8 @@ async fn hec_route_sanitizes_traversal_sourcetype_before_it_reaches_the_object_k
     hec_cfg.hec.token = "tok".to_string();
     let shared_config = std::sync::Arc::new(RwLock::new(hec_cfg));
     let ingest_state = IngestState {
-        generic_s3: None,
         generic_local: Some(handler.clone()),
+        ..Default::default()
     };
 
     let app: Router = Router::new()

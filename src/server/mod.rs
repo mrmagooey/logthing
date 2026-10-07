@@ -301,8 +301,8 @@ pub struct Server {
     wef_worker_handles: Vec<tokio::task::JoinHandle<()>>,
     /// Shared extension state for HEC / NDJSON ingest routes.
     ingest_state: IngestState,
-    /// JoinHandles for the HEC→S3 and HEC→local Parquet worker tasks (0, 1, or 2
-    /// present depending on how many of `[hec.s3]` / `[hec.local]` are configured
+    /// JoinHandles for the HEC and OTLP Parquet worker tasks (0 to 4, depending on how
+    /// many of `[hec.s3]` / `[hec.local]` / `[otlp.s3]` / `[otlp.local]` are configured
     /// and construct successfully). Awaited during graceful shutdown.
     hec_worker_handles: Vec<tokio::task::JoinHandle<()>>,
     /// The SAME `IpWhitelist` instance shared with `main.rs`'s five
@@ -510,7 +510,7 @@ impl Server {
             parquet_local_sender,
         });
 
-        // --- Build IngestState for HEC / NDJSON ingest routes ---
+        // --- Build IngestState for HEC / NDJSON and OTLP ingest routes ---
         let mut hec_worker_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         let mut generic_s3_handler = None;
         let mut generic_local_handler = None;
@@ -564,9 +564,63 @@ impl Server {
             }
         }
 
+        let mut otlp_s3_handler = None;
+        let mut otlp_local_handler = None;
+
+        if config.otlp.enabled {
+            if let Some(s3_cfg) = config.otlp.s3.as_ref() {
+                match crate::forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await
+                {
+                    Ok(sink) => {
+                        info!("Initialized OTLP Parquet S3 forwarder");
+                        let (handler, join_handle) = crate::forwarding::otlp_s3::otlp_start(
+                            s3_cfg,
+                            Arc::new(sink),
+                            config.otlp.max_service_partitions,
+                            source_stats.clone(),
+                            descriptor_sink.clone(),
+                        );
+                        hec_worker_handles.push(join_handle);
+                        flush_registry.register("otlp.s3", handler.flush_interval());
+                        otlp_s3_handler = Some(handler);
+                    }
+                    Err(e) => {
+                        error!("Failed to create S3Sink for OTLP ingest, skipping S3 target: {e}");
+                    }
+                }
+            }
+
+            if let Some(local_cfg) = config.otlp.local.as_ref() {
+                match crate::forwarding::local_sink::LocalDiskSink::new(local_cfg.directory.clone())
+                    .await
+                {
+                    Ok(sink) => {
+                        info!("Initialized OTLP Parquet local-disk forwarder");
+                        let (handler, join_handle) = crate::forwarding::otlp_s3::otlp_local_start(
+                            local_cfg,
+                            Arc::new(sink),
+                            config.otlp.max_service_partitions,
+                            source_stats.clone(),
+                            descriptor_sink.clone(),
+                        );
+                        hec_worker_handles.push(join_handle);
+                        flush_registry.register("otlp.local", handler.flush_interval());
+                        otlp_local_handler = Some(handler);
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to create LocalDiskSink for OTLP ingest, skipping local target: {e}"
+                        );
+                    }
+                }
+            }
+        }
+
         let ingest_state = IngestState {
             generic_s3: generic_s3_handler,
             generic_local: generic_local_handler,
+            otlp_s3: otlp_s3_handler,
+            otlp_local: otlp_local_handler,
         };
 
         Ok(Self {
@@ -589,12 +643,12 @@ impl Server {
         std::mem::take(&mut self.wef_worker_handles)
     }
 
-    /// Take the HEC persistence workers' JoinHandles for awaiting at shutdown.
+    /// Take the HEC and OTLP persistence workers' JoinHandles for awaiting at shutdown.
     ///
     /// Must be called BEFORE `run`/`run_tls`; after the server consumes `self`
-    /// the handles are no longer accessible. Returns 0, 1, or 2 handles
-    /// depending on how many of `[hec.s3]` / `[hec.local]` constructed
-    /// successfully.
+    /// the handles are no longer accessible. Returns 0 to 4 handles depending on
+    /// how many of `[hec.s3]` / `[hec.local]` / `[otlp.s3]` / `[otlp.local]`
+    /// constructed successfully.
     pub fn take_hec_worker_handles(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
         std::mem::take(&mut self.hec_worker_handles)
     }
@@ -3557,10 +3611,7 @@ event_parsers:
         let mut cfg = Config::default();
         cfg.hec.token = token.to_string();
         let shared_config = Arc::new(RwLock::new(cfg));
-        let ingest_state = IngestState {
-            generic_s3: None,
-            generic_local: None,
-        };
+        let ingest_state = IngestState::default();
 
         Router::new()
             .route("/services/collector/event", post(handle_hec_event))
@@ -4141,15 +4192,169 @@ event_parsers:
                 ..Default::default()
             };
             let app_state = super::build_state_with_config(config).await;
-            let ingest_state = IngestState {
-                generic_s3: None,
-                generic_local: None,
-            };
+            let ingest_state = IngestState::default();
 
             axum::Router::new()
                 .route("/v1/logs", post(handle_otlp_logs))
                 .layer(axum::Extension(ingest_state))
                 .with_state(app_state)
+        }
+
+        async fn build_otlp_app_with_ingest(ingest_state: IngestState) -> axum::Router {
+            let config = Config {
+                otlp: OtlpConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let app_state = super::build_state_with_config(config).await;
+            axum::Router::new()
+                .route("/v1/logs", post(handle_otlp_logs))
+                .layer(axum::Extension(ingest_state))
+                .with_state(app_state)
+        }
+
+        fn stalled_otlp_handle(
+            capacity: usize,
+        ) -> (
+            crate::forwarding::otlp_s3::OtlpHandler,
+            tokio::sync::mpsc::Receiver<crate::forwarding::otlp_s3::OtlpRecord>,
+        ) {
+            let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+            (
+                crate::forwarding::buffered_writer::ParquetWriterHandle::for_test(
+                    tx, "otlp", "test",
+                ),
+                rx,
+            )
+        }
+
+        #[tokio::test]
+        async fn handle_otlp_logs_sends_typed_records_with_event_uuid_to_otlp_sink() {
+            let (h, mut rx) = stalled_otlp_handle(16);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                ..Default::default()
+            })
+            .await;
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(make_proto_request().encode_to_vec()))
+                    .unwrap(),
+            );
+            assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+            let rec = rx.recv().await.unwrap();
+            assert_eq!(rec.service_name.as_deref(), Some("test-svc"));
+            assert_eq!(rec.peer_addr.as_deref(), Some("127.0.0.1"));
+            assert_eq!(rec.body.as_deref(), Some("e2e test message"));
+            let id = rec.event_uuid.expect("handler assigns event_uuid");
+            assert_eq!(uuid::Uuid::parse_str(&id).unwrap().get_version_num(), 7);
+        }
+
+        #[tokio::test]
+        async fn handle_otlp_logs_never_writes_to_hec_sinks() {
+            // Regression for "OTLP rides [hec] sinks": the generic channel must stay empty.
+            let (tx, mut generic_rx) = tokio::sync::mpsc::channel(16);
+            let generic = crate::forwarding::buffered_writer::ParquetWriterHandle::<
+                crate::forwarding::generic_s3::GenericSink,
+            >::for_test(tx, "hec", "test");
+            let (otlp, mut otlp_rx) = stalled_otlp_handle(16);
+            let app = build_otlp_app_with_ingest(IngestState {
+                generic_s3: Some(generic),
+                otlp_s3: Some(otlp),
+                ..Default::default()
+            })
+            .await;
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(make_proto_request().encode_to_vec()))
+                    .unwrap(),
+            );
+            assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+            assert!(otlp_rx.try_recv().is_ok());
+            assert!(
+                generic_rx.try_recv().is_err(),
+                "OTLP must not touch HEC sinks"
+            );
+        }
+
+        #[tokio::test]
+        async fn handle_otlp_logs_invalid_utf8_protobuf_string_returns_400() {
+            let app = build_otlp_app(None).await;
+            // ExportLogsServiceRequest{resource_logs:[ResourceLogs{scope_logs:[ScopeLogs{
+            //   log_records:[LogRecord{severity_text: "\xFF\xFE"}]}]}]}
+            let lr = [0x1a, 0x02, 0xFF, 0xFE]; // LogRecord.severity_text (field 3)
+            let mut sl = vec![0x12, lr.len() as u8]; // ScopeLogs.log_records (field 2)
+            sl.extend_from_slice(&lr);
+            let mut rl = vec![0x12, sl.len() as u8]; // ResourceLogs.scope_logs (field 2)
+            rl.extend_from_slice(&sl);
+            let mut req = vec![0x0a, rl.len() as u8]; // Request.resource_logs (field 1)
+            req.extend_from_slice(&rl);
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(req))
+                    .unwrap(),
+            );
+            assert_eq!(
+                app.oneshot(request).await.unwrap().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        #[tokio::test]
+        async fn handle_otlp_logs_full_channel_counts_drop_and_still_returns_200() {
+            let (h, mut rx) = stalled_otlp_handle(1);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                ..Default::default()
+            })
+            .await;
+            let mut req = make_proto_request();
+            let rec = req.resource_logs[0].scope_logs[0].log_records[0].clone();
+            req.resource_logs[0].scope_logs[0].log_records = vec![rec.clone(), rec.clone(), rec];
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(req.encode_to_vec()))
+                    .unwrap(),
+            );
+            assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+            assert!(rx.try_recv().is_ok());
+            assert!(
+                rx.try_recv().is_err(),
+                "capacity 1: the other two were dropped"
+            );
+        }
+
+        #[tokio::test]
+        async fn otlp_sinks_are_built_from_otlp_config_without_hec_enabled() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.hec.enabled = false;
+            config.otlp.enabled = true;
+            config.otlp.local = Some(crate::config::OtlpLocalConfig {
+                directory: tmp.path().to_path_buf(),
+                prefix: "otlp".to_string(),
+                flush_threshold_bytes: 1 << 20,
+                flush_interval_secs: 3600,
+                channel_capacity: 16,
+                max_buffer_rows: 1000,
+            });
+            let server = super::build_server(config).await;
+            assert!(server.ingest_state.otlp_local.is_some());
+            assert!(server.ingest_state.generic_local.is_none());
         }
 
         // ── Test A: valid protobuf POST → 200 + valid ExportLogsServiceResponse ──
@@ -4935,8 +5140,9 @@ async fn handle_syslog_examples() -> Json<serde_json::Value> {
 /// Comparison is constant-time (via `subtle::ConstantTimeEq`) on the equal-length
 /// path; a length mismatch is an early branch (token length is low-sensitivity).
 ///
-/// On success: maps each `LogRecord` → `GenericRecord` via `otlp::map_otlp_request`,
-/// forwards through `IngestState.generic_s3` (warn-and-drop on channel full/closed),
+/// On success: maps each `LogRecord` → `OtlpRecord` via `otlp::map_otlp_request`, assigns
+/// event UUIDs, forwards to `IngestState.otlp_s3` / `otlp_local` (warn-and-drop on channel
+/// full/closed),
 /// and returns an empty `ExportLogsServiceResponse` (200) in the SAME encoding
 /// (protobuf or JSON) as the request.
 ///
@@ -4947,7 +5153,7 @@ async fn handle_syslog_examples() -> Json<serde_json::Value> {
 #[cfg(feature = "otlp")]
 pub async fn handle_otlp_logs(
     State(app_state): State<Arc<AppState>>,
-    axum::extract::Extension(_ingest): axum::extract::Extension<IngestState>,
+    axum::extract::Extension(ingest): axum::extract::Extension<IngestState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
@@ -5005,13 +5211,15 @@ pub async fn handle_otlp_logs(
             return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
         };
 
-    // ── Map (INTERIM: Task 4 routes these to the OTLP sinks) ──────────────
+    // ── Map, assign ids, route to the OTLP sinks ─────────────────────────
     let source_host = addr.ip().to_string();
-    let records = crate::server::otlp::map_otlp_request(req, source_host);
+    let mut records = crate::server::otlp::map_otlp_request(req, source_host);
+    // ORDERING: identity is assigned AFTER mapping (and, in a later phase, after redaction),
+    // as its own step, never inside the mapper.
+    crate::ingest::assign_event_uuids(&mut records);
     let count = records.len() as u64;
-    drop(records);
-
-    metrics::counter!("otlp_logs_received").increment(count);
+    let rejected_full = dispatch_otlp_records(&ingest, records);
+    metrics::counter!("otlp_logs_received").increment(count - rejected_full);
 
     // ── Respond in the same encoding as the request ───────────────────────
     let (resp_bytes, response_ct) = if ct.starts_with("application/json") {
@@ -5028,4 +5236,58 @@ pub async fn handle_otlp_logs(
         .header("Content-Type", response_ct)
         .body(axum::body::Body::from(resp_bytes))
         .unwrap())
+}
+
+/// Offer one record to an OTLP sink. Returns `true` when the channel was full.
+#[cfg(feature = "otlp")]
+fn offer_otlp(
+    handler: &crate::forwarding::otlp_s3::OtlpHandler,
+    record: crate::forwarding::otlp_s3::OtlpRecord,
+    target: &str,
+) -> bool {
+    match handler.try_send(record) {
+        Ok(()) => false,
+        Err(e) => {
+            metrics::counter!("otlp_events_dropped").increment(1);
+            let kind = DropKind::from(&e);
+            if let Some(dropped_total) = handler.drop_log_due(DropSite::Otlp, kind) {
+                match kind {
+                    DropKind::Full => {
+                        warn!(dropped_total, target, "OTLP channel full; dropped record")
+                    }
+                    DropKind::Closed => {
+                        error!(dropped_total, target, "OTLP channel closed; dropped record")
+                    }
+                }
+            }
+            matches!(kind, DropKind::Full)
+        }
+    }
+}
+
+/// Try-send every record to every configured OTLP sink. Returns how many records hit a FULL
+/// channel on at least one sink (a closed channel is logged and counted but not returned: the
+/// writer is gone, retrying cannot help).
+#[cfg(feature = "otlp")]
+fn dispatch_otlp_records(
+    ingest: &IngestState,
+    records: Vec<crate::forwarding::otlp_s3::OtlpRecord>,
+) -> u64 {
+    let mut full_rejected = 0u64;
+    for record in records {
+        let full = match (&ingest.otlp_s3, &ingest.otlp_local) {
+            (Some(s3), Some(local)) => {
+                let a = offer_otlp(s3, record.clone(), "s3");
+                let b = offer_otlp(local, record, "local");
+                a || b
+            }
+            (Some(h), None) => offer_otlp(h, record, "s3"),
+            (None, Some(h)) => offer_otlp(h, record, "local"),
+            (None, None) => false,
+        };
+        if full {
+            full_rejected += 1;
+        }
+    }
+    full_rejected
 }

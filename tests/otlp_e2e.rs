@@ -4,9 +4,9 @@
 //! tokio::spawn so there is no race on the port number).  Real reqwest POSTs
 //! are fired at that port and the HTTP status + body are inspected.
 //!
-//! No external services required (no MinIO).  `IngestState.generic_s3 = None`
-//! means records are accepted and silently dropped — the test validates HTTP
-//! behaviour only.
+//! No external services required (no MinIO).  The HTTP-behaviour tests use an empty
+//! `IngestState` (records are accepted and not persisted); the typed-column tests wire a real
+//! local-disk OTLP sink and read the written Parquet back.
 //!
 //! Run with:
 //!   cargo test --features otlp --test otlp_e2e
@@ -30,7 +30,12 @@
 // src/server/mod.rs's `otlp_handler_tests`.  No test-only constructor needed.
 
 #[cfg(feature = "otlp")]
+#[path = "common/mod.rs"]
+mod common;
+
+#[cfg(feature = "otlp")]
 mod otlp_e2e {
+    use super::common;
     use axum::{Extension, Router, routing::post};
     use logthing::config::{Config, OtlpConfig};
     use logthing::ingest::IngestState;
@@ -104,10 +109,7 @@ mod otlp_e2e {
         bearer_token: Option<String>,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let app_state = build_app_state(bearer_token).await;
-        let ingest_state = IngestState {
-            generic_s3: None,
-            generic_local: None,
-        };
+        let ingest_state = IngestState::default();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -250,6 +252,193 @@ mod otlp_e2e {
             .unwrap();
 
         assert_eq!(resp.status(), 400, "malformed protobuf body must yield 400");
+    }
+
+    async fn spawn_otlp_server_with_local_sink(
+        dir: &std::path::Path,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use logthing::config::OtlpLocalConfig;
+        use logthing::forwarding::local_sink::LocalDiskSink;
+        use logthing::forwarding::otlp_s3::otlp_local_start;
+
+        let sink = Arc::new(LocalDiskSink::new(dir.to_path_buf()).await.unwrap());
+        let cfg = OtlpLocalConfig {
+            directory: dir.to_path_buf(),
+            prefix: "otlp".to_string(),
+            flush_threshold_bytes: 1,
+            flush_interval_secs: 1,
+            channel_capacity: 256,
+            max_buffer_rows: 100_000,
+        };
+        let (handler, _join) = otlp_local_start(
+            &cfg,
+            sink,
+            64,
+            Arc::new(logthing::stats::SourceHourlyStats::new()),
+            None,
+        );
+        let config = Config {
+            otlp: OtlpConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let app_state = Arc::new(AppState {
+            config: Arc::new(RwLock::new(config)),
+            throughput: Arc::new(ThroughputStats::new()),
+            wef_cardinality_watchers: Vec::new(),
+            parser: WefParser::new(),
+            event_parser: None,
+            parquet_s3_sender: None,
+            parquet_local_sender: None,
+        });
+        let router = Router::new()
+            .route("/v1/logs", post(handle_otlp_logs))
+            .layer(Extension(IngestState {
+                otlp_local: Some(handler),
+                ..Default::default()
+            }))
+            .with_state(app_state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        (base, handle)
+    }
+
+    async fn post_proto(base: &str, req: &ExportLogsServiceRequest) -> u16 {
+        reqwest::Client::new()
+            .post(format!("{base}/v1/logs"))
+            .header("content-type", "application/x-protobuf")
+            .body(req.encode_to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    fn with_service_name(value: Option<AnyVal>) -> ExportLogsServiceRequest {
+        let mut req = make_request();
+        req.resource_logs[0].resource = Some(opentelemetry_proto::tonic::resource::v1::Resource {
+            attributes: vec![opentelemetry_proto::tonic::common::v1::KeyValue {
+                key: "service.name".to_string(),
+                value: value.map(|v| AnyValue { value: Some(v) }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        req
+    }
+
+    #[tokio::test]
+    async fn e2e_otlp_records_land_as_typed_parquet_in_local_sink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, _server) = spawn_otlp_server_with_local_sink(tmp.path()).await;
+        let mut req = with_service_name(Some(AnyVal::StringValue("Typed Svc".into())));
+        {
+            let lr = &mut req.resource_logs[0].scope_logs[0].log_records[0];
+            lr.severity_number = 13;
+            lr.severity_text = "WARN".to_string();
+            lr.trace_id = vec![0x11; 16];
+            lr.span_id = vec![0x22; 8];
+        }
+        assert_eq!(post_proto(&base, &req).await, 200);
+
+        let batches = common::wait_for_rows(tmp.path(), 1, Duration::from_secs(15)).await;
+        let b = &batches[0];
+        assert_eq!(common::str_col(b, "service_name").value(0), "Typed Svc");
+        assert_eq!(common::str_col(b, "severity_text").value(0), "WARN");
+        assert_eq!(common::str_col(b, "trace_id").value(0), "11".repeat(16));
+        assert_eq!(common::str_col(b, "span_id").value(0), "22".repeat(8));
+        assert_eq!(common::str_col(b, "peer_addr").value(0), "127.0.0.1");
+        let sev = b
+            .column_by_name("severity_number")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        assert_eq!(sev.value(0), 13);
+        let id = common::str_col(b, "event_uuid").value(0);
+        assert_eq!(uuid::Uuid::parse_str(id).unwrap().get_version_num(), 7);
+        assert!(
+            common::parquet_files(tmp.path())
+                .iter()
+                .any(|p| p.to_string_lossy().contains("/otlp/typed_svc/")),
+            "partition segment is the sanitized service name"
+        );
+    }
+
+    /// No resource / no `service.name` / empty or non-string `service.name`: every request is
+    /// accepted (200), lands under the `unknown` partition, and the written `service_name`
+    /// column is NULL.
+    #[tokio::test]
+    async fn e2e_otlp_missing_or_invalid_service_name_lands_in_unknown_with_null() {
+        use arrow::array::Array;
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, _server) = spawn_otlp_server_with_local_sink(tmp.path()).await;
+
+        let mut no_attr = make_request();
+        no_attr.resource_logs[0].resource =
+            Some(opentelemetry_proto::tonic::resource::v1::Resource::default());
+        let mut no_value = with_service_name(None);
+        no_value.resource_logs[0].scope_logs[0].log_records[0].severity_text = "NOVALUE".into();
+        let variants = vec![
+            make_request(),                                              // no resource at all
+            no_attr,  // resource without attributes
+            no_value, // service.name key with no value
+            with_service_name(Some(AnyVal::StringValue(String::new()))), // empty
+            with_service_name(Some(AnyVal::IntValue(42))), // non-string
+        ];
+        let n = variants.len();
+        for v in &variants {
+            assert_eq!(post_proto(&base, v).await, 200);
+        }
+
+        let batches = common::wait_for_rows(tmp.path(), n, Duration::from_secs(15)).await;
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, n, "no record dropped");
+        let nulls: usize = batches
+            .iter()
+            .map(|b| common::str_col(b, "service_name").null_count())
+            .sum();
+        assert_eq!(nulls, n, "service_name is NULL for every row");
+        let files = common::parquet_files(tmp.path());
+        assert!(!files.is_empty());
+        assert!(
+            files
+                .iter()
+                .all(|p| p.to_string_lossy().contains("/otlp/unknown/")),
+            "all rows are in the `unknown` partition: {files:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_otlp_invalid_utf8_protobuf_returns_400() {
+        let (base, _server) = start_test_server(None).await;
+        // LogRecord.severity_text (field 3) = invalid UTF-8, wrapped to the request root.
+        let lr = [0x1a, 0x02, 0xFF, 0xFE];
+        let mut sl = vec![0x12, lr.len() as u8];
+        sl.extend_from_slice(&lr);
+        let mut rl = vec![0x12, sl.len() as u8];
+        rl.extend_from_slice(&sl);
+        let mut body = vec![0x0a, rl.len() as u8];
+        body.extend_from_slice(&rl);
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/logs"))
+            .header("content-type", "application/x-protobuf")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
     }
 }
 
