@@ -22,7 +22,7 @@ A high-performance log ingestion server written in Rust. Receives Windows Event 
 - **Log Aggregation**: Optionally count records as they arrive, grouped by configured columns, writing an SQL `GROUP BY`-style table to Parquet instead of the raw rows — cuts noisy streams down to their useful summary
 - **TLS/SSL Encryption**: Secure connections with certificate support
 - **IP Whitelisting**: Control which hosts can connect
-- **High Performance**: Async I/O with Tokio for handling 100+ hosts
+- **Performance**: async I/O with Tokio; on one shared 12-vCPU host the HEC route sustained 78125 records/s and OTLP 10625 records/s (gzip, batches of 100, local Parquet sink, loopback) -- method, variance and caveats in [docs/performance.md](docs/performance.md)
 - **Metrics & Monitoring**: Prometheus metrics endpoint
 - **Structured Logging**: JSON or pretty-printed logs
 
@@ -171,6 +171,7 @@ repository conventions.
 - [docs/zeek.md](docs/zeek.md) — Zeek NDJSON ingestion, typed per-stream schemas, and S3 persistence
 - [docs/hec.md](docs/hec.md) — HEC/NDJSON ingest, columns, gzip, backpressure, migration
 - [docs/otlp.md](docs/otlp.md) — OTLP/HTTP log ingest, typed schema, service partitions, exporter setup, migration
+- [docs/performance.md](docs/performance.md) — measured single-node HEC/OTLP ingest ceilings, method, hardware, caveats and how to reproduce
 - [docs/aggregation.md](docs/aggregation.md) — log aggregation rules and output schema
 - [docs/iceberg.md](docs/iceberg.md) — Iceberg descriptor output and a suggested committer/catalog deployment pattern
 - [committer/README.md](committer/README.md) — the shipped Iceberg descriptor committer (container image, configuration, end-to-end test)
