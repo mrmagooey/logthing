@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end: Helm chart on minikube -> syslog into logthing -> committer -> Trino (HTTPS + password) and Metabase see the rows.
+# End-to-end: Helm chart on minikube -> syslog, Zeek, OTLP and HEC into logthing -> committer -> Trino (HTTPS + password) and Metabase see the rows.
 # Requires minikube (docker driver), helm, kubectl and an AVX2-capable CPU (or a TRINO_IMAGE
 # override; locally present override images are loaded into the cluster). KEEP_CLUSTER=1 keeps it.
 set -euo pipefail
@@ -10,6 +10,7 @@ preflight_cpu
 DBT=${DBT:-$ANALYTICS/.venv/bin/dbt}
 [ -x "$DBT" ] || { echo "dbt not found at $DBT: run $ANALYTICS/.venv/bin/pip install -r $ANALYTICS/tests/requirements.txt (or set DBT=)" >&2; exit 1; }
 DBT_WORK=$(mktemp -d)
+build_local_images   # logthing + committer from THIS checkout (A1 code); set LOGTHING_IMAGE/COMMITTER_IMAGE to skip
 
 PROFILE=${MINIKUBE_PROFILE:-lt-analytics-e2e}
 NS=analytics
@@ -57,6 +58,7 @@ dump_logs() {
   "${K[@]}" logs -l app.kubernetes.io/component=committer --tail 80 --prefix >&2 || true
   "${K[@]}" logs "deploy/$FULL-logthing" --tail 80 >&2 || true
 }
+fail() { echo "FAIL: $*" >&2; "${K[@]}" logs "deploy/$FULL-trino" --tail 80 >&2 || true; exit 1; }
 
 echo "== [1/9] minikube profile $PROFILE =="
 # start is idempotent on a running profile (status exits non-zero against a fresh private kubeconfig).
@@ -65,7 +67,7 @@ minikube start -p "$PROFILE" --cpus 6 --memory 12g --driver docker
 minikube update-context -p "$PROFILE" >/dev/null
 
 echo "== [2/9] load local override images =="
-for img in "${TRINO_IMAGE:-}"; do
+for img in "${TRINO_IMAGE:-}" "$LOGTHING_IMAGE" "$COMMITTER_IMAGE"; do
   if [ -n "$img" ] && docker image inspect "$img" >/dev/null 2>&1; then
     # Loading a multi-GB image is slow; skip it when a kept cluster already has it.
     if ! minikube -p "$PROFILE" image ls 2>/dev/null | grep -qxF -e "$img" -e "docker.io/$img" -e "docker.io/library/$img"; then
@@ -75,7 +77,8 @@ for img in "${TRINO_IMAGE:-}"; do
 done
 
 echo "== [3/9] helm install =="
-SETS=(--set logthing.flushIntervalSecs=5)
+SETS=(--set logthing.flushIntervalSecs=5
+      --set "logthing.image=$LOGTHING_IMAGE" --set "committer.image=$COMMITTER_IMAGE")
 [ -z "${TRINO_IMAGE:-}" ] || SETS+=(--set "trino.image=$TRINO_IMAGE")
 "${H[@]}" upgrade --install lt "$CHART" --namespace "$NS" --create-namespace --wait --timeout 15m "${SETS[@]}" \
   || { echo "helm install failed" >&2; dump_logs; exit 1; }
@@ -143,6 +146,42 @@ timeout 300 "${K[@]}" run zeeksender --rm -i --restart=Never --pod-running-timeo
   --image=python:3.12-slim -- python -c "$ZEEK_SENDER" \
   || { echo "zeek sender failed" >&2; exit 1; }
 
+echo "== [5b/9] send $N OTLP records and $N HEC events with the generated tokens =="
+secret_key() {
+  local v
+  v=$("${K[@]}" get secret "$FULL-credentials" -o jsonpath="{.data.$1}" | base64 -d) || v=
+  [ -n "$v" ] || fail "Secret $FULL-credentials has no key $1"
+}
+secret_key hec-token; secret_key otlp-bearer-token
+"${K[@]}" delete pod appsender --ignore-not-found >/dev/null
+# Tokens reach the pod through secretKeyRef, so they never appear in the pod spec or local argv.
+"${K[@]}" apply -f - >/dev/null <<YEOF || fail "could not create appsender pod"
+apiVersion: v1
+kind: Pod
+metadata: {name: appsender}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: appsender
+      image: python:3.12-slim
+      command: [python, -c]
+      args:
+        - |
+$(sed 's/^/          /' "$HERE/send_app_logs.py")
+        - http://$FULL-logthing-tcp:5985
+        - $MARKER
+        - "$N"
+      env:
+        - name: HEC_TOKEN
+          valueFrom: {secretKeyRef: {name: $FULL-credentials, key: hec-token}}
+        - name: OTLP_BEARER_TOKEN
+          valueFrom: {secretKeyRef: {name: $FULL-credentials, key: otlp-bearer-token}}
+YEOF
+"${K[@]}" wait --for=jsonpath='{.status.phase}'=Succeeded pod/appsender --timeout=300s \
+  || { echo "app log sender failed" >&2; "${K[@]}" logs appsender >&2 || true; dump_logs; exit 1; }
+"${K[@]}" logs appsender
+"${K[@]}" delete pod appsender --ignore-not-found >/dev/null
+
 COUNT_SQL="SELECT count(*) FROM iceberg.logs.syslog WHERE message LIKE '%$MARKER%'"
 trino_count() {
   timeout 30 "${K[@]}" exec "deploy/$FULL-trino" -- "${TRINO_CLI[@]}" --output-format TSV --execute "$COUNT_SQL" 2>/dev/null \
@@ -165,6 +204,8 @@ sql() {
 zeek_landed() { [ "$(sql "SELECT count(*) FROM iceberg.logs.$1 WHERE uid = '$MARKER'")" = 1 ]; }
 wait_until 300 "zeek_conn row" zeek_landed zeek_conn || { dump_logs; exit 1; }
 wait_until 300 "zeek_dns row" zeek_landed zeek_dns || { dump_logs; exit 1; }
+wait_until 300 "otlp + hec rows" app_logs_landed || { dump_logs; exit 1; }
+assert_app_log_rows || { dump_logs; exit 1; }
 echo "trino: $N"
 
 echo "== [7/9] Trino security through a port-forward: HTTPS + password negatives =="
@@ -199,7 +240,6 @@ dbt_ok "$rc" "$DBT_OUT" \
 echo "dbt: build ok"
 
 echo "== [8b/9] OCSF views and detection analyses over the Zeek rows =="
-fail() { echo "FAIL: $*" >&2; "${K[@]}" logs "deploy/$FULL-trino" --tail 80 >&2 || true; exit 1; }
 [ "$(sql "SELECT count(*) FROM iceberg.logs.ocsf_network_activity WHERE metadata_correlation_uid = '$MARKER' AND class_uid = 4001 AND src_endpoint_ip = '10.20.30.40' AND dst_endpoint_port = 443 AND connection_info_protocol_num = 6")" = 1 ] \
   || fail "ocsf_network_activity did not map the Zeek conn record"
 [ "$(sql "SELECT count(*) FROM iceberg.logs.ocsf_dns_activity WHERE metadata_correlation_uid = '$MARKER' AND query_hostname = '$MARKER.example.test' AND activity_id = 2")" = 1 ] \
@@ -228,5 +268,14 @@ MB_COUNT=$(METABASE_PASSWORD="$MB_PW" "$PY" "$HERE/metabase_query.py" \
   || { "${K[@]}" logs "deploy/$FULL-metabase" --tail 80 >&2 || true; exit 1; }
 [ "$MB_COUNT" = "$N" ] || { echo "Metabase returned $MB_COUNT, expected $N" >&2; exit 1; }
 echo "metabase: $MB_COUNT"
+OTLP_MB=$(METABASE_PASSWORD="$MB_PW" "$PY" "$HERE/metabase_query.py" \
+  "http://127.0.0.1:$MB_LOCAL_PORT" admin@logthing.example \
+  "SELECT count(*) FROM iceberg.logs.otlp WHERE $(_otlp_where)") \
+  || { "${K[@]}" logs "deploy/$FULL-metabase" --tail 80 >&2 || true; exit 1; }
+[ "$OTLP_MB" = "$N" ] || { echo "Metabase otlp count $OTLP_MB, expected $N" >&2; exit 1; }
+echo "metabase otlp: $OTLP_MB"
+# Last: it inserts a duplicate raw otlp row, which would break the Metabase count above.
+assert_staging_dedup || { dump_logs; exit 1; }
+echo "staging: stg_otlp/stg_hec = $N, duplicate event_uuid deduped"
 
 echo "Analytics Helm E2E PASSED"

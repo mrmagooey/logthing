@@ -37,6 +37,16 @@ x-logthing-s3: &logthing-s3
   LOGTHING__ZEEK__S3__ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
   LOGTHING__ZEEK__S3__SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
   LOGTHING__ZEEK__S3__FLUSH_INTERVAL_SECS: ${LOGTHING_FLUSH_INTERVAL_SECS:-60}
+  LOGTHING__HEC__S3__ENDPOINT: http://garage:3900
+  LOGTHING__HEC__S3__ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  LOGTHING__HEC__S3__SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  LOGTHING__HEC__S3__FLUSH_INTERVAL_SECS: ${LOGTHING_FLUSH_INTERVAL_SECS:-60}
+  LOGTHING__HEC__TOKEN: ${HEC_TOKEN:?set HEC_TOKEN (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  LOGTHING__OTLP__S3__ENDPOINT: http://garage:3900
+  LOGTHING__OTLP__S3__ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  LOGTHING__OTLP__S3__SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
+  LOGTHING__OTLP__S3__FLUSH_INTERVAL_SECS: ${LOGTHING_FLUSH_INTERVAL_SECS:-60}
+  LOGTHING__OTLP__BEARER_TOKEN: ${OTLP_BEARER_TOKEN:?set OTLP_BEARER_TOKEN (run deploy/analytics/scripts/gen-analytics-env.sh)}
   LOGTHING__ICEBERG__S3__ENDPOINT: http://garage:3900
   LOGTHING__ICEBERG__S3__ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
   LOGTHING__ICEBERG__S3__SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
@@ -130,6 +140,7 @@ services:
       - "${IPFIX_PORT:-4739}:4739/udp"
       - "${SFLOW_PORT:-6343}:6343/udp"
       - "${ZEEK_PORT:-47760}:47760/tcp"
+      # 5985: HTTP ingest (OTLP /v1/logs, HEC /services/collector/event) plus /health.
       - "${LOGTHING_HEALTH_PORT:-5985}:5985/tcp"
 
   committer:

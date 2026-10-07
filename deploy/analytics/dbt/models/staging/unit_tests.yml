@@ -1,0 +1,108 @@
+version: 2
+
+unit_tests:
+  - name: stg_otlp_keeps_one_row_per_event_uuid
+    model: stg_otlp
+    given:
+      - input: ref('stg_otlp_typed')
+        format: sql
+        rows: |
+          select * from (values
+            (cast('u1' as varchar), cast(null as timestamp(6) with time zone),
+             cast(null as timestamp(6) with time zone),
+             cast('2026-10-01 12:00:09 UTC' as timestamp(6) with time zone),
+             cast(9 as integer), cast('INFO' as varchar), cast('retry copy' as varchar),
+             cast('svc' as varchar), cast(null as varchar), cast(null as varchar),
+             cast(null as varchar), cast(null as varchar), cast(null as varchar),
+             cast(null as varchar), cast(null as bigint), cast(null as varchar),
+             cast(null as varchar), cast(null as varchar), cast('{}' as varchar),
+             cast('{}' as varchar),
+             cast('2026-10-01 12:00:09 UTC' as timestamp(6) with time zone)),
+            ('u1', null, null, timestamp '2026-10-01 12:00:01 UTC', 9, 'INFO', 'first copy',
+             'svc', null, null, null, null, null, null, null, null, null, null, '{}', '{}',
+             timestamp '2026-10-01 12:00:01 UTC'),
+            ('u2', null, null, timestamp '2026-10-01 12:00:02 UTC', 9, 'INFO', 'other event',
+             'svc', null, null, null, null, null, null, null, null, null, null, '{}', '{}',
+             timestamp '2026-10-01 12:00:02 UTC')
+          ) as t("event_uuid", "time", "observed_time", "received_at", "severity_number",
+                 "severity_text", "body", "service_name", "service_namespace",
+                 "service_instance_id", "host_name", "peer_addr", "trace_id", "span_id",
+                 "flags", "event_name", "scope_name", "scope_version",
+                 "resource_attributes", "attributes", "partition_time")
+    expect:
+      format: dict
+      rows:
+        - {event_uuid: u1, body: first copy}
+        - {event_uuid: u2, body: other event}
+
+  - name: stg_otlp_breaks_received_at_and_partition_time_ties_on_time
+    model: stg_otlp
+    given:
+      - input: ref('stg_otlp_typed')
+        format: sql
+        rows: |
+          select * from (values
+            (cast('u3' as varchar), timestamp '2026-10-01 11:00:05 UTC',
+             cast(null as timestamp(6) with time zone),
+             cast('2026-10-01 12:00:01 UTC' as timestamp(6) with time zone),
+             cast(9 as integer), cast('INFO' as varchar), cast('later time' as varchar),
+             cast('svc' as varchar), cast(null as varchar), cast(null as varchar),
+             cast(null as varchar), cast(null as varchar), cast(null as varchar),
+             cast(null as varchar), cast(null as bigint), cast(null as varchar),
+             cast(null as varchar), cast(null as varchar), cast('{}' as varchar),
+             cast('{}' as varchar),
+             cast('2026-10-01 12:00:01 UTC' as timestamp(6) with time zone)),
+            ('u3', timestamp '2026-10-01 11:00:01 UTC', null,
+             timestamp '2026-10-01 12:00:01 UTC', 9, 'INFO', 'earlier time',
+             'svc', null, null, null, null, null, null, null, null, null, null, '{}', '{}',
+             timestamp '2026-10-01 12:00:01 UTC'),
+            -- u4 lists the earlier-time row FIRST so the result cannot depend on input order.
+            ('u4', timestamp '2026-10-01 11:00:01 UTC', null,
+             timestamp '2026-10-01 12:00:01 UTC', 9, 'INFO', 'earlier time listed first',
+             'svc', null, null, null, null, null, null, null, null, null, null, '{}', '{}',
+             timestamp '2026-10-01 12:00:01 UTC'),
+            ('u4', timestamp '2026-10-01 11:00:05 UTC', null,
+             timestamp '2026-10-01 12:00:01 UTC', 9, 'INFO', 'later time listed second',
+             'svc', null, null, null, null, null, null, null, null, null, null, '{}', '{}',
+             timestamp '2026-10-01 12:00:01 UTC')
+          ) as t("event_uuid", "time", "observed_time", "received_at", "severity_number",
+                 "severity_text", "body", "service_name", "service_namespace",
+                 "service_instance_id", "host_name", "peer_addr", "trace_id", "span_id",
+                 "flags", "event_name", "scope_name", "scope_version",
+                 "resource_attributes", "attributes", "partition_time")
+    expect:
+      format: dict
+      rows:
+        - {event_uuid: u3, body: earlier time}
+        - {event_uuid: u4, body: earlier time listed first}
+
+  - name: stg_hec_dedups_but_keeps_every_legacy_null_uuid_row
+    model: stg_hec
+    given:
+      - input: ref('stg_hec_typed')
+        format: sql
+        rows: |
+          select * from (values
+            (cast('app' as varchar), cast('h1' as varchar),
+             cast(null as timestamp(6) with time zone),
+             cast('2026-10-01 12:00:01 UTC' as timestamp(6) with time zone),
+             cast('{"m":"a"}' as varchar),
+             cast('2026-10-01 12:00:01 UTC' as timestamp(6) with time zone),
+             cast('h-1' as varchar), cast('src' as varchar), cast('main' as varchar),
+             cast('{}' as varchar)),
+            ('app', 'h1', null, timestamp '2026-10-01 12:00:05 UTC', '{"m":"a-dup"}',
+             timestamp '2026-10-01 12:00:05 UTC', 'h-1', 'src', 'main', '{}'),
+            ('old', 'h1', null, timestamp '2026-09-01 00:00:01 UTC', '{"m":"legacy1"}',
+             timestamp '2026-09-01 00:00:01 UTC', null, null, null, null),
+            ('old', 'h1', null, timestamp '2026-09-01 00:00:02 UTC', '{"m":"legacy2"}',
+             timestamp '2026-09-01 00:00:02 UTC', null, null, null, null)
+          ) as t("sourcetype", "host", "time", "received_at", "fields", "partition_time",
+                 "event_uuid", "source", "index", "indexed_fields")
+    expect:
+      format: dict
+      rows:
+        # Every row names the same keys: dbt's dict format builds one SELECT per row and
+        # Trino's UNION ALL rejects rows with differing column counts.
+        - {sourcetype: app, event_uuid: h-1, index: main, fields: '{"m":"a"}'}
+        - {sourcetype: old, event_uuid: null, index: null, fields: '{"m":"legacy1"}'}
+        - {sourcetype: old, event_uuid: null, index: null, fields: '{"m":"legacy2"}'}

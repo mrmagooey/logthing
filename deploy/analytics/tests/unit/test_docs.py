@@ -51,3 +51,28 @@ def test_dbt_readme_documents_detection_caveats_and_runtime_setup():
         assert needle in text, needle
     cron = text[text.index("cron every"):]
     assert "TRINO_PASSWORD" in cron and "TRINO_USER" in cron and "TRINO_PORT" in cron
+
+
+def test_readme_documents_sending_app_logs():
+    for needle in ("Sending application logs", "HEC_TOKEN", "OTLP_BEARER_TOKEN", "/v1/logs",
+                   "/services/collector/event", "Authorization: Splunk", "Authorization: Bearer",
+                   "docs/otlp.md", "hec-token", "otlp-bearer-token", "0.22.0"):
+        assert needle in README, needle
+    assert "unauthenticated plaintext HTTP" not in README
+    assert "cleartext" in README.lower()  # tokens cross the wire unencrypted: front with TLS
+
+
+def test_dbt_readme_documents_stg_otlp_and_stg_hec_decisions():
+    text = (ANALYTICS / "dbt" / "README.md").read_text()
+    for needle in ("stg_otlp", "stg_hec", "event_uuid", "earliest", "not incremental",
+                   "legacy", "NULL"):
+        assert needle in text, needle
+
+
+def test_readme_existing_secret_keys_match_chart_secret():
+    chart_keys = set(re.findall(r"(?m)^  ([a-z0-9-]+): \{\{ include \"la.cred\"",
+                                (CHART / "templates" / "secret.yaml").read_text()))
+    assert "hec-token" in chart_keys and "otlp-bearer-token" in chart_keys
+    start = README.index("`credentials.existingSecret` naming a")
+    block = README[start:README.index("- **Trino TLS:**", start)]
+    assert set(re.findall(r"(?m)^  - `([a-z0-9-]+)`$", block)) == chart_keys

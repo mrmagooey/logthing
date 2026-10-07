@@ -204,6 +204,7 @@ def test_secret_keys_complete():
         "postgres-password", "lakekeeper-db-password", "lakekeeper-encryption-key",
         "trino-admin-password", "trino-metabase-password", "trino-shared-secret",
         "metabase-db-password", "metabase-encryption-key", "metabase-admin-password",
+        "hec-token", "otlp-bearer-token",
     }
 
 
@@ -708,3 +709,51 @@ def test_postgres_policy_selects_the_real_metabase_pods():
     assert pod_spec_meta(by(docs, "Deployment", f"{FULL}-metabase"))["labels"][LABEL] == "metabase"
     (rule,) = policies()[f"{FULL}-postgres"]["spec"]["ingress"]
     assert "metabase" in peers(rule)
+
+
+def test_secret_has_ingest_tokens_with_url_safe_generated_values():
+    data = by(render(), "Secret", f"{FULL}-credentials")["stringData"]
+    for key in ("hec-token", "otlp-bearer-token"):
+        assert re.fullmatch(r"[A-Za-z0-9]{40}", data[key]), key
+    assert data["hec-token"] != data["otlp-bearer-token"]
+
+
+def test_explicit_ingest_tokens_win():
+    data = by(render("credentials.hecToken=HecTokenPinned1234",
+                     "credentials.otlpBearerToken=OtlpTokenPinned12"),
+              "Secret", f"{FULL}-credentials")["stringData"]
+    assert data["hec-token"] == "HecTokenPinned1234"
+    assert data["otlp-bearer-token"] == "OtlpTokenPinned12"
+
+
+def test_logthing_gets_hec_and_otlp_sinks_and_token_secret_refs():
+    docs = render("logthing.flushIntervalSecs=15")
+    env = {e["name"]: e for e in
+           pod_spec(by(docs, "Deployment", f"{FULL}-logthing"))["containers"][0]["env"]}
+    for sec in ("HEC", "OTLP"):
+        assert env[f"LOGTHING__{sec}__S3__ENDPOINT"]["value"] == f"http://{FULL}-garage:3900"
+        assert env[f"LOGTHING__{sec}__S3__FLUSH_INTERVAL_SECS"]["value"] == "15"
+        assert "valueFrom" in env[f"LOGTHING__{sec}__S3__ACCESS_KEY"]
+    ref = lambda n: env[n]["valueFrom"]["secretKeyRef"]
+    assert ref("LOGTHING__HEC__TOKEN")["key"] == "hec-token"
+    assert ref("LOGTHING__OTLP__BEARER_TOKEN")["key"] == "otlp-bearer-token"
+    assert "value" not in env["LOGTHING__HEC__TOKEN"]  # never inline
+
+
+def test_notes_say_how_to_read_the_ingest_tokens():
+    text = notes()
+    assert "hec-token" in text and "otlp-bearer-token" in text
+
+
+def test_require_tokens_init_container_guards_empty_tokens():
+    for sets in ((), ("credentials.existingSecret=mine",)):
+        docs = render(*sets)
+        secret = "mine" if sets else f"{FULL}-credentials"
+        init = {c["name"]: c for c in pod_spec(by(docs, "Deployment", f"{FULL}-logthing"))
+                ["initContainers"]}["require-tokens"]
+        refs = {e["name"]: e for e in init["env"]}
+        assert set(refs) == {"HEC_TOKEN", "OTLP_BEARER_TOKEN"}
+        for name, key in (("HEC_TOKEN", "hec-token"), ("OTLP_BEARER_TOKEN", "otlp-bearer-token")):
+            assert "value" not in refs[name]
+            assert refs[name]["valueFrom"]["secretKeyRef"] == {"name": secret, "key": key}
+        assert "exit 1" in " ".join(init["command"])

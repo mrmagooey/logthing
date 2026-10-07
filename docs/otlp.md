@@ -82,7 +82,7 @@ One Iceberg table `otlp` (all services), partitioned by `day(partition_time)`.
 | `attributes` | string (JSON), not null | log attributes merged over scope attributes |
 | `partition_time` | timestamp(us, UTC), not null | event time if within the backfill/skew window of receipt, else receipt time |
 
-Query JSON columns with `json_extract_scalar(attributes, '$."http.route"')` (Trino).
+Query JSON columns with `json_extract_scalar(attributes, '$["http.route"]')` (Trino).
 
 ## Partitioning by service, the `_overflow` cap, and small files
 

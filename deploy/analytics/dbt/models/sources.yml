@@ -27,5 +27,6 @@ sources:
       - name: suricata
         description: Suricata EVE JSON envelope (event_type, src_ip, payload).
       - name: hec
-        description: Splunk HEC / NDJSON events (staging model arrives with the OTLP/HEC work).
-      # - name: otlp   # added together with stg_otlp once the OTLP table exists
+        description: Splunk HEC / NDJSON events (event_uuid, source, index, indexed_fields exist from 0.22.0; NULL on older rows).
+      - name: otlp
+        description: OTLP logs, one typed table for all services (21 columns, docs/otlp.md); exists once the first OTLP record is committed.
