@@ -257,6 +257,11 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     ),
     (
         Kind::Counter,
+        "redactions_applied",
+        "Values redacted by rule type (drop, hash, mask) and ingest source (hec, otlp).",
+    ),
+    (
+        Kind::Counter,
         "body_budget_exhausted",
         "HTTP requests rejected because the in-flight request-body memory budget was exhausted.",
     ),

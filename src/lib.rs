@@ -19,6 +19,7 @@ pub mod net;
 pub mod parser;
 pub mod profiling;
 pub mod protocol;
+pub mod redaction;
 pub mod server;
 pub mod sflow;
 pub mod shutdown;

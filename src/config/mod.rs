@@ -877,6 +877,32 @@ pub struct GenericLocalConfig {
     pub max_buffer_rows: usize,
 }
 
+/// Redaction rules for one ingest surface (`[hec.redaction]` / `[otlp.redaction]`).
+/// See `docs/redaction.md` for exact semantics.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct RedactionConfig {
+    /// Dotted paths removed from the record (OTLP: `@body`, `@host_name`, `@peer_addr` address
+    /// typed columns).
+    #[serde(default)]
+    pub drop_fields: Vec<String>,
+    /// Dotted paths replaced by the lowercase-hex HMAC-SHA256 of the value.
+    #[serde(default)]
+    pub hash_fields: Vec<String>,
+    /// NAME of the environment variable holding the HMAC key (not the key itself).
+    #[serde(default)]
+    pub hash_key_env: Option<String>,
+    /// Regexes applied to every string leaf; each match becomes `[REDACTED]`.
+    #[serde(default)]
+    pub mask_patterns: Vec<String>,
+}
+
+impl RedactionConfig {
+    /// True when no rule is configured (redaction is then skipped entirely).
+    pub fn is_empty(&self) -> bool {
+        self.drop_fields.is_empty() && self.hash_fields.is_empty() && self.mask_patterns.is_empty()
+    }
+}
+
 /// Top-level `[hec]` config section.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct HecConfig {
@@ -905,6 +931,9 @@ pub struct HecConfig {
     /// case records are written to both.
     #[serde(default)]
     pub local: Option<GenericLocalConfig>,
+    /// Redaction rules (`[hec.redaction]`), applied after parse and before enqueue.
+    #[serde(default)]
+    pub redaction: RedactionConfig,
 }
 
 fn default_hec_enabled() -> bool {
@@ -922,6 +951,7 @@ impl Default for HecConfig {
             max_sourcetype_partitions: default_hec_max_sourcetype_partitions(),
             s3: None,
             local: None,
+            redaction: RedactionConfig::default(),
         }
     }
 }
@@ -1017,6 +1047,9 @@ pub struct OtlpConfig {
     /// Optional local-disk persistence (`[otlp.local]`). Independent of `s3`.
     #[serde(default)]
     pub local: Option<OtlpLocalConfig>,
+    /// Redaction rules (`[otlp.redaction]`), applied after mapping and before enqueue.
+    #[serde(default)]
+    pub redaction: RedactionConfig,
 }
 
 fn default_otlp_enabled() -> bool {
@@ -1031,6 +1064,7 @@ impl Default for OtlpConfig {
             max_service_partitions: default_otlp_max_service_partitions(),
             s3: None,
             local: None,
+            redaction: RedactionConfig::default(),
         }
     }
 }
@@ -1885,6 +1919,24 @@ pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
                     .to_string(),
             );
         }
+    }
+
+    if cfg.hec.enabled
+        && let Err(e) = crate::redaction::Redactor::compile_optional(
+            &cfg.hec.redaction,
+            crate::redaction::RedactorKind::Hec,
+        )
+    {
+        errors.push(format!("{e:#}"));
+    }
+    if cfg!(feature = "otlp")
+        && cfg.otlp.enabled
+        && let Err(e) = crate::redaction::Redactor::compile_optional(
+            &cfg.otlp.redaction,
+            crate::redaction::RedactorKind::Otlp,
+        )
+    {
+        errors.push(format!("{e:#}"));
     }
 
     if errors.is_empty() {
@@ -3463,6 +3515,49 @@ directory = "/tmp/otlp"
         let mut cfg = Config::default();
         cfg.tls.enabled = false;
         cfg
+    }
+
+    #[test]
+    fn validate_config_invariants_rejects_bad_redaction_regex_when_hec_enabled() {
+        let mut cfg = valid_base();
+        cfg.hec.enabled = true;
+        cfg.hec.local = sink_dir();
+        cfg.hec.redaction.mask_patterns = vec!["(".to_string()];
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert!(err.contains("hec.redaction"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_config_invariants_rejects_hash_fields_without_key_env_var() {
+        let mut cfg = valid_base();
+        cfg.hec.enabled = true;
+        cfg.hec.local = sink_dir();
+        cfg.hec.redaction.hash_fields = vec!["email".to_string()];
+        cfg.hec.redaction.hash_key_env = Some("LOGTHING_TEST_SURELY_UNSET_KEY".to_string());
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert!(err.contains("LOGTHING_TEST_SURELY_UNSET_KEY"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_config_invariants_ignores_redaction_when_hec_disabled() {
+        let mut cfg = valid_base();
+        cfg.hec.redaction.mask_patterns = vec!["(".to_string()];
+        assert_eq!(validate_config_invariants(&cfg), Ok(()));
+    }
+
+    #[test]
+    fn redaction_section_parses_from_toml() {
+        let cfg: Config = toml::from_str(
+            "[hec.redaction]\ndrop_fields=[\"a.b\"]\nhash_fields=[\"e\"]\n\
+             hash_key_env=\"K\"\nmask_patterns=[\"x\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.hec.redaction.drop_fields, vec!["a.b"]);
+        assert_eq!(cfg.hec.redaction.hash_fields, vec!["e"]);
+        assert_eq!(cfg.hec.redaction.hash_key_env.as_deref(), Some("K"));
+        assert_eq!(cfg.hec.redaction.mask_patterns, vec!["x"]);
+        assert!(!cfg.hec.redaction.is_empty());
+        assert!(cfg.otlp.redaction.is_empty());
     }
 
     #[test]
