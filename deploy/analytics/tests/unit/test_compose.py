@@ -47,7 +47,7 @@ def cfg(tmp_path_factory):
 def test_all_services_present(cfg):
     assert set(cfg["services"]) == {
         "postgres", "garage", "garage-init", "lakekeeper-migrate", "lakekeeper",
-        "lakekeeper-init", "logthing", "committer", "trino", "hue",
+        "lakekeeper-init", "logthing", "committer", "certgen", "authgen", "trino",
     }
 
 
@@ -57,7 +57,8 @@ def test_pinned_default_images(cfg):
     assert img["committer"] == "ghcr.io/mrmagooey/logthing-committer:0.21.0"
     assert img["garage"] == "dxflrs/garage:v2.4.1"
     assert img["trino"] == "trinodb/trino:483"
-    assert img["hue"] == "gethue/hue:20260611-140101"
+    assert img["certgen"] == "alpine/openssl:3.5.9"
+    assert img["authgen"] == "httpd:2.4.69-alpine"
     assert img["lakekeeper"] == "quay.io/lakekeeper/catalog:v0.13.6"
 
 
@@ -70,8 +71,74 @@ def test_ordering(cfg):
         "lakekeeper": "service_healthy", "garage-init": "service_completed_successfully"}
     assert dep("logthing") == {"garage-init": "service_completed_successfully"}
     assert dep("committer") == {"lakekeeper-init": "service_completed_successfully"}
-    assert dep("trino") == {"lakekeeper-init": "service_completed_successfully"}
-    assert dep("hue") == {"postgres": "service_healthy", "trino": "service_healthy"}
+    assert dep("trino") == {
+        "lakekeeper-init": "service_completed_successfully",
+        "certgen": "service_completed_successfully",
+        "authgen": "service_completed_successfully",
+    }
+
+
+def test_trino_publishes_only_https_never_the_plain_http_port(cfg):
+    trino = cfg["services"]["trino"]
+    assert [(p["target"], p["host_ip"], p["published"]) for p in trino["ports"]] == [
+        (8443, "127.0.0.1", "8443")]
+    assert not any(p["target"] == 8080 for p in trino["ports"])
+    assert not trino.get("expose")
+
+
+def test_trino_is_authenticated_and_mounts_are_read_only(cfg):
+    trino = cfg["services"]["trino"]
+    env = trino["environment"]
+    assert env["TRINO_SHARED_SECRET"] and env["TRINO_PASSWORD"]
+    assert "https://localhost:8443" in " ".join(trino["healthcheck"]["test"])
+    mounts = {v["target"]: v for v in trino["volumes"]}
+    for path in ("/etc/trino/config.properties", "/etc/trino/password-authenticator.properties",
+                 "/etc/trino/catalog/iceberg.properties", "/etc/trino/tls", "/etc/trino/auth"):
+        assert mounts[path]["read_only"] is True, path
+    for svc in ("certgen", "authgen"):
+        assert cfg["services"][svc]["restart"] == "no"
+
+
+def test_only_trino_mounts_the_tls_volume_with_the_server_key(cfg):
+    for name, svc in cfg["services"].items():
+        sources = {v.get("source") for v in svc.get("volumes", [])}
+        if name not in ("trino", "certgen"):
+            assert "trino-tls" not in sources, name
+
+
+def test_trino_password_env_matches_authgen_admin_secret(tmp_path):
+    svc = compose_config(tmp_path, {"TRINO_ADMIN_PASSWORD": "AdminPw1234567890"})["services"]
+    assert svc["trino"]["environment"]["TRINO_PASSWORD"] == "AdminPw1234567890"
+    assert svc["authgen"]["environment"]["TRINO_ADMIN_PASSWORD"] == "AdminPw1234567890"
+    assert svc["authgen"]["environment"]["TRINO_USERS"] == (
+        "admin:TRINO_ADMIN_PASSWORD,metabase:TRINO_METABASE_PASSWORD")
+
+
+def _properties(path):
+    out = {}
+    for line in path.read_text().splitlines():
+        if line.strip() and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def test_trino_config_contract():
+    files = ANALYTICS / "helm" / "logthing-analytics" / "files"
+    cfg = _properties(files / "trino-config.properties")
+    assert cfg["http-server.https.enabled"] == "true"
+    assert cfg["http-server.https.port"] == "8443"
+    assert cfg["http-server.https.keystore.path"] == "/etc/trino/tls/server.pem"
+    # topology B: plain HTTP stays on 8080 for internal traffic only (never published)
+    assert cfg["http-server.http.enabled"] == "true"
+    assert cfg["http-server.http.port"] == "8080"
+    assert cfg["discovery.uri"] == "http://localhost:8080"
+    assert not any(k.startswith("internal-communication.https") for k in cfg)
+    assert cfg["http-server.authentication.type"] == "PASSWORD"
+    assert cfg["internal-communication.shared-secret"] == "${ENV:TRINO_SHARED_SECRET}"
+    auth = _properties(files / "trino-password-authenticator.properties")
+    assert auth["password-authenticator.name"] == "file"
+    assert auth["file.password-file"] == "/etc/trino/auth/password.db"
 
 
 def test_postgres_healthcheck_uses_tcp(cfg):
@@ -133,7 +200,7 @@ def test_bind_mount_sources_exist(cfg):
 
 
 def test_non_ingest_ports_default_to_loopback(cfg):
-    for name in ("garage", "lakekeeper", "trino", "hue"):
+    for name in ("garage", "lakekeeper", "trino"):
         for p in cfg["services"][name]["ports"]:
             assert p["host_ip"] == "127.0.0.1", name
     for p in cfg["services"]["logthing"]["ports"]:
@@ -141,7 +208,7 @@ def test_non_ingest_ports_default_to_loopback(cfg):
 
 
 def test_long_running_services_restart(cfg):
-    for name in ("postgres", "garage", "lakekeeper", "trino", "hue", "logthing", "committer"):
+    for name in ("postgres", "garage", "lakekeeper", "trino", "logthing", "committer"):
         assert cfg["services"][name]["restart"] == "unless-stopped", name
 
 

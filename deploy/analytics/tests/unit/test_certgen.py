@@ -83,3 +83,30 @@ def test_missing_openssl_fails_loudly(tmp_path):
     assert r.returncode != 0
     assert "openssl" in r.stderr
     assert not (out / "server.pem").exists()
+
+
+def test_failure_mid_generation_leaves_previous_files_and_no_ca_key(tmp_path):
+    out = tmp_path / "out"
+    run(out, TLS_DAYS="1")  # expiring: the next run regenerates
+    before = {n: (out / n).read_bytes() for n in ("ca.pem", "server.pem")}
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    real = shutil.which("openssl")
+    shim = bindir / "openssl"
+    shim.write_text(f'#!/bin/sh\n[ "$1" = x509 ] && [ "$2" = -req ] && exit 1\nexec {real} "$@"\n')
+    shim.chmod(0o755)
+    e = {"PATH": f"{bindir}:{os.environ['PATH']}", "OUT_DIR": str(out)}
+    r = subprocess.run(["sh", str(SCRIPT)], env=e, capture_output=True, text=True)
+    assert r.returncode != 0
+    assert {n: (out / n).read_bytes() for n in ("ca.pem", "server.pem")} == before
+    assert sorted(p.name for p in out.iterdir()) == ["ca.pem", "server.pem"]
+
+
+def test_ca_and_chain_pass_strict_verification(tmp_path):
+    # Python 3.13's default context (VERIFY_X509_STRICT) rejects a CA without keyUsage.
+    run(tmp_path)
+    text = cert_text(tmp_path / "ca.pem")
+    assert "CA:TRUE" in text and "Certificate Sign" in text
+    subprocess.run(
+        ["openssl", "verify", "-x509_strict", "-CAfile", str(tmp_path / "ca.pem"),
+         str(tmp_path / "server.pem")], check=True, capture_output=True)

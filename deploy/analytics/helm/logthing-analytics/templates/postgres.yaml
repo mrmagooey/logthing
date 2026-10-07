@@ -37,7 +37,6 @@ spec:
           env:
             {{- include "la.secretEnv" (dict "root" . "name" "POSTGRES_PASSWORD" "key" "postgres-password") | nindent 12 }}
             {{- include "la.secretEnv" (dict "root" . "name" "LAKEKEEPER_DB_PASSWORD" "key" "lakekeeper-db-password") | nindent 12 }}
-            {{- include "la.secretEnv" (dict "root" . "name" "HUE_DB_PASSWORD" "key" "hue-db-password") | nindent 12 }}
             - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
           readinessProbe:
             # TCP on purpose: the unix-socket check passes during the init-time temporary server.

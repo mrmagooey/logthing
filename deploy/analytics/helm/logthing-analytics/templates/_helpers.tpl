@@ -58,33 +58,6 @@ app.kubernetes.io/component: {{ .component }}
   volumeMounts:
     - {name: files, mountPath: /bootstrap/bootstrap.py, subPath: bootstrap.py}
 {{- end -}}
-{{/* initContainer for Hue: wait for Postgres (TCP) and Trino (HTTP /v1/info) */}}
-{{- define "la.waitHue" -}}
-- name: wait-deps
-  image: {{ .Values.bootstrap.image }}
-  command:
-    - python
-    - -c
-    - |
-      import socket, sys, time, urllib.request
-      deadline = time.time() + float(sys.argv[1])
-      def pg():
-          socket.create_connection((sys.argv[2], 5432), 3).close()
-      def trino():
-          assert urllib.request.urlopen(sys.argv[3], timeout=3).status == 200
-      for name, check in (("postgres", pg), ("trino", trino)):
-          while True:
-              try:
-                  check()
-                  break
-              except Exception as e:
-                  if time.time() > deadline:
-                      sys.exit(f"wait-deps: {name} not ready: {e}")
-                  time.sleep(2)
-    - {{ .Values.bootstrap.timeoutSecs | quote }}
-    - {{ include "la.fullname" . }}-postgres
-    - http://{{ include "la.fullname" . }}-trino:8080/v1/info
-{{- end -}}
 {{/* pod volume for the shared files ConfigMap */}}
 {{- define "la.filesVolume" -}}
 - name: files
@@ -133,4 +106,8 @@ Generated values never change after first install by design, so they need no rol
 */}}
 {{- define "la.credsum" -}}
 {{- omit .Values.credentials "existingSecret" | toJson | sha256sum -}}
+{{- end -}}
+{{/* name of the Secret holding ca.pem and server.pem for Trino */}}
+{{- define "la.trinoTlsSecret" -}}
+{{- .Values.trino.tls.existingSecret | default (printf "%s-trino-tls" (include "la.fullname" .)) -}}
 {{- end -}}

@@ -1,11 +1,10 @@
 logthing analytics stack installed as {{ include "la.fullname" . }}.
 
-Open Hue (the first person to log in becomes the admin):
-  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "la.fullname" . }}-hue 8888
-  then browse http://localhost:8888
-
-Query Trino directly:
-  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "la.fullname" . }}-trino 8080
+Query Trino (HTTPS + password; user admin, password in Secret {{ include "la.secretName" . }} key trino-admin-password):
+  kubectl exec -n {{ .Release.Namespace }} deploy/{{ include "la.fullname" . }}-trino -- \
+    trino --server https://localhost:8443 --truststore-path /etc/trino/tls/ca.pem --user admin --password --execute 'SHOW TABLES FROM iceberg.logs'
+  From your machine: kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "la.fullname" . }}-trino 8443
+  and trust the CA in Secret {{ include "la.trinoTlsSecret" . }} key ca.pem.
 
 Tables appear only after the first committer run (CronJob {{ include "la.fullname" . }}-committer,
 schedule "{{ .Values.committer.schedule }}") has seen flushed data.

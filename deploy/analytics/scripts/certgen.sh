@@ -22,8 +22,16 @@ if [ -s server.pem ] && [ -s ca.pem ] \
   echo "certgen: existing certificate still valid, keeping it"
   exit 0
 fi
+# Generate in a private work dir and move the results into place only at the very end, so a
+# failure never leaves ca.key behind or a ca.pem that does not match server.pem.
+umask 077
+work=$(mktemp -d "$OUT_DIR/.certgen.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+cd "$work"
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out ca.key
-openssl req -x509 -new -key ca.key -sha256 -days 3650 -subj "/CN=logthing-analytics-ca" -out ca.pem
+openssl req -x509 -new -key ca.key -sha256 -days 3650 -subj "/CN=logthing-analytics-ca" \
+  -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -out ca.pem
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out server.key
 openssl req -new -key server.key -subj "/CN=trino" -out server.csr
 printf 'subjectAltName=%s\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\n' \
@@ -31,8 +39,9 @@ printf 'subjectAltName=%s\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,
 openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days "$DAYS" \
   -sha256 -extfile ext.cnf -out server.crt
 cat server.crt server.key >server.pem
-rm -f server.csr ext.cnf ca.srl server.crt server.key ca.key
 chmod 644 ca.pem
 chmod 600 server.pem
 if [ -n "${TLS_OWNER:-}" ]; then chown "$TLS_OWNER" server.pem ca.pem; fi
+mv -f server.pem "$OUT_DIR/server.pem"
+mv -f ca.pem "$OUT_DIR/ca.pem"
 echo "certgen: wrote $OUT_DIR/ca.pem and $OUT_DIR/server.pem (SANs: $SANS)"

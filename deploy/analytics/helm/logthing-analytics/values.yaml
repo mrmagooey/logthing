@@ -2,7 +2,8 @@
 # keeps them on upgrades (read back from the live Secret). Set a value to pin it. Or set
 # existingSecret to a Secret with these keys: garage-rpc-secret garage-admin-token
 # s3-access-key s3-secret-key postgres-password lakekeeper-db-password
-# lakekeeper-encryption-key hue-db-password hue-secret-key.
+# lakekeeper-encryption-key trino-admin-password trino-metabase-password
+# trino-shared-secret.
 # Values must be URL-safe ([A-Za-z0-9._~-]): they are spliced into Postgres URLs. The Garage key
 # id must be GK + 24 lowercase hex, its secret 64 lowercase hex.
 credentials:
@@ -14,8 +15,9 @@ credentials:
   postgresPassword: ""
   lakekeeperDbPassword: ""
   lakekeeperEncryptionKey: ""
-  hueDbPassword: ""
-  hueSecretKey: ""
+  trinoAdminPassword: ""
+  trinoMetabasePassword: ""
+  trinoSharedSecret: ""
 
 bootstrap:
   image: python:3.12-slim
@@ -58,17 +60,18 @@ committer:
 
 trino:
   image: trinodb/trino:483
+  authgen:
+    image: httpd:2.4.69-alpine
+  tls:
+    # Name of a Secret with keys ca.pem and server.pem (certificate chain + PKCS#8/PKCS#1 key)
+    # whose certificate is valid for the Trino Service DNS name. Empty = the chart generates a
+    # private CA and certificate (kept across upgrades via lookup; delete the <release>-trino-tls
+    # Secret and upgrade to rotate).
+    existingSecret: ""
   service:
     type: ClusterIP
   resources:
     requests: {memory: 2Gi}
     limits: {memory: 4Gi}
-
-hue:
-  image: gethue/hue:20260611-140101
-  service:
-    type: ClusterIP
-  resources:
-    requests: {memory: 1Gi}
 
 storageClassName: ""

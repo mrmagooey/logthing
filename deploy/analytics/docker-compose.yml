@@ -1,5 +1,5 @@
 # logthing analytics stack: logthing -> Garage (S3) -> committer -> Lakekeeper (Iceberg REST)
-# -> Trino -> Hue. Shared config files live in helm/logthing-analytics/files/ and are used
+# -> Trino. Shared config files live in helm/logthing-analytics/files/ and are used
 # unchanged by the Helm chart. Secrets are REQUIRED (no defaults): run scripts/gen-analytics-env.sh.
 name: logthing-analytics
 
@@ -48,7 +48,6 @@ services:
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
       LAKEKEEPER_DB_PASSWORD: ${LAKEKEEPER_DB_PASSWORD:?set LAKEKEEPER_DB_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
-      HUE_DB_PASSWORD: ${HUE_DB_PASSWORD:?set HUE_DB_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
     volumes:
       - ./helm/logthing-analytics/files/postgres-init.sh:/docker-entrypoint-initdb.d/10-init.sh:ro
       - pgdata:/var/lib/postgresql/data
@@ -159,47 +158,63 @@ services:
       lakekeeper-init: {condition: service_completed_successfully}
     restart: unless-stopped
 
+  certgen:
+    image: ${CERTGEN_IMAGE:-alpine/openssl:3.5.9}
+    entrypoint: ["sh", "/certgen.sh"]
+    environment:
+      OUT_DIR: /tls
+      TLS_OWNER: "1000:1000"
+    volumes:
+      - ./scripts/certgen.sh:/certgen.sh:ro
+      - trino-tls:/tls
+    restart: "no"
+
+  authgen:
+    image: ${AUTHGEN_IMAGE:-httpd:2.4.69-alpine}
+    entrypoint: ["sh", "/authgen.sh"]
+    environment:
+      OUT_DIR: /auth
+      TRINO_USERS: admin:TRINO_ADMIN_PASSWORD,metabase:TRINO_METABASE_PASSWORD
+      TRINO_ADMIN_PASSWORD: ${TRINO_ADMIN_PASSWORD:?set TRINO_ADMIN_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      TRINO_METABASE_PASSWORD: ${TRINO_METABASE_PASSWORD:?set TRINO_METABASE_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
+    volumes:
+      - ./helm/logthing-analytics/files/authgen.sh:/authgen.sh:ro
+      - trino-auth:/auth
+    restart: "no"
+
   trino:
     image: ${TRINO_IMAGE:-trinodb/trino:483}
     restart: unless-stopped
     volumes:
+      - ./helm/logthing-analytics/files/trino-config.properties:/etc/trino/config.properties:ro
+      - ./helm/logthing-analytics/files/trino-password-authenticator.properties:/etc/trino/password-authenticator.properties:ro
       - ./helm/logthing-analytics/files/trino-iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+      - trino-tls:/etc/trino/tls:ro
+      - trino-auth:/etc/trino/auth:ro
     environment:
       <<: *s3-creds
       CATALOG_URI: http://lakekeeper:8181/catalog
       S3_ENDPOINT: http://garage:3900
+      TRINO_SHARED_SECRET: ${TRINO_SHARED_SECRET:?set TRINO_SHARED_SECRET (run deploy/analytics/scripts/gen-analytics-env.sh)}
+      # Read by the trino CLI (healthcheck and `docker compose exec trino trino ...`).
+      TRINO_PASSWORD: ${TRINO_ADMIN_PASSWORD:?set TRINO_ADMIN_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
     healthcheck:
-      test: ["CMD", "/usr/lib/trino/bin/health-check"]
-      interval: 5s
-      timeout: 5s
+      test: ["CMD-SHELL", "trino --server https://localhost:8443 --truststore-path /etc/trino/tls/ca.pem --user admin --password --execute 'SELECT 1' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 20s
       retries: 60
       start_period: 30s
     depends_on:
       lakekeeper-init: {condition: service_completed_successfully}
+      certgen: {condition: service_completed_successfully}
+      authgen: {condition: service_completed_successfully}
+    # 8080 (plain HTTP, internal node traffic only) is deliberately never published.
     ports:
-      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${TRINO_PORT:-8080}:8080"
-
-  hue:
-    image: ${HUE_IMAGE:-gethue/hue:20260611-140101}
-    restart: unless-stopped
-    volumes:
-      - ./hue.ini:/usr/share/hue/desktop/conf/z-hue-overrides.ini:ro
-    environment:
-      HUE_DB_PASSWORD: ${HUE_DB_PASSWORD:?set HUE_DB_PASSWORD (run deploy/analytics/scripts/gen-analytics-env.sh)}
-      HUE_SECRET_KEY: ${HUE_SECRET_KEY:?set HUE_SECRET_KEY (run deploy/analytics/scripts/gen-analytics-env.sh)}
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8888/desktop/debug/is_alive"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 60s
-    depends_on:
-      postgres: {condition: service_healthy}
-      trino: {condition: service_healthy}
-    ports:
-      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${HUE_PORT:-8888}:8888"
+      - "${ANALYTICS_BIND_ADDR:-127.0.0.1}:${TRINO_PORT:-8443}:8443"
 
 volumes:
   pgdata: {}
   garage-meta: {}
   garage-data: {}
+  trino-tls: {}
+  trino-auth: {}

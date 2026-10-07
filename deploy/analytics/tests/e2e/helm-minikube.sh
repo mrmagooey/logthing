@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# End-to-end: Helm chart on minikube -> syslog into logthing -> committer -> Trino and Hue see the rows.
-# Requires minikube (docker driver), helm, kubectl and an AVX2-capable CPU (or TRINO_IMAGE/HUE_IMAGE
-# overrides; locally present override images are loaded into the cluster). KEEP_CLUSTER=1 keeps it.
+# End-to-end: Helm chart on minikube -> syslog into logthing -> committer -> Trino (HTTPS + password) sees the rows.
+# Requires minikube (docker driver), helm, kubectl and an AVX2-capable CPU (or a TRINO_IMAGE
+# override; locally present override images are loaded into the cluster). KEEP_CLUSTER=1 keeps it.
 set -euo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ANALYTICS=$(cd -- "$HERE/../.." && pwd)
@@ -12,7 +12,8 @@ PROFILE=${MINIKUBE_PROFILE:-lt-analytics-e2e}
 NS=analytics
 FULL=lt-logthing-analytics
 CHART="$ANALYTICS/helm/logthing-analytics"
-HUE_LOCAL_PORT=28889
+TRINO_LOCAL_PORT=28443
+CA=$(mktemp)
 N=40
 MARKER="analytics-e2e-$(date +%s)-$$"
 PY=${PYTHON:-python3}
@@ -27,10 +28,13 @@ fi
 export KUBECONFIG
 K=(kubectl --context "$PROFILE" -n "$NS")
 H=(helm --kube-context "$PROFILE")
+TRINO_CLI=(trino --server https://localhost:8443 --truststore-path /etc/trino/tls/ca.pem
+           --user admin --password)
 
 PF_PID=""
 cleanup() {
   [ -z "$PF_PID" ] || kill "$PF_PID" 2>/dev/null || true
+  rm -f "$CA"
   if [ "${KEEP_CLUSTER:-}" = 1 ]; then
     echo "KEEP_CLUSTER=1: leaving minikube profile $PROFILE running" >&2
   else
@@ -54,7 +58,7 @@ minikube start -p "$PROFILE" --cpus 6 --memory 12g --driver docker
 minikube update-context -p "$PROFILE" >/dev/null
 
 echo "== [2/7] load local override images =="
-for img in "${TRINO_IMAGE:-}" "${HUE_IMAGE:-}"; do
+for img in "${TRINO_IMAGE:-}"; do
   if [ -n "$img" ] && docker image inspect "$img" >/dev/null 2>&1; then
     # Loading a multi-GB image is slow; skip it when a kept cluster already has it.
     if ! minikube -p "$PROFILE" image ls 2>/dev/null | grep -qxF -e "$img" -e "docker.io/$img" -e "docker.io/library/$img"; then
@@ -66,7 +70,6 @@ done
 echo "== [3/7] helm install =="
 SETS=(--set logthing.flushIntervalSecs=5)
 [ -z "${TRINO_IMAGE:-}" ] || SETS+=(--set "trino.image=$TRINO_IMAGE")
-[ -z "${HUE_IMAGE:-}" ] || SETS+=(--set "hue.image=$HUE_IMAGE")
 "${H[@]}" upgrade --install lt "$CHART" --namespace "$NS" --create-namespace --wait --timeout 15m "${SETS[@]}" \
   || { echo "helm install failed" >&2; dump_logs; exit 1; }
 
@@ -101,7 +104,7 @@ timeout 300 "${K[@]}" run sender --rm -i --restart=Never --pod-running-timeout=3
 
 COUNT_SQL="SELECT count(*) FROM iceberg.logs.syslog WHERE message LIKE '%$MARKER%'"
 trino_count() {
-  timeout 30 "${K[@]}" exec "deploy/$FULL-trino" -- trino --output-format TSV --execute "$COUNT_SQL" 2>/dev/null \
+  timeout 30 "${K[@]}" exec "deploy/$FULL-trino" -- "${TRINO_CLI[@]}" --output-format TSV --execute "$COUNT_SQL" 2>/dev/null \
     | tr -d '"\r' || true
 }
 
@@ -117,19 +120,23 @@ until [ "$(trino_count)" = "$N" ]; do
 done
 echo "trino: $N"
 
-echo "== [7/7] same query through Hue's REST API =="
-"${K[@]}" port-forward "svc/$FULL-hue" "$HUE_LOCAL_PORT:8888" >/dev/null 2>&1 &
+echo "== [7/7] Trino security through a port-forward: HTTPS + password negatives =="
+"${K[@]}" port-forward "svc/$FULL-trino" "$TRINO_LOCAL_PORT:8443" >/dev/null 2>&1 &
 PF_PID=$!
-hue_alive() {
-  kill -0 "$PF_PID" 2>/dev/null && curl -fsS "http://127.0.0.1:$HUE_LOCAL_PORT/desktop/debug/is_alive"
+"${K[@]}" get secret "$FULL-trino-tls" -o jsonpath='{.data.ca\.pem}' | base64 -d >"$CA"
+ADMIN_PW=$("${K[@]}" get secret "$FULL-credentials" -o jsonpath='{.data.trino-admin-password}' | base64 -d)
+trino_alive() {
+  kill -0 "$PF_PID" 2>/dev/null && curl -s -o /dev/null --cacert "$CA" "https://localhost:$TRINO_LOCAL_PORT/v1/info"
 }
-wait_until 120 "Hue port-forward" hue_alive \
-  || { "${K[@]}" logs "deploy/$FULL-hue" --tail 80 >&2 || true; exit 1; }
-# The password is arbitrary: Hue creates the user (as superuser) on first login.
-HUE_COUNT=$(HUE_PASSWORD=e2e-admin-pass "$PY" "$HERE/hue_query.py" "http://127.0.0.1:$HUE_LOCAL_PORT" admin \
-  "SELECT count(*) FROM syslog WHERE message LIKE '%$MARKER%'") \
-  || { "${K[@]}" logs "deploy/$FULL-hue" --tail 80 >&2 || true; exit 1; }
-[ "$HUE_COUNT" = "$N" ] || { echo "Hue returned $HUE_COUNT, expected $N" >&2; exit 1; }
-echo "hue: $HUE_COUNT"
+wait_until 120 "Trino port-forward" trino_alive \
+  || { "${K[@]}" logs "deploy/$FULL-trino" --tail 80 >&2 || true; exit 1; }
+trino_security_checks "https://localhost:$TRINO_LOCAL_PORT" "$CA" "$ADMIN_PW" \
+  || { "${K[@]}" logs "deploy/$FULL-trino" --tail 80 >&2 || true; exit 1; }
+# Topology B: plain-HTTP 8080 is internal to the pod; the Service must expose only 8443.
+PORTS=$("${K[@]}" get svc "$FULL-trino" -o jsonpath='{.spec.ports[*].port}')
+[ "$PORTS" = 8443 ] || { echo "Trino Service exposes ports '$PORTS', expected only 8443" >&2; exit 1; }
+if "${K[@]}" exec "deploy/$FULL-trino" -- env TRINO_PASSWORD=wrong "${TRINO_CLI[@]}" --execute 'SELECT 1' >/dev/null 2>&1; then
+  echo "Trino CLI accepted a wrong password" >&2; exit 1
+fi
 
 echo "Analytics Helm E2E PASSED"

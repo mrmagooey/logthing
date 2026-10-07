@@ -63,21 +63,19 @@ def test_expected_resources():
     for kind, name in [
         ("Secret", f"{FULL}-credentials"),
         ("ConfigMap", f"{FULL}-files"),
-        ("ConfigMap", f"{FULL}-hue"),
+        ("Secret", f"{FULL}-trino-tls"),
         ("StatefulSet", f"{FULL}-postgres"),
         ("StatefulSet", f"{FULL}-garage"),
         ("Service", f"{FULL}-postgres"),
         ("Service", f"{FULL}-garage"),
         ("Service", f"{FULL}-lakekeeper"),
         ("Service", f"{FULL}-trino"),
-        ("Service", f"{FULL}-hue"),
         ("Job", f"{FULL}-garage-init-1"),
         ("Job", f"{FULL}-lakekeeper-init-1"),
         ("Deployment", f"{FULL}-lakekeeper"),
         ("Deployment", f"{FULL}-logthing"),
         ("CronJob", f"{FULL}-committer"),
         ("Deployment", f"{FULL}-trino"),
-        ("Deployment", f"{FULL}-hue"),
         ("Service", f"{FULL}-logthing-udp"),
         ("Service", f"{FULL}-logthing-tcp"),
     ]:
@@ -174,7 +172,8 @@ def _secret_refs(docs):
 
 def test_existing_secret_used():
     docs = render("credentials.existingSecret=mine")
-    assert not any(d["kind"] == "Secret" for d in docs)
+    # the generated TLS Secret is independent of credentials.existingSecret
+    assert [d["metadata"]["name"] for d in docs if d["kind"] == "Secret"] == [f"{FULL}-trino-tls"]
     assert _secret_refs(docs) == {"mine"}
     assert _secret_refs(render()) == {f"{FULL}-credentials"}
 
@@ -184,7 +183,7 @@ def test_secret_keys_complete():
     assert set(data) == {
         "garage-rpc-secret", "garage-admin-token", "s3-access-key", "s3-secret-key",
         "postgres-password", "lakekeeper-db-password", "lakekeeper-encryption-key",
-        "hue-db-password", "hue-secret-key",
+        "trino-admin-password", "trino-metabase-password", "trino-shared-secret",
     }
 
 
@@ -195,11 +194,12 @@ def test_helm_secret_refs_everywhere():
     )
     assert {"S3_ACCESS_KEY", "S3_SECRET_KEY"} <= env_names(docs, "Deployment", f"{FULL}-trino")
     assert {"S3_ACCESS_KEY", "S3_SECRET_KEY"} <= env_names(docs, "CronJob", f"{FULL}-committer")
-    assert {"HUE_DB_PASSWORD", "HUE_SECRET_KEY"} <= env_names(docs, "Deployment", f"{FULL}-hue")
+    assert {"TRINO_SHARED_SECRET", "TRINO_PASSWORD"} <= env_names(
+        docs, "Deployment", f"{FULL}-trino")
     assert {"GARAGE_RPC_SECRET", "GARAGE_ADMIN_TOKEN"} <= env_names(
         docs, "StatefulSet", f"{FULL}-garage"
     )
-    assert {"POSTGRES_PASSWORD", "LAKEKEEPER_DB_PASSWORD", "HUE_DB_PASSWORD"} <= env_names(
+    assert {"POSTGRES_PASSWORD", "LAKEKEEPER_DB_PASSWORD"} <= env_names(
         docs, "StatefulSet", f"{FULL}-postgres"
     )
 
@@ -229,11 +229,11 @@ def test_committer_env_matches_compose():
 
 
 def test_image_overrides():
-    docs = render("trino.image=trinodb/trino:470", "hue.image=example/hue:x")
-    trino = pod_spec(by(docs, "Deployment", f"{FULL}-trino"))["containers"][0]["image"]
-    hue = pod_spec(by(docs, "Deployment", f"{FULL}-hue"))["containers"][0]["image"]
-    assert trino == "trinodb/trino:470"
-    assert hue == "example/hue:x"
+    docs = render("trino.image=trinodb/trino:470", "trino.authgen.image=example/htpasswd:x")
+    spec = pod_spec(by(docs, "Deployment", f"{FULL}-trino"))
+    assert spec["containers"][0]["image"] == "trinodb/trino:470"
+    assert next(c for c in spec["initContainers"] if c["name"] == "authgen")["image"] == \
+        "example/htpasswd:x"
 
 
 def test_default_images_pinned():
@@ -247,7 +247,7 @@ def test_default_images_pinned():
         "postgres:17", "dxflrs/garage:v2.4.1", "python:3.12-slim",
         "quay.io/lakekeeper/catalog:v0.13.6", "ghcr.io/mrmagooey/logthing:0.21.0",
         "ghcr.io/mrmagooey/logthing-committer:0.21.0", "trinodb/trino:483",
-        "gethue/hue:20260611-140101",
+        "httpd:2.4.69-alpine",
     }
 
 
@@ -267,22 +267,11 @@ def test_storage_class_only_when_set():
 def test_shared_files_are_verbatim():
     files = by(render(), "ConfigMap", f"{FULL}-files")["data"]
     names = ("bootstrap.py", "garage.toml", "logthing.toml", "trino-iceberg.properties",
-             "postgres-init.sh")
+             "postgres-init.sh", "authgen.sh", "trino-config.properties",
+             "trino-password-authenticator.properties")
     assert set(files) == set(names)
     for name in names:
         assert files[name].strip() == (CHART / "files" / name).read_text().strip(), name
-
-
-def _significant(text):
-    return [
-        ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")
-    ]
-
-
-def test_hue_ini_parity_with_compose():
-    rendered = by(render(), "ConfigMap", f"{FULL}-hue")["data"]["z-hue-overrides.ini"]
-    normalised = rendered.replace(f"{FULL}-postgres", "postgres").replace(f"{FULL}-trino", "trino")
-    assert _significant(normalised) == _significant((ANALYTICS / "hue.ini").read_text())
 
 
 def test_rendered_yaml_has_no_duplicate_keys():
@@ -333,29 +322,87 @@ def pod_spec_meta(doc):
 def test_checksum_annotations():
     docs = render()
     for kind, name in [("Deployment", "logthing"), ("Deployment", "trino"),
-                       ("StatefulSet", "garage"), ("StatefulSet", "postgres"),
-                       ("Deployment", "hue")]:
+                       ("StatefulSet", "garage"), ("StatefulSet", "postgres")]:
         a = _annotations(docs, kind, f"{FULL}-{name}")
-        assert "checksum/secret" in a, name
-        assert ("checksum/hue" if name == "hue" else "checksum/files") in a, name
-    docs = render("credentials.existingSecret=mine")
-    assert "checksum/secret" not in _annotations(docs, "Deployment", f"{FULL}-trino")
+        assert "checksum/secret" in a and "checksum/files" in a, name
+    assert "checksum/tls" in _annotations(docs, "Deployment", f"{FULL}-trino")
+    docs = render("credentials.existingSecret=mine", "trino.tls.existingSecret=mytls")
+    a = _annotations(docs, "Deployment", f"{FULL}-trino")
+    assert "checksum/secret" not in a and "checksum/tls" not in a
 
 
 def test_checksum_changes_with_values():
-    a = _annotations(render(), "Deployment", f"{FULL}-hue")["checksum/secret"]
-    b = _annotations(render("credentials.hueDbPassword=other"), "Deployment",
-                     f"{FULL}-hue")["checksum/secret"]
+    a = _annotations(render(), "Deployment", f"{FULL}-trino")["checksum/secret"]
+    b = _annotations(render("credentials.trinoAdminPassword=other"), "Deployment",
+                     f"{FULL}-trino")["checksum/secret"]
     assert a != b
 
 
-def test_hue_waits_for_postgres_and_trino():
-    spec = pod_spec(by(render(), "Deployment", f"{FULL}-hue"))
-    init = spec["initContainers"][0]
-    assert init["image"] == "python:3.12-slim"
-    cmd = init["command"]
-    assert f"{FULL}-postgres" in cmd and f"http://{FULL}-trino:8080/v1/info" in cmd
-    assert "600" in cmd
+def _decode(secret, key):
+    import base64
+    return base64.b64decode(secret["data"][key]).decode()
+
+
+def test_trino_tls_secret_is_a_valid_ca_signed_cert():
+    import os
+    import tempfile
+    secret = by(render(), "Secret", f"{FULL}-trino-tls")
+    assert set(secret["data"]) == {"ca.pem", "server.pem"}
+    server, ca = _decode(secret, "server.pem"), _decode(secret, "ca.pem")
+    assert "BEGIN CERTIFICATE" in server and "PRIVATE KEY" in server
+    assert "PRIVATE KEY" not in ca
+    if not shutil.which("openssl"):
+        return
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "server.pem"), "w").write(server)
+        open(os.path.join(d, "ca.pem"), "w").write(ca)
+        subprocess.run(["openssl", "verify", "-CAfile", f"{d}/ca.pem", f"{d}/server.pem"],
+                       check=True, capture_output=True)
+        text = subprocess.run(["openssl", "x509", "-in", f"{d}/server.pem", "-noout", "-text"],
+                              capture_output=True, text=True, check=True).stdout
+    for san in (f"DNS:{FULL}-trino", f"DNS:{FULL}-trino.default.svc", "DNS:localhost",
+                "IP Address:127.0.0.1"):
+        assert san in text, san
+
+
+def test_trino_tls_existing_secret_is_used_and_not_rendered():
+    docs = render("trino.tls.existingSecret=mytls")
+    assert not any(d["kind"] == "Secret" and d["metadata"]["name"].endswith("-trino-tls")
+                   for d in docs)
+    vols = pod_spec(by(docs, "Deployment", f"{FULL}-trino"))["volumes"]
+    assert next(v for v in vols if v["name"] == "tls")["secret"]["secretName"] == "mytls"
+
+
+def test_trino_service_exposes_only_https_never_plain_http():
+    svc = by(render(), "Service", f"{FULL}-trino")
+    assert [(p["name"], p["port"]) for p in svc["spec"]["ports"]] == [("https", 8443)]
+    assert all(p["port"] != 8080 and p["targetPort"] != 8080 for p in svc["spec"]["ports"])
+
+
+def test_trino_pod_wiring():
+    spec = pod_spec(by(render(), "Deployment", f"{FULL}-trino"))
+    assert spec["securityContext"]["fsGroup"] == 1000
+    assert spec["initContainers"][0]["name"] == "wait-lakekeeper"
+    authgen = next(c for c in spec["initContainers"] if c["name"] == "authgen")
+    assert authgen["command"] == ["sh", "/bootstrap/authgen.sh"]
+    refs = {e["name"]: e["valueFrom"]["secretKeyRef"]["key"] for e in authgen["env"]
+            if "valueFrom" in e}
+    assert refs == {"TRINO_ADMIN_PASSWORD": "trino-admin-password",
+                    "TRINO_METABASE_PASSWORD": "trino-metabase-password"}
+    trino = spec["containers"][0]
+    # 8080 (internal/discovery) is deliberately not declared; only HTTPS is a container port.
+    assert [p["containerPort"] for p in trino["ports"]] == [8443]
+    env = {e["name"]: e["valueFrom"]["secretKeyRef"]["key"] for e in trino["env"]
+           if "valueFrom" in e}
+    assert env["TRINO_SHARED_SECRET"] == "trino-shared-secret"
+    assert env["TRINO_PASSWORD"] == "trino-admin-password"
+    mounts = {m["mountPath"]: m for m in trino["volumeMounts"]}
+    for path in ("/etc/trino/config.properties", "/etc/trino/password-authenticator.properties",
+                 "/etc/trino/catalog/iceberg.properties", "/etc/trino/tls", "/etc/trino/auth"):
+        assert path in mounts, path
+    assert "https://localhost:8443" in " ".join(trino["readinessProbe"]["exec"]["command"])
+    tls = next(v for v in spec["volumes"] if v["name"] == "tls")["secret"]
+    assert tls["defaultMode"] == 0o440 and tls["secretName"] == f"{FULL}-trino-tls"
 
 
 def test_exec_probes_have_timeouts():
@@ -429,7 +476,8 @@ def test_generated_credentials_have_required_shapes():
     assert re.fullmatch(r"GK[0-9a-f]{24}", d["s3-access-key"])
     assert HEX64.fullmatch(d["s3-secret-key"]) and HEX64.fullmatch(d["garage-rpc-secret"])
     for k in ("garage-admin-token", "postgres-password", "lakekeeper-db-password",
-              "lakekeeper-encryption-key", "hue-db-password", "hue-secret-key"):
+              "lakekeeper-encryption-key", "trino-admin-password", "trino-metabase-password",
+              "trino-shared-secret"):
         assert re.fullmatch(r"[A-Za-z0-9]{32,}", d[k]), k
 
 
@@ -472,7 +520,7 @@ def test_checksum_secret_is_stable_across_renders_with_generated_secrets():
     # (secret unchanged across `helm upgrade`). This test pins the checksum independence from
     # whatever the Secret resolved to, which is what makes the lookup path roll-free.
     a, b = render(), render()
-    for kind, name in (("Deployment", "logthing"), ("Deployment", "hue"),
+    for kind, name in (("Deployment", "logthing"),
                        ("Deployment", "trino"), ("StatefulSet", "postgres"),
                        ("StatefulSet", "garage"), ("Deployment", "lakekeeper"),
                        ("CronJob", "committer"), ("Job", "garage-init-1"),
