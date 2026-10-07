@@ -42,10 +42,16 @@ unit_tests:
         format: sql
         rows: |
           select * from (values
-            ('u3', timestamp '2026-10-01 11:00:05 UTC', null,
-             timestamp '2026-10-01 12:00:01 UTC', 9, 'INFO', 'later time',
-             'svc', null, null, null, null, null, null, null, null, null, null, '{}', '{}',
-             timestamp '2026-10-01 12:00:01 UTC'),
+            (cast('u3' as varchar), timestamp '2026-10-01 11:00:05 UTC',
+             cast(null as timestamp(6) with time zone),
+             cast('2026-10-01 12:00:01 UTC' as timestamp(6) with time zone),
+             cast(9 as integer), cast('INFO' as varchar), cast('later time' as varchar),
+             cast('svc' as varchar), cast(null as varchar), cast(null as varchar),
+             cast(null as varchar), cast(null as varchar), cast(null as varchar),
+             cast(null as varchar), cast(null as bigint), cast(null as varchar),
+             cast(null as varchar), cast(null as varchar), cast('{}' as varchar),
+             cast('{}' as varchar),
+             cast('2026-10-01 12:00:01 UTC' as timestamp(6) with time zone)),
             ('u3', timestamp '2026-10-01 11:00:01 UTC', null,
              timestamp '2026-10-01 12:00:01 UTC', 9, 'INFO', 'earlier time',
              'svc', null, null, null, null, null, null, null, null, null, null, '{}', '{}',
