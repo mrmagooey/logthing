@@ -14,7 +14,7 @@ metric shows loss:
 |---|---|---|---|
 | HEC (`/services/collector/*`), NDJSON (`/ingest`), OTLP over HTTP | Request rejected | `503` + `Retry-After: 1` (HEC code 9 "Server is busy"); the client is expected to retry | `hec_events_dropped`, `otlp_events_dropped` count records not enqueued |
 | WEF (`/wsman`) | Event dropped, request still answered | `200` (WEF is **not** backpressured: the Windows event forwarder gets no signal) | `parquet_s3_dropped{source="wef"}` |
-| Syslog UDP, IPFIX, sFlow | Kernel socket buffer overflows before logthing reads | Nothing (UDP has no feedback) | `syslog_socket_drops`, `ipfix_socket_drops`, `sflow_socket_drops`; `parquet_s3_dropped{source}` for records that were read but not enqueued |
+| Syslog UDP, IPFIX, sFlow | Kernel socket buffer overflows before logthing reads | Nothing (UDP has no feedback) | `syslog_udp_socket_drops`, `ipfix_socket_drops`, `sflow_socket_drops`; `parquet_s3_dropped{source}` for records that were read but not enqueued |
 | Syslog TCP | Record dropped when the channel is full (non-blocking enqueue) | Nothing; the connection stays open | `parquet_s3_dropped{source="syslog"}` |
 | Zeek, Suricata (TCP) | The connection task waits up to 5 s for channel space, so the sensor sees TCP backpressure; after the wait the record is dropped | Slow socket, then silence | `parquet_s3_dropped{source="zeek"\|"suricata"}` |
 
@@ -29,15 +29,21 @@ accepted -> channel -> in-memory partition buffer -> encode (Parquet) -> sink
 
 A record is only in memory from the moment it is accepted until its partition is flushed.
 Flushes fire on `flush_interval_secs`, `max_buffer_rows` or `flush_threshold_bytes`, whichever
-comes first (a burst arriving while a flush is in flight coalesces into the next flush). A
+comes first. Only one flush per partition is in flight at a time: rows that cross
+`max_buffer_rows` / `flush_threshold_bytes` while a flush is running are flushed as soon as
+that flush completes, while rows below the thresholds wait for the next trigger, up to one
+flush interval (checked on the periodic tick and on each arriving record). A
 crash, `SIGKILL` or power loss loses everything in that window; the spool does not change
 this, because it sits **after** the flush. To shrink the window, lower `flush_interval_secs`
 and `flush_threshold_bytes`. The trade-off is more, smaller Parquet files and more work for the
 Iceberg committer.
 
-A graceful stop (`SIGTERM`/Ctrl-C) flushes every buffer first. Zeek and Suricata writers only
-finish early if their TCP connections close; otherwise the 10 s writer deadline expires and the
-last periodic flush is what is durable.
+A graceful stop (`SIGTERM`/Ctrl-C) flushes every buffer first, with one exception. A writer
+only finishes once every sender of its channel is gone. Zeek and Suricata connections run in
+detached tasks that keep a sender, so while a sensor is still connected at shutdown those
+writers do not finish: the 10 s writer deadline expires (`S3 writer flush timed out`), the
+process exits, and rows buffered since the last periodic flush are lost (they never reach the
+spool). Other sources release their senders when their listeners are aborted.
 
 ## Local sink
 

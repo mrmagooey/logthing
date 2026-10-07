@@ -1366,8 +1366,23 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
 
         match outcome {
             FlushOutcome::Success { key } => {
-                if let Some(buf) = self.buffers.get_mut(&key) {
-                    buf.in_flight = false;
+                // Rows that crossed `max_rows`/`max_bytes` while this flush was in
+                // flight were refused a second flush by `try_flush_partition_async`
+                // and would otherwise wait for the next push or tick (up to ~2x the
+                // flush interval). Flush them as soon as the slot frees up.
+                let over_threshold = self
+                    .buffers
+                    .get_mut(&key)
+                    .map(|buf| {
+                        buf.in_flight = false;
+                        buf.row_count > 0
+                            && (buf.row_count >= self.policy.max_rows
+                                || buf.byte_count >= self.policy.max_bytes)
+                    })
+                    .unwrap_or(false);
+                if over_threshold {
+                    self.try_flush_partition_async(&key);
+                    return;
                 }
                 // A flush that lands with nothing accumulated since it was
                 // kicked off (no pushes arrived while the upload was
@@ -5339,7 +5354,7 @@ secret_key  = "SECRET"
         );
 
         // Release the blocked upload so the test can clean up without hanging.
-        gate.add_permits(1);
+        gate.add_permits(16); // the first flush plus the follow-up flush of rows over the threshold
         w.drain_pending_flushes().await;
     }
 
@@ -5380,7 +5395,7 @@ secret_key  = "SECRET"
             hard_cap
         );
 
-        gate.add_permits(1);
+        gate.add_permits(16); // the first flush plus the follow-up flush of rows over the threshold
         w.drain_pending_flushes().await;
     }
 
@@ -5433,6 +5448,44 @@ secret_key  = "SECRET"
              loop's row_count undercounts real content by a factor of \
              {rows_per_push}x"
         );
+
+        gate.add_permits(16); // the first flush plus the follow-up flush of rows over the threshold
+        w.drain_pending_flushes().await;
+    }
+
+    /// Rows that crossed the row threshold while a flush was in flight must start their own
+    /// flush as soon as the first one completes, without another push or a tick.
+    #[tokio::test]
+    async fn threshold_crossing_rows_flush_when_the_in_flight_flush_completes() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let sink: Arc<dyn UploadSink> = Arc::new(BlockingSink { gate: gate.clone() });
+        let max_rows = 2usize;
+        let (cfg, policy) = test_config(max_rows);
+        let mut w = PartitionedParquetWriter::new(MockSink, sink, cfg, policy);
+
+        w.push("r0".to_string()).await.unwrap();
+        w.push("r1".to_string()).await.unwrap();
+        assert!(w.buffer_by_partition("").unwrap().in_flight);
+        // Cross the threshold again while the first flush is stuck.
+        for i in 2..2 + max_rows + 1 {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+        let before = w.buffer_by_partition("").unwrap();
+        assert!(before.in_flight && before.row_count >= max_rows);
+
+        // Complete the first flush and apply its outcome; no push, no tick.
+        gate.add_permits(1);
+        let outcome = w
+            .flush_tasks
+            .join_next()
+            .await
+            .expect("first flush task")
+            .expect("task joined");
+        w.apply_flush_outcome(outcome);
+
+        let after = w.buffer_by_partition("").expect("buffer kept");
+        assert!(after.in_flight, "a second flush must have started");
+        assert_eq!(after.row_count, 0, "its rows must have been detached");
 
         gate.add_permits(1);
         w.drain_pending_flushes().await;
