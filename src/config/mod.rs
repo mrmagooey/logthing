@@ -1312,7 +1312,8 @@ pub struct SyslogS3Config {
     /// Flush after this many seconds regardless of row count (default 900 = 15 min).
     #[serde(default = "default_syslog_s3_flush_interval_secs")]
     pub flush_interval_secs: u64,
-    /// Bounded channel capacity (number of messages; default 4096).
+    /// Bounded channel capacity (number of messages; default derived from the 100 MiB channel
+    /// budget, 136 533 at the default).
     #[serde(default = "default_syslog_s3_channel_capacity")]
     pub channel_capacity: usize,
 }
@@ -1353,7 +1354,7 @@ pub struct SyslogLocalConfig {
     /// Flush after this many seconds regardless of row count (default 900).
     #[serde(default = "default_syslog_s3_flush_interval_secs")]
     pub flush_interval_secs: u64,
-    /// Bounded channel capacity (default 4096).
+    /// Bounded channel capacity (default derived from the 100 MiB channel budget, 136 533).
     #[serde(default = "default_syslog_s3_channel_capacity")]
     pub channel_capacity: usize,
 }

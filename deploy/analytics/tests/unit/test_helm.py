@@ -266,8 +266,8 @@ def test_default_images_pinned():
     }
     assert images == {
         "postgres:17", "dxflrs/garage:v2.4.1", "python:3.12-slim",
-        "quay.io/lakekeeper/catalog:v0.13.6", "ghcr.io/mrmagooey/logthing:0.21.0",
-        "ghcr.io/mrmagooey/logthing-committer:0.21.0", "trinodb/trino:483",
+        "quay.io/lakekeeper/catalog:v0.13.6", "ghcr.io/mrmagooey/logthing:0.22.0",
+        "ghcr.io/mrmagooey/logthing-committer:0.22.0", "trinodb/trino:483",
         "httpd:2.4.69-alpine", "metabase/metabase:v0.64.1",
     }
 

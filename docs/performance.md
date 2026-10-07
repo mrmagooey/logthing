@@ -5,7 +5,7 @@ These are measurements on one machine under the stated conditions, not guarantee
 
 ## Results
 
-Measured 2026-10-07 at commit `bf74d3c` (version 0.21.0), release build, 12 vCPU host
+Measured 2026-10-07 at commit `bf74d3c` (pre-release of 0.22.0), release build, 12 vCPU host
 shared with another project's workloads (see [Hardware and load](#hardware-and-load)).
 Ceilings are in records per second (one HEC event or one OTLP log record is one record).
 Every row used batches of 100 records per request, concurrency 64, a PII-shaped payload

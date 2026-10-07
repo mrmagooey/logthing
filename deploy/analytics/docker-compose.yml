@@ -127,7 +127,7 @@ services:
       garage-init: {condition: service_completed_successfully}
 
   logthing:
-    image: ${LOGTHING_IMAGE:-ghcr.io/mrmagooey/logthing:0.21.0}
+    image: ${LOGTHING_IMAGE:-ghcr.io/mrmagooey/logthing:0.22.0}
     volumes:
       - ./helm/logthing-analytics/files/logthing.toml:/etc/logthing/config.toml:ro
     environment: *logthing-s3
@@ -144,7 +144,7 @@ services:
       - "${LOGTHING_HEALTH_PORT:-5985}:5985/tcp"
 
   committer:
-    image: ${COMMITTER_IMAGE:-ghcr.io/mrmagooey/logthing-committer:0.21.0}
+    image: ${COMMITTER_IMAGE:-ghcr.io/mrmagooey/logthing-committer:0.22.0}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |

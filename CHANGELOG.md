@@ -6,32 +6,33 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
-### Added
-
-- `deploy/analytics/` — docker compose and Helm deployments of logthing, Garage (S3), the
-  committer, Lakekeeper (Iceberg REST), Trino and Metabase, plus a dbt-trino project
-  (`deploy/analytics/dbt/`) with OCSF views (network, DNS, authentication, detection finding)
-  and example detection queries. See `deploy/analytics/README.md`.
-- Analytics stack security defaults: secrets are generated and never defaulted
-  (`deploy/analytics/scripts/gen-analytics-env.sh` for compose; `randAlphaNum` + `lookup` in
-  Helm); Trino serves HTTPS on 8443 with password authentication and a generated CA (plain HTTP
-  8080 is not published); Lakekeeper, Postgres and the Garage admin API are not published; Helm
-  ships NetworkPolicies.
-- Redaction for HEC and OTLP records: `[hec.redaction]` / `[otlp.redaction]` with
-  `drop_fields`, `hash_fields` (HMAC-SHA256, key from the env var named by `hash_key_env`) and
-  `mask_patterns`, applied before the record is enqueued. See `docs/redaction.md`.
-- `[spool]` (`dir`, `max_bytes`): every S3 flush is committed to local disk (tmp, fsync, rename)
-  and uploaded in the background with backoff, replayed on startup. See
-  `docs/delivery-semantics.md`.
-- Iceberg descriptors gain an additive `sha256` field (hex digest of the Parquet file).
-- S3 Object Lock: `object_lock_mode` (`GOVERNANCE` / `COMPLIANCE`) and `object_lock_retain_days`
-  on every S3 sink, with `checksum_algorithm = SHA256` on puts. See `docs/object-lock.md`.
-- Local-disk sinks fsync the file and its directory before reporting success.
-- New metrics: `redactions_applied{source,rule}`, `spool_bytes`, `spool_entries`,
-  `spool_unreadable`, `spool_rejected{reason}`, `spool_uploaded{sink}`,
-  `spool_upload_errors{sink}`, `spool_corrupt`, `local_sink_dir_fsync_errors`.
+## [0.22.0] - 2026-10-07
 
 ### Breaking
+
+- OTLP has its own sinks. `[otlp] enabled = true` now requires `[otlp.s3]` and/or
+  `[otlp.local]`; OTLP no longer writes through the `[hec]` sinks into the `hec` table. See
+  `docs/otlp.md#migration`.
+- Startup fails when HEC or OTLP is enabled with no sink configured (previously records were
+  accepted and silently dropped, or written through the other route's sink). Add
+  `[hec.s3]`/`[hec.local]` or `[otlp.s3]`/`[otlp.local]`. The shared analytics stack config keeps
+  `[otlp.s3]`; never drop it.
+- HEC (`/services/collector/event`, `/services/collector/raw`, `/ingest`), NDJSON and OTLP answer
+  `503` (HEC body `{"text":"Server is busy","code":9}`, `Retry-After: 1`) when a writer channel
+  is full, instead of 200 with a counted drop. Clients must retry. A request partially enqueued
+  before the channel filled is rejected whole, so a retry duplicates the enqueued prefix. WEF is
+  unchanged.
+- The generic/HEC Iceberg schema gained the columns `event_uuid`, `source`, `index` and
+  `indexed_fields`, and OTLP writes a new typed `otlp` table. Upgrade the committer BEFORE
+  logthing: an old committer quarantines the new-shaped files. OTLP rows written by 0.21.0 sit in
+  the `hec` table with a NULL `event_uuid` (the `stg_hec` model keeps them). See `docs/hec.md`
+  and `docs/otlp.md` (Migration).
+- The default HEC `channel_capacity` is about 43% smaller (the per-record budget rose from 1024
+  to 1792 bytes to cover the new envelope columns). Set `channel_capacity` explicitly if you
+  relied on the old default; a full channel now answers 503.
+- Analytics stack image pins moved to 0.22.0 for both logthing and the committer, in lockstep
+  with the crate version. If you override `LOGTHING_IMAGE` / `COMMITTER_IMAGE` or the Helm image
+  values, move both to 0.22.0 together.
 
 - Analytics stack upgrades keep the old PUBLIC demo secrets: Postgres role passwords, the Garage
   key and the Lakekeeper encryption key persist in volumes/PVCs, and Helm's `lookup` and
@@ -55,8 +56,49 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   set `false` to opt out). They can block previously open pod-to-pod access to Lakekeeper,
   Postgres, the Garage admin API and Trino's plain-HTTP 8080 from pods not listed as peers.
 
+### Added
+
+- Typed HEC ingest: the generic Iceberg table gains `event_uuid` (UUIDv7 assigned at ingest on
+  every route), `source`, `index` and `indexed_fields`. The committer evolves existing tables
+  additively before `add_files`; old rows read NULL.
+- OTLP/HTTP logs (`POST /v1/logs`) write a typed `otlp` table through their own
+  `[otlp.s3]`/`[otlp.local]` sinks, partitioned per `service.name`
+  (`max_service_partitions`, then an `_overflow` partition). See `docs/otlp.md`.
+- gzip request bodies on HEC, NDJSON and OTLP, with a 64 MiB decompressed cap (`413` beyond it,
+  `415` for other encodings, `400` for a corrupt stream).
+- `loadgen otlp-http`; `--gzip`, `--pii-fields` and `--max-retries` on the HTTP subcommands;
+  `scripts/max-ingest-rate.sh` supports the otlp format, gzip, redaction and a 503 verdict.
+- `docs/performance.md` (measured single-node HEC/OTLP throughput) and `docs/scaling.md`.
+- `deploy/analytics/` — docker compose and Helm deployments of logthing, Garage (S3), the
+  committer, Lakekeeper (Iceberg REST), Trino and Metabase, plus a dbt-trino project
+  (`deploy/analytics/dbt/`) with OCSF views (network, DNS, authentication, detection finding)
+  and example detection queries. See `deploy/analytics/README.md`.
+- Analytics stack security defaults: secrets are generated and never defaulted
+  (`deploy/analytics/scripts/gen-analytics-env.sh` for compose; `randAlphaNum` + `lookup` in
+  Helm); Trino serves HTTPS on 8443 with password authentication and a generated CA (plain HTTP
+  8080 is not published); Lakekeeper, Postgres and the Garage admin API are not published; Helm
+  ships NetworkPolicies.
+- Redaction for HEC and OTLP records: `[hec.redaction]` / `[otlp.redaction]` with
+  `drop_fields`, `hash_fields` (HMAC-SHA256, key from the env var named by `hash_key_env`) and
+  `mask_patterns`, applied before the record is enqueued. See `docs/redaction.md`.
+- `[spool]` (`dir`, `max_bytes`): every S3 flush is committed to local disk (tmp, fsync, rename)
+  and uploaded in the background with backoff, replayed on startup. See
+  `docs/delivery-semantics.md`.
+- Iceberg descriptors gain an additive `sha256` field (hex digest of the Parquet file).
+- S3 Object Lock: `object_lock_mode` (`GOVERNANCE` / `COMPLIANCE`) and `object_lock_retain_days`
+  on every S3 sink, with `checksum_algorithm = SHA256` on puts. See `docs/object-lock.md`.
+- Local-disk sinks fsync the file and its directory before reporting success.
+- New metrics: `redactions_applied{source,rule}`, `spool_bytes`, `spool_entries`,
+  `spool_unreadable`, `spool_rejected{reason}`, `spool_uploaded{sink}`,
+  `spool_upload_errors{sink}`, `spool_corrupt`, `local_sink_dir_fsync_errors`.
+
 ### Changed
 
+- Stack default images pin 0.22.0 (logthing and committer).
+- `loadgen` treats `503` as backpressure and retries per `Retry-After` instead of counting an
+  error.
+- The README throughput claim is replaced by measured numbers; stale admin, syslog, metrics and
+  container-tag docs examples are corrected.
 - `parquet_s3_uploads` no longer increments for spooled files; see `spool_uploaded`.
 
 ### Fixed
@@ -64,6 +106,11 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 - Buffered writer: rows that cross `max_buffer_rows` / `flush_threshold_bytes` while a flush is
   in flight are now flushed as soon as that flush completes, instead of waiting for the next
   tick or record.
+
+### Not yet supported
+
+- OTLP gRPC (port 4317); use the `otlphttp` exporter.
+- WEF does not answer 503 on a full channel (200 with a counted drop, unchanged).
 
 ## [0.21.0] - 2026-09-30
 

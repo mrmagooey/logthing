@@ -117,7 +117,9 @@ check and its commit (`add_files` reports the file as already referenced), it re
 table, re-checks and finishes the rest once. A catalog commit conflict (`CommitFailedException`)
 on the append itself is not retried: the run aborts with the remaining descriptors still queued
 and the next run picks them up. Only schema-evolution commits are retried (up to 5 times with
-backoff, then the file is quarantined or the run aborts) ([committer/README.md](../committer/README.md)).
+backoff); once those retries are exhausted the run aborts with the descriptors still queued.
+Quarantine is for permanent errors (`ValidationError`, `ValueError`, `BadRequestError`), which
+are not retried ([committer/README.md](../committer/README.md)).
 The cost is duplicated listing and footer reads, aborted runs and extra catalog commits, not
 duplicated rows.
 See [iceberg.md](iceberg.md).
