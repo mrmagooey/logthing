@@ -5,6 +5,7 @@ catalog.
 import sys
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 from botocore.exceptions import ClientError, ConnectionClosedError, EndpointConnectionError
 from pyiceberg.exceptions import (
@@ -17,6 +18,7 @@ from pyiceberg.exceptions import (
     ServerError,
     ServiceUnavailableError,
     UnauthorizedError,
+    ValidationError,
 )
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import Timeout as RequestsTimeout
@@ -326,3 +328,233 @@ def test_main_missing_required_env_var_exits_2_with_clear_message(monkeypatch, c
         assert commit.main() == 2
 
     assert any("missing required environment variable" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# otlp table naming + additive schema evolution (fakes)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("partition", [None, "checkout_svc", "_overflow", "unknown", "a/b"])
+def test_otlp_is_one_table_regardless_of_service_partition(partition):
+    # The Parquet path segment is only a per-service grouping key; the Iceberg table is shared.
+    assert commit.table_name("otlp", partition) == "otlp"
+
+
+class _FakeSchema:
+    def __init__(self, names):
+        self.column_names = list(names)
+
+
+class _FakeUpdate:
+    def __init__(self, tbl):
+        self.tbl = tbl
+        self.staged = []
+
+    def union_by_name(self, schema):
+        if self.tbl.union_error is not None:
+            raise self.tbl.union_error
+        self.staged = [f.name for f in schema]
+
+    def commit(self):
+        if self.tbl.commit_error is not None:
+            raise self.tbl.commit_error
+        if self.tbl.commit_failures > 0:
+            self.tbl.commit_failures -= 1
+            raise CommitFailedException("stale table metadata")
+        self.tbl.union_calls.append(self.staged)
+        for n in self.staged:
+            if n not in self.tbl.names:
+                self.tbl.names.append(n)
+
+
+class _FakeTable:
+    def __init__(
+        self, names, commit_failures=0, union_error=None, commit_error=None, committed=()
+    ):
+        self.names = list(names)
+        self.commit_failures = commit_failures
+        self.union_error = union_error
+        self.commit_error = commit_error
+        self.union_calls = []
+        self.committed = set(committed)
+
+    def schema(self):
+        return _FakeSchema(self.names)
+
+    def update_schema(self):
+        return _FakeUpdate(self)
+
+
+class _FakeCatalog:
+    def __init__(self, reloads):
+        self.reloads = list(reloads)
+        self.loaded = []
+
+    def load_table(self, ident):
+        self.loaded.append(ident)
+        return self.reloads.pop(0)
+
+
+def _ucfg():
+    return commit.Config(
+        bucket="b",
+        s3_endpoint="http://x",
+        s3_access_key="k",
+        s3_secret_key="s",
+        catalog_uri="u",
+        warehouse="s3://b/w",
+    )
+
+
+OLD = pa.schema([("sourcetype", pa.string()), ("fields", pa.string())])
+NEW = pa.schema([("sourcetype", pa.string()), ("fields", pa.string()), ("event_uuid", pa.string())])
+
+
+@pytest.fixture
+def evolve_env(monkeypatch):
+    schemas = {}
+    sleeps = []
+    monkeypatch.setattr(commit, "_read_file_schema", lambda fs, cfg, uri: schemas[uri])
+    monkeypatch.setattr(commit, "force_pyarrow_io", lambda t, c: t)
+    monkeypatch.setattr(commit, "committed_file_set", lambda t: set(t.committed))
+    monkeypatch.setattr(commit.time, "sleep", lambda s: sleeps.append(s))
+    return schemas, sleeps
+
+
+def _evolve(tbl, batch, catalog=None, committed=None):
+    return commit.evolve_schema(
+        catalog or _FakeCatalog([]),
+        _ucfg(),
+        None,
+        "hec",
+        tbl,
+        set() if committed is None else committed,
+        batch,
+    )
+
+
+def test_evolve_no_new_columns_makes_no_catalog_call(evolve_env):
+    schemas, _ = evolve_env
+    schemas["s3://b/a"] = OLD
+    tbl = _FakeTable(["sourcetype", "fields", "event_uuid"])
+    out, fits, done, conflicted = _evolve(tbl, [("d1", "s3://b/a")])
+    assert out is tbl and fits == [("d1", "s3://b/a")] and done == [] and conflicted == []
+    assert tbl.union_calls == []
+
+
+def test_evolve_adds_missing_columns_once_per_file_that_needs_it(evolve_env):
+    schemas, _ = evolve_env
+    schemas["s3://b/new"] = NEW
+    schemas["s3://b/new2"] = NEW
+    tbl = _FakeTable(["sourcetype", "fields"])
+    _, fits, _, conflicted = _evolve(tbl, [("d1", "s3://b/new"), ("d2", "s3://b/new2")])
+    assert len(fits) == 2 and conflicted == []
+    assert len(tbl.union_calls) == 1, "second file no longer needs evolution"
+    assert "event_uuid" in tbl.names
+
+
+def test_evolve_type_conflict_quarantines_only_that_file(evolve_env):
+    schemas, _ = evolve_env
+    schemas["s3://b/bad"] = NEW
+    schemas["s3://b/ok"] = OLD
+    tbl = _FakeTable(["sourcetype", "fields"], union_error=ValidationError("type mismatch"))
+    _, fits, _, conflicted = _evolve(tbl, [("d1", "s3://b/bad"), ("d2", "s3://b/ok")])
+    assert conflicted == [("d1", "s3://b/bad")]
+    assert fits == [("d2", "s3://b/ok")]
+    assert tbl.union_calls == [], "a rejected file must never commit staged columns"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"union_error": ValueError("Cannot add required column: x")},
+        {"commit_error": BadRequestError("catalog rejected schema update")},
+    ],
+)
+def test_evolve_required_column_or_catalog_400_quarantines_only_that_file(evolve_env, kwargs):
+    schemas, _ = evolve_env
+    schemas["s3://b/bad"] = NEW
+    schemas["s3://b/ok"] = OLD
+    tbl = _FakeTable(["sourcetype", "fields"], **kwargs)
+    _, fits, _, conflicted = _evolve(tbl, [("d1", "s3://b/bad"), ("d2", "s3://b/ok")])
+    assert conflicted == [("d1", "s3://b/bad")]
+    assert fits == [("d2", "s3://b/ok")]
+
+
+@pytest.mark.parametrize("exc", [ServerError("boom"), UnauthorizedError("no"), ForbiddenError("no")])
+def test_evolve_abort_class_errors_raise_abort(evolve_env, exc):
+    schemas, _ = evolve_env
+    schemas["s3://b/new"] = NEW
+    tbl = _FakeTable(["sourcetype", "fields"], commit_error=exc)
+    with pytest.raises(commit._Abort):
+        _evolve(tbl, [("d1", "s3://b/new")])
+
+
+def test_evolve_s3_credential_error_reading_footer_raises_abort(evolve_env, monkeypatch):
+    def deny(fs, cfg, uri):
+        raise ClientError(
+            {"Error": {"Code": "AccessDenied"}, "ResponseMetadata": {"HTTPStatusCode": 403}},
+            "GetObject",
+        )
+
+    monkeypatch.setattr(commit, "_read_file_schema", deny)
+    with pytest.raises(commit._Abort):
+        _evolve(_FakeTable(["sourcetype"]), [("d1", "s3://b/new")])
+
+
+def test_evolve_missing_footer_quarantines_that_file(evolve_env, monkeypatch):
+    def missing(fs, cfg, uri):
+        raise FileNotFoundError(uri)
+
+    monkeypatch.setattr(commit, "_read_file_schema", missing)
+    _, fits, _, conflicted = _evolve(_FakeTable(["sourcetype"]), [("d1", "s3://b/gone")])
+    assert fits == [] and conflicted == [("d1", "s3://b/gone")]
+
+
+def test_evolve_retries_commit_conflicts_with_backoff_and_reloads(evolve_env):
+    schemas, sleeps = evolve_env
+    schemas["s3://b/new"] = NEW
+    stale = _FakeTable(["sourcetype", "fields"], commit_failures=2)
+    fresh1 = _FakeTable(["sourcetype", "fields"], commit_failures=1)
+    fresh2 = _FakeTable(["sourcetype", "fields"])
+    cat = _FakeCatalog([fresh1, fresh2])
+    out, fits, _, _ = _evolve(stale, [("d1", "s3://b/new")], catalog=cat)
+    assert out is fresh2 and fits == [("d1", "s3://b/new")]
+    assert sleeps == [0.2, 0.4]
+    assert cat.loaded == [("logs", "hec"), ("logs", "hec")]
+
+
+def test_evolve_gives_up_after_five_commit_conflicts(evolve_env):
+    schemas, sleeps = evolve_env
+    schemas["s3://b/new"] = NEW
+    tables = [_FakeTable(["sourcetype", "fields"], commit_failures=9) for _ in range(5)]
+    with pytest.raises(CommitFailedException):
+        _evolve(tables[0], [("d1", "s3://b/new")], catalog=_FakeCatalog(tables[1:]))
+    assert sleeps == [0.2, 0.4, 0.8, 1.6]
+
+
+def test_evolve_reload_rededupes_files_another_committer_registered(evolve_env):
+    schemas, _ = evolve_env
+    schemas["s3://b/new"] = NEW
+    schemas["s3://b/other"] = NEW
+    stale = _FakeTable(["sourcetype", "fields"], commit_failures=1)
+    fresh = _FakeTable(["sourcetype", "fields"], committed={"s3://b/other"})
+    committed = set()
+    _, fits, done, _ = _evolve(
+        stale,
+        [("d1", "s3://b/new"), ("d2", "s3://b/other")],
+        catalog=_FakeCatalog([fresh]),
+        committed=committed,
+    )
+    assert fits == [("d1", "s3://b/new")]
+    assert done == [("d2", "s3://b/other")]
+    assert committed == {"s3://b/other"}, "caller's committed set is refreshed in place"
+
+
+def test_is_already_referenced_matches_only_that_value_error():
+    assert commit._is_already_referenced(
+        ValueError("Cannot add files that are already referenced by table, files: s3://x")
+    )
+    assert not commit._is_already_referenced(ValueError("schema mismatch"))
+    assert not commit._is_already_referenced(RuntimeError("already referenced"))

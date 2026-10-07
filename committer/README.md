@@ -33,7 +33,9 @@ any Iceberg REST catalog and any S3-compatible object store.
 4. Create a table if it doesn't exist yet (schema inferred from the first
    file's Parquet footer), partitioned by `day(partition_time)`. Existing
    tables are checked for that partition spec on every load, not just once
-   at creation, and get it added if missing.
+   at creation, and get it added if missing. Tables are evolved additively
+   (`union_by_name`) when a new file carries extra columns; a type conflict
+   quarantines that file (see [Schema evolution](#schema-evolution)).
 5. Move each chunk's descriptors to `DONE_PREFIX` once that chunk's commit
    succeeds.
 
@@ -57,6 +59,7 @@ logthing's key layout:
 | `zeek` | `conn`, `dns`, ... | `zeek_<partition>` |
 | `aggregate` | `<rule name>` | `agg_<rule name>` |
 | `sflow` | `flow`, `counter` | `sflow_<partition>` |
+| `otlp` | per-service path segment (ignored) | `otlp` |
 | anything else | (ignored) | `<source>` |
 
 `zeek`, `aggregate` and `sflow` are special-cased because their sinks emit a
@@ -72,6 +75,25 @@ table across all of that source's partitions.
 Table/partition segments are sanitized to `[a-z0-9_]` and capped at 64
 characters; a missing partition for `zeek`/`aggregate`/`sflow` becomes
 `unknown`.
+
+The `otlp` sink writes one fixed schema; its per-service Parquet path segment
+is only a file-grouping key (the `service_name` column carries the service),
+so all services share the single `otlp` table.
+
+## Schema evolution
+
+New logthing releases append nullable columns (for example `event_uuid`,
+`source`, `index`, `indexed_fields` on `hec`). Before each `add_files` the
+committer compares every queued file's Parquet footer with the table schema
+and, for files with extra columns, runs
+`update_schema().union_by_name(...)`. Old rows read NULL for the new columns.
+Evolution is additive only: a file whose existing column changes type (or is
+otherwise rejected, e.g. a required-column error or a catalog 400 on the
+schema update) is quarantined on its own. A concurrent committer changing the
+table triggers a reload, a re-dedupe against the table's registered files and
+up to 5 retries (backoff 0.2 * 2^n seconds); if the conflict persists the run
+aborts with descriptors still queued. A file another committer already
+registered is marked done rather than quarantined.
 
 ## file_path parsing
 
