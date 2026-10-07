@@ -83,3 +83,17 @@ Each stream produces a separate Parquet file series using its own typed schema (
 - A record with a valid `_path` that would create a new partition beyond the `max_partitions` cap (default 256) is routed to `zeek/_overflow/` by the generic partition-cap machinery.
 
 **Memory safety**: when S3 is unavailable and a stream's buffer exceeds `max_buffer_rows * 4` rows, the oldest batches are dropped and the `parquet_s3_buffer_dropped{source="zeek"}` counter is incremented.
+
+## Suricata EVE JSON
+
+Suricata is configured the same way as Zeek: a TCP NDJSON listener (default port 47761, disabled by
+default) with optional `[suricata.s3]` / `[suricata.local]` sinks (prefix defaults to `"suricata"`,
+other keys and defaults as for `[zeek.s3]`). One EVE record per line; the `event_type` field
+selects the output stream. The 300-second TCP idle timeout described above applies.
+
+```toml
+[suricata]
+enabled = true
+tcp_port = 47761
+bind_address = "0.0.0.0"
+```

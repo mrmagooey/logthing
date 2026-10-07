@@ -102,6 +102,7 @@ enabled = true      # env: LOGTHING__SYSLOG__ENABLED
 udp_port = 514      # Standard syslog UDP port (env: LOGTHING__SYSLOG__UDP_PORT)
 tcp_port = 601      # Standard syslog TCP port (RFC 6587) (env: LOGTHING__SYSLOG__TCP_PORT)
 parse_dns = true    # Enable DNS log parsing (env: LOGTHING__SYSLOG__PARSE_DNS)
+# parse_payloads = false  # sub-parse CEF/LEEF/auditd/DHCP/RADIUS/web/DNS into [syslog.structured_s3]; see docs/syslog.md
 
 # Number of UDP receive tasks draining udp_port (default: 8; the TCP listener
 # on tcp_port is unaffected). Raise when syslog_udp_socket_drops climbs while
@@ -148,6 +149,10 @@ parse_dns = true    # Enable DNS log parsing (env: LOGTHING__SYSLOG__PARSE_DNS)
 # flush_interval_secs  = 900                      # flush after N seconds (default 900)
 # channel_capacity     = 136533                   # channel depth (default: 100 MiB budget / 768 B per message)
 
+# Optional: persist raw syslog messages to a local directory instead of (or as well as) S3.
+# [syslog.local]
+# directory = "/data/syslog"
+
 # Zeek NDJSON TCP listener.
 # Disabled by default — set enabled = true to activate.
 [zeek]
@@ -176,9 +181,9 @@ enabled      = false        # env: LOGTHING__IPFIX__ENABLED
 udp_port     = 4739        # IANA-standard IPFIX port (env: LOGTHING__IPFIX__UDP_PORT)
 bind_address = "0.0.0.0"   # env: LOGTHING__IPFIX__BIND_ADDRESS
 
-# Number of UDP receive tasks draining udp_port (default: 1). Raise when
+# Number of UDP receive tasks draining udp_port (default: 8). Raise when
 # ipfix_socket_drops climbs while the process is using roughly one core.
-# Default: 8. Measured recommendation: 4 — 8 bought no
+# Measured recommendation: 4 — 8 bought no
 # further median improvement over 4 on throughput; the default is set to 8
 # anyway for headroom, since idle-cost measurement showed the knob is nearly
 # free (~19 KB RSS and one file descriptor per extra socket, zero receive
@@ -270,7 +275,7 @@ bind_address = "0.0.0.0"   # env: LOGTHING__SFLOW__BIND_ADDRESS
 # prefix                = "sflow"                 # default: "sflow"
 # flush_threshold_bytes = 104857600               # flush at 100 MiB (default)
 # flush_interval_secs   = 900                     # flush after N seconds (default 900)
-# channel_capacity      = 81920                   # channel depth (default: 100 MiB budget / 1280 B per record)
+# channel_capacity      = 11702                   # channel depth (default: 100 MiB budget / 8960 B per record)
 # max_buffer_rows       = 100000                  # hard-cap before oldest rows dropped (default 100 000)
 
 # Optional: emit a small JSON "descriptor" alongside every Parquet file,

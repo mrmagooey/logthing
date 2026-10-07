@@ -88,6 +88,76 @@ Listener health: `listener_accept_errors` (labelled `protocol="syslog_tcp"|"zeek
   exhaustion) pauses that listener's accept loop for 1s per error instead of
   spinning.
 
+Further counters and gauges (every name registered in `src/metrics_descriptions.rs` is listed
+on this page):
+
+HTTP and listener admission:
+
+- `body_budget_exhausted` - HTTP requests rejected (503) because the in-flight request-body
+  memory budget was exhausted
+- `listener_source_rejected{protocol}` - datagrams or connections rejected because the source IP
+  is not in `security.allowed_ips`
+- `hec_auth_failures`, `otlp_auth_failures` - HEC / OTLP requests rejected for a missing or
+  incorrect token
+- `throughput_event_types_capped` - throughput-stats updates folded into the `_other` bucket
+  because the event-type cardinality cap was reached
+
+Syslog:
+
+- `syslog_parse_errors` - messages the parser rejected
+- `syslog_payload_parsed{type}` - payloads recognised by a structured sub-parser
+  (`parse_payloads`)
+- `syslog_oversized_lines` - TCP lines over the maximum length (the connection is closed)
+- `syslog_tcp_connections_rejected` - TCP connections refused at the concurrent-connection limit
+- `syslog_tcp_idle_timeouts` - TCP connections closed after the 300 s idle timeout
+- `syslog_recv_task_failed` - UDP receive tasks that exited with an error
+
+IPFIX and sFlow:
+
+- `<protocol>_socket_drops` (counter) and `<protocol>_socket_rx_queue_bytes` (gauge), for protocol
+  `syslog_udp`, `ipfix` and `sflow` - datagrams the kernel discarded on the listener socket (read
+  from `/proc/net/udp`) and bytes currently queued in its receive buffer
+- `ipfix_templates_received` - template records stored in the template cache
+- `ipfix_templates_missing` - data sets dropped because no template was cached for their
+  (exporter, observation domain, set id)
+- `ipfix_templates_dropped` - templates not cached because the cache was at its maximum size
+- `ipfix_templates_evicted` - templates evicted after going unused past their TTL
+- `ipfix_recv_task_failed`, `sflow_recv_task_failed` - UDP receive tasks that exited with an error
+- `sflow_unknown_records_dropped` - records discarded because the per-datagram unknown-record
+  budget was exhausted
+
+Zeek and Suricata:
+
+- `zeek_records_received`, `zeek_records_by_path{log_path}` - records parsed and handed to the
+  forwarding handlers / counted per Zeek log path (label set is capped)
+- `suricata_records_by_event_type{event_type}` - records counted per EVE event type (label set is capped)
+- `zeek_parse_errors` - lines that failed to parse as a record
+- `zeek_missing_path`, `suricata_missing_event_type` - records dropped for lack of a log path /
+  event type
+- `zeek_oversized_lines`, `suricata_oversized_lines` - TCP lines over the maximum length (the
+  connection is closed)
+- `zeek_tcp_budget_exhausted`, `suricata_tcp_budget_exhausted` - TCP connections closed because
+  the aggregate line-buffer memory budget was exhausted
+- `zeek_tcp_connections_rejected`, `suricata_tcp_connections_rejected` - TCP connections refused
+  at the concurrent-connection limit
+- `zeek_tcp_idle_timeouts`, `suricata_tcp_idle_timeouts` - TCP connections closed after the idle
+  timeout
+
+Parquet and Iceberg descriptors:
+
+- `parquet_s3_flushes_in_flight` (gauge) - buffer flushes currently uploading
+- `parquet_s3_partitions_capped` - records routed to the `_overflow` partition because the
+  per-writer partition cap was reached
+- `iceberg_descriptor_uploads`, `iceberg_descriptor_upload_errors` - descriptor objects uploaded
+  alongside a Parquet object / uploads that returned an error
+
+Cardinality watch (`metrics.cardinality_watch`; see [configuration.md](configuration.md)):
+
+- `field_distinct_values{source,stream,field}` (gauge) - distinct values of a watched field in
+  the most recently completed window; a count of wire values, not a host identity
+- `field_distinct_values_capped{source,stream,field}` - values discarded because
+  `cardinality_max_values` was reached; non-zero means the gauge undercounts
+
 Counters are exported with a `_total` suffix by the Prometheus exporter.
 
 ## API Endpoints
@@ -103,15 +173,21 @@ Counters are exported with a `_total` suffix by the Prometheus exporter.
 - `GET /syslog/examples` - Get example DNS syslog records (JSON)
 
 ### HEC Endpoints
+Mounted only when `[hec] enabled = true`; otherwise they return 404.
+
 - `POST /services/collector/event` - Splunk HEC-compatible event ingest
 - `POST /services/collector/raw` - Splunk HEC-compatible raw ingest
 - `POST /ingest` - NDJSON ingest, same auth/dispatch path as the HEC routes
 
 ### OTLP Endpoints
-- `POST /v1/logs` - OTLP/HTTP log ingest (protobuf or JSON); only present when
-  the `otlp` Cargo feature is enabled
+- `POST /v1/logs` - OTLP/HTTP log ingest (protobuf or JSON); mounted only when
+  `[otlp] enabled = true` and the binary was built with the `otlp` Cargo feature
+  (on by default); otherwise 404
 
 ### Management Endpoints
-- `GET /health` - Health check endpoint
-- `GET /stats/throughput` - Ingest throughput statistics (JSON)
-- `GET /metrics` - Prometheus metrics (port 9090)
+- `GET /health` - Health check endpoint (main server; public, no authentication)
+- `GET /stats/throughput` - Ingest throughput statistics (JSON; main server, public)
+- `GET /metrics` - Prometheus metrics (separate listener, port 9090 by default)
+
+The read-only admin server (separate port, authenticated) has its own routes; see
+[admin.md](admin.md).

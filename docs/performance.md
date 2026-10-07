@@ -35,11 +35,20 @@ Notes on reading the table:
 - Row 4 (gzip + redaction) with the default single generator process ended
   `GENERATOR-LIMITED 40000` (achieved 39283 of 40000 in the failing runs). Per the
   harness rules it was rerun with `GEN_PROCS=2`, which gave the `CEILING 75000` shown.
-  Rows 1-3 used the default single generator process.
-- OTLP ceilings are about one eighth of the HEC ceilings in this environment. During the
-  OTLP ceiling runs the harness reported the generator at about 0.25 cores and the server at
-  about 1.7-2.0 of its 8 cores, i.e. neither side was CPU-saturated. This document reports
-  the measurement and does not attribute a cause.
+  Rows 1-3 used the default single generator process. Because row 4 used two generator
+  processes and row 3 one, the -4.0% in row 4 is not a like-for-like comparison, and like
+  the other redaction deltas it is within the run-to-run spread described above.
+- Each ceiling is the median of 3 runs. Under this host's load a single run occasionally
+  stalled in the generator; the median absorbs such a run, and no cause is claimed for any
+  individual stall.
+- OTLP ceilings (both gzip) are roughly 7-8x lower than the gzip HEC ceilings in this
+  environment (row 5 versus row 3: 7.4x; row 6 versus row 4: 7.5x). During the OTLP ceiling
+  runs the harness reported the generator at about 0.25 cores and the server at about
+  1.5-2.1 of its 8 cores, i.e. neither side was CPU-saturated. This document reports the
+  measurement and does not attribute a cause.
+- Row 6's count at the failing rate (30) is lower than at its last passing rate (64). The
+  count is a total over the 3 runs at that one rate and is not monotonic in the offered
+  rate; I did not investigate why, and make no claim about it.
 
 ## Method
 

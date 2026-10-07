@@ -1,21 +1,30 @@
-# Admin Interface Security Hardening
+# Admin Interface
 
-This document describes the security hardening improvements implemented in the Logthing admin interface.
+The admin interface is a separate, read-only HTTP server (its own port, its own authentication)
+for inspecting the effective configuration, ingestion statistics and live metric values. It
+changes nothing at runtime; see "Read-only interface" below. This page describes its
+configuration (all `LOGTHING_ADMIN_*` environment variables, read once at startup) and its
+security controls.
 
 ## Security Features
 
 ### 1. Configurable Admin Port
 
-The admin interface bind address is now configurable via environment variable:
+The admin interface bind address is set by environment variable. The default is loopback only,
+`127.0.0.1:8080`; an unparseable value logs a warning and also falls back to `127.0.0.1:8080`.
 
 ```bash
-# Default: 0.0.0.0:8080
+# Default: 127.0.0.1:8080
 LOGTHING_ADMIN_BIND=0.0.0.0:8443
 ```
 
+Binding to a non-loopback address while the username and password are both the default
+`admin`/`admin` is refused: the admin server fails to start with an error. Set
+`LOGTHING_ADMIN_USER`/`LOGTHING_ADMIN_PASS` (or `LOGTHING_ADMIN_PASS_HASH`) first.
+
 ### 2. HTTPS/TLS Support
 
-The admin interface now supports TLS for encrypted connections:
+The admin interface supports TLS for encrypted connections:
 
 ```bash
 LOGTHING_ADMIN_TLS_CERT=/path/to/cert.pem
@@ -37,7 +46,7 @@ If not set, all IPs are allowed (warning logged on startup).
 
 ### 4. Password Hashing
 
-Passwords are now hashed using Argon2 for secure storage:
+Passwords are hashed with Argon2:
 
 ```bash
 # Option 1: Plain password (automatically hashed at runtime)
@@ -62,6 +71,11 @@ All admin interface actions are logged with timestamps and user information:
 - Statistics JSON read (`STATS_JSON_READ`)
 - Metrics page access (`METRICS_PAGE_ACCESS`)
 - Audit log reads (`AUDIT_LOG_READ`)
+- Trusted-header verification failures (`TRUSTED_HEADER_REJECTED`; see section 7)
+
+Entries are also appended to a file, `log/admin-audit.log` by default; set
+`LOGTHING_ADMIN_AUDIT_LOG` to change the path. The last entries are reloaded from that file
+at startup.
 
 Audit logs are available:
 - In the application logs (standard logging)
@@ -71,7 +85,7 @@ Audit logs are available:
 
 ### 6. Rate Limiting
 
-Requests to the admin interface are rate-limited to prevent brute force attacks:
+Requests to the admin interface are rate-limited per client IP to slow brute-force attempts:
 
 ```bash
 # Enable/disable rate limiting (default: true)
@@ -168,7 +182,7 @@ take effect. See the CHANGELOG for the breaking-change details.
 ## API Endpoints
 
 - `GET /` - Admin web interface (requires authentication)
-- `GET /health` - Health check endpoint (no authentication required)
+- `GET /health` - Health check endpoint (no authentication; the IP allowlist and rate limit still apply)
 - `GET /config` - Get current (redacted) configuration (requires authentication)
 - `GET /stats` - Ingestion statistics page (requires authentication)
 - `GET /stats.json` - Ingestion statistics as JSON (requires authentication)
@@ -179,7 +193,8 @@ take effect. See the CHANGELOG for the breaking-change details.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `LOGTHING_ADMIN_BIND` | Bind address for admin interface | `0.0.0.0:8080` |
+| `LOGTHING_ADMIN_BIND` | Bind address for admin interface | `127.0.0.1:8080` |
+| `LOGTHING_ADMIN_AUDIT_LOG` | Audit log file path | `log/admin-audit.log` |
 | `LOGTHING_ADMIN_USER` | Admin username | `admin` |
 | `LOGTHING_ADMIN_PASS` | Admin password (plain text) | `admin` |
 | `LOGTHING_ADMIN_PASS_HASH` | Admin password (Argon2 hash) | - |
@@ -199,7 +214,7 @@ take effect. See the CHANGELOG for the breaking-change details.
 1. **Always use TLS in production** - Set `LOGTHING_ADMIN_TLS_CERT` and `LOGTHING_ADMIN_TLS_KEY`
 2. **Configure IP whitelist** - Restrict access to known admin IPs with `LOGTHING_ADMIN_ALLOWED_IPS`
 3. **Use hashed passwords** - Generate a pre-hashed password with Argon2 for production
-4. **Change default credentials** - Never use the default `admin/admin` credentials
+4. **Change default credentials** - The default `admin/admin` is accepted only on a loopback bind; a non-loopback bind with default credentials refuses to start
 5. **Monitor audit logs** - Regularly review the audit log for suspicious activity
 6. **Use a non-default port** - Consider using a non-standard port to reduce automated scans
 

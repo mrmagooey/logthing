@@ -1,6 +1,6 @@
 # logthing
 
-A high-performance log ingestion server written in Rust. Receives Windows Event Logs via Windows Event Forwarding (WEF), plus syslog, IPFIX/NetFlow, Zeek, Suricata, sFlow, HEC, and OTLP, and persists them as Parquet to S3 or local disk.
+A log ingestion server written in Rust (single-node ceilings measured in [docs/performance.md](docs/performance.md)). Receives Windows Event Logs via Windows Event Forwarding (WEF), plus syslog, IPFIX/NetFlow, Zeek, Suricata, sFlow, HEC, and OTLP, and persists them as Parquet to S3 or local disk.
 
 ## Features
 
@@ -103,22 +103,25 @@ OTLP logs (HTTP)          ─┘                ▼
 Prometheus metrics on :9090 (/metrics) cover every stage from ingest to write.
 ```
 
+logthing keeps no state shared between instances; to run several behind a load balancer see
+[docs/scaling.md](docs/scaling.md).
+
 ## Container Image / Releases
 
 The container image is published to GitHub Container Registry on every `v*` tag push:
 
 ```bash
-docker pull ghcr.io/mrmagooey/logthing:0.2.0   # pin to an exact release
+docker pull ghcr.io/mrmagooey/logthing:0.22.0   # pin to an exact release
 docker pull ghcr.io/mrmagooey/logthing:latest  # most recent non-prerelease release
 ```
 
-**Tags** (produced by the release workflow for tag `v0.2.0`):
-- `:0.2.0` — exact version
-- `:0.2` — minor series
+**Tags** (produced by the release workflow for tag `v0.22.0`):
+- `:0.22.0` — exact version
+- `:0.22` — minor series
 - `:0` — major series
 - `:latest` — the most recent non-prerelease release. `docker/metadata-action`'s
   default `flavor.latest=auto` adds this automatically for any non-prerelease
-  semver tag (a pre-release such as `v0.3.0-rc1` would *not* move `:latest`).
+  semver tag (a pre-release such as `v0.23.0-rc1` would *not* move `:latest`).
 
 **Platforms**: linux/amd64, linux/arm64 (multi-arch manifest).
 
@@ -167,10 +170,11 @@ repository conventions.
 - [docs/configuration.md](docs/configuration.md) — full `logthing.toml` reference, config sources/precedence, environment variable overrides, and live-vs-restart-required settings
 - [docs/wef.md](docs/wef.md) — Kerberos client authentication, Active Directory setup, Windows client (WEF) configuration, WEF S3 persistence, the generic event parser, and event parser coverage
 - [docs/syslog.md](docs/syslog.md) — syslog listener, HTTP endpoint, DNS log parsing, and syslog S3 persistence
-- [docs/ipfix.md](docs/ipfix.md) — IPFIX/NetFlow ingestion and S3 persistence
-- [docs/zeek.md](docs/zeek.md) — Zeek NDJSON ingestion, typed per-stream schemas, and S3 persistence
+- [docs/ipfix.md](docs/ipfix.md) — IPFIX/NetFlow and sFlow ingestion and S3 persistence
+- [docs/zeek.md](docs/zeek.md) — Zeek NDJSON and Suricata EVE ingestion, typed per-stream schemas, and S3 persistence
 - [docs/hec.md](docs/hec.md) — HEC/NDJSON ingest, columns, gzip, backpressure, migration
 - [docs/otlp.md](docs/otlp.md) — OTLP/HTTP log ingest, typed schema, service partitions, exporter setup, migration
+- [docs/scaling.md](docs/scaling.md) — running several instances: what can be load balanced, per-exporter affinity for IPFIX/sFlow, per-instance spool, one committer per catalog
 - [docs/performance.md](docs/performance.md) — measured single-node HEC/OTLP ingest ceilings, method, hardware, caveats and how to reproduce
 - [docs/aggregation.md](docs/aggregation.md) — log aggregation rules and output schema
 - [docs/iceberg.md](docs/iceberg.md) — Iceberg descriptor output and a suggested committer/catalog deployment pattern
