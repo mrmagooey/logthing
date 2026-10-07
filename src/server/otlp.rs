@@ -91,6 +91,7 @@ pub fn map_otlp_request(req: ExportLogsServiceRequest, source_host: String) -> V
                     time,
                     fields: Value::Object(fields),
                     received_at,
+                    ..Default::default()
                 });
             }
         }

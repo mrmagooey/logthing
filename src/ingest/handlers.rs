@@ -17,7 +17,7 @@
 use crate::config::Config;
 use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::ingest::{
-    IngestState, check_hec_token,
+    IngestState, assign_event_uuids, check_hec_token,
     parse::{parse_hec_event_body, parse_hec_raw_body, parse_ndjson_body},
 };
 use axum::{
@@ -152,10 +152,12 @@ pub async fn handle_hec_event(
     }
 
     let default_st = params.sourcetype.as_deref().unwrap_or(DEFAULT_SOURCETYPE);
-    let records = match parse_hec_event_body(&body, default_st) {
+    let mut records = match parse_hec_event_body(&body, default_st) {
         Ok(r) => r,
         Err(e) => return hec_parse_error(&e.to_string()),
     };
+    // Identity is assigned after parse (and, in a later phase, after redaction).
+    assign_event_uuids(&mut records);
 
     metrics::counter!("hec_events_received").increment(records.len() as u64);
 
@@ -195,10 +197,11 @@ pub async fn handle_hec_raw(
     }
 
     let st = params.sourcetype.as_deref().unwrap_or(DEFAULT_SOURCETYPE);
-    let record = match parse_hec_raw_body(&body, st) {
+    let mut record = match parse_hec_raw_body(&body, st) {
         Ok(r) => r,
         Err(e) => return hec_parse_error(&e.to_string()),
     };
+    assign_event_uuids(std::slice::from_mut(&mut record));
 
     metrics::counter!("hec_events_received").increment(1);
 
@@ -236,10 +239,11 @@ pub async fn handle_ndjson(
     }
 
     let st = params.sourcetype.as_deref().unwrap_or(DEFAULT_SOURCETYPE);
-    let records = match parse_ndjson_body(&body, st) {
+    let mut records = match parse_ndjson_body(&body, st) {
         Ok(r) => r,
         Err(e) => return hec_parse_error(&e.to_string()),
     };
+    assign_event_uuids(&mut records);
 
     metrics::counter!("hec_events_received").increment(records.len() as u64);
 
@@ -270,11 +274,14 @@ mod tests {
     /// live — no router rebuild, matching the live-reload contract in
     /// `handle_hec_event`/`handle_hec_raw`/`handle_ndjson`'s doc comments.
     fn make_router_with_config(config: Arc<RwLock<Config>>) -> axum::Router {
+        make_router_with_ingest(config, IngestState::default())
+    }
+
+    fn make_router_with_ingest(
+        config: Arc<RwLock<Config>>,
+        ingest_state: IngestState,
+    ) -> axum::Router {
         use axum::{Extension, Router, routing::post};
-        let ingest_state = IngestState {
-            generic_s3: None,
-            generic_local: None,
-        };
         Router::new()
             .route("/services/collector/event", post(handle_hec_event))
             .route("/services/collector/raw", post(handle_hec_raw))
@@ -637,5 +644,57 @@ mod tests {
             StatusCode::OK,
             "the new token must work immediately, without a process restart"
         );
+    }
+
+    #[tokio::test]
+    async fn hec_routes_assign_event_uuid_and_keep_envelope_fields() {
+        use crate::forwarding::buffered_writer::ParquetWriterHandle;
+        use crate::forwarding::generic_s3::GenericSink;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let ingest = IngestState {
+            generic_s3: Some(ParquetWriterHandle::<GenericSink>::for_test(
+                tx, "hec", "test",
+            )),
+            ..Default::default()
+        };
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/services/collector/event")
+            .body(Body::from(
+                r#"{"event":{"k":1},"source":"s1","index":"main","fields":{"a":"b"}}
+{"event":"two"}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        assert_eq!(first.source.as_deref(), Some("s1"));
+        assert_eq!(first.index.as_deref(), Some("main"));
+        assert_eq!(first.indexed_fields, Some(serde_json::json!({"a": "b"})));
+        let (a, b) = (first.event_uuid.unwrap(), second.event_uuid.unwrap());
+        assert_ne!(a, b);
+        assert_eq!(uuid::Uuid::parse_str(&a).unwrap().get_version_num(), 7);
+
+        // raw and NDJSON routes assign too.
+        for (uri, body) in [
+            ("/services/collector/raw", "plain text"),
+            ("/ingest", "{\"x\":1}\n"),
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(Body::from(body))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(req).await.unwrap().status(),
+                StatusCode::OK
+            );
+            let rec = rx.recv().await.unwrap();
+            assert!(rec.event_uuid.is_some(), "{uri} must assign event_uuid");
+        }
     }
 }

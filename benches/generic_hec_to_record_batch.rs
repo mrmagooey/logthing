@@ -28,6 +28,7 @@ fn make_hec_record() -> GenericRecord {
             "user_agent": "curl/8.4.0"
         }),
         received_at: Utc::now(),
+        ..Default::default()
     }
 }
 

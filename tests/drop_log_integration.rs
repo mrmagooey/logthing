@@ -176,6 +176,7 @@ async fn hec_and_otlp_share_a_real_handle_without_muting_each_other() {
             time: Some(chrono::Utc::now()),
             fields: serde_json::json!({"action": "login"}),
             received_at: chrono::Utc::now(),
+            ..Default::default()
         }
     }
 

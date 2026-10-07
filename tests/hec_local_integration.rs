@@ -1,6 +1,8 @@
 //! End-to-end integration test: HEC/generic records pushed through
 //! `hec_local_start` land as real, readable Parquet files on local disk.
 
+mod common;
+
 use bytes::Bytes;
 use logthing::config::GenericLocalConfig;
 use logthing::forwarding::generic_s3::hec_local_start;
@@ -53,6 +55,7 @@ async fn hec_records_appear_as_parquet_on_local_disk() {
         time: Some(chrono::Utc::now()),
         fields: serde_json::json!({"action": "login", "user": "alice"}),
         received_at: chrono::Utc::now(),
+        ..Default::default()
     };
     let rec2 = GenericRecord {
         sourcetype: "access_log".to_string(),
@@ -60,6 +63,7 @@ async fn hec_records_appear_as_parquet_on_local_disk() {
         time: None,
         fields: serde_json::json!({"action": "logout", "user": "bob"}),
         received_at: chrono::Utc::now(),
+        ..Default::default()
     };
 
     handler.try_send(rec1).expect("send rec1");
@@ -96,7 +100,7 @@ async fn hec_records_appear_as_parquet_on_local_disk() {
     let buf = Bytes::from(raw);
     let builder = ParquetRecordBatchReaderBuilder::try_new(buf).unwrap();
     let schema = builder.schema().clone();
-    assert_eq!(schema.fields().len(), 6);
+    assert_eq!(schema.fields().len(), 10);
     for col in ["time", "received_at", "partition_time"] {
         assert_eq!(
             schema.field_with_name(col).unwrap().data_type(),
@@ -176,6 +180,7 @@ async fn hec_local_start_emits_iceberg_descriptor_when_configured() {
         time: Some(chrono::Utc::now()),
         fields: serde_json::json!({"action": "login", "user": "alice"}),
         received_at: chrono::Utc::now(),
+        ..Default::default()
     };
     handler.try_send(rec).expect("send rec");
 
@@ -259,6 +264,7 @@ async fn hec_local_burst_crossing_builder_batch_rows_across_multiple_partitions(
                 time: None,
                 fields: serde_json::json!({"i": i}),
                 received_at: chrono::Utc::now(),
+                ..Default::default()
             }
         } else {
             GenericRecord {
@@ -267,6 +273,7 @@ async fn hec_local_burst_crossing_builder_batch_rows_across_multiple_partitions(
                 time: Some(chrono::Utc::now()),
                 fields: serde_json::json!({"i": i}),
                 received_at: chrono::Utc::now(),
+                ..Default::default()
             }
         };
         handler.try_send(rec).expect("channel has ample capacity");
@@ -278,6 +285,7 @@ async fn hec_local_burst_crossing_builder_batch_rows_across_multiple_partitions(
             time: Some(chrono::Utc::now()),
             fields: serde_json::json!({"i": i}),
             received_at: chrono::Utc::now(),
+            ..Default::default()
         };
         handler.try_send(rec).expect("channel has ample capacity");
     }
@@ -473,5 +481,64 @@ async fn hec_route_sanitizes_traversal_sourcetype_before_it_reaches_the_object_k
         rel.starts_with("hec/___escape"),
         "sourcetype '../escape' must be sanitized into the 'hec/___escape' \
          partition, matching sanitize_log_path's semantics; got {rel:?}"
+    );
+}
+
+#[tokio::test]
+async fn hec_typed_columns_and_event_uuid_land_in_local_parquet() {
+    use arrow::array::Array;
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = std::sync::Arc::new(LocalDiskSink::new(tmp.path().to_path_buf()).await.unwrap());
+    let cfg = GenericLocalConfig {
+        directory: tmp.path().to_path_buf(),
+        prefix: "hec".to_string(),
+        flush_threshold_bytes: usize::MAX,
+        flush_interval_secs: 3600,
+        channel_capacity: 256,
+        max_buffer_rows: 100_000,
+    };
+    let (handler, join) = hec_local_start(
+        &cfg,
+        sink,
+        64,
+        std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+    let mut with_env = GenericRecord {
+        sourcetype: "app".to_string(),
+        fields: serde_json::json!({"msg": "hi"}),
+        ..Default::default()
+    };
+    with_env.event_uuid = Some(logthing::ingest::new_event_uuid());
+    with_env.source = Some("/var/log/app.log".to_string());
+    with_env.index = Some("main".to_string());
+    with_env.indexed_fields = Some(serde_json::json!({"env": "prod"}));
+    let bare = GenericRecord {
+        sourcetype: "app".to_string(),
+        fields: serde_json::json!({"msg": "bare"}),
+        ..Default::default()
+    };
+    handler.try_send(with_env.clone()).unwrap();
+    handler.try_send(bare).unwrap();
+    drop(handler);
+    join.await.unwrap();
+
+    let batches = common::read_all(tmp.path());
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 2);
+    let b = &batches[0];
+    assert_eq!(b.schema().fields().len(), 10);
+    let uuids = common::str_col(b, "event_uuid");
+    let non_null: Vec<&str> = (0..b.num_rows())
+        .filter(|&i| !uuids.is_null(i))
+        .map(|i| uuids.value(i))
+        .collect();
+    assert_eq!(non_null, vec![with_env.event_uuid.as_deref().unwrap()]);
+    let idx = (0..b.num_rows()).find(|&i| !uuids.is_null(i)).unwrap();
+    assert_eq!(common::str_col(b, "source").value(idx), "/var/log/app.log");
+    assert_eq!(common::str_col(b, "index").value(idx), "main");
+    assert_eq!(
+        common::str_col(b, "indexed_fields").value(idx),
+        r#"{"env":"prod"}"#
     );
 }

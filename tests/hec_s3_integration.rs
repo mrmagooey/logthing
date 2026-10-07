@@ -43,6 +43,7 @@ fn make_record(sourcetype: &str, user: &str) -> GenericRecord {
         time: Some(chrono::Utc::now()),
         fields: serde_json::json!({"user": user, "action": "login"}),
         received_at: chrono::Utc::now(),
+        ..Default::default()
     }
 }
 
@@ -153,8 +154,8 @@ async fn hec_records_appear_as_parquet_in_s3() {
         }
         assert_eq!(
             schema.fields().len(),
-            6,
-            "HEC schema must have exactly 6 columns"
+            10,
+            "HEC schema must have exactly 10 columns"
         );
 
         let mut reader = builder.build().expect("parquet reader");

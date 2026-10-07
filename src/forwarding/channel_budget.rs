@@ -163,9 +163,10 @@ pub const ZEEK_RECORD_BYTES: usize = 2560;
 /// not, and each nested object costs a BTreeMap node of its own.
 pub const SURICATA_RECORD_BYTES: usize = 4608;
 
-/// Measured heap footprint of one `GenericRecord` (HEC/NDJSON, OTLP): 825
-/// bytes measured for a representative HEC event, rounded up to 1024.
-pub const GENERIC_RECORD_BYTES: usize = 1024;
+/// Measured heap footprint of one `GenericRecord` (HEC/NDJSON, OTLP): 1625
+/// bytes measured for a representative HEC event carrying the `event_uuid`,
+/// `source`, `index` and `indexed_fields` envelope columns, rounded up to 1792.
+pub const GENERIC_RECORD_BYTES: usize = 1792;
 
 /// Measured heap footprint of one `SyslogMessage`: 697 bytes measured for a
 /// representative RFC 5424 message with structured data, rounded up to 768.
@@ -443,11 +444,19 @@ mod tests {
             time: Some(chrono::Utc::now()),
             fields,
             received_at: chrono::Utc::now(),
+            event_uuid: Some(crate::ingest::new_event_uuid()),
+            source: Some("/var/log/auth.log".to_string()),
+            index: Some("main".to_string()),
+            indexed_fields: Some(serde_json::json!({"env": "prod"})),
         };
         let measured = std::mem::size_of::<GenericRecord>()
             + record.sourcetype.capacity()
             + record.host.as_ref().map_or(0, |s| s.capacity())
-            + json_heap_bytes(&record.fields);
+            + json_heap_bytes(&record.fields)
+            + record.event_uuid.as_ref().map_or(0, |s| s.capacity())
+            + record.source.as_ref().map_or(0, |s| s.capacity())
+            + record.index.as_ref().map_or(0, |s| s.capacity())
+            + record.indexed_fields.as_ref().map_or(0, json_heap_bytes);
         assert_within_2x(measured, GENERIC_RECORD_BYTES, "GenericRecord");
     }
 
