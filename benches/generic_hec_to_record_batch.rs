@@ -1,10 +1,6 @@
 //! Criterion micro-benchmark: baseline cost of `GenericSink::to_record_batch`
-//! -- the shared writer path for both HEC and OTLP ingest (OTLP maps to
-//! `GenericRecord` via `map_otlp_request` before reaching this sink). HEC
-//! vs OTLP is this codebase's built-in "control" comparison: since both
-//! share this writer path, any throughput delta between them isolates
-//! decode cost (JSON parse+sourcetype extraction vs protobuf) with the
-//! writer path held constant -- this benchmark measures that shared cost.
+//! -- the HEC writer path. OTLP does NOT share it: OTLP has its own `OtlpSink` with its own
+//! accumulator (see `benches/otlp_record_batch.rs`).
 //!
 //! Run with: `cargo bench --bench generic_hec_to_record_batch`
 

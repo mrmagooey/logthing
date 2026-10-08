@@ -22,7 +22,7 @@ A log ingestion server written in Rust (single-node ceilings measured in [docs/p
 - **Log Aggregation**: Optionally count records as they arrive, grouped by configured columns, writing an SQL `GROUP BY`-style table to Parquet instead of the raw rows — cuts noisy streams down to their useful summary
 - **TLS/SSL Encryption**: Secure connections with certificate support
 - **IP Whitelisting**: Control which hosts can connect
-- **Performance**: async I/O with Tokio; on one shared 12-vCPU host the HEC route sustained 78125 records/s and OTLP at least 10625 records/s (a lower bound: neither side was CPU-saturated and the cause is not yet investigated; gzip, batches of 100, local Parquet sink, loopback) -- method, variance and caveats in [docs/performance.md](docs/performance.md)
+- **Performance**: async I/O with Tokio; on one shared 12-vCPU host the HEC route sustained 78125 records/s and OTLP 80625 records/s (gzip, batches of 100, local Parquet sink, loopback; OTLP was 10625 before the 2026-10-08 writer fix) -- method, variance and caveats in [docs/performance.md](docs/performance.md)
 - **Metrics & Monitoring**: Prometheus metrics endpoint
 - **Structured Logging**: JSON or pretty-printed logs
 
