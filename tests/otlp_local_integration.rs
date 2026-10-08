@@ -131,3 +131,41 @@ async fn sixty_fifth_service_goes_to_overflow_with_raw_service_name() {
         "raw value kept"
     );
 }
+
+#[tokio::test]
+async fn many_rows_per_service_split_into_one_partition_each_via_the_accumulator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (h, join) = start(tmp.path(), 64).await;
+    for i in 0..300 {
+        let svc = if i % 2 == 0 { "Alpha" } else { "Beta" };
+        h.try_send(record(Some(svc), &format!("{svc}-{i}")))
+            .unwrap();
+    }
+    drop(h);
+    join.await.unwrap();
+
+    assert_eq!(
+        top_dirs(tmp.path()),
+        ["alpha", "beta"].iter().map(|s| s.to_string()).collect()
+    );
+    for (dir, raw, parity) in [("alpha", "Alpha", 0), ("beta", "Beta", 1)] {
+        let batches = common::read_all(&tmp.path().join("otlp").join(dir));
+        let mut bodies = Vec::new();
+        for b in &batches {
+            assert_eq!(b.schema().fields().len(), 21);
+            let sn = common::str_col(b, "service_name");
+            let body = common::str_col(b, "body");
+            for i in 0..b.num_rows() {
+                assert_eq!(sn.value(i), raw);
+                bodies.push(body.value(i).to_string());
+            }
+        }
+        bodies.sort();
+        let mut want: Vec<String> = (0..300)
+            .filter(|i| i % 2 == parity)
+            .map(|i| format!("{raw}-{i}"))
+            .collect();
+        want.sort();
+        assert_eq!(bodies, want, "{dir}");
+    }
+}

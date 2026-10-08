@@ -243,3 +243,7 @@ harness = false
 inherits = "release"
 debug = true
 strip = false
+
+[[bench]]
+name = "otlp_record_batch"
+harness = false

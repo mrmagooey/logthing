@@ -10,8 +10,10 @@
 //! (`prefix = "hec"`, channel capacity derived from `GENERIC_RECORD_BYTES`), so OTLP gets
 //! mirror structs (`OtlpS3Config`, `OtlpLocalConfig`) that reuse HEC's flush/row default
 //! functions. `resource_attributes` keeps ALL resource attributes (promoted keys included)
-//! so the column is lossless. The sink uses the default per-record `to_record_batch` path
-//! (no amortized accumulator).
+//! so the column is lossless. The writer appends records through `OtlpAccumulator`
+//! (`ParquetSink::new_batch`), which reuses one set of Arrow builders across many rows;
+//! building a 21-column one-row batch per record capped a single writer near 13k rec/s.
+//! `to_record_batch` is a thin one-row wrapper over the same accumulator.
 //!
 //! S3 key layout: `otlp/<service>/year={Y}/month={MM}/day={DD}/{uuid}.parquet`
 //!
@@ -20,14 +22,16 @@
 
 use crate::config::{OtlpLocalConfig, OtlpS3Config};
 use crate::forwarding::buffered_writer::{
-    ParquetSink, ParquetWriterHandle, UploadSink, partition_time, sanitize_log_path, start_writer,
+    ParquetSink, ParquetWriterHandle, RecordBatchAccumulator, UploadSink, partition_time,
+    sanitize_log_path, start_writer,
 };
 use crate::ingest::EventUuid;
-use arrow_array::{
-    ArrayRef, Int32Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt32Array,
+use arrow_array::builder::{
+    Int32Builder, StringBuilder, TimestampMicrosecondBuilder, UInt32Builder,
 };
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use std::sync::{Arc, LazyLock};
 
 /// Partition segment used when a record carries no usable `service.name`.
@@ -156,52 +160,182 @@ impl ParquetSink for OtlpSink {
         Some("partition_time")
     }
 
+    /// One-row wrapper over `OtlpAccumulator`: the column-append code exists in exactly one
+    /// place (`OtlpAccumulator::append_record_value`), shared with the amortized path.
     fn to_record_batch(
         &self,
         r: &OtlpRecord,
         _schema: &Arc<Schema>,
     ) -> anyhow::Result<RecordBatch> {
-        let ts = |v: Option<DateTime<Utc>>| -> ArrayRef {
-            Arc::new(
-                TimestampMicrosecondArray::from(vec![v.map(|d| d.timestamp_micros())])
-                    .with_timezone("UTC"),
-            )
-        };
-        let utf8 = |v: Option<&str>| -> ArrayRef { Arc::new(StringArray::from(vec![v])) };
-        let fallback_uuid;
-        let event_uuid = match r.event_uuid.as_deref() {
-            Some(u) => u,
-            None => {
-                fallback_uuid = crate::ingest::new_event_uuid();
-                &fallback_uuid
-            }
-        };
-        let resource_attributes = json_text(&r.resource_attributes);
-        let attributes = json_text(&r.attributes);
+        let mut acc = OtlpAccumulator::new();
+        acc.append_record_value(r);
+        acc.finish_batch()
+    }
+
+    /// Amortized-builder fast path, gated on `Arc::ptr_eq` with the one OTLP schema.
+    fn new_batch(
+        &self,
+        schema: &Arc<Schema>,
+    ) -> Option<Box<dyn RecordBatchAccumulator<OtlpRecord>>> {
+        if Arc::ptr_eq(schema, &otlp_schema()) {
+            Some(Box::new(OtlpAccumulator::new()))
+        } else {
+            None
+        }
+    }
+
+    /// Derives the day from `partition_time(time, received_at)` without building a batch.
+    /// Load-bearing: `push()` calls this before it knows the record goes to the accumulator,
+    /// so building a batch here would reintroduce the per-record cost. `partition_time` is
+    /// always non-null in `to_record_batch`, so this is exactly what `day_from_batch` reads.
+    fn day_and_batch(
+        &self,
+        record: &OtlpRecord,
+        _schema: &Arc<Schema>,
+        _now: DateTime<Utc>,
+    ) -> anyhow::Result<(NaiveDate, Option<RecordBatch>)> {
+        Ok((
+            partition_time(record.time, record.received_at).date_naive(),
+            None,
+        ))
+    }
+}
+
+/// Persistent Arrow builders for the 21-column OTLP schema, reused across many rows.
+pub(crate) struct OtlpAccumulator {
+    event_uuid: StringBuilder,
+    time: TimestampMicrosecondBuilder,
+    observed_time: TimestampMicrosecondBuilder,
+    received_at: TimestampMicrosecondBuilder,
+    severity_number: Int32Builder,
+    severity_text: StringBuilder,
+    body: StringBuilder,
+    service_name: StringBuilder,
+    service_namespace: StringBuilder,
+    service_instance_id: StringBuilder,
+    host_name: StringBuilder,
+    peer_addr: StringBuilder,
+    trace_id: StringBuilder,
+    span_id: StringBuilder,
+    flags: UInt32Builder,
+    event_name: StringBuilder,
+    scope_name: StringBuilder,
+    scope_version: StringBuilder,
+    resource_attributes: StringBuilder,
+    attributes: StringBuilder,
+    partition_time: TimestampMicrosecondBuilder,
+    rows: usize,
+}
+
+impl OtlpAccumulator {
+    fn new() -> Self {
+        let ts = || TimestampMicrosecondBuilder::new().with_data_type(ts_type());
+        Self {
+            event_uuid: StringBuilder::new(),
+            time: ts(),
+            observed_time: ts(),
+            received_at: ts(),
+            severity_number: Int32Builder::new(),
+            severity_text: StringBuilder::new(),
+            body: StringBuilder::new(),
+            service_name: StringBuilder::new(),
+            service_namespace: StringBuilder::new(),
+            service_instance_id: StringBuilder::new(),
+            host_name: StringBuilder::new(),
+            peer_addr: StringBuilder::new(),
+            trace_id: StringBuilder::new(),
+            span_id: StringBuilder::new(),
+            flags: UInt32Builder::new(),
+            event_name: StringBuilder::new(),
+            scope_name: StringBuilder::new(),
+            scope_version: StringBuilder::new(),
+            resource_attributes: StringBuilder::new(),
+            attributes: StringBuilder::new(),
+            partition_time: ts(),
+            rows: 0,
+        }
+    }
+
+    /// Append one record to every column. Infallible: no partial row is possible.
+    fn append_record_value(&mut self, r: &OtlpRecord) {
+        match r.event_uuid.as_deref() {
+            Some(u) => self.event_uuid.append_value(u),
+            None => self
+                .event_uuid
+                .append_value(crate::ingest::new_event_uuid()),
+        }
+        self.time
+            .append_option(r.time.map(|d| d.timestamp_micros()));
+        self.observed_time
+            .append_option(r.observed_time.map(|d| d.timestamp_micros()));
+        self.received_at
+            .append_value(r.received_at.timestamp_micros());
+        self.severity_number.append_option(r.severity_number);
+        self.severity_text.append_option(r.severity_text.as_deref());
+        self.body.append_option(r.body.as_deref());
+        self.service_name.append_option(r.service_name.as_deref());
+        self.service_namespace
+            .append_option(r.service_namespace.as_deref());
+        self.service_instance_id
+            .append_option(r.service_instance_id.as_deref());
+        self.host_name.append_option(r.host_name.as_deref());
+        self.peer_addr.append_option(r.peer_addr.as_deref());
+        self.trace_id.append_option(r.trace_id.as_deref());
+        self.span_id.append_option(r.span_id.as_deref());
+        self.flags.append_option(r.flags);
+        self.event_name.append_option(r.event_name.as_deref());
+        self.scope_name.append_option(r.scope_name.as_deref());
+        self.scope_version.append_option(r.scope_version.as_deref());
+        self.resource_attributes
+            .append_value(json_text(&r.resource_attributes));
+        self.attributes.append_value(json_text(&r.attributes));
+        self.partition_time
+            .append_value(partition_time(r.time, r.received_at).timestamp_micros());
+        self.rows += 1;
+    }
+
+    fn finish_batch(&mut self) -> anyhow::Result<RecordBatch> {
         let columns: Vec<ArrayRef> = vec![
-            utf8(Some(event_uuid)),
-            ts(r.time),
-            ts(r.observed_time),
-            ts(Some(r.received_at)),
-            Arc::new(Int32Array::from(vec![r.severity_number])),
-            utf8(r.severity_text.as_deref()),
-            utf8(r.body.as_deref()),
-            utf8(r.service_name.as_deref()),
-            utf8(r.service_namespace.as_deref()),
-            utf8(r.service_instance_id.as_deref()),
-            utf8(r.host_name.as_deref()),
-            utf8(r.peer_addr.as_deref()),
-            utf8(r.trace_id.as_deref()),
-            utf8(r.span_id.as_deref()),
-            Arc::new(UInt32Array::from(vec![r.flags])),
-            utf8(r.event_name.as_deref()),
-            utf8(r.scope_name.as_deref()),
-            utf8(r.scope_version.as_deref()),
-            utf8(Some(&resource_attributes)),
-            utf8(Some(&attributes)),
-            ts(Some(partition_time(r.time, r.received_at))),
+            Arc::new(self.event_uuid.finish()),
+            Arc::new(self.time.finish()),
+            Arc::new(self.observed_time.finish()),
+            Arc::new(self.received_at.finish()),
+            Arc::new(self.severity_number.finish()),
+            Arc::new(self.severity_text.finish()),
+            Arc::new(self.body.finish()),
+            Arc::new(self.service_name.finish()),
+            Arc::new(self.service_namespace.finish()),
+            Arc::new(self.service_instance_id.finish()),
+            Arc::new(self.host_name.finish()),
+            Arc::new(self.peer_addr.finish()),
+            Arc::new(self.trace_id.finish()),
+            Arc::new(self.span_id.finish()),
+            Arc::new(self.flags.finish()),
+            Arc::new(self.event_name.finish()),
+            Arc::new(self.scope_name.finish()),
+            Arc::new(self.scope_version.finish()),
+            Arc::new(self.resource_attributes.finish()),
+            Arc::new(self.attributes.finish()),
+            Arc::new(self.partition_time.finish()),
         ];
+        self.rows = 0;
         Ok(RecordBatch::try_new(otlp_schema(), columns)?)
+    }
+}
+
+impl RecordBatchAccumulator<OtlpRecord> for OtlpAccumulator {
+    fn try_append(&mut self, record: &OtlpRecord, _now: DateTime<Utc>) -> anyhow::Result<bool> {
+        // One fixed schema, so there is no mismatch case to fall back from.
+        self.append_record_value(record);
+        Ok(true)
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+        self.finish_batch()
     }
 }
 
@@ -306,6 +440,52 @@ mod tests {
             resource_attributes: json!({}),
             attributes: json!({}),
         }
+    }
+
+    /// Frozen copy of the pre-accumulator one-row-per-record implementation. Independent of
+    /// production code so the equivalence tests pin byte-identical output.
+    fn reference_batch(r: &OtlpRecord) -> RecordBatch {
+        let ts = |v: Option<DateTime<Utc>>| -> ArrayRef {
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![v.map(|d| d.timestamp_micros())])
+                    .with_timezone("UTC"),
+            )
+        };
+        let utf8 = |v: Option<&str>| -> ArrayRef { Arc::new(StringArray::from(vec![v])) };
+        let fallback_uuid;
+        let event_uuid = match r.event_uuid.as_deref() {
+            Some(u) => u,
+            None => {
+                fallback_uuid = crate::ingest::new_event_uuid();
+                &fallback_uuid
+            }
+        };
+        let resource_attributes = json_text(&r.resource_attributes);
+        let attributes = json_text(&r.attributes);
+        let columns: Vec<ArrayRef> = vec![
+            utf8(Some(event_uuid)),
+            ts(r.time),
+            ts(r.observed_time),
+            ts(Some(r.received_at)),
+            Arc::new(Int32Array::from(vec![r.severity_number])),
+            utf8(r.severity_text.as_deref()),
+            utf8(r.body.as_deref()),
+            utf8(r.service_name.as_deref()),
+            utf8(r.service_namespace.as_deref()),
+            utf8(r.service_instance_id.as_deref()),
+            utf8(r.host_name.as_deref()),
+            utf8(r.peer_addr.as_deref()),
+            utf8(r.trace_id.as_deref()),
+            utf8(r.span_id.as_deref()),
+            Arc::new(UInt32Array::from(vec![r.flags])),
+            utf8(r.event_name.as_deref()),
+            utf8(r.scope_name.as_deref()),
+            utf8(r.scope_version.as_deref()),
+            utf8(Some(&resource_attributes)),
+            utf8(Some(&attributes)),
+            ts(Some(partition_time(r.time, r.received_at))),
+        ];
+        RecordBatch::try_new(otlp_schema(), columns).unwrap()
     }
 
     #[test]
@@ -498,5 +678,172 @@ mod tests {
         let mut r = bare();
         crate::ingest::assign_event_uuids(std::slice::from_mut(&mut r));
         assert!(r.event_uuid.is_some());
+    }
+
+    fn full_record(i: usize) -> OtlpRecord {
+        let sev = [1, 5, 9, 13, 17, 21, 24][i % 7];
+        OtlpRecord {
+            event_uuid: Some(format!("0199c4e0-7d2a-7b3c-9a10-{i:012}")),
+            time: Some(
+                Utc.timestamp_micros(1_790_000_000_000_000 + i as i64 * 997)
+                    .unwrap(),
+            ),
+            observed_time: Some(Utc.timestamp_micros(1_790_000_000_000_500).unwrap()),
+            received_at: Utc.with_ymd_and_hms(2026, 10, 6, 12, 0, 1).unwrap(),
+            severity_number: Some(sev),
+            severity_text: Some(["TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"][i % 6].into()),
+            body: Some(format!("body \u{e9}\u{4e2d}\u{1f600} \"q\" {i}")),
+            service_name: Some(format!("Svc {}", i % 3)),
+            service_namespace: Some("ns".into()),
+            service_instance_id: Some(format!("inst-{i}")),
+            host_name: Some("h\u{fc}st".into()),
+            peer_addr: Some("::1".into()),
+            trace_id: Some("0af7651916cd43dd8448eb211c80319c".into()),
+            span_id: Some("b7ad6b7169203331".into()),
+            flags: Some(u32::MAX),
+            event_name: Some("ev".into()),
+            scope_name: Some("lib".into()),
+            scope_version: Some("1.0".into()),
+            resource_attributes: json!({"service.name": format!("Svc {}", i % 3), "n": i}),
+            attributes: json!({"k": ["a", 1, null], "u": "\u{1f600}"}),
+        }
+    }
+
+    fn representative_records() -> Vec<OtlpRecord> {
+        let mut v: Vec<OtlpRecord> = (0..40).map(full_record).collect();
+        v.push(sample());
+        let mut b = bare();
+        b.event_uuid = Some("fixed-uuid".into());
+        v.push(b);
+        // Edge timestamps: epoch, far future, pre-epoch, outside the partition clamp.
+        for micros in [0_i64, -1, 4_102_444_800_000_000, 1] {
+            let mut r = full_record(1);
+            r.time = Some(Utc.timestamp_micros(micros).unwrap());
+            r.observed_time = Some(Utc.timestamp_micros(micros).unwrap());
+            v.push(r);
+        }
+        let mut null_attrs = full_record(2);
+        null_attrs.resource_attributes = serde_json::Value::Null;
+        null_attrs.attributes = serde_json::Value::Null;
+        v.push(null_attrs);
+        let mut empty_strs = full_record(3);
+        empty_strs.body = Some(String::new());
+        empty_strs.service_name = Some(String::new());
+        v.push(empty_strs);
+        v
+    }
+
+    #[test]
+    fn new_batch_activates_for_real_schema_and_not_for_an_unrelated_one() {
+        assert!(OtlpSink.new_batch(&otlp_schema()).is_some());
+        let unrelated = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, false)]));
+        assert!(OtlpSink.new_batch(&unrelated).is_none());
+        // Equal-by-value but a distinct Arc must not activate (Arc::ptr_eq contract).
+        let copy = Arc::new(Schema::new(otlp_schema().fields().clone()));
+        assert!(OtlpSink.new_batch(&copy).is_none());
+    }
+
+    #[test]
+    fn accumulator_finish_equals_concat_of_per_record_batches() {
+        let records = representative_records();
+        let mut acc = OtlpSink.new_batch(&otlp_schema()).unwrap();
+        let now = Utc::now();
+        for r in &records {
+            assert!(acc.try_append(r, now).unwrap());
+        }
+        assert_eq!(acc.len(), records.len());
+        let got = acc.finish().unwrap();
+        assert_eq!(acc.len(), 0, "finish resets");
+        let singles: Vec<RecordBatch> = records.iter().map(reference_batch).collect();
+        let want = arrow::compute::concat_batches(&otlp_schema(), &singles).unwrap();
+        assert_eq!(got.schema(), want.schema());
+        assert_eq!(got.num_rows(), want.num_rows());
+        for (i, f) in want.schema().fields().iter().enumerate() {
+            assert_eq!(
+                got.column(i).as_ref(),
+                want.column(i).as_ref(),
+                "column {}",
+                f.name()
+            );
+        }
+        // The production per-record path must agree with the reference too.
+        for r in &records {
+            let a = OtlpSink.to_record_batch(r, &otlp_schema()).unwrap();
+            assert_eq!(a, reference_batch(r));
+        }
+    }
+
+    #[test]
+    fn accumulator_is_reusable_after_finish() {
+        let mut acc = OtlpSink.new_batch(&otlp_schema()).unwrap();
+        let now = Utc::now();
+        for round in 0..2 {
+            for i in 0..5 {
+                assert!(acc.try_append(&full_record(i), now).unwrap());
+            }
+            let b = acc.finish().unwrap();
+            assert_eq!(b.num_rows(), 5, "round {round}");
+            assert_eq!(
+                b,
+                arrow::compute::concat_batches(
+                    &otlp_schema(),
+                    &(0..5)
+                        .map(|i| reference_batch(&full_record(i)))
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn accumulator_missing_event_uuid_gets_a_generated_v7_uuid() {
+        let mut acc = OtlpSink.new_batch(&otlp_schema()).unwrap();
+        assert!(acc.try_append(&bare(), Utc::now()).unwrap());
+        let b = acc.finish().unwrap();
+        let id = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(uuid::Uuid::parse_str(id).unwrap().get_version_num(), 7);
+    }
+
+    /// No `OtlpRecord` can make `try_append` fail or half-append: every column is built from
+    /// infallible builder appends (JSON text falls back to `{}`), and the schema is fixed so
+    /// there is no mismatch case. Assert the observable consequence: always `Ok(true)` and
+    /// `len()` grows by exactly one, even for the most hostile values.
+    #[test]
+    fn try_append_never_fails_and_adds_exactly_one_row() {
+        let mut acc = OtlpSink.new_batch(&otlp_schema()).unwrap();
+        let mut hostile = full_record(0);
+        hostile.body = Some("\0\n\u{feff}".repeat(10_000));
+        hostile.attributes = json!({"deep": {"a": {"b": {"c": [1, 2, {"d": null}]}}}});
+        for (n, r) in [bare(), hostile, full_record(1)].iter().enumerate() {
+            assert!(acc.try_append(r, Utc::now()).unwrap());
+            assert_eq!(acc.len(), n + 1);
+        }
+        assert_eq!(acc.finish().unwrap().num_rows(), 3);
+    }
+
+    #[test]
+    fn day_and_batch_never_builds_a_batch_and_matches_partition_day() {
+        let schema = otlp_schema();
+        let now = Utc::now();
+        for r in representative_records() {
+            let (day, batch) = OtlpSink.day_and_batch(&r, &schema, now).unwrap();
+            assert!(batch.is_none(), "must not build a throwaway batch");
+            let single = reference_batch(&r);
+            let micros = single
+                .column_by_name("partition_time")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap()
+                .value(0);
+            let old_day = Utc.timestamp_micros(micros).unwrap().date_naive();
+            assert_eq!(day, old_day);
+        }
     }
 }
