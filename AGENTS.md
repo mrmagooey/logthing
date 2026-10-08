@@ -111,6 +111,10 @@ use crate::models::WindowsEvent;
 - Use conventional commit style: `feat:`, `fix:`, `docs:`, `test:`, `refactor:`
 - Never amend or force-push without explicit approval
 - Keep working tree clean before new tasks
+- Release checklist: tag and publish the images BEFORE anyone runs the analytics stack from
+  master (compose and Helm default to the `:<crate version>` tag, e.g. `:0.22.0`); run
+  `deploy/analytics/tests/e2e/helm-minikube.sh` on a host with a normal inotify limit
+  before and after tagging
 
 ## 5. Safety & Guardrails
 

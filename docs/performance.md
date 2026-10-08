@@ -61,16 +61,26 @@ rate down to `BISECT_RESOLUTION` (default 1000 records/s). At each rate it:
    `flush_interval_secs = 5` (the "real" shape: the production write path, no S3).
 2. Runs `RUNS` (3 here) timed runs of `DURATION` (15 s here; the harness minimum is 10)
    with `tools/loadgen` over loopback.
-3. Compares records written against records offered. A rate **passes** when the median
-   total loss is at most `LOSS_BUDGET` (0.1%) and the median achieved rate is at least 99%
-   of the target. If the generator fell short of 99% and saw no 503s, the verdict is
-   `GENERATOR-LIMITED` (not a server ceiling). If it fell short and did see 503s, the verdict
-   is `FAIL-BACKPRESSURE`: the server pushed back, which is a real ceiling.
+3. Computes loss from the server's drop counters (kernel socket drops + writer drops +
+   buffer drops, over records offered). A rate **passes** when the median total loss is at
+   most `LOSS_BUDGET` (0.1%) and the median achieved rate is at least 99% of the target. If
+   the generator fell short of 99%, the verdict is `FAIL-BACKPRESSURE` only when the 503s
+   plausibly explain the shortfall: each 503 parks one of the `CONCURRENCY` workers for the
+   1 s `Retry-After`, so the estimated stalled capacity is
+   `503s_per_run * 1 s * target / CONCURRENCY` records, and it must be at least 50% of the
+   missing records `(target - achieved) * DURATION`. Otherwise (no 503s, or too few to
+   account for the gap) the verdict is `GENERATOR-LIMITED`, which is not a server ceiling.
 
 The generator retries 503 responses according to `Retry-After`; requests it gives up on are
-counted as "abandoned" and reported per run. Loss is computed against records actually
-offered, floored at 0 (a retried request after a partial enqueue duplicates the enqueued
-prefix, see [hec.md](hec.md#backpressure)).
+counted as "abandoned" and reported per run. A retry after a partial enqueue duplicates the
+enqueued prefix, see [hec.md](hec.md#backpressure).
+
+> **Note on the published labels.** The rows in this document were produced before the
+> explain-the-shortfall rule above: the earlier harness called any run under 99% achieved
+> `FAIL-BACKPRESSURE` as soon as a single 503 was seen. The CEILING numbers are unchanged
+> by the rule (the ramp treats any failure, `FAIL-BACKPRESSURE` or `FAIL-LOSS`, as the
+> ceiling), but the "server pushed back" reading of a failing rate was not verified for each
+> row. Row 6's failing rate (30 503s over 3 runs) in particular may be generator-side.
 
 Redaction rows add this rule set, verbatim from the harness, to the listener's config:
 
@@ -129,7 +139,7 @@ FORMAT=otlp GZIP=1 PII_FIELDS=1 REDACTION=1 EVENTS_PER_REQUEST=100 DURATION=15 R
   achieved, bisected to 1000 records/s. Pass/fail near the ceiling is not monotonic (the
   server restarts and the host is shared), so treat the last ~5% below a ceiling as uncertain.
 - A 503 retried after a partial enqueue duplicates the enqueued prefix (see
-  [hec.md](hec.md#backpressure)); the harness floors loss at 0.
+  [hec.md](hec.md#backpressure)).
 - Other formats: the harness also supports `FORMAT=syslog|ipfix|sflow|zeek|suricata`
   (UDP/TCP). This document reports only the HTTP routes measured in this release.
 

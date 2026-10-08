@@ -37,6 +37,14 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 - Analytics stack image pins moved to 0.22.0 for both logthing and the committer, in lockstep
   with the crate version. If you override `LOGTHING_IMAGE` / `COMMITTER_IMAGE` or the Helm image
   values, move both to 0.22.0 together.
+- Redaction config is validated at startup: an invalid, duplicate or non-identifier
+  `hash_key_env`, or a `mask_patterns` entry that is not a valid regex, is a startup error
+  rather than being ignored.
+- OTLP redaction on an unparseable body: a JSON-looking OTLP body that cannot be parsed while
+  `@body.*` rules are configured is stored as `[REDACTED]` in whole, and the event is counted
+  as `redactions_applied{rule="body_unparseable"}`.
+- The Helm chart `version` is 0.2.0 (was 0.1.0): the chart contents changed incompatibly
+  (new required secret keys, NetworkPolicies, image pins).
 
 - Analytics stack upgrades keep the old PUBLIC demo secrets: Postgres role passwords, the Garage
   key and the Lakekeeper encryption key persist in volumes/PVCs, and Helm's `lookup` and
@@ -100,7 +108,6 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ### Changed
 
-- Stack default images pin 0.22.0 (logthing and committer).
 - `loadgen` treats `503` as backpressure and retries per `Retry-After` instead of counting an
   error.
 - The README throughput claim is replaced by measured numbers; stale admin, syslog, metrics and

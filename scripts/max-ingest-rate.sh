@@ -30,7 +30,12 @@ sum_proc_net_udp_drops() {
 # one a ceiling. The one exception: when the generator observed 503s (HTTP
 # backpressure from the server's full writer channel) AND fell under the floor,
 # that IS server pushback -- the verdict is FAIL-BACKPRESSURE, a real ceiling,
-# not GENERATOR-LIMITED.
+# not GENERATOR-LIMITED -- but only if the 503s plausibly explain the shortfall
+# (see classify_run: the stall estimate must cover >= BACKPRESSURE_EXPLAIN_PCT of
+# the missing records). A handful of 503s beside a large shortfall is still
+# GENERATOR-LIMITED.
+BACKPRESSURE_EXPLAIN_PCT="${BACKPRESSURE_EXPLAIN_PCT:-50}"
+RETRY_AFTER_SECS="${RETRY_AFTER_SECS:-1}"
 ACHIEVED_FLOOR_PCT="${ACHIEVED_FLOOR_PCT:-99}"
 
 # Pure parsers for loadgen's summary line, e.g.
@@ -39,15 +44,32 @@ ACHIEVED_FLOOR_PCT="${ACHIEVED_FLOOR_PCT:-99}"
 parse_throttled() { printf '%s\n' "$1" | sed -n 's/.*backpressure: \([0-9]\{1,\}\) 503 responses.*/\1/p' | tail -1 | grep . || echo 0; }
 parse_abandoned() { printf '%s\n' "$1" | sed -n 's/.*503 responses, \([0-9]\{1,\}\) requests abandoned.*/\1/p' | tail -1 | grep . || echo 0; }
 
-# classify_run achieved target loss budget [throttled]; throttled = 503 responses seen (default 0).
+# classify_run achieved target loss budget [throttled [duration [workers]]]
+#   throttled = 503 responses seen PER RUN (default 0); duration = run seconds
+#   (default $DURATION); workers = generator concurrency (default $CONCURRENCY, 64).
+# FAIL-BACKPRESSURE needs the 503s to explain the shortfall. Each 503 parks one
+# worker for RETRY_AFTER_SECS (the server's Retry-After, 1 s); that worker would
+# otherwise have offered target/workers records/s, so
+#   stalled  = throttled * RETRY_AFTER_SECS * target / workers   (records)
+#   missing  = (target - achieved) * duration                    (records)
+# and the verdict is FAIL-BACKPRESSURE only if stalled >= missing * BACKPRESSURE_EXPLAIN_PCT/100.
+# (A 503 on a batch request parks the worker for the same time whatever the batch
+# size, so events_per_request cancels out of the per-worker rate.)
 classify_run() {
     local achieved="$1" target="$2" loss="$3" budget="$4" throttled="${5:-0}"
+    local duration="${6:-${DURATION:-15}}" workers="${7:-${CONCURRENCY:-64}}"
     if [ "$target" != "0" ]; then
         local ok
         ok="$(awk -v a="$achieved" -v t="$target" -v f="$ACHIEVED_FLOOR_PCT" \
               'BEGIN { print (a >= t * f / 100) ? 1 : 0 }')"
         if [ "$ok" != "1" ]; then
-            if [ "$throttled" -gt 0 ]; then echo "FAIL-BACKPRESSURE"; else echo "GENERATOR-LIMITED"; fi
+            if awk -v th="$throttled" -v t="$target" -v a="$achieved" -v d="$duration" \
+                   -v w="$workers" -v r="$RETRY_AFTER_SECS" -v p="$BACKPRESSURE_EXPLAIN_PCT" \
+                   'BEGIN { exit !(th > 0 && th * r * t / w >= (t - a) * d * p / 100) }'; then
+                echo "FAIL-BACKPRESSURE"
+            else
+                echo "GENERATOR-LIMITED"
+            fi
             return 0
         fi
     fi
@@ -67,12 +89,13 @@ classify_run() {
 # and printed by run_one -- that audit trail is unchanged. This is only the
 # gate, and the gate now looks at the median achieved rate and median loss,
 # both describing the same set of runs.
+# throttled is the per-run mean 503 count.
 classify_rate() {
     local achieveds="$1" losses="$2" target="$3" budget="$4" throttled="${5:-0}"
     local med_ach med
     med_ach="$(printf '%s' "$achieveds" | grep -v '^$' | median_of)"
     med="$(printf '%s' "$losses" | grep -v '^$' | median_of)"
-    classify_run "$med_ach" "$target" "$med" "$budget" "$throttled"
+    classify_run "$med_ach" "$target" "$med" "$budget" "$throttled" "${6:-}" "${7:-}"
 }
 
 BISECT_RESOLUTION="${BISECT_RESOLUTION:-1000}"
@@ -827,7 +850,8 @@ measure_rate() {
     # stderr: fixed-rate mode discards this function's stdout.
     echo "503 total: $throttled_total (abandoned: $abandoned_total)" >&2
     local verdict
-    verdict="$(classify_rate "$achieveds" "$losses" "$rate" "$LOSS_BUDGET" "$throttled_total")"
+    verdict="$(classify_rate "$achieveds" "$losses" "$rate" "$LOSS_BUDGET" \
+        "$(awk -v t="$throttled_total" -v n="$RUNS" 'BEGIN { print t / n }')")"
     # Echoed to stderr too, alongside the per-run rows and the summary line
     # above, so fixed-rate mode -- which redirects this function's stdout to
     # /dev/null below -- still shows the rate-level verdict somewhere. The
@@ -906,12 +930,16 @@ if [ "${SELFTEST:-0}" = "1" ]; then
     check "unbounded target"     "$(classify_run 12796 0 0.00 0.1)"     "PASS"
 
     # 503s observed + achieved under the floor => the server pushed back (a ceiling), not a slow generator.
-    check "classify backpressure" "$(classify_run 15000 20000 0.00 0.1 42)" "FAIL-BACKPRESSURE"
+    # missing = 5000*15 = 75000; stalled = th*1*20000/64 = th*312.5 -> threshold th >= 120.
+    check "classify backpressure many 503s" "$(classify_run 15000 20000 0.00 0.1 400 15 64)" "FAIL-BACKPRESSURE"
+    check "classify few 503s + shortfall is generator" "$(classify_run 15000 20000 0.00 0.1 7 15 64)" "GENERATOR-LIMITED"
+    check "classify 503 explain boundary" "$(classify_run 15000 20000 0.00 0.1 120 15 64)" "FAIL-BACKPRESSURE"
+    check "classify just under boundary" "$(classify_run 15000 20000 0.00 0.1 119 15 64)" "GENERATOR-LIMITED"
     check "classify gen limited without 503s" "$(classify_run 15000 20000 0.00 0.1 0)" "GENERATOR-LIMITED"
     check "classify default throttled arg" "$(classify_run 15000 20000 0.00 0.1)" "GENERATOR-LIMITED"
     check "classify pass with some 503s absorbed" "$(classify_run 19999 20000 0.00 0.1 42)" "PASS"
     check "classify_rate passes throttled through" \
-        "$(classify_rate "$(printf '%s\n' 15000 15100 15200)" "$(printf '%s\n' 0 0 0)" 20000 0.1 7)" "FAIL-BACKPRESSURE"
+        "$(classify_rate "$(printf '%s\n' 15000 15100 15200)" "$(printf '%s\n' 0 0 0)" 20000 0.1 400 15 64)" "FAIL-BACKPRESSURE"
     check "parse_throttled" "$(parse_throttled 'loadgen hec-http: backpressure: 12 503 responses, 3 requests abandoned after 5 retries')" "12"
     check "parse_abandoned" "$(parse_abandoned 'loadgen hec-http: backpressure: 12 503 responses, 3 requests abandoned after 5 retries')" "3"
     check "parse_throttled absent" "$(parse_throttled 'nothing here')" "0"
