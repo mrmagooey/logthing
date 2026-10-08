@@ -18,8 +18,8 @@ Parquet sink flushing every 5 s.
 | HEC `/services/collector/event` | no | drop + hash + mask | 79375 (pass 2); 80000 (pass 1); -7.3% / -0.8% vs the row above | CEILING | 462 / 1456 (pass 2); 61 / 1198 (pass 1) |
 | HEC `/services/collector/event` | yes | none | 78125 | CEILING | 428 / 504 |
 | HEC `/services/collector/event` | yes | drop + hash + mask | 75000 (`GEN_PROCS=2`); -4.0% vs the row above | CEILING | 520 / 1047 |
-| OTLP `/v1/logs` | yes | none | 10625 | CEILING | 166 / 244 |
-| OTLP `/v1/logs` | yes | drop + hash + mask | 10000; -5.9% vs the row above | CEILING | 64 / 30 |
+| OTLP `/v1/logs` | yes | none | 80625 (re-measured 2026-10-08, see below) | CEILING | 45 / 692 |
+| OTLP `/v1/logs` | yes | drop + hash + mask | 79375 (re-measured 2026-10-08); -1.6% vs the row above | CEILING | 0 / 375 |
 
 Notes on reading the table:
 
@@ -41,14 +41,21 @@ Notes on reading the table:
 - Each ceiling is the median of 3 runs. Under this host's load a single run occasionally
   stalled in the generator; the median absorbs such a run, and no cause is claimed for any
   individual stall.
-- OTLP ceilings (both gzip) are roughly 7-8x lower than the gzip HEC ceilings in this
-  environment (row 5 versus row 3: 7.4x; row 6 versus row 4: 7.5x). During the OTLP ceiling
-  runs the harness reported the generator at about 0.25 cores and the server at about
-  1.5-2.1 of its 8 cores, i.e. neither side was CPU-saturated. This document reports the
-  measurement and does not attribute a cause.
-- Row 6's count at the failing rate (30) is lower than at its last passing rate (64). The
-  count is a total over the 3 runs at that one rate and is not monotonic in the offered
-  rate; I did not investigate why, and make no claim about it.
+- **OTLP rows were re-measured on 2026-10-08** at commit `cf8af42` (branch
+  `fix/otlp-batch-accumulator`, same host, same harness settings, commands in
+  [Method](#method)); rows 1-4 are unchanged from 2026-10-07. The earlier OTLP ceilings were
+  10625 (no redaction) and 10000 (redaction). The cause was found: `OtlpSink` had no
+  amortized batch builder, so the single OTLP writer task built a 21-column one-row Arrow
+  batch for every record (about 75 us each) and concatenated them at flush. That one task
+  saturated one core near 13k records/s (the server used only about 2 of its 8 cores), the
+  writer channel filled and the handler answered 503. OTLP now appends records into reused
+  Arrow builders as HEC and Zeek do (`OtlpAccumulator`); the micro-benchmark
+  `benches/otlp_record_batch.rs` shows 10k records going from about 763 ms to about 14 ms of
+  Arrow work. With that fixed, OTLP and HEC ceilings are within noise of each other (80625
+  versus 78125 gzip no-redaction; 79375 versus 75000 with redaction, the latter measured
+  with different generator process counts). They are probably bounded by the shared
+  request-handling path or the generator, which this document did not investigate.
+- Row 6's count at its last passing rate is 0; its first failing rate (80000) had 375.
 
 ## Method
 
@@ -75,12 +82,12 @@ The generator retries 503 responses according to `Retry-After`; requests it give
 counted as "abandoned" and reported per run. A retry after a partial enqueue duplicates the
 enqueued prefix, see [hec.md](hec.md#backpressure).
 
-> **Note on the published labels.** The rows in this document were produced before the
+> **Note on the published labels.** The HEC rows in this document were produced before the
 > explain-the-shortfall rule above: the earlier harness called any run under 99% achieved
 > `FAIL-BACKPRESSURE` as soon as a single 503 was seen. The CEILING numbers are unchanged
 > by the rule (the ramp treats any failure, `FAIL-BACKPRESSURE` or `FAIL-LOSS`, as the
 > ceiling), but the "server pushed back" reading of a failing rate was not verified for each
-> row. Row 6's failing rate (30 503s over 3 runs) in particular may be generator-side.
+> row. The OTLP rows (5 and 6) were re-measured with the current harness.
 
 Redaction rows add this rule set, verbatim from the harness, to the listener's config:
 
@@ -124,8 +131,8 @@ FORMAT=otlp GZIP=1 PII_FIELDS=1 REDACTION=1 EVENTS_PER_REQUEST=100 DURATION=15 R
 | 3 | 5.92 | 3.82 / 9.03 |
 | 4, pass 1 (generator-limited, superseded) | 5.53 | 3.97 / 6.10 |
 | 4, pass 2 (`GEN_PROCS=2`) | 3.94 | 1.72 / 13.87 |
-| 5 | 5.01 | 3.24 / 6.40 |
-| 6 | 5.23 | 2.96 / 6.21 |
+| 5 (re-measured 2026-10-08) | 5.21 | not sampled; 6.20 at end of run |
+| 6 (re-measured 2026-10-08) | 6.20 | not sampled; 7.11 at end of run |
 
 ## Caveats
 

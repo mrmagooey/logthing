@@ -6,6 +6,14 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
+### Fixed
+
+- OTLP ingest throughput: the OTLP writer now appends records into reused Arrow builders
+  (`OtlpAccumulator`) instead of building a 21-column one-row batch per record, which capped a
+  single writer near 13k records/s and returned 503 above it. Single-node ceiling on the
+  benchmark host rose from 10625 to 80625 records/s (gzip, batches of 100); Parquet content is
+  unchanged. See `docs/performance.md`.
+
 ## [0.22.0] - 2026-10-07
 
 ### Breaking
