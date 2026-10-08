@@ -8,7 +8,7 @@
 # is: cargo validates every workspace member and [[bench]] target path when it
 # *parses* the manifest, so all of them must be present even though only
 # -p loadgen is built. See tests/docker_build_context_integration.rs.
-FROM rust:1.93-slim-bookworm AS build
+FROM rust:1.99-slim-bookworm AS build
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
