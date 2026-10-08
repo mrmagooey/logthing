@@ -1,6 +1,6 @@
 [package]
 name = "logthing"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2024"
 license = "MIT"
 
@@ -26,7 +26,7 @@ axum = { version = "0.7", features = ["macros"] }
 axum-extra = { version = "0.9", features = ["typed-header"] }
 headers = "0.4"
 tower = { version = "0.4", features = ["limit", "util"] }
-tower-http = { version = "0.5", features = ["trace", "cors", "timeout"] }
+tower-http = { version = "0.5", features = ["trace", "cors", "timeout", "decompression-gzip"] }
 # Already compiled in transitively as the axum 0.7 / hyper 1.x body types --
 # named directly (pinned to the exact versions already in Cargo.lock) so
 # `src/server/mod.rs`'s body-byte-budget middleware can implement
@@ -84,7 +84,7 @@ socket2 = "0.6"
 libc = "0.2"
 
 # Utilities
-uuid = { version = "1.7", features = ["v4", "serde"] }
+uuid = { version = "1.7", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
 futures = "0.3"
@@ -110,6 +110,9 @@ aws-credential-types = "1.1"
 tempfile = "3.9"
 bytes = "1.5"
 regex = "1.10"
+regex-syntax = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
 async-trait = "0.1"
 hex = "0.4.3"
 aho-corasick = "1.1"
@@ -148,6 +151,7 @@ pprof = { version = "0.14", default-features = false, features = [
 
 [dev-dependencies]
 tempfile = "3.9"
+flate2 = "1"
 metrics-util = { version = "0.16", features = ["debugging"] }
 criterion = "0.5"
 # `start_paused = true` on `#[tokio::test]` (src/net.rs's AcceptBackoff

@@ -1,10 +1,12 @@
 //! Generic JSON / HEC → S3 Parquet persistence.
 //!
 //! `GenericSink` is a `ParquetSink` that partitions `GenericRecord`s by
-//! `sourcetype`.  All partitions share a single fixed schema (6 columns):
+//! `sourcetype`.  All partitions share a single fixed schema (10 columns):
 //! `sourcetype`, `host` (nullable), `time` (nullable timestamp), `received_at`,
-//! `fields` (JSON string), and `partition_time` (non-null; derived from `time`,
-//! clamped and falling back to `received_at` -- see `ParquetSink::time_column`).
+//! `fields` (JSON string), `partition_time` (non-null; derived from `time`,
+//! clamped and falling back to `received_at` -- see `ParquetSink::time_column`),
+//! then the nullable envelope columns `event_uuid`, `source`, `index` and
+//! `indexed_fields` (JSON string).
 //! The `_overflow` partition uses the same schema.
 //!
 //! S3 key layout: `hec/<sourcetype>/year={Y}/month={MM}/day={DD}/{uuid}.parquet`
@@ -24,7 +26,7 @@ use std::sync::{Arc, LazyLock};
 #[derive(Clone, Default)]
 pub struct GenericSink;
 
-/// Build the fixed 6-column schema used for all HEC partitions.
+/// Build the fixed 10-column schema used for all HEC partitions.
 ///
 /// `LazyLock`-cached (one `Arc` for the process lifetime) so `new_batch`'s
 /// `Arc::ptr_eq` gate against this same value is meaningful -- a fresh
@@ -52,13 +54,17 @@ fn generic_schema() -> Arc<Schema> {
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 false,
             ),
+            Field::new("event_uuid", DataType::Utf8, true),
+            Field::new("source", DataType::Utf8, true),
+            Field::new("index", DataType::Utf8, true),
+            Field::new("indexed_fields", DataType::Utf8, true),
         ]))
     });
     S.clone()
 }
 
-/// Amortized builder set for the fixed 6-column HEC/generic schema. Holds
-/// the same 6 Arrow builders `to_record_batch` used to create fresh on
+/// Amortized builder set for the fixed 10-column HEC/generic schema. Holds
+/// the same 10 Arrow builders `to_record_batch` used to create fresh on
 /// every call, as persistent fields, so they can be reused across many
 /// records via `finish(&mut self)` instead of reallocated per record.
 /// Mirrors `suricata::schema::EnvelopeAccumulator`.
@@ -69,6 +75,10 @@ pub(crate) struct GenericAccumulator {
     b_received_at: TimestampMicrosecondBuilder,
     b_fields: StringBuilder,
     b_partition_time: TimestampMicrosecondBuilder,
+    b_event_uuid: StringBuilder,
+    b_source: StringBuilder,
+    b_index: StringBuilder,
+    b_indexed_fields: StringBuilder,
     rows: usize,
 }
 
@@ -82,6 +92,10 @@ impl GenericAccumulator {
             b_received_at: TimestampMicrosecondBuilder::new().with_data_type(ts_dtype.clone()),
             b_fields: StringBuilder::new(),
             b_partition_time: TimestampMicrosecondBuilder::new().with_data_type(ts_dtype),
+            b_event_uuid: StringBuilder::new(),
+            b_source: StringBuilder::new(),
+            b_index: StringBuilder::new(),
+            b_indexed_fields: StringBuilder::new(),
             rows: 0,
         }
     }
@@ -111,6 +125,16 @@ impl GenericAccumulator {
             crate::forwarding::buffered_writer::partition_time(record.time, record.received_at);
         self.b_partition_time
             .append_value(partition_time_value.timestamp_micros());
+        self.b_event_uuid
+            .append_option(record.event_uuid.as_deref());
+        self.b_source.append_option(record.source.as_deref());
+        self.b_index.append_option(record.index.as_deref());
+        self.b_indexed_fields.append_option(
+            record
+                .indexed_fields
+                .as_ref()
+                .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string())),
+        );
         self.rows += 1;
     }
 
@@ -122,6 +146,10 @@ impl GenericAccumulator {
             Arc::new(self.b_received_at.finish()),
             Arc::new(self.b_fields.finish()),
             Arc::new(self.b_partition_time.finish()),
+            Arc::new(self.b_event_uuid.finish()),
+            Arc::new(self.b_source.finish()),
+            Arc::new(self.b_index.finish()),
+            Arc::new(self.b_indexed_fields.finish()),
         ];
         self.rows = 0;
         Ok(RecordBatch::try_new(generic_schema(), columns)?)
@@ -140,7 +168,7 @@ impl crate::forwarding::buffered_writer::RecordBatchAccumulator<GenericRecord>
         // doc comment for why the parameter exists at all.
         _now: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<bool> {
-        // GenericSink has exactly one schema (the fixed 6-column schema),
+        // GenericSink has exactly one schema (the fixed 10-column schema),
         // unlike Zeek's per-log-path registry, so there is no mismatch case
         // to fall back from: every GenericRecord belongs to this accumulator.
         self.append_record_value(record);
@@ -178,7 +206,7 @@ impl ParquetSink for GenericSink {
     }
 
     /// All partitions — including `_overflow` and `None` — use the same fixed
-    /// 6-column schema.  There is no per-sourcetype typed schema.
+    /// 10-column schema.  There is no per-sourcetype typed schema.
     fn schema(&self, _partition: Option<&str>) -> Arc<Schema> {
         generic_schema()
     }
@@ -207,7 +235,7 @@ impl ParquetSink for GenericSink {
     }
 
     /// Amortized-builder fast path: `GenericSink` has exactly one schema
-    /// (the fixed 6-column schema), so this always matches -- gated on
+    /// (the fixed 10-column schema), so this always matches -- gated on
     /// `Arc::ptr_eq` rather than unconditionally returning `Some` purely
     /// defensively, mirroring `SuricataSink::new_batch`, in case a second
     /// schema is ever added.
@@ -328,6 +356,8 @@ mod tests {
             region: "us-east-1".to_string(),
             access_key: "AKIATEST".to_string(),
             secret_key: "SECRETTEST".to_string(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         };
         Arc::new(S3Sink::from_connection(&conn).await.expect("constructs"))
     }
@@ -339,6 +369,7 @@ mod tests {
             time: Some(Utc::now()),
             fields: json!({"action": "login", "user": "alice"}),
             received_at: Utc::now(),
+            ..Default::default()
         }
     }
 
@@ -381,9 +412,9 @@ mod tests {
     }
 
     #[test]
-    fn generic_sink_schema_has_six_columns() {
+    fn generic_sink_schema_has_ten_columns() {
         let schema = GenericSink.schema(Some("access_log"));
-        assert_eq!(schema.fields().len(), 6);
+        assert_eq!(schema.fields().len(), 10);
         for col in &[
             "sourcetype",
             "host",
@@ -655,6 +686,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "AKIATEST".to_string(),
                 secret_key: "SECRETTEST".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "hec".to_string(),
             max_buffer_rows: 100_000,
@@ -703,6 +736,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "AKIATEST".to_string(),
                 secret_key: "SECRETTEST".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "hec".to_string(),
             max_buffer_rows: 100_000,
@@ -745,6 +780,8 @@ mod tests {
             region: "us-east-1".to_string(),
             access_key: "AKIATEST".to_string(),
             secret_key: "SECRETTEST".to_string(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         };
         let s3 = Arc::new(S3Sink::from_connection(&conn).await.expect("S3Sink"));
         let cfg = HecS3Config {
@@ -822,6 +859,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "K".to_string(),
                 secret_key: "S".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "hec".to_string(),
             max_buffer_rows: 1_000,
@@ -869,6 +908,7 @@ mod tests {
                 time: None,
                 fields: json!({"uptime": 42}),
                 received_at: Utc::now(),
+                ..Default::default()
             },
             // Unusual/attacker-shaped sourcetype -- must round-trip byte for
             // byte, not just for the common ASCII case. `sourcetype` is
@@ -880,6 +920,7 @@ mod tests {
                 time: Some(Utc::now()),
                 fields: json!({"note": "unicode sourcetype"}),
                 received_at: Utc::now(),
+                ..Default::default()
             },
         ]
     }
@@ -992,5 +1033,69 @@ mod tests {
             GenericSink.new_batch(&unrelated_schema).is_none(),
             "new_batch must not activate for a schema Arc it doesn't own"
         );
+    }
+
+    #[test]
+    fn generic_schema_appends_typed_hec_columns_after_the_original_six() {
+        let schema = GenericSink.schema(None);
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "sourcetype",
+                "host",
+                "time",
+                "received_at",
+                "fields",
+                "partition_time",
+                "event_uuid",
+                "source",
+                "index",
+                "indexed_fields"
+            ]
+        );
+        for n in ["event_uuid", "source", "index", "indexed_fields"] {
+            let f = schema.field_with_name(n).unwrap();
+            assert_eq!(f.data_type(), &DataType::Utf8, "{n}");
+            assert!(f.is_nullable(), "{n} must be nullable (additive evolution)");
+        }
+    }
+
+    #[test]
+    fn generic_record_envelope_fields_become_columns_and_absent_ones_null() {
+        use arrow::array::{Array, StringArray};
+        let schema = GenericSink.schema(None);
+        let mut rec = make_record("access_log");
+        rec.event_uuid = Some("0199c4e0-7d2a-7b3c-9a10-4f2b6d8e1c35".to_string());
+        rec.source = Some("/var/log/app.log".to_string());
+        rec.index = Some("main".to_string());
+        rec.indexed_fields = Some(json!({"env": "prod"}));
+        let batch = GenericSink.to_record_batch(&rec, &schema).unwrap();
+        let col = |n: &str| {
+            batch
+                .column_by_name(n)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            col("event_uuid").value(0),
+            "0199c4e0-7d2a-7b3c-9a10-4f2b6d8e1c35"
+        );
+        assert_eq!(col("source").value(0), "/var/log/app.log");
+        assert_eq!(col("index").value(0), "main");
+        assert_eq!(col("indexed_fields").value(0), r#"{"env":"prod"}"#);
+
+        let bare = GenericSink
+            .to_record_batch(&make_record("access_log"), &schema)
+            .unwrap();
+        for n in ["event_uuid", "source", "index", "indexed_fields"] {
+            assert!(
+                bare.column_by_name(n).unwrap().is_null(0),
+                "{n} must be null"
+            );
+        }
     }
 }

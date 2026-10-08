@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
-# End-to-end: Helm chart on minikube -> syslog into logthing -> committer -> Trino and Hue see the rows.
-# Requires minikube (docker driver), helm, kubectl and an AVX2-capable CPU (or TRINO_IMAGE/HUE_IMAGE
-# overrides; locally present override images are loaded into the cluster). KEEP_CLUSTER=1 keeps it.
+# End-to-end: Helm chart on minikube -> syslog, Zeek, OTLP and HEC into logthing -> committer -> Trino (HTTPS + password) and Metabase see the rows.
+# Requires minikube (docker driver), helm, kubectl and an AVX2-capable CPU (or a TRINO_IMAGE
+# override; locally present override images are loaded into the cluster). KEEP_CLUSTER=1 keeps it.
 set -euo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ANALYTICS=$(cd -- "$HERE/../.." && pwd)
 . "$HERE/lib.sh"
 preflight_cpu
+DBT=${DBT:-$ANALYTICS/.venv/bin/dbt}
+[ -x "$DBT" ] || { echo "dbt not found at $DBT: run $ANALYTICS/.venv/bin/pip install -r $ANALYTICS/tests/requirements.txt (or set DBT=)" >&2; exit 1; }
+DBT_WORK=$(mktemp -d)
+build_local_images   # logthing + committer from THIS checkout (A1 code); set LOGTHING_IMAGE/COMMITTER_IMAGE to skip
 
 PROFILE=${MINIKUBE_PROFILE:-lt-analytics-e2e}
 NS=analytics
 FULL=lt-logthing-analytics
 CHART="$ANALYTICS/helm/logthing-analytics"
-HUE_LOCAL_PORT=28889
+TRINO_LOCAL_PORT=28443
+MB_LOCAL_PORT=28000
+CA=$(mktemp)
 N=40
 MARKER="analytics-e2e-$(date +%s)-$$"
 PY=${PYTHON:-python3}
@@ -27,10 +33,16 @@ fi
 export KUBECONFIG
 K=(kubectl --context "$PROFILE" -n "$NS")
 H=(helm --kube-context "$PROFILE")
+TRINO_CLI=(trino --server https://localhost:8443 --truststore-path /etc/trino/tls/ca.pem
+           --user admin --password)
 
 PF_PID=""
+MB_PF_PID=""
 cleanup() {
   [ -z "$PF_PID" ] || kill "$PF_PID" 2>/dev/null || true
+  [ -z "$MB_PF_PID" ] || kill "$MB_PF_PID" 2>/dev/null || true
+  rm -f "$CA"
+  rm -rf "$DBT_WORK"
   if [ "${KEEP_CLUSTER:-}" = 1 ]; then
     echo "KEEP_CLUSTER=1: leaving minikube profile $PROFILE running" >&2
   else
@@ -46,15 +58,16 @@ dump_logs() {
   "${K[@]}" logs -l app.kubernetes.io/component=committer --tail 80 --prefix >&2 || true
   "${K[@]}" logs "deploy/$FULL-logthing" --tail 80 >&2 || true
 }
+fail() { echo "FAIL: $*" >&2; "${K[@]}" logs "deploy/$FULL-trino" --tail 80 >&2 || true; exit 1; }
 
-echo "== [1/7] minikube profile $PROFILE =="
+echo "== [1/9] minikube profile $PROFILE =="
 # start is idempotent on a running profile (status exits non-zero against a fresh private kubeconfig).
 minikube start -p "$PROFILE" --cpus 6 --memory 12g --driver docker
 # A kept cluster's context is not in this run's private kubeconfig; (re)write it.
 minikube update-context -p "$PROFILE" >/dev/null
 
-echo "== [2/7] load local override images =="
-for img in "${TRINO_IMAGE:-}" "${HUE_IMAGE:-}"; do
+echo "== [2/9] load local override images =="
+for img in "${TRINO_IMAGE:-}" "$LOGTHING_IMAGE" "$COMMITTER_IMAGE"; do
   if [ -n "$img" ] && docker image inspect "$img" >/dev/null 2>&1; then
     # Loading a multi-GB image is slow; skip it when a kept cluster already has it.
     if ! minikube -p "$PROFILE" image ls 2>/dev/null | grep -qxF -e "$img" -e "docker.io/$img" -e "docker.io/library/$img"; then
@@ -63,21 +76,38 @@ for img in "${TRINO_IMAGE:-}" "${HUE_IMAGE:-}"; do
   fi
 done
 
-echo "== [3/7] helm install =="
-SETS=(--set logthing.flushIntervalSecs=5)
+echo "== [3/9] helm install =="
+SETS=(--set logthing.flushIntervalSecs=5
+      --set "logthing.image=$LOGTHING_IMAGE" --set "committer.image=$COMMITTER_IMAGE")
 [ -z "${TRINO_IMAGE:-}" ] || SETS+=(--set "trino.image=$TRINO_IMAGE")
-[ -z "${HUE_IMAGE:-}" ] || SETS+=(--set "hue.image=$HUE_IMAGE")
 "${H[@]}" upgrade --install lt "$CHART" --namespace "$NS" --create-namespace --wait --timeout 15m "${SETS[@]}" \
   || { echo "helm install failed" >&2; dump_logs; exit 1; }
 
-echo "== [4/7] wait for init jobs =="
+echo "== [3b/9] helm upgrade keeps generated credentials (lookup persistence) =="
+secret_hash() {
+  for s in "$FULL-credentials" "$FULL-trino-tls"; do
+    "${K[@]}" get secret "$s" -o jsonpath='{.data}'
+  done | sha256sum | cut -d' ' -f1
+}
+BEFORE=$(secret_hash)
+"${H[@]}" upgrade lt "$CHART" --namespace "$NS" --reuse-values --wait --timeout 15m \
+  || { echo "helm upgrade failed" >&2; dump_logs; exit 1; }
+[ "$(secret_hash)" = "$BEFORE" ] \
+  || { echo "credentials or Trino TLS Secret changed across helm upgrade" >&2; exit 1; }
+
+echo "== [3c/9] NetworkPolicies exist (enforcement is NOT tested: minikube's default CNI is not verified to enforce them) =="
+for p in lakekeeper postgres garage trino; do
+  "${K[@]}" get networkpolicy "$FULL-$p" >/dev/null || { echo "missing NetworkPolicy $FULL-$p" >&2; exit 1; }
+done
+
+echo "== [4/9] wait for init jobs =="
 # Job names carry the release revision, so select by label.
-for c in garage-init lakekeeper-init; do
+for c in garage-init lakekeeper-init metabase-init; do
   "${K[@]}" wait --for=condition=complete job -l "app.kubernetes.io/component=$c" --timeout 10m \
     || { echo "job $c did not complete" >&2; "${K[@]}" logs -l "app.kubernetes.io/component=$c" --tail 80 >&2 || true; exit 1; }
 done
 
-echo "== [5/7] send $N syslog messages ($MARKER) =="
+echo "== [5/9] send $N syslog messages ($MARKER) =="
 SENDER=$(cat <<PYEOF
 import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -92,13 +122,73 @@ timeout 300 "${K[@]}" run sender --rm -i --restart=Never --pod-running-timeout=3
   --image=python:3.12-slim -- python -c "$SENDER" \
   || { echo "sender failed" >&2; exit 1; }
 
+ZEEK_SENDER=$(cat <<PYEOF
+import json, socket, time
+ts = time.time()
+recs = [
+    {"_path": "conn", "ts": ts, "uid": "$MARKER", "id.orig_h": "10.20.30.40", "id.orig_p": 51234,
+     "id.resp_h": "198.51.100.9", "id.resp_p": 443, "proto": "tcp", "service": "ssl",
+     "duration": 1.5, "orig_bytes": 100, "resp_bytes": 2000, "conn_state": "SF",
+     "history": "ShADadFf", "orig_pkts": 4, "resp_pkts": 6},
+    {"_path": "dns", "ts": ts, "uid": "$MARKER", "id.orig_h": "10.20.30.40", "id.orig_p": 53211,
+     "id.resp_h": "10.20.30.1", "id.resp_p": 53, "proto": "udp", "trans_id": 4242,
+     "query": "$MARKER.example.test", "qtype_name": "A", "qclass_name": "C_INTERNET",
+     "rcode_name": "NOERROR", "answers": ["192.0.2.10"]},
+]
+s = socket.create_connection(("$FULL-logthing-tcp", 47760), 10)
+for r in recs:
+    s.sendall((json.dumps(r) + "\n").encode())
+s.close()
+PYEOF
+)
+"${K[@]}" delete pod zeeksender --ignore-not-found >/dev/null
+timeout 300 "${K[@]}" run zeeksender --rm -i --restart=Never --pod-running-timeout=3m \
+  --image=python:3.12-slim -- python -c "$ZEEK_SENDER" \
+  || { echo "zeek sender failed" >&2; exit 1; }
+
+echo "== [5b/9] send $N OTLP records and $N HEC events with the generated tokens =="
+secret_key() {
+  local v
+  v=$("${K[@]}" get secret "$FULL-credentials" -o jsonpath="{.data.$1}" | base64 -d) || v=
+  [ -n "$v" ] || fail "Secret $FULL-credentials has no key $1"
+}
+secret_key hec-token; secret_key otlp-bearer-token
+"${K[@]}" delete pod appsender --ignore-not-found >/dev/null
+# Tokens reach the pod through secretKeyRef, so they never appear in the pod spec or local argv.
+"${K[@]}" apply -f - >/dev/null <<YEOF || fail "could not create appsender pod"
+apiVersion: v1
+kind: Pod
+metadata: {name: appsender}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: appsender
+      image: python:3.12-slim
+      command: [python, -c]
+      args:
+        - |
+$(sed 's/^/          /' "$HERE/send_app_logs.py")
+        - http://$FULL-logthing-tcp:5985
+        - $MARKER
+        - "$N"
+      env:
+        - name: HEC_TOKEN
+          valueFrom: {secretKeyRef: {name: $FULL-credentials, key: hec-token}}
+        - name: OTLP_BEARER_TOKEN
+          valueFrom: {secretKeyRef: {name: $FULL-credentials, key: otlp-bearer-token}}
+YEOF
+"${K[@]}" wait --for=jsonpath='{.status.phase}'=Succeeded pod/appsender --timeout=300s \
+  || { echo "app log sender failed" >&2; "${K[@]}" logs appsender >&2 || true; dump_logs; exit 1; }
+"${K[@]}" logs appsender
+"${K[@]}" delete pod appsender --ignore-not-found >/dev/null
+
 COUNT_SQL="SELECT count(*) FROM iceberg.logs.syslog WHERE message LIKE '%$MARKER%'"
 trino_count() {
-  timeout 30 "${K[@]}" exec "deploy/$FULL-trino" -- trino --output-format TSV --execute "$COUNT_SQL" 2>/dev/null \
+  timeout 30 "${K[@]}" exec "deploy/$FULL-trino" -- "${TRINO_CLI[@]}" --output-format TSV --execute "$COUNT_SQL" 2>/dev/null \
     | tr -d '"\r' || true
 }
 
-echo "== [6/7] wait (<=300s) for committer to land rows in iceberg.logs.syslog =="
+echo "== [6/9] wait (<=300s) for committer to land rows in iceberg.logs.syslog =="
 deadline=$(( $(date +%s) + 300 ))
 until [ "$(trino_count)" = "$N" ]; do
   if [ "$(date +%s)" -ge "$deadline" ]; then
@@ -108,21 +198,84 @@ until [ "$(trino_count)" = "$N" ]; do
   fi
   sleep 5
 done
+sql() {
+  timeout 60 "${K[@]}" exec "deploy/$FULL-trino" -- "${TRINO_CLI[@]}" --output-format TSV --execute "$1" | tr -d '"\r'
+}
+zeek_landed() { [ "$(sql "SELECT count(*) FROM iceberg.logs.$1 WHERE uid = '$MARKER'")" = 1 ]; }
+wait_until 300 "zeek_conn row" zeek_landed zeek_conn || { dump_logs; exit 1; }
+wait_until 300 "zeek_dns row" zeek_landed zeek_dns || { dump_logs; exit 1; }
+wait_until 300 "otlp + hec rows" app_logs_landed || { dump_logs; exit 1; }
+assert_app_log_rows || { dump_logs; exit 1; }
 echo "trino: $N"
 
-echo "== [7/7] same query through Hue's REST API =="
-"${K[@]}" port-forward "svc/$FULL-hue" "$HUE_LOCAL_PORT:8888" >/dev/null 2>&1 &
+echo "== [7/9] Trino security through a port-forward: HTTPS + password negatives =="
+"${K[@]}" port-forward "svc/$FULL-trino" "$TRINO_LOCAL_PORT:8443" >/dev/null 2>&1 &
 PF_PID=$!
-hue_alive() {
-  kill -0 "$PF_PID" 2>/dev/null && curl -fsS "http://127.0.0.1:$HUE_LOCAL_PORT/desktop/debug/is_alive"
+"${K[@]}" get secret "$FULL-trino-tls" -o jsonpath='{.data.ca\.pem}' | base64 -d >"$CA"
+ADMIN_PW=$("${K[@]}" get secret "$FULL-credentials" -o jsonpath='{.data.trino-admin-password}' | base64 -d)
+trino_alive() {
+  kill -0 "$PF_PID" 2>/dev/null && curl -s -o /dev/null --cacert "$CA" "https://localhost:$TRINO_LOCAL_PORT/v1/info"
 }
-wait_until 120 "Hue port-forward" hue_alive \
-  || { "${K[@]}" logs "deploy/$FULL-hue" --tail 80 >&2 || true; exit 1; }
-# The password is arbitrary: Hue creates the user (as superuser) on first login.
-HUE_COUNT=$(HUE_PASSWORD=e2e-admin-pass "$PY" "$HERE/hue_query.py" "http://127.0.0.1:$HUE_LOCAL_PORT" admin \
-  "SELECT count(*) FROM syslog WHERE message LIKE '%$MARKER%'") \
-  || { "${K[@]}" logs "deploy/$FULL-hue" --tail 80 >&2 || true; exit 1; }
-[ "$HUE_COUNT" = "$N" ] || { echo "Hue returned $HUE_COUNT, expected $N" >&2; exit 1; }
-echo "hue: $HUE_COUNT"
+wait_until 120 "Trino port-forward" trino_alive \
+  || { "${K[@]}" logs "deploy/$FULL-trino" --tail 80 >&2 || true; exit 1; }
+trino_security_checks "https://localhost:$TRINO_LOCAL_PORT" "$CA" "$ADMIN_PW" \
+  || { "${K[@]}" logs "deploy/$FULL-trino" --tail 80 >&2 || true; exit 1; }
+# Topology B: plain-HTTP 8080 is internal to the pod; the Service must expose only 8443.
+PORTS=$("${K[@]}" get svc "$FULL-trino" -o jsonpath='{.spec.ports[*].port}')
+[ "$PORTS" = 8443 ] || { echo "Trino Service exposes ports '$PORTS', expected only 8443" >&2; exit 1; }
+if "${K[@]}" exec "deploy/$FULL-trino" -- env TRINO_PASSWORD=wrong "${TRINO_CLI[@]}" --execute 'SELECT 1' >/dev/null 2>&1; then
+  echo "Trino CLI accepted a wrong password" >&2; exit 1
+fi
+
+echo "== [8/9] dbt build through the Trino port-forward =="
+rc=0
+DBT_OUT=$(env TRINO_HOST=localhost TRINO_PORT="$TRINO_LOCAL_PORT" TRINO_USER=admin \
+  TRINO_PASSWORD="$ADMIN_PW" TRINO_CA_CERT="$CA" DBT_SEND_ANONYMOUS_USAGE_STATS=false \
+  "$DBT" --log-path "$DBT_WORK/logs" build --project-dir "$ANALYTICS/dbt" \
+  --profiles-dir "$ANALYTICS/dbt" --target-path "$DBT_WORK/target" 2>&1) || rc=$?
+printf '%s\n' "$DBT_OUT"
+dbt_ok "$rc" "$DBT_OUT" \
+  || { echo "dbt build failed (exit $rc or ERROR>0 in summary)" >&2
+       "${K[@]}" logs "deploy/$FULL-trino" --tail 80 >&2 || true; exit 1; }
+echo "dbt: build ok"
+
+echo "== [8b/9] OCSF views and detection analyses over the Zeek rows =="
+[ "$(sql "SELECT count(*) FROM iceberg.logs.ocsf_network_activity WHERE metadata_correlation_uid = '$MARKER' AND class_uid = 4001 AND src_endpoint_ip = '10.20.30.40' AND dst_endpoint_port = 443 AND connection_info_protocol_num = 6")" = 1 ] \
+  || fail "ocsf_network_activity did not map the Zeek conn record"
+[ "$(sql "SELECT count(*) FROM iceberg.logs.ocsf_dns_activity WHERE metadata_correlation_uid = '$MARKER' AND query_hostname = '$MARKER.example.test' AND activity_id = 2")" = 1 ] \
+  || fail "ocsf_dns_activity did not map the Zeek dns record"
+env TRINO_HOST=localhost TRINO_PORT="$TRINO_LOCAL_PORT" TRINO_USER=admin \
+  TRINO_PASSWORD="$ADMIN_PW" TRINO_CA_CERT="$CA" DBT_SEND_ANONYMOUS_USAGE_STATS=false \
+  "$DBT" --log-path "$DBT_WORK/logs" compile --project-dir "$ANALYTICS/dbt" \
+  --profiles-dir "$ANALYTICS/dbt" --target-path "$DBT_WORK/target" >/dev/null || fail "dbt compile failed"
+analyses=0
+for f in "$DBT_WORK"/target/compiled/logthing_analytics/analyses/*.sql; do
+  sql "$(cat "$f")" >/dev/null || fail "analysis $(basename "$f") failed to execute"
+  analyses=$((analyses + 1))
+done
+[ "$analyses" = 3 ] || fail "expected 3 compiled analyses, found $analyses"
+echo "ocsf: network + dns mapped; $analyses analyses executed"
+
+echo "== [9/9] same query through Metabase's API =="
+"${K[@]}" port-forward "svc/$FULL-metabase" "$MB_LOCAL_PORT:3000" >/dev/null 2>&1 &
+MB_PF_PID=$!
+mb_alive() { kill -0 "$MB_PF_PID" 2>/dev/null && curl -fsS "http://127.0.0.1:$MB_LOCAL_PORT/api/health"; }
+wait_until 180 "Metabase port-forward" mb_alive \
+  || { "${K[@]}" logs "deploy/$FULL-metabase" --tail 80 >&2 || true; exit 1; }
+MB_PW=$("${K[@]}" get secret "$FULL-credentials" -o jsonpath='{.data.metabase-admin-password}' | base64 -d)
+MB_COUNT=$(METABASE_PASSWORD="$MB_PW" "$PY" "$HERE/metabase_query.py" \
+  "http://127.0.0.1:$MB_LOCAL_PORT" admin@logthing.example "$COUNT_SQL") \
+  || { "${K[@]}" logs "deploy/$FULL-metabase" --tail 80 >&2 || true; exit 1; }
+[ "$MB_COUNT" = "$N" ] || { echo "Metabase returned $MB_COUNT, expected $N" >&2; exit 1; }
+echo "metabase: $MB_COUNT"
+OTLP_MB=$(METABASE_PASSWORD="$MB_PW" "$PY" "$HERE/metabase_query.py" \
+  "http://127.0.0.1:$MB_LOCAL_PORT" admin@logthing.example \
+  "SELECT count(*) FROM iceberg.logs.otlp WHERE $(_otlp_where)") \
+  || { "${K[@]}" logs "deploy/$FULL-metabase" --tail 80 >&2 || true; exit 1; }
+[ "$OTLP_MB" = "$N" ] || { echo "Metabase otlp count $OTLP_MB, expected $N" >&2; exit 1; }
+echo "metabase otlp: $OTLP_MB"
+# Last: it inserts a duplicate raw otlp row, which would break the Metabase count above.
+assert_staging_dedup || { dump_logs; exit 1; }
+echo "staging: stg_otlp/stg_hec = $N, duplicate event_uuid deduped"
 
 echo "Analytics Helm E2E PASSED"

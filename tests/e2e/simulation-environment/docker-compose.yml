@@ -17,6 +17,7 @@ services:
       - ipfix-local-data:/var/log/ipfix-local
       - wef-local-data:/var/log/wef-local
       - hec-local-data:/var/log/hec-local
+      - otlp-local-data:/var/log/otlp-local
       - iceberg-local-data:/var/log/iceberg-local
     depends_on:
       - minio
@@ -497,6 +498,34 @@ services:
     networks:
       - e2e
 
+  otlp-generator:
+    build:
+      context: .
+      dockerfile: otlp-generator/Dockerfile
+    environment:
+      - LOGTHING_URL=http://logthing:5985
+      - OTLP_TOKEN=e2e-otlp-token
+      - CONNECT_TIMEOUT_SECS=30
+    depends_on:
+      - logthing
+    networks:
+      - e2e
+
+  otlp-local-verifier:
+    build:
+      context: .
+      dockerfile: otlp-local-verifier/Dockerfile
+    environment:
+      - OTLP_LOCAL_DIR=/var/log/otlp-local
+      - E2E_TIMEOUT_SECS=60
+    volumes:
+      - otlp-local-data:/var/log/otlp-local:ro
+    depends_on:
+      - otlp-generator
+      - logthing
+    networks:
+      - e2e
+
 networks:
   e2e:
     driver: bridge
@@ -506,4 +535,5 @@ volumes:
   ipfix-local-data:
   wef-local-data:
   hec-local-data:
+  otlp-local-data:
   iceberg-local-data:

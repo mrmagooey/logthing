@@ -1,0 +1,32 @@
+version: 2
+
+sources:
+  - name: logthing
+    description: >
+      Iceberg tables registered by the logthing committer in namespace `logs` (Lakekeeper
+      warehouse `logthing`). A table exists only after data for it has been committed.
+    database: iceberg
+    schema: logs
+    tables:
+      - name: wef
+        description: Windows Event Forwarding events; `event_data` is the serialized WindowsEvent JSON (raw_xml + parsed).
+      - name: syslog
+        description: Syslog messages. No natural OCSF class, so no OCSF model.
+      - name: structured_syslog
+        description: Structured-data syslog records. No OCSF model.
+      - name: zeek_conn
+        description: Zeek conn.log (table zeek_<stream>).
+      - name: zeek_dns
+        description: Zeek dns.log.
+      - name: ipfix
+        description: IPFIX / NetFlow flow records.
+      - name: sflow_flow
+        description: sFlow flow samples (table sflow_<partition>).
+      - name: sflow_counter
+        description: sFlow counter samples (interface counters, not flows).
+      - name: suricata
+        description: Suricata EVE JSON envelope (event_type, src_ip, payload).
+      - name: hec
+        description: Splunk HEC / NDJSON events (event_uuid, source, index, indexed_fields exist from 0.22.0; NULL on older rows).
+      - name: otlp
+        description: OTLP logs, one typed table for all services (21 columns, docs/otlp.md); exists once the first OTLP record is committed.

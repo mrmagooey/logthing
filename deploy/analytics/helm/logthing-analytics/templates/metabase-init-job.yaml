@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "la.fullname" . }}-metabase-init-{{ .Release.Revision }}
+  labels:
+    {{- include "la.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metabase-init
+spec:
+  # Plain Job, not a hook (see garage-init). Retries internally until Metabase and Trino are ready.
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 20
+  template:
+    metadata:
+      labels:
+        {{- include "la.podLabels" (dict "root" . "component" "metabase-init") | nindent 8 }}
+      annotations:
+        checksum/files: {{ include (print $.Template.BasePath "/configmap-files.yaml") . | sha256sum }}
+        {{- if not .Values.credentials.existingSecret }}
+        checksum/secret: {{ include "la.credsum" . }}
+        {{- end }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: metabase-init
+          image: {{ .Values.bootstrap.image }}
+          command: ["python", "/bootstrap/bootstrap.py", "metabase"]
+          env:
+            - {name: METABASE_URL, value: "http://{{ include "la.fullname" . }}-metabase:3000"}
+            - {name: METABASE_ADMIN_EMAIL, value: {{ .Values.metabase.adminEmail | quote }}}
+            {{- include "la.secretEnv" (dict "root" . "name" "METABASE_ADMIN_PASSWORD" "key" "metabase-admin-password") | nindent 12 }}
+            - {name: TRINO_HOST, value: "{{ include "la.fullname" . }}-trino"}
+            - {name: TRINO_PORT, value: "8443"}
+            - {name: TRINO_METABASE_USER, value: metabase}
+            {{- include "la.secretEnv" (dict "root" . "name" "TRINO_METABASE_PASSWORD" "key" "trino-metabase-password") | nindent 12 }}
+            - {name: TRINO_TLS_MODE, value: {{ .Values.metabase.trinoTlsMode | quote }}}
+            - {name: TRINO_CA_PATH, value: /tls/ca.pem}
+            - {name: BOOTSTRAP_TIMEOUT_SECS, value: {{ .Values.bootstrap.timeoutSecs | quote }}}
+          volumeMounts:
+            - {name: files, mountPath: /bootstrap/bootstrap.py, subPath: bootstrap.py}
+      volumes:
+        {{- include "la.filesVolume" . | nindent 8 }}

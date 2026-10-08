@@ -8,6 +8,8 @@
 //! No external dependency required.  These tests MUST run and pass without
 //! MinIO or any other service.
 
+mod common;
+
 use axum::{Extension, Router, extract::DefaultBodyLimit, routing::post};
 use logthing::config::Config;
 use logthing::ingest::{
@@ -30,10 +32,7 @@ async fn spawn_hec_server(token: &str) -> (String, tokio::task::JoinHandle<()>) 
     let mut cfg = Config::default();
     cfg.hec.token = token.to_string();
     let shared_config = Arc::new(RwLock::new(cfg));
-    let ingest_state = IngestState {
-        generic_s3: None,
-        generic_local: None,
-    };
+    let ingest_state = IngestState::default();
 
     let router: Router = Router::new()
         .route("/services/collector/event", post(handle_hec_event))
@@ -257,4 +256,74 @@ async fn e2e_hec_event_multiple_newline_delimited_returns_200() {
         .unwrap();
 
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+/// Like `spawn_hec_server` but wired to a real local-disk sink under `dir`.
+async fn spawn_hec_server_with_local_sink(
+    dir: &std::path::Path,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use logthing::config::GenericLocalConfig;
+    use logthing::forwarding::generic_s3::hec_local_start;
+    use logthing::forwarding::local_sink::LocalDiskSink;
+
+    let sink = Arc::new(LocalDiskSink::new(dir.to_path_buf()).await.unwrap());
+    let cfg = GenericLocalConfig {
+        directory: dir.to_path_buf(),
+        prefix: "hec".to_string(),
+        flush_threshold_bytes: 1, // flush on first byte
+        flush_interval_secs: 1,
+        channel_capacity: 256,
+        max_buffer_rows: 100_000,
+    };
+    let (handler, _join) = hec_local_start(
+        &cfg,
+        sink,
+        64,
+        Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+    let ingest_state = IngestState {
+        generic_local: Some(handler),
+        ..Default::default()
+    };
+    let shared_config = Arc::new(RwLock::new(Config::default()));
+    let router: Router = Router::new()
+        .route("/services/collector/event", post(handle_hec_event))
+        .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(Extension(shared_config))
+        .layer(Extension(ingest_state));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (base, handle)
+}
+
+#[tokio::test]
+async fn e2e_hec_event_persists_event_uuid_and_envelope_columns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (base, _server) = spawn_hec_server_with_local_sink(tmp.path()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/services/collector/event"))
+        .json(&serde_json::json!({
+            "event": {"msg": "e2e"}, "sourcetype": "e2e_t", "source": "unit",
+            "index": "main", "fields": {"env": "test"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let batches = common::wait_for_rows(tmp.path(), 1, Duration::from_secs(15)).await;
+    let b = &batches[0];
+    let id = common::str_col(b, "event_uuid").value(0);
+    assert_eq!(uuid::Uuid::parse_str(id).unwrap().get_version_num(), 7);
+    assert_eq!(common::str_col(b, "source").value(0), "unit");
+    assert_eq!(common::str_col(b, "index").value(0), "main");
+    assert_eq!(
+        common::str_col(b, "indexed_fields").value(0),
+        r#"{"env":"test"}"#
+    );
+    assert_eq!(common::str_col(b, "sourcetype").value(0), "e2e_t");
 }

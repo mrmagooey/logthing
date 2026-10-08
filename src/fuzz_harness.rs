@@ -197,9 +197,17 @@ pub fn hec(data: &[u8]) -> usize {
         1 => parse_hec_raw_body(body, "fuzz").map(|r| vec![r]),
         _ => parse_ndjson_body(body, "fuzz"),
     };
-    let Ok(records) = records else {
+    let Ok(mut records) = records else {
         return 0;
     };
+    // Mirror the production handlers: redaction (no rules here) precedes id assignment.
+    let ingest = crate::ingest::IngestState::default();
+    if let Some(r) = &ingest.hec_redactor {
+        for rec in records.iter_mut() {
+            r.redact_generic(rec);
+        }
+    }
+    crate::ingest::assign_event_uuids(&mut records);
     for rec in &records {
         map_record(&GenericSink, rec);
     }
@@ -222,9 +230,17 @@ pub fn otlp(data: &[u8]) -> usize {
     let Some(req) = req else {
         return 0;
     };
-    let records = crate::server::otlp::map_otlp_request(req, "192.0.2.1".to_string());
+    let mut records = crate::server::otlp::map_otlp_request(req, "192.0.2.1".to_string());
+    // Mirror the production handler: redaction (no rules here), then ids after mapping.
+    let ingest = crate::ingest::IngestState::default();
+    if let Some(r) = &ingest.otlp_redactor {
+        for rec in records.iter_mut() {
+            r.redact_otlp(rec);
+        }
+    }
+    crate::ingest::assign_event_uuids(&mut records);
     for rec in &records {
-        map_record(&GenericSink, rec);
+        map_record(&crate::forwarding::otlp_s3::OtlpSink, rec);
     }
     records.len()
 }

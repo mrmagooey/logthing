@@ -27,6 +27,8 @@ fn minio_hec_config(endpoint: &str) -> HecS3Config {
                 .unwrap_or_else(|_| "minioadmin".to_string()),
             secret_key: std::env::var("MINIO_SECRET_KEY")
                 .unwrap_or_else(|_| "minioadmin".to_string()),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         },
         prefix: "hec".to_string(),
         max_buffer_rows: 1,       // flush immediately
@@ -43,6 +45,7 @@ fn make_record(sourcetype: &str, user: &str) -> GenericRecord {
         time: Some(chrono::Utc::now()),
         fields: serde_json::json!({"user": user, "action": "login"}),
         received_at: chrono::Utc::now(),
+        ..Default::default()
     }
 }
 
@@ -153,8 +156,8 @@ async fn hec_records_appear_as_parquet_in_s3() {
         }
         assert_eq!(
             schema.fields().len(),
-            6,
-            "HEC schema must have exactly 6 columns"
+            10,
+            "HEC schema must have exactly 10 columns"
         );
 
         let mut reader = builder.build().expect("parquet reader");

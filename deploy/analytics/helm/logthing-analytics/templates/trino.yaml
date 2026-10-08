@@ -6,8 +6,9 @@ metadata:
 spec:
   type: {{ .Values.trino.service.type }}
   selector: {{- include "la.selector" (dict "root" . "component" "trino") | nindent 4 }}
+  # Only HTTPS is exposed. Trino's plain-HTTP port 8080 (internal node traffic) is not a Service port.
   ports:
-    - {name: http, port: 8080, targetPort: 8080}
+    - {name: https, port: 8443, targetPort: 8443}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -25,31 +26,62 @@ spec:
       annotations:
         checksum/files: {{ include (print $.Template.BasePath "/configmap-files.yaml") . | sha256sum }}
         {{- if not .Values.credentials.existingSecret }}
-        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        checksum/secret: {{ include "la.credsum" . }}
+        {{- end }}
+        {{- if not .Values.trino.tls.existingSecret }}
+        checksum/tls: {{ include (print $.Template.BasePath "/trino-tls-secret.yaml") . | sha256sum }}
         {{- end }}
     spec:
+      securityContext:
+        fsGroup: 1000
       initContainers:
         {{- include "la.waitFor" (dict "root" . "target" "lakekeeper") | nindent 8 }}
+        - name: authgen
+          image: {{ .Values.trino.authgen.image }}
+          command: ["sh", "/bootstrap/authgen.sh"]
+          env:
+            - {name: OUT_DIR, value: /auth}
+            - {name: TRINO_USERS, value: "admin:TRINO_ADMIN_PASSWORD,metabase:TRINO_METABASE_PASSWORD"}
+            {{- include "la.secretEnv" (dict "root" . "name" "TRINO_ADMIN_PASSWORD" "key" "trino-admin-password") | nindent 12 }}
+            {{- include "la.secretEnv" (dict "root" . "name" "TRINO_METABASE_PASSWORD" "key" "trino-metabase-password") | nindent 12 }}
+          volumeMounts:
+            - {name: files, mountPath: /bootstrap/authgen.sh, subPath: authgen.sh}
+            - {name: auth, mountPath: /auth}
       containers:
         - name: trino
           image: {{ .Values.trino.image }}
           ports:
-            - {name: http, containerPort: 8080}
+            - {name: https, containerPort: 8443}
           env:
             - name: CATALOG_URI
               value: http://{{ include "la.fullname" . }}-lakekeeper:8181/catalog
             {{- include "la.s3Env" . | nindent 12 }}
+            {{- include "la.secretEnv" (dict "root" . "name" "TRINO_SHARED_SECRET" "key" "trino-shared-secret") | nindent 12 }}
+            {{- include "la.secretEnv" (dict "root" . "name" "TRINO_PASSWORD" "key" "trino-admin-password") | nindent 12 }}
           readinessProbe:
             exec:
-              command: ["/usr/lib/trino/bin/health-check"]
+              command:
+                - /bin/sh
+                - -c
+                - trino --server https://localhost:8443 --truststore-path /etc/trino/tls/ca.pem --user admin --password --execute 'SELECT 1' >/dev/null
             initialDelaySeconds: 20
-            timeoutSeconds: 5
-            periodSeconds: 5
+            timeoutSeconds: 20
+            periodSeconds: 10
             failureThreshold: 60
           volumeMounts:
+            - {name: files, mountPath: /etc/trino/config.properties, subPath: trino-config.properties}
+            - {name: files, mountPath: /etc/trino/password-authenticator.properties, subPath: trino-password-authenticator.properties}
             - {name: files, mountPath: /etc/trino/catalog/iceberg.properties, subPath: trino-iceberg.properties}
+            - {name: tls, mountPath: /etc/trino/tls, readOnly: true}
+            - {name: auth, mountPath: /etc/trino/auth, readOnly: true}
           {{- with .Values.trino.resources }}
           resources: {{- toYaml . | nindent 12 }}
           {{- end }}
       volumes:
         {{- include "la.filesVolume" . | nindent 8 }}
+        - name: tls
+          secret:
+            secretName: {{ include "la.trinoTlsSecret" . }}
+            defaultMode: 0440
+        - name: auth
+          emptyDir: {}

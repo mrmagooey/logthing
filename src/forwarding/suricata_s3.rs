@@ -264,6 +264,8 @@ mod tests {
             region: "us-east-1".to_string(),
             access_key: "AKIATEST".to_string(),
             secret_key: "SECRETTEST".to_string(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         };
         Arc::new(S3Sink::from_connection(&conn).await.expect("constructs"))
     }
@@ -428,6 +430,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "AKIATEST".to_string(),
                 secret_key: "SECRETTEST".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "suricata".to_string(),
             max_buffer_rows: 100_000,
@@ -549,6 +553,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "AKIATEST".to_string(),
                 secret_key: "SECRETTEST".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "suricata".to_string(),
             flush_threshold_bytes: usize::MAX,
@@ -587,6 +593,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "K".to_string(),
                 secret_key: "S".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "suricata".to_string(),
             max_buffer_rows: 1_000,

@@ -486,6 +486,8 @@ mod tests {
             region: "us-east-1".to_string(),
             access_key: "AKIATEST".to_string(),
             secret_key: "SECRETTEST".to_string(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         };
         Arc::new(
             crate::forwarding::s3_sink::S3Sink::from_connection(&conn)
@@ -1249,6 +1251,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "AKIATEST".to_string(),
                 secret_key: "SECRETTEST".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "syslog".to_string(),
             max_buffer_rows: 10_000,
@@ -1360,6 +1364,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "AKIATEST".to_string(),
                 secret_key: "SECRETTEST".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "syslog".to_string(),
             max_buffer_rows: 10_000,
@@ -1399,6 +1405,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "K".to_string(),
                 secret_key: "S".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "syslog".to_string(),
             max_buffer_rows: 1_000,

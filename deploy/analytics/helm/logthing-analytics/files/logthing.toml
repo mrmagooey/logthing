@@ -1,6 +1,7 @@
 # logthing config for the analytics stack. Every S3 table omits endpoint/access_key/secret_key:
 # they come from LOGTHING__<SECTION>__S3__{ENDPOINT,ACCESS_KEY,SECRET_KEY} so this file is
 # identical under docker compose and Kubernetes.
+# [hec]/[otlp] tokens come from LOGTHING__HEC__TOKEN / LOGTHING__OTLP__BEARER_TOKEN.
 bind_address = "0.0.0.0:5985"
 
 [tls]
@@ -59,3 +60,21 @@ flush_interval_secs = 60
 bucket = "logthing-data"
 region = "garage"
 prefix = "_iceberg_descriptors"
+
+[hec]
+enabled = true
+
+[hec.s3]
+bucket = "logthing-data"
+region = "garage"
+prefix = "hec"
+flush_interval_secs = 60
+
+[otlp]
+enabled = true
+
+[otlp.s3]
+bucket = "logthing-data"
+region = "garage"
+prefix = "otlp"
+flush_interval_secs = 60

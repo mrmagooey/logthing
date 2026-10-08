@@ -82,6 +82,74 @@ port: `LOGTHING__SYSLOG__UDP_PORT`, `LOGTHING__SYSLOG__TCP_PORT`,
 `LOGTHING__<SECTION>__BIND_ADDRESS` to change which interface they listen on;
 syslog's bind address is fixed at `0.0.0.0` and has no such override.
 
+## Sections and where they are documented
+
+Every top-level section of the configuration, with the page that documents its keys:
+
+| Section | Purpose | Documented in |
+|---|---|---|
+| `bind_address`, `[tls]`, `[security]`, `[logging]` | Main HTTP/WEF server, TLS, allowlist, log format | this page; Kerberos (`[security.kerberos]`) in [wef.md](wef.md) |
+| `[metrics]` | Prometheus listener (`enabled`, `port`, `bind_address`) and `[[metrics.cardinality_watch]]` with `cardinality_window_secs` / `cardinality_max_values` | this page; [metrics.md](metrics.md) |
+| `[syslog]`, `[syslog.s3]`, `[syslog.structured_s3]`, `[syslog.local]` | Syslog UDP/TCP/HTTP and its persistence | [syslog.md](syslog.md) |
+| `[ipfix]`, `[sflow]` | IPFIX/NetFlow and sFlow UDP listeners (+ `.s3`/`.local` sinks) | [ipfix.md](ipfix.md) (sFlow in its last section) |
+| `[zeek]`, `[suricata]` | Zeek and Suricata TCP listeners (+ `.s3`/`.local` sinks) | [zeek.md](zeek.md) (Suricata in its last section) |
+| `[wef]`, `[wef.s3]`, `[wef.local]` | Windows Event Forwarding persistence | [wef.md](wef.md) |
+| `[hec]`, `[hec.s3]`, `[hec.local]`, `[hec.redaction]` | Splunk HEC and NDJSON ingest | [hec.md](hec.md), [redaction.md](redaction.md) |
+| `[otlp]`, `[otlp.s3]`, `[otlp.local]`, `[otlp.redaction]` | OTLP/HTTP log ingest | [otlp.md](otlp.md), [redaction.md](redaction.md) |
+| `[iceberg.s3]`, `[iceberg.local]` | Descriptor files for the Iceberg committer | [iceberg.md](iceberg.md) |
+| `[spool]` | Durable local spool in front of S3 uploads | "Spool" below; [delivery-semantics.md](delivery-semantics.md) |
+| `[aggregate]`, `[[aggregate.rules]]`, `[aggregate.s3]`, `[aggregate.local]` | Group-by counting instead of raw rows | [aggregation.md](aggregation.md) |
+| `object_lock_mode`, `object_lock_retain_days` (in any `.s3` table) | S3 Object Lock | "Shared S3 connection keys" below; [object-lock.md](object-lock.md) |
+
+## HEC and OTLP require a sink
+
+`[hec] enabled = true` needs `[hec.s3]` or `[hec.local]`, and `[otlp] enabled = true` needs
+`[otlp.s3]` or `[otlp.local]`. Without one, startup fails with a message naming the missing
+table. Environment overrides are validated the same way: `LOGTHING__HEC__ENABLED=true` with no
+HEC sink configured also fails startup. See [hec.md](hec.md) and [otlp.md](otlp.md).
+
+## Shared S3 connection keys
+
+Every `[<source>.s3]` table (syslog, ipfix, zeek, suricata, wef, hec, otlp, sflow, aggregate,
+iceberg) shares these keys:
+
+| Key | Meaning |
+|-----|---------|
+| `endpoint`, `bucket`, `region` | Target object store |
+| `access_key`, `secret_key` | Credentials (masked in the admin API) |
+| `object_lock_mode` | Optional `"GOVERNANCE"` or `"COMPLIANCE"`; any other string fails startup |
+| `object_lock_retain_days` | Retention in days (1-36500); set together with `object_lock_mode` |
+
+The Object Lock keys also work as environment overrides (`LOGTHING__HEC__S3__OBJECT_LOCK_MODE`,
+`...OBJECT_LOCK_RETAIN_DAYS`). See [object-lock.md](object-lock.md).
+
+## Spool
+
+`[spool]` persists every S3 flush to local disk before it is uploaded, so an S3 outage or a
+restart no longer loses flushed data. Off by default.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `dir` | path | required | Spool directory. Created if missing. Must be **dedicated**: startup deletes unmarked `*.tmp`, `*.parquet` and `*.json` files in it. |
+| `max_bytes` | integer | 1 GiB | Cap on spooled bytes; must be > 0. Beyond it flushes fall back to a direct upload. |
+
+Semantics, limits and metrics are in [delivery-semantics.md](delivery-semantics.md).
+
+## Redaction
+
+`[hec.redaction]` and `[otlp.redaction]` drop, HMAC-hash or mask values before records are
+enqueued (off by default). Both tables take the same keys; full semantics, key rotation and
+erasure procedure are in [redaction.md](redaction.md).
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `drop_fields` | list of paths | `[]` | Remove these paths (OTLP also `@body`, `@host_name`, `@peer_addr`). |
+| `hash_fields` | list of paths | `[]` | Replace with lowercase-hex HMAC-SHA256. Needs `hash_key_env`. |
+| `hash_key_env` | string | unset | NAME of the environment variable holding the HMAC key (16+ bytes). |
+| `mask_patterns` | list of regexes | `[]` | Matches inside string values become `[REDACTED]`. |
+
+Invalid rules fail startup, but only for sections that are enabled.
+
 ## Running
 
 ```bash
@@ -92,7 +160,7 @@ syslog's bind address is fixed at `0.0.0.0` and has no such override.
 LOGTHING__BIND_ADDRESS=0.0.0.0:5985 LOGTHING__TLS__ENABLED=true ./logthing
 
 # For nested configuration values
-LOGTHING__SECURITY__MAX_CONNECTIONS=5000 LOGTHING__METRICS__PORT=8080 ./logthing
+LOGTHING__SECURITY__MAX_CONNECTIONS=5000 LOGTHING__METRICS__PORT=9091 ./logthing
 
 # Every listener's bind port (and, except for syslog, its bind address) can
 # be overridden the same way — no code or config-file changes needed:

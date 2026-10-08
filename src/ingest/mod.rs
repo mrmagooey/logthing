@@ -5,6 +5,7 @@
 //! `GenericSink` is the `ParquetSink` adapter that persists these records
 //! to S3 partitioned by `sourcetype`.
 
+pub mod decompress;
 pub mod handlers;
 pub mod parse;
 
@@ -33,6 +34,63 @@ pub struct GenericRecord {
     pub fields: serde_json::Value,
     /// Wall-clock time this server received the record.
     pub received_at: DateTime<Utc>,
+    /// Row identity (UUIDv7 string). `None` until [`assign_event_uuids`] runs.
+    #[serde(default)]
+    pub event_uuid: Option<String>,
+    /// Splunk envelope `"source"` (string only).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Splunk envelope `"index"` (string only).
+    #[serde(default)]
+    pub index: Option<String>,
+    /// Splunk envelope `"fields"` object (indexed fields); other JSON types are ignored.
+    #[serde(default)]
+    pub indexed_fields: Option<serde_json::Value>,
+}
+
+impl Default for GenericRecord {
+    fn default() -> Self {
+        Self {
+            sourcetype: String::new(),
+            host: None,
+            time: None,
+            fields: serde_json::Value::Null,
+            received_at: Utc::now(),
+            event_uuid: None,
+            source: None,
+            index: None,
+            indexed_fields: None,
+        }
+    }
+}
+
+/// Records that carry a row identity assigned at ingest.
+pub trait EventUuid {
+    /// Store the freshly generated identity on the record.
+    fn set_event_uuid(&mut self, uuid: String);
+}
+
+impl EventUuid for GenericRecord {
+    fn set_event_uuid(&mut self, uuid: String) {
+        self.event_uuid = Some(uuid);
+    }
+}
+
+/// A new time-ordered row identity (UUIDv7, hyphenated lowercase).
+pub fn new_event_uuid() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
+/// Give every record in `records` a fresh `event_uuid`.
+///
+/// ORDERING CONTRACT: handlers call this as a SEPARATE step AFTER parsing/mapping AND AFTER
+/// redaction (`IngestState::{hec,otlp}_redactor`), and BEFORE `try_send`. Redaction must
+/// therefore never see or depend on the id, and the id must never be derived from
+/// redacted-away content. Do not fold id generation into the parsers.
+pub fn assign_event_uuids<R: EventUuid>(records: &mut [R]) {
+    for r in records.iter_mut() {
+        r.set_event_uuid(new_event_uuid());
+    }
 }
 
 /// Axum extension carrying optional ingest-route S3 handlers.
@@ -40,9 +98,6 @@ pub struct GenericRecord {
 /// Injected as `.layer(axum::Extension(ingest_state))` on the protected router.
 /// Cloning is O(1): `GenericS3Handler` is a `ParquetWriterHandle<_>` which
 /// wraps an `Arc<tokio::sync::mpsc::Sender<_>>`.
-///
-/// # Extension point
-/// Unit 5 will add `pub otlp_s3: Option<OtlpS3Handler>` here.
 #[derive(Clone, Default)]
 pub struct IngestState {
     /// Generic S3 handler for HEC / NDJSON ingest routes.
@@ -52,7 +107,15 @@ pub struct IngestState {
     /// `None` when `[hec.local]` is absent or construction failed.
     /// Independent of `generic_s3` — both may be `Some` simultaneously.
     pub generic_local: Option<GenericS3Handler>,
-    // Unit 5: pub otlp_s3: Option<OtlpS3Handler>,
+    /// OTLP S3 handler. `None` when `[otlp.s3]` is absent or construction failed.
+    pub otlp_s3: Option<crate::forwarding::otlp_s3::OtlpHandler>,
+    /// OTLP local-disk handler. `None` when `[otlp.local]` is absent or construction failed.
+    /// Independent of `otlp_s3`.
+    pub otlp_local: Option<crate::forwarding::otlp_s3::OtlpHandler>,
+    /// Compiled `[hec.redaction]`; `None` when no rule is configured.
+    pub hec_redactor: Option<std::sync::Arc<crate::redaction::Redactor>>,
+    /// Compiled `[otlp.redaction]`; `None` when no rule is configured.
+    pub otlp_redactor: Option<std::sync::Arc<crate::redaction::Redactor>>,
 }
 
 /// Validate an `Authorization` header value against the configured HEC token.
@@ -98,6 +161,7 @@ mod tests {
             time: None,
             fields: json!({"key": "value"}),
             received_at: Utc::now(),
+            ..Default::default()
         };
         assert_eq!(rec.sourcetype, "my_app");
         assert_eq!(rec.host.as_deref(), Some("host1"));
@@ -113,6 +177,7 @@ mod tests {
             time: Some(Utc::now()),
             fields: json!({}),
             received_at: Utc::now(),
+            ..Default::default()
         };
         let cloned = rec.clone();
         assert_eq!(cloned.sourcetype, rec.sourcetype);
@@ -125,17 +190,18 @@ mod tests {
         let state = IngestState::default();
         assert!(state.generic_s3.is_none());
         assert!(state.generic_local.is_none());
+        assert!(state.otlp_s3.is_none());
+        assert!(state.otlp_local.is_none());
     }
 
     #[test]
     fn ingest_state_is_clone() {
-        let state = IngestState {
-            generic_s3: None,
-            generic_local: None,
-        };
+        let state = IngestState::default();
         let cloned = state.clone();
         assert!(cloned.generic_s3.is_none());
         assert!(cloned.generic_local.is_none());
+        assert!(cloned.otlp_s3.is_none());
+        assert!(cloned.otlp_local.is_none());
     }
 
     #[test]
@@ -183,5 +249,43 @@ mod tests {
             Some("Splunk short"),
             "a-much-longer-token-value"
         ));
+    }
+
+    #[test]
+    fn assign_event_uuids_sets_unique_time_ordered_v7_ids() {
+        let mut recs = vec![
+            GenericRecord::default(),
+            GenericRecord::default(),
+            GenericRecord::default(),
+        ];
+        assign_event_uuids(&mut recs);
+        let ids: Vec<String> = recs
+            .iter()
+            .map(|r| r.event_uuid.clone().expect("event_uuid assigned"))
+            .collect();
+        for id in &ids {
+            let u = uuid::Uuid::parse_str(id).expect("valid uuid");
+            assert_eq!(u.get_version_num(), 7, "must be UUIDv7: {id}");
+        }
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted, ids, "ids must be unique and non-decreasing");
+    }
+
+    #[test]
+    fn generic_record_default_has_no_event_uuid_or_envelope_fields() {
+        let r = GenericRecord::default();
+        assert!(r.event_uuid.is_none() && r.source.is_none() && r.index.is_none());
+        assert!(r.indexed_fields.is_none());
+    }
+
+    #[test]
+    fn generic_record_deserializes_without_new_fields() {
+        // Forward compatibility: JSON written before these fields existed.
+        let json = r#"{"sourcetype":"t","host":null,"time":null,"fields":{},
+                       "received_at":"2026-10-06T00:00:00Z"}"#;
+        let r: GenericRecord = serde_json::from_str(json).expect("old shape parses");
+        assert!(r.event_uuid.is_none());
     }
 }

@@ -4,6 +4,7 @@ pub mod otlp;
 use crate::config::Config;
 use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::ingest::IngestState;
+use crate::ingest::decompress::post_gzip;
 use crate::ingest::handlers::{handle_hec_event, handle_hec_raw, handle_ndjson};
 use crate::middleware::{IpWhitelist, ip_whitelist_middleware};
 use crate::models::WindowsEvent;
@@ -74,9 +75,13 @@ const MAX_CONCURRENT_EVENT_PROCESSING: usize = 16;
 ///
 /// - **Input-side / attacker ceiling: ~1 GiB.** `BudgetedBody` (below)
 ///   charges every request's ACTUAL streamed bytes as they arrive, so this
-///   is a hard ceiling on raw buffered-body bytes regardless of how many of
+///   is a hard ceiling on buffered-body bytes regardless of how many of
 ///   the 10,000 connection slots an attacker fills, what protocol version
-///   they use, or what headers they send (or omit). Payloads that are
+///   they use, or what headers they send (or omit). Gzip routes
+///   (HEC/NDJSON/OTLP, via `post_gzip`) are charged twice against the same
+///   budget and release scope: once for the wire bytes and again for the
+///   decoded bytes, so the budget bounds decompressed buffering too and a
+///   tiny gzip bomb cannot sidestep it. Payloads that are
 ///   never valid, parseable records — the attacker case — stay at this
 ///   scale, since they never reach the amplification below.
 /// - **Realistic legitimate peak: ~14 GiB, not 1 GiB.** The permit is held
@@ -131,6 +136,26 @@ struct BudgetedBody {
     inner: Body,
     budget: Arc<Semaphore>,
     held: Arc<std::sync::Mutex<Vec<OwnedSemaphorePermit>>>,
+}
+
+/// Handles to the request's body-budget charge, stashed in the request extensions by
+/// `body_budget_middleware` so a route that DECODES its body (`post_gzip`) can charge the
+/// decoded bytes against the same budget and the same `held` release scope.
+#[derive(Clone)]
+pub(crate) struct BodyBudgetHandles {
+    budget: Arc<Semaphore>,
+    held: Arc<std::sync::Mutex<Vec<OwnedSemaphorePermit>>>,
+}
+
+impl BodyBudgetHandles {
+    /// Wrap `body` so every frame is charged against the shared budget (see `BudgetedBody`).
+    pub(crate) fn charge(&self, body: Body) -> Body {
+        Body::new(BudgetedBody {
+            inner: body,
+            budget: self.budget.clone(),
+            held: self.held.clone(),
+        })
+    }
 }
 
 impl HttpBody for BudgetedBody {
@@ -254,7 +279,11 @@ async fn body_budget_middleware(
     }
 
     let held = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
+    parts.extensions.insert(BodyBudgetHandles {
+        budget: budget.clone(),
+        held: held.clone(),
+    });
     let budgeted = BudgetedBody {
         inner: body,
         budget,
@@ -301,8 +330,8 @@ pub struct Server {
     wef_worker_handles: Vec<tokio::task::JoinHandle<()>>,
     /// Shared extension state for HEC / NDJSON ingest routes.
     ingest_state: IngestState,
-    /// JoinHandles for the HEC→S3 and HEC→local Parquet worker tasks (0, 1, or 2
-    /// present depending on how many of `[hec.s3]` / `[hec.local]` are configured
+    /// JoinHandles for the HEC and OTLP Parquet worker tasks (0 to 4, depending on how
+    /// many of `[hec.s3]` / `[hec.local]` / `[otlp.s3]` / `[otlp.local]` are configured
     /// and construct successfully). Awaited during graceful shutdown.
     hec_worker_handles: Vec<tokio::task::JoinHandle<()>>,
     /// The SAME `IpWhitelist` instance shared with `main.rs`'s five
@@ -361,6 +390,11 @@ impl Server {
         ip_whitelist: IpWhitelist,
         wef_cardinality_watchers: Vec<Arc<CardinalityWatcher>>,
     ) -> anyhow::Result<Self> {
+        // Idempotent: `main` normally installed the spool already. The uploader is spawned
+        // by `main` once every writer has registered.
+        if let Some(cfg) = config.spool.as_ref() {
+            crate::forwarding::spool::init_global(cfg)?;
+        }
         #[cfg(feature = "kerberos-auth")]
         {
             if config.security.kerberos.enabled {
@@ -510,7 +544,7 @@ impl Server {
             parquet_local_sender,
         });
 
-        // --- Build IngestState for HEC / NDJSON ingest routes ---
+        // --- Build IngestState for HEC / NDJSON and OTLP ingest routes ---
         let mut hec_worker_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         let mut generic_s3_handler = None;
         let mut generic_local_handler = None;
@@ -564,9 +598,83 @@ impl Server {
             }
         }
 
+        let mut otlp_s3_handler = None;
+        let mut otlp_local_handler = None;
+
+        if config.otlp.enabled {
+            if let Some(s3_cfg) = config.otlp.s3.as_ref() {
+                match crate::forwarding::s3_sink::S3Sink::from_connection(&s3_cfg.connection).await
+                {
+                    Ok(sink) => {
+                        info!("Initialized OTLP Parquet S3 forwarder");
+                        let (handler, join_handle) = crate::forwarding::otlp_s3::otlp_start(
+                            s3_cfg,
+                            Arc::new(sink),
+                            config.otlp.max_service_partitions,
+                            source_stats.clone(),
+                            descriptor_sink.clone(),
+                        );
+                        hec_worker_handles.push(join_handle);
+                        flush_registry.register("otlp.s3", handler.flush_interval());
+                        otlp_s3_handler = Some(handler);
+                    }
+                    Err(e) => {
+                        error!("Failed to create S3Sink for OTLP ingest, skipping S3 target: {e}");
+                    }
+                }
+            }
+
+            if let Some(local_cfg) = config.otlp.local.as_ref() {
+                match crate::forwarding::local_sink::LocalDiskSink::new(local_cfg.directory.clone())
+                    .await
+                {
+                    Ok(sink) => {
+                        info!("Initialized OTLP Parquet local-disk forwarder");
+                        let (handler, join_handle) = crate::forwarding::otlp_s3::otlp_local_start(
+                            local_cfg,
+                            Arc::new(sink),
+                            config.otlp.max_service_partitions,
+                            source_stats.clone(),
+                            descriptor_sink.clone(),
+                        );
+                        hec_worker_handles.push(join_handle);
+                        flush_registry.register("otlp.local", handler.flush_interval());
+                        otlp_local_handler = Some(handler);
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to create LocalDiskSink for OTLP ingest, skipping local target: {e}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Same condition as config validation: rules in a disabled section are ignored.
+        let hec_redactor = if config.hec.enabled {
+            crate::redaction::Redactor::compile_optional(
+                &config.hec.redaction,
+                crate::redaction::RedactorKind::Hec,
+            )?
+        } else {
+            None
+        };
+        let otlp_redactor = if cfg!(feature = "otlp") && config.otlp.enabled {
+            crate::redaction::Redactor::compile_optional(
+                &config.otlp.redaction,
+                crate::redaction::RedactorKind::Otlp,
+            )?
+        } else {
+            None
+        };
+
         let ingest_state = IngestState {
             generic_s3: generic_s3_handler,
             generic_local: generic_local_handler,
+            otlp_s3: otlp_s3_handler,
+            otlp_local: otlp_local_handler,
+            hec_redactor,
+            otlp_redactor,
         };
 
         Ok(Self {
@@ -589,12 +697,12 @@ impl Server {
         std::mem::take(&mut self.wef_worker_handles)
     }
 
-    /// Take the HEC persistence workers' JoinHandles for awaiting at shutdown.
+    /// Take the HEC and OTLP persistence workers' JoinHandles for awaiting at shutdown.
     ///
     /// Must be called BEFORE `run`/`run_tls`; after the server consumes `self`
-    /// the handles are no longer accessible. Returns 0, 1, or 2 handles
-    /// depending on how many of `[hec.s3]` / `[hec.local]` constructed
-    /// successfully.
+    /// the handles are no longer accessible. Returns 0 to 4 handles depending on
+    /// how many of `[hec.s3]` / `[hec.local]` / `[otlp.s3]` / `[otlp.local]`
+    /// constructed successfully.
     pub fn take_hec_worker_handles(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
         std::mem::take(&mut self.hec_worker_handles)
     }
@@ -722,9 +830,9 @@ impl Server {
         // protected routes.
         if self.config.hec.enabled {
             protected_router = protected_router
-                .route("/services/collector/event", post(handle_hec_event))
-                .route("/services/collector/raw", post(handle_hec_raw))
-                .route("/ingest", post(handle_ndjson));
+                .route("/services/collector/event", post_gzip(handle_hec_event))
+                .route("/services/collector/raw", post_gzip(handle_hec_raw))
+                .route("/ingest", post_gzip(handle_ndjson));
         }
 
         // OTLP log ingest route — registered ONLY when the `otlp` feature is
@@ -735,7 +843,7 @@ impl Server {
         // and body-limit middleware as the other protected routes.
         #[cfg(feature = "otlp")]
         if self.config.otlp.enabled {
-            protected_router = protected_router.route("/v1/logs", post(handle_otlp_logs));
+            protected_router = protected_router.route("/v1/logs", post_gzip(handle_otlp_logs));
         }
 
         // Shared in-flight body-byte budget (see `BODY_BYTE_BUDGET`), constructed
@@ -756,6 +864,10 @@ impl Server {
         let protected_router = protected_router
             .layer(axum::Extension(self.ingest_state.clone()))
             .layer(axum::Extension(self.state.config.clone()))
+            // For routes wrapped by `post_gzip` this limit applies to the DECOMPRESSED stream
+            // (the `Bytes` extractor wraps whatever body the route hands it);
+            // `body_budget_middleware` below charges the WIRE bytes, and `post_gzip`
+            // routes charge the decoded bytes again against the same budget.
             .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE))
             .layer(middleware::from_fn_with_state(
                 body_budget,
@@ -1504,6 +1616,47 @@ mod tests {
         let Json(value) = handle_syslog_examples().await;
         assert!(!value["bind_named"].as_array().unwrap().is_empty());
         assert!(!value["powerdns"].as_array().unwrap().is_empty());
+    }
+
+    /// WEF is deliberately UNCHANGED by the 503 backpressure work: a full writer channel is a
+    /// counted drop and the request is still answered 200 (the WEF protocol has its own
+    /// redelivery semantics).
+    #[tokio::test]
+    async fn handle_events_full_wef_channel_still_returns_200() {
+        use crate::forwarding::buffered_writer::ParquetWriterHandle;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let state = Arc::new(AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            throughput: Arc::new(ThroughputStats::new()),
+            wef_cardinality_watchers: Vec::new(),
+            parser: WefParser::new(),
+            event_parser: None,
+            parquet_s3_sender: Some(ParquetWriterHandle::for_test(tx, "wef", "s3")),
+            parquet_local_sender: None,
+        });
+        let event = |id: u32| {
+            format!(
+                "<Event><System><Provider>Security</Provider><EventID>{id}</EventID>\
+                 <Level>4</Level><TimeCreated>2024-01-01T00:00:00Z</TimeCreated>\
+                 <Computer>host</Computer></System></Event>"
+            )
+        };
+        let body = Bytes::from(format!(
+            "<Envelope><Body><Events>{}{}{}</Events></Body></Envelope>",
+            event(4624),
+            event(4625),
+            event(4634)
+        ));
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let response = handle_events(State(state), ConnectInfo(addr), body)
+            .await
+            .expect("events accepted");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_ok());
+        assert!(
+            rx.try_recv().is_err(),
+            "capacity 1: the rest were dropped, not 503'd"
+        );
     }
 
     #[tokio::test]
@@ -2356,6 +2509,124 @@ event_parsers:
         assert!(
             accepted >= 1,
             "at least some of the {REQUESTS} requests should still be admitted"
+        );
+    }
+
+    /// Router with a gzip route behind `body_budget_middleware` and a small budget; the handler
+    /// reports the budget still available while it holds the extracted body, then sleeps so
+    /// concurrent requests overlap.
+    fn gzip_budget_router(
+        budget: Arc<Semaphore>,
+        seen_available: Arc<std::sync::Mutex<Vec<usize>>>,
+    ) -> Router {
+        let probe = budget.clone();
+        Router::new()
+            .route(
+                "/gz",
+                post_gzip(move |_body: Bytes| {
+                    let probe = probe.clone();
+                    let seen = seen_available.clone();
+                    async move {
+                        seen.lock().unwrap().push(probe.available_permits());
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        (StatusCode::OK, "ok")
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                budget,
+                body_budget_middleware,
+            ))
+    }
+
+    fn gzip_request(plain_len: usize) -> (axum::http::Request<Body>, usize) {
+        use std::io::Write;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        e.write_all(&vec![0u8; plain_len]).unwrap();
+        let wire = e.finish().unwrap();
+        let wire_len = wire.len();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/gz")
+            .header("content-encoding", "gzip")
+            .body(Body::from(wire))
+            .unwrap();
+        (req, wire_len)
+    }
+
+    /// Decompressed bytes (not just the tiny wire bytes) are charged against the budget: while
+    /// the handler holds a 512 KiB decoded body, at least 512 KiB of the 1 MiB budget is gone.
+    #[tokio::test]
+    async fn gzip_decompressed_bytes_are_charged_to_body_budget() {
+        use tower::ServiceExt;
+        const PLAIN: usize = 512 * 1024;
+        let budget = Arc::new(Semaphore::new(1024 * 1024));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = gzip_budget_router(budget.clone(), seen.clone());
+
+        let (req, wire_len) = gzip_request(PLAIN);
+        assert!(
+            wire_len < 4096,
+            "test premise: wire body is tiny ({wire_len})"
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let available = seen.lock().unwrap()[0];
+        assert!(
+            available <= 1024 * 1024 - PLAIN,
+            "decoded bytes must be charged: {available} permits still free, wire was {wire_len}"
+        );
+        assert_eq!(
+            budget.available_permits(),
+            1024 * 1024,
+            "every charged permit is released once the request ends"
+        );
+    }
+
+    /// Concurrent decompression bombs: each wire body is tiny (so wire-only charging admits all
+    /// of them) but 6 x 512 KiB decoded exceeds the 1 MiB budget. Some must be rejected (400
+    /// body-read failure, or the 503 fast path) and the peak decoded bytes held by admitted
+    /// handlers must never exceed the budget.
+    #[tokio::test]
+    async fn gzip_concurrent_decompression_bombs_hit_body_budget() {
+        use tower::ServiceExt;
+        const PLAIN: usize = 512 * 1024;
+        const BUDGET: usize = 1024 * 1024;
+        let budget = Arc::new(Semaphore::new(BUDGET));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = gzip_budget_router(budget.clone(), seen.clone());
+
+        let mut tasks = Vec::new();
+        for _ in 0..6 {
+            let router = router.clone();
+            tasks.push(tokio::spawn(async move {
+                let (req, _) = gzip_request(PLAIN);
+                router.oneshot(req).await.unwrap().status()
+            }));
+        }
+        let mut ok = 0;
+        let mut rejected = 0;
+        for t in tasks {
+            match t.await.unwrap() {
+                StatusCode::OK => ok += 1,
+                StatusCode::BAD_REQUEST | StatusCode::SERVICE_UNAVAILABLE => rejected += 1,
+                other => panic!("unexpected status {other}"),
+            }
+        }
+        assert!(ok >= 1, "at least one bomb fits the budget");
+        assert!(
+            rejected >= 1,
+            "6 x 512 KiB decoded must overflow the 1 MiB budget (ok={ok}, rejected={rejected})"
+        );
+        assert!(
+            ok * PLAIN <= BUDGET,
+            "admitted decoded bytes ({ok} x {PLAIN}) exceed the budget"
+        );
+        assert_eq!(
+            budget.available_permits(),
+            BUDGET,
+            "all permits released afterwards"
         );
     }
 
@@ -3557,10 +3828,7 @@ event_parsers:
         let mut cfg = Config::default();
         cfg.hec.token = token.to_string();
         let shared_config = Arc::new(RwLock::new(cfg));
-        let ingest_state = IngestState {
-            generic_s3: None,
-            generic_local: None,
-        };
+        let ingest_state = IngestState::default();
 
         Router::new()
             .route("/services/collector/event", post(handle_hec_event))
@@ -3694,6 +3962,148 @@ event_parsers:
         let addr: SocketAddr = "127.0.0.1:40000".parse().unwrap();
         req.extensions_mut().insert(ConnectInfo(addr));
         req
+    }
+
+    fn gz(data: &[u8]) -> Vec<u8> {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+        let mut e = GzEncoder::new(Vec::new(), Compression::fast());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    async fn router_with_hec_and_otlp() -> axum::Router {
+        let mut config = Config::default();
+        config.hec.enabled = true;
+        #[cfg(feature = "otlp")]
+        {
+            config.otlp.enabled = true;
+        }
+        let server = build_server(config).await;
+        server
+            .create_router(IpWhitelist::empty())
+            .expect("router builds")
+    }
+
+    async fn post_status(
+        router: &axum::Router,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> StatusCode {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+        let mut b = HttpRequest::builder().method("POST").uri(uri);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let req = with_connect_info(b.body(Body::from(body)).unwrap());
+        router.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn create_router_accepts_gzip_on_hec_event_and_ndjson_routes() {
+        let router = router_with_hec_and_otlp().await;
+        for (uri, body) in [
+            (
+                "/services/collector/event",
+                br#"{"event":{"k":1}}"#.to_vec(),
+            ),
+            ("/ingest", b"{\"k\":1}\n".to_vec()),
+        ] {
+            let st = post_status(&router, uri, &[("content-encoding", "gzip")], gz(&body)).await;
+            assert_eq!(st, StatusCode::OK, "{uri}");
+        }
+    }
+
+    #[cfg(feature = "otlp")]
+    #[tokio::test]
+    async fn create_router_accepts_gzip_otlp_protobuf_and_json() {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use prost::Message as _;
+        let router = router_with_hec_and_otlp().await;
+        let req = ExportLogsServiceRequest::default();
+        for (ct, body) in [
+            ("application/x-protobuf", req.encode_to_vec()),
+            ("application/json", serde_json::to_vec(&req).unwrap()),
+        ] {
+            let st = post_status(
+                &router,
+                "/v1/logs",
+                &[("content-type", ct), ("content-encoding", "gzip")],
+                gz(&body),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{ct}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_router_gzip_bomb_over_max_body_size_is_413() {
+        let router = router_with_hec_and_otlp().await;
+        // MAX_BODY_SIZE + 1 zero bytes: ~64 KiB on the wire.
+        let bomb = gz(&vec![0u8; MAX_BODY_SIZE + 1]);
+        assert!(bomb.len() < 1024 * 1024);
+        let st = post_status(
+            &router,
+            "/services/collector/raw",
+            &[("content-encoding", "gzip")],
+            bomb,
+        )
+        .await;
+        assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn create_router_unsupported_encoding_on_hec_is_415() {
+        let router = router_with_hec_and_otlp().await;
+        for enc in ["br", "deflate", "gzip, gzip"] {
+            let st = post_status(
+                &router,
+                "/services/collector/event",
+                &[("content-encoding", enc)],
+                b"x".to_vec(),
+            )
+            .await;
+            assert_eq!(st, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{enc}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_router_syslog_and_wef_routes_do_not_decompress_gzip() {
+        let router = router_with_hec_and_otlp().await;
+        let syslog = "<134>Jan 15 10:30:45 dns-server named[1234]: query";
+        let events = r#"<Envelope><Body><Events><Event><System><Provider>Security</Provider>
+            <EventID>4624</EventID><Level>4</Level><TimeCreated>2024-01-01T00:00:00Z</TimeCreated>
+            <Computer>host</Computer></System></Event></Events></Body></Envelope>"#;
+        for (uri, valid) in [("/syslog", syslog), ("/wsman/events", events)] {
+            // Control: the plain payload is accepted.
+            let plain = post_status(&router, uri, &[], valid.as_bytes().to_vec()).await;
+            assert_eq!(plain, StatusCode::OK, "{uri} control");
+            // gzip of the same payload is NOT decoded: the handler sees undecodable bytes.
+            let zipped = post_status(
+                &router,
+                uri,
+                &[("content-encoding", "gzip")],
+                gz(valid.as_bytes()),
+            )
+            .await;
+            assert_eq!(
+                zipped,
+                StatusCode::BAD_REQUEST,
+                "{uri} gzip must not be decoded"
+            );
+            // An encoding the layer would 415 is not 415 here either: plain body still OK.
+            let br = post_status(
+                &router,
+                uri,
+                &[("content-encoding", "br")],
+                valid.as_bytes().to_vec(),
+            )
+            .await;
+            assert_eq!(br, StatusCode::OK, "{uri} br ignored, not 415");
+        }
     }
 
     /// With `hec.enabled = false` (the default), the three HEC routes must NOT
@@ -4136,19 +4546,341 @@ event_parsers:
                 otlp: OtlpConfig {
                     enabled: true,
                     bearer_token,
+                    ..Default::default()
                 },
                 ..Default::default()
             };
             let app_state = super::build_state_with_config(config).await;
-            let ingest_state = IngestState {
-                generic_s3: None,
-                generic_local: None,
-            };
+            let ingest_state = IngestState::default();
 
             axum::Router::new()
                 .route("/v1/logs", post(handle_otlp_logs))
                 .layer(axum::Extension(ingest_state))
                 .with_state(app_state)
+        }
+
+        async fn build_otlp_app_with_ingest(ingest_state: IngestState) -> axum::Router {
+            let config = Config {
+                otlp: OtlpConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let app_state = super::build_state_with_config(config).await;
+            axum::Router::new()
+                .route("/v1/logs", post(handle_otlp_logs))
+                .layer(axum::Extension(ingest_state))
+                .with_state(app_state)
+        }
+
+        fn stalled_otlp_handle(
+            capacity: usize,
+        ) -> (
+            crate::forwarding::otlp_s3::OtlpHandler,
+            tokio::sync::mpsc::Receiver<crate::forwarding::otlp_s3::OtlpRecord>,
+        ) {
+            let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+            (
+                crate::forwarding::buffered_writer::ParquetWriterHandle::for_test(
+                    tx, "otlp", "test",
+                ),
+                rx,
+            )
+        }
+
+        #[tokio::test]
+        async fn handle_otlp_logs_sends_typed_records_with_event_uuid_to_otlp_sink() {
+            let (h, mut rx) = stalled_otlp_handle(16);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                ..Default::default()
+            })
+            .await;
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(make_proto_request().encode_to_vec()))
+                    .unwrap(),
+            );
+            assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+            let rec = rx.recv().await.unwrap();
+            assert_eq!(rec.service_name.as_deref(), Some("test-svc"));
+            assert_eq!(rec.peer_addr.as_deref(), Some("127.0.0.1"));
+            assert_eq!(rec.body.as_deref(), Some("e2e test message"));
+            let id = rec.event_uuid.expect("handler assigns event_uuid");
+            assert_eq!(uuid::Uuid::parse_str(&id).unwrap().get_version_num(), 7);
+        }
+
+        #[tokio::test]
+        async fn handle_otlp_logs_redacts_attributes_before_enqueue_and_before_uuid() {
+            let redactor = crate::redaction::Redactor::compile_with_env(
+                &crate::config::RedactionConfig {
+                    mask_patterns: vec!["e2e test message".to_string()],
+                    drop_fields: vec!["@peer_addr".to_string()],
+                    ..Default::default()
+                },
+                crate::redaction::RedactorKind::Otlp,
+                &|_| None,
+            )
+            .unwrap();
+            let (h, mut rx) = stalled_otlp_handle(16);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                otlp_redactor: Some(Arc::new(redactor)),
+                ..Default::default()
+            })
+            .await;
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(make_proto_request().encode_to_vec()))
+                    .unwrap(),
+            );
+            assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+            let rec = rx.recv().await.unwrap();
+            assert_eq!(rec.body.as_deref(), Some("[REDACTED]"));
+            assert_eq!(rec.peer_addr, None, "typed column dropped");
+            assert_eq!(rec.service_name.as_deref(), Some("test-svc"));
+            let id = rec.event_uuid.expect("uuid assigned after redaction");
+            assert_eq!(uuid::Uuid::parse_str(&id).unwrap().get_version_num(), 7);
+        }
+
+        #[tokio::test]
+        async fn handle_otlp_logs_never_writes_to_hec_sinks() {
+            // Regression for "OTLP rides [hec] sinks": the generic channel must stay empty.
+            let (tx, mut generic_rx) = tokio::sync::mpsc::channel(16);
+            let generic = crate::forwarding::buffered_writer::ParquetWriterHandle::<
+                crate::forwarding::generic_s3::GenericSink,
+            >::for_test(tx, "hec", "test");
+            let (otlp, mut otlp_rx) = stalled_otlp_handle(16);
+            let app = build_otlp_app_with_ingest(IngestState {
+                generic_s3: Some(generic),
+                otlp_s3: Some(otlp),
+                ..Default::default()
+            })
+            .await;
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(make_proto_request().encode_to_vec()))
+                    .unwrap(),
+            );
+            assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+            assert!(otlp_rx.try_recv().is_ok());
+            assert!(
+                generic_rx.try_recv().is_err(),
+                "OTLP must not touch HEC sinks"
+            );
+        }
+
+        #[tokio::test]
+        async fn handle_otlp_logs_invalid_utf8_protobuf_string_returns_400() {
+            let app = build_otlp_app(None).await;
+            // ExportLogsServiceRequest{resource_logs:[ResourceLogs{scope_logs:[ScopeLogs{
+            //   log_records:[LogRecord{severity_text: "\xFF\xFE"}]}]}]}
+            let lr = [0x1a, 0x02, 0xFF, 0xFE]; // LogRecord.severity_text (field 3)
+            let mut sl = vec![0x12, lr.len() as u8]; // ScopeLogs.log_records (field 2)
+            sl.extend_from_slice(&lr);
+            let mut rl = vec![0x12, sl.len() as u8]; // ResourceLogs.scope_logs (field 2)
+            rl.extend_from_slice(&sl);
+            let mut req = vec![0x0a, rl.len() as u8]; // Request.resource_logs (field 1)
+            req.extend_from_slice(&rl);
+            let request = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(req))
+                    .unwrap(),
+            );
+            assert_eq!(
+                app.oneshot(request).await.unwrap().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        fn otlp_request_with_records(n: usize) -> Vec<u8> {
+            let mut req = make_proto_request();
+            let template = req.resource_logs[0].scope_logs[0].log_records[0].clone();
+            req.resource_logs[0].scope_logs[0].log_records = vec![template; n];
+            req.encode_to_vec()
+        }
+
+        fn otlp_post(body: Vec<u8>) -> HttpRequest<Body> {
+            super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        }
+
+        #[tokio::test]
+        async fn handle_otlp_logs_full_channel_returns_503_with_retry_after() {
+            let (h, mut rx) = stalled_otlp_handle(1);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                ..Default::default()
+            })
+            .await;
+            let ok = app
+                .clone()
+                .oneshot(otlp_post(otlp_request_with_records(1)))
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), StatusCode::OK);
+            let busy = app
+                .oneshot(otlp_post(otlp_request_with_records(1)))
+                .await
+                .unwrap();
+            assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(busy.headers().get("retry-after").unwrap(), "1");
+            assert!(rx.try_recv().is_ok());
+            assert!(rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn handle_otlp_logs_partial_batch_is_503_and_prefix_stays_enqueued() {
+            let (h, mut rx) = stalled_otlp_handle(2);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_s3: Some(h),
+                ..Default::default()
+            })
+            .await;
+            let resp = app
+                .oneshot(otlp_post(otlp_request_with_records(5)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let mut ids = std::collections::HashSet::new();
+            while let Ok(r) = rx.try_recv() {
+                ids.insert(r.event_uuid.unwrap());
+            }
+            assert_eq!(ids.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn handle_otlp_logs_closed_channel_still_200() {
+            let (h, rx) = stalled_otlp_handle(1);
+            drop(rx);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                ..Default::default()
+            })
+            .await;
+            let resp = app
+                .oneshot(otlp_post(otlp_request_with_records(1)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn handle_otlp_logs_one_sink_full_other_ok_is_503() {
+            let (full, _full_rx) = stalled_otlp_handle(1);
+            let (roomy, mut roomy_rx) = stalled_otlp_handle(16);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_s3: Some(full),
+                otlp_local: Some(roomy),
+                ..Default::default()
+            })
+            .await;
+            let ok = app
+                .clone()
+                .oneshot(otlp_post(otlp_request_with_records(1)))
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), StatusCode::OK);
+            let busy = app
+                .oneshot(otlp_post(otlp_request_with_records(1)))
+                .await
+                .unwrap();
+            assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+            // The roomy sink accepted both (at-least-once toward the client).
+            assert!(roomy_rx.try_recv().is_ok());
+            assert!(roomy_rx.try_recv().is_ok());
+        }
+
+        fn counter_value(snapshotter: &metrics_util::debugging::Snapshotter, name: &str) -> u64 {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter(|(k, ..)| k.key().name() == name)
+                .map(|(_, _, _, v)| match v {
+                    metrics_util::debugging::DebugValue::Counter(c) => c,
+                    _ => 0,
+                })
+                .sum()
+        }
+
+        #[tokio::test]
+        async fn otlp_logs_received_counts_only_enqueued_records_on_503() {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let (h, _rx) = stalled_otlp_handle(2);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                ..Default::default()
+            })
+            .await;
+            let resp = app
+                .oneshot(otlp_post(otlp_request_with_records(5)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(counter_value(&snapshotter, "otlp_logs_received"), 2);
+            // record 3 hit Full, records 4 and 5 were never offered
+            assert_eq!(counter_value(&snapshotter, "otlp_events_dropped"), 3);
+        }
+
+        #[tokio::test]
+        async fn otlp_logs_received_counts_all_records_on_success() {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let (h, _rx) = stalled_otlp_handle(8);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                ..Default::default()
+            })
+            .await;
+            let resp = app
+                .oneshot(otlp_post(otlp_request_with_records(3)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(counter_value(&snapshotter, "otlp_logs_received"), 3);
+            assert_eq!(counter_value(&snapshotter, "otlp_events_dropped"), 0);
+        }
+
+        #[tokio::test]
+        async fn otlp_sinks_are_built_from_otlp_config_without_hec_enabled() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.hec.enabled = false;
+            config.otlp.enabled = true;
+            config.otlp.local = Some(crate::config::OtlpLocalConfig {
+                directory: tmp.path().to_path_buf(),
+                prefix: "otlp".to_string(),
+                flush_threshold_bytes: 1 << 20,
+                flush_interval_secs: 3600,
+                channel_capacity: 16,
+                max_buffer_rows: 1000,
+            });
+            let server = super::build_server(config).await;
+            assert!(server.ingest_state.otlp_local.is_some());
+            assert!(server.ingest_state.generic_local.is_none());
         }
 
         // ── Test A: valid protobuf POST → 200 + valid ExportLogsServiceResponse ──
@@ -4934,8 +5666,9 @@ async fn handle_syslog_examples() -> Json<serde_json::Value> {
 /// Comparison is constant-time (via `subtle::ConstantTimeEq`) on the equal-length
 /// path; a length mismatch is an early branch (token length is low-sensitivity).
 ///
-/// On success: maps each `LogRecord` → `GenericRecord` via `otlp::map_otlp_request`,
-/// forwards through `IngestState.generic_s3` (warn-and-drop on channel full/closed),
+/// On success: maps each `LogRecord` → `OtlpRecord` via `otlp::map_otlp_request`, assigns
+/// event UUIDs, forwards to `IngestState.otlp_s3` / `otlp_local` (warn-and-drop on channel
+/// full/closed),
 /// and returns an empty `ExportLogsServiceResponse` (200) in the SAME encoding
 /// (protobuf or JSON) as the request.
 ///
@@ -4991,12 +5724,20 @@ pub async fn handle_otlp_logs(
     let req: ExportLogsServiceRequest =
         if ct.starts_with("application/x-protobuf") || ct.starts_with("application/protobuf") {
             ExportLogsServiceRequest::decode(body.as_ref()).map_err(|e| {
+                // prost's message names fields/lengths only, never payload bytes.
                 warn!("OTLP protobuf decode error from {}: {e}", addr.ip());
                 StatusCode::BAD_REQUEST
             })?
         } else if ct.starts_with("application/json") {
             serde_json::from_slice::<ExportLogsServiceRequest>(&body).map_err(|e| {
-                warn!("OTLP JSON decode error from {}: {e}", addr.ip());
+                // serde messages can quote the offending value; log category and position only.
+                warn!(
+                    "OTLP JSON decode error from {}: {:?} error at line {} column {}",
+                    addr.ip(),
+                    e.classify(),
+                    e.line(),
+                    e.column()
+                );
                 StatusCode::BAD_REQUEST
             })?
         } else {
@@ -5004,54 +5745,31 @@ pub async fn handle_otlp_logs(
             return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
         };
 
-    // ── Map to GenericRecords ─────────────────────────────────────────────
+    // ── Map, assign ids, route to the OTLP sinks ─────────────────────────
     let source_host = addr.ip().to_string();
-    let records = crate::server::otlp::map_otlp_request(req, source_host);
-    let count = records.len() as u64;
-
-    // ── Route through generic S3 handler ─────────────────────────────────
-    // try_send is non-blocking; channel full / closed → warn and drop,
-    // mirroring the HEC handler pattern in src/ingest/handlers.rs.
-    for record in records {
-        if let Some(ref handler) = ingest.generic_s3
-            && let Err(e) = handler.try_send(record.clone())
-        {
-            let kind = DropKind::from(&e);
-            if let Some(dropped_total) = handler.drop_log_due(DropSite::Otlp, kind) {
-                match kind {
-                    DropKind::Full => {
-                        warn!(
-                            dropped_total,
-                            "OTLP generic_s3 channel full, dropping record"
-                        );
-                    }
-                    DropKind::Closed => {
-                        error!(dropped_total, "OTLP generic_s3 channel closed");
-                    }
-                }
-            }
-        }
-        if let Some(ref handler) = ingest.generic_local
-            && let Err(e) = handler.try_send(record)
-        {
-            let kind = DropKind::from(&e);
-            if let Some(dropped_total) = handler.drop_log_due(DropSite::Otlp, kind) {
-                match kind {
-                    DropKind::Full => {
-                        warn!(
-                            dropped_total,
-                            "OTLP generic_local channel full, dropping record"
-                        );
-                    }
-                    DropKind::Closed => {
-                        error!(dropped_total, "OTLP generic_local channel closed");
-                    }
-                }
-            }
+    let mut records = crate::server::otlp::map_otlp_request(req, source_host);
+    // ORDERING: redaction runs after mapping and BEFORE identity assignment, so unredacted
+    // values never reach a channel, the spool, or disk and the id never depends on them.
+    if let Some(r) = &ingest.otlp_redactor {
+        for rec in records.iter_mut() {
+            r.redact_otlp(rec);
         }
     }
-
-    metrics::counter!("otlp_logs_received").increment(count);
+    crate::ingest::assign_event_uuids(&mut records);
+    let count = records.len() as u64;
+    match dispatch_otlp_records(&ingest, records) {
+        Ok(()) => {
+            metrics::counter!("otlp_logs_received").increment(count);
+        }
+        Err(rejected) => {
+            metrics::counter!("otlp_logs_received").increment(count - rejected);
+            return Ok(Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(axum::http::header::RETRY_AFTER, "1")
+                .body(axum::body::Body::empty())
+                .unwrap());
+        }
+    }
 
     // ── Respond in the same encoding as the request ───────────────────────
     let (resp_bytes, response_ct) = if ct.starts_with("application/json") {
@@ -5068,4 +5786,64 @@ pub async fn handle_otlp_logs(
         .header("Content-Type", response_ct)
         .body(axum::body::Body::from(resp_bytes))
         .unwrap())
+}
+
+/// Offer one record to an OTLP sink. Returns `true` when the channel was full.
+#[cfg(feature = "otlp")]
+fn offer_otlp(
+    handler: &crate::forwarding::otlp_s3::OtlpHandler,
+    record: crate::forwarding::otlp_s3::OtlpRecord,
+    target: &str,
+) -> bool {
+    match handler.try_send(record) {
+        Ok(()) => false,
+        Err(e) => {
+            metrics::counter!("otlp_events_dropped").increment(1);
+            let kind = DropKind::from(&e);
+            if let Some(dropped_total) = handler.drop_log_due(DropSite::Otlp, kind) {
+                match kind {
+                    DropKind::Full => {
+                        warn!(dropped_total, target, "OTLP channel full; dropped record")
+                    }
+                    DropKind::Closed => {
+                        error!(dropped_total, target, "OTLP channel closed; dropped record")
+                    }
+                }
+            }
+            matches!(kind, DropKind::Full)
+        }
+    }
+}
+
+/// Try-send every record to every configured OTLP sink, STOPPING at the first record that hits
+/// a full channel ("full" = `Full` on ANY configured sink, instantaneous). `Err(n)` = `n`
+/// records (the full one plus those never offered) were not accepted: answer 503. Records
+/// already enqueued stay enqueued (a retry duplicates them with new `event_uuid`s). Closed
+/// channels are logged/counted but do not cause an `Err` (retrying a dead writer cannot help).
+#[cfg(feature = "otlp")]
+fn dispatch_otlp_records(
+    ingest: &IngestState,
+    records: Vec<crate::forwarding::otlp_s3::OtlpRecord>,
+) -> Result<(), u64> {
+    let total = records.len() as u64;
+    for (i, record) in records.into_iter().enumerate() {
+        let full = match (&ingest.otlp_s3, &ingest.otlp_local) {
+            (Some(s3), Some(local)) => {
+                let a = offer_otlp(s3, record.clone(), "s3");
+                let b = offer_otlp(local, record, "local");
+                a || b
+            }
+            (Some(h), None) => offer_otlp(h, record, "s3"),
+            (None, Some(h)) => offer_otlp(h, record, "local"),
+            (None, None) => false,
+        };
+        if full {
+            let never_offered = total - i as u64 - 1;
+            if never_offered > 0 {
+                metrics::counter!("otlp_events_dropped").increment(never_offered);
+            }
+            return Err(total - i as u64);
+        }
+    }
+    Ok(())
 }

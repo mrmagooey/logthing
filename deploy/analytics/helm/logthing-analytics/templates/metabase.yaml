@@ -1,0 +1,64 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "la.fullname" . }}-metabase
+  labels: {{- include "la.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.metabase.service.type }}
+  selector: {{- include "la.selector" (dict "root" . "component" "metabase") | nindent 4 }}
+  ports:
+    - {name: http, port: 3000, targetPort: 3000}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "la.fullname" . }}-metabase
+  labels: {{- include "la.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "la.selector" (dict "root" . "component" "metabase") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "la.podLabels" (dict "root" . "component" "metabase") | nindent 8 }}
+      annotations:
+        {{- if not .Values.credentials.existingSecret }}
+        checksum/secret: {{ include "la.credsum" . }}
+        {{- end }}
+        {{- if not .Values.trino.tls.existingSecret }}
+        checksum/tls: {{ include (print $.Template.BasePath "/trino-tls-secret.yaml") . | sha256sum }}
+        {{- end }}
+    spec:
+      initContainers:
+        {{- include "la.waitPostgres" . | nindent 8 }}
+      containers:
+        - name: metabase
+          image: {{ .Values.metabase.image }}
+          ports:
+            - {name: http, containerPort: 3000}
+          env:
+            - {name: MB_DB_TYPE, value: postgres}
+            - {name: MB_DB_HOST, value: {{ include "la.fullname" . }}-postgres}
+            - {name: MB_DB_PORT, value: "5432"}
+            - {name: MB_DB_DBNAME, value: metabase}
+            - {name: MB_DB_USER, value: metabase}
+            {{- include "la.secretEnv" (dict "root" . "name" "MB_DB_PASS" "key" "metabase-db-password") | nindent 12 }}
+            {{- include "la.secretEnv" (dict "root" . "name" "MB_ENCRYPTION_SECRET_KEY" "key" "metabase-encryption-key") | nindent 12 }}
+          readinessProbe:
+            httpGet: {path: /api/health, port: 3000}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 180
+          volumeMounts:
+            - {name: tls, mountPath: /tls, readOnly: true}
+          {{- with .Values.metabase.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ include "la.trinoTlsSecret" . }}
+            # Metabase only needs the CA, never Trino's private key.
+            items:
+              - {key: ca.pem, path: ca.pem}

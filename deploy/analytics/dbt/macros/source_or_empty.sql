@@ -1,0 +1,36 @@
+{#
+  Select the given columns, cast to the given Trino types, from a logthing source table. The
+  committer creates each Iceberg table only once data for it has arrived (no Zeek rows -> no
+  zeek_conn table), and a view over a missing table cannot be created. When the table does not
+  exist this emits a typed empty result with the same shape instead, so `dbt build` works on a
+  fresh stack. The view then stays empty until `dbt run` is executed again after the table exists.
+  When the table exists but lacks some of the requested columns (a pre-0.22 `hec` table before
+  the committer has evolved it), the missing ones are emitted as typed NULLs.
+  columns: dict of column name -> Trino type, e.g. {'ts': 'timestamp(6) with time zone'}.
+#}
+{% macro source_or_empty(source_name, table_name, columns) %}
+{%- set src = source(source_name, table_name) -%}
+{%- set rel = adapter.get_relation(database=src.database, schema=src.schema, identifier=src.identifier) -%}
+{%- if execute and rel is none -%}
+select
+{%- for name, type in columns.items() %}
+    cast(null as {{ type }}) as "{{ name }}"{{ "," if not loop.last }}
+{%- endfor %}
+where false
+{%- elif execute -%}
+{#- Intentional: a requested column absent from the table is NULL-filled, not an error. A typo in
+    a model's column list is caught by the staging/Rust-schema parity pytest, not here. -#}
+{%- set existing = adapter.get_columns_in_relation(rel) | map(attribute='name') | map('lower') | list -%}
+select
+{%- for name, type in columns.items() %}
+    {% if name | lower in existing -%}cast("{{ name }}" as {{ type }}){%- else -%}cast(null as {{ type }}){%- endif %} as "{{ name }}"{{ "," if not loop.last }}
+{%- endfor %}
+from {{ src }}
+{%- else -%}
+select
+{%- for name, type in columns.items() %}
+    cast("{{ name }}" as {{ type }}) as "{{ name }}"{{ "," if not loop.last }}
+{%- endfor %}
+from {{ src }}
+{%- endif -%}
+{% endmacro %}

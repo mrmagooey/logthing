@@ -17,7 +17,7 @@ spec:
       annotations:
         checksum/files: {{ include (print $.Template.BasePath "/configmap-files.yaml") . | sha256sum }}
         {{- if not .Values.credentials.existingSecret }}
-        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        checksum/secret: {{ include "la.credsum" . }}
         {{- end }}
     spec:
       restartPolicy: OnFailure

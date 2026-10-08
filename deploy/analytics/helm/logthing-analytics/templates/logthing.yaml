@@ -40,11 +40,29 @@ spec:
       annotations:
         checksum/files: {{ include (print $.Template.BasePath "/configmap-files.yaml") . | sha256sum }}
         {{- if not .Values.credentials.existingSecret }}
-        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        checksum/secret: {{ include "la.credsum" . }}
         {{- end }}
     spec:
       initContainers:
         {{- include "la.waitFor" (dict "root" . "target" "garage") | nindent 8 }}
+        # Refuse to start with an empty token: logthing only warns and would then serve the
+        # HEC / OTLP endpoints unauthenticated (possible with credentials.existingSecret).
+        - name: require-tokens
+          image: {{ .Values.bootstrap.image }}
+          command:
+            - sh
+            - -c
+            - |
+              for v in HEC_TOKEN OTLP_BEARER_TOKEN; do
+                eval "val=\$$v"
+                if [ -z "$val" ]; then
+                  echo "ERROR: Secret key for $v (hec-token / otlp-bearer-token) is empty; refusing to start logthing with unauthenticated HEC/OTLP endpoints" >&2
+                  exit 1
+                fi
+              done
+          env:
+            {{- include "la.secretEnv" (dict "root" . "name" "HEC_TOKEN" "key" "hec-token") | nindent 12 }}
+            {{- include "la.secretEnv" (dict "root" . "name" "OTLP_BEARER_TOKEN" "key" "otlp-bearer-token") | nindent 12 }}
       containers:
         - name: logthing
           image: {{ .Values.logthing.image }}
@@ -56,7 +74,7 @@ spec:
             - {name: zeek, containerPort: 47760, protocol: TCP}
             - {name: http, containerPort: 5985, protocol: TCP}
           env:
-            {{- range $sec := list "SYSLOG" "IPFIX" "SFLOW" "ZEEK" "ICEBERG" }}
+            {{- range $sec := list "SYSLOG" "IPFIX" "SFLOW" "ZEEK" "HEC" "OTLP" "ICEBERG" }}
             - name: LOGTHING__{{ $sec }}__S3__ENDPOINT
               value: http://{{ include "la.fullname" $ }}-garage:3900
             {{- include "la.secretEnv" (dict "root" $ "name" (printf "LOGTHING__%s__S3__ACCESS_KEY" $sec) "key" "s3-access-key") | nindent 12 }}
@@ -66,6 +84,8 @@ spec:
               value: {{ $.Values.logthing.flushIntervalSecs | quote }}
             {{- end }}
             {{- end }}
+            {{- include "la.secretEnv" (dict "root" . "name" "LOGTHING__HEC__TOKEN" "key" "hec-token") | nindent 12 }}
+            {{- include "la.secretEnv" (dict "root" . "name" "LOGTHING__OTLP__BEARER_TOKEN" "key" "otlp-bearer-token") | nindent 12 }}
           readinessProbe:
             httpGet: {path: /health, port: 5985}
             periodSeconds: 5

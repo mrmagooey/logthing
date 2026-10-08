@@ -43,6 +43,17 @@ receive_buffer_bytes = 0   # 0 = leave SO_RCVBUF alone; omit for the 4 MiB defau
 
 TCP syslog is unaffected — `SO_RCVBUF` here applies only to the UDP arm.
 
+## Spool volume
+
+If you enable `[spool]` (see [delivery-semantics.md](delivery-semantics.md#spool)), `spool.dir`
+must be on durable local storage and dedicated to logthing, and sized for `max_bytes`. Under
+Docker, mount a volume at that path. On Kubernetes, mount a PersistentVolumeClaim at
+`spool.dir`: an `emptyDir` is deleted when the pod is rescheduled, which loses every spooled
+entry not yet uploaded and so voids the spool's guarantee. A pod restart on the same node keeps
+an `emptyDir`, a reschedule does not.
+
+Running more than one instance: see [scaling.md](scaling.md).
+
 ## Security Considerations
 
 1. **Use TLS**: Always enable TLS in production
@@ -52,6 +63,6 @@ TCP syslog is unaffected — `SO_RCVBUF` here applies only to the UDP arm.
    Defaults: `5985` (HTTP/WEF), `5986` (HTTPS/TLS), `9090` (Prometheus
    metrics), `514`/`601` (syslog UDP/TCP), `4739` (IPFIX UDP), `47760` (Zeek
    TCP), `47761` (Suricata TCP), `6343` (sFlow UDP), and `8080` (admin
-   interface, see [admin.md](admin.md) — normally kept off the public
-   network entirely rather than firewalled).
+   interface, see [admin.md](admin.md); it binds loopback only by default,
+   so keep it off the public network unless you set `LOGTHING_ADMIN_BIND`).
 5. **Least Privilege**: Run server with minimal permissions

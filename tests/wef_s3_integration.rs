@@ -26,6 +26,8 @@ fn minio_wef_config(endpoint: &str) -> WefS3Config {
                 .unwrap_or_else(|_| "minioadmin".to_string()),
             secret_key: std::env::var("MINIO_SECRET_KEY")
                 .unwrap_or_else(|_| "minioadmin".to_string()),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         },
         prefix: "".to_string(), // empty prefix — preserves legacy event_type=<id>/ root layout
         max_buffer_rows: 1,     // flush immediately on first event

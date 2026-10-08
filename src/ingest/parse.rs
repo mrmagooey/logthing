@@ -10,7 +10,8 @@ use chrono::{DateTime, TimeZone, Utc};
 /// Parse one or more newline-delimited HEC event envelopes.
 ///
 /// Each line must be a JSON object with at minimum an `"event"` key.
-/// Optional keys: `"time"` (Unix epoch float), `"host"`, `"sourcetype"`.
+/// Optional keys: `"time"` (Unix epoch float), `"host"`, `"sourcetype"`, `"source"`, `"index"`
+/// and `"fields"`.
 /// Blank / whitespace-only lines are skipped.
 ///
 /// Returns an error if any non-blank line fails to parse as JSON or is
@@ -29,7 +30,7 @@ pub fn parse_hec_event_body(
             continue;
         }
         let obj: serde_json::Value = serde_json::from_str(line)
-            .map_err(|e| anyhow::anyhow!("HEC envelope JSON parse error: {e}"))?;
+            .map_err(|e| anyhow::Error::new(e).context("HEC envelope JSON parse error"))?;
 
         let event = obj
             .get("event")
@@ -52,12 +53,26 @@ pub fn parse_hec_event_body(
             .and_then(|v| v.as_f64())
             .map(epoch_float_to_datetime);
 
+        let source = obj
+            .get("source")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let index = obj
+            .get("index")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let indexed_fields = obj.get("fields").filter(|v| v.is_object()).cloned();
+
         records.push(GenericRecord {
             sourcetype,
             host,
             time,
             fields: event,
             received_at: now,
+            event_uuid: None,
+            source,
+            index,
+            indexed_fields,
         });
     }
 
@@ -80,6 +95,7 @@ pub fn parse_hec_raw_body(body: &[u8], sourcetype: &str) -> anyhow::Result<Gener
         time: None,
         fields: serde_json::json!({ "raw": raw }),
         received_at: Utc::now(),
+        ..Default::default()
     })
 }
 
@@ -103,8 +119,8 @@ pub fn parse_ndjson_body(
         if line.is_empty() {
             continue;
         }
-        let fields: serde_json::Value =
-            serde_json::from_str(line).map_err(|e| anyhow::anyhow!("NDJSON parse error: {e}"))?;
+        let fields: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| anyhow::Error::new(e).context("NDJSON parse error"))?;
 
         records.push(GenericRecord {
             sourcetype: default_sourcetype.to_string(),
@@ -112,6 +128,7 @@ pub fn parse_ndjson_body(
             time: None,
             fields,
             received_at: now,
+            ..Default::default()
         });
     }
 
@@ -290,5 +307,35 @@ mod tests {
         let body = b"{\"k\":1}\n";
         let records = parse_ndjson_body(body, "my_src").unwrap();
         assert_eq!(records[0].sourcetype, "my_src");
+    }
+
+    #[test]
+    fn hec_event_envelope_keeps_source_index_and_indexed_fields() {
+        let body = br#"{"event":"x","source":"/var/log/app.log","index":"main","fields":{"env":"prod","n":3}}"#;
+        let records = parse_hec_event_body(body, "t").unwrap();
+        let r = &records[0];
+        assert_eq!(r.source.as_deref(), Some("/var/log/app.log"));
+        assert_eq!(r.index.as_deref(), Some("main"));
+        assert_eq!(
+            r.indexed_fields,
+            Some(serde_json::json!({"env": "prod", "n": 3}))
+        );
+        assert!(r.event_uuid.is_none(), "parse must not assign ids");
+    }
+
+    #[test]
+    fn hec_event_envelope_ignores_non_object_fields_and_non_string_source() {
+        let body = br#"{"event":"x","source":5,"index":null,"fields":["a"]}"#;
+        let records = parse_hec_event_body(body, "t").unwrap();
+        let r = &records[0];
+        assert!(r.source.is_none() && r.index.is_none() && r.indexed_fields.is_none());
+    }
+
+    #[test]
+    fn raw_and_ndjson_records_carry_no_envelope_columns() {
+        let raw = parse_hec_raw_body(b"hello", "t").unwrap();
+        assert!(raw.source.is_none() && raw.index.is_none() && raw.indexed_fields.is_none());
+        let nd = parse_ndjson_body(b"{\"a\":1}\n", "t").unwrap();
+        assert!(nd[0].source.is_none() && nd[0].index.is_none());
     }
 }

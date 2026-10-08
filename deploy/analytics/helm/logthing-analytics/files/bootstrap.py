@@ -5,6 +5,7 @@
     bootstrap.py lakekeeper        bootstrap Lakekeeper, create the warehouse if absent
     bootstrap.py wait garage       block until the bucket exists and the key can read+write it
     bootstrap.py wait lakekeeper   block until the warehouse exists
+    bootstrap.py metabase          finish Metabase first-run setup (admin + Trino database), idempotent
 
 Every step is safe to re-run. Connection failures and 5xx responses are retried until
 BOOTSTRAP_TIMEOUT_SECS; any other unexpected response fails immediately.
@@ -45,12 +46,24 @@ class Config:
     region: str
     timeout: float
     retry: float
+    metabase_url: str
+    metabase_email: str
+    metabase_password: str = field(repr=False)
+    metabase_db_name: str
+    trino_host: str
+    trino_port: int
+    trino_user: str
+    trino_password: str = field(repr=False)
+    trino_catalog: str
+    tls_mode: str
+    ca_path: str
 
     REQUIRED = {
         "garage": ("GARAGE_ADMIN_TOKEN", "S3_ACCESS_KEY", "S3_SECRET_KEY"),
         "wait-garage": ("GARAGE_ADMIN_TOKEN", "S3_ACCESS_KEY"),
         "lakekeeper": ("S3_ACCESS_KEY", "S3_SECRET_KEY"),
         "wait-lakekeeper": (),
+        "metabase": ("METABASE_ADMIN_PASSWORD", "TRINO_METABASE_PASSWORD"),
     }
 
     @classmethod
@@ -63,8 +76,13 @@ class Config:
                                    str(10 * 1024**3)))
             timeout = float(env.get("BOOTSTRAP_TIMEOUT_SECS", "300"))
             retry = float(env.get("BOOTSTRAP_RETRY_SECS", "2"))
+            trino_port = int(env.get("TRINO_PORT", "8443"))
         except ValueError as e:
             raise ValueError(f"invalid configuration: {e}") from e
+        tls_mode = env.get("TRINO_TLS_MODE", "pem")
+        if tls_mode not in ("pem", "insecure"):
+            raise ValueError(
+                f"invalid configuration: TRINO_TLS_MODE must be pem or insecure, got {tls_mode!r}")
         return cls(
             garage_admin_url=env.get(
                 "GARAGE_ADMIN_URL",
@@ -86,10 +104,21 @@ class Config:
             region=env.get("S3_REGION", "garage"),
             timeout=timeout,
             retry=retry,
+            metabase_url=env.get("METABASE_URL", "http://metabase:3000").rstrip("/"),
+            metabase_email=env.get("METABASE_ADMIN_EMAIL", "admin@logthing.example"),
+            metabase_password=env.get("METABASE_ADMIN_PASSWORD", ""),
+            metabase_db_name=env.get("METABASE_DB_NAME", "logthing"),
+            trino_host=env.get("TRINO_HOST", "trino"),
+            trino_port=trino_port,
+            trino_user=env.get("TRINO_METABASE_USER", "metabase"),
+            trino_password=env.get("TRINO_METABASE_PASSWORD", ""),
+            trino_catalog=env.get("TRINO_CATALOG", "iceberg"),
+            tls_mode=tls_mode,
+            ca_path=env.get("TRINO_CA_PATH", "/tls/ca.pem"),
         )
 
 
-def http(method, url, token=None, body=None):
+def http(method, url, token=None, body=None, headers=None):
     """Return (status, parsed JSON or None). Raises Transient on connection
     failure or 5xx."""
     data = None if body is None else json.dumps(body).encode()
@@ -97,6 +126,8 @@ def http(method, url, token=None, body=None):
     req.add_header("Content-Type", "application/json")
     if token:
         req.add_header("Authorization", f"Bearer {token}")
+    for name, value in (headers or {}).items():
+        req.add_header(name, value)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             status, raw = resp.status, resp.read()
@@ -241,6 +272,84 @@ def lakekeeper_ready(cfg):
     return cfg.warehouse in _warehouses(cfg)
 
 
+def _short(parsed):
+    text = str(parsed)
+    return text if len(text) <= 300 else text[:300] + "..."
+
+
+def _mb(cfg, method, path, body=None, session=None):
+    headers = {"X-Metabase-Session": session} if session else None
+    return http(method, cfg.metabase_url + path, body=body, headers=headers)
+
+
+def metabase_details(cfg):
+    """Starburst driver connection details: Trino over TLS, trusting the generated CA."""
+    options = ("SSLVerification=NONE" if cfg.tls_mode == "insecure"
+               else f"SSLTrustStorePath={cfg.ca_path}")
+    return {
+        "host": cfg.trino_host,
+        "port": cfg.trino_port,
+        "catalog": cfg.trino_catalog,
+        "user": cfg.trino_user,
+        "password": cfg.trino_password,
+        "ssl": True,
+        "additional-options": options,
+    }
+
+
+def _mb_login(cfg):
+    st, r = _mb(cfg, "POST", "/api/session",
+                {"username": cfg.metabase_email, "password": cfg.metabase_password})
+    if st in (400, 401, 403):
+        raise Fatal(
+            f"Metabase admin login failed (HTTP {st}): METABASE_ADMIN_PASSWORD / "
+            f"METABASE_ADMIN_EMAIL do not match the admin created at first setup")
+    if st == 429:
+        raise Transient(f"metabase login rate-limited: HTTP 429 {_short(r)}")
+    expect(st, r, {200}, "metabase login")
+    return r["id"]
+
+
+def metabase_bootstrap(cfg):
+    st, props = _mb(cfg, "GET", "/api/session/properties")
+    expect(st, props, {200}, "metabase session properties")
+    engines = (props or {}).get("engines") or {}
+    if "starburst" not in engines:
+        raise Fatal("Metabase has no 'starburst' database driver (available: "
+                    f"{', '.join(sorted(engines)) or 'none'}); the pinned OSS image is expected")
+    token = props.get("setup-token")
+    if token:
+        # No database here: /api/setup silently drops one whose connection test fails, which
+        # would leave an admin and no way to tell. The database is registered below, loudly.
+        body = {
+            "token": token,
+            "user": {"first_name": "Logthing", "last_name": "Admin",
+                     "email": cfg.metabase_email, "password": cfg.metabase_password},
+            "prefs": {"site_name": "logthing", "allow_tracking": False},
+        }
+        st, r = _mb(cfg, "POST", "/api/setup", body)
+        if st == 403:
+            raise Transient(f"metabase setup: HTTP {st} {_short(r)}")  # a concurrent run won
+        expect(st, r, {200}, "metabase setup")
+    session = _mb_login(cfg)
+    details = metabase_details(cfg)
+    st, dbs = _mb(cfg, "GET", "/api/database", session=session)
+    expect(st, dbs, {200}, "metabase list databases")
+    items = dbs["data"] if isinstance(dbs, dict) else dbs
+    existing = next((d for d in items if d.get("name") == cfg.metabase_db_name), None)
+    if existing is None:
+        database = {"engine": "starburst", "name": cfg.metabase_db_name, "details": details,
+                    "is_full_sync": True}
+        st, r = _mb(cfg, "POST", "/api/database", database, session)
+    else:
+        st, r = _mb(cfg, "PUT", f"/api/database/{existing['id']}", {"details": details}, session)
+    if st in (401, 403):
+        raise Fatal(f"metabase database update: HTTP {st} {_short(r)}")
+    if st >= 400:
+        # 400 is typically Trino not accepting the connection yet; retried until the deadline.
+        raise Transient(f"metabase database update: HTTP {st} {_short(r)}")
+
+
 def with_retry(fn, cfg, what):
     """Run fn until it returns a non-False value; retry Transient until the deadline."""
     deadline = time.monotonic() + cfg.timeout
@@ -265,6 +374,9 @@ def main(argv, env):
         "lakekeeper": (
             lakekeeper_bootstrap,
             lambda c: f"lakekeeper at {c.lakekeeper_url}"),
+        "metabase": (
+            metabase_bootstrap,
+            lambda c: f"metabase at {c.metabase_url} (Trino {c.trino_host}:{c.trino_port})"),
         "wait-garage": (
             garage_ready,
             lambda c: (
@@ -277,7 +389,7 @@ def main(argv, env):
                 f"warehouse '{c.warehouse}'")),
     }
     if command not in actions:
-        msg = ("usage: bootstrap.py garage|lakekeeper|wait garage|"
+        msg = ("usage: bootstrap.py garage|lakekeeper|metabase|wait garage|"
                "wait lakekeeper")
         print(msg, file=sys.stderr)
         return 2

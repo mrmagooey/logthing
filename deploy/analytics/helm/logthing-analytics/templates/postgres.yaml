@@ -26,7 +26,7 @@ spec:
       annotations:
         checksum/files: {{ include (print $.Template.BasePath "/configmap-files.yaml") . | sha256sum }}
         {{- if not .Values.credentials.existingSecret }}
-        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        checksum/secret: {{ include "la.credsum" . }}
         {{- end }}
     spec:
       containers:
@@ -37,7 +37,7 @@ spec:
           env:
             {{- include "la.secretEnv" (dict "root" . "name" "POSTGRES_PASSWORD" "key" "postgres-password") | nindent 12 }}
             {{- include "la.secretEnv" (dict "root" . "name" "LAKEKEEPER_DB_PASSWORD" "key" "lakekeeper-db-password") | nindent 12 }}
-            {{- include "la.secretEnv" (dict "root" . "name" "HUE_DB_PASSWORD" "key" "hue-db-password") | nindent 12 }}
+            {{- include "la.secretEnv" (dict "root" . "name" "METABASE_DB_PASSWORD" "key" "metabase-db-password") | nindent 12 }}
             - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
           readinessProbe:
             # TCP on purpose: the unix-socket check passes during the init-time temporary server.

@@ -48,6 +48,14 @@ echo "Zeek E2E Tests Completed Successfully"
 
 echo ""
 echo "========================================"
+echo "Running OTLP E2E Tests"
+echo "========================================"
+docker compose -f "$COMPOSE_FILE" run --rm otlp-generator
+docker compose -f "$COMPOSE_FILE" run --rm --no-deps otlp-local-verifier
+echo "OTLP E2E Tests Completed Successfully"
+
+echo ""
+echo "========================================"
 echo "Running Parsing Validator"
 echo "========================================"
 docker compose -f "$COMPOSE_FILE" run --rm parsing-validator

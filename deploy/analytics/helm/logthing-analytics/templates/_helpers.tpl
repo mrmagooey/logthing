@@ -58,33 +58,6 @@ app.kubernetes.io/component: {{ .component }}
   volumeMounts:
     - {name: files, mountPath: /bootstrap/bootstrap.py, subPath: bootstrap.py}
 {{- end -}}
-{{/* initContainer for Hue: wait for Postgres (TCP) and Trino (HTTP /v1/info) */}}
-{{- define "la.waitHue" -}}
-- name: wait-deps
-  image: {{ .Values.bootstrap.image }}
-  command:
-    - python
-    - -c
-    - |
-      import socket, sys, time, urllib.request
-      deadline = time.time() + float(sys.argv[1])
-      def pg():
-          socket.create_connection((sys.argv[2], 5432), 3).close()
-      def trino():
-          assert urllib.request.urlopen(sys.argv[3], timeout=3).status == 200
-      for name, check in (("postgres", pg), ("trino", trino)):
-          while True:
-              try:
-                  check()
-                  break
-              except Exception as e:
-                  if time.time() > deadline:
-                      sys.exit(f"wait-deps: {name} not ready: {e}")
-                  time.sleep(2)
-    - {{ .Values.bootstrap.timeoutSecs | quote }}
-    - {{ include "la.fullname" . }}-postgres
-    - http://{{ include "la.fullname" . }}-trino:8080/v1/info
-{{- end -}}
 {{/* pod volume for the shared files ConfigMap */}}
 {{- define "la.filesVolume" -}}
 - name: files
@@ -97,4 +70,88 @@ app.kubernetes.io/name: {{ .root.Chart.Name }}
 app.kubernetes.io/version: {{ .root.Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .root.Release.Service }}
 {{ include "la.selector" . }}
+{{- end -}}
+
+{{/*
+Resolve one credential: explicit value > value already stored in the live Secret (lookup, so
+`helm upgrade` never rotates what Postgres/Garage persisted) > freshly generated.
+Args: root, key (Secret key), field (values name, for the error), value (explicit), gen.
+`helm template` has no cluster, so lookup is empty there and every render generates new values:
+pin credentials.* (or existingSecret) for GitOps.
+*/}}
+{{- define "la.cred" -}}
+{{- $key := .key -}}
+{{- $v := "" -}}
+{{- if .value -}}
+{{- $v = toString .value -}}
+{{- else -}}
+{{- with lookup "v1" "Secret" .root.Release.Namespace (printf "%s-credentials" (include "la.fullname" .root)) -}}
+{{- with .data -}}
+{{- if hasKey . $key -}}{{- $v = index . $key | b64dec -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not $v -}}{{- $v = .gen -}}{{- end -}}
+{{- end -}}
+{{- if not (regexMatch "^[A-Za-z0-9._~-]+$" $v) -}}
+{{- fail (printf "credentials.%s must be URL-safe ([A-Za-z0-9._~-]); it is spliced into connection URLs" .field) -}}
+{{- end -}}
+{{- $v -}}
+{{- end -}}
+
+{{/*
+Pod-roll checksum for the credentials. Hashes only the values the user sets (credentials.*),
+never the generated/looked-up ones: those are random per render (and invisible to
+`helm template`), so hashing the rendered Secret would roll every pod on every `helm upgrade`.
+Generated values never change after first install by design, so they need no roll trigger.
+*/}}
+{{- define "la.credsum" -}}
+{{- omit .Values.credentials "existingSecret" | toJson | sha256sum -}}
+{{- end -}}
+{{/* name of the Secret holding ca.pem and server.pem for Trino */}}
+{{- define "la.trinoTlsSecret" -}}
+{{- .Values.trino.tls.existingSecret | default (printf "%s-trino-tls" (include "la.fullname" .)) -}}
+{{- end -}}
+{{/* NetworkPolicy peers: pods of this release whose component label is in .components */}}
+{{- define "la.npPeers" -}}
+{{- $root := .root }}
+{{- range .components }}
+- podSelector:
+    matchLabels: {{- include "la.selector" (dict "root" $root "component" .) | nindent 8 }}
+{{- end }}
+{{- end -}}
+{{/* initContainer for Metabase: wait for Postgres (TCP) */}}
+{{- define "la.waitPostgres" -}}
+- name: wait-postgres
+  image: {{ .Values.bootstrap.image }}
+  command:
+    - python
+    - -c
+    - |
+      import socket, sys, time
+      deadline = time.time() + float(sys.argv[1])
+      while True:
+          try:
+              socket.create_connection((sys.argv[2], 5432), 3).close()
+              break
+          except OSError as e:
+              if time.time() > deadline:
+                  sys.exit(f"wait-postgres: {sys.argv[2]}:5432 not ready: {e}")
+              time.sleep(2)
+    - {{ .Values.bootstrap.timeoutSecs | quote }}
+    - {{ include "la.fullname" . }}-postgres
+{{- end -}}
+{{/*
+Keys of the credentials Secret whose resolved value (explicit or looked up from the live Secret)
+is a public demo literal shipped by the pre-B1 chart. Space-separated, empty when none.
+*/}}
+{{- define "la.demoCreds" -}}
+{{- $root := . -}}
+{{- $demo := dict "garage-rpc-secret" "5f0c4d3a9b8e7f6a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b" "garage-admin-token" "demo-garage-admin-token-change-me" "s3-access-key" "GK6b9c062a24e5a702c7c53e5b" "s3-secret-key" "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" "postgres-password" "demo-postgres-change-me" "lakekeeper-db-password" "demo-lakekeeper-change-me" "lakekeeper-encryption-key" "demo-lakekeeper-encryption-key-change-me" -}}
+{{- $fields := dict "garage-rpc-secret" "garageRpcSecret" "garage-admin-token" "garageAdminToken" "s3-access-key" "s3AccessKey" "s3-secret-key" "s3SecretKey" "postgres-password" "postgresPassword" "lakekeeper-db-password" "lakekeeperDbPassword" "lakekeeper-encryption-key" "lakekeeperEncryptionKey" -}}
+{{- $bad := list -}}
+{{- range $key, $lit := $demo -}}
+{{- $v := include "la.cred" (dict "root" $root "key" $key "field" (get $fields $key) "value" (get $root.Values.credentials (get $fields $key)) "gen" "unset") -}}
+{{- if eq $v $lit -}}{{- $bad = append $bad $key -}}{{- end -}}
+{{- end -}}
+{{- join " " (sortAlpha $bad) -}}
 {{- end -}}

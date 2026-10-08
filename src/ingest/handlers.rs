@@ -12,14 +12,16 @@
 //! 2. Parse the body with the appropriate helper.
 //! 3. Increment metrics counters.
 //! 4. If `ingest.generic_s3` is `Some`, call `try_send` for each record.
-//! 5. Return the HEC canonical success envelope or an error response.
+//! 5. Return the HEC canonical success envelope or an error response; `503` (`code 9`,
+//!    `Retry-After: 1`) when a writer channel is full.
 
 use crate::config::Config;
 use crate::forwarding::drop_log::{DropKind, DropSite};
 use crate::ingest::{
-    IngestState, check_hec_token,
+    IngestState, assign_event_uuids, check_hec_token,
     parse::{parse_hec_event_body, parse_hec_raw_body, parse_ndjson_body},
 };
+use axum::http::header::RETRY_AFTER;
 use axum::{
     Json,
     body::Bytes,
@@ -50,6 +52,16 @@ fn hec_success() -> Response {
     (StatusCode::OK, Json(json!({"text": "Success", "code": 0}))).into_response()
 }
 
+/// 503 sent when a writer channel is full: HEC "Server is busy" (code 9) plus `Retry-After`.
+fn hec_busy() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(RETRY_AFTER, "1")],
+        Json(json!({"text": "Server is busy", "code": 9})),
+    )
+        .into_response()
+}
+
 fn hec_auth_error() -> Response {
     metrics::counter!("hec_auth_failures").increment(1);
     (
@@ -59,9 +71,30 @@ fn hec_auth_error() -> Response {
         .into_response()
 }
 
-fn hec_parse_error(msg: &str) -> Response {
+/// Describe a parse failure WITHOUT any of the payload: serde errors can quote the offending
+/// value (`invalid type: string "alice@example.com"`), and logs must never carry record
+/// contents (they bypass redaction). Only the error category and position survive.
+pub(crate) fn sanitized_parse_error(e: &anyhow::Error) -> String {
+    for cause in e.chain() {
+        if let Some(je) = cause.downcast_ref::<serde_json::Error>() {
+            return format!(
+                "JSON {:?} error at line {} column {}",
+                je.classify(),
+                je.line(),
+                je.column()
+            );
+        }
+    }
+    if e.chain().any(|c| c.is::<std::str::Utf8Error>()) {
+        return "body is not valid UTF-8".to_string();
+    }
+    // Remaining errors are our own fixed strings (e.g. "missing required 'event' key").
+    e.to_string()
+}
+
+fn hec_parse_error(e: &anyhow::Error) -> Response {
     metrics::counter!("hec_parse_errors").increment(1);
-    tracing::warn!("HEC parse error: {}", msg);
+    tracing::warn!("HEC parse error: {}", sanitized_parse_error(e));
     (
         StatusCode::BAD_REQUEST,
         Json(json!({"text": "Invalid data format", "code": 6})),
@@ -88,12 +121,14 @@ fn dispatch_generic_record(
     ingest: &IngestState,
     record: crate::ingest::GenericRecord,
     context: &str,
-) {
+) -> bool {
+    let mut full = false;
     if let Some(ref handler) = ingest.generic_s3
         && let Err(e) = handler.try_send(record.clone())
     {
         metrics::counter!("hec_events_dropped").increment(1);
         let kind = DropKind::from(&e);
+        full |= matches!(kind, DropKind::Full);
         if let Some(dropped_total) = handler.drop_log_due(DropSite::Hec, kind) {
             match kind {
                 DropKind::Full => {
@@ -110,6 +145,7 @@ fn dispatch_generic_record(
     {
         metrics::counter!("hec_events_dropped").increment(1);
         let kind = DropKind::from(&e);
+        full |= matches!(kind, DropKind::Full);
         if let Some(dropped_total) = handler.drop_log_due(DropSite::Hec, kind) {
             match kind {
                 DropKind::Full => {
@@ -119,6 +155,44 @@ fn dispatch_generic_record(
                     tracing::error!(dropped_total, "HEC local channel closed; dropped {context}");
                 }
             }
+        }
+    }
+    full
+}
+
+/// Offer a request's records in order, STOPPING at the first one that meets a full channel.
+///
+/// "Overloaded" means `try_send` returned `Full` on ANY configured sink (instantaneous, no
+/// averaging); a record accepted by one sink and rejected by the other is also a 503
+/// (at-least-once toward the client). `Err(n)` = `n` records (the full one plus those never
+/// offered) were not accepted and the request must be answered 503. Records already enqueued
+/// stay enqueued: a client retry re-sends them and they get NEW `event_uuid`s (retries cannot
+/// be de-duplicated). A `Closed` channel (writer gone) is counted and logged but does not cause
+/// an `Err`: retrying against a dead writer cannot help, so the request is still answered 200.
+fn dispatch_generic_batch(
+    ingest: &IngestState,
+    records: Vec<crate::ingest::GenericRecord>,
+    context: &str,
+) -> Result<(), usize> {
+    let total = records.len();
+    for (i, record) in records.into_iter().enumerate() {
+        if dispatch_generic_record(ingest, record, context) {
+            let never_offered = total - i - 1;
+            if never_offered > 0 {
+                metrics::counter!("hec_events_dropped").increment(never_offered as u64);
+            }
+            return Err(total - i);
+        }
+    }
+    Ok(())
+}
+
+/// Apply the HEC redactor (if configured) to every parsed record. Must run BEFORE
+/// `assign_event_uuids` and before dispatch so unredacted data never reaches a channel.
+fn redact_generic_records(ingest: &IngestState, records: &mut [crate::ingest::GenericRecord]) {
+    if let Some(r) = &ingest.hec_redactor {
+        for rec in records.iter_mut() {
+            r.redact_generic(rec);
         }
     }
 }
@@ -152,17 +226,19 @@ pub async fn handle_hec_event(
     }
 
     let default_st = params.sourcetype.as_deref().unwrap_or(DEFAULT_SOURCETYPE);
-    let records = match parse_hec_event_body(&body, default_st) {
+    let mut records = match parse_hec_event_body(&body, default_st) {
         Ok(r) => r,
-        Err(e) => return hec_parse_error(&e.to_string()),
+        Err(e) => return hec_parse_error(&e),
     };
+    // Identity is assigned after parse and after redaction.
+    redact_generic_records(&ingest, &mut records);
+    assign_event_uuids(&mut records);
 
     metrics::counter!("hec_events_received").increment(records.len() as u64);
 
-    for rec in records {
-        dispatch_generic_record(&ingest, rec, "1 record");
+    if dispatch_generic_batch(&ingest, records, "1 record").is_err() {
+        return hec_busy();
     }
-
     hec_success()
 }
 
@@ -195,15 +271,18 @@ pub async fn handle_hec_raw(
     }
 
     let st = params.sourcetype.as_deref().unwrap_or(DEFAULT_SOURCETYPE);
-    let record = match parse_hec_raw_body(&body, st) {
+    let mut record = match parse_hec_raw_body(&body, st) {
         Ok(r) => r,
-        Err(e) => return hec_parse_error(&e.to_string()),
+        Err(e) => return hec_parse_error(&e),
     };
+    redact_generic_records(&ingest, std::slice::from_mut(&mut record));
+    assign_event_uuids(std::slice::from_mut(&mut record));
 
     metrics::counter!("hec_events_received").increment(1);
 
-    dispatch_generic_record(&ingest, record, "raw record");
-
+    if dispatch_generic_batch(&ingest, vec![record], "raw record").is_err() {
+        return hec_busy();
+    }
     hec_success()
 }
 
@@ -236,23 +315,47 @@ pub async fn handle_ndjson(
     }
 
     let st = params.sourcetype.as_deref().unwrap_or(DEFAULT_SOURCETYPE);
-    let records = match parse_ndjson_body(&body, st) {
+    let mut records = match parse_ndjson_body(&body, st) {
         Ok(r) => r,
-        Err(e) => return hec_parse_error(&e.to_string()),
+        Err(e) => return hec_parse_error(&e),
     };
+    redact_generic_records(&ingest, &mut records);
+    assign_event_uuids(&mut records);
 
     metrics::counter!("hec_events_received").increment(records.len() as u64);
 
-    for rec in records {
-        dispatch_generic_record(&ingest, rec, "1 NDJSON record");
+    if dispatch_generic_batch(&ingest, records, "1 NDJSON record").is_err() {
+        return hec_busy();
     }
-
     hec_success()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sanitized_parse_error_never_contains_payload_values() {
+        // serde's own message quotes the value; the sanitised one must not.
+        let raw = serde_json::from_str::<u32>("\"alice@example.com\"").unwrap_err();
+        assert!(raw.to_string().contains("alice@example.com"), "premise");
+        let err = anyhow::Error::new(raw).context("NDJSON parse error");
+        let msg = sanitized_parse_error(&err);
+        assert!(!msg.contains("alice"), "{msg}");
+        assert!(!msg.contains("example.com"), "{msg}");
+        assert!(msg.contains("line 1"), "{msg}");
+    }
+
+    #[test]
+    fn test_parse_helpers_errors_sanitise_without_payload_text() {
+        let body = b"{\"event\": \"ok\"}\n{\"event\": \"ssn 123-45-6789\" oops}";
+        let e = crate::ingest::parse::parse_hec_event_body(body, "st").unwrap_err();
+        let msg = sanitized_parse_error(&e);
+        assert!(!msg.contains("123-45-6789"), "{msg}");
+        let e = crate::ingest::parse::parse_ndjson_body(b"{\"a\": \"ssn 123-45-6789\" x}", "st")
+            .unwrap_err();
+        assert!(!sanitized_parse_error(&e).contains("123-45-6789"));
+    }
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -270,11 +373,14 @@ mod tests {
     /// live — no router rebuild, matching the live-reload contract in
     /// `handle_hec_event`/`handle_hec_raw`/`handle_ndjson`'s doc comments.
     fn make_router_with_config(config: Arc<RwLock<Config>>) -> axum::Router {
+        make_router_with_ingest(config, IngestState::default())
+    }
+
+    fn make_router_with_ingest(
+        config: Arc<RwLock<Config>>,
+        ingest_state: IngestState,
+    ) -> axum::Router {
         use axum::{Extension, Router, routing::post};
-        let ingest_state = IngestState {
-            generic_s3: None,
-            generic_local: None,
-        };
         Router::new()
             .route("/services/collector/event", post(handle_hec_event))
             .route("/services/collector/raw", post(handle_hec_raw))
@@ -637,5 +743,322 @@ mod tests {
             StatusCode::OK,
             "the new token must work immediately, without a process restart"
         );
+    }
+
+    #[tokio::test]
+    async fn hec_routes_assign_event_uuid_and_keep_envelope_fields() {
+        use crate::forwarding::buffered_writer::ParquetWriterHandle;
+        use crate::forwarding::generic_s3::GenericSink;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let ingest = IngestState {
+            generic_s3: Some(ParquetWriterHandle::<GenericSink>::for_test(
+                tx, "hec", "test",
+            )),
+            ..Default::default()
+        };
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/services/collector/event")
+            .body(Body::from(
+                r#"{"event":{"k":1},"source":"s1","index":"main","fields":{"a":"b"}}
+{"event":"two"}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        assert_eq!(first.source.as_deref(), Some("s1"));
+        assert_eq!(first.index.as_deref(), Some("main"));
+        assert_eq!(first.indexed_fields, Some(serde_json::json!({"a": "b"})));
+        let (a, b) = (first.event_uuid.unwrap(), second.event_uuid.unwrap());
+        assert_ne!(a, b);
+        assert_eq!(uuid::Uuid::parse_str(&a).unwrap().get_version_num(), 7);
+
+        // raw and NDJSON routes assign too.
+        for (uri, body) in [
+            ("/services/collector/raw", "plain text"),
+            ("/ingest", "{\"x\":1}\n"),
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(Body::from(body))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(req).await.unwrap().status(),
+                StatusCode::OK
+            );
+            let rec = rx.recv().await.unwrap();
+            assert!(rec.event_uuid.is_some(), "{uri} must assign event_uuid");
+        }
+    }
+
+    fn stalled_ingest(
+        capacity: usize,
+    ) -> (
+        IngestState,
+        tokio::sync::mpsc::Receiver<crate::ingest::GenericRecord>,
+    ) {
+        use crate::forwarding::buffered_writer::ParquetWriterHandle;
+        use crate::forwarding::generic_s3::GenericSink;
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        (
+            IngestState {
+                generic_s3: Some(ParquetWriterHandle::<GenericSink>::for_test(
+                    tx, "hec", "test",
+                )),
+                ..Default::default()
+            },
+            rx,
+        )
+    }
+
+    fn post(uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn hec_event_full_channel_returns_503_code_9_with_retry_after() {
+        let (ingest, mut rx) = stalled_ingest(1);
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let ok = app
+            .clone()
+            .oneshot(post("/services/collector/event", r#"{"event":"one"}"#))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let busy = app
+            .oneshot(post("/services/collector/event", r#"{"event":"two"}"#))
+            .await
+            .unwrap();
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(busy.headers().get("retry-after").unwrap(), "1");
+        assert_eq!(
+            body_json(busy).await,
+            serde_json::json!({"text": "Server is busy", "code": 9})
+        );
+        assert!(rx.try_recv().is_ok(), "first record stayed enqueued");
+        assert!(rx.try_recv().is_err(), "rejected record was not enqueued");
+    }
+
+    #[tokio::test]
+    async fn hec_event_partial_batch_stops_at_first_full_and_returns_503() {
+        let (ingest, mut rx) = stalled_ingest(2);
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .oneshot(post(
+                "/services/collector/event",
+                "{\"event\":1}\n{\"event\":2}\n{\"event\":3}\n{\"event\":4}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(
+            n, 2,
+            "the prefix that fit stays enqueued; the rest is never offered"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_and_ndjson_full_channel_return_503() {
+        for (uri, body) in [
+            ("/services/collector/raw", "plain"),
+            ("/ingest", "{\"a\":1}\n"),
+        ] {
+            let (ingest, _rx) = stalled_ingest(1);
+            let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+            assert_eq!(
+                app.clone().oneshot(post(uri, body)).await.unwrap().status(),
+                StatusCode::OK
+            );
+            let busy = app.oneshot(post(uri, body)).await.unwrap();
+            assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            assert_eq!(busy.headers().get("retry-after").unwrap(), "1");
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_channel_keeps_returning_200() {
+        let (ingest, rx) = stalled_ingest(1);
+        drop(rx); // writer gone
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .oneshot(post("/services/collector/event", r#"{"event":"x"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn hec_one_sink_full_other_ok_is_503() {
+        use crate::forwarding::buffered_writer::ParquetWriterHandle;
+        use crate::forwarding::generic_s3::GenericSink;
+        let (full_tx, _full_rx) = tokio::sync::mpsc::channel(1);
+        let (roomy_tx, mut roomy_rx) = tokio::sync::mpsc::channel(16);
+        let ingest = IngestState {
+            generic_s3: Some(ParquetWriterHandle::<GenericSink>::for_test(
+                full_tx, "hec", "s3",
+            )),
+            generic_local: Some(ParquetWriterHandle::<GenericSink>::for_test(
+                roomy_tx, "hec", "local",
+            )),
+            ..Default::default()
+        };
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let uri = "/services/collector/event";
+        assert_eq!(
+            app.clone()
+                .oneshot(post(uri, r#"{"event":1}"#))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let busy = app.oneshot(post(uri, r#"{"event":2}"#)).await.unwrap();
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(roomy_rx.try_recv().is_ok());
+        assert!(roomy_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn hec_events_dropped_counts_full_and_never_offered_records() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let (ingest, _rx) = stalled_ingest(1);
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .oneshot(post(
+                "/services/collector/event",
+                "{\"event\":1}\n{\"event\":2}\n{\"event\":3}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let dropped: u64 = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == "hec_events_dropped")
+            .map(|(_, _, _, v)| match v {
+                metrics_util::debugging::DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(dropped, 2, "record 2 hit Full, record 3 never offered");
+    }
+
+    // --- Redaction wiring ---
+
+    fn hec_redactor(cfg: crate::config::RedactionConfig) -> Arc<crate::redaction::Redactor> {
+        Arc::new(
+            crate::redaction::Redactor::compile_with_env(
+                &cfg,
+                crate::redaction::RedactorKind::Hec,
+                &|n| (n == "K").then(|| "0123456789abcdef".to_string()),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn redacting_ingest(
+        cfg: crate::config::RedactionConfig,
+    ) -> (
+        IngestState,
+        tokio::sync::mpsc::Receiver<crate::ingest::GenericRecord>,
+    ) {
+        let (mut ingest, rx) = stalled_ingest(16);
+        ingest.hec_redactor = Some(hec_redactor(cfg));
+        (ingest, rx)
+    }
+
+    #[tokio::test]
+    async fn hec_event_redacts_before_enqueue_and_still_assigns_uuid() {
+        let (ingest, mut rx) = redacting_ingest(crate::config::RedactionConfig {
+            drop_fields: vec!["pw".into()],
+            hash_fields: vec!["email".into()],
+            hash_key_env: Some("K".into()),
+            mask_patterns: vec![],
+        });
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .oneshot(post(
+                "/services/collector/event",
+                r#"{"event":{"email":"a@b.co","pw":"x"},"sourcetype":"t"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rec = rx.recv().await.unwrap();
+        assert!(rec.fields.get("pw").is_none(), "{}", rec.fields);
+        let email = rec.fields["email"].as_str().unwrap();
+        assert_eq!(email.len(), 64, "{email}");
+        assert!(email.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(email, "a@b.co");
+        let id = rec.event_uuid.expect("uuid assigned after redaction");
+        assert_eq!(uuid::Uuid::parse_str(&id).unwrap().get_version_num(), 7);
+    }
+
+    #[tokio::test]
+    async fn hec_raw_redacts_masked_pattern_before_enqueue() {
+        let (ingest, mut rx) = redacting_ingest(crate::config::RedactionConfig {
+            mask_patterns: vec![r"secret=\w+".into()],
+            ..Default::default()
+        });
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .oneshot(post("/services/collector/raw", "login secret=abc"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rec = rx.recv().await.unwrap();
+        assert_eq!(rec.fields, serde_json::json!({"raw": "login [REDACTED]"}));
+        assert!(rec.event_uuid.is_some());
+    }
+
+    #[tokio::test]
+    async fn ndjson_redacts_dropped_field_on_every_line() {
+        let (ingest, mut rx) = redacting_ingest(crate::config::RedactionConfig {
+            drop_fields: vec!["token".into()],
+            ..Default::default()
+        });
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .oneshot(post(
+                "/ingest",
+                "{\"token\":\"t1\",\"keep\":1}\n{\"token\":\"t2\",\"keep\":2}\n",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        for keep in [1, 2] {
+            let rec = rx.recv().await.unwrap();
+            assert_eq!(rec.fields, serde_json::json!({"keep": keep}));
+            assert!(rec.event_uuid.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn hec_without_redactor_leaves_records_untouched() {
+        let (ingest, mut rx) = stalled_ingest(4);
+        assert!(ingest.hec_redactor.is_none());
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        app.oneshot(post("/ingest", "{\"pw\":\"x\"}\n"))
+            .await
+            .unwrap();
+        let rec = rx.recv().await.unwrap();
+        assert_eq!(rec.fields, serde_json::json!({"pw": "x"}));
     }
 }

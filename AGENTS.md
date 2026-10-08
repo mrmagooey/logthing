@@ -22,11 +22,14 @@ This document explains how automated or semi-automated agents should interact wi
 | Coverage report | `scripts/run_coverage.sh` |
 | E2E tests | `tests/e2e/simulation-environment/run.sh` (requires Docker) |
 | Fuzz (nightly) | `scripts/fuzz.sh <target|all> [secs]` |
+| Harness real-server test | `cargo build --release --bin logthing && cargo build --release -p loadgen && cargo test --test max_ingest_rate_harness_integration -- --ignored --test-threads=1` |
 | Committer tests | `committer/.venv/bin/pytest committer/tests --ignore=committer/tests/e2e` |
 | Committer E2E test | `committer/tests/e2e/run.sh` (requires Docker) |
+| Object Lock integration test | `MINIO_ENDPOINT=http://host:9000 [MINIO_ACCESS_KEY=.. MINIO_SECRET_KEY=..] cargo test --test object_lock_integration` (skips when `MINIO_ENDPOINT` is unset) |
 | Analytics unit tests | `deploy/analytics/.venv/bin/pytest -c deploy/analytics/tests/pytest.ini deploy/analytics/tests/unit` |
-| Analytics integration test | `deploy/analytics/.venv/bin/pytest -c deploy/analytics/tests/pytest.ini deploy/analytics/tests/integration -m integration` (requires Docker) |
-| Analytics E2E (compose) | `deploy/analytics/tests/e2e/compose.sh` (requires Docker + AVX2 CPU) |
+| Analytics integration test | `deploy/analytics/.venv/bin/pytest -c deploy/analytics/tests/pytest.ini deploy/analytics/tests/integration -m integration` (requires Docker; Trino tests need AVX2 or `TRINO_IMAGE`) |
+| Analytics E2E (compose) | `deploy/analytics/tests/e2e/compose.sh` (requires Docker + AVX2 CPU, or `TRINO_IMAGE=trinodb/trino:470`) |
+| Analytics dbt build | `deploy/analytics/.venv/bin/dbt build --project-dir deploy/analytics/dbt --profiles-dir deploy/analytics/dbt` (needs `TRINO_PASSWORD`, `TRINO_CA_CERT`; see `deploy/analytics/dbt/README.md`) |
 | Analytics E2E (Helm) | `deploy/analytics/tests/e2e/helm-minikube.sh` (requires minikube + AVX2 CPU) |
 
 **Example - run a specific test:**
@@ -108,6 +111,10 @@ use crate::models::WindowsEvent;
 - Use conventional commit style: `feat:`, `fix:`, `docs:`, `test:`, `refactor:`
 - Never amend or force-push without explicit approval
 - Keep working tree clean before new tasks
+- Release checklist: tag and publish the images BEFORE anyone runs the analytics stack from
+  master (compose and Helm default to the `:<crate version>` tag, e.g. `:0.22.0`); run
+  `deploy/analytics/tests/e2e/helm-minikube.sh` on a host with a normal inotify limit
+  before and after tagging
 
 ## 5. Safety & Guardrails
 
@@ -132,21 +139,26 @@ use crate::models::WindowsEvent;
 
 ```
 src/
-  admin/        # Admin API and hot-reload
+  admin/        # Read-only admin UI and effective-config API (config is restart-only)
   config/       # Configuration loading
-  forwarding/   # Parquet/S3 and local-disk sinks
+  forwarding/   # Parquet/S3 and local-disk sinks (incl. otlp_s3.rs typed OTLP sink)
+  ingest/       # HEC / NDJSON ingest, event_uuid assignment, gzip request decoding
   ipfix/        # IPFIX / NetFlow flow ingestion
   middleware/   # HTTP middleware
   models/       # Data structures
   parser/       # Event parsing logic
   protocol/     # WEF protocol handlers
-  server/       # HTTP server implementation
+  redaction/    # HEC/OTLP drop/hash/mask rules
+  server/       # HTTP server implementation (OTLP handler + mapper in otlp.rs)
   stats/        # Metrics and statistics
   syslog/       # Syslog listener
   zeek/         # Zeek NDJSON ingestion
 committer/  # Python Iceberg committer (separate image)
-deploy/analytics/  # Compose + Helm analytics stack (Garage, Lakekeeper, Trino, Hue)
+deploy/analytics/  # Compose + Helm analytics stack (Garage, Lakekeeper, Trino, Metabase)
+deploy/analytics/dbt/  # dbt-trino project: staging, OCSF views, detection analyses
 ```
+
+Delivery guarantees per source (spool, shutdown, fsync) are documented in `docs/delivery-semantics.md`.
 
 Note: `src/lib.rs` is the crate's module root (the crate is both a library and a binary); `src/main.rs` is the binary entry point only.
 

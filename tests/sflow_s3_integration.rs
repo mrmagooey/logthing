@@ -26,6 +26,8 @@ fn minio_sflow_config(endpoint: &str) -> SflowS3Config {
                 .unwrap_or_else(|_| "minioadmin".to_string()),
             secret_key: std::env::var("MINIO_SECRET_KEY")
                 .unwrap_or_else(|_| "minioadmin".to_string()),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
         },
         prefix: "sflow".to_string(),
         max_buffer_rows: 1, // flush on first record

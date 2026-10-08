@@ -11,13 +11,17 @@ importing commit.py or logthing internals directly.
 Usage:
     verify.py <marker> <expected_row_count>
 
+Also verifies the hec upgrade path and the otlp table when HEC_MARKER/OTLP_MARKER are set.
+
 Exits non-zero (with an assertion message) on any check failure.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import uuid
 
 import boto3
 from pyiceberg.catalog.rest import RestCatalog
@@ -77,6 +81,49 @@ def prefix_object_count(client, prefix: str) -> int:
     return count
 
 
+def load(cat, name):
+    table = cat.load_table((NAMESPACE, name))
+    table.io = PyArrowFileIO(properties=s3_io_properties())
+    return table
+
+
+def verify_hec(cat, marker: str) -> None:
+    table = load(cat, "hec")
+    cols = set(table.schema().column_names)
+    assert {"event_uuid", "source", "index", "indexed_fields"} <= cols, cols
+    # The table was CREATED from a legacy-shaped file (run.sh seeds one first), so the new
+    # columns can only be there because the committer evolved the schema.
+    assert len(table.metadata.schemas) >= 2, "expected schema evolution to create a new schema"
+    rows = table.scan().to_arrow().to_pylist()
+    legacy = [r for r in rows if "legacy-row" in r["fields"]]
+    fresh = [r for r in rows if marker in r["fields"]]
+    assert len(legacy) == 1 and len(fresh) == 1, (len(legacy), len(fresh), len(rows))
+    assert legacy[0]["event_uuid"] is None, "old rows must read NULL for new columns"
+    assert uuid.UUID(fresh[0]["event_uuid"]).version == 7
+    assert fresh[0]["source"] == "committer-e2e" and fresh[0]["index"] == "main"
+    assert json.loads(fresh[0]["indexed_fields"]) == {"env": "e2e"}
+    print(f"OK: hec evolved ({len(table.metadata.schemas)} schemas), legacy NULL, new row typed")
+
+
+def verify_otlp(cat, marker: str) -> None:
+    names = sorted(t[1] for t in cat.list_tables(NAMESPACE))
+    assert "otlp" in names and not [n for n in names if n.startswith("otlp_")], names
+    table = load(cat, "otlp")
+    day = [f for f in table.spec().fields if f.transform.__class__.__name__ == "DayTransform"]
+    assert day and table.schema().find_field(day[0].source_id).name == "partition_time"
+    rows = [r for r in table.scan().to_arrow().to_pylist() if r["body"] == marker]
+    assert len(rows) == 1, f"expected exactly one OTLP row with the marker, found {len(rows)}"
+    r = rows[0]
+    assert r["service_name"] == "committer-e2e" and r["severity_number"] == 9
+    assert r["severity_text"] == "INFO" and r["scope_name"] == "e2e-lib"
+    assert r["trace_id"] == "0af7651916cd43dd8448eb211c80319c"
+    assert r["span_id"] == "b7ad6b7169203331" and r["peer_addr"]
+    assert r["time"] is not None and uuid.UUID(r["event_uuid"]).version == 7
+    assert json.loads(r["attributes"]) == {"http.route": "/e2e"}
+    assert json.loads(r["resource_attributes"])["service.name"] == "committer-e2e"
+    print(f"OK: otlp table has typed row, tables={names}")
+
+
 def main() -> int:
     if len(sys.argv) != 3:
         print(f"usage: {sys.argv[0]} <marker> <expected_row_count>", file=sys.stderr)
@@ -112,6 +159,13 @@ def main() -> int:
     assert any(marker in m for m in messages), (
         f"marker {marker!r} not found in any of {len(messages)} committed rows"
     )
+
+    hec_marker = os.environ.get("HEC_MARKER")
+    otlp_marker = os.environ.get("OTLP_MARKER")
+    if hec_marker:
+        verify_hec(cat, hec_marker)
+    if otlp_marker:
+        verify_otlp(cat, otlp_marker)
 
     client = s3_client()
     remaining = prefix_object_count(client, DESC_PREFIX)

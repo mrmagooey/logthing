@@ -5,7 +5,8 @@
 //! (`{prefix}/{partition}/year=/month=/day=/{uuid}.parquet`, produced by
 //! `buffered_writer::build_key`). Writes are atomic: bytes land in a
 //! same-directory temp file first, then are renamed into place, so a
-//! concurrent reader scanning the directory never observes a partial file.
+//! concurrent reader scanning the directory never observes a partial file. The
+//! temp file is fsynced before the rename and the directory is fsynced after it.
 
 use crate::forwarding::buffered_writer::UploadSink;
 use std::path::{Component, Path, PathBuf};
@@ -108,8 +109,25 @@ impl UploadSink for LocalDiskSink {
             .into_owned();
         let tmp_path = parent.join(format!(".{}.tmp-{file_name}", uuid::Uuid::new_v4()));
 
-        tokio::fs::write(&tmp_path, &body).await?;
-        tokio::fs::rename(&tmp_path, &dest).await?;
+        use tokio::io::AsyncWriteExt;
+        // On any failure after the temp file exists, remove it so no partial file lingers.
+        let write_result: std::io::Result<()> = async {
+            let mut file = tokio::fs::File::create(&tmp_path).await?;
+            file.write_all(&body).await?;
+            file.sync_all().await?;
+            drop(file);
+            tokio::fs::rename(&tmp_path, &dest).await
+        }
+        .await;
+        if let Err(e) = write_result {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e.into());
+        }
+        // Persist the rename itself: without a directory fsync a crash can lose the entry
+        // even though the file's bytes were synced.
+        // The file is already visible under its final key, so a failure here must NOT surface
+        // as an upload error: the writer would retry and write a duplicate under a new key.
+        persist_dir_entry(parent, key).await;
         Ok(())
     }
 
@@ -119,6 +137,19 @@ impl UploadSink for LocalDiskSink {
 
     fn location_hint(&self) -> String {
         format!("file://{}", self.root.display())
+    }
+}
+
+/// Fsync `dir` so a just-completed rename survives a crash. Failure is logged and counted
+/// (`local_sink_dir_fsync_errors`), never returned: the rename already happened.
+async fn persist_dir_entry(dir: &Path, key: &str) {
+    let result = async { tokio::fs::File::open(dir).await?.sync_all().await }.await;
+    if let Err(e) = result {
+        tracing::warn!(
+            "LocalDiskSink: directory fsync failed after renaming {key:?} into place \
+             (file is written; durability across a crash is not guaranteed): {e}"
+        );
+        metrics::counter!("local_sink_dir_fsync_errors").increment(1);
     }
 }
 
@@ -171,6 +202,79 @@ mod tests {
             vec!["f.parquet".to_string()],
             "no stray .tmp file: {entries:?}"
         );
+    }
+
+    /// Durability is verified behaviourally, not by observing fsync (which is not reliably
+    /// observable in-process): the file appears only via atomic rename, so after `upload`
+    /// returns the directory holds exactly the final file with exact content and no temp.
+    #[tokio::test]
+    async fn upload_leaves_no_temp_files_and_content_is_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = LocalDiskSink::new(dir.path().to_path_buf()).await.unwrap();
+        let body: Vec<u8> = (0..=255u8).cycle().take(100_000).collect();
+
+        sink.upload("a/b/x.parquet", body.clone()).await.unwrap();
+
+        let names: Vec<String> = std::fs::read_dir(dir.path().join("a/b"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["x.parquet".to_string()]);
+        assert_eq!(
+            std::fs::read(dir.path().join("a/b/x.parquet")).unwrap(),
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_failure_removes_temp_file_and_exposes_no_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = LocalDiskSink::new(dir.path().to_path_buf()).await.unwrap();
+        // A directory occupies the destination name, so the final rename must fail.
+        std::fs::create_dir_all(dir.path().join("d/x.parquet")).unwrap();
+
+        let result = sink.upload("d/x.parquet", b"payload".to_vec()).await;
+
+        assert!(result.is_err(), "rename onto a directory must fail");
+        let names: Vec<String> = std::fs::read_dir(dir.path().join("d"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["x.parquet".to_string()],
+            "temp file leaked: {names:?}"
+        );
+        assert!(dir.path().join("d/x.parquet").is_dir());
+    }
+
+    /// A directory-fsync failure after the rename must be logged and counted, not returned:
+    /// returning Err would make the writer retry and duplicate the object under a new key.
+    #[tokio::test]
+    async fn dir_fsync_failure_after_rename_is_counted_not_returned() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let dir = tempfile::tempdir().unwrap();
+        // Opening a directory that does not exist makes the fsync step fail for real.
+        persist_dir_entry(&dir.path().join("missing"), "k/x.parquet").await;
+        let counted = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(k, ..)| k.key().name() == "local_sink_dir_fsync_errors")
+            .map(|(_, _, _, v)| v);
+        assert_eq!(counted, Some(DebugValue::Counter(1)));
+        // The success path leaves the counter untouched.
+        persist_dir_entry(dir.path(), "k/x.parquet").await;
+        let again = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(k, ..)| k.key().name() == "local_sink_dir_fsync_errors")
+            .map(|(_, _, _, v)| v);
+        assert_eq!(again, Some(DebugValue::Counter(1)));
     }
 
     #[tokio::test]

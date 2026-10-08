@@ -221,7 +221,10 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     (
         Kind::Counter,
         "hec_events_dropped",
-        "HEC events dropped because a forwarding channel was full or closed.",
+        concat!(
+            "HEC records not enqueued: one per failed per-sink send (full or closed) plus ",
+            "records never offered after the first full channel (request answered 503)."
+        ),
     ),
     (
         Kind::Counter,
@@ -236,12 +239,30 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     (
         Kind::Counter,
         "otlp_logs_received",
-        "OTLP log records accepted by the logs endpoint.",
+        "OTLP log records accepted (enqueued) by the logs endpoint.",
+    ),
+    (
+        Kind::Counter,
+        "otlp_events_dropped",
+        concat!(
+            "OTLP records not enqueued: one per failed per-sink send (full or closed; with two ",
+            "sinks one record can count twice) plus records never offered after the first full ",
+            "channel (request answered 503)."
+        ),
     ),
     (
         Kind::Counter,
         "otlp_auth_failures",
         "OTLP requests rejected for a missing or incorrect token.",
+    ),
+    (
+        Kind::Counter,
+        "redactions_applied",
+        concat!(
+            "Values redacted by rule type (drop, hash, mask, body_unparseable) and ingest source ",
+            "(hec, otlp). body_unparseable counts OTLP bodies that looked like JSON but did not ",
+            "parse while an @body.<path> rule was set; the whole body was replaced."
+        ),
     ),
     (
         Kind::Counter,
@@ -282,6 +303,11 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
         Kind::Counter,
         "parquet_s3_uploads",
         "Parquet objects uploaded successfully.",
+    ),
+    (
+        Kind::Counter,
+        "local_sink_dir_fsync_errors",
+        "Local-disk sink directory fsyncs that failed after the file was renamed into place.",
     ),
     (
         Kind::Counter,
@@ -378,6 +404,45 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
         "Distinct values of a watched field discarded because cardinality_max_values was \
          already reached, labelled by source/stream/field — non-zero here means \
          field_distinct_values is undercounting the true cardinality.",
+    ),
+    // ── spool ─────────────────────────────────────────────────────────────
+    (
+        Kind::Gauge,
+        "spool_bytes",
+        "Bytes (Parquet + descriptors) currently held in the durable S3 upload spool.",
+    ),
+    (
+        Kind::Gauge,
+        "spool_entries",
+        "Complete entries currently held in the durable S3 upload spool.",
+    ),
+    (
+        Kind::Counter,
+        "spool_rejected",
+        "Flushes the spool refused (reason=full|io); they fell back to a direct upload.",
+    ),
+    (
+        Kind::Gauge,
+        "spool_unreadable",
+        "Spool entries skipped at startup because a file could not be read (EIO, permissions); \
+         left on disk, counted in spool_bytes, retried on the next start.",
+    ),
+    (
+        Kind::Counter,
+        "spool_uploaded",
+        "Spool entries delivered to S3 (Parquet and descriptor) and removed, labelled by sink.",
+    ),
+    (
+        Kind::Counter,
+        "spool_upload_errors",
+        "Failed background uploads of spool entries, labelled by sink; the entry stays and is \
+         retried with exponential backoff.",
+    ),
+    (
+        Kind::Counter,
+        "spool_corrupt",
+        "Spool entries quarantined to corrupt/ (missing file, size or sha256 mismatch, \
+         unknown meta version), at the startup scan or at upload time.",
     ),
 ];
 

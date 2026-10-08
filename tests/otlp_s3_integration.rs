@@ -1,4 +1,4 @@
-//! Integration test: OTLP ExportLogsServiceRequest → GenericS3Handler → Parquet in MinIO.
+//! Integration test: OTLP ExportLogsServiceRequest → OtlpHandler → Parquet in MinIO.
 //!
 //! Requires a running MinIO (or S3-compatible) instance.
 //! Set MINIO_ENDPOINT, MINIO_BUCKET, MINIO_ACCESS_KEY, MINIO_SECRET_KEY env vars.
@@ -9,10 +9,9 @@
 
 #[cfg(feature = "otlp")]
 mod tests {
-    use logthing::config::{HecS3Config, S3ConnectionConfig};
-    use logthing::forwarding::generic_s3::hec_start;
+    use logthing::config::{OtlpS3Config, S3ConnectionConfig};
+    use logthing::forwarding::otlp_s3::{OtlpRecord, otlp_start};
     use logthing::forwarding::s3_sink::S3Sink;
-    use logthing::ingest::GenericRecord;
     use logthing::server::otlp::map_otlp_request;
     use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value as AnyVal};
@@ -24,8 +23,8 @@ mod tests {
         std::env::var("MINIO_ENDPOINT").ok()
     }
 
-    fn minio_hec_config(endpoint: &str) -> HecS3Config {
-        HecS3Config {
+    fn minio_otlp_config(endpoint: &str) -> OtlpS3Config {
+        OtlpS3Config {
             connection: S3ConnectionConfig {
                 endpoint: endpoint.to_string(),
                 bucket: std::env::var("MINIO_BUCKET").unwrap_or_else(|_| "otlp-test".to_string()),
@@ -34,6 +33,8 @@ mod tests {
                     .unwrap_or_else(|_| "minioadmin".to_string()),
                 secret_key: std::env::var("MINIO_SECRET_KEY")
                     .unwrap_or_else(|_| "minioadmin".to_string()),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "otlp-integration".to_string(),
             max_buffer_rows: 1,       // flush immediately on first record
@@ -90,15 +91,15 @@ mod tests {
             }
         };
 
-        let cfg = minio_hec_config(&endpoint);
+        let cfg = minio_otlp_config(&endpoint);
         let sink = Arc::new(
             S3Sink::from_connection(&cfg.connection)
                 .await
                 .expect("S3Sink::from_connection"),
         );
 
-        // Start the generic HEC handler targeting the S3 sink.
-        let (handler, _writer_task) = hec_start(
+        // Start the OTLP handler targeting the S3 sink.
+        let (handler, _writer_task) = otlp_start(
             &cfg,
             sink.clone(),
             64,
@@ -106,11 +107,11 @@ mod tests {
             None,
         );
 
-        // Map the OTLP request to GenericRecords.
+        // Map the OTLP request, assign ids like the production handler does.
         let req = make_otlp_request();
-        let records: Vec<GenericRecord> = map_otlp_request(req, "127.0.0.1".to_string());
+        let mut records: Vec<OtlpRecord> = map_otlp_request(req, "127.0.0.1".to_string());
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].sourcetype, "otlp");
+        logthing::ingest::assign_event_uuids(&mut records);
 
         // Send via the handler (flushes immediately because max_buffer_rows=1).
         handler
@@ -142,9 +143,9 @@ mod tests {
                 .build(),
         );
 
-        // Verify the object was written under the `otlp` partition.
-        // S3 key layout: {prefix}/otlp/year={Y}/month={MM}/day={DD}/{uuid}.parquet
-        let prefix = format!("{}/otlp/", cfg.prefix);
+        // Verify the object was written under the sanitized service partition
+        // (`integration-svc` sanitizes to `integration_svc`).
+        let prefix = format!("{}/integration_svc/", cfg.prefix);
         let list_result = s3
             .list_objects_v2()
             .bucket(&cfg.connection.bucket)
@@ -162,8 +163,8 @@ mod tests {
 
         let key = objects[0].key().expect("object must have a key");
         assert!(
-            key.ends_with(".parquet"),
-            "written object must have .parquet extension; got {key}"
+            key.starts_with(&prefix) && key.ends_with(".parquet"),
+            "object key must be under {prefix} and end in .parquet; got {key}"
         );
 
         // Fetch and validate the Parquet object.
@@ -188,17 +189,33 @@ mod tests {
         let builder = ParquetRecordBatchReaderBuilder::try_new(buf).expect("parquet builder");
         let schema = builder.schema().clone();
 
-        // Must have the 5 HEC columns.
-        for col in &["sourcetype", "host", "time", "received_at", "fields"] {
-            assert!(
-                schema.field_with_name(col).is_ok(),
-                "Schema under {prefix} must have column '{col}'"
-            );
-        }
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(
-            schema.fields().len(),
-            6,
-            "HEC schema must have exactly 6 columns"
+            names,
+            vec![
+                "event_uuid",
+                "time",
+                "observed_time",
+                "received_at",
+                "severity_number",
+                "severity_text",
+                "body",
+                "service_name",
+                "service_namespace",
+                "service_instance_id",
+                "host_name",
+                "peer_addr",
+                "trace_id",
+                "span_id",
+                "flags",
+                "event_name",
+                "scope_name",
+                "scope_version",
+                "resource_attributes",
+                "attributes",
+                "partition_time",
+            ],
+            "schema must be the 21 frozen OTLP columns in order"
         );
 
         let mut reader = builder.build().expect("parquet reader");
@@ -212,16 +229,20 @@ mod tests {
         );
 
         use arrow::array::StringArray;
-        let st = rb
-            .column_by_name("sourcetype")
-            .expect("sourcetype col must exist")
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(
-            st.value(0),
-            "otlp",
-            "sourcetype column must equal 'otlp' for OTLP-ingested records"
+        let col = |name: &str| {
+            rb.column_by_name(name)
+                .unwrap_or_else(|| panic!("{name} col must exist"))
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap_or_else(|| panic!("{name} must be Utf8"))
+                .clone()
+        };
+        assert_eq!(col("service_name").value(0), "integration-svc");
+        assert_eq!(col("severity_text").value(0), "WARN");
+        assert_eq!(col("body").value(0), "integration test log");
+        assert!(
+            col("attributes").value(0).contains("\"test.run\":true"),
+            "attributes JSON must carry test.run=true"
         );
     }
 }

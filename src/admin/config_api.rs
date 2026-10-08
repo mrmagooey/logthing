@@ -31,6 +31,8 @@ fn redact_s3_connection(conn: &S3ConnectionConfig) -> S3ConnectionConfig {
         region: conn.region.clone(),
         access_key: REDACTED.to_string(),
         secret_key: REDACTED.to_string(),
+        object_lock_mode: conn.object_lock_mode,
+        object_lock_retain_days: conn.object_lock_retain_days,
     }
 }
 
@@ -90,6 +92,9 @@ pub fn redacted_config(cfg: &Config) -> Config {
     if let Some(ref mut s3) = out.hec.s3 {
         s3.connection = redact_s3_connection(&s3.connection);
     }
+    if let Some(ref mut s3) = out.otlp.s3 {
+        s3.connection = redact_s3_connection(&s3.connection);
+    }
     if let Some(ref mut s3) = out.sflow.s3 {
         s3.connection = redact_s3_connection(&s3.connection);
     }
@@ -134,6 +139,8 @@ mod tests {
                 region: "us-east-1".to_string(),
                 access_key: "REAL_ACCESS_KEY".to_string(),
                 secret_key: "REAL_SECRET_KEY".to_string(),
+                object_lock_mode: None,
+                object_lock_retain_days: None,
             },
             prefix: "syslog".to_string(),
             max_buffer_rows: 10_000,
@@ -207,6 +214,17 @@ mod tests {
     // /config/reload all return) must mask the three ingest shared-secret
     // tokens the same way it masks S3 credentials.
     #[test]
+    fn redacted_config_keeps_hash_key_env_name_and_masks_nothing_else_in_redaction() {
+        let mut cfg = Config::default();
+        cfg.hec.redaction.hash_key_env = Some("LOGTHING_HASH_KEY".to_string());
+        cfg.hec.redaction.hash_fields = vec!["email".to_string()];
+        let out = redacted_config(&cfg);
+        assert_eq!(out.hec.redaction, cfg.hec.redaction);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.contains("LOGTHING_HASH_KEY"));
+    }
+
+    #[test]
     fn redacted_config_masks_ingest_tokens() {
         let mut cfg = Config::default();
         cfg.hec.token = "REAL_HEC_TOKEN".to_string();
@@ -276,14 +294,15 @@ mod tests {
         cfg.suricata.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
         cfg.wef.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
         cfg.hec.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
+        cfg.otlp.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
         cfg.sflow.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
         cfg.aggregate.s3 = Some(serde_json::from_value(conn.clone()).unwrap());
         cfg.iceberg.s3 = Some(serde_json::from_value(conn).unwrap());
     }
 
     /// Every S3-bearing config section must be redacted, not just the three that
-    /// were originally covered. This test enumerates all ten so that adding an
-    /// eleventh section without redacting it fails here.
+    /// were originally covered. This test enumerates all eleven so that adding a
+    /// twelfth section without redacting it fails here.
     #[test]
     fn redacted_config_masks_every_s3_section() {
         const SENTINEL_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
@@ -303,5 +322,64 @@ mod tests {
             !json.contains(SENTINEL_SECRET),
             "a plaintext secret_key survived redaction: {json}"
         );
+    }
+
+    /// `[otlp.s3]` credentials must be masked in the admin config view/export, while the
+    /// non-secret connection fields and the `[otlp.local]` directory survive.
+    #[test]
+    fn redacted_config_masks_otlp_s3_credentials() {
+        let mut cfg = Config::default();
+        cfg.otlp.s3 = Some(
+            serde_json::from_value(serde_json::json!({
+                "endpoint": "http://minio:9000",
+                "bucket": "otlp-logs",
+                "region": "us-east-1",
+                "access_key": "REAL_OTLP_ACCESS",
+                "secret_key": "REAL_OTLP_SECRET",
+            }))
+            .unwrap(),
+        );
+        cfg.otlp.local = Some(
+            serde_json::from_value(serde_json::json!({"directory": "/var/lib/otlp"})).unwrap(),
+        );
+
+        let out = redacted_config(&cfg);
+        let s3 = out.otlp.s3.as_ref().expect("otlp.s3 present");
+        assert_eq!(s3.connection.access_key, REDACTED);
+        assert_eq!(s3.connection.secret_key, REDACTED);
+        assert_eq!(s3.connection.bucket, "otlp-logs");
+        assert_eq!(
+            out.otlp.local.as_ref().unwrap().directory,
+            std::path::PathBuf::from("/var/lib/otlp")
+        );
+
+        let json = serde_json::to_string(&out).unwrap();
+        let toml_str = toml::to_string(&out).unwrap();
+        for leaked in ["REAL_OTLP_ACCESS", "REAL_OTLP_SECRET"] {
+            assert!(!json.contains(leaked), "{leaked} leaked in JSON: {json}");
+            assert!(
+                !toml_str.contains(leaked),
+                "{leaked} leaked in TOML: {toml_str}"
+            );
+        }
+    }
+
+    #[test]
+    fn redacted_config_preserves_object_lock_settings() {
+        use crate::config::{HecS3Config, ObjectLockMode};
+        let mut cfg = Config::default();
+        let mut s3: HecS3Config = toml::from_str(
+            "endpoint=\"http://m\"\nbucket=\"b\"\nregion=\"r\"\n\
+             access_key=\"REAL_AK\"\nsecret_key=\"REAL_SK\"\n",
+        )
+        .unwrap();
+        s3.connection.object_lock_mode = Some(ObjectLockMode::Governance);
+        s3.connection.object_lock_retain_days = Some(365);
+        cfg.hec.s3 = Some(s3);
+        let c = redacted_config(&cfg).hec.s3.unwrap().connection;
+        assert_eq!(c.object_lock_mode, Some(ObjectLockMode::Governance));
+        assert_eq!(c.object_lock_retain_days, Some(365));
+        assert_eq!(c.access_key, REDACTED);
+        assert_eq!(c.secret_key, REDACTED);
     }
 }

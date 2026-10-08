@@ -1,0 +1,348 @@
+version: 2
+
+unit_tests:
+  - name: network_activity_maps_zeek_ipfix_and_sflow
+    model: ocsf_network_activity
+    given:
+      - input: ref('stg_zeek_conn')
+        format: sql
+        rows: |
+          select cast('2026-10-01 12:00:00 UTC' as timestamp(6) with time zone) as ts,
+                 cast('Cabc' as varchar) as uid, cast('10.0.0.5' as varchar) as id_orig_h,
+                 cast(51000 as integer) as id_orig_p, cast('93.184.216.34' as varchar) as id_resp_h,
+                 cast(443 as integer) as id_resp_p, cast('TCP' as varchar) as proto,
+                 cast(1.5 as double) as duration, cast(100 as bigint) as orig_bytes,
+                 cast(2000 as bigint) as resp_bytes, cast(4 as bigint) as orig_pkts,
+                 cast(6 as bigint) as resp_pkts,
+                 cast('2026-10-01 12:00:01 UTC' as timestamp(6) with time zone) as partition_time
+      - input: ref('stg_ipfix')
+        format: sql
+        rows: |
+          select cast('2026-10-01 12:05:00 UTC' as timestamp(6) with time zone) as export_time,
+                 cast('2026-10-01 12:00:00 UTC' as timestamp(6) with time zone) as flow_start,
+                 cast('2026-10-01 12:00:09 UTC' as timestamp(6) with time zone) as flow_end,
+                 cast('10.0.0.6' as varchar) as src_addr, cast('203.0.113.5' as varchar) as dst_addr,
+                 cast(40000 as integer) as src_port, cast(53 as integer) as dst_port,
+                 cast(17 as integer) as ip_protocol, cast(500 as bigint) as octet_delta_count,
+                 cast(5 as bigint) as packet_delta_count,
+                 cast('2026-10-01 12:05:01 UTC' as timestamp(6) with time zone) as partition_time
+      - input: ref('stg_sflow_flow')
+        format: sql
+        rows: |
+          select cast('2026-10-01 12:00:03 UTC' as timestamp(6) with time zone) as received_at,
+                 cast('10.0.0.7' as varchar) as src_addr, cast('203.0.113.6' as varchar) as dst_addr,
+                 cast(1234 as integer) as src_port, cast(80 as integer) as dst_port,
+                 cast(6 as integer) as ip_protocol,
+                 cast('2026-10-01 12:00:04 UTC' as timestamp(6) with time zone) as partition_time
+    expect:
+      format: dict
+      rows:
+        - class_uid: 4001
+          type_uid: 400106
+          metadata_log_name: 'zeek_conn'
+          src_endpoint_ip: '10.0.0.5'
+          dst_endpoint_port: 443
+          connection_info_protocol_num: 6
+          connection_info_protocol_name: 'tcp'
+          traffic_bytes: 2100
+          metadata_correlation_uid: 'Cabc'
+          time: '2026-10-01 12:00:00 UTC'
+        - class_uid: 4001
+          type_uid: 400106
+          metadata_log_name: 'ipfix'
+          src_endpoint_ip: '10.0.0.6'
+          dst_endpoint_port: 53
+          connection_info_protocol_num: 17
+          connection_info_protocol_name: 'udp'
+          traffic_bytes: 500
+          metadata_correlation_uid: null
+          time: '2026-10-01 12:00:00 UTC'
+        - class_uid: 4001
+          type_uid: 400106
+          metadata_log_name: 'sflow_flow'
+          src_endpoint_ip: '10.0.0.7'
+          dst_endpoint_port: 80
+          connection_info_protocol_num: 6
+          connection_info_protocol_name: 'tcp'
+          traffic_bytes: null
+          metadata_correlation_uid: null
+          time: '2026-10-01 12:00:03 UTC'
+
+  - name: network_activity_ipfix_time_falls_back_to_export_time
+    model: ocsf_network_activity
+    given:
+      - input: ref('stg_zeek_conn')
+        format: sql
+        rows: |
+          select cast(null as timestamp(6) with time zone) as ts, cast(null as varchar) as uid,
+                 cast(null as varchar) as id_orig_h, cast(null as integer) as id_orig_p,
+                 cast(null as varchar) as id_resp_h, cast(null as integer) as id_resp_p,
+                 cast(null as varchar) as proto, cast(null as double) as duration,
+                 cast(null as bigint) as orig_bytes, cast(null as bigint) as resp_bytes,
+                 cast(null as bigint) as orig_pkts, cast(null as bigint) as resp_pkts,
+                 cast(null as timestamp(6) with time zone) as partition_time
+          where false
+      - input: ref('stg_ipfix')
+        format: sql
+        rows: |
+          select cast('2026-10-01 12:05:00 UTC' as timestamp(6) with time zone) as export_time,
+                 cast(null as timestamp(6) with time zone) as flow_start,
+                 cast(null as timestamp(6) with time zone) as flow_end,
+                 cast('10.0.0.6' as varchar) as src_addr, cast('203.0.113.5' as varchar) as dst_addr,
+                 cast(1 as integer) as src_port, cast(2 as integer) as dst_port,
+                 cast(1 as integer) as ip_protocol, cast(1 as bigint) as octet_delta_count,
+                 cast(1 as bigint) as packet_delta_count,
+                 cast('2026-10-01 12:05:01 UTC' as timestamp(6) with time zone) as partition_time
+      - input: ref('stg_sflow_flow')
+        format: sql
+        rows: |
+          select cast(null as timestamp(6) with time zone) as received_at,
+                 cast(null as varchar) as src_addr, cast(null as varchar) as dst_addr,
+                 cast(null as integer) as src_port, cast(null as integer) as dst_port,
+                 cast(null as integer) as ip_protocol,
+                 cast(null as timestamp(6) with time zone) as partition_time
+          where false
+    expect:
+      format: dict
+      rows:
+        - time: '2026-10-01 12:05:00 UTC'
+          connection_info_protocol_name: 'icmp'
+
+  - name: network_activity_zeek_protocol_number_comes_from_the_protocol_name
+    model: ocsf_network_activity
+    given:
+      - input: ref('stg_zeek_conn')
+        format: sql
+        rows: |
+          select cast('2026-10-01 12:00:00 UTC' as timestamp(6) with time zone) as ts,
+                 cast('P1' as varchar) as uid, cast('10.0.0.5' as varchar) as id_orig_h,
+                 cast(1 as integer) as id_orig_p, cast('10.0.0.6' as varchar) as id_resp_h,
+                 cast(2 as integer) as id_resp_p, cast('icmp' as varchar) as proto,
+                 cast(null as double) as duration, cast(null as bigint) as orig_bytes,
+                 cast(null as bigint) as resp_bytes, cast(null as bigint) as orig_pkts,
+                 cast(null as bigint) as resp_pkts,
+                 cast('2026-10-01 12:00:01 UTC' as timestamp(6) with time zone) as partition_time
+          union all
+          select cast('2026-10-01 12:00:00 UTC' as timestamp(6) with time zone), 'P2', '::1', 1,
+                 '::2', 2, 'icmp6', null, null, null, null, null,
+                 cast('2026-10-01 12:00:01 UTC' as timestamp(6) with time zone)
+          union all
+          select cast('2026-10-01 12:00:00 UTC' as timestamp(6) with time zone), 'P3', '10.0.0.5',
+                 1, '10.0.0.6', 2, 'UDP', null, null, null, null, null,
+                 cast('2026-10-01 12:00:01 UTC' as timestamp(6) with time zone)
+          union all
+          select cast('2026-10-01 12:00:00 UTC' as timestamp(6) with time zone), 'P4', '10.0.0.5',
+                 1, '10.0.0.6', 2, 'unknown_transport', null, null, null, null, null,
+                 cast('2026-10-01 12:00:01 UTC' as timestamp(6) with time zone)
+      - input: ref('stg_ipfix')
+        format: sql
+        rows: |
+          select cast(null as timestamp(6) with time zone) as export_time,
+                 cast(null as timestamp(6) with time zone) as flow_start,
+                 cast(null as timestamp(6) with time zone) as flow_end,
+                 cast(null as varchar) as src_addr, cast(null as varchar) as dst_addr,
+                 cast(null as integer) as src_port, cast(null as integer) as dst_port,
+                 cast(null as integer) as ip_protocol, cast(null as bigint) as octet_delta_count,
+                 cast(null as bigint) as packet_delta_count,
+                 cast(null as timestamp(6) with time zone) as partition_time
+          where false
+      - input: ref('stg_sflow_flow')
+        format: sql
+        rows: |
+          select cast(null as timestamp(6) with time zone) as received_at,
+                 cast(null as varchar) as src_addr, cast(null as varchar) as dst_addr,
+                 cast(null as integer) as src_port, cast(null as integer) as dst_port,
+                 cast(null as integer) as ip_protocol,
+                 cast(null as timestamp(6) with time zone) as partition_time
+          where false
+    expect:
+      format: dict
+      rows:
+        - metadata_correlation_uid: 'P1'
+          connection_info_protocol_num: 1
+          connection_info_protocol_name: 'icmp'
+        - metadata_correlation_uid: 'P2'
+          connection_info_protocol_num: 58
+          connection_info_protocol_name: 'icmp6'
+        - metadata_correlation_uid: 'P3'
+          connection_info_protocol_num: 17
+          connection_info_protocol_name: 'udp'
+        - metadata_correlation_uid: 'P4'
+          connection_info_protocol_num: null
+          connection_info_protocol_name: 'unknown_transport'
+
+  - name: dns_activity_distinguishes_query_from_response
+    model: ocsf_dns_activity
+    given:
+      - input: ref('stg_zeek_dns')
+        format: sql
+        rows: |
+          select cast('2026-10-01 12:00:00 UTC' as timestamp(6) with time zone) as ts,
+                 cast('D1' as varchar) as uid, cast('10.0.0.5' as varchar) as id_orig_h,
+                 cast(53211 as integer) as id_orig_p, cast('10.0.0.1' as varchar) as id_resp_h,
+                 cast(53 as integer) as id_resp_p, cast('UDP' as varchar) as proto,
+                 cast('example.test' as varchar) as query, cast('A' as varchar) as qtype_name,
+                 cast('C_INTERNET' as varchar) as qclass_name, cast(null as varchar) as rcode_name,
+                 cast(null as varchar) as answers,
+                 cast('2026-10-01 12:00:01 UTC' as timestamp(6) with time zone) as partition_time
+          union all
+          select cast('2026-10-01 12:00:02 UTC' as timestamp(6) with time zone), 'D2', '10.0.0.5',
+                 53212, '10.0.0.1', 53, 'UDP', 'example.test', 'A', 'C_INTERNET', 'NOERROR',
+                 '["192.0.2.10"]', cast('2026-10-01 12:00:03 UTC' as timestamp(6) with time zone)
+    expect:
+      format: dict
+      rows:
+        - class_uid: 4003
+          type_uid: 400301
+          activity_name: 'Query'
+          query_hostname: 'example.test'
+          rcode: null
+          connection_info_protocol_name: 'udp'
+          metadata_correlation_uid: 'D1'
+        - class_uid: 4003
+          type_uid: 400302
+          activity_name: 'Response'
+          query_hostname: 'example.test'
+          rcode: 'NOERROR'
+          connection_info_protocol_name: 'udp'
+          metadata_correlation_uid: 'D2'
+
+  - name: authentication_maps_windows_logon_events_from_the_event_xml
+    model: ocsf_authentication
+    given:
+      - input: ref('stg_wef')
+        format: sql
+        rows: |
+          select cast(4624 as bigint) as event_id,
+                 cast('2026-10-01 12:00:05 UTC' as timestamp(6) with time zone) as received_at,
+                 cast('ws01' as varchar) as source_host,
+                 cast('{"raw_xml": "<Event><EventData><Data Name=\"TargetUserName\">john.doe</Data><Data Name=''TargetDomainName''>CONTOSO</Data><Data Name=\"LogonType\">3</Data><Data Name=\"IpAddress\">192.168.1.100</Data><Data Name=\"IpPort\">49234</Data></EventData></Event>", "parsed": {"event_id": 4624, "computer": "WS01.contoso.com", "time_created": "2026-10-01T12:00:00Z", "data": null}}' as varchar) as event_data
+          union all
+          select 4625, cast('2026-10-01 12:01:05 UTC' as timestamp(6) with time zone), 'ws01',
+                 '{"raw_xml": "<Event><EventData><Data Name=\"TargetUserName\">admin</Data><Data Name=\"TargetDomainName\">CONTOSO</Data><Data Name=\"LogonType\">3</Data><Data Name=\"Status\">0xc000006d</Data><Data Name=\"SubStatus\">0xc0000064</Data><Data Name=\"IpAddress\">203.0.113.9</Data><Data Name=\"IpPort\">-</Data></EventData></Event>", "parsed": {"event_id": 4625, "computer": "WS01.contoso.com", "time_created": "2026-10-01T12:01:00Z", "data": null}}'
+          union all
+          select 4634, cast('2026-10-01 12:02:05 UTC' as timestamp(6) with time zone), 'ws01',
+                 '{"raw_xml": "<Event><EventData><Data Name=\"TargetUserName\">john.doe</Data><Data Name=\"TargetDomainName\">CONTOSO</Data></EventData></Event>", "parsed": {"event_id": 4634, "computer": "WS01.contoso.com", "time_created": "2026-10-01T12:02:00Z", "data": null}}'
+          union all
+          select 4648, cast('2026-10-01 12:03:05 UTC' as timestamp(6) with time zone), 'ws01',
+                 '{"raw_xml": "<Event><EventData><Data Name=\"SubjectUserName\">svc-backup</Data><Data Name=\"TargetUserName\">admin</Data><Data Name=\"TargetDomainName\">CONTOSO</Data><Data Name=\"IpAddress\">-</Data></EventData></Event>", "parsed": {"event_id": 4648, "computer": "WS01.contoso.com", "time_created": "2026-10-01T12:03:00Z", "data": null}}'
+          union all
+          select 4688, cast('2026-10-01 12:04:05 UTC' as timestamp(6) with time zone), 'ws01',
+                 '{"raw_xml": "<Event/>", "parsed": {"event_id": 4688, "computer": "WS01.contoso.com", "time_created": "2026-10-01T12:04:00Z", "data": null}}'
+          union all
+          select 4624, cast('2026-10-01 12:09:00 UTC' as timestamp(6) with time zone), 'ws09',
+                 'not json at all'
+    expect:
+      format: dict
+      rows:
+        - metadata_event_code: '4624'
+          user_name: 'john.doe'
+          user_domain: 'CONTOSO'
+          actor_user_name: null
+          logon_type_id: 3
+          src_endpoint_ip: '192.168.1.100'
+          src_endpoint_port: 49234
+          status_id: 1
+          severity_id: 1
+          activity_id: 1
+          type_uid: 300201
+          status_detail: null
+          dst_endpoint_hostname: 'WS01.contoso.com'
+          time: '2026-10-01 12:00:00 UTC'
+        - metadata_event_code: '4625'
+          user_name: 'admin'
+          user_domain: 'CONTOSO'
+          actor_user_name: null
+          logon_type_id: 3
+          src_endpoint_ip: '203.0.113.9'
+          src_endpoint_port: null
+          status_id: 2
+          severity_id: 2
+          activity_id: 1
+          type_uid: 300201
+          status_detail: '0xc0000064'
+          dst_endpoint_hostname: 'WS01.contoso.com'
+          time: '2026-10-01 12:01:00 UTC'
+        - metadata_event_code: '4634'
+          user_name: 'john.doe'
+          user_domain: 'CONTOSO'
+          actor_user_name: null
+          logon_type_id: null
+          src_endpoint_ip: null
+          src_endpoint_port: null
+          status_id: 1
+          severity_id: 1
+          activity_id: 2
+          type_uid: 300202
+          status_detail: null
+          dst_endpoint_hostname: 'WS01.contoso.com'
+          time: '2026-10-01 12:02:00 UTC'
+        - metadata_event_code: '4648'
+          user_name: 'admin'
+          user_domain: 'CONTOSO'
+          actor_user_name: 'svc-backup'
+          logon_type_id: null
+          src_endpoint_ip: null
+          src_endpoint_port: null
+          status_id: 1
+          severity_id: 1
+          activity_id: 1
+          type_uid: 300201
+          status_detail: null
+          dst_endpoint_hostname: 'WS01.contoso.com'
+          time: '2026-10-01 12:03:00 UTC'
+        - metadata_event_code: '4624'
+          user_name: null
+          user_domain: null
+          actor_user_name: null
+          logon_type_id: null
+          src_endpoint_ip: null
+          src_endpoint_port: null
+          status_id: 1
+          severity_id: 1
+          activity_id: 1
+          type_uid: 300201
+          status_detail: null
+          dst_endpoint_hostname: 'ws09'
+          time: '2026-10-01 12:09:00 UTC'
+
+  - name: detection_finding_maps_suricata_alerts_and_ignores_other_events
+    model: ocsf_detection_finding
+    given:
+      - input: ref('stg_suricata')
+        format: sql
+        rows: |
+          select cast('alert' as varchar) as event_type,
+                 cast('2026-10-01 12:00:10 UTC' as timestamp(6) with time zone) as received_at,
+                 cast('10.0.0.8' as varchar) as src_ip,
+                 cast('{"timestamp": "2026-10-01T12:00:00.123456+0000", "src_ip": "10.0.0.8", "src_port": 4444, "dest_ip": "198.51.100.7", "dest_port": 22, "proto": "TCP", "alert": {"signature": "ET SCAN test", "signature_id": 2001219, "severity": 1, "category": "Attempted Recon", "action": "allowed"}}' as varchar) as payload
+          union all
+          select 'dns', cast('2026-10-01 12:00:11 UTC' as timestamp(6) with time zone), '10.0.0.8', '{}'
+          union all
+          select 'alert', cast('2026-10-01 12:00:20 UTC' as timestamp(6) with time zone), '10.0.0.9',
+                 '{"timestamp": "garbage", "dest_ip": "198.51.100.8", "alert": {"signature": "ET MISC", "signature_id": 2001220, "severity": 3}}'
+    expect:
+      format: dict
+      rows:
+        - class_uid: 2004
+          type_uid: 200401
+          finding_info_title: 'ET SCAN test'
+          finding_info_uid: '2001219'
+          severity_id: 4
+          src_endpoint_ip: '10.0.0.8'
+          dst_endpoint_ip: '198.51.100.7'
+          dst_endpoint_port: 22
+          connection_info_protocol_name: 'tcp'
+          disposition_name: 'allowed'
+          time: '2026-10-01 12:00:00.123456 UTC'
+        - class_uid: 2004
+          type_uid: 200401
+          finding_info_title: 'ET MISC'
+          finding_info_uid: '2001220'
+          severity_id: 2
+          src_endpoint_ip: '10.0.0.9'
+          dst_endpoint_ip: '198.51.100.8'
+          dst_endpoint_port: null
+          connection_info_protocol_name: null
+          disposition_name: null
+          time: '2026-10-01 12:00:20 UTC'

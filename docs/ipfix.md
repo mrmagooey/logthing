@@ -73,3 +73,31 @@ Objects are stored at `ipfix/year=YYYY/month=MM/day=DD/<uuid>.parquet`, distinct
 `flow_start` and `flow_end` are nullable, so neither is a safe Iceberg partition-transform source on its own — a file with a null in either would yield two partition values and Iceberg refuses the write. `partition_time` is the correct source: it is non-null, derived from `export_time` (clamped to a bounded backfill/skew window around receipt time and otherwise falling back to receipt time), and holds the instant the file's buffer day was actually derived from.
 
 **Memory safety**: when S3 is unavailable and the buffer exceeds `max_buffer_rows * 4` rows, the oldest batches are dropped and the `parquet_s3_buffer_dropped{source="ipfix"}` counter is incremented.
+
+## sFlow v5
+
+sFlow v5 flow and counter samples arrive on a separate UDP listener (default port 6343, disabled by
+default). The decoder is stateless: every datagram carries the context needed to decode it.
+
+```toml
+[sflow]
+enabled = true
+udp_port = 6343
+bind_address = "0.0.0.0"
+recv_tasks = 8              # UDP receive tasks; default 8 (same semantics as [syslog] recv_tasks)
+recv_batch_size = 32        # datagrams per recvmmsg(2) call; default 32
+receive_buffer_bytes = 4194304  # requested SO_RCVBUF; 0 = OS default (default 4 MiB)
+
+[sflow.s3]                  # or [sflow.local] with `directory`; same keys, prefix defaults to "sflow"
+endpoint   = "http://localhost:9000"
+bucket     = "sflow"
+region     = "us-east-1"
+access_key = "minioadmin"
+secret_key = "minioadmin"
+flush_threshold_bytes = 104857600   # default 100 MiB
+flush_interval_secs   = 900         # default 900
+max_buffer_rows       = 100000      # default 100 000
+# channel_capacity defaults to the 100 MiB channel budget / 8960 B per record
+```
+
+Without `[sflow.s3]`/`[sflow.local]` each datagram is decoded and logged only; nothing is persisted.

@@ -94,3 +94,15 @@ flush_interval_secs   = 5
 [iceberg.local]
 directory = "/var/log/iceberg-local"
 prefix    = "_iceberg_descriptors"
+
+# OTLP/HTTP logs: local-disk sink only (same reasoning as [hec] above). The bearer token is
+# exercised by otlp-generator (a wrong token must be rejected with 401).
+[otlp]
+enabled      = true
+bearer_token = "e2e-otlp-token"
+
+[otlp.local]
+directory             = "/var/log/otlp-local"
+prefix                = "otlp"
+flush_threshold_bytes = 1
+flush_interval_secs   = 5

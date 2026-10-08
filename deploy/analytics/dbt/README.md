@@ -1,0 +1,116 @@
+# logthing dbt project
+
+dbt-trino models over the Iceberg tables logthing writes (namespace `logs`): typed staging views,
+four flattened OCSF 1.3 views and three example detections.
+
+## Setup and running
+
+```bash
+deploy/analytics/.venv/bin/pip install -r deploy/analytics/tests/requirements.txt   # pins dbt-core 1.11.15, dbt-trino 1.10.6
+export PATH=$PWD/deploy/analytics/.venv/bin:$PATH   # or call .venv/bin/dbt explicitly
+cd deploy/analytics/dbt
+# compose: extract the generated CA once
+docker compose -f ../docker-compose.yml exec -T trino cat /etc/trino/tls/ca.pem > trino-ca.pem
+export TRINO_HOST=localhost TRINO_PORT=8443 TRINO_USER=admin
+export TRINO_PASSWORD=<TRINO_ADMIN_PASSWORD from .env> TRINO_CA_CERT=$PWD/trino-ca.pem
+dbt build            # (.venv/bin/dbt) views, schema tests and dbt unit tests
+dbt compile          # compiles analyses/ to target/compiled/logthing_analytics/analyses/
+```
+Helm: `kubectl port-forward svc/<release>-logthing-analytics-trino 8443` and read the CA with
+`kubectl get secret <release>-logthing-analytics-trino-tls -o jsonpath='{.data.ca\.pem}' | base64 -d`.
+
+**Tables appear only after data arrives.** The committer creates `zeek_conn`, `wef`, `suricata`, ...
+on first data. `stg_*` views use the `source_or_empty` macro, so `dbt build` works on an empty lake
+(empty views), but a view built while its table was missing stays empty: run `dbt run` again once
+the table exists.
+
+## Models
+
+| Model | Source table | Notes |
+|-------|--------------|-------|
+| `stg_wef`, `stg_zeek_conn`, `stg_zeek_dns`, `stg_ipfix`, `stg_sflow_flow`, `stg_suricata` | `wef`, `zeek_conn`, `zeek_dns`, `ipfix`, `sflow_flow`, `suricata` | typed passthrough |
+| `ocsf_network_activity` (4001) | zeek_conn, ipfix, sflow_flow | activity 6 Traffic; protocol number from the Zeek protocol name (tcp 6, udp 17, icmp 1, icmp6 58) |
+| `ocsf_dns_activity` (4003) | zeek_dns | Query (1) without rcode, Response (2) with |
+| `ocsf_authentication` (3002) | wef 4624, 4625, 4634, 4648 | Logon (1) / Logoff (2); 4625 = status Failure, severity Low |
+| `ocsf_detection_finding` (2004) | suricata `event_type = 'alert'` | Suricata severity 1/2/3 -> OCSF 4/3/2; timestamps keep microseconds |
+
+OCSF dotted attributes are flattened with underscores (`src_endpoint.ip` -> `src_endpoint_ip`,
+`metadata.product.name` -> `metadata_product_name`). Required columns carry `not_null` tests.
+**Syslog has no OCSF model** (no natural OCSF class); `syslog`, `structured_syslog`, `sflow_counter`
+are declared as sources only.
+
+### stg_otlp and stg_hec
+
+`otlp` is one typed table for every OTLP service (21 columns, `docs/otlp.md`); `hec` has 10
+columns (`sourcetype`, `host`, `time`, `received_at`, `fields`, `partition_time` plus `event_uuid`,
+`source`, `index`, `indexed_fields` from 0.22.0). `stg_otlp_typed` and `stg_hec_typed` are typed
+passthroughs; `stg_otlp` and `stg_hec` sit on top and keep one row per `event_uuid` (the earliest
+`received_at` wins). The sinks are at-least-once, so a replayed batch can land the same event twice
+with the same `event_uuid`.
+
+They are views, not incremental models: an incremental model would be a dbt-managed Iceberg table
+inside the committer's namespace, `merge` through Lakekeeper, and a second copy that can drift from
+the source, for no benefit at current volume. Revisit when the dedup scan gets slow.
+
+Rows with a NULL `event_uuid` (legacy HEC rows written before 0.22.0) have no identity, so all of
+them are kept. Client retries mint new uuids and therefore cannot be deduplicated. Columns missing
+from a not-yet-evolved `hec` table read NULL (`source_or_empty` fills them), so `stg_hec` works
+before the committer has evolved the table.
+
+Attributes are JSON strings:
+
+```sql
+select json_extract_scalar(attributes, '$["http.route"]') from stg_otlp;
+select json_extract_scalar(fields, '$.user') from stg_hec;
+```
+
+**WEF fields come from `raw_xml`.** The `wef.event_data` column is the serialized event JSON; its
+`parsed.data` is always null, so TargetUserName, IpAddress, LogonType... are read from the XML in
+`raw_xml` with a regexp (`macros/wef_field.sql`). Absent, empty and `-` values become NULL, and
+malformed JSON/XML yields NULLs (the row's `time` falls back to the receipt time).
+
+## Detections (`analyses/`)
+
+| Analysis | Fires when | Variable |
+|----------|-----------|----------|
+| `detect_auth_bruteforce` | >= N failed logons (4625) from one source IP in a 10-minute window, last day | `bruteforce_threshold` (10) |
+| `detect_suricata_high_severity` | Suricata alerts with OCSF severity >= 4, grouped by destination, last day | `suricata_min_severity_id` (4) |
+| `detect_rare_outbound_port` | destination port unseen in the previous 7 days and < N connections in the last day | `rare_port_max_connections` (5) |
+
+"Last day" is relative to the wall clock by default. Set `detection_as_of` (ISO 8601, e.g.
+`--vars '{detection_as_of: "2026-10-05T12:00:00Z"}'`) to pin the reference time, for replaying
+history or reproducible tests. When it is set the analyses also apply an upper bound
+(`"time" <= detection_as_of`) so a replay never sees events after the pinned instant; live runs
+(variable unset) are unbounded above.
+
+**Caveats.**
+- `detect_auth_bruteforce` uses 10-minute *tumbling* windows: a burst that straddles a window
+  boundary is split and may stay below the threshold in both halves (a sliding window would be
+  more precise).
+- `detect_rare_outbound_port` needs history: until ~8 days of baseline exist, nearly every
+  port looks "new", so expect noise on a fresh lake. Ports are not keyed by protocol (tcp/443 and
+  udp/443 are the same port) and "outbound" means towards the responder.
+
+dbt compiles analyses but never runs them. Schedule them yourself: compile, then run the SQL with
+any Trino client over HTTPS with the CA, e.g. cron every 10 minutes:
+
+```bash
+# needs in the environment: TRINO_HOST TRINO_PORT (8443) TRINO_USER TRINO_PASSWORD TRINO_CA_CERT
+# (dbt profile) and, for the CLI, the CA as a truststore plus the password via TRINO_PASSWORD
+export TRINO_HOST=trino.example TRINO_PORT=8443 TRINO_USER=admin TRINO_PASSWORD=... \
+       TRINO_CA_CERT=/etc/ssl/trino-ca.pem
+cd /opt/logthing/deploy/analytics/dbt && /opt/logthing/deploy/analytics/.venv/bin/dbt compile -q --vars '{bruteforce_threshold: 20}' && \
+for f in target/compiled/logthing_analytics/analyses/detect_*.sql; do
+  trino --server "https://$TRINO_HOST:$TRINO_PORT" --truststore-path "$TRINO_CA_CERT" \
+        --user "$TRINO_USER" --password --execute "$(cat "$f")"
+done
+```
+or the same two commands in a Kubernetes `CronJob` whose image contains dbt (`pip install -r
+requirements.txt`) and the Trino CLI, with `TRINO_*` taken from the credentials Secret and the CA
+mounted (illustrative: this stack ships no such image). Alert routing is up to you; logthing is a
+SIEM feeder, not an alerting engine.
+
+**Sigma:** there is no pySigma backend for Trino (verified 2026-10-06 against the pySigma plugin
+directory: none for Trino, Presto, Athena or generic SQL), so Sigma rules are not converted
+automatically. The future route is a custom pySigma `TextQueryBackend` emitting Trino SQL over these
+OCSF views; that is not shipped.

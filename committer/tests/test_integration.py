@@ -25,7 +25,9 @@ import pytest
 from botocore.exceptions import ClientError
 from moto.server import ThreadedMotoServer
 from pyiceberg.catalog.sql import SqlCatalog
-from pyiceberg.exceptions import CommitFailedException
+from pyiceberg.exceptions import BadRequestError, CommitFailedException
+from pyiceberg.table.update.schema import UpdateSchema
+from pyiceberg.types import StringType
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -441,3 +443,190 @@ def test_half_completed_move_is_finished_on_rerun(cfg, s3, catalog, pa_fs):
     # copy in DONE_PREFIX.
     assert list_keys(s3, cfg, cfg.desc_prefix) == []
     assert list_keys(s3, cfg, cfg.done_prefix) == [done_key]
+
+
+# ---------------------------------------------------------------------------
+# Additive schema evolution + single otlp table
+# ---------------------------------------------------------------------------
+
+
+def _uuid_rows(marker: str, uuid_value: str) -> dict:
+    return {
+        "sourcetype": [marker],
+        "fields": ["{}"],
+        "event_uuid": [uuid_value],
+        "source": pa.array([None], type=pa.string()),
+    }
+
+
+def test_new_shaped_file_evolves_existing_hec_table_and_old_rows_read_null(
+    cfg, s3, catalog, pa_fs
+):
+    # Table created BEFORE the upgrade: the old narrow column shape.
+    old_key = "hec/legacy/year=2026/month=01/day=01/old.parquet"
+    write_parquet(
+        s3, cfg.bucket, old_key, {"sourcetype": ["legacy"], "fields": ["{}"]}, "2026-01-01"
+    )
+    put_descriptor(s3, cfg, "old.json", source="hec", data_key=old_key, record_count=1)
+    assert commit.run(cfg, s3, catalog, pa_fs) == 0
+    assert "event_uuid" not in catalog.load_table(("logs", "hec")).schema().column_names
+
+    # After the upgrade logthing writes files with extra columns.
+    new_key = "hec/app/year=2026/month=01/day=02/new.parquet"
+    write_parquet(s3, cfg.bucket, new_key, _uuid_rows("fresh", "0199c4e0-aaaa"), "2026-01-02")
+    put_descriptor(s3, cfg, "new.json", source="hec", data_key=new_key, record_count=1)
+    assert commit.run(cfg, s3, catalog, pa_fs) == 0
+
+    tbl = catalog.load_table(("logs", "hec"))
+    assert {"event_uuid", "source"} <= set(tbl.schema().column_names)
+    by_type = {r["sourcetype"]: r for r in tbl.scan().to_arrow().to_pylist()}
+    assert by_type["legacy"]["event_uuid"] is None, "old rows read NULL for new columns"
+    assert by_type["fresh"]["event_uuid"] == "0199c4e0-aaaa", "new column VALUES must be readable"
+    assert list_keys(s3, cfg, cfg.quarantine_prefix) == []
+    assert sorted(list_keys(s3, cfg, cfg.done_prefix)) == [
+        cfg.done_prefix + "new.json",
+        cfg.done_prefix + "old.json",
+    ]
+
+
+def test_type_change_on_existing_column_is_quarantined_but_neighbours_commit(
+    cfg, s3, catalog, pa_fs
+):
+    k1 = "hec/a/year=2026/month=01/day=01/a.parquet"
+    write_parquet(s3, cfg.bucket, k1, {"sourcetype": ["a"], "fields": ["{}"]}, "2026-01-01")
+    put_descriptor(s3, cfg, "a.json", source="hec", data_key=k1, record_count=1)
+    assert commit.run(cfg, s3, catalog, pa_fs) == 0
+
+    # `extra` is new and precedes `fields` turning into an int: union_by_name stages `extra`,
+    # then rejects the type change. The staged column must NOT leak into the table.
+    k2 = "hec/b/year=2026/month=01/day=02/b.parquet"
+    write_parquet(
+        s3, cfg.bucket, k2, {"sourcetype": ["b"], "extra": ["x"], "fields": [7]}, "2026-01-02"
+    )
+    put_descriptor(s3, cfg, "b.json", source="hec", data_key=k2, record_count=1)
+    k3 = "hec/c/year=2026/month=01/day=02/c.parquet"
+    write_parquet(
+        s3,
+        cfg.bucket,
+        k3,
+        {"sourcetype": ["c"], "fields": ["{}"], "event_uuid": ["u"]},
+        "2026-01-02",
+    )
+    put_descriptor(s3, cfg, "c.json", source="hec", data_key=k3, record_count=1)
+
+    assert commit.run(cfg, s3, catalog, pa_fs) != 0
+    tbl = catalog.load_table(("logs", "hec"))
+    assert sorted(r["sourcetype"] for r in tbl.scan().to_arrow().to_pylist()) == ["a", "c"]
+    assert list_keys(s3, cfg, cfg.quarantine_prefix) == [cfg.quarantine_prefix + "b.json"]
+    assert "extra" not in tbl.schema().column_names, "rejected file must not evolve the table"
+
+
+def test_catalog_400_on_schema_update_quarantines_that_file_only(
+    cfg, s3, catalog, pa_fs, monkeypatch
+):
+    k1 = "hec/a/year=2026/month=01/day=01/a.parquet"
+    write_parquet(s3, cfg.bucket, k1, {"sourcetype": ["a"], "fields": ["{}"]}, "2026-01-01")
+    put_descriptor(s3, cfg, "a.json", source="hec", data_key=k1, record_count=1)
+    assert commit.run(cfg, s3, catalog, pa_fs) == 0
+
+    def reject(self):
+        raise BadRequestError("catalog rejects this schema update")
+
+    monkeypatch.setattr(UpdateSchema, "commit", reject)
+    k2 = "hec/b/year=2026/month=01/day=02/b.parquet"
+    write_parquet(s3, cfg.bucket, k2, _uuid_rows("b", "u-b"), "2026-01-02")
+    put_descriptor(s3, cfg, "b.json", source="hec", data_key=k2, record_count=1)
+    k3 = "hec/c/year=2026/month=01/day=02/c.parquet"
+    write_parquet(s3, cfg.bucket, k3, {"sourcetype": ["c"], "fields": ["{}"]}, "2026-01-02")
+    put_descriptor(s3, cfg, "c.json", source="hec", data_key=k3, record_count=1)
+
+    assert commit.run(cfg, s3, catalog, pa_fs) != 0
+    assert list_keys(s3, cfg, cfg.quarantine_prefix) == [cfg.quarantine_prefix + "b.json"]
+    rows = catalog.load_table(("logs", "hec")).scan().to_arrow().to_pylist()
+    assert sorted(r["sourcetype"] for r in rows) == ["a", "c"]
+
+
+def test_persistent_commit_conflict_on_evolution_aborts_and_leaves_descriptors_queued(
+    cfg, s3, catalog, pa_fs, monkeypatch
+):
+    monkeypatch.setattr(commit.time, "sleep", lambda s: None)
+    k1 = "hec/a/year=2026/month=01/day=01/a.parquet"
+    write_parquet(s3, cfg.bucket, k1, {"sourcetype": ["a"], "fields": ["{}"]}, "2026-01-01")
+    put_descriptor(s3, cfg, "a.json", source="hec", data_key=k1, record_count=1)
+    assert commit.run(cfg, s3, catalog, pa_fs) == 0
+
+    def conflict(self):
+        raise CommitFailedException("always conflicts")
+
+    monkeypatch.setattr(UpdateSchema, "commit", conflict)
+    k2 = "hec/b/year=2026/month=01/day=02/b.parquet"
+    write_parquet(s3, cfg.bucket, k2, _uuid_rows("b", "u-b"), "2026-01-02")
+    put_descriptor(s3, cfg, "b.json", source="hec", data_key=k2, record_count=1)
+
+    assert commit.run(cfg, s3, catalog, pa_fs) != 0
+    assert list_keys(s3, cfg, cfg.desc_prefix) == [cfg.desc_prefix + "b.json"]
+    assert list_keys(s3, cfg, cfg.quarantine_prefix) == []
+
+
+def test_stale_table_handle_evolution_reloads_and_retries(cfg, s3, catalog, pa_fs, monkeypatch):
+    # Two committers: ours holds a STALE table object; the other one evolves the schema first.
+    monkeypatch.setattr(commit.time, "sleep", lambda s: None)
+    k1 = "hec/a/year=2026/month=01/day=01/a.parquet"
+    write_parquet(s3, cfg.bucket, k1, {"sourcetype": ["a"], "fields": ["{}"]}, "2026-01-01")
+    put_descriptor(s3, cfg, "a.json", source="hec", data_key=k1, record_count=1)
+    assert commit.run(cfg, s3, catalog, pa_fs) == 0
+
+    ident = ("logs", "hec")
+    stale = commit.force_pyarrow_io(catalog.load_table(ident), cfg)
+    other = catalog.load_table(ident)
+    with other.update_schema() as upd:
+        upd.add_column("other_committer_col", StringType())
+
+    k2 = "hec/b/year=2026/month=01/day=02/b.parquet"
+    write_parquet(s3, cfg.bucket, k2, _uuid_rows("b", "u-b"), "2026-01-02")
+    uri = f"s3://{cfg.bucket}/{k2}"
+    tbl, fits, done, conflicted = commit.evolve_schema(
+        catalog, cfg, pa_fs, "hec", stale, set(), [("b.json", uri)]
+    )
+    assert fits == [("b.json", uri)] and conflicted == [] and done == []
+    assert {"other_committer_col", "event_uuid", "source"} <= set(tbl.schema().column_names)
+
+
+def test_file_registered_by_another_committer_is_skipped_not_quarantined(
+    cfg, s3, catalog, pa_fs
+):
+    k = "hec/a/year=2026/month=01/day=01/a.parquet"
+    write_parquet(s3, cfg.bucket, k, {"sourcetype": ["a"], "fields": ["{}"]}, "2026-01-01")
+    uri = f"s3://{cfg.bucket}/{k}"
+    put_descriptor(s3, cfg, "a.json", source="hec", data_key=k, record_count=1)
+
+    commit.ensure_namespace(catalog, cfg.namespace)
+    tbl = commit.ensure_table(catalog, pa_fs, cfg, "hec", uri)
+    table_cache = {"hec": tbl}
+    committed_cache = {"hec": set()}  # stale: believes nothing is registered
+    tbl.add_files([uri])  # "the other committer" wins the race
+
+    counts = commit._commit_batch(
+        cfg, s3, catalog, pa_fs, table_cache, committed_cache, "hec", [(cfg.desc_prefix + "a.json", uri)]
+    )
+    assert (counts.committed, counts.skipped, counts.quarantined) == (0, 1, 0)
+    assert list_keys(s3, cfg, cfg.quarantine_prefix) == []
+    assert catalog.load_table(("logs", "hec")).scan().to_arrow().num_rows == 1
+
+
+def test_otlp_files_for_different_services_share_one_table(cfg, s3, catalog, pa_fs):
+    for i, service_dir in enumerate(["svc_a", "_overflow"]):
+        key = f"otlp/{service_dir}/year=2026/month=01/day=01/{i}.parquet"
+        write_parquet(
+            s3,
+            cfg.bucket,
+            key,
+            {"event_uuid": [f"u{i}"], "service_name": [service_dir], "body": ["x"]},
+            "2026-01-01",
+        )
+        put_descriptor(
+            s3, cfg, f"{i}.json", source="otlp", data_key=key, record_count=1, partition=service_dir
+        )
+    assert commit.run(cfg, s3, catalog, pa_fs) == 0
+    assert catalog.list_tables("logs") == [("logs", "otlp")]
+    assert catalog.load_table(("logs", "otlp")).scan().to_arrow().num_rows == 2

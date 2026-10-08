@@ -66,18 +66,17 @@ impl<R> From<&tokio::sync::mpsc::error::SendTimeoutError<R>> for DropKind {
 /// Which logical call site is reporting.
 ///
 /// This is deliberately finer-grained than the owning `ParquetWriterHandle`:
-/// OTLP and HEC/NDJSON share the *same* `ParquetWriterHandle<GenericSink>`
-/// instances, so keying only by handle would let an OTLP drop burst mute
-/// HEC's first-occurrence line for a full interval.
+/// `Hec` and `Otlp` are distinct call sites with distinct handles
+/// (`ParquetWriterHandle<GenericSink>` vs `ParquetWriterHandle<OtlpSink>`), but the
+/// throttle is keyed per site rather than per handle so one site's drop burst can
+/// never mute another's first-occurrence line for a full interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropSite {
     /// WEF ingest, `ParquetWriterHandle<WefSink>` (`server/mod.rs`).
     Wef = 0,
     /// HEC/NDJSON ingest, `ParquetWriterHandle<GenericSink>` (`ingest/handlers.rs`).
-    /// Shares its handle with `Otlp` — see the struct-level note above.
     Hec = 1,
-    /// OTLP ingest, `ParquetWriterHandle<GenericSink>` (`server/mod.rs`).
-    /// Shares its handle with `Hec` — see the struct-level note above.
+    /// OTLP ingest, `ParquetWriterHandle<OtlpSink>` (`forwarding/otlp_s3.rs`).
     Otlp = 2,
     /// sFlow ingest (`forwarding/sflow_s3.rs`).
     Sflow = 3,

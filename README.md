@@ -1,6 +1,6 @@
 # logthing
 
-A high-performance log ingestion server written in Rust. Receives Windows Event Logs via Windows Event Forwarding (WEF), plus syslog, IPFIX/NetFlow, Zeek, Suricata, sFlow, HEC, and OTLP, and persists them as Parquet to S3 or local disk.
+A log ingestion server written in Rust (single-node ceilings measured in [docs/performance.md](docs/performance.md)). Receives Windows Event Logs via Windows Event Forwarding (WEF), plus syslog, IPFIX/NetFlow, Zeek, Suricata, sFlow, HEC, and OTLP, and persists them as Parquet to S3 or local disk.
 
 ## Features
 
@@ -10,16 +10,19 @@ A high-performance log ingestion server written in Rust. Receives Windows Event 
 - **Zeek NDJSON Support**: TCP NDJSON listener for Zeek network security monitor logs; per-stream typed Parquet schemas with S3 persistence
 - **Suricata EVE JSON Support**: TCP NDJSON listener for Suricata EVE JSON records; S3 Parquet persistence
 - **sFlow Support**: UDP listener for sFlow v5 flow and counter samples; S3 Parquet persistence
-- **HEC Ingest**: Splunk HTTP Event Collector-compatible endpoints (`/services/collector/event`, `/services/collector/raw`, `/ingest`)
-- **OTLP Logs Support**: `POST /v1/logs` OTLP/HTTP log ingest (protobuf or JSON); built when the `otlp` Cargo feature is enabled
+- **HEC Ingest**: Splunk HTTP Event Collector-compatible endpoints (`/services/collector/event`, `/services/collector/raw`, `/ingest`); typed envelope columns (`source`, `index`, `indexed_fields`) and a UUIDv7 `event_uuid`; gzip request bodies; `503` backpressure when the writer is saturated — see [docs/hec.md](docs/hec.md)
+- **OTLP Logs Support**: `POST /v1/logs` OTLP/HTTP log ingest (protobuf or JSON, gzip accepted) into its own typed Parquet/Iceberg table (`service_name`, severity, `trace_id`, `span_id`, `body`, attributes); built when the `otlp` Cargo feature is enabled (default); gRPC (4317) is not supported yet — see [docs/otlp.md](docs/otlp.md)
 - **DNS Log Parsing**: Automatic parsing of BIND, Unbound, and PowerDNS query logs
 - **Generic Event Parser**: YAML-configurable parsing for specific Windows event codes
 - **Parquet Storage**: Aggregate events into Parquet files and store in S3-compatible storage or on local disk
+- **Redaction**: Drop, HMAC-hash or mask fields in HEC and OTLP records before they are stored — see [docs/redaction.md](docs/redaction.md)
+- **Durable Spool**: Optional on-disk spool in front of S3 uploads that survives outages and restarts, with documented per-source delivery guarantees — see [docs/delivery-semantics.md](docs/delivery-semantics.md)
+- **S3 Object Lock**: Write-once retention (GOVERNANCE/COMPLIANCE) for uploaded Parquet and descriptors — see [docs/object-lock.md](docs/object-lock.md)
 - **Iceberg Descriptor Output**: Optional per-file JSON descriptors (row count, stats, location) for an external Apache Iceberg committer
 - **Log Aggregation**: Optionally count records as they arrive, grouped by configured columns, writing an SQL `GROUP BY`-style table to Parquet instead of the raw rows — cuts noisy streams down to their useful summary
 - **TLS/SSL Encryption**: Secure connections with certificate support
 - **IP Whitelisting**: Control which hosts can connect
-- **High Performance**: Async I/O with Tokio for handling 100+ hosts
+- **Performance**: async I/O with Tokio; on one shared 12-vCPU host the HEC route sustained 78125 records/s and OTLP at least 10625 records/s (a lower bound: neither side was CPU-saturated and the cause is not yet investigated; gzip, batches of 100, local Parquet sink, loopback) -- method, variance and caveats in [docs/performance.md](docs/performance.md)
 - **Metrics & Monitoring**: Prometheus metrics endpoint
 - **Structured Logging**: JSON or pretty-printed logs
 
@@ -100,22 +103,25 @@ OTLP logs (HTTP)          ─┘                ▼
 Prometheus metrics on :9090 (/metrics) cover every stage from ingest to write.
 ```
 
+logthing keeps no state shared between instances; to run several behind a load balancer see
+[docs/scaling.md](docs/scaling.md).
+
 ## Container Image / Releases
 
 The container image is published to GitHub Container Registry on every `v*` tag push:
 
 ```bash
-docker pull ghcr.io/mrmagooey/logthing:0.2.0   # pin to an exact release
+docker pull ghcr.io/mrmagooey/logthing:0.22.0   # pin to an exact release
 docker pull ghcr.io/mrmagooey/logthing:latest  # most recent non-prerelease release
 ```
 
-**Tags** (produced by the release workflow for tag `v0.2.0`):
-- `:0.2.0` — exact version
-- `:0.2` — minor series
+**Tags** (produced by the release workflow for tag `v0.22.0`):
+- `:0.22.0` — exact version
+- `:0.22` — minor series
 - `:0` — major series
 - `:latest` — the most recent non-prerelease release. `docker/metadata-action`'s
   default `flavor.latest=auto` adds this automatically for any non-prerelease
-  semver tag (a pre-release such as `v0.3.0-rc1` would *not* move `:latest`).
+  semver tag (a pre-release such as `v0.23.0-rc1` would *not* move `:latest`).
 
 **Platforms**: linux/amd64, linux/arm64 (multi-arch manifest).
 
@@ -164,12 +170,19 @@ repository conventions.
 - [docs/configuration.md](docs/configuration.md) — full `logthing.toml` reference, config sources/precedence, environment variable overrides, and live-vs-restart-required settings
 - [docs/wef.md](docs/wef.md) — Kerberos client authentication, Active Directory setup, Windows client (WEF) configuration, WEF S3 persistence, the generic event parser, and event parser coverage
 - [docs/syslog.md](docs/syslog.md) — syslog listener, HTTP endpoint, DNS log parsing, and syslog S3 persistence
-- [docs/ipfix.md](docs/ipfix.md) — IPFIX/NetFlow ingestion and S3 persistence
-- [docs/zeek.md](docs/zeek.md) — Zeek NDJSON ingestion, typed per-stream schemas, and S3 persistence
+- [docs/ipfix.md](docs/ipfix.md) — IPFIX/NetFlow and sFlow ingestion and S3 persistence
+- [docs/zeek.md](docs/zeek.md) — Zeek NDJSON and Suricata EVE ingestion, typed per-stream schemas, and S3 persistence
+- [docs/hec.md](docs/hec.md) — HEC/NDJSON ingest, columns, gzip, backpressure, migration
+- [docs/otlp.md](docs/otlp.md) — OTLP/HTTP log ingest, typed schema, service partitions, exporter setup, migration
+- [docs/scaling.md](docs/scaling.md) — running several instances: what can be load balanced, per-exporter affinity for IPFIX/sFlow, per-instance spool, one committer per catalog
+- [docs/performance.md](docs/performance.md) — measured single-node HEC/OTLP ingest ceilings, method, hardware, caveats and how to reproduce
 - [docs/aggregation.md](docs/aggregation.md) — log aggregation rules and output schema
 - [docs/iceberg.md](docs/iceberg.md) — Iceberg descriptor output and a suggested committer/catalog deployment pattern
 - [committer/README.md](committer/README.md) — the shipped Iceberg descriptor committer (container image, configuration, end-to-end test)
-- [deploy/analytics/README.md](deploy/analytics/README.md) — ready-to-run docker compose / Helm analytics stack (Garage, committer, Lakekeeper, Trino, Hue)
+- [deploy/analytics/README.md](deploy/analytics/README.md) — ready-to-run docker compose / Helm analytics stack (Garage, committer, Lakekeeper, Trino, Metabase)
+- [docs/redaction.md](docs/redaction.md) — HEC/OTLP redaction rules (drop, hash, mask), key handling, deleting data by subject
+- [docs/delivery-semantics.md](docs/delivery-semantics.md) — per-source delivery guarantees, shutdown behaviour and the on-disk spool
+- [docs/object-lock.md](docs/object-lock.md) — S3 Object Lock configuration, bucket requirements and limits
 - [docs/deployment.md](docs/deployment.md) — host tuning for UDP ingest and security considerations
 - [docs/metrics.md](docs/metrics.md) — Prometheus metrics and the full API endpoint list
 - [docs/admin.md](docs/admin.md) — read-only admin web interface

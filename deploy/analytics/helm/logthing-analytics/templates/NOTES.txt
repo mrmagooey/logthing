@@ -1,19 +1,44 @@
 logthing analytics stack installed as {{ include "la.fullname" . }}.
 
-Open Hue (the first person to log in becomes the admin):
-  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "la.fullname" . }}-hue 8888
-  then browse http://localhost:8888
+Open Metabase (admin {{ .Values.metabase.adminEmail }}, password in Secret {{ include "la.secretName" . }} key metabase-admin-password):
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "la.fullname" . }}-metabase 3000
+  then browse http://localhost:3000 (the Trino database "logthing" is already registered)
 
-Query Trino directly:
-  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "la.fullname" . }}-trino 8080
+Query Trino (HTTPS + password; user admin, password in Secret {{ include "la.secretName" . }} key trino-admin-password):
+  kubectl exec -n {{ .Release.Namespace }} deploy/{{ include "la.fullname" . }}-trino -- \
+    trino --server https://localhost:8443 --truststore-path /etc/trino/tls/ca.pem --user admin --password --execute 'SHOW TABLES FROM iceberg.logs'
+  From your machine: kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "la.fullname" . }}-trino 8443
+  and trust the CA in Secret {{ include "la.trinoTlsSecret" . }} key ca.pem.
+
+Send application logs (plaintext HTTP; front with TLS if untrusted networks can reach it):
+  endpoint http://{{ include "la.fullname" . }}-logthing-tcp:5985  (POST /v1/logs, POST /services/collector/event)
+  kubectl get secret -n {{ .Release.Namespace }} {{ include "la.secretName" . }} -o jsonpath='{.data.otlp-bearer-token}' | base64 -d   # Authorization: Bearer
+  kubectl get secret -n {{ .Release.Namespace }} {{ include "la.secretName" . }} -o jsonpath='{.data.hec-token}' | base64 -d   # Authorization: Splunk
+{{- if .Values.credentials.existingSecret }}
+  With credentials.existingSecret, add the keys hec-token and otlp-bearer-token to your Secret first,
+  non-empty: the logthing pod's require-tokens initContainer refuses to start if either is empty.
+{{- end }}
 
 Tables appear only after the first committer run (CronJob {{ include "la.fullname" . }}-committer,
 schedule "{{ .Values.committer.schedule }}") has seen flushed data.
 
 Uninstalling leaves the PersistentVolumeClaims behind (Postgres roles and Garage keys persist
-in them). To reinstall with different credentials, delete them first:
+in them) but deletes the generated credentials Secret. Delete the PVCs before reinstalling
+unless you supply credentials.existingSecret with the original values:
   kubectl delete pvc -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }}
 {{- if not .Values.credentials.existingSecret }}
 
-WARNING: Demo credentials in use - set credentials.* or credentials.existingSecret.
+Credentials were generated (or taken from credentials.*) and stored in Secret
+{{ include "la.fullname" . }}-credentials. They persist across `helm upgrade`. Read one with:
+  kubectl get secret -n {{ .Release.Namespace }} {{ include "la.fullname" . }}-credentials -o jsonpath='{.data.postgres-password}' | base64 -d
+`helm template` cannot read the live Secret, so rendered manifests contain fresh random values:
+pin credentials.* or use credentials.existingSecret when applying with GitOps tooling.
+{{- end }}
+{{- $demo := include "la.demoCreds" . }}
+{{- if and (not .Values.credentials.existingSecret) $demo }}
+
+WARNING: these credentials are the PUBLIC demo values shipped by a pre-B1 chart version: {{ $demo }}
+Anyone who has read the repository knows them. This release was upgraded from (or pinned to) the
+old defaults, and Postgres roles, the Garage key and the Lakekeeper encryption key persist. Rotate
+them: see "Upgrading an existing stack" in deploy/analytics/README.md.
 {{- end }}

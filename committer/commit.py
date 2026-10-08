@@ -28,12 +28,14 @@ import logging
 import os
 import re
 import sys
+import time
 import urllib.parse
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
 import boto3
+import pyarrow as pa
 import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 from botocore.exceptions import ClientError, ConnectionClosedError, EndpointConnectionError
@@ -45,6 +47,7 @@ from pyiceberg.exceptions import (
     NamespaceAlreadyExistsError,
     NoSuchTableError,
     RESTError,
+    ValidationError,
 )
 from pyiceberg.io.pyarrow import PyArrowFileIO
 from pyiceberg.table import Table
@@ -267,6 +270,9 @@ _NAME_CAP = 64
 # schema, so folding all of a source's partitions into a single table is
 # safe for them and would fail `add_files` with a schema mismatch for these
 # three.
+# `otlp` is deliberately NOT listed: its sink writes one fixed schema, and its per-service Parquet
+# path segment is only a file-grouping key (the `service_name` column carries the service), so
+# every service shares the single `otlp` table.
 _PARTITIONED_TABLE_PREFIX = {
     "zeek": "zeek",
     "aggregate": "agg",
@@ -435,6 +441,101 @@ def committed_file_set(tbl: Table) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# Additive schema evolution
+# ---------------------------------------------------------------------------
+
+_EVOLVE_ATTEMPTS = 5
+
+
+def _read_file_schema(pa_fs: pafs.S3FileSystem, cfg: Config, uri: str) -> pa.Schema:
+    key = uri[len(f"s3://{cfg.bucket}/") :]
+    return pq.read_schema(pa_fs.open_input_file(f"{cfg.bucket}/{key}"))
+
+
+def _is_already_referenced(exc: BaseException) -> bool:
+    """`add_files` raises a bare ValueError when a file is already registered in the table."""
+    return isinstance(exc, ValueError) and "already referenced" in str(exc)
+
+
+def _reload_table(catalog: Catalog, cfg: Config, name: str, committed_files: set[str]) -> Table:
+    """Reload `name` and refresh `committed_files` IN PLACE (it is the run-wide cache entry)."""
+    tbl = force_pyarrow_io(catalog.load_table((cfg.namespace, name)), cfg)
+    committed_files.clear()
+    committed_files.update(committed_file_set(tbl))
+    return tbl
+
+
+def evolve_schema(
+    catalog: Catalog,
+    cfg: Config,
+    pa_fs: pafs.S3FileSystem,
+    name: str,
+    tbl: Table,
+    committed_files: set[str],
+    batch: list[tuple[str, str]],
+) -> tuple[Table, list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str]]]:
+    """Additively evolve `tbl` so every file in `batch` fits it.
+
+    For each file whose Parquet footer has columns the table lacks, stage
+    `update_schema().union_by_name(file_schema)` and then `commit()` it (stage-then-commit, never
+    a `with` block: see the comment in the loop). A type conflict (`ValidationError`), a
+    required-column `ValueError`, a catalog `BadRequestError` or an unreadable footer marks just
+    that file `conflicted` (the caller quarantines it). A `CommitFailedException` (another
+    committer changed the table) reloads the table, re-runs the committed-file filter, and
+    retries up to `_EVOLVE_ATTEMPTS` times with backoff `0.2 * 2**attempt`; the last failure
+    propagates (`should_abort` treats it as abort). Other abort-class errors raise `_Abort`.
+
+    Returns `(table, to_add, already_done, conflicted)`: the (possibly reloaded) table, files that
+    now fit, files another committer registered in the meantime, and files that cannot fit.
+    """
+    for attempt in range(_EVOLVE_ATTEMPTS):
+        to_add = [(d, u) for d, u in batch if u not in committed_files]
+        already_done = [(d, u) for d, u in batch if u in committed_files]
+        fits: list[tuple[str, str]] = []
+        conflicted: list[tuple[str, str]] = []
+        try:
+            for dkey, uri in to_add:
+                try:
+                    fschema = _read_file_schema(pa_fs, cfg, uri)
+                except Exception as exc:  # noqa: BLE001 - classified immediately below
+                    if should_abort(exc):
+                        raise _Abort(exc) from exc
+                    logger.error("cannot read footer of %s: %r", uri, exc)
+                    conflicted.append((dkey, uri))
+                    continue
+                have = set(tbl.schema().column_names)
+                if any(f.name not in have for f in fschema):
+                    # Deliberately NOT `with tbl.update_schema() as upd:`. pyiceberg's
+                    # `__exit__` commits even when the body raised, which would persist
+                    # columns `union_by_name` had already staged before it hit the conflict,
+                    # evolving the table on behalf of a file we are about to quarantine.
+                    try:
+                        upd = tbl.update_schema()
+                        upd.union_by_name(fschema)
+                        upd.commit()
+                    except (ValidationError, ValueError, BadRequestError) as exc:
+                        logger.error(
+                            "schema of %s cannot evolve %s.%s: %r", uri, cfg.namespace, name, exc
+                        )
+                        conflicted.append((dkey, uri))
+                        continue
+                    except CommitFailedException:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - classified immediately below
+                        if should_abort(exc):
+                            raise _Abort(exc) from exc
+                        raise
+                fits.append((dkey, uri))
+            return tbl, fits, already_done, conflicted
+        except CommitFailedException:
+            if attempt == _EVOLVE_ATTEMPTS - 1:
+                raise
+            time.sleep(0.2 * 2**attempt)
+            tbl = _reload_table(catalog, cfg, name, committed_files)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+# ---------------------------------------------------------------------------
 # Descriptor relocation
 # ---------------------------------------------------------------------------
 
@@ -479,11 +580,17 @@ def _commit_batch(
     committed_cache: dict[str, set[str]],
     name: str,
     batch: list[tuple[str, str]],
+    allow_redo: bool = True,
 ) -> _Counts:
     """Commit one table's worth of queued descriptors (up to `batch_size`) in
     a single `add_files` call, then move each of their descriptors to
     `DONE_PREFIX`. Raises `_Abort` when `should_abort` says so -- callers
     must let that unwind the whole run.
+
+    Before `add_files` the table is evolved additively for files carrying new columns (files that
+    cannot evolve are quarantined individually). If `add_files` reports a file already referenced
+    (another committer won the race) the table is reloaded and the batch re-deduped once
+    (`allow_redo`), marking those files done instead of quarantining them.
     """
     counts = _Counts()
 
@@ -522,6 +629,27 @@ def _commit_batch(
         return counts
 
     try:
+        tbl, to_add, raced_done, conflicted = evolve_schema(
+            catalog, cfg, pa_fs, name, tbl, committed_files, to_add
+        )
+    except Exception as exc:  # noqa: BLE001 - classified immediately below
+        if isinstance(exc, _Abort):
+            raise
+        if should_abort(exc):
+            raise _Abort(exc) from exc
+        raise
+    table_cache[name] = tbl
+    for dkey, uri in raced_done:
+        logger.info("skip (registered by another committer): %s", uri)
+        _mark_done(s3, cfg, dkey)
+        counts.skipped += 1
+    for dkey, _uri in conflicted:
+        _mark_quarantined(s3, cfg, dkey)
+        counts.quarantined += 1
+    if not to_add:
+        return counts
+
+    try:
         tbl.add_files([uri for _dkey, uri in to_add])
         for dkey, uri in to_add:
             _mark_done(s3, cfg, dkey)
@@ -532,6 +660,27 @@ def _commit_batch(
     except Exception as exc:  # noqa: BLE001 - classified immediately below
         if should_abort(exc):
             raise _Abort(exc) from exc
+        if allow_redo and _is_already_referenced(exc):
+            # Another committer registered one of these files between our dedupe and our
+            # commit. Reload, re-dedupe, and finish the rest once instead of quarantining.
+            logger.warning(
+                "add_files hit already-registered file(s) in %s.%s; reloading and re-deduping",
+                cfg.namespace,
+                name,
+            )
+            try:
+                table_cache[name] = _reload_table(catalog, cfg, name, committed_files)
+            except Exception as reload_exc:  # noqa: BLE001 - classified immediately below
+                if should_abort(reload_exc):
+                    raise _Abort(reload_exc) from reload_exc
+                raise
+            sub = _commit_batch(
+                cfg, s3, catalog, pa_fs, table_cache, committed_cache, name, to_add, False
+            )
+            counts.committed += sub.committed
+            counts.skipped += sub.skipped
+            counts.quarantined += sub.quarantined
+            return counts
         # Permanent failure on the batched call doesn't tell us which file is
         # bad. Retry one at a time so only the actually-broken one quarantines
         # and the rest of the batch still commits.
