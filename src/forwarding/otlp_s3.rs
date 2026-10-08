@@ -160,6 +160,11 @@ impl ParquetSink for OtlpSink {
         Some("partition_time")
     }
 
+    /// One-row fallback path. Unreachable from the OTLP writer (`new_batch` is always `Some`
+    /// for `otlp_schema()` and `try_append` always returns `Ok(true)`); it is slower than the
+    /// accumulator by design (fresh builders per call). Used by tests and as the trait's
+    /// required fallback.
+    ///
     /// One-row wrapper over `OtlpAccumulator`: the column-append code exists in exactly one
     /// place (`OtlpAccumulator::append_record_value`), shared with the amortized path.
     fn to_record_batch(
@@ -294,6 +299,11 @@ impl OtlpAccumulator {
         self.rows += 1;
     }
 
+    /// Drain every builder into one batch and reset. The builders are drained before
+    /// `RecordBatch::try_new`, so an error would lose the rows; it cannot occur here because
+    /// the schema is fixed and the 21 columns are built in schema order with matching types
+    /// and equal lengths. Returns `Result` only to match `RecordBatchAccumulator::finish`
+    /// (same shape as `GenericAccumulator::finish_batch`).
     fn finish_batch(&mut self) -> anyhow::Result<RecordBatch> {
         let columns: Vec<ArrayRef> = vec![
             Arc::new(self.event_uuid.finish()),

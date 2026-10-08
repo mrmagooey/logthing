@@ -55,6 +55,11 @@ Notes on reading the table:
   versus 78125 gzip no-redaction; 79375 versus 75000 with redaction, the latter measured
   with different generator process counts). They are probably bounded by the shared
   request-handling path or the generator, which this document did not investigate.
+- At the OTLP backpressure limit, `parquet_s3_dropped{source="otlp"}` equals the 503 count:
+  the writer channel was full and the client retries (a retry after a partial enqueue
+  duplicates the enqueued prefix, see [hec.md](hec.md#backpressure)). At the 80625 ceiling,
+  run 3 of 3 saw 45 such 503s (0.0037% loss) while runs 1 and 2 saw none, so the median loss
+  was 0%, under the 0.1% budget.
 - Row 6's count at its last passing rate is 0; its first failing rate (80000) had 375.
 
 ## Method

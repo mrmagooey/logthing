@@ -169,3 +169,39 @@ async fn many_rows_per_service_split_into_one_partition_each_via_the_accumulator
         assert_eq!(bodies, want, "{dir}");
     }
 }
+
+#[tokio::test]
+async fn more_than_builder_batch_rows_per_service_keep_exact_counts_and_bodies() {
+    // BUILDER_BATCH_ROWS is 1000: 1500 rows per service force at least one mid-stream
+    // materialization of the live builder plus a final partial one.
+    const PER_SVC: usize = 1500;
+    let tmp = tempfile::tempdir().unwrap();
+    let (h, join) = start(tmp.path(), 64).await;
+    for i in 0..PER_SVC {
+        for svc in ["Alpha", "Beta"] {
+            h.send_or_drop(record(Some(svc), &format!("{svc}-{i}")))
+                .await
+                .unwrap();
+        }
+    }
+    drop(h);
+    join.await.unwrap();
+
+    for (dir, raw) in [("alpha", "Alpha"), ("beta", "Beta")] {
+        let batches = common::read_all(&tmp.path().join("otlp").join(dir));
+        let mut bodies = Vec::new();
+        for b in &batches {
+            let sn = common::str_col(b, "service_name");
+            let body = common::str_col(b, "body");
+            for i in 0..b.num_rows() {
+                assert_eq!(sn.value(i), raw);
+                bodies.push(body.value(i).to_string());
+            }
+        }
+        bodies.sort();
+        let mut want: Vec<String> = (0..PER_SVC).map(|i| format!("{raw}-{i}")).collect();
+        want.sort();
+        assert_eq!(bodies.len(), PER_SVC, "{dir} row count");
+        assert_eq!(bodies, want, "{dir}");
+    }
+}
