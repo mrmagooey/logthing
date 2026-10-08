@@ -49,7 +49,7 @@ lakekeeper:
     requests: {cpu: 100m, memory: 128Mi}
 
 logthing:
-  image: ghcr.io/mrmagooey/logthing:0.22.0
+  image: ghcr.io/mrmagooey/logthing:0.22.1
   flushIntervalSecs: 60
   udpService:
     type: ClusterIP
@@ -59,7 +59,7 @@ logthing:
     requests: {cpu: 100m, memory: 128Mi}
 
 committer:
-  image: ghcr.io/mrmagooey/logthing-committer:0.22.0
+  image: ghcr.io/mrmagooey/logthing-committer:0.22.1
   schedule: "*/1 * * * *"
   resources:
     requests: {cpu: 100m, memory: 256Mi}
