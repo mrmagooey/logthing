@@ -54,8 +54,8 @@ def test_all_services_present(cfg):
 
 def test_pinned_default_images(cfg):
     img = {k: v["image"] for k, v in cfg["services"].items()}
-    assert img["logthing"] == "ghcr.io/mrmagooey/logthing:0.22.0"
-    assert img["committer"] == "ghcr.io/mrmagooey/logthing-committer:0.22.0"
+    assert img["logthing"] == "ghcr.io/mrmagooey/logthing:0.22.1"
+    assert img["committer"] == "ghcr.io/mrmagooey/logthing-committer:0.22.1"
     assert img["garage"] == "dxflrs/garage:v2.4.1"
     assert img["trino"] == "trinodb/trino:483"
     assert img["certgen"] == "alpine/openssl:3.5.9"

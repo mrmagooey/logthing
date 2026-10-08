@@ -11,9 +11,9 @@ syslog / IPFIX / sFlow / Zeek ──▶ logthing ──Parquet + descriptors─�
 
 | Component | Role | Default image |
 |-----------|------|---------------|
-| logthing | ingest, writes Parquet + descriptors to S3 | `ghcr.io/mrmagooey/logthing:0.22.0` |
+| logthing | ingest, writes Parquet + descriptors to S3 | `ghcr.io/mrmagooey/logthing:0.22.1` |
 | Garage | S3-compatible object store (bucket `logthing-data`) | `dxflrs/garage:v2.4.1` |
-| committer | registers descriptors as Iceberg tables | `ghcr.io/mrmagooey/logthing-committer:0.22.0` |
+| committer | registers descriptors as Iceberg tables | `ghcr.io/mrmagooey/logthing-committer:0.22.1` |
 | Lakekeeper | Iceberg REST catalog (warehouse `logthing`) | `quay.io/lakekeeper/catalog:v0.13.6` |
 | Postgres | Lakekeeper and Metabase metadata | `postgres:17` |
 | Trino | SQL engine over HTTPS 8443 with password auth, catalog `iceberg`, schema `logs` | `trinodb/trino:483` |
@@ -271,8 +271,8 @@ list is under Credentials; `hec-token` and `otlp-bearer-token` are required too)
 
 ## Sending application logs (OTLP and HEC)
 
-The default images are `0.22.0`, the first release with the typed OTLP table and the new HEC
-columns. Overriding `LOGTHING_IMAGE` / `COMMITTER_IMAGE` (compose) or the chart's image values
+The default images are `0.22.1`; `0.22.0` was the first release with the typed OTLP table and
+the new HEC columns. Overriding `LOGTHING_IMAGE` / `COMMITTER_IMAGE` (compose) or the chart's image values
 with an older tag disables this pipeline: an older logthing cannot write the typed OTLP table
 (its OTLP rows land in the old `hec` table and `stg_otlp` stays empty), and an older committer
 quarantines the new-shaped files, so upgrade the committer first (see the migration section of

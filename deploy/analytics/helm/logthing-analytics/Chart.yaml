@@ -2,5 +2,5 @@ apiVersion: v2
 name: logthing-analytics
 description: logthing -> Garage -> Iceberg (Lakekeeper) -> Trino analytics environment
 type: application
-version: 0.2.0
-appVersion: "0.22.0"
+version: 0.2.1
+appVersion: "0.22.1"

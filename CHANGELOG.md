@@ -6,6 +6,20 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-10-08
+
+### Fixed
+
+- Build on Rust 1.99: replace `AtomicUsize::fetch_update` (deprecated in 1.99, renamed
+  `try_update`), which failed `cargo clippy -- -D warnings` in CI on the latest stable toolchain.
+
+### Changed
+
+- Docker builder images (`Dockerfile`, simulation `Dockerfile.kerberos`, loadgen `Dockerfile`)
+  move from `rust:1.93-slim-bookworm` to `rust:1.99-slim-bookworm`.
+- Analytics stack default image pins move to 0.22.1 for both logthing and the committer (still in
+  lockstep); Helm chart version 0.2.1. No schema or config changes from 0.22.0.
+
 ## [0.22.0] - 2026-10-08
 
 ### Breaking
