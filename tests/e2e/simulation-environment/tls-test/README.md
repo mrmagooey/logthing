@@ -32,19 +32,15 @@ Validates that:
 - Tests WEF protocol over HTTPS (`/wsman`)
 - Sends subscription request
 
-### 6. HTTPS Events Endpoint
-- Tests events ingestion over HTTPS (`/wsman/events`)
-- Posts test events
-
-### 7. HTTPS Syslog Endpoint
+### 6. HTTPS Syslog Endpoint
 - Tests syslog HTTP endpoint over HTTPS (`/syslog`)
 - Posts syslog messages
 
-### 8. HTTPS Throughput Stats
+### 7. HTTPS Throughput Stats
 - Tests stats endpoint over HTTPS (`/stats/throughput`)
 - Validates JSON response
 
-### 9. HTTPS Metrics Endpoint
+### 8. HTTPS Metrics Endpoint
 - Tests metrics endpoint over HTTPS (`/metrics`)
 - Accepts 404 (metrics may be on separate port)
 

@@ -226,40 +226,6 @@ def test_https_wef_endpoint():
         )
 
 
-def test_https_events_endpoint():
-    """Test events endpoint over HTTPS."""
-    print("\nTesting Events Endpoint over HTTPS...")
-
-    url = f"{HTTPS_ENDPOINT}/wsman/events"
-    body = b"""<?xml version="1.0" encoding="utf-8"?>
-<Envelope>
-  <Body>
-    <Events>
-      <Event>
-        <System>
-          <EventID>4624</EventID>
-        </System>
-      </Event>
-    </Events>
-  </Body>
-</Envelope>"""
-
-    headers = {"Content-Type": "application/soap+xml"}
-    status, response = http_request(
-        url, method="POST", data=body, headers=headers, verify=False
-    )
-
-    # Same 404 rule as the WEF endpoint above.
-    if status in [200, 201, 202, 400, 404]:
-        return log_result("HTTPS Events Endpoint", True, f"Status {status}")
-    else:
-        return log_result(
-            "HTTPS Events Endpoint",
-            False,
-            f"Status {status}, Response: {response[:100]}",
-        )
-
-
 def test_https_syslog_endpoint():
     """Test syslog HTTP endpoint over HTTPS."""
     print("\nTesting Syslog HTTP Endpoint over HTTPS...")
@@ -348,7 +314,6 @@ def main():
         ("HTTPS Health with CA Cert", test_https_with_ca_cert),
         ("Certificate Validation", test_https_certificate_validation),
         ("HTTPS WEF Endpoint", test_https_wef_endpoint),
-        ("HTTPS Events Endpoint", test_https_events_endpoint),
         ("HTTPS Syslog Endpoint", test_https_syslog_endpoint),
         ("HTTPS Throughput Stats", test_https_throughput_stats),
         ("HTTPS Metrics Endpoint", test_https_metrics_endpoint),

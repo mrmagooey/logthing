@@ -18,6 +18,14 @@ wef_interop() {
   trap 'rc=$?; [ $rc -eq 0 ] || "${dc[@]}" logs --no-color kdc logthing-wef-krb logthing-wef-mtls | tail -n 150; "${dc[@]}" down -v >/dev/null 2>&1 || true' EXIT
   "${dc[@]}" build kdc logthing-wef-krb wefemu-krb-checks wef-interop-verifier
   "${dc[@]}" up -d --wait kdc logthing-wef-krb logthing-wef-mtls
+  # Prove which KDC actually answered: the service name is the same for both, so ask the
+  # running container (samba-tool exists only in the Samba AD image) rather than echo the flag.
+  if "${dc[@]}" exec -T kdc sh -c 'command -v samba-tool' >/dev/null 2>&1; then
+    echo "== KDC: Samba AD ($("${dc[@]}" exec -T kdc samba --version | tr -d '\r'), realm EXAMPLE.COM," \
+         "host kdc.example.com, keytabs exported by samba-tool) =="
+  else
+    echo "== KDC: MIT Kerberos (realm EXAMPLE.COM, host kdc.example.com, keytabs from kadmin.local) =="
+  fi
   # `run` (not `up --abort-on-container-exit`): that flag stops everything when the first
   # emulator exits, even successfully, and loses the other containers' exit codes.
   echo "== Kerberos auth checks"
