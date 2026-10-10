@@ -128,8 +128,9 @@ async fn handle_wsman(
         Ok(t) => t,
         Err(e) => {
             warn!(
-                "WEF body from {} has an undecodable charset: {e:#}",
-                addr.ip()
+                "WEF body from {} has an undecodable charset: {}",
+                addr.ip(),
+                crate::sanitize_for_log(&format!("{e:#}"), 128)
             );
             return status(StatusCode::BAD_REQUEST);
         }
@@ -137,7 +138,12 @@ async fn handle_wsman(
     let req = match soap::parse(&text) {
         Ok(r) => r,
         Err(e) => {
-            warn!("WEF request from {} is not valid SOAP: {e:#}", addr.ip());
+            // The parser error embeds wire element names, so it is sanitised like any wire text.
+            warn!(
+                "WEF request from {} is not valid SOAP: {}",
+                addr.ip(),
+                crate::sanitize_for_log(&format!("{e:#}"), 128)
+            );
             return status(StatusCode::BAD_REQUEST);
         }
     };
@@ -433,10 +439,13 @@ mod tests {
         let stored = state.bookmarks.get("win10.example.com", uuid).unwrap();
         assert!(stored.contains("RecordId=\"1042\""));
         let (_, _, body) = post(&app, "/wsman", &[], utf16(ENUMERATE)).await;
-        // The replayed bookmark is embedded (escaped) in the Subscribe envelope.
+        // The replayed bookmark is embedded as verbatim XML in the Subscribe envelope.
+        let s = text(&body);
         assert!(
-            text(&body).contains("RecordId=&quot;1042&quot;")
-                || text(&body).contains("RecordId=\"1042\"")
+            s.contains(
+                "<w:Bookmark><BookmarkList><Bookmark Channel=\"Security\" RecordId=\"1042\""
+            ),
+            "{s}"
         );
     }
 
@@ -584,6 +593,7 @@ mod tests {
         let mut got = counter(snap, "wef_requests_total");
         got.sort();
         let labels: Vec<&str> = got.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(got.iter().all(|(_, n)| *n == 1), "{got:?}");
         assert_eq!(
             labels,
             [
@@ -623,6 +633,53 @@ mod tests {
                 .any(|(l, n)| l.contains("source=wef") && *n >= 1),
             "{dropped:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_parse_error_log_sanitizes_wire_element_names() {
+        crate::test_support::install_and_clear();
+        let app = app(&state_with(true, None));
+        let evil = "<Ev\u{1b}[31mil>";
+        let (st, _, _) = post(&app, "/wsman", &[], evil.as_bytes().to_vec()).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let events = crate::test_support::captured_events();
+        assert!(
+            events.iter().any(|m| m.contains("not valid SOAP")),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().all(|m| !m.contains('\u{1b}')),
+            "raw ESC leaked: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_machine_id_log_sanitized_in_heartbeat_and_events() {
+        crate::test_support::install_and_clear();
+        let app = app(&state_with(true, None));
+        let evil = |x: &str| x.replace("win10.example.com", "wi\u{1b}[31mn");
+        post(&app, &delivery_path(), &[], utf16(&evil(HEARTBEAT))).await;
+        post(&app, &delivery_path(), &[], utf16(&evil(EVENTS))).await;
+        let events = crate::test_support::captured_events();
+        let lines: Vec<_> = events
+            .iter()
+            .filter(|m| m.starts_with("WEF") && m.contains(" from "))
+            .collect();
+        assert!(lines.len() == 2, "{events:?}");
+        assert!(lines.iter().all(|m| !m.contains('\u{1b}')), "{lines:?}");
+        assert!(lines.iter().all(|m| m.contains('\u{fffd}')), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn test_delivery_events_without_message_id_400_and_not_ingested() {
+        let state = state_with(true, None);
+        let app = app(&state);
+        let mid = soap::parse(EVENTS).unwrap().message_id.unwrap();
+        let no_mid = EVENTS.replace(&format!("<a:MessageID>{mid}</a:MessageID>"), "");
+        assert_ne!(no_mid, EVENTS);
+        let (st, _, _) = post(&app, &delivery_path(), &[], utf16(&no_mid)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(state.throughput.snapshot().await.is_empty());
     }
 
     #[test]

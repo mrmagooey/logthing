@@ -244,6 +244,8 @@ pub fn parse(xml: &str) -> anyhow::Result<SoapRequest> {
                             }
                         }
                         Some(Field::Action) => req.action_uri = trimmed,
+                        // MessageID is kept untrimmed (only blank ones drop out) so RelatesTo
+                        // echoes the client's exact bytes.
                         Some(Field::MessageId) => {
                             req.message_id = (!trimmed.is_empty()).then_some(c.text)
                         }
