@@ -460,3 +460,39 @@ async fn test_sldc_decompression_bomb_is_rejected() {
     );
     h.finish().await;
 }
+
+/// Another test's server already answers /health on our port: `await_ready` must notice that
+/// our own server lost the bind and report `false`, not adopt the stranger's 200.
+#[tokio::test]
+async fn test_await_ready_rejects_foreign_server_on_clashing_port() {
+    let stranger = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = stranger.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        while let Ok((mut s, _)) = stranger.accept().await {
+            tokio::spawn(async move {
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            });
+        }
+    });
+    let base = format!("http://127.0.0.1:{port}");
+    let dir = tempfile::tempdir().unwrap();
+    let config = build_config(&common::wef_toml(&base), port, dir.path());
+    let server = new_server(config).await.expect("Server::new");
+    let (_shutdown, rx) = tokio::sync::watch::channel(false);
+    let task = common::spawn_server(server.run(rx));
+    let client = reqwest::Client::new();
+    assert!(!common::await_ready(&client, &format!("{base}/health"), &task).await);
+}
+
+#[test]
+fn test_is_addr_in_use_sees_through_anyhow_context() {
+    use anyhow::Context;
+    let io = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+    let wrapped = Err::<(), _>(io).context("bind").unwrap_err();
+    assert!(common::is_addr_in_use(&wrapped));
+    let other = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
+    assert!(!common::is_addr_in_use(&other));
+}

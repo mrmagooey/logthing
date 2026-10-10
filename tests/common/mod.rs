@@ -146,18 +146,28 @@ where
 /// task ended on `AddrInUse` (the caller should retry on a fresh port). Panics on any other
 /// early exit or on timeout.
 pub async fn await_ready(client: &reqwest::Client, health_url: &str, task: &ServerTask) -> bool {
+    // True when the task already ended; asserts that it ended on a bind clash.
+    let lost_bind = || {
+        if !task.handle.is_finished() {
+            return false;
+        }
+        assert!(
+            task.addr_in_use.load(std::sync::atomic::Ordering::SeqCst),
+            "server task exited before becoming ready"
+        );
+        true
+    };
     for _ in 0..100 {
-        if task.handle.is_finished() {
-            assert!(
-                task.addr_in_use.load(std::sync::atomic::Ordering::SeqCst),
-                "server task exited before becoming ready"
-            );
+        if lost_bind() {
             return false;
         }
         if let Ok(r) = client.get(health_url).send().await
             && r.status().is_success()
         {
-            return true;
+            // The 200 may come from another test's server that owns the port while our task
+            // (not yet polled on a current-thread runtime) loses its bind. Let it settle.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            return !lost_bind();
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -314,7 +324,12 @@ impl Proc {
             if let Ok(r) = reqwest::get(format!("{}/health", self.base())).await
                 && r.status().is_success()
             {
-                return true;
+                // The 200 may come from another test's server on our port while the child is
+                // still starting; it only counts if the child survives a settle period.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                if self.child.try_wait().unwrap().is_none() {
+                    return true;
+                }
             }
             if let Some(st) = self.child.try_wait().unwrap() {
                 let logs = self.logs();
