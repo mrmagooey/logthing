@@ -155,6 +155,7 @@ tempfile = "3.9"
 flate2 = "1"
 metrics-util = { version = "0.16", features = ["debugging"] }
 criterion = "0.5"
+rcgen = { version = "0.13", default-features = false, features = ["pem", "aws_lc_rs"] }
 # `start_paused = true` on `#[tokio::test]` (src/net.rs's AcceptBackoff
 # cancel-safety tests) needs tokio's virtual clock. Additive to the
 # `features = ["full"]` main dependency and dev-only, so it does not reach

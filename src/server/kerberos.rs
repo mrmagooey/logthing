@@ -25,7 +25,7 @@ use tracing::{debug, warn};
 /// Cap on any `/wsman/**` request or response body buffered by the auth layer. Windows'
 /// MaxEnvelopeSize is 512000 bytes, so 4 MiB is ample even with GSS overhead; it keeps one
 /// ticket-holding host from making the (outermost, pre-body-budget) layer buffer 64 MiB.
-const WSMAN_MAX_BODY: usize = 4 * 1024 * 1024;
+pub(crate) const WSMAN_MAX_BODY: usize = 4 * 1024 * 1024;
 
 /// True when `e` (a body-read error) is the length limit being exceeded.
 fn is_length_limit(e: &axum::Error) -> bool {

@@ -911,7 +911,12 @@ impl Server {
                 .with_state(self.state.clone())
         };
         let protected_router = with_common_layers(protected_router);
-        let wsman_router = with_common_layers(wef_routes::routes());
+        // Applied innermost (before the common 64 MiB limit) because the innermost
+        // `DefaultBodyLimit` wins; this caps /wsman bodies at 4 MiB in every topology,
+        // not only where the Kerberos layer buffers them.
+        let wsman_router = with_common_layers(wef_routes::routes().layer(
+            axum::extract::DefaultBodyLimit::max(kerberos::WSMAN_MAX_BODY),
+        ));
 
         // Kerberos wraps the protected routes (outermost). `/wsman/**` instead gets
         // per-connection auth with message encryption, chosen by deployment topology.

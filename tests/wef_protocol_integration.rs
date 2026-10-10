@@ -397,3 +397,18 @@ async fn test_malformed_event_in_batch_others_ingested() {
     ids.sort_unstable();
     assert_eq!(ids, vec![4672, 7045]);
 }
+
+#[tokio::test]
+async fn test_oversize_wsman_body_is_413_in_plain_unauthenticated() {
+    let h = Harness::start(|t| t).await;
+    let resp = h
+        .client
+        .post(format!("{}/wsman", h.base))
+        .header("Content-Type", "application/soap+xml;charset=UTF-16")
+        .body(vec![b'a'; 5 * 1024 * 1024])
+        .send()
+        .await
+        .expect("POST");
+    assert_eq!(resp.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    h.finish().await;
+}
