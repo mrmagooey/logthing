@@ -10,6 +10,7 @@
 //!   `Negotiate` check used by every other protected route.
 
 use super::conn::{ConnAuthState, ConnSlot};
+use crate::wef::identity::ClientIdentity;
 use crate::wef::multipart::{self, EncProtocol};
 use axum::{
     body::Body,
@@ -381,6 +382,15 @@ pub async fn wsman_auth_middleware(
         resp.headers_mut().insert(header::WWW_AUTHENTICATE, tok);
         return resp;
     }
+
+    // Every request forwarded below runs on an authenticated slot; hand the handler the
+    // verified principal so it never has to trust the client-asserted MachineID.
+    let ConnAuthState::Authenticated { principal, .. } = &*state else {
+        return reject(AuthFailure::Missing);
+    };
+    parts
+        .extensions
+        .insert(ClientIdentity::Kerberos(principal.clone()));
 
     let enc = multipart::detect(
         parts
@@ -926,6 +936,14 @@ mod tests {
         slot: ConnSlot,
     }
 
+    async fn echo_identity(ext: Option<axum::Extension<ClientIdentity>>) -> String {
+        match ext {
+            Some(axum::Extension(ClientIdentity::Kerberos(p))) => format!("krb:{p}"),
+            Some(axum::Extension(other)) => format!("other:{other:?}"),
+            None => "none".into(),
+        }
+    }
+
     fn router_with(factory: Arc<FakeFactory>, seen: Seen) -> Router {
         let seen_echo = seen.clone();
         let echo = move |headers: axum::http::HeaderMap, body: Bytes| {
@@ -948,6 +966,7 @@ mod tests {
         Router::new()
             .route("/wsman", post(echo))
             .route("/wsman/end", post(|| async { StatusCode::OK }))
+            .route("/wsman/identity", post(echo_identity))
             .layer(middleware::from_fn_with_state(
                 Arc::new(WsmanAuth::new(factory)),
                 wsman_auth_middleware,
@@ -1054,6 +1073,45 @@ mod tests {
         );
         assert!(body_bytes(resp).await.is_empty());
         assert!(h.seen.lock().unwrap().is_empty(), "handler must not run");
+    }
+
+    #[tokio::test]
+    async fn test_identity_attached_on_token_request_with_plain_body() {
+        let h = Harness::new();
+        let resp = h
+            .send(auth_req(
+                "Kerberos",
+                "principal:bob",
+                "/wsman/identity",
+                b"<soap/>".to_vec(),
+            ))
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"krb:bob");
+    }
+
+    #[tokio::test]
+    async fn test_identity_attached_on_absent_authorization_after_handshake() {
+        let h = Harness::new();
+        login(&h, "bob").await;
+        let resp = h.send(plain_req("/wsman/identity", b"<soap/>")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"krb:bob");
+    }
+
+    #[tokio::test]
+    async fn test_identity_attached_on_encrypted_body() {
+        let h = Harness::new();
+        let id = login(&h, "bob").await;
+        let plain = b"<soap/>";
+        let resp = h
+            .send(enc_req("/wsman/identity", id, plain, plain.len()))
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let wire = body_bytes(resp).await;
+        let parsed = multipart::parse(&wire).unwrap();
+        let out = fake_unwrap(id, &parsed.header, &parsed.data).unwrap();
+        assert_eq!(out, b"krb:bob");
     }
 
     #[tokio::test]

@@ -623,3 +623,58 @@ async fn test_real_kerberos_second_connection_needs_own_auth() {
     assert_eq!(st, 200);
     h.finish().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_real_kerberos_spoofed_machine_id_cannot_overwrite_bookmark() {
+    let Some(env) = krb_env() else { return };
+    let h = Harness::start(&env).await;
+    let fixture = common::wef_fixture("security_4624");
+
+    // Two authenticated principals both claim the same client-asserted MachineID.
+    for (principal, record_id, mid) in [
+        ("WIN10$@EXAMPLE.COM", 100, "b1"),
+        ("WIN11$@EXAMPLE.COM", 999999, "b2"),
+    ] {
+        let mut conn = h.conn().await;
+        let mut ctx = authenticate(&mut conn, principal, HOST).await;
+        let (st, _) = exchange(
+            &mut conn,
+            &mut ctx,
+            &h.sub_url(),
+            &common::events_envelope(mid, MACHINE, record_id, &[fixture.as_str()]),
+        )
+        .await;
+        assert_eq!(st, 200, "{principal}");
+    }
+
+    // Each principal resumes from its own bookmark, whatever MachineID it asserts.
+    for (principal, want, other, mid) in [
+        (
+            "WIN10$@EXAMPLE.COM",
+            "RecordId=\"100\"",
+            "RecordId=\"999999\"",
+            "c1",
+        ),
+        (
+            "WIN11$@EXAMPLE.COM",
+            "RecordId=\"999999\"",
+            "RecordId=\"100\"",
+            "d1",
+        ),
+    ] {
+        let mut conn = h.conn().await;
+        let mut ctx = authenticate(&mut conn, principal, HOST).await;
+        let (st, text) = exchange(
+            &mut conn,
+            &mut ctx,
+            "/wsman",
+            &common::enumerate_envelope(mid, MACHINE),
+        )
+        .await;
+        assert_eq!(st, 200, "{principal}");
+        let text = text.expect("encrypted EnumerateResponse");
+        assert!(text.contains(want), "{principal}: {text}");
+        assert!(!text.contains(other), "{principal}: {text}");
+    }
+    h.finish().await;
+}
