@@ -34,6 +34,9 @@ KDC
     kadmin.local -q "ktadd -k $KT/logthing.keytab HTTP/logthing.example.com"
     kadmin.local -q "ktadd -k $KT/other.keytab HTTP/other.example.com"
     kadmin.local -q "ktadd -k $KT/clients.keytab WIN10\$ WIN11\$"
+    # alice authenticates by keytab too (no kinit in the test host); -norandkey keeps the
+    # testpass password valid for the compose consumers.
+    kadmin.local -q "ktadd -norandkey -k $KT/clients.keytab alice"
     chmod 644 "$KT"/*.keytab
     touch "$KT/.provisioned"
     echo "provisioning done"

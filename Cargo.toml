@@ -153,6 +153,10 @@ pprof = { version = "0.14", default-features = false, features = [
 [dev-dependencies]
 tempfile = "3.9"
 flate2 = "1"
+# Persistent keep-alive HTTP/1.1 client connections for the real-Kerberos integration test,
+# which must control exactly which TCP connection carries which request.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 metrics-util = { version = "0.16", features = ["debugging"] }
 criterion = "0.5"
 # `start_paused = true` on `#[tokio::test]` (src/net.rs's AcceptBackoff
