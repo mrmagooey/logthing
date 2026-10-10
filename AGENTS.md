@@ -28,7 +28,7 @@ This document explains how automated or semi-automated agents should interact wi
 | Committer E2E test | `committer/tests/e2e/run.sh` (requires Docker) |
 | Test KDC (real Kerberos) | `eval "$(scripts/kdc-test-env.sh up)"` ... `scripts/kdc-test-env.sh down` (requires Docker; exports `LOGTHING_TEST_KRB5_*`) |
 | WEF client emulator tests | `tests/e2e/simulation-environment/wef-client-emulator/.venv/bin/pytest tests/e2e/simulation-environment/wef-client-emulator/tests` |
-| WEF Kerberos integration test | `eval "$(scripts/kdc-test-env.sh up)" && cargo test --features kerberos-auth --test wef_kerberos_integration` (requires Docker; the test file lands in a later task) |
+| WEF Kerberos integration test | `eval "$(scripts/kdc-test-env.sh up)" && cargo test --features kerberos-auth --test wef_kerberos_integration` (requires Docker) |
 | Object Lock integration test | `MINIO_ENDPOINT=http://host:9000 [MINIO_ACCESS_KEY=.. MINIO_SECRET_KEY=..] cargo test --test object_lock_integration` (skips when `MINIO_ENDPOINT` is unset) |
 | Analytics unit tests | `deploy/analytics/.venv/bin/pytest -c deploy/analytics/tests/pytest.ini deploy/analytics/tests/unit` |
 | Analytics integration test | `deploy/analytics/.venv/bin/pytest -c deploy/analytics/tests/pytest.ini deploy/analytics/tests/integration -m integration` (requires Docker; Trino tests need AVX2 or `TRINO_IMAGE`) |

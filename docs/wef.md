@@ -105,6 +105,10 @@ Kerberos and logthing encrypts the SOAP messages (see below).
 `ca_file` set to the CA that issued the clients' certificates, `collector_url` starting
 `https://`.
 
+There is also a third, explicit opt-in and **unsafe** mode: `wef.allow_unauthenticated = true`
+accepts clients over plain HTTP with no authentication at all. Startup logs a warning, and
+`security.allowed_ips` is the only control left. Use it only on a trusted, isolated network.
+
 Startup fails with one of these messages when the configuration does not fit:
 
 - `wef.collector_url is required when [[wef.subscriptions]] are configured`
@@ -162,7 +166,9 @@ manager: Enumerate and End) and `/wsman/subscriptions/<subscription uuid>` (even
 delivery, which logthing acknowledges). Unknown paths or subscriptions return `404`; an
 unsupported `Content-Encoding` returns `415`; an unparseable body returns `400`. Event batches
 compressed with SLDC and UTF-8 or UTF-16 bodies are accepted. Bodies that are a bare `<Events>`
-element with no SOAP envelope are rejected with `400`.
+element with no SOAP envelope are rejected with `400`. A request body larger than 4 MiB is
+rejected with `413` in every topology (Windows' default `MaxEnvelopeSize` is 512000 bytes, so
+normal clients stay far below this).
 
 ### Known limits
 
@@ -171,8 +177,8 @@ element with no SOAP envelope are rejected with `400`.
   does not resend it. Watch `parquet_s3_dropped{source="wef"}` and size
   `channel_capacity`/`max_buffer_rows` accordingly.
 - **Bookmarks are held in memory.** After a logthing restart (or when `bookmark_capacity` is
-  exceeded) clients resume from the start of the subscription (the earliest event if
-  `read_existing_events = true`, otherwise from now), which can duplicate or skip events.
+  exceeded) clients have no bookmark and resume from now (or from the earliest event if
+  `read_existing_events = true`), which can duplicate or skip events.
 - **Any client certificate issued by the configured CA can read every subscription** and submit
   events for any of them. Use a dedicated CA for event forwarding clients.
 - Windows Server 2025 clients requesting `host/<fqdn>` and NTLM are not supported.

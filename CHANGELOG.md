@@ -21,6 +21,10 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 - Windows client emulator and a Docker KDC test environment (`scripts/kdc-test-env.sh`) for
   testing the WEF receiver without Windows.
 - `docs/wef.md` documents GPO client setup, the two topologies and known limits.
+- `/wsman` request bodies larger than 4 MiB are rejected with `413` in all topologies.
+- Tests: a Docker `wef-interop` end-to-end scenario (`run.sh wef-interop`, MIT KDC plus the
+  Windows client emulator over Kerberos-HTTP and HTTPS client certificates) and a real-Kerberos
+  integration test (`tests/wef_kerberos_integration.rs`, needs `scripts/kdc-test-env.sh`).
 
 ### Changed
 
@@ -30,8 +34,11 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ### Removed
 
-- `POST /wsman/events` and the bare `POST /wsman/subscriptions` endpoints. A bare `<Events>` body
-  (no SOAP envelope) is now answered with `400`.
+- The legacy bare-`<Events>` ingest. `POST /wsman/events` and `POST /wsman/subscriptions` are no
+  longer ingest endpoints: they are handled as subscription-manager requests, so a bare
+  `<Events>` body (no SOAP envelope) gets `400`. Any other `/wsman/subscriptions/<path>` that is
+  not `<uuid>` or `<uuid>/<number>` gets `404`.
+- The old `kerberos-test` simulation container, replaced by the `wef-interop` scenario.
 
 ## [0.22.1] - 2026-10-08
 
