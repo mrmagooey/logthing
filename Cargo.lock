@@ -2697,6 +2697,8 @@ dependencies = [
  "hmac",
  "http-body 1.0.1",
  "http-body-util",
+ "hyper 1.8.1",
+ "hyper-util",
  "ipnet",
  "libc",
  "libgssapi",
