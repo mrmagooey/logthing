@@ -378,3 +378,77 @@ pub fn heartbeat_envelope(message_id: &str, machine_id: &str) -> String {
         delivery_header("Heartbeat", message_id, machine_id, "")
     )
 }
+
+/// Literal-only SLDC encoder (ECMA-321 scheme 1): a Reset-1 control, every byte as a 9-bit
+/// literal (`0` + 8 data bits), then End-of-Record zero-padded to a 32-bit boundary. Valid
+/// SLDC, so it drives the server's decoder without needing a match-finding compressor.
+pub fn sldc_literals(data: &[u8]) -> Vec<u8> {
+    let mut bits: Vec<bool> = Vec::new();
+    let mut push = |value: u32, n: usize| {
+        for i in (0..n).rev() {
+            bits.push((value >> i) & 1 == 1);
+        }
+    };
+    push(0x1FF0 | 0x5, 13);
+    for &b in data {
+        push(u32::from(b), 9);
+    }
+    push(0x1FF0 | 0x4, 13);
+    while !bits.len().is_multiple_of(32) {
+        bits.push(false);
+    }
+    bits.chunks(8)
+        .map(|c| c.iter().fold(0u8, |acc, &b| (acc << 1) | u8::from(b)))
+        .collect()
+}
+
+/// Decode a UTF-16LE (BOM optional) response body to a `String`.
+pub fn decode_utf16(bytes: &[u8]) -> String {
+    let body = bytes.strip_prefix(&[0xFF, 0xFE][..]).unwrap_or(bytes);
+    let units: Vec<u16> = body
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
+    String::from_utf16(&units).expect("response is valid UTF-16")
+}
+
+/// The first `NotifyTo` `a:Address` in an `EnumerateResponse` (the delivery URL a client uses).
+pub fn notify_to(enumerate_response: &str) -> String {
+    let after = enumerate_response
+        .split("<e:NotifyTo>")
+        .nth(1)
+        .expect("NotifyTo in EnumerateResponse");
+    after
+        .split("<a:Address>")
+        .nth(1)
+        .and_then(|s| s.split("</a:Address>").next())
+        .expect("NotifyTo a:Address")
+        .to_string()
+}
+
+/// The `m:Version` GUID of the first subscription item in an `EnumerateResponse`.
+pub fn subscription_version(enumerate_response: &str) -> String {
+    enumerate_response
+        .split("<m:Version>")
+        .nth(1)
+        .and_then(|s| s.split("</m:Version>").next())
+        .expect("m:Version in EnumerateResponse")
+        .to_string()
+}
+
+/// Whether `response` is an Ack whose `a:RelatesTo` is exactly `message_id` (with `uuid:`).
+pub fn acks(response: &str, message_id: &str) -> bool {
+    response.contains("wsman/Ack")
+        && response.contains(&format!("<a:RelatesTo>uuid:{message_id}</a:RelatesTo>"))
+}
+
+/// Contents of the fixture `tests/fixtures/wef/events/<name>.xml`.
+pub fn wef_fixture(name: &str) -> String {
+    let p = format!(
+        "{}/tests/fixtures/wef/events/{name}.xml",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {p}: {e}"))
+}
