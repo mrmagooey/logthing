@@ -1,0 +1,33 @@
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Security-Auditing" Guid="{54849625-5478-4994-a5ba-3e3b0328c30d}">
+    </Provider>
+    <EventID>4688</EventID>
+    <Version>0</Version>
+    <Level>0</Level>
+    <Task>13312</Task>
+    <Opcode>0</Opcode>
+    <Keywords>0x8020000000000000</Keywords>
+    <TimeCreated SystemTime="2016-10-06T01:47:07.166302Z">
+    </TimeCreated>
+    <EventRecordID>227127</EventRecordID>
+    <Correlation>
+    </Correlation>
+    <Execution ProcessID="4" ThreadID="80">
+    </Execution>
+    <Channel>Security</Channel>
+    <Computer>WIN-WFBHIBE5GXZ.example.co.jp</Computer>
+    <Security>
+    </Security>
+  </System>
+  <EventData>
+    <Data Name="SubjectUserSid">S-1-5-21-1524084746-3249201829-3114449661-500</Data>
+    <Data Name="SubjectUserName">Administrator</Data>
+    <Data Name="SubjectDomainName">EXAMPLE</Data>
+    <Data Name="SubjectLogonId">0x32cfb</Data>
+    <Data Name="NewProcessId">0x98c</Data>
+    <Data Name="NewProcessName">C:\Windows\System32\cmd.exe</Data>
+    <Data Name="TokenElevationType">%%1936</Data>
+    <Data Name="ProcessId">0xb74</Data>
+  </EventData>
+</Event>

@@ -1,0 +1,30 @@
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Service Control Manager" Guid="{555908d1-a6d7-4695-8e1e-26931d2012f4}" EventSourceName="Service Control Manager">
+    </Provider>
+    <EventID Qualifiers="16384">7045</EventID>
+    <Version>0</Version>
+    <Level>4</Level>
+    <Task>0</Task>
+    <Opcode>0</Opcode>
+    <Keywords>0x8080000000000000</Keywords>
+    <TimeCreated SystemTime="2017-07-12T17:16:29.401630Z">
+    </TimeCreated>
+    <EventRecordID>45</EventRecordID>
+    <Correlation>
+    </Correlation>
+    <Execution ProcessID="620" ThreadID="1796">
+    </Execution>
+    <Channel>System</Channel>
+    <Computer>WIN-P4SIAA0SQCO</Computer>
+    <Security UserID="S-1-5-18">
+    </Security>
+  </System>
+  <EventData>
+    <Data Name="ServiceName">UMDF Reflector service for Sensors HID Class Driver</Data>
+    <Data Name="ImagePath">\SystemRoot\System32\drivers\WUDFRd.sys</Data>
+    <Data Name="ServiceType">kernel mode driver</Data>
+    <Data Name="StartType">demand start</Data>
+    <Data Name="AccountName"></Data>
+  </EventData>
+</Event>

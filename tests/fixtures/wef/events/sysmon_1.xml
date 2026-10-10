@@ -1,0 +1,41 @@
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Sysmon" Guid="5770385F-C22A-43E0-BF4C-06F5698FFBD9">
+    </Provider>
+    <EventID>1</EventID>
+    <Version>5</Version>
+    <Level>4</Level>
+    <Task>1</Task>
+    <Opcode>0</Opcode>
+    <Keywords>0x8000000000000000</Keywords>
+    <TimeCreated SystemTime="2017-12-26T13:10:29.136879Z">
+    </TimeCreated>
+    <EventRecordID>1742</EventRecordID>
+    <Correlation>
+    </Correlation>
+    <Execution ProcessID="2284" ThreadID="5252">
+    </Execution>
+    <Channel>Microsoft-Windows-Sysmon/Operational</Channel>
+    <Computer>DESKTOP-2KGM189</Computer>
+    <Security UserID="S-1-5-18">
+    </Security>
+  </System>
+  <EventData>
+    <Data Name="UtcTime">2017-12-26 13:10:29.134</Data>
+    <Data Name="ProcessGuid">94F748D5-4A45-5A42-0000-0010D265F20F</Data>
+    <Data Name="ProcessId">9112</Data>
+    <Data Name="Image">C:\Windows\SysWOW64\PING.EXE</Data>
+    <Data Name="CommandLine">ping  -n 6 127.0.0.1 </Data>
+    <Data Name="CurrentDirectory">C:\Windows\Temp\</Data>
+    <Data Name="User">NT AUTHORITY\SYSTEM</Data>
+    <Data Name="LogonGuid">94F748D5-5A64-5966-0000-0020E7030000</Data>
+    <Data Name="LogonId">0x3e7</Data>
+    <Data Name="TerminalSessionId">0</Data>
+    <Data Name="IntegrityLevel">System</Data>
+    <Data Name="Hashes">SHA1=CE8E487CB76704FE5FBB821A78A1E969EFBE71F9,MD5=A27A24553B2C36E139647F88DF738C35,SHA256=8F16A431C919A0AA7C9466EC1CDC1E721F30EB5C8182835585A1B74ABECB1920,IMPHASH=0EB64EACA8C951D760EEA1A941A2A3F7</Data>
+    <Data Name="ParentProcessGuid">94F748D5-D211-597D-0000-00109BD2C107</Data>
+    <Data Name="ParentProcessId">8392</Data>
+    <Data Name="ParentImage">C:\Windows\SysWOW64\cmd.exe</Data>
+    <Data Name="ParentCommandLine">C:\Windows\system32\cmd.exe /c C:\Windows\TEMP\update.bat C:\Users\tony\AppData\Local\Temp\pytest-of-tony\pytest-0\test_agent_update_op0\pathfinder\pathfinder.exe C:\Windows\TEMP\pathfinder_sfx.exe</Data>
+  </EventData>
+</Event>

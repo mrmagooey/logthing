@@ -1,0 +1,45 @@
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Security-Auditing" Guid="{54849625-5478-4994-a5ba-3e3b0328c30d}">
+    </Provider>
+    <EventID>4624</EventID>
+    <Version>0</Version>
+    <Level>0</Level>
+    <Task>12544</Task>
+    <Opcode>0</Opcode>
+    <Keywords>0x8020000000000000</Keywords>
+    <TimeCreated SystemTime="2016-10-06T01:47:21.955197Z">
+    </TimeCreated>
+    <EventRecordID>227443</EventRecordID>
+    <Correlation>
+    </Correlation>
+    <Execution ProcessID="572" ThreadID="1244">
+    </Execution>
+    <Channel>Security</Channel>
+    <Computer>WIN-WFBHIBE5GXZ.example.co.jp</Computer>
+    <Security>
+    </Security>
+  </System>
+  <EventData>
+    <Data Name="SubjectUserSid">S-1-0-0</Data>
+    <Data Name="SubjectUserName">-</Data>
+    <Data Name="SubjectDomainName">-</Data>
+    <Data Name="SubjectLogonId">0x0</Data>
+    <Data Name="TargetUserSid">S-1-5-18</Data>
+    <Data Name="TargetUserName">WIN-WFBHIBE5GXZ$</Data>
+    <Data Name="TargetDomainName">EXAMPLE</Data>
+    <Data Name="TargetLogonId">0x1f9cd52</Data>
+    <Data Name="LogonType">3</Data>
+    <Data Name="LogonProcessName">Kerberos</Data>
+    <Data Name="AuthenticationPackageName">Kerberos</Data>
+    <Data Name="WorkstationName"></Data>
+    <Data Name="LogonGuid">5C3C5E3E-F799-7DBA-5237-223CC0B4DC93</Data>
+    <Data Name="TransmittedServices">-</Data>
+    <Data Name="LmPackageName">-</Data>
+    <Data Name="KeyLength">0</Data>
+    <Data Name="ProcessId">0x0</Data>
+    <Data Name="ProcessName">-</Data>
+    <Data Name="IpAddress">fe80::4888:72d0:4f06:d1a1</Data>
+    <Data Name="IpPort">49547</Data>
+  </EventData>
+</Event>

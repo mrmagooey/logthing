@@ -1,0 +1,39 @@
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Security-Auditing" Guid="{54849625-5478-4994-a5ba-3e3b0328c30d}">
+    </Provider>
+    <EventID>4768</EventID>
+    <Version>0</Version>
+    <Level>0</Level>
+    <Task>14339</Task>
+    <Opcode>0</Opcode>
+    <Keywords>0x8020000000000000</Keywords>
+    <TimeCreated SystemTime="2016-10-06T05:37:51.615448Z">
+    </TimeCreated>
+    <EventRecordID>234828</EventRecordID>
+    <Correlation>
+    </Correlation>
+    <Execution ProcessID="572" ThreadID="672">
+    </Execution>
+    <Channel>Security</Channel>
+    <Computer>WIN-WFBHIBE5GXZ.example.co.jp</Computer>
+    <Security>
+    </Security>
+  </System>
+  <EventData>
+    <Data Name="TargetUserName">WIN-WFBHIBE5GXZ$</Data>
+    <Data Name="TargetDomainName">EXAMPLE.CO.JP</Data>
+    <Data Name="TargetSid">S-1-5-21-1524084746-3249201829-3114449661-1000</Data>
+    <Data Name="ServiceName">krbtgt</Data>
+    <Data Name="ServiceSid">S-1-5-21-1524084746-3249201829-3114449661-502</Data>
+    <Data Name="TicketOptions">0x40810010</Data>
+    <Data Name="Status">0x0</Data>
+    <Data Name="TicketEncryptionType">0x12</Data>
+    <Data Name="PreAuthType">2</Data>
+    <Data Name="IpAddress">::1</Data>
+    <Data Name="IpPort">0</Data>
+    <Data Name="CertIssuerName"></Data>
+    <Data Name="CertSerialNumber"></Data>
+    <Data Name="CertThumbprint"></Data>
+  </EventData>
+</Event>
