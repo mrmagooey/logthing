@@ -161,6 +161,12 @@ pub fn wef_envelope(data: &[u8]) -> usize {
     n
 }
 
+/// SLDC-compressed WEF body: decode with the production bomb guard (4 MiB); returns the
+/// decoded length, 0 on a decode error.
+pub fn wef_sldc(data: &[u8]) -> usize {
+    crate::wef::sldc::decompress(data, 4 << 20).map_or(0, |v| v.len())
+}
+
 /// NDJSON listener framing: `\n`-split, trailing `\r` stripped, empty lines
 /// skipped, non-UTF-8 lines dropped (the listeners count and skip them).
 fn ndjson_lines(data: &[u8]) -> impl Iterator<Item = &str> {
@@ -354,6 +360,33 @@ mod tests {
                 "{} yielded no events",
                 path.display()
             );
+        }
+    }
+
+    #[test]
+    fn test_wef_sldc_every_seed_decodes() {
+        for (path, bytes) in seeds("wef_sldc") {
+            assert!(wef_sldc(&bytes) > 0, "{} did not decode", path.display());
+        }
+        assert_eq!(wef_sldc(&[]), 0);
+        assert_eq!(wef_sldc(&[0xff; 64]), 0);
+    }
+
+    #[test]
+    #[ignore = "regenerates fuzz/seeds/wef_sldc/*.bin"]
+    fn write_wef_sldc_seeds() {
+        use crate::wef::{encoding::encode_utf16le_bom, sldc::compress_literals_and_copies as c};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/seeds/wef_sldc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let soap = "<s:Envelope><e:Event>logon admin</e:Event></s:Envelope>".repeat(40);
+        let seeds = [
+            ("literals.bin", c(b"AB")),
+            ("copies.bin", c(b"abcabcabcabcabc")),
+            ("long_run.bin", c(&[b'z'; 700])),
+            ("utf16_soap.bin", c(&encode_utf16le_bom(&soap))),
+        ];
+        for (name, bytes) in seeds {
+            std::fs::write(dir.join(name), bytes).unwrap();
         }
     }
 

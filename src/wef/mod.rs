@@ -6,3 +6,4 @@
 //! [`encoding`]) -> SOAP parse.
 
 pub mod encoding;
+pub mod sldc;
