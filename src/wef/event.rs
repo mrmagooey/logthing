@@ -62,6 +62,9 @@ fn num<T: std::str::FromStr + Default>(field: &str, text: &str) -> T {
     })
 }
 
+/// Maximum element nesting accepted; deeper payloads are rejected as malformed.
+const MAX_DEPTH: usize = 64;
+
 #[derive(Default)]
 struct Builder {
     p: Option<ParsedEvent>,
@@ -73,9 +76,10 @@ struct Builder {
 }
 
 impl Builder {
-    fn start(&mut self, path: &[String], e: &BytesStart<'_>) {
+    /// Handle an element start. `path` includes the element; `in_system` is true only for
+    /// direct children of the first `Event/System`.
+    fn start(&mut self, path: &[String], in_system: bool, e: &BytesStart<'_>) {
         let name = path.last().map(String::as_str).unwrap_or("");
-        let in_system = path.iter().any(|s| s == "System");
         let p = self.p.get_or_insert_with(blank);
         match name {
             "Provider" if in_system => p.provider = attr(e, "Name").unwrap_or_default(),
@@ -91,7 +95,7 @@ impl Builder {
                 p.thread_id = attr(e, "ThreadID").and_then(|v| v.trim().parse().ok());
             }
             "Security" if in_system => p.security_user_id = attr(e, "UserID"),
-            "Data" if parent(path) == "EventData" => {
+            "Data" if is_child_of(path, "EventData") => {
                 let key = attr(e, "Name").unwrap_or_else(|| {
                     self.unnamed += 1;
                     if self.unnamed == 1 {
@@ -100,68 +104,65 @@ impl Builder {
                         format!("Data{}", self.unnamed - 1)
                     }
                 });
-                self.data
-                    .entry(key.clone())
-                    .or_insert_with(|| Value::String(String::new()));
+                self.data.insert(key.clone(), Value::String(String::new()));
                 self.cur_data_key = Some(key);
             }
             _ => {}
         }
     }
 
-    fn text(&mut self, path: &[String], text: &str) {
+    /// Handle a finished leaf element's complete text (entities/CDATA already joined).
+    fn leaf(&mut self, path: &[String], in_system: bool, text: &str) {
         let name = path.last().map(String::as_str).unwrap_or("");
-        let in_system = path.iter().any(|s| s == "System");
         let p = self.p.get_or_insert_with(blank);
-        match name {
-            "EventID" if in_system => p.event_id = num("EventID", text),
-            "Level" if in_system => {
-                p.level = match num::<u8>("Level", text) {
-                    1 => EventLevel::Critical,
-                    2 => EventLevel::Error,
-                    3 => EventLevel::Warning,
-                    5 => EventLevel::Verbose,
-                    _ => EventLevel::Information,
+        let t = text.trim();
+        if in_system {
+            match name {
+                "EventID" => p.event_id = num("EventID", t),
+                "Level" => {
+                    p.level = match num::<u8>("Level", t) {
+                        1 => EventLevel::Critical,
+                        2 => EventLevel::Error,
+                        3 => EventLevel::Warning,
+                        5 => EventLevel::Verbose,
+                        _ => EventLevel::Information,
+                    }
                 }
-            }
-            "Task" if in_system => p.task = num("Task", text),
-            "Opcode" if in_system => p.opcode = num("Opcode", text),
-            "Keywords" if in_system => {
-                let t = text.trim();
-                let h = t
-                    .strip_prefix("0x")
-                    .or_else(|| t.strip_prefix("0X"))
-                    .unwrap_or(t);
-                p.keywords = u64::from_str_radix(h, 16).unwrap_or(0);
-            }
-            "EventRecordID" if in_system => p.event_record_id = num("EventRecordID", text),
-            "Channel" if in_system => p.channel = text.to_string(),
-            "Computer" if in_system => p.computer = text.to_string(),
-            "Message" if parent(path) == "RenderingInfo" => {
-                self.rendered.get_or_insert_with(|| text.to_string());
-            }
-            "Data" if parent(path) == "EventData" => {
-                if let Some(k) = &self.cur_data_key {
-                    self.data.insert(k.clone(), Value::String(text.to_string()));
+                "Task" => p.task = num("Task", t),
+                "Opcode" => p.opcode = num("Opcode", t),
+                "Keywords" => {
+                    let h = t
+                        .strip_prefix("0x")
+                        .or_else(|| t.strip_prefix("0X"))
+                        .unwrap_or(t);
+                    p.keywords = u64::from_str_radix(h, 16).unwrap_or(0);
                 }
-                if !text.is_empty() {
-                    self.first_data.get_or_insert_with(|| text.to_string());
-                }
+                "EventRecordID" => p.event_record_id = num("EventRecordID", t),
+                "Channel" => p.channel = t.to_string(),
+                "Computer" => p.computer = t.to_string(),
+                _ => {}
             }
-            _ if path.iter().any(|s| s == "UserData") && name != "UserData" => {
-                self.data
-                    .insert(name.to_string(), Value::String(text.to_string()));
+            return;
+        }
+        if name == "Message" && is_child_of(path, "RenderingInfo") {
+            self.rendered.get_or_insert_with(|| text.to_string());
+        } else if name == "Data" && is_child_of(path, "EventData") {
+            if let Some(k) = self.cur_data_key.take() {
+                self.data.insert(k, Value::String(text.to_string()));
             }
-            _ => {}
+            if !text.is_empty() {
+                self.first_data.get_or_insert_with(|| text.to_string());
+            }
+        } else if path.len() >= 3 && path[1] == "UserData" {
+            self.data
+                .insert(name.to_string(), Value::String(text.to_string()));
         }
     }
 }
 
-fn parent(path: &[String]) -> &str {
-    path.len()
-        .checked_sub(2)
-        .map(|i| path[i].as_str())
-        .unwrap_or("")
+/// True when `path` is exactly `Event/<parent>/<leaf>`.
+fn is_child_of(path: &[String], parent: &str) -> bool {
+    path.len() == 3 && path[1] == parent
 }
 
 fn blank() -> ParsedEvent {
@@ -186,42 +187,66 @@ fn blank() -> ParsedEvent {
 
 /// Parse one event XML string (a WEF CDATA payload) into a [`ParsedEvent`].
 ///
-/// Elements are matched by local name. `Level` 0 and 4 (and any unknown value) map to
-/// `Information`; unparsable numeric fields, including a `Keywords` value that is not
-/// `0x`-prefixed hex, default to 0; a missing or unparsable `TimeCreated` defaults to now.
-/// `message` is the `RenderingInfo/Message` text when present, else the first non-empty
-/// `EventData/Data` text. `data` maps `EventData/Data@Name` (unnamed ones become `Data`,
-/// `Data1`, ...) or `UserData` leaf element names to their text.
+/// Elements are matched by local name and by position: System fields are honoured only as
+/// direct children of the first `Event/System` (a `System` inside `UserData` cannot spoof
+/// them). `Level` 0 and 4 (and any unknown value) map to `Information`; unparsable numeric
+/// fields default to 0, as does a `Keywords` value that is not hex (a `0x` prefix is
+/// optional); a missing or unparsable `TimeCreated` defaults to now. `message` is the
+/// `RenderingInfo/Message` text when present, else the first non-empty `EventData/Data`
+/// text. `data` maps `EventData/Data@Name` (unnamed ones become `Data`, `Data1`, ...; on
+/// duplicate names the last wins) or `UserData` leaf element names to their untrimmed text.
 ///
 /// # Errors
-/// Fails on malformed XML (reader error or unclosed elements) or when there is no
-/// `<Event>` root element.
+/// Fails on malformed XML (reader error or unclosed elements), nesting deeper than 64, or
+/// when there is no `<Event>` root element.
 pub fn parse_event(xml: &str) -> Result<ParsedEvent> {
     let mut reader = Reader::from_str(xml);
-    reader.trim_text(true);
     let mut b = Builder::default();
     let mut path: Vec<String> = Vec::new();
     let mut saw_event = false;
+    // Ordinal of the most recent depth-2 `System` element; only ordinal 1 counts.
+    let mut system_ordinal = 0usize;
+    let mut text = String::new();
+    let mut last_was_start = false;
     loop {
-        match reader.read_event().context("malformed event XML")? {
-            XmlEvent::Start(e) => {
+        let ev = reader.read_event().context("malformed event XML")?;
+        match ev {
+            XmlEvent::Start(_) | XmlEvent::Empty(_) => {
+                let (e, empty) = match &ev {
+                    XmlEvent::Start(e) => (e, false),
+                    XmlEvent::Empty(e) => (e, true),
+                    _ => unreachable!(),
+                };
+                if path.len() >= MAX_DEPTH {
+                    bail!("event XML nested deeper than {MAX_DEPTH}");
+                }
                 path.push(local(e.name().as_ref()));
                 saw_event |= path.len() == 1 && path[0] == "Event";
-                b.start(&path, &e);
-            }
-            XmlEvent::Empty(e) => {
-                path.push(local(e.name().as_ref()));
-                b.start(&path, &e);
-                path.pop();
+                if path.len() == 2 && path[1] == "System" {
+                    system_ordinal += 1;
+                }
+                let in_system = path.len() == 3 && path[1] == "System" && system_ordinal == 1;
+                b.start(&path, in_system, e);
+                text.clear();
+                if empty {
+                    b.leaf(&path, in_system, "");
+                    path.pop();
+                    last_was_start = false;
+                } else {
+                    last_was_start = true;
+                }
             }
             XmlEvent::End(_) => {
+                let in_system = path.len() == 3 && path[1] == "System" && system_ordinal == 1;
+                if last_was_start {
+                    b.leaf(&path, in_system, &text);
+                }
                 path.pop();
+                text.clear();
+                last_was_start = false;
             }
-            XmlEvent::Text(t) => {
-                let t = t.unescape().context("bad XML text")?;
-                b.text(&path, &t);
-            }
-            XmlEvent::CData(c) => b.text(&path, &String::from_utf8_lossy(&c)),
+            XmlEvent::Text(t) => text.push_str(&t.unescape().context("bad XML text")?),
+            XmlEvent::CData(c) => text.push_str(&String::from_utf8_lossy(&c)),
             XmlEvent::Eof => break,
             _ => {}
         }
@@ -305,8 +330,11 @@ mod tests {
         assert_eq!(p.thread_id, Some(700));
         assert_eq!(p.channel, "Security");
         assert!(!p.computer.is_empty());
-        assert_eq!(p.time_created.timestamp_subsec_nanos() % 100, 0);
-        assert!(p.time_created.timestamp() > 0);
+        assert_eq!(p.time_created.timestamp_subsec_nanos(), 123_456_700);
+        assert_eq!(
+            p.time_created.to_rfc3339(),
+            "2026-10-09T10:00:00.123456700+00:00"
+        );
         assert!(p.data.unwrap()["TargetUserName"].is_string());
     }
 
@@ -358,6 +386,37 @@ mod tests {
         let p = parse_event(x).unwrap();
         assert_eq!(p.message.as_deref(), Some("hello"));
         assert_eq!(p.data.unwrap()["Data1"], "b");
+    }
+
+    #[test]
+    fn test_parse_event_deep_nesting_errors_quickly() {
+        let n = 10_000;
+        let x = format!("<Event>{}{}</Event>", "<a>".repeat(n), "</a>".repeat(n));
+        let start = std::time::Instant::now();
+        assert!(parse_event(&x).is_err());
+        assert!(start.elapsed().as_secs() < 2);
+    }
+
+    #[test]
+    fn test_parse_event_userdata_system_cannot_spoof() {
+        let x = "<Event><System><EventID>4624</EventID><Provider Name='real'/>\
+                 <Channel>Security</Channel></System><UserData><System><EventID>1</EventID>\
+                 <Provider Name='fake'/><Channel>X</Channel></System></UserData>\
+                 <System><EventID>2</EventID></System></Event>";
+        let p = parse_event(x).unwrap();
+        assert_eq!(p.event_id, 4624);
+        assert_eq!(p.provider, "real");
+        assert_eq!(p.channel, "Security");
+    }
+
+    #[test]
+    fn test_parse_event_data_whitespace_preserved_and_split_text_joined() {
+        let x = "<Event><System/><EventData><Data Name='a'>  x &amp; y  </Data>\
+                 <Data Name='b'>p<![CDATA[q]]>r</Data><Data Name='c'> </Data></EventData></Event>";
+        let d = parse_event(x).unwrap().data.unwrap();
+        assert_eq!(d["a"], "  x & y  ");
+        assert_eq!(d["b"], "pqr");
+        assert_eq!(d["c"], " ");
     }
 
     #[test]
