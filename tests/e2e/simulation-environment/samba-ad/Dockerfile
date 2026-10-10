@@ -15,5 +15,6 @@ EXPOSE 88/tcp 88/udp
 HEALTHCHECK --interval=2s --timeout=3s --start-period=20s --retries=60 \
     CMD test -f /keytabs/.provisioned && test -f /keytabs/logthing.keytab \
         && test -f /keytabs/clients.keytab && test -f /keytabs/other.keytab \
-        && pgrep -x samba >/dev/null
+        && pgrep -x samba >/dev/null \
+        && bash -c 'exec 3<>/dev/tcp/127.0.0.1/88'
 ENTRYPOINT ["/provision.sh"]

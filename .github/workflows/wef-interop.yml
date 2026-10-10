@@ -4,9 +4,13 @@ on:
   push:
     branches: [ "master" ]
   pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
 jobs:
   interop:
+    if: github.event_name != 'schedule'
     # Windows-shaped WEF clients (emulator) vs logthing over Kerberos and
     # client-cert HTTPS, all in docker compose. The Rust image build is long.
     runs-on: ubuntu-latest
@@ -19,6 +23,7 @@ jobs:
       run: tests/e2e/simulation-environment/run.sh wef-interop
 
   emulator-unit:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -38,3 +43,16 @@ jobs:
     - name: Run emulator unit tests
       working-directory: tests/e2e/simulation-environment/wef-client-emulator
       run: .venv/bin/pytest tests
+
+  samba-nightly:
+    # Same scenario against a Samba AD DC (real PAC, machine accounts). Non-gating.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run WEF interop e2e against Samba AD
+      run: tests/e2e/simulation-environment/run.sh wef-interop --samba

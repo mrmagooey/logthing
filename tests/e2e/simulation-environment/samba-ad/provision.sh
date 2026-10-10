@@ -6,7 +6,7 @@ set -eu
 REALM=EXAMPLE.COM
 KT=/keytabs
 
-if [ ! -f "$KT/.provisioned" ]; then
+if [ ! -f "$KT/.provisioned" ] || [ ! -f /var/lib/samba/private/sam.ldb ]; then
     echo "provisioning AD realm $REALM"
     rm -f "$KT"/*.keytab "$KT/.provisioned"
     rm -f /etc/samba/smb.conf
@@ -36,7 +36,7 @@ if [ ! -f "$KT/.provisioned" ]; then
     done
     # Accounts without msDS-SupportedEncryptionTypes only get RC4 keys exported; advertise
     # AES128+AES256 (24) like a current Windows domain, so tickets are AES-encrypted.
-    for acct in logthing-svc other-svc alice; do
+    for acct in logthing-svc other-svc alice 'WIN10$' 'WIN11$'; do
         dn=$(ldbsearch -H /var/lib/samba/private/sam.ldb "(sAMAccountName=$acct)" dn \
             | sed -n 's/^dn: //p')
         printf 'dn: %s\nchangetype: modify\nreplace: msDS-SupportedEncryptionTypes\nmsDS-SupportedEncryptionTypes: 24\n' \
