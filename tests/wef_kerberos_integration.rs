@@ -105,6 +105,17 @@ struct Harness {
 
 impl Harness {
     async fn start(env: &Env) -> Harness {
+        // free_port() is racy; if the server loses the bind race, retry on a fresh port.
+        for _ in 0..common::START_ATTEMPTS {
+            if let Some(h) = Self::try_start(env).await {
+                return h;
+            }
+        }
+        panic!("server never bound a free port");
+    }
+
+    /// One startup attempt; `None` when the port was taken before the server could bind it.
+    async fn try_start(env: &Env) -> Option<Harness> {
         let port = common::free_port();
         let dir = tempfile::tempdir().unwrap();
         let toml = common::wef_toml(&format!("http://{HOST}:{port}")).replace(
@@ -159,28 +170,19 @@ impl Harness {
         .expect("Server::new with real Kerberos");
         let workers = server.take_wef_worker_handles();
         let (shutdown, rx) = tokio::sync::watch::channel(false);
-        let task = tokio::spawn(async move {
-            server.run(rx).await.expect("server run");
-        });
+        let task = common::spawn_server(server.run(rx));
         let client = reqwest::Client::new();
-        for _ in 0..100 {
-            if let Ok(r) = client
-                .get(format!("http://127.0.0.1:{port}/health"))
-                .send()
-                .await
-                && r.status().is_success()
-            {
-                return Harness {
-                    port,
-                    dir,
-                    shutdown,
-                    task,
-                    workers,
-                };
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        let health = format!("http://127.0.0.1:{port}/health");
+        if !common::await_ready(&client, &health, &task).await {
+            return None;
         }
-        panic!("server did not become ready");
+        Some(Harness {
+            port,
+            dir,
+            shutdown,
+            task: task.handle,
+            workers,
+        })
     }
 
     async fn conn(&self) -> Conn {

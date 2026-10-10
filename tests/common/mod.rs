@@ -89,14 +89,79 @@ pub fn str_col<'a>(batch: &'a RecordBatch, name: &str) -> &'a StringArray {
         .unwrap_or_else(|| panic!("column {name} is not Utf8"))
 }
 
-/// Ask the OS for a free localhost TCP port (released immediately; small race is accepted,
-/// same trade-off the other e2e tests make).
+/// Ask the OS for a free localhost TCP port. The probe listener is dropped immediately, so
+/// another test can grab the port before the caller binds it. Callers that start a server must
+/// tolerate that: see [`spawn_server`] / [`await_ready`] (in-process) and
+/// [`Proc::spawn_healthy`] (binary), which retry on a fresh port.
 pub fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
         .port()
+}
+
+/// How many times a harness retries startup on a fresh port after losing a bind race.
+pub const START_ATTEMPTS: usize = 5;
+
+/// True when `e` (or anything in its cause chain) is an `AddrInUse` I/O error.
+pub fn is_addr_in_use(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+    })
+}
+
+/// A server running on a tokio task, remembering whether it died on a bind clash.
+pub struct ServerTask {
+    pub handle: tokio::task::JoinHandle<()>,
+    addr_in_use: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Spawn `fut` (a `Server::run`/`run_tls` call). `AddrInUse` is recorded for [`await_ready`]
+/// (the task then ends quietly); any other error panics the task as before.
+pub fn spawn_server<F>(fut: F) -> ServerTask
+where
+    F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let addr_in_use = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = addr_in_use.clone();
+    let handle = tokio::spawn(async move {
+        if let Err(e) = fut.await {
+            if is_addr_in_use(&e) {
+                flag.store(true, Ordering::SeqCst);
+            } else {
+                panic!("server run: {e:#}");
+            }
+        }
+    });
+    ServerTask {
+        handle,
+        addr_in_use,
+    }
+}
+
+/// Poll `health_url` until it answers 2xx. Returns `true` when ready, `false` when the server
+/// task ended on `AddrInUse` (the caller should retry on a fresh port). Panics on any other
+/// early exit or on timeout.
+pub async fn await_ready(client: &reqwest::Client, health_url: &str, task: &ServerTask) -> bool {
+    for _ in 0..100 {
+        if task.handle.is_finished() {
+            assert!(
+                task.addr_in_use.load(std::sync::atomic::Ordering::SeqCst),
+                "server task exited before becoming ready"
+            );
+            return false;
+        }
+        if let Ok(r) = client.get(health_url).send().await
+            && r.status().is_success()
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("server did not become ready");
 }
 
 fn write_cfg(dir: &Path, toml: &str) {
@@ -234,15 +299,29 @@ impl Proc {
 
     /// Poll `/health` until it answers 200 (panics with the child's logs on timeout or exit).
     pub async fn wait_healthy(&mut self) {
+        assert!(
+            self.wait_healthy_or_port_clash().await,
+            "logthing exited early on a port clash; stderr:\n{}",
+            self.logs()
+        );
+    }
+
+    /// Like [`Proc::wait_healthy`], but returns `false` (instead of panicking) when the child
+    /// exited with "Address already in use", so the caller can respawn on a fresh port.
+    pub async fn wait_healthy_or_port_clash(&mut self) -> bool {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Ok(r) = reqwest::get(format!("{}/health", self.base())).await
                 && r.status().is_success()
             {
-                return;
+                return true;
             }
             if let Some(st) = self.child.try_wait().unwrap() {
-                panic!("logthing exited early ({st}); stderr:\n{}", self.logs());
+                let logs = self.logs();
+                if logs.to_lowercase().contains("address already in use") {
+                    return false;
+                }
+                panic!("logthing exited early ({st}); stderr:\n{logs}");
             }
             assert!(
                 Instant::now() < deadline,
@@ -251,6 +330,20 @@ impl Proc {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    /// [`Proc::spawn`] + wait for health, respawning on a fresh port (up to
+    /// [`START_ATTEMPTS`]) when the port was taken between `free_port()` and the bind.
+    pub async fn spawn_healthy(bin: &str, toml: &str, envs: &[(&str, &str)]) -> Proc {
+        for _ in 1..START_ATTEMPTS {
+            let mut p = Proc::spawn(bin, toml, envs);
+            if p.wait_healthy_or_port_clash().await {
+                return p;
+            }
+        }
+        let mut p = Proc::spawn(bin, toml, envs);
+        p.wait_healthy().await;
+        p
     }
 
     /// stdout+stderr captured so far.

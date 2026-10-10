@@ -58,8 +58,7 @@ async fn post(
 #[tokio::test]
 async fn test_e2e_windows_shaped_flow_lands_in_parquet() {
     let toml = config(&common::wef_toml("http://127.0.0.1:{HTTP}"));
-    let mut p = common::Proc::spawn(BIN, &toml, &[]);
-    p.wait_healthy().await;
+    let p = common::Proc::spawn_healthy(BIN, &toml, &[]).await;
     let client = reqwest::Client::builder()
         // Keep-alive reuse is not asserted (reqwest exposes no connection counter); a single
         // pooled HTTP/1.1 client is what makes consecutive requests eligible for reuse.

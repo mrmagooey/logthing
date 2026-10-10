@@ -167,50 +167,45 @@ impl Harness {
     }
 
     async fn start_with(
-        tweak_config: impl FnOnce(Config) -> Config,
+        tweak_config: impl Fn(Config) -> Config,
         tweak_toml: impl Fn(String) -> String,
     ) -> Harness {
         logthing::server::install_crypto_provider();
-        let port = common::free_port();
-        let base = format!("https://127.0.0.1:{port}");
-        let dir = tempfile::tempdir().unwrap();
-        let tls_dir = tempfile::tempdir().unwrap();
-        let ca = Ca::new("logthing mtls test CA");
-        let toml =
-            tweak_toml(common::wef_toml(&base).replace("allow_unauthenticated = true\n", ""));
-        let config = tweak_config(tls_config(
-            &toml,
-            port,
-            dir.path(),
-            tls_dir.path(),
-            &ca,
-            true,
-        ));
-        let mut server = new_server(config).await.expect("Server::new");
-        let workers = server.take_wef_worker_handles();
-        let (shutdown, rx) = tokio::sync::watch::channel(false);
-        let task = tokio::spawn(async move {
-            server.run_tls(rx).await.expect("server run_tls");
-        });
-        let h = Harness {
-            base,
-            dir,
-            _tls_dir: tls_dir,
-            ca,
-            shutdown,
-            task,
-            workers,
-        };
-        let c = h.good_client();
-        for _ in 0..100 {
-            if let Ok(r) = c.get(format!("{}/health", h.base)).send().await
-                && r.status().is_success()
-            {
-                return h;
+        for _ in 0..common::START_ATTEMPTS {
+            // free_port() is racy; if the server loses the bind race, retry on fresh ports.
+            let port = common::free_port();
+            let base = format!("https://127.0.0.1:{port}");
+            let dir = tempfile::tempdir().unwrap();
+            let tls_dir = tempfile::tempdir().unwrap();
+            let ca = Ca::new("logthing mtls test CA");
+            let toml =
+                tweak_toml(common::wef_toml(&base).replace("allow_unauthenticated = true\n", ""));
+            let config = tweak_config(tls_config(
+                &toml,
+                port,
+                dir.path(),
+                tls_dir.path(),
+                &ca,
+                true,
+            ));
+            let mut server = new_server(config).await.expect("Server::new");
+            let workers = server.take_wef_worker_handles();
+            let (shutdown, rx) = tokio::sync::watch::channel(false);
+            let task = common::spawn_server(server.run_tls(rx));
+            let c = client(&ca, Some(&ca.issue("win10.example.com", false)));
+            if common::await_ready(&c, &format!("{base}/health"), &task).await {
+                return Harness {
+                    base,
+                    dir,
+                    _tls_dir: tls_dir,
+                    ca,
+                    shutdown,
+                    task: task.handle,
+                    workers,
+                };
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        panic!("TLS server did not become ready");
+        panic!("TLS server never bound free ports");
     }
 
     fn good_client(&self) -> reqwest::Client {
@@ -400,7 +395,7 @@ async fn test_mtls_syslog_still_requires_kerberos_when_enabled() {
         move |mut c| {
             c.security.kerberos.enabled = true;
             c.security.kerberos.spn = Some(spn.to_string());
-            c.security.kerberos.keytab = Some(kt);
+            c.security.kerberos.keytab = Some(kt.clone());
             c
         },
         |t| t,

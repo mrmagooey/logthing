@@ -79,34 +79,30 @@ impl Harness {
         collector_url: Option<&str>,
         tweak: impl Fn(String) -> String,
     ) -> Harness {
-        let port = common::free_port();
-        let base = format!("http://127.0.0.1:{port}");
-        let advertised = collector_url.unwrap_or(&base).to_string();
-        let dir = tempfile::tempdir().unwrap();
-        let config = build_config(&tweak(common::wef_toml(&advertised)), port, dir.path());
-        let mut server = new_server(config).await.expect("Server::new");
-        let workers = server.take_wef_worker_handles();
-        let (shutdown, rx) = tokio::sync::watch::channel(false);
-        let task = tokio::spawn(async move {
-            server.run(rx).await.expect("server run");
-        });
-        let client = reqwest::Client::new();
-        for _ in 0..100 {
-            if let Ok(r) = client.get(format!("{base}/health")).send().await
-                && r.status().is_success()
-            {
+        for _ in 0..common::START_ATTEMPTS {
+            // free_port() is racy; if the server loses the bind race, retry on a fresh port.
+            let port = common::free_port();
+            let base = format!("http://127.0.0.1:{port}");
+            let advertised = collector_url.unwrap_or(&base).to_string();
+            let dir = tempfile::tempdir().unwrap();
+            let config = build_config(&tweak(common::wef_toml(&advertised)), port, dir.path());
+            let mut server = new_server(config).await.expect("Server::new");
+            let workers = server.take_wef_worker_handles();
+            let (shutdown, rx) = tokio::sync::watch::channel(false);
+            let task = common::spawn_server(server.run(rx));
+            let client = reqwest::Client::new();
+            if common::await_ready(&client, &format!("{base}/health"), &task).await {
                 return Harness {
                     base,
                     dir,
                     client,
                     shutdown,
-                    task,
+                    task: task.handle,
                     workers,
                 };
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        panic!("server did not become ready");
+        panic!("server never bound a free port");
     }
 
     /// POST a UTF-16 envelope; returns (status, decoded body, raw content-type, body len).
