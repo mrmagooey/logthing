@@ -1,29 +1,45 @@
 //! In-memory LRU store of the last bookmark acknowledged per (machine, subscription).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use uuid::Uuid;
+
+use crate::wef::subscription::validate_xml_fragment;
+
+/// Largest bookmark accepted by [`BookmarkStore::put`].
+pub const MAX_BOOKMARK_BYTES: usize = 64 * 1024;
+/// Largest machine id accepted by [`BookmarkStore::put`].
+pub const MAX_MACHINE_ID_BYTES: usize = 255;
 
 type Key = (String, Uuid);
 
 #[derive(Debug, Default)]
 struct Inner {
-    map: HashMap<Key, String>,
-    /// Least recently used at the front.
-    order: VecDeque<Key>,
+    /// key -> (bookmark, recency generation)
+    map: HashMap<Key, (String, u64)>,
+    /// generation -> key; the smallest generation is the least recently used.
+    order: BTreeMap<u64, Key>,
+    next_gen: u64,
 }
 
 impl Inner {
-    fn touch(&mut self, key: &Key) {
-        if let Some(pos) = self.order.iter().position(|k| k == key) {
-            self.order.remove(pos);
+    fn bump(&mut self, key: &Key, old_gen: Option<u64>) -> u64 {
+        if let Some(g) = old_gen {
+            self.order.remove(&g);
         }
-        self.order.push_back(key.clone());
+        let g = self.next_gen;
+        self.next_gen += 1;
+        self.order.insert(g, key.clone());
+        g
     }
 }
 
 /// Bounded bookmark store; evicts the least recently used entry at capacity.
+///
+/// Both lookups and inserts are O(log n). Bookmarks are replayed verbatim into outgoing
+/// subscription XML and arrive from clients, so [`put`](Self::put) validates them; callers
+/// rely on that and must not bypass it.
 #[derive(Debug)]
 pub struct BookmarkStore {
     capacity: usize,
@@ -43,23 +59,38 @@ impl BookmarkStore {
     pub fn get(&self, machine_id: &str, sub: Uuid) -> Option<String> {
         let key = (machine_id.to_string(), sub);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let value = inner.map.get(&key).cloned()?;
-        inner.touch(&key);
+        let (value, old) = inner.map.get(&key).cloned()?;
+        let g = inner.bump(&key, Some(old));
+        inner.map.insert(key, (value.clone(), g));
         Some(value)
     }
 
     /// Stores a bookmark, evicting the least recently used entry when full.
-    pub fn put(&self, machine_id: &str, sub: Uuid, bookmark: String) {
+    ///
+    /// Returns `false` (and stores nothing) when `machine_id` is not 1..=255 bytes or the
+    /// bookmark exceeds 64 KiB or is not a complete, well-formed XML fragment with a single
+    /// `BookmarkList` root.
+    #[must_use]
+    pub fn put(&self, machine_id: &str, sub: Uuid, bookmark: String) -> bool {
+        if machine_id.is_empty()
+            || machine_id.len() > MAX_MACHINE_ID_BYTES
+            || bookmark.len() > MAX_BOOKMARK_BYTES
+            || validate_xml_fragment(&bookmark, "BookmarkList").is_err()
+        {
+            return false;
+        }
         let key = (machine_id.to_string(), sub);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if !inner.map.contains_key(&key)
+        let old = inner.map.get(&key).map(|(_, g)| *g);
+        if old.is_none()
             && inner.map.len() >= self.capacity
-            && let Some(oldest) = inner.order.pop_front()
+            && let Some((_, oldest)) = inner.order.pop_first()
         {
             inner.map.remove(&oldest);
         }
-        inner.touch(&key);
-        inner.map.insert(key, bookmark);
+        let g = inner.bump(&key, old);
+        inner.map.insert(key, (bookmark, g));
+        true
     }
 
     /// Number of stored bookmarks.
@@ -81,27 +112,35 @@ impl BookmarkStore {
 mod tests {
     use super::*;
 
+    fn bm(n: u32) -> String {
+        format!("<BookmarkList><Bookmark Channel=\"Security\" RecordId=\"{n}\"/></BookmarkList>")
+    }
+
+    fn put(s: &BookmarkStore, m: &str, u: Uuid, n: u32) {
+        assert!(s.put(m, u, bm(n)));
+    }
+
     #[test]
     fn test_bookmark_store_lru_evicts_oldest() {
         let s = BookmarkStore::new(2);
         let u = Uuid::nil();
-        s.put("a", u, "1".into());
-        s.put("b", u, "2".into());
-        s.put("c", u, "3".into());
+        put(&s, "a", u, 1);
+        put(&s, "b", u, 2);
+        put(&s, "c", u, 3);
         assert_eq!(s.len(), 2);
         assert_eq!(s.get("a", u), None);
-        assert_eq!(s.get("b", u).as_deref(), Some("2"));
-        assert_eq!(s.get("c", u).as_deref(), Some("3"));
+        assert_eq!(s.get("b", u), Some(bm(2)));
+        assert_eq!(s.get("c", u), Some(bm(3)));
     }
 
     #[test]
     fn test_bookmark_store_get_refreshes_recency() {
         let s = BookmarkStore::new(2);
         let u = Uuid::nil();
-        s.put("a", u, "1".into());
-        s.put("b", u, "2".into());
+        put(&s, "a", u, 1);
+        put(&s, "b", u, 2);
         assert!(s.get("a", u).is_some());
-        s.put("c", u, "3".into());
+        put(&s, "c", u, 3);
         assert!(s.get("a", u).is_some());
         assert_eq!(s.get("b", u), None);
     }
@@ -110,11 +149,61 @@ mod tests {
     fn test_bookmark_store_put_existing_updates_without_eviction() {
         let s = BookmarkStore::new(2);
         let u = Uuid::nil();
-        s.put("a", u, "1".into());
-        s.put("b", u, "2".into());
-        s.put("a", u, "9".into());
+        put(&s, "a", u, 1);
+        put(&s, "b", u, 2);
+        put(&s, "a", u, 9);
         assert_eq!(s.len(), 2);
-        assert_eq!(s.get("a", u).as_deref(), Some("9"));
-        assert_eq!(s.get("b", u).as_deref(), Some("2"));
+        assert_eq!(s.get("a", u), Some(bm(9)));
+        assert_eq!(s.get("b", u), Some(bm(2)));
+    }
+
+    #[test]
+    fn test_bookmark_store_eviction_order_after_interleaved_gets() {
+        let s = BookmarkStore::new(4);
+        let u = Uuid::nil();
+        for m in ["a", "b", "c", "d"] {
+            put(&s, m, u, 1);
+        }
+        // recency, oldest first: a b c d -> after gets: c d b a
+        s.get("a", u);
+        s.get("b", u);
+        s.get("a", u);
+        s.get("b", u);
+        put(&s, "e", u, 1); // evicts c
+        put(&s, "f", u, 1); // evicts d
+        assert_eq!(s.get("c", u), None);
+        assert_eq!(s.get("d", u), None);
+        put(&s, "g", u, 1); // evicts a (oldest of a,b,e,f after the gets above)
+        assert_eq!(s.get("a", u), None);
+        assert!(s.get("b", u).is_some());
+        assert_eq!(s.len(), 4);
+    }
+
+    #[test]
+    fn test_bookmark_store_rejects_invalid_input() {
+        let s = BookmarkStore::new(4);
+        let u = Uuid::nil();
+        assert!(!s.put("", u, bm(1)));
+        assert!(!s.put(&"m".repeat(256), u, bm(1)));
+        assert!(s.put(&"m".repeat(255), u, bm(1)));
+        let big = format!(
+            "<BookmarkList>{}</BookmarkList>",
+            " ".repeat(MAX_BOOKMARK_BYTES)
+        );
+        assert!(!s.put("a", u, big));
+        for bad in [
+            "<BookmarkList>",
+            "<BookmarkList><Bookmark>",
+            "<Other/>",
+            "<BookmarkList/><BookmarkList/>",
+            "</BookmarkList><x>",
+            "<!-- c --><BookmarkList/>",
+            "<BookmarkList>&foo;</BookmarkList>",
+            "",
+        ] {
+            assert!(!s.put("a", u, bad.to_string()), "{bad}");
+        }
+        assert_eq!(s.len(), 1);
+        assert!(s.put("b", u, "<b:BookmarkList xmlns:b=\"urn:x\"/>".into()));
     }
 }

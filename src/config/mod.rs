@@ -2165,6 +2165,8 @@ pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn test_config_wef_subscriptions_deserialize_defaults() {
         let wef: WefConfig = toml::from_str(
@@ -2189,7 +2191,6 @@ channels = ["Security"]
         assert!(empty.subscriptions.is_empty() && empty.collector_url.is_none());
     }
 
-    use super::*;
     use crate::forwarding::channel_budget::{
         GENERIC_RECORD_BYTES, IPFIX_DATAGRAM_BYTES, SFLOW_RECORD_BYTES, SURICATA_RECORD_BYTES,
         SYSLOG_MESSAGE_BYTES, WEF_EVENT_BYTES, ZEEK_RECORD_BYTES, capacity_for,

@@ -198,45 +198,61 @@ fn validate_subscription(s: &WefSubscriptionConfig) -> anyhow::Result<String> {
 /// Requires well-formed XML with a single `QueryList` root and no declaration/DTD/PI, since
 /// the text is embedded verbatim inside the Subscribe filter.
 fn validate_query_list(q: &str) -> anyhow::Result<()> {
-    let mut r = Reader::from_str(q);
+    validate_xml_fragment(q, "QueryList")
+}
+
+/// Checks that `xml` is a complete, well-formed fragment with exactly one root element whose
+/// local name is `root`: all elements closed, no declaration/DOCTYPE/PI, no comments, CDATA or
+/// text outside the root, and no undeclared entities. Callers embed the text verbatim in an
+/// outgoing envelope, so anything that could unbalance or extend it is rejected.
+pub(crate) fn validate_xml_fragment(xml: &str, root: &str) -> anyhow::Result<()> {
+    let bad_root = || anyhow!("XML must have a single <{root}> root element");
+    let mut r = Reader::from_str(xml);
     let (mut depth, mut roots) = (0usize, 0usize);
     loop {
-        match r
+        let ev = r
             .read_event()
-            .map_err(|e| anyhow!("query is not well-formed XML: {e}"))?
-        {
-            Event::Start(e) => {
+            .map_err(|e| anyhow!("XML is not well-formed: {e}"))?;
+        match &ev {
+            Event::Start(e) | Event::Empty(e) => {
                 if depth == 0 {
                     roots += 1;
-                    if roots > 1 || e.local_name().as_ref() != b"QueryList" {
-                        bail!("query must have a single <QueryList> root");
+                    if roots > 1 || e.local_name().as_ref() != root.as_bytes() {
+                        return Err(bad_root());
                     }
                 }
-                depth += 1;
-            }
-            Event::Empty(e) => {
-                if depth == 0 {
-                    roots += 1;
-                    if roots > 1 || e.local_name().as_ref() != b"QueryList" {
-                        bail!("query must have a single <QueryList> root");
-                    }
+                for a in e.attributes() {
+                    let a = a.map_err(|e| anyhow!("XML is not well-formed: {e}"))?;
+                    a.unescape_value()
+                        .map_err(|e| anyhow!("XML has a bad entity: {e}"))?;
+                }
+                if matches!(ev, Event::Start(_)) {
+                    depth += 1;
                 }
             }
             Event::End(_) => depth = depth.saturating_sub(1),
             Event::Decl(_) | Event::DocType(_) | Event::PI(_) => {
-                bail!(
-                    "query must not contain an XML declaration, DOCTYPE or processing instruction"
-                )
+                bail!("XML must not contain an XML declaration, DOCTYPE or processing instruction")
             }
-            Event::Text(t) if depth == 0 && !t.iter().all(u8::is_ascii_whitespace) => {
-                bail!("query has text outside <QueryList>")
+            Event::Comment(_) | Event::CData(_) if depth == 0 => {
+                bail!("XML has a comment or CDATA outside <{root}>")
+            }
+            Event::Text(t) => {
+                if depth == 0 && !t.iter().all(u8::is_ascii_whitespace) {
+                    bail!("XML has text outside <{root}>");
+                }
+                t.unescape()
+                    .map_err(|e| anyhow!("XML has a bad entity: {e}"))?;
             }
             Event::Eof => break,
             _ => {}
         }
     }
+    if depth != 0 {
+        bail!("XML has unclosed elements");
+    }
     if roots != 1 {
-        bail!("query must have a single <QueryList> root");
+        return Err(bad_root());
     }
     Ok(())
 }
@@ -256,7 +272,11 @@ fn version_uuid(
         s.name.clone(),
         s.uuid.as_hyphenated().to_string(),
         query_xml.to_string(),
-        format!("{:?}", s.content_format),
+        match s.content_format {
+            ContentFormat::Raw => "Raw",
+            ContentFormat::RenderedText => "RenderedText",
+        }
+        .to_string(),
         s.heartbeat_interval_secs.to_string(),
         s.max_latency_secs.to_string(),
         s.max_envelope_size.to_string(),
@@ -592,6 +612,30 @@ mod tests {
         let mut c = base_cfg();
         c.wef.subscriptions[0].name = "bad name".into();
         assert!(err(&c, true).contains("[A-Za-z0-9_.-]"));
+    }
+
+    #[test]
+    fn test_validate_https_mutual_without_ca_file_rejected() {
+        let mut c = tls_cfg();
+        c.tls.ca_file = None;
+        assert!(err(&c, true).contains("tls.ca_file"));
+    }
+
+    #[test]
+    fn test_validate_warning_only_for_plain_unauthenticated() {
+        crate::test_support::install_and_clear();
+        let mut c = base_cfg();
+        c.wef.allow_unauthenticated = true;
+        rt(&c, false);
+        let warned = crate::test_support::captured_events_at(tracing::Level::WARN)
+            .iter()
+            .any(|m| m.contains("accept ANY client"));
+        assert!(warned);
+        crate::test_support::install_and_clear();
+        let mut c = tls_cfg();
+        c.wef.allow_unauthenticated = true;
+        rt(&c, false);
+        assert!(crate::test_support::captured_events_at(tracing::Level::WARN).is_empty());
     }
 
     #[test]
