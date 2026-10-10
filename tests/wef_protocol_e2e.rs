@@ -61,7 +61,10 @@ async fn test_e2e_windows_shaped_flow_lands_in_parquet() {
     let mut p = common::Proc::spawn(BIN, &toml, &[]);
     p.wait_healthy().await;
     let client = reqwest::Client::builder()
+        // Keep-alive reuse is not asserted (reqwest exposes no connection counter); a single
+        // pooled HTTP/1.1 client is what makes consecutive requests eligible for reuse.
         .pool_max_idle_per_host(1)
+        .http1_only()
         .build()
         .unwrap();
 

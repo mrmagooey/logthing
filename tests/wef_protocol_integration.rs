@@ -70,10 +70,20 @@ async fn new_server(config: Config) -> anyhow::Result<Server> {
 impl Harness {
     /// Start a server whose config is `common::wef_toml` transformed by `tweak`.
     async fn start(tweak: impl Fn(String) -> String) -> Harness {
+        Self::start_with_url(None, tweak).await
+    }
+
+    /// Like [`Harness::start`], advertising `collector_url` (when given) instead of the bound
+    /// address. Requests still go to the bound port via `self.base`.
+    async fn start_with_url(
+        collector_url: Option<&str>,
+        tweak: impl Fn(String) -> String,
+    ) -> Harness {
         let port = common::free_port();
         let base = format!("http://127.0.0.1:{port}");
+        let advertised = collector_url.unwrap_or(&base).to_string();
         let dir = tempfile::tempdir().unwrap();
-        let config = build_config(&tweak(common::wef_toml(&base)), port, dir.path());
+        let config = build_config(&tweak(common::wef_toml(&advertised)), port, dir.path());
         let mut server = new_server(config).await.expect("Server::new");
         let workers = server.take_wef_worker_handles();
         let (shutdown, rx) = tokio::sync::watch::channel(false);
@@ -159,6 +169,21 @@ fn rows(batches: &[arrow::record_batch::RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
+fn event_ids(batches: &[arrow::record_batch::RecordBatch]) -> Vec<u32> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            let a = b
+                .column_by_name("event_id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            (0..a.len()).map(|i| a.value(i)).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 fn column_strings(batches: &[arrow::record_batch::RecordBatch], col: &str) -> Vec<String> {
     batches
         .iter()
@@ -226,18 +251,7 @@ async fn test_full_flow_enumerate_heartbeat_events_subscription_end() {
 
     let batches = h.finish().await;
     assert_eq!(rows(&batches), 3);
-    let mut ids: Vec<u32> = batches
-        .iter()
-        .flat_map(|b| {
-            let a = b
-                .column_by_name("event_id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .unwrap();
-            (0..a.len()).map(|i| a.value(i)).collect::<Vec<_>>()
-        })
-        .collect();
+    let mut ids = event_ids(&batches);
     ids.sort_unstable();
     assert_eq!(ids, vec![1, 4624, 4625]);
     assert!(
@@ -300,9 +314,12 @@ async fn test_bookmark_replayed_on_reenumerate() {
 
 #[tokio::test]
 async fn test_version_changes_after_config_change() {
+    // The advertised collector_url is part of the version hash, so pin it across runs: only
+    // the channel list may differ.
+    const URL: &str = "http://wec.example.com:5985";
     let mut versions = Vec::new();
-    for channel in ["Security", "System"] {
-        let h = Harness::start(|t| {
+    for channel in ["Security", "System", "Security"] {
+        let h = Harness::start_with_url(Some(URL), |t| {
             t.replace(
                 "channels = [\"Security\"]",
                 &format!("channels = [\"{channel}\"]"),
@@ -319,6 +336,10 @@ async fn test_version_changes_after_config_change() {
         versions.push(common::subscription_version(&body));
         h.finish().await;
     }
+    assert_eq!(
+        versions[0], versions[2],
+        "same config and URL must give an equal version"
+    );
     assert_ne!(
         versions[0], versions[1],
         "query change must change m:Version"
@@ -369,4 +390,7 @@ async fn test_malformed_event_in_batch_others_ingested() {
     );
     let batches = h.finish().await;
     assert_eq!(rows(&batches), 2);
+    let mut ids = event_ids(&batches);
+    ids.sort_unstable();
+    assert_eq!(ids, vec![4672, 7045]);
 }
