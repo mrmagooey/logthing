@@ -360,10 +360,13 @@ async fn test_startup_fails_without_auth_or_opt_in() {
         .expect("Server::new must refuse an unauthenticated WEF topology");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("WEF subscriptions require authentication"),
+        msg.contains(
+            "WEF subscriptions require authentication: enable [security.kerberos] (built with \
+             --features kerberos-auth) or TLS with require_client_cert, or set \
+             wef.allow_unauthenticated = true"
+        ),
         "{msg}"
     );
-    assert!(msg.contains("wef.allow_unauthenticated = true"), "{msg}");
 }
 
 #[tokio::test]

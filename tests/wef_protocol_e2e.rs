@@ -139,11 +139,11 @@ fn test_e2e_binary_refuses_start_without_auth() {
     let (status, stderr) = common::run_to_exit(BIN, &toml, &[]);
     assert!(!status.success(), "must exit non-zero; stderr:\n{stderr}");
     assert!(
-        stderr.contains("WEF subscriptions require authentication"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("wef.allow_unauthenticated = true"),
+        stderr.contains(
+            "WEF subscriptions require authentication: enable [security.kerberos] (built with \
+             --features kerberos-auth) or TLS with require_client_cert, or set \
+             wef.allow_unauthenticated = true"
+        ),
         "{stderr}"
     );
 }
