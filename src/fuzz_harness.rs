@@ -163,7 +163,8 @@ pub fn wef_envelope(data: &[u8]) -> usize {
 /// SLDC-compressed WEF body: decode with the production bomb guard (4 MiB); returns the
 /// decoded length, 0 on a decode error.
 pub fn wef_sldc(data: &[u8]) -> usize {
-    crate::wef::sldc::decompress(data, 4 << 20).map_or(0, |v| v.len())
+    crate::wef::sldc::decompress(data, crate::server::kerberos::WSMAN_MAX_BODY)
+        .map_or(0, |v| v.len())
 }
 
 /// Kerberos/SPNEGO encrypted multipart envelope: returns header + data length, 0 on a

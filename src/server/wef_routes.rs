@@ -6,7 +6,8 @@
 //! forwarding sinks; a full sink channel is a counted drop, not a failure (the sinks'
 //! drop semantics are unchanged).
 
-use super::{AppState, MAX_BODY_SIZE, process_events};
+use super::kerberos::WSMAN_MAX_BODY;
+use super::{AppState, process_events};
 use crate::wef::soap::{self, SoapRequest, WefAction};
 use crate::wef::subscription::{Subscription, render_subscription_item};
 use crate::wef::{encoding, event, sldc};
@@ -20,7 +21,7 @@ use axum::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 /// Content type of every non-empty `/wsman/**` response on the plaintext path.
@@ -95,6 +96,22 @@ fn action_label(a: WefAction) -> &'static str {
     }
 }
 
+/// Bodies above this size are SLDC-decoded on the blocking pool, not the async worker.
+const SLDC_INLINE_MAX: usize = 64 * 1024;
+
+/// SLDC-decode `body` (or return it unchanged when it is not a valid stream), bounding the
+/// decoded output at `max_out` bytes. Output over the cap is a decode error, so the raw bytes
+/// come back and fail the later charset/SOAP checks (a 400), never a large allocation. Returns
+/// `None` only if the blocking task itself failed.
+async fn decode_sldc_body(body: Bytes, max_out: usize) -> Option<Vec<u8>> {
+    if body.len() <= SLDC_INLINE_MAX {
+        return Some(sldc::decode_or_raw(&body, max_out).into_owned());
+    }
+    tokio::task::spawn_blocking(move || sldc::decode_or_raw(&body, max_out).into_owned())
+        .await
+        .ok()
+}
+
 /// Entry point for every `POST /wsman` and `POST /wsman/**`.
 async fn handle_wsman(
     State(state): State<Arc<AppState>>,
@@ -120,7 +137,10 @@ async fn handle_wsman(
         return empty_ok();
     }
     let raw = if sldc_encoded {
-        sldc::decode_or_raw(&body, MAX_BODY_SIZE)
+        match decode_sldc_body(body.clone(), WSMAN_MAX_BODY).await {
+            Some(v) => std::borrow::Cow::Owned(v),
+            None => return status(StatusCode::INTERNAL_SERVER_ERROR),
+        }
     } else {
         std::borrow::Cow::Borrowed(&body[..])
     };
@@ -222,7 +242,7 @@ async fn delivery(
 
 async fn ingest(state: &Arc<AppState>, addr: SocketAddr, sub: &Subscription, req: &SoapRequest) {
     let events = event::extract_events(&req.events, &addr.ip().to_string(), &sub.cfg.name);
-    info!(
+    debug!(
         "WEF: {} events from {} for subscription {}",
         events.len(),
         crate::sanitize_for_log(req.machine_id.as_deref().unwrap_or("-"), 128),
@@ -680,6 +700,38 @@ mod tests {
         let (st, _, _) = post(&app, &delivery_path(), &[], utf16(&no_mid)).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         assert!(state.throughput.snapshot().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_decode_sldc_body_over_cap_is_not_expanded() {
+        let enc = crate::wef::sldc::compress_literals_and_copies(&[b'z'; 2000]);
+        assert!(enc.len() < 200, "bomb must be small on the wire");
+        // Cap below the expanded size: decode fails and the raw bytes come back unexpanded.
+        let got = decode_sldc_body(Bytes::from(enc.clone()), 1000)
+            .await
+            .unwrap();
+        assert_eq!(got, enc);
+        // Under the cap it decodes normally.
+        let got = decode_sldc_body(Bytes::from(enc), 2000).await.unwrap();
+        assert_eq!(got, vec![b'z'; 2000]);
+    }
+
+    #[tokio::test]
+    async fn test_decode_sldc_body_large_input_uses_blocking_path() {
+        // Incompressible-ish literals pushed past SLDC_INLINE_MAX still decode correctly.
+        let mut x = 0x1234_5678u32;
+        let data: Vec<u8> = (0..SLDC_INLINE_MAX + 100)
+            .map(|_| {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                (x >> 24) as u8
+            })
+            .collect();
+        let enc = crate::wef::sldc::compress_literals_and_copies(&data);
+        assert!(enc.len() > SLDC_INLINE_MAX);
+        let got = decode_sldc_body(Bytes::from(enc), data.len())
+            .await
+            .unwrap();
+        assert_eq!(got, data);
     }
 
     #[test]

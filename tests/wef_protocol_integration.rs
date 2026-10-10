@@ -412,3 +412,55 @@ async fn test_oversize_wsman_body_is_413_in_plain_unauthenticated() {
     assert_eq!(resp.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
     h.finish().await;
 }
+
+/// Hand-built SLDC stream: one literal then ~5 MiB of `len`-32.. copies of it (about 22 bits
+/// per 287 output bytes), so a ~50 KB body expands past the 4 MiB `/wsman` cap.
+fn sldc_bomb() -> Vec<u8> {
+    let mut bits: Vec<bool> = Vec::new();
+    let mut push = |value: u32, n: usize| {
+        for i in (0..n).rev() {
+            bits.push((value >> i) & 1 == 1);
+        }
+    };
+    push(0x1FF0 | 0x5, 13); // Reset 1
+    push(u32::from(b'a'), 9);
+    let mut pos = 1usize;
+    while pos < 5 * 1024 * 1024 {
+        push(1, 1);
+        push(0xF00 | 255, 12); // match length 32 + 255
+        push(((pos - 1) % 1024) as u32, 10); // distance 1
+        pos += 287;
+    }
+    push(0x1FF0 | 0x4, 13); // End of Record
+    while !bits.len().is_multiple_of(32) {
+        bits.push(false);
+    }
+    bits.chunks(8)
+        .map(|c| c.iter().fold(0u8, |acc, &b| (acc << 1) | u8::from(b)))
+        .collect()
+}
+
+#[tokio::test]
+async fn test_sldc_decompression_bomb_is_rejected() {
+    let h = Harness::start(|t| t).await;
+    let bomb = sldc_bomb();
+    assert!(
+        bomb.len() < 1024 * 1024,
+        "bomb must fit under the body cap on the wire"
+    );
+    let resp = h
+        .client
+        .post(format!("{}/wsman", h.base))
+        .header("Content-Type", "application/soap+xml;charset=UTF-16")
+        .header("Content-Encoding", "SLDC")
+        .body(bomb)
+        .send()
+        .await
+        .expect("POST");
+    assert!(
+        !resp.status().is_success(),
+        "bomb must not be accepted: {}",
+        resp.status()
+    );
+    h.finish().await;
+}
