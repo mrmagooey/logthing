@@ -2,8 +2,8 @@
 # Regenerate tests/fixtures/wef/events/*.xml from public EVTX samples.
 #
 # Usage: scripts/wef_fixtures_from_evtx.sh        (needs network, curl, python3,
-#                                                  and `cargo install evtx --locked`)
-# Source: omerbenamram/evtx samples (Apache-2.0), pinned by commit SHA below. The OTRF
+#                                                  and `cargo install evtx --locked --version 0.12.3`)
+# Source: omerbenamram/evtx samples (repo licence MIT OR Apache-2.0; used under MIT), pinned by commit SHA below. The OTRF
 # Security-Datasets repo (MIT) ships JSON zips, not EVTX, so it contributes nothing.
 # Never use EVTX-ATTACK-SAMPLES (GPL-3). Takes the first record per (file, channel, id),
 # strips the <?xml?> banner and "Record N" line, and writes <channel>_<id>.xml.
@@ -14,6 +14,8 @@ SHA=7479d02dfaa3bdeb41c5ea87195e84116a032cfc
 BASE=https://raw.githubusercontent.com/omerbenamram/evtx/$SHA/samples
 OUT="$(cd "$(dirname "$0")/.." && pwd)/tests/fixtures/wef/events"
 DUMP=${EVTX_DUMP:-$(command -v evtx_dump || echo "$HOME/.cargo/bin/evtx_dump")}
+[ "$("$DUMP" --version)" = "EVTX Parser 0.12.3" ] \
+    || { echo "need evtx 0.12.3: cargo install evtx --locked --version 0.12.3" >&2; exit 1; }
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$OUT"
@@ -34,7 +36,9 @@ system.evtx|7045|System|system_7045
 
 for f in $(echo "$WANTED" | cut -d'|' -f1 | sort -u); do
     curl -sfL -o "$TMP/$f" "$BASE/$f"
-    "$DUMP" -o xml "$TMP/$f" > "$TMP/$f.xml" 2>/dev/null
+    "$DUMP" -o xml "$TMP/$f" > "$TMP/$f.xml" 2> "$TMP/$f.err" \
+        || { cat "$TMP/$f.err" >&2; exit 1; }
+    # Trailing-chunk warnings (sample files end in garbage chunks) are benign; shown only on failure.
 done
 
 echo "$WANTED" | while IFS='|' read -r file id chan name; do

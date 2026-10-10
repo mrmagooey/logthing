@@ -6,9 +6,43 @@ record of the given sample, converted with `evtx_dump -o xml` (evtx 0.12.3), ban
 (plus a trailing newline).
 
 Source: https://github.com/omerbenamram/evtx, commit
-`7479d02dfaa3bdeb41c5ea87195e84116a032cfc`, directory `samples/`. Licence: Apache-2.0
-(Copyright the evtx authors; used unmodified as test data, licensed under
-http://www.apache.org/licenses/LICENSE-2.0).
+`7479d02dfaa3bdeb41c5ea87195e84116a032cfc`, directory `samples/`. Converter: evtx 0.12.3
+(`cargo install evtx --locked --version 0.12.3`; the script verifies the version).
+
+## Licence and provenance facts
+
+- The evtx repo is licensed "Apache-2.0 OR MIT" (`LICENSE-APACHE`, `LICENSE-MIT` at the pinned
+  commit; Cargo.toml says `MIT/Apache-2.0`). logthing uses it under the MIT option.
+- `samples/` carries no per-file provenance or licence statement. The four source files were
+  committed by the repo owner (Omer Ben-Amram) in 2019 with no source attribution:
+  `security_big_sample.evtx` (25d57ee19b, 2019-04-01), `Security_short_selected.evtx`
+  (65a2ca78ef, 2019-03-30), `sysmon.evtx` (9cbe4f8539, 2019-03-30), `system.evtx`
+  (874dffb5e5, 2019-03-30; later history of the file not re-examined).
+- None of the four appear in the GPL EVTX-ATTACK-SAMPLES tree (checked by the reviewer), and
+  `system.evtx` differs (md5) from plaso's / python-evtx's `system.evtx`.
+- The fixtures contain real-world hostnames, IPs and usernames from public sample captures
+  (e.g. 23.94.153.202, DESKTOP-2KGM189, user path "tony"), kept unmodified for fidelity.
+
+Attribution (`LICENSE-MIT` of omerbenamram/evtx):
+
+> The MIT License (MIT)
+>
+> Copyright (c) 2019 Omer Ben-Amram
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+> and associated documentation files (the "Software"), to deal in the Software without
+> restriction, including without limitation the rights to use, copy, modify, merge, publish,
+> distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
+> Software is furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in all copies or
+> substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+> BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+> NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+> DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+> OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 | Fixture | Sample file | Record |
 |---|---|---|
@@ -28,7 +62,8 @@ Command per file: `evtx_dump -o xml <sample>` then first `<Event>` with the want
 
 - `synth_illegal_char.xml`: copy of `security_4624.xml` with U+0004 inserted at the start of the
   first `<Data>` value (an XML-1.0-illegal character).
-- `rendered_7045.xml`: `system_7045.xml` plus a hand-written `<RenderingInfo>` block.
+- `rendered_7045.xml`: `system_7045.xml` plus a hand-written `<RenderingInfo>` block
+  appended after `</EventData>` (synthetic placement).
 
 ## Not available
 
@@ -36,3 +71,8 @@ Command per file: `evtx_dump -o xml <sample>` then first `<Event>` with the want
   in the evtx repo. OTRF Security-Datasets (MIT, commit
   `d9d40ef123d2c87d5d3df28c96bcab4f0faccc87`) contains no `.evtx` files; its datasets are JSON
   zips without raw event XML. EVTX-ATTACK-SAMPLES (GPL-3) is excluded by policy. Not synthesised.
+
+## Notes
+
+`evtx_dump` prints "Invalid EVTX chunk header magic" warnings on stderr for some samples
+(trailing garbage chunks); the script shows stderr only if `evtx_dump` exits non-zero.
