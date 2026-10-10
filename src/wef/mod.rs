@@ -6,6 +6,7 @@
 //! [`encoding`]) -> SOAP parse.
 
 pub mod encoding;
+pub mod event;
 pub mod multipart;
 pub mod sldc;
 pub mod soap;
