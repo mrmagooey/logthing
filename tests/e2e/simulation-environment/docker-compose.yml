@@ -24,24 +24,6 @@ services:
     networks:
       - e2e
 
-  logthing-kerberos:
-    build:
-      context: ../../..
-      dockerfile: tests/e2e/simulation-environment/Dockerfile.kerberos
-    image: logthing:e2e-kerberos
-    environment:
-      - RUST_LOG=info
-      - LOGTHING__TLS__ENABLED=false
-      - LOGTHING__SYSLOG__ENABLED=true
-      - LOGTHING__SYSLOG__UDP_PORT=5514
-      - LOGTHING__SYSLOG__TCP_PORT=5601
-    volumes:
-      - ./config/logthing-kerberos.toml:/etc/logthing/config.toml:ro
-    depends_on:
-      - minio
-    networks:
-      - e2e
-
   minio:
     # minio/minio on Docker Hub now returns "repository does not exist"; MinIO
     # publishes to quay.io. Pinned to a digest-free tag deliberately: a prior
@@ -134,15 +116,155 @@ services:
     networks:
       - e2e
 
-  kerberos-test:
+  # ---------------------------------------------------------------------------
+  # wef-interop (profile): real Windows-shaped WEF clients (tools: wef-client-emulator)
+  # against logthing over Kerberos-encrypted HTTP (MIT KDC) and HTTPS client certificates.
+  # Driven by `run.sh wef-interop`; hostnames come from the network aliases below because
+  # the Kerberos SPN and the TLS certificate are bound to them.
+  # ---------------------------------------------------------------------------
+  kdc:
+    profiles: ["wef-interop"]
+    build:
+      context: ./kdc
+    image: logthing-test-kdc:latest
+    volumes:
+      - keytabs:/keytabs
+    networks:
+      e2e:
+        aliases:
+          - kdc.example.com
+
+  logthing-wef-krb:
+    profiles: ["wef-interop"]
+    build:
+      context: ../../..
+      dockerfile: tests/e2e/simulation-environment/Dockerfile.kerberos
+    image: logthing:e2e-kerberos
+    environment:
+      - RUST_LOG=info,logthing=debug
+    volumes:
+      - ./config/logthing-wef-kerberos.toml:/etc/logthing/config.toml:ro
+      - ./kdc/krb5.conf:/etc/krb5.conf:ro
+      - keytabs:/keytabs:ro
+      - wef-interop-data:/var/log/wef-local
+      - wef-interop-iceberg:/var/log/iceberg-local
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/5985"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      kdc:
+        condition: service_healthy
+    networks:
+      e2e:
+        aliases:
+          - logthing.example.com
+
+  logthing-wef-mtls:
+    profiles: ["wef-interop"]
+    # Same binary as logthing-wef-krb (Kerberos compiled in but disabled by config).
+    image: logthing:e2e-kerberos
+    environment:
+      - RUST_LOG=info,logthing=debug
+    volumes:
+      - ./config/logthing-wef-mtls.toml:/etc/logthing/config.toml:ro
+      - ./certs/server.crt:/etc/logthing/certs/server.crt:ro
+      - ./certs/server.key:/etc/logthing/certs/server.key:ro
+      - ./certs/ca.crt:/etc/logthing/certs/ca.crt:ro
+      - wef-interop-data:/var/log/wef-local
+      - wef-interop-iceberg:/var/log/iceberg-local
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/5986"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      logthing-wef-krb:
+        condition: service_healthy
+    networks:
+      e2e:
+        aliases:
+          - logthing-tls.example.com
+
+  wefemu-krb-checks:
+    profiles: ["wef-interop"]
+    build:
+      context: ./wef-client-emulator
+    image: wef-client-emulator:e2e
+    environment:
+      - KRB5_CLIENT_KEYTAB=/keytabs/clients.keytab
+    command: ["checks", "--server", "http://logthing.example.com:5985", "--kerberos"]
+    volumes:
+      - ./kdc/krb5.conf:/etc/krb5.conf:ro
+      - keytabs:/keytabs:ro
+    depends_on:
+      logthing-wef-krb:
+        condition: service_healthy
+    networks:
+      - e2e
+
+  wefemu-krb:
+    profiles: ["wef-interop"]
+    image: wef-client-emulator:e2e
+    environment:
+      - KRB5_CLIENT_KEYTAB=/keytabs/clients.keytab
+    command:
+      - flow
+      - --mode=kerberos-http
+      - --server=http://logthing.example.com:5985/wsman/SubscriptionManager/WEC
+      - --machine-id=win10.example.com
+      - --events-dir=/events
+      - --batches=3
+      - --batch-size=5
+    volumes:
+      - ./kdc/krb5.conf:/etc/krb5.conf:ro
+      - keytabs:/keytabs:ro
+      - ../../fixtures/wef/events:/events:ro
+    depends_on:
+      logthing-wef-krb:
+        condition: service_healthy
+    networks:
+      - e2e
+
+  wefemu-mtls:
+    profiles: ["wef-interop"]
+    image: wef-client-emulator:e2e
+    command:
+      - flow
+      - --mode=https-mtls
+      - --server=https://logthing-tls.example.com:5986/wsman/SubscriptionManager/WEC
+      - --machine-id=win10.example.com
+      - --events-dir=/events
+      - --batches=3
+      - --batch-size=5
+      - --ca=/certs/ca.crt
+      - --cert=/certs/wef-client.crt
+      - --key=/certs/wef-client.key
+    volumes:
+      - ./certs:/certs:ro
+      - ../../fixtures/wef/events:/events:ro
+    depends_on:
+      logthing-wef-mtls:
+        condition: service_healthy
+    networks:
+      - e2e
+
+  wef-interop-verifier:
+    profiles: ["wef-interop"]
+    # Same image as wef-local-verifier; reads the volume both interop servers write to.
     build:
       context: .
-      dockerfile: kerberos-test/Dockerfile
+      dockerfile: wef-local-verifier/Dockerfile
     environment:
-      - WEF_ENDPOINT=http://logthing-kerberos:5985
-      - WEF_TIMEOUT_SECS=60
-    depends_on:
-      - logthing-kerberos
+      - WEF_LOCAL_DIR=/var/log/wef-local
+      - ICEBERG_LOCAL_DIR=/var/log/iceberg-local
+      - EXPECTED_EVENT_TOTAL=30
+      - EXPECTED_EXACT=1
+      - E2E_TIMEOUT_SECS=60
+    volumes:
+      - wef-interop-data:/var/log/wef-local:ro
+      - wef-interop-iceberg:/var/log/iceberg-local:ro
     networks:
       - e2e
 
@@ -537,3 +659,6 @@ volumes:
   hec-local-data:
   otlp-local-data:
   iceberg-local-data:
+  keytabs:
+  wef-interop-data:
+  wef-interop-iceberg:

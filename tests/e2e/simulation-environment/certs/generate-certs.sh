@@ -24,7 +24,7 @@ openssl req -new -key server.key -out server.csr \
 # Generate server certificate signed by CA (X.509 v3)
 openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
     -out server.crt -days 365 \
-    -extensions v3_req -extfile <(printf "[v3_req]\nsubjectAltName=DNS:wef-server-tls,DNS:localhost,IP:127.0.0.1") 2>/dev/null
+    -extensions v3_req -extfile <(printf "[v3_req]\nsubjectAltName=DNS:wef-server-tls,DNS:logthing-tls,DNS:logthing-tls.example.com,DNS:localhost,IP:127.0.0.1") 2>/dev/null
 
 # Combine certificate and key into PEM format for server
 cat server.crt server.key > server.pem
@@ -38,8 +38,19 @@ openssl req -new -key client.key -out client.csr \
 openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
     -out client.crt -days 365 2>/dev/null
 
+# WEF client certificate (what a Windows machine presents): CN is the machine FQDN and the
+# extended key usage is clientAuth, as the Windows WEF HTTPS client requires.
+openssl genrsa -out wef-client.key 2048 2>/dev/null
+
+openssl req -new -key wef-client.key -out wef-client.csr \
+    -subj "/C=US/ST=Test/L=Test/O=WEF Server Test/CN=win10.example.com" 2>/dev/null
+
+openssl x509 -req -in wef-client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+    -out wef-client.crt -days 365 \
+    -extfile <(printf "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\nsubjectAltName=DNS:win10.example.com") 2>/dev/null
+
 # Clean up intermediate files
-rm -f server.csr client.csr ca.srl
+rm -f server.csr client.csr wef-client.csr ca.srl
 
 echo "TLS certificates generated successfully:"
 ls -la "$CERT_DIR/"*.crt "$CERT_DIR/"*.key "$CERT_DIR/"*.pem 2>/dev/null || true

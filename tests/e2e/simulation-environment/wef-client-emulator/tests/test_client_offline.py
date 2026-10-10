@@ -210,3 +210,55 @@ def test_checks_positive_negotiate_uses_context_factory():
     # the stub rejects the Negotiate token, so the positive check must report a failure
     pos = [c for c in res["checks"] if c["name"] == "syslog-negotiate-2xx"]
     assert pos and pos[0]["ok"] is False and seen["steps"][0] is None
+
+
+def test_checks_positive_negotiate_posts_a_raw_syslog_line_not_json():
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    seen = {}
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            if self.path == "/syslog" and self.headers.get("Authorization"):
+                seen["body"] = body.decode()
+                seen["ctype"] = self.headers.get("Content-Type")
+                self.send_response(200)
+            else:
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", "Kerberos")
+                self.send_header("WWW-Authenticate", "Negotiate")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    class Ctx:
+        def step(self, tok=None):
+            return b"T"
+
+    httpd = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        res = run_checks(f"http://127.0.0.1:{httpd.server_port}", kerberos=True, positive=True,
+                         context_factory=lambda host: Ctx())
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    pos = [c for c in res["checks"] if c["name"] == "syslog-negotiate-2xx"]
+    assert pos and pos[0]["ok"] is True
+    assert seen["body"].startswith("<134>") and seen["ctype"] == "text/plain"
+
+
+def test_load_events_skips_a_fixture_that_is_not_well_formed_xml(tmp_path):
+    good = "<Event><System><EventID>1</EventID></System></Event>"
+    (tmp_path / "a_good.xml").write_text(good, encoding="utf-8")
+    (tmp_path / "b_illegal.xml").write_text("<Event>\x04</Event>", encoding="utf-8")
+    assert load_events(tmp_path) == [good]

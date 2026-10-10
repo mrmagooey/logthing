@@ -4,6 +4,38 @@ set -euo pipefail
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 COMPOSE_FILE="$ROOT_DIR/docker-compose.yml"
 
+# wef-interop [--samba]: Windows-shaped WEF clients (tools: wef-client-emulator) against
+# logthing over Kerberos-encrypted HTTP (MIT KDC) and HTTPS client certificates, verified from
+# the files logthing writes. Exits non-zero if any emulator, checks or verifier container fails.
+wef_interop() {
+  case "${1:-}" in
+    "") ;;
+    --samba) echo "wef-interop --samba: not yet implemented" >&2; exit 2 ;;
+    *) echo "usage: run.sh wef-interop [--samba]" >&2; exit 2 ;;
+  esac
+  dc=(docker compose -f "$COMPOSE_FILE" --profile wef-interop)
+  trap 'rc=$?; [ $rc -eq 0 ] || "${dc[@]}" logs --no-color kdc logthing-wef-krb logthing-wef-mtls | tail -n 150; "${dc[@]}" down -v >/dev/null 2>&1 || true' EXIT
+  "${dc[@]}" build kdc logthing-wef-krb wefemu-krb-checks wef-interop-verifier
+  "${dc[@]}" up -d --wait kdc logthing-wef-krb logthing-wef-mtls
+  # `run` (not `up --abort-on-container-exit`): that flag stops everything when the first
+  # emulator exits, even successfully, and loses the other containers' exit codes.
+  echo "== Kerberos auth checks"
+  "${dc[@]}" run --rm wefemu-krb-checks
+  echo "== Kerberos-over-HTTP client flow"
+  "${dc[@]}" run --rm wefemu-krb
+  echo "== HTTPS client-certificate client flow"
+  "${dc[@]}" run --rm wefemu-mtls
+  echo "== Verifying what logthing wrote"
+  "${dc[@]}" run --rm wef-interop-verifier
+  echo "wef-interop passed"
+}
+
+if [ "${1:-}" = "wef-interop" ]; then
+  shift
+  wef_interop "$@"
+  exit 0
+fi
+
 cleanup() {
   docker compose -f "$COMPOSE_FILE" down -v >/dev/null 2>&1 || true
 }
@@ -129,14 +161,6 @@ echo "========================================"
 docker compose -f "$COMPOSE_FILE" stop logthing
 docker compose -f "$COMPOSE_FILE" up -d logthing-tls
 docker compose -f "$COMPOSE_FILE" run --rm tls-test
-
-echo ""
-echo "========================================"
-echo "Running Kerberos Authentication E2E Tests"
-echo "========================================"
-docker compose -f "$COMPOSE_FILE" stop logthing-tls
-docker compose -f "$COMPOSE_FILE" up -d logthing-kerberos
-docker compose -f "$COMPOSE_FILE" run --rm kerberos-test
 
 echo ""
 echo "========================================"

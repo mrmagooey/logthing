@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import re
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -32,7 +33,13 @@ def load_events(events_dir) -> list[str]:
     events: list[str] = []
     for path in sorted(Path(events_dir).glob("*.xml")):
         text = path.read_text(encoding="utf-8").strip()
-        root = ET.fromstring(text)
+        try:
+            root = ET.fromstring(text)
+        except ET.ParseError as exc:
+            # Windows renders event XML well-formed (illegal characters never reach the wire),
+            # so a fixture that is not well-formed is not something a client would send.
+            print(f"wefemu: skipping {path.name}: not well-formed XML ({exc})", file=sys.stderr)
+            continue
         if root.tag.endswith("}Envelope"):
             events += [(e.text or "").strip() for e in root.iter(E._q(E.NS_W, "Event"))]
         else:
@@ -303,6 +310,9 @@ def run_checks(server, kerberos=False, positive=True, context_factory=None, time
     return {"ok": all(r["ok"] for r in results), "checks": results}
 
 
+SYSLOG_LINE = "<134>Jan 15 10:30:45 win10 wefemu[1]: kerberos check"
+
+
 def _positive_negotiate(origin, context_factory, timeout):
     host = urlsplit(origin).hostname
     if context_factory:
@@ -316,11 +326,11 @@ def _positive_negotiate(origin, context_factory, timeout):
     in_token = None
     for _ in range(4):
         out = ctx.step(in_token)
-        headers = {"Content-Type": "application/json"}
+        # logthing's /syslog takes one raw RFC 3164/5424 line, not JSON
+        headers = {"Content-Type": "text/plain"}
         if out:
             headers["Authorization"] = "Negotiate " + base64.b64encode(out).decode("ascii")
-        r = requests.post(origin + "/syslog", data=json.dumps({"message": "kerberos check"}),
-                          headers=headers, timeout=timeout)
+        r = requests.post(origin + "/syslog", data=SYSLOG_LINE, headers=headers, timeout=timeout)
         if 200 <= r.status_code < 300:
             return True, f"HTTP {r.status_code}"
         www = r.headers.get("WWW-Authenticate", "")

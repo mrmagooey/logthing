@@ -1,0 +1,31 @@
+# WEF interop e2e, topology (a): Kerberos over plain HTTP against the compose MIT KDC.
+# collector_url uses the name clients put in the SPN (HTTP/logthing.example.com), which the
+# compose network alias provides.
+[logging]
+level = "info"
+format = "pretty"
+
+[tls]
+enabled = false
+
+[security.kerberos]
+enabled = true
+spn = "HTTP/logthing.example.com@EXAMPLE.COM"
+keytab = "/keytabs/logthing.keytab"
+
+[wef]
+collector_url = "http://logthing.example.com:5985"
+
+[[wef.subscriptions]]
+name     = "security"
+uuid     = "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0"
+channels = ["Security"]
+
+[wef.local]
+directory             = "/var/log/wef-local"
+flush_threshold_bytes = 1
+flush_interval_secs   = 2
+
+[iceberg.local]
+directory = "/var/log/iceberg-local"
+prefix    = "_iceberg_descriptors"
