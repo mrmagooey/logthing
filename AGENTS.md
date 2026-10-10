@@ -25,6 +25,7 @@ This document explains how automated or semi-automated agents should interact wi
 | Harness real-server test | `cargo build --release --bin logthing && cargo build --release -p loadgen && cargo test --test max_ingest_rate_harness_integration -- --ignored --test-threads=1` |
 | Committer tests | `committer/.venv/bin/pytest committer/tests --ignore=committer/tests/e2e` |
 | Committer E2E test | `committer/tests/e2e/run.sh` (requires Docker) |
+| Test KDC (real Kerberos) | `eval "$(scripts/kdc-test-env.sh up)"` ... `scripts/kdc-test-env.sh down` (requires Docker; exports `LOGTHING_TEST_KRB5_*`) |
 | Object Lock integration test | `MINIO_ENDPOINT=http://host:9000 [MINIO_ACCESS_KEY=.. MINIO_SECRET_KEY=..] cargo test --test object_lock_integration` (skips when `MINIO_ENDPOINT` is unset) |
 | Analytics unit tests | `deploy/analytics/.venv/bin/pytest -c deploy/analytics/tests/pytest.ini deploy/analytics/tests/unit` |
 | Analytics integration test | `deploy/analytics/.venv/bin/pytest -c deploy/analytics/tests/pytest.ini deploy/analytics/tests/integration -m integration` (requires Docker; Trino tests need AVX2 or `TRINO_IMAGE`) |
