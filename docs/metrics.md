@@ -53,7 +53,9 @@ WEF requests (counted in the request handler, not per event):
   (`enumerate|heartbeat|events|subscription_end|end|unknown`); requests rejected before parsing
   are not counted
 - `wef_auth_failures_total{reason}` - rejected Kerberos authentication or message-decryption
-  attempts (`missing|bad_scheme|bad_token|gss_error|missing_flags|decrypt_error|h2_encrypted`)
+  attempts (`missing|bad_scheme|bad_token|gss_error|missing_flags|decrypt_error|h2_encrypted`).
+  `reason="missing"` increments on the first unauthenticated request of every new connection;
+  that is normal for the Kerberos 401 challenge handshake and is not an attack signal on its own
 
 Parquet persistence (labelled `source="wef"|"syslog"|"ipfix"|"zeek"|"suricata"|"sflow"|"hec"|"otlp"`):
 

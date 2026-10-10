@@ -151,11 +151,11 @@ src/
   middleware/   # HTTP middleware
   models/       # Data structures
   parser/       # Event parsing logic
-  protocol/     # WEF protocol handlers
   redaction/    # HEC/OTLP drop/hash/mask rules
   server/       # HTTP server implementation (OTLP handler + mapper in otlp.rs)
   stats/        # Metrics and statistics
   syslog/       # Syslog listener
+  wef/          # WEF wire protocol: SOAP, SLDC, Kerberos multipart, subscriptions, bookmarks
   zeek/         # Zeek NDJSON ingestion
 committer/  # Python Iceberg committer (separate image)
 deploy/analytics/  # Compose + Helm analytics stack (Garage, Lakekeeper, Trino, Metabase)
