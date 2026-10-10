@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wefemu"
+version = "0.1.0"
+description = "Independent emulator of a Windows source-initiated WEF client (test tool)"
+requires-python = ">=3.10"
+dependencies = ["requests>=2.31", "pyspnego>=0.10"]
+
+[project.optional-dependencies]
+# Needs libkrb5-dev + a C compiler on the host; the Docker image provides them.
+kerberos = ["pyspnego[kerberos]>=0.10"]
+test = ["pytest>=7", "cryptography>=41"]
+
+[tool.setuptools]
+packages = ["wefemu"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
