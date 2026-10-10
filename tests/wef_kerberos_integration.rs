@@ -243,6 +243,10 @@ impl Conn {
         if let Some(a) = authorization {
             req = req.header("Authorization", a);
         }
+        self.sender
+            .ready()
+            .await
+            .expect("persistent connection ready for the next request");
         let resp = self
             .sender
             .send_request(req.body(Full::new(Bytes::from(body))).unwrap())
