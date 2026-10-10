@@ -4355,11 +4355,12 @@ event_parsers:
             let mut config = Config::default();
             config.tls.enabled = false;
             let kerberos = cfg!(feature = "kerberos-auth");
+            let mut server = build_server(config).await;
             if kerberos {
-                config.security.kerberos.enabled = true;
-                config.security.kerberos.spn = Some("HTTP/test.invalid@EXAMPLE.COM".into());
+                // Set after construction: `Server::new` would demand a real keytab.
+                server.config.security.kerberos.enabled = true;
+                server.config.security.kerberos.spn = Some("HTTP/test.invalid@EXAMPLE.COM".into());
             }
-            let mut server = build_server_unchecked(config).await;
             Arc::get_mut(&mut server.state).expect("unique state").wef = None;
             let router = server.create_router(IpWhitelist::empty()).expect("router");
             let resp = router.oneshot(post("/wsman")).await.unwrap();

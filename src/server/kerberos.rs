@@ -1223,10 +1223,7 @@ mod tests {
     async fn test_oversize_response_not_sent_in_plaintext() {
         let factory = Arc::new(FakeFactory::default());
         let router = Router::new()
-            .route(
-                "/wsman",
-                post(|| async { vec![b'z'; WSMAN_MAX_BODY + 1] }),
-            )
+            .route("/wsman", post(|| async { vec![b'z'; WSMAN_MAX_BODY + 1] }))
             .layer(middleware::from_fn_with_state(
                 Arc::new(WsmanAuth::new(factory.clone())),
                 wsman_auth_middleware,
@@ -1234,7 +1231,10 @@ mod tests {
         let slot = ConnSlot::default();
         let mut auth = auth_req("Kerberos", "principal:a", "/wsman", vec![]);
         auth.extensions_mut().insert(slot.clone());
-        assert_eq!(router.clone().oneshot(auth).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            router.clone().oneshot(auth).await.unwrap().status(),
+            StatusCode::OK
+        );
         let mut req = enc_req("/wsman", 1, b"abcd", 4);
         req.extensions_mut().insert(slot);
         let resp = router.oneshot(req).await.unwrap();
