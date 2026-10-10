@@ -5,15 +5,16 @@ ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 COMPOSE_FILE="$ROOT_DIR/docker-compose.yml"
 
 # wef-interop [--samba]: Windows-shaped WEF clients (tools: wef-client-emulator) against
-# logthing over Kerberos-encrypted HTTP (MIT KDC) and HTTPS client certificates, verified from
+# logthing over Kerberos-encrypted HTTP (MIT KDC, or a Samba AD DC with --samba) and HTTPS client certificates, verified from
 # the files logthing writes. Exits non-zero if any emulator, checks or verifier container fails.
 wef_interop() {
+  compose_files=(-f "$COMPOSE_FILE")
   case "${1:-}" in
     "") ;;
-    --samba) echo "wef-interop --samba: not yet implemented" >&2; exit 2 ;;
+    --samba) compose_files+=(-f "$ROOT_DIR/docker-compose.samba.yml") ;;
     *) echo "usage: run.sh wef-interop [--samba]" >&2; exit 2 ;;
   esac
-  dc=(docker compose -f "$COMPOSE_FILE" --profile wef-interop)
+  dc=(docker compose "${compose_files[@]}" --profile wef-interop)
   trap 'rc=$?; [ $rc -eq 0 ] || "${dc[@]}" logs --no-color kdc logthing-wef-krb logthing-wef-mtls | tail -n 150; "${dc[@]}" down -v >/dev/null 2>&1 || true' EXIT
   "${dc[@]}" build kdc logthing-wef-krb wefemu-krb-checks wef-interop-verifier
   "${dc[@]}" up -d --wait kdc logthing-wef-krb logthing-wef-mtls
