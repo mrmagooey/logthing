@@ -1,0 +1,6 @@
+--Encrypted Boundary
+Content-Type: application/HTTP-Kerberos-session-encrypted
+OriginalContent: type=application/soap+xml;charset=UTF-16;Length={N}
+--Encrypted Boundary
+Content-Type: application/octet-stream
+<BINARY>--Encrypted Boundary--

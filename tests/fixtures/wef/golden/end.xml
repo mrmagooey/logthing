@@ -1,0 +1,17 @@
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:n="http://schemas.xmlsoap.org/ws/2004/09/enumeration" xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd" xmlns:p="http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd" xmlns:b="http://schemas.dmtf.org/wbem/wsman/1/cimbinding.xsd">
+  <s:Header>
+    <a:To>http://logthing.example.com:5985/wsman/subscriptions/0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0/1</a:To>
+    <w:ResourceURI s:mustUnderstand="true">http://schemas.microsoft.com/wbem/wsman/1/wsman/FullDuplex</w:ResourceURI>
+    <m:MachineID xmlns:m="http://schemas.microsoft.com/wbem/wsman/1/machineid" s:mustUnderstand="false">
+      win10.example.com
+    </m:MachineID>
+    <a:ReplyTo>
+      <a:Address s:mustUnderstand="true">http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:Address>
+    </a:ReplyTo>
+    <a:Action s:mustUnderstand="true">http://schemas.microsoft.com/wbem/wsman/1/wsman/End</a:Action>
+    <a:MessageID>uuid:9E0F1A2B-3C4D-4E5F-8061-728394A5B6C7</a:MessageID>
+    <p:OperationID s:mustUnderstand="false">uuid:A1B2C3D4-E5F6-4708-9192-A3B4C5D6E7F8</p:OperationID>
+    <p:SequenceId s:mustUnderstand="false">1</p:SequenceId>
+  </s:Header>
+  <s:Body/>
+</s:Envelope>
