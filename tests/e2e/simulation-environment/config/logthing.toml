@@ -62,6 +62,15 @@ prefix                = "zeek"
 flush_threshold_bytes = 1
 flush_interval_secs   = 5
 
+[wef]
+collector_url = "http://logthing:5985"
+allow_unauthenticated = true
+
+[[wef.subscriptions]]
+name     = "security"
+uuid     = "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0"
+channels = ["Security"]
+
 [wef.s3]
 endpoint   = "http://minio:9000"
 bucket     = "wef-events"

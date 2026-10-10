@@ -136,6 +136,14 @@ directory = "{out}/hec"
 enabled = true
 [otlp.local]
 directory = "{out}/otlp"
+
+[wef]
+collector_url = "http://127.0.0.1:{http}"
+allow_unauthenticated = true
+[[wef.subscriptions]]
+name = "security"
+uuid = "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0"
+channels = ["Security"]
 "#,
         http = p.http,
         metrics = p.metrics,
@@ -412,10 +420,12 @@ async fn test_fuzz_corpus_listeners_binary_survives_every_committed_input() {
             .await;
     }
 
-    // wef_envelope: the raw HTTP body WEF's `/wsman/events` receives.
+    // wef_envelope: the raw HTTP body a Windows client POSTs to the delivery URL.
     for bytes in corpus(&fuzz_root, "wef_envelope") {
         let _ = http_client
-            .post(format!("{http_base}/wsman/events"))
+            .post(format!(
+                "{http_base}/wsman/subscriptions/0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0"
+            ))
             .body(bytes)
             .send()
             .await;

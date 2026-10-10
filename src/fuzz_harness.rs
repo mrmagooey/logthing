@@ -26,7 +26,6 @@ use crate::forwarding::syslog_s3::SyslogSink;
 use crate::forwarding::zeek_s3::ZeekSink;
 use crate::ipfix::decoder::{IpfixDecoder, MAX_CACHED_TEMPLATES};
 use crate::parser::GenericEventParser;
-use crate::protocol::{WefMessage, WefParser};
 use crate::syslog::SyslogMessage;
 use crate::syslog::payload::{self, StructuredSyslogRecord};
 
@@ -145,17 +144,17 @@ pub fn wef_event(data: &[u8]) -> usize {
     )
 }
 
-/// WEF HTTP body: envelope split, per-event generic parse, and WEF mapping.
+/// WEF HTTP body: charset decode, SOAP parse, per-event parse, and WEF mapping.
 pub fn wef_envelope(data: &[u8]) -> usize {
-    let body = String::from_utf8_lossy(data);
-    let Ok(WefMessage::Events(events)) = WefParser.parse_message(&body, "192.0.2.1".into()) else {
+    let Ok(text) = crate::wef::encoding::decode_body(data) else {
         return 0;
     };
+    let Ok(req) = crate::wef::soap::parse(&text) else {
+        return 0;
+    };
+    let events = crate::wef::event::extract_events(&req.events, "192.0.2.1", "fuzz");
     let n = events.len();
     for event in events {
-        if let Some(parsed) = &event.parsed {
-            let _ = event_parser().parse_event(parsed.event_id, &event.raw_xml);
-        }
         map_record(&WefSink, &Arc::new(event));
     }
     n
@@ -358,7 +357,9 @@ mod tests {
     #[test]
     fn test_wef_envelope_every_events_seed_yields_events() {
         for (path, bytes) in seeds("wef_envelope") {
-            if path.ends_with("subscribe.xml") {
+            // Non-Events seeds (garbage, a bare subscribe body) exist for coverage only.
+            let name = path.file_name().unwrap().to_string_lossy();
+            if !name.starts_with("events_") {
                 continue;
             }
             assert!(

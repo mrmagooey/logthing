@@ -15,6 +15,17 @@ parse_dns = true
 [security]
 kerberos = { enabled = true, spn = "HTTP/wef-server@EXAMPLE.COM", keytab = "/etc/wef-server/keytabs/wef.keytab" }
 
+[wef]
+collector_url = "http://logthing-kerberos:5985"
+# Kerberos takes precedence when available; the flag only keeps a build without the
+# kerberos-auth feature from refusing to start.
+allow_unauthenticated = true
+
+[[wef.subscriptions]]
+name     = "security"
+uuid     = "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0"
+channels = ["Security"]
+
 [wef.s3]
 endpoint   = "http://minio:9000"
 bucket     = "wef-events"

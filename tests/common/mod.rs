@@ -270,3 +270,111 @@ impl Drop for Proc {
         let _ = self.child.wait();
     }
 }
+
+/// UUID of the single subscription `wef_toml` configures.
+pub const TEST_SUB_UUID: &str = "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0";
+
+/// A `[wef]` config block: `collector_url`, `allow_unauthenticated = true` and one
+/// subscription named "security" (uuid `TEST_SUB_UUID`, channel "Security").
+pub fn wef_toml(collector_url: &str) -> String {
+    format!(
+        "[wef]\ncollector_url = \"{collector_url}\"\nallow_unauthenticated = true\n\n\
+         [[wef.subscriptions]]\nname = \"security\"\nuuid = \"{TEST_SUB_UUID}\"\n\
+         channels = [\"Security\"]\n"
+    )
+}
+
+/// UTF-16LE with a leading BOM, the encoding Windows clients send.
+pub fn utf16(s: &str) -> Vec<u8> {
+    let mut out = vec![0xFF, 0xFE];
+    out.extend(s.encode_utf16().flat_map(u16::to_le_bytes));
+    out
+}
+
+const ENV_OPEN: &str = "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" \
+    xmlns:a=\"http://schemas.xmlsoap.org/ws/2004/08/addressing\" \
+    xmlns:n=\"http://schemas.xmlsoap.org/ws/2004/09/enumeration\" \
+    xmlns:w=\"http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd\" \
+    xmlns:p=\"http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd\" \
+    xmlns:b=\"http://schemas.dmtf.org/wbem/wsman/1/cimbinding.xsd\">";
+
+fn msg_id(message_id: &str) -> String {
+    if message_id.starts_with("uuid:") {
+        message_id.to_string()
+    } else {
+        format!("uuid:{message_id}")
+    }
+}
+
+fn delivery_header(action: &str, message_id: &str, machine_id: &str, extra: &str) -> String {
+    format!(
+        "<s:Header><a:To>http://logthing.example.com:5985/wsman/subscriptions/{TEST_SUB_UUID}/1\
+         </a:To><m:MachineID xmlns:m=\"http://schemas.microsoft.com/wbem/wsman/1/machineid\" \
+         s:mustUnderstand=\"false\">{machine_id}</m:MachineID><a:ReplyTo><a:Address \
+         s:mustUnderstand=\"true\">http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous\
+         </a:Address></a:ReplyTo><a:Action s:mustUnderstand=\"true\">\
+         http://schemas.dmtf.org/wbem/wsman/1/wsman/{action}</a:Action>\
+         <a:MessageID>{mid}</a:MessageID><p:OperationID s:mustUnderstand=\"false\">\
+         uuid:3E4F5061-7283-4940-A5B6-C7D8E9F0A1B2</p:OperationID>\
+         <p:SequenceId s:mustUnderstand=\"false\">1</p:SequenceId>\
+         <w:OperationTimeout>PT60.000S</w:OperationTimeout>\
+         <e:Identifier xmlns:e=\"http://schemas.xmlsoap.org/ws/2004/08/eventing\" \
+         s:mustUnderstand=\"true\">{TEST_SUB_UUID}</e:Identifier>{extra}<w:AckRequested/>\
+         </s:Header>",
+        mid = msg_id(message_id)
+    )
+}
+
+/// A subscription-manager `Enumerate` request in the shape Windows sends.
+pub fn enumerate_envelope(message_id: &str, machine_id: &str) -> String {
+    format!(
+        "{ENV_OPEN}<s:Header><a:To>http://logthing.example.com:5985/wsman/SubscriptionManager/WEC\
+         </a:To><w:ResourceURI s:mustUnderstand=\"true\">\
+         http://schemas.microsoft.com/wbem/wsman/1/SubscriptionManager/Subscription\
+         </w:ResourceURI><m:MachineID xmlns:m=\"http://schemas.microsoft.com/wbem/wsman/1/machineid\" \
+         s:mustUnderstand=\"false\">{machine_id}</m:MachineID><a:ReplyTo><a:Address \
+         s:mustUnderstand=\"true\">http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous\
+         </a:Address></a:ReplyTo><a:Action s:mustUnderstand=\"true\">\
+         http://schemas.xmlsoap.org/ws/2004/09/enumeration/Enumerate</a:Action>\
+         <w:MaxEnvelopeSize s:mustUnderstand=\"true\">512000</w:MaxEnvelopeSize>\
+         <a:MessageID>{mid}</a:MessageID><w:OperationTimeout>PT60.000S</w:OperationTimeout>\
+         </s:Header><s:Body><n:Enumerate><w:OptimizeEnumeration/><w:MaxElements>32000\
+         </w:MaxElements></n:Enumerate></s:Body></s:Envelope>",
+        mid = msg_id(message_id)
+    )
+}
+
+/// A delivery `Events` request: each entry of `events_xml` becomes one CDATA `w:Event`, and
+/// a bookmark for channel Security at `bookmark_record_id` rides in the header.
+pub fn events_envelope(
+    message_id: &str,
+    machine_id: &str,
+    bookmark_record_id: u64,
+    events_xml: &[&str],
+) -> String {
+    let bookmark = format!(
+        "<w:Bookmark><BookmarkList><Bookmark Channel=\"Security\" \
+         RecordId=\"{bookmark_record_id}\" IsCurrent=\"true\"/></BookmarkList></w:Bookmark>"
+    );
+    let events: String = events_xml
+        .iter()
+        .map(|e| {
+            format!(
+                "<w:Event Action=\"http://schemas.dmtf.org/wbem/wsman/1/wsman/Event\">\
+                 <![CDATA[{e}]]></w:Event>"
+            )
+        })
+        .collect();
+    format!(
+        "{ENV_OPEN}{}<s:Body><w:Events>{events}</w:Events></s:Body></s:Envelope>",
+        delivery_header("Events", message_id, machine_id, &bookmark)
+    )
+}
+
+/// An empty keep-alive `Heartbeat` delivery request.
+pub fn heartbeat_envelope(message_id: &str, machine_id: &str) -> String {
+    format!(
+        "{ENV_OPEN}{}<s:Body><w:Events></w:Events></s:Body></s:Envelope>",
+        delivery_header("Heartbeat", message_id, machine_id, "")
+    )
+}

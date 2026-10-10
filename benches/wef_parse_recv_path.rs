@@ -2,11 +2,11 @@
 //! cost of `GenericEventParser::parse_event`, exactly as
 //! `src/server/mod.rs:947` runs it — once per event, after the SOAP envelope
 //! has already been split into individual `<Event>` XML fragments by
-//! `protocol::parse_events`. This is the field-extraction layer: a per-field
+//! `wef::soap::parse`. This is the field-extraction layer: a per-field
 //! `str::find` scan through the event XML (`extract_from_event_data` /
 //! `extract_from_system`), not a real XML parser (no quick-xml, no DOM).
 //!
-//! Deliberately NOT measured: SOAP envelope parsing (`protocol::parse_events`,
+//! Deliberately NOT measured: SOAP envelope parsing (`wef::soap::parse`,
 //! upstream of this), the HTTP/WS-Man transport layer, and
 //! `WefSink::to_record_batch` (covered by `wef_to_record_batch.rs`). This is
 //! the config-driven per-event-id extraction only.

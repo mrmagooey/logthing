@@ -9,6 +9,7 @@ the ingestion performance. Supports both event-count and duration-based testing.
 import os
 import tempfile
 import time
+import uuid
 import json
 import sys
 from datetime import datetime, timezone
@@ -22,7 +23,12 @@ STATS_ENDPOINT = os.environ.get(
     "WEF_STATS_ENDPOINT", f"{WEF_ENDPOINT}/stats/throughput"
 )
 HEALTH_ENDPOINT = f"{WEF_ENDPOINT}/health"
-EVENTS_URL = f"{WEF_ENDPOINT}/wsman/events"
+SUBSCRIPTION_UUID = os.environ.get(
+    "WEF_SUBSCRIPTION_UUID", "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0"
+)
+# Delivery URL of the subscription configured in the server's [[wef.subscriptions]].
+EVENTS_URL = f"{WEF_ENDPOINT}/wsman/subscriptions/{SUBSCRIPTION_UUID}"
+MACHINE_ID = os.environ.get("WEF_MACHINE_ID", "PERF-TEST-HOST")
 
 # S3 Configuration for verification
 S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "http://minio:9000")
@@ -64,12 +70,12 @@ def build_event_xml(
     evt_id = fixed_event_type if fixed_event_type else event_id
     return f"""    <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
       <System>
-        <Provider Name="Microsoft-Windows-Security-Auditing">Microsoft-Windows-Security-Auditing</Provider>
+        <Provider Name="Microsoft-Windows-Security-Auditing"/>
         <EventID>{evt_id}</EventID>
         <Level>0</Level>
         <Task>12544</Task>
         <Keywords>0x8020000000000000</Keywords>
-        <TimeCreated SystemTime="{timestamp}">{timestamp}</TimeCreated>
+        <TimeCreated SystemTime="{timestamp}"/>
         <EventRecordID>{event_id}</EventRecordID>
         <Channel>Security</Channel>
         <Computer>PERF-TEST-HOST</Computer>
@@ -83,18 +89,30 @@ def build_event_xml(
     </Event>"""
 
 
-def build_batch_payload(events_xml: list) -> str:
-    """Wrap multiple events in an envelope."""
-    inner = "\n".join(events_xml)
-    return f"""<?xml version="1.0" encoding="utf-8"?>
-<Envelope>
-  <Body>
-    <Events>
-{inner}
-    </Events>
-  </Body>
-</Envelope>
-"""
+def build_batch_payload(events_xml: list) -> bytes:
+    """Wrap events in a Windows-shaped Events envelope, UTF-16LE with a BOM."""
+    events = "".join(
+        '<w:Event Action="http://schemas.dmtf.org/wbem/wsman/1/wsman/Event">'
+        f"<![CDATA[{e}]]></w:Event>"
+        for e in events_xml
+    )
+    envelope = (
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+        'xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" '
+        'xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd" '
+        'xmlns:p="http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd">'
+        f"<s:Header><a:To>{EVENTS_URL}</a:To>"
+        '<m:MachineID xmlns:m="http://schemas.microsoft.com/wbem/wsman/1/machineid" '
+        f's:mustUnderstand="false">{MACHINE_ID}</m:MachineID>'
+        '<a:Action s:mustUnderstand="true">'
+        "http://schemas.dmtf.org/wbem/wsman/1/wsman/Events</a:Action>"
+        f"<a:MessageID>uuid:{str(uuid.uuid4()).upper()}</a:MessageID>"
+        '<e:Identifier xmlns:e="http://schemas.xmlsoap.org/ws/2004/08/eventing" '
+        f's:mustUnderstand="true">{SUBSCRIPTION_UUID}</e:Identifier>'
+        "<w:AckRequested/></s:Header>"
+        f"<s:Body><w:Events>{events}</w:Events></s:Body></s:Envelope>"
+    )
+    return b"\xff\xfe" + envelope.encode("utf-16-le")
 
 
 def send_batch(
@@ -111,12 +129,10 @@ def send_batch(
 
     payload = build_batch_payload(events_xml)
 
-    headers = {"Content-Type": "application/soap+xml"}
+    headers = {"Content-Type": "application/soap+xml;charset=UTF-16"}
 
     try:
-        resp = requests.post(
-            EVENTS_URL, data=payload.encode("utf-8"), headers=headers, timeout=30
-        )
+        resp = requests.post(EVENTS_URL, data=payload, headers=headers, timeout=30)
         resp.raise_for_status()
         return True
     except requests.RequestException as e:

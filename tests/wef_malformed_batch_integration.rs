@@ -1,32 +1,28 @@
 //! Integration test: a WEF batch with a malformed MIDDLE event still lands
 //! the well-formed events on both sides of it in Parquet, exercising the
-//! resync fix in `WefParser::parse_events` (src/protocol/mod.rs) end to end
-//! through `wef_local_start` (pattern: `tests/wef_local_integration.rs`).
+//! per-event skip in `wef::event::extract_events` end to end through `wef_local_start`
+//! (pattern: `tests/wef_local_integration.rs`), with the batch coming out of a real
+//! Windows-shaped `Events` envelope via `wef::soap::parse`.
 //!
-//! The malformed event itself (`</Mismatch>` inside `<System>`, same trigger
-//! as the unit tests in `src/protocol/mod.rs`) becomes its own raw,
-//! *unparsed* `WindowsEvent` — `WefAccumulator::append_event`/`try_append`
-//! (src/forwarding/parquet_s3.rs) silently skip unparsed events (pre-existing
-//! behavior, unrelated to this fix), so it never becomes a Parquet row
-//! itself. What this test proves is the resync itself: parsing resumes at
-//! the next `<Event` start rather than folding the rest of the batch into
-//! that one unparsed fragment, so the event AFTER the malformed one — not
-//! just the one before it — still reaches Parquet.
+//! The malformed event (`</Mismatch>` inside `<System>`) is dropped and counted; the
+//! events on BOTH sides of it still reach Parquet.
+
+mod common;
 
 use bytes::Bytes;
 use logthing::config::WefLocalConfig;
 use logthing::forwarding::local_sink::LocalDiskSink;
 use logthing::forwarding::parquet_s3::wef_local_start;
-use logthing::protocol::{WefMessage, WefParser};
+use logthing::wef::{encoding, event, soap};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::sync::Arc;
 
-/// Well-formed `<Event>` for event number `n`, matching real WEF shape —
-/// same helper shape as the unit tests in `src/protocol/mod.rs`.
+/// Well-formed Windows `<Event>` for event number `n`.
 fn wef_event(n: u32) -> String {
     format!(
-        "<Event><System><Provider>P</Provider><EventID>{n}</EventID><Level>4</Level>\
-         </System></Event>"
+        "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>\
+         <Provider Name='P'/><EventID>{n}</EventID><Level>4</Level><Channel>Security</Channel>\
+         <Computer>host</Computer></System></Event>"
     )
 }
 
@@ -40,27 +36,25 @@ fn wef_malformed_event() -> &'static str {
 
 #[tokio::test]
 async fn malformed_middle_event_does_not_drop_the_good_events_on_either_side() {
-    let body = format!(
-        "<Envelope><Body><Events>{}{}{}</Events></Body></Envelope>",
-        wef_event(1),
-        wef_malformed_event(),
-        wef_event(3)
+    let (e1, e3) = (wef_event(1), wef_event(3));
+    let body = common::utf16(&common::events_envelope(
+        "uuid:1C2D3E4F-5061-4728-8394-A5B6C7D8E9F0",
+        "win10.example.com",
+        3,
+        &[&e1, wef_malformed_event(), &e3],
+    ));
+    let req = soap::parse(&encoding::decode_body(&body).unwrap()).expect("envelope parses");
+    assert_eq!(
+        req.events.len(),
+        3,
+        "all three CDATA payloads are extracted"
     );
+    let events = event::extract_events(&req.events, "host-a", "security");
 
-    let parser = WefParser::new();
-    let WefMessage::Events(events) = parser
-        .parse_message(&body, "host-a".into())
-        .expect("parse_message must not error even on a malformed middle event")
-    else {
-        panic!("expected Events");
-    };
-
-    // event(1), the malformed event's raw fragment, and event(3) — resync
-    // must reach event 3 rather than swallowing it into the raw fragment.
-    assert_eq!(events.len(), 3, "events: {events:?}");
+    // event(1) and event(3); the malformed middle payload is skipped.
+    assert_eq!(events.len(), 2, "events: {events:?}");
     assert_eq!(events[0].parsed.as_ref().map(|p| p.event_id), Some(1));
-    assert!(events[1].parsed.is_none());
-    assert_eq!(events[2].parsed.as_ref().map(|p| p.event_id), Some(3));
+    assert_eq!(events[1].parsed.as_ref().map(|p| p.event_id), Some(3));
 
     let tmp = tempfile::tempdir().unwrap();
     let sink = Arc::new(
@@ -115,8 +109,7 @@ async fn malformed_middle_event_does_not_drop_the_good_events_on_either_side() {
         .collect();
     // event(1) and event(3) partition into separate `event_type=<id>/`
     // directories (unlike `wef_local_integration.rs`, whose two events share
-    // one event_id), so 2 files are expected here — the malformed middle
-    // event has no parsed data and produces no file at all.
+    // one event_id), so 2 files are expected here.
     assert_eq!(
         parquet_files.len(),
         2,
@@ -156,7 +149,7 @@ async fn malformed_middle_event_does_not_drop_the_good_events_on_either_side() {
     assert_eq!(
         total_rows, 2,
         "only the 2 well-formed events must land as Parquet rows; the malformed middle event \
-         has no parsed data and is skipped by WefSink, matching pre-existing behavior"
+         is skipped by extract_events"
     );
     assert!(
         found_event_id_1,

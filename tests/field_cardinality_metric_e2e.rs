@@ -15,7 +15,7 @@
 //! the clock.
 //!
 //! The WEF counterpart of this test — driving the SAME feature through
-//! `/wsman/events` instead of the zeek TCP listener — is
+//! the WEF delivery URL instead of the zeek TCP listener — is
 //! `tests/field_cardinality_metric_wef_e2e.rs`.
 //!
 //! This MUST be the only `#[tokio::test]` in this binary — see the doc

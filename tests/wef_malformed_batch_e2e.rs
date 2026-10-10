@@ -1,21 +1,16 @@
 //! End-to-end test: a WEF batch with a malformed MIDDLE event, POSTed to
-//! the real `/wsman/events` HTTP endpoint of a real `logthing::server::Server`
-//! with a `[wef.local]` destination wired up — proving the resync fix in
-//! `WefParser::parse_events` (src/protocol/mod.rs) end to end: the HTTP
+//! the real `/wsman/subscriptions/<uuid>` delivery endpoint of a real
+//! `logthing::server::Server` with a `[wef.local]` destination wired up — proving the
+//! per-event skip in `wef::event::extract_events` end to end: the HTTP
 //! response is still 200 (so the Windows forwarder does not resend), the
 //! `wef_xml_parse_errors` counter increments on the real `/metrics` scrape,
 //! and the well-formed events on BOTH sides of the malformed one still
-//! reach Parquet on local disk (proving resync actually resumes parsing
-//! after the error, rather than folding everything after it into one
-//! unparsed fragment). Also asserts
-//! `parquet_s3_records_skipped{source="wef",target="local"} == 1` — the
-//! malformed event's raw fragment (no `.parsed` data) reaches the WEF
-//! local writer and is skipped there, exactly once, making this the real
-//! outer-interface trigger for that counter.
+//! reach Parquet on local disk. The malformed event never reaches the writer, so
+//! `parquet_s3_records_skipped{source="wef",target="local"}` stays absent.
 //!
 //! Template: `tests/field_cardinality_metric_wef_e2e.rs` for the overall
 //! shape (real `Server`, `metrics.enabled = true`, `reserve_port`, real
-//! `POST /wsman/events`) and `tests/wef_local_integration.rs` for the
+//! delivery POST) and `tests/wef_local_integration.rs` for the
 //! `[wef.local]` config shape and how to read the resulting Parquet back.
 //! `main.rs`'s shutdown sequence (`take_wef_worker_handles` before
 //! `Server::run` consumes `self`, then await those handles after the
@@ -25,6 +20,8 @@
 //! This MUST be the only `#[tokio::test]` in this binary — `Server::run`
 //! installs the real Prometheus recorder, a process-global, install-once
 //! call.
+
+mod common;
 
 use bytes::Bytes;
 use logthing::config::{Config, MetricsConfig, TlsConfig, WefConfig, WefLocalConfig};
@@ -42,12 +39,12 @@ async fn reserve_port() -> u16 {
     probe.local_addr().unwrap().port()
 }
 
-/// Well-formed `<Event>` for event number `n`, matching real WEF shape —
-/// same helper shape as the unit tests in `src/protocol/mod.rs`.
+/// Well-formed Windows `<Event>` for event number `n`.
 fn wef_event(n: u32) -> String {
     format!(
-        "<Event><System><Provider>P</Provider><EventID>{n}</EventID><Level>4</Level>\
-         </System></Event>"
+        "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>\
+         <Provider Name='P'/><EventID>{n}</EventID><Level>4</Level><Channel>Security</Channel>\
+         <Computer>host</Computer></System></Event>"
     )
 }
 
@@ -73,6 +70,9 @@ async fn malformed_batch_returns_200_counts_the_error_and_keeps_the_good_events(
     let metrics_port = reserve_port().await;
     let tmp = tempfile::tempdir().unwrap();
 
+    let config: Config =
+        toml::from_str(&common::wef_toml(&format!("http://127.0.0.1:{http_port}"))).unwrap();
+    let wef_cfg = config.wef.clone();
     let config = Config {
         bind_address: format!("127.0.0.1:{http_port}").parse().unwrap(),
         tls: TlsConfig {
@@ -85,7 +85,6 @@ async fn malformed_batch_returns_200_counts_the_error_and_keeps_the_good_events(
             ..MetricsConfig::default()
         },
         wef: WefConfig {
-            s3: None,
             local: Some(WefLocalConfig {
                 directory: tmp.path().to_path_buf(),
                 prefix: "".to_string(),
@@ -94,7 +93,7 @@ async fn malformed_batch_returns_200_counts_the_error_and_keeps_the_good_events(
                 channel_capacity: 256,
                 max_buffer_rows: 100_000,
             }),
-            ..WefConfig::default()
+            ..wef_cfg
         },
         ..Config::default()
     };
@@ -145,19 +144,23 @@ async fn malformed_batch_returns_200_counts_the_error_and_keeps_the_good_events(
     }
     assert!(ready, "server did not become ready in time");
 
-    let body = format!(
-        "<Envelope><Body><Events>{}{}{}</Events></Body></Envelope>",
-        wef_event(1),
-        wef_malformed_event(),
-        wef_event(3)
-    );
+    let (e1, e3) = (wef_event(1), wef_event(3));
+    let body = common::utf16(&common::events_envelope(
+        "uuid:1C2D3E4F-5061-4728-8394-A5B6C7D8E9F0",
+        "win10.example.com",
+        3,
+        &[&e1, wef_malformed_event(), &e3],
+    ));
 
     let resp = client
-        .post(format!("{base_url}/wsman/events"))
+        .post(format!(
+            "{base_url}/wsman/subscriptions/{}",
+            common::TEST_SUB_UUID
+        ))
         .body(body)
         .send()
         .await
-        .expect("POST /wsman/events must succeed");
+        .expect("POST delivery must succeed");
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::OK,
@@ -165,18 +168,12 @@ async fn malformed_batch_returns_200_counts_the_error_and_keeps_the_good_events(
          must not be told to resend"
     );
 
-    // Scrape /metrics until both wef_xml_parse_errors AND
-    // parquet_s3_records_skipped{source="wef",target="local"} show up —
-    // the latter is incremented asynchronously by the WEF local writer
-    // task once it receives and rejects the malformed event's unparsed
-    // fragment, so it can lag slightly behind the HTTP response.
-    const SKIPPED_PREFIX: &str = "parquet_s3_records_skipped{source=\"wef\",target=\"local\"} ";
+    // The counter is incremented in the request handler, before the response.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let scrape = loop {
         if let Ok(resp) = reqwest::get(&metrics_url).await
             && let Ok(text) = resp.text().await
             && find_metric_value(&text, "wef_xml_parse_errors ") == Some(1.0)
-            && find_metric_value(&text, SKIPPED_PREFIX) == Some(1.0)
         {
             break text;
         }
@@ -197,12 +194,10 @@ async fn malformed_batch_returns_200_counts_the_error_and_keeps_the_good_events(
         "wef_xml_parse_errors never reached 1 on the real /metrics endpoint within 15s. Full \
          scrape body:\n{scrape}"
     );
-    assert_eq!(
-        find_metric_value(&scrape, SKIPPED_PREFIX),
-        Some(1.0),
-        "parquet_s3_records_skipped{{source=\"wef\",target=\"local\"}} never reached 1 on the \
-         real /metrics endpoint within 15s — the malformed event's unparsed fragment must reach \
-         the WEF local writer and be counted as skipped there. Full scrape body:\n{scrape}"
+    assert!(
+        !scrape.contains("parquet_s3_records_skipped{source=\"wef\""),
+        "the malformed event is dropped before the writer, so nothing may be counted as \
+         skipped there. Full scrape body:\n{scrape}"
     );
 
     // --- Clean shutdown: signal, join the server task (drops AppState,
@@ -271,7 +266,7 @@ async fn malformed_batch_returns_200_counts_the_error_and_keeps_the_good_events(
     assert_eq!(
         total_rows, 2,
         "only the 2 well-formed events must land as Parquet rows; the malformed middle event \
-         has no parsed data and is skipped by WefSink, matching pre-existing behavior"
+         is skipped by extract_events"
     );
     assert!(
         found_event_id_1,
