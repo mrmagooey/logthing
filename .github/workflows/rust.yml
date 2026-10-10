@@ -73,8 +73,16 @@ jobs:
       # The script prints `export K=V K=V ...`; convert to GITHUB_ENV lines.
       # tests/wef_kerberos_integration.rs hard-fails under CI=true if these
       # are missing, so the real-Kerberos test cannot silently skip.
+      shell: bash
       run: |
-        scripts/kdc-test-env.sh up | sed 's/^export //' | tr ' ' '\n' >> "$GITHUB_ENV"
+        out="$(scripts/kdc-test-env.sh up)"
+        vars="$(printf '%s\n' "$out" | sed 's/^export //' | tr ' ' '\n')"
+        if printf '%s\n' "$vars" | grep -qvE '^[A-Z_0-9]+='; then
+          echo "unexpected kdc-test-env.sh output:" >&2
+          printf '%s\n' "$out" >&2
+          exit 1
+        fi
+        printf '%s\n' "$vars" >> "$GITHUB_ENV"
 
     - name: Run tests (kerberos-auth feature)
       run: cargo test --features kerberos-auth --verbose
