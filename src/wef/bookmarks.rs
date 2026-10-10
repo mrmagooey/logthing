@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::wef::subscription::validate_xml_fragment;
 
 /// Largest bookmark accepted by [`BookmarkStore::put`].
-pub const MAX_BOOKMARK_BYTES: usize = 64 * 1024;
+pub const MAX_BOOKMARK_BYTES: usize = 8 * 1024;
 /// Largest machine id accepted by [`BookmarkStore::put`].
 pub const MAX_MACHINE_ID_BYTES: usize = 255;
 
@@ -177,6 +177,26 @@ mod tests {
         assert_eq!(s.get("a", u), None);
         assert!(s.get("b", u).is_some());
         assert_eq!(s.len(), 4);
+    }
+
+    #[test]
+    fn test_bookmark_store_size_boundary_8192_accepted_8193_rejected() {
+        assert_eq!(MAX_BOOKMARK_BYTES, 8192);
+        let s = BookmarkStore::new(4);
+        let u = Uuid::nil();
+        let wrap = "<BookmarkList></BookmarkList>".len();
+        let at_limit = format!(
+            "<BookmarkList>{}</BookmarkList>",
+            " ".repeat(MAX_BOOKMARK_BYTES - wrap)
+        );
+        assert_eq!(at_limit.len(), 8192);
+        assert!(s.put("a", u, at_limit));
+        let over = format!(
+            "<BookmarkList>{}</BookmarkList>",
+            " ".repeat(MAX_BOOKMARK_BYTES - wrap + 1)
+        );
+        assert_eq!(over.len(), 8193);
+        assert!(!s.put("b", u, over));
     }
 
     #[test]

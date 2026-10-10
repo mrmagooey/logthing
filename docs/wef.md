@@ -181,6 +181,11 @@ normal clients stay far below this).
   `read_existing_events = true`), which can duplicate or skip events.
 - **Any client certificate issued by the configured CA can read every subscription** and submit
   events for any of them. Use a dedicated CA for event forwarding clients.
+- **Bookmarks are not bound to the authenticated client.** The MachineID in Heartbeat/Events
+  bookmarks is not tied to the authenticated Kerberos principal or client certificate, so an
+  authenticated client can overwrite another machine's stored bookmark, causing that machine to
+  resend or skip events after a reconnect. Each bookmark is capped at 8 KiB, so memory is bounded
+  by `bookmark_capacity` x 8 KiB. Binding the principal to the MachineID is a planned follow-up.
 - Windows Server 2025 clients requesting `host/<fqdn>` and NTLM are not supported.
 - Topologies (a) and (b) cannot be combined on one instance.
 
