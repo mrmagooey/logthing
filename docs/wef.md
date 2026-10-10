@@ -12,11 +12,11 @@ keytab = "/etc/logthing/krb5.keytab"
 ```
 
 - Build the binary or container with `--features kerberos-auth` so the Kerberos middleware is compiled in. (Without the feature the server will log a warning and continue without enforcing Negotiate.)
-- When `enabled = true`, the main server's protected routes (`/wsman`, `/wsman/subscriptions`, `/wsman/events`, `/syslog`) enforce Kerberos authentication before any route logic runs. `/health` and `/stats/throughput` stay public. The **admin API is a separate server on its own port and is NOT covered by Kerberos** — it has its own Basic-auth/trusted-header authentication and its own IP allowlist.
+- When `enabled = true`, the main server's protected routes (`/wsman/**`, `/syslog`) enforce Kerberos authentication before any route logic runs. `/health` and `/stats/throughput` stay public. The **admin API is a separate server on its own port and is NOT covered by Kerberos** — it has its own Basic-auth/trusted-header authentication and its own IP allowlist.
 - `spn` must match the service principal registered in Active Directory (format `HTTP/hostname@REALM`).
 - `keytab` (optional) points to the keytab that contains the service principal’s keys. If provided, logthing sets `KRB5_KTNAME` automatically so `libgssapi` can decrypt tickets.
 - The middleware logs the authenticated client principal at `debug` level; there is no extractor exposing it to handlers.
-- Only two-pass SPNEGO is supported: the client is expected to already hold a Kerberos ticket and send a single, complete `Negotiate` token, as real Kerberos-over-HTTP normally works. Multi-leg negotiation (as an NTLM fallback would need) is not implemented — a token that comes back "continue needed" is rejected with `401` rather than tracked across requests.
+- `/wsman/**` uses its own per-connection Kerberos handling with message encryption (see "Kerberos details" below); this paragraph's two-pass SPNEGO applies to the other protected routes. Only two-pass SPNEGO is supported there: the client is expected to already hold a Kerberos ticket and send a single, complete `Negotiate` token, as real Kerberos-over-HTTP normally works. Multi-leg negotiation (as an NTLM fallback would need) is not implemented — a token that comes back "continue needed" is rejected with `401` rather than tracked across requests.
 
 ### Active Directory Setup (Kerberos clients → logthing)
 
@@ -42,68 +42,141 @@ keytab = "/etc/logthing/krb5.keytab"
    kinit -k -t "$KRB5_KTNAME" HTTP/wef.contoso.com@CONTOSO.COM
    curl --negotiate -u : https://wef.contoso.com/wsman -d '' -k
    ```
-   (The curl call should return `401` until you pass a valid SOAP payload, but it proves SPNEGO works.)
+   (The curl call should not return `401`; anything else shows the ticket exchange works.)
 6. **Update `logthing.toml`** as shown above, restart the service, and ensure the keytab is mounted into any containers. Clients will now need valid Kerberos tickets to reach the API.
 
-## Windows Client Configuration
+## Windows Client Configuration (source-initiated)
 
-On each Windows host that will forward events:
+logthing is a **source-initiated** collector: Windows machines are pointed at it with a group
+policy and fetch their subscriptions from it. Nothing is created on the Windows side with
+`wecutil` (that tool configures a Windows *collector*, which logthing is not).
 
-### 1. Enable WinRM
-```powershell
-Enable-PSRemoting -Force
-winrm quickconfig -q
+### 1. Define the subscriptions on logthing
+
+```toml
+[wef]
+collector_url = "http://logthing.example.com:5985"   # what clients will use; no trailing path
+
+[[wef.subscriptions]]
+name = "security"
+uuid = "0b0e3a7c-52f4-4b8a-9c53-7e2f1a6d9b10"       # any unique GUID
+channels = ["Security", "System"]                     # or query = "<QueryList>...</QueryList>"
+content_format = "Raw"                                # or "RenderedText"
+heartbeat_interval_secs = 3600
+max_latency_secs = 30
+read_existing_events = false
 ```
 
-### 2. Create Subscription (Source-Initiated)
-```powershell
-wecutil cs subscription.xml
+`[[wef.subscriptions]]` keys:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `name` | required | Unique, 1 to 128 characters of `A-Z a-z 0-9 _ . -` |
+| `uuid` | required | Unique subscription identifier |
+| `channels` | `[]` | Event log channels to forward (all events). Exclusive with `query` |
+| `query` | none | A full `<QueryList>` XML document. Exclusive with `channels` |
+| `content_format` | `Raw` | `Raw` or `RenderedText` (adds the localized message text) |
+| `heartbeat_interval_secs` | `3600` | Client heartbeat interval |
+| `max_latency_secs` | `30` | Maximum time the client batches events |
+| `max_envelope_size` | `512000` | Maximum SOAP envelope bytes, minimum `8192` |
+| `read_existing_events` | `false` | Also send events already in the log when a client first subscribes |
+| `enabled` | `true` | Disabled subscriptions are not offered to clients |
+
+Other `[wef]` keys:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `collector_url` | none | Public base URL clients use. Required when any subscription is configured; must be `http://` without TLS and `https://` with TLS |
+| `allow_unauthenticated` | `false` | Accept clients with no authentication (plain HTTP, no Kerberos). Anyone who can reach the port can then submit events; `security.allowed_ips` is the only remaining control |
+| `bookmark_capacity` | `10000` | Maximum number of per-(machine, subscription) bookmarks held in memory |
+
+Changing any client-visible parameter changes the subscription's version, so clients pick up
+the change at their next refresh. Settings are read at startup.
+
+### 2. Choose a topology
+
+Exactly one of these applies to a logthing instance. Mixing them is not supported.
+
+**(a) Kerberos over HTTP.** TLS disabled, `[security.kerberos]` enabled (build with
+`--features kerberos-auth`), `collector_url` starting `http://`. Clients authenticate with
+Kerberos and logthing encrypts the SOAP messages (see below).
+
+**(b) HTTPS with client certificates.** `[tls] enabled = true`, `require_client_cert = true`,
+`ca_file` set to the CA that issued the clients' certificates, `collector_url` starting
+`https://`.
+
+Startup fails with one of these messages when the configuration does not fit:
+
+- `wef.collector_url is required when [[wef.subscriptions]] are configured`
+- `wef.collector_url must use https:// when TLS is enabled`
+- `wef.collector_url must use http:// when TLS is disabled`
+- `WEF subscriptions over TLS require tls.require_client_cert = true (Windows HTTPS delivery uses client certificates); for Kerberos, disable TLS and use the plain HTTP listener`
+- `WEF subscriptions over TLS require tls.ca_file (client CA certificates)`
+- `WEF subscriptions require authentication: enable [security.kerberos] (built with --features kerberos-auth) or TLS with require_client_cert, or set wef.allow_unauthenticated = true`
+
+### 3. Point Windows at logthing (group policy)
+
+In a GPO linked to the machines that should forward events, set
+`Computer Configuration > Administrative Templates > Windows Components > Event Forwarding >
+Configure target Subscription Manager` to Enabled and add one entry:
+
+```
+Server=http://logthing.example.com:5985/wsman/SubscriptionManager/WEC,Refresh=60
 ```
 
-Example `subscription.xml`:
-```xml
-<Subscription xmlns="http://schemas.microsoft.com/2006/03/windows/events/subscription">
-  <SubscriptionId>SecurityEvents</SubscriptionId>
-  <SubscriptionType>SourceInitiated</SubscriptionType>
-  <Description>Forward security events</Description>
-  <Enabled>true</Enabled>
-  <Uri>http://schemas.microsoft.com/wbem/wsman/1/windows/EventLog</Uri>
-  <ConfigurationMode>Custom</ConfigurationMode>
-  <Delivery Mode="Push">
-    <Batching>
-      <MaxItems>5</MaxItems>
-      <MaxLatencyTime>30000</MaxLatencyTime>
-    </Batching>
-    <PushSettings>
-      <Heartbeat Interval="900000"/>
-    </PushSettings>
-  </Delivery>
-  <Query>
-    <![CDATA[
-      <QueryList>
-        <Query Id="0" Path="Security">
-          <Select Path="Security">*</Select>
-        </Query>
-      </QueryList>
-    ]]>
-  </Query>
-  <ReadExistingEvents>true</ReadExistingEvents>
-  <TransportName>HTTPS</TransportName>
-  <ContentFormat>RenderedText</ContentFormat>
-  <Locale Language="en-US"/>
-  <LogFile>ForwardedEvents</LogFile>
-  <PublisherName>Microsoft-Windows-EventCollector</PublisherName>
-  <AllowedSourceNonDomainComputers></AllowedSourceNonDomainComputers>
-  <AllowedSourceDomainComputers>O:NSG:NSD:(A;;GA;;;DC)(A;;GA;;;NS)</AllowedSourceDomainComputers>
-</Subscription>
+For HTTPS (topology b), give the SHA-1 thumbprint of the CA that issued logthing's server
+certificate (hex, no spaces):
+
+```
+Server=https://logthing.example.com:5986/wsman/SubscriptionManager/WEC,Refresh=60,IssuerCA=<SHA-1 thumbprint of the CA, hex, no spaces>
 ```
 
-### 3. Configure Forwarder
+`Refresh` is how often, in seconds, the client re-reads its subscriptions. The client also
+needs the Windows Remote Management service running (`winrm quickconfig -q`) and, for HTTPS,
+a client certificate issued by the CA in `tls.ca_file` in the machine's certificate store.
 
-Set the collector server:
-```powershell
-winrm set winrm/config/client '@{TrustedHosts="your-logthing-ip"}'
-```
+**Standard Windows WEF prerequisite (not specific to logthing):** the forwarding service runs
+as NETWORK SERVICE and needs read access to the logs it forwards. For the Security log, either
+add NETWORK SERVICE to the local `Event Log Readers` group or grant it access with
+`wevtutil sl security /ca:<SDDL including (A;;0x1;;;NS)>`.
+
+### Kerberos details
+
+- Each TCP connection authenticates once. logthing accepts both `Authorization: Kerberos` (what
+  Windows sends) and `Authorization: Negotiate`, and answers an unauthenticated request with a
+  `401` offering both schemes. A new `Authorization` header on a connection always starts a
+  fresh authentication.
+- After authentication, Windows sends each SOAP message encrypted
+  (`multipart/encrypted`); logthing decrypts it and encrypts its responses. Contexts that do not
+  provide confidentiality, integrity and mutual authentication are refused. Encrypted bodies are
+  refused on HTTP/2 connections (`400`); Windows uses HTTP/1.1.
+- The service principal must be `HTTP/<fqdn>` for the name in `collector_url` (see the Active
+  Directory setup above). Windows Server 2025 clients may request `host/<fqdn>` instead; that is
+  not supported yet.
+- NTLM is not supported.
+
+### Endpoints
+
+All are `POST`, under the same listener: `/wsman/SubscriptionManager/WEC` (subscription
+manager: Enumerate and End) and `/wsman/subscriptions/<subscription uuid>` (event and heartbeat
+delivery, which logthing acknowledges). Unknown paths or subscriptions return `404`; an
+unsupported `Content-Encoding` returns `415`; an unparseable body returns `400`. Event batches
+compressed with SLDC and UTF-8 or UTF-16 bodies are accepted. Bodies that are a bare `<Events>`
+element with no SOAP envelope are rejected with `400`.
+
+### Known limits
+
+- **Acknowledged events can still be lost.** logthing answers a delivery with an Ack even when
+  an event is dropped because the sink buffer is full. Windows then advances its bookmark and
+  does not resend it. Watch `parquet_s3_dropped{source="wef"}` and size
+  `channel_capacity`/`max_buffer_rows` accordingly.
+- **Bookmarks are held in memory.** After a logthing restart (or when `bookmark_capacity` is
+  exceeded) clients resume from the start of the subscription (the earliest event if
+  `read_existing_events = true`, otherwise from now), which can duplicate or skip events.
+- **Any client certificate issued by the configured CA can read every subscription** and submit
+  events for any of them. Use a dedicated CA for event forwarding clients.
+- Windows Server 2025 clients requesting `host/<fqdn>` and NTLM are not supported.
+- Topologies (a) and (b) cannot be combined on one instance.
 
 ## WEF (Windows Event) S3 Persistence
 

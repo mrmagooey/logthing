@@ -9,7 +9,6 @@
 //! * `kerberos_auth_middleware` (feature `kerberos-auth`): the stateless per-request
 //!   `Negotiate` check used by every other protected route.
 
-use super::MAX_BODY_SIZE;
 use super::conn::{ConnAuthState, ConnSlot};
 use crate::wef::multipart::{self, EncProtocol};
 use axum::{
@@ -22,6 +21,23 @@ use axum::{
 use base64::Engine;
 use std::sync::Arc;
 use tracing::{debug, warn};
+
+/// Cap on any `/wsman/**` request or response body buffered by the auth layer. Windows'
+/// MaxEnvelopeSize is 512000 bytes, so 4 MiB is ample even with GSS overhead; it keeps one
+/// ticket-holding host from making the (outermost, pre-body-budget) layer buffer 64 MiB.
+const WSMAN_MAX_BODY: usize = 4 * 1024 * 1024;
+
+/// True when `e` (a body-read error) is the length limit being exceeded.
+fn is_length_limit(e: &axum::Error) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if err.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
+}
 
 /// Content type given to a decrypted request body and to plaintext SOAP responses.
 const SOAP_UTF16: &str = "application/soap+xml;charset=UTF-16";
@@ -53,8 +69,9 @@ pub trait GssAcceptor: Send + std::fmt::Debug {
     fn principal(&mut self) -> anyhow::Result<String>;
     /// Whether the context negotiated confidentiality, integrity and mutual authentication.
     fn has_conf_integ_mutual(&mut self) -> anyhow::Result<bool>;
-    /// Decrypts `data` in place of a `header`/`data` wrap token; returns the plaintext.
-    fn unwrap_iov(&mut self, header: &[u8], data: &[u8]) -> anyhow::Result<Vec<u8>>;
+    /// Decrypts a `header`/`data` wrap token (consuming `data`, decrypted in place); returns the
+    /// plaintext.
+    fn unwrap_iov(&mut self, header: &[u8], data: Vec<u8>) -> anyhow::Result<Vec<u8>>;
     /// Encrypts `plaintext`; returns `(header, data + padding)`.
     fn wrap_iov(&mut self, plaintext: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)>;
 }
@@ -257,7 +274,7 @@ fn decrypt_body(
         }
         let payload = multipart::parse(body).map_err(|_| DecryptError::Framing)?;
         let plain = ctx
-            .unwrap_iov(&payload.header, &payload.data)
+            .unwrap_iov(&payload.header, payload.data)
             .map_err(|_| DecryptError::Gss)?;
         if plain.len() != payload.original_length {
             return Err(DecryptError::Length);
@@ -346,8 +363,14 @@ pub async fn wsman_auth_middleware(
         }
     }
 
-    let bytes = match axum::body::to_bytes(body, MAX_BODY_SIZE).await {
+    // Oversize is counted as `decrypt_error` (no extra label value) and leaves the slot as is:
+    // nothing was decrypted, so the connection's authentication is unaffected.
+    let bytes = match axum::body::to_bytes(body, WSMAN_MAX_BODY).await {
         Ok(b) => b,
+        Err(e) if is_length_limit(&e) => {
+            record_failure(AuthFailure::DecryptError);
+            return empty(StatusCode::PAYLOAD_TOO_LARGE);
+        }
         Err(_) => return empty(StatusCode::BAD_REQUEST),
     };
     if bytes.is_empty()
@@ -437,7 +460,7 @@ async fn encrypt_response(
     resp: Response,
 ) -> Response {
     let (mut parts, body) = resp.into_parts();
-    let plain = match axum::body::to_bytes(body, MAX_BODY_SIZE).await {
+    let plain = match axum::body::to_bytes(body, WSMAN_MAX_BODY).await {
         Ok(b) => b,
         Err(_) => return empty(StatusCode::INTERNAL_SERVER_ERROR),
     };
@@ -768,11 +791,10 @@ impl GssAcceptor for LibGssAcceptor {
         Ok(self.ctx.flags()?.contains(need))
     }
 
-    fn unwrap_iov(&mut self, header: &[u8], data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    fn unwrap_iov(&mut self, header: &[u8], mut data: Vec<u8>) -> anyhow::Result<Vec<u8>> {
         use libgssapi::context::SecurityContext;
         use libgssapi::util::{GssIov, GssIovType};
         let mut header = header.to_vec();
-        let mut data = data.to_vec();
         let mut iov = [
             GssIov::new(GssIovType::Header, &mut header),
             GssIov::new(GssIovType::Data, &mut data),
@@ -864,8 +886,8 @@ mod tests {
         fn has_conf_integ_mutual(&mut self) -> anyhow::Result<bool> {
             Ok(self.flags_ok)
         }
-        fn unwrap_iov(&mut self, header: &[u8], data: &[u8]) -> anyhow::Result<Vec<u8>> {
-            fake_unwrap(self.id, header, data)
+        fn unwrap_iov(&mut self, header: &[u8], data: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+            fake_unwrap(self.id, header, &data)
         }
         fn wrap_iov(&mut self, plaintext: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
             Ok(fake_wrap(self.id, plaintext))
@@ -1182,6 +1204,42 @@ mod tests {
         let resp = h.send(enc_req("/wsman", id, b"abcd", 5)).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(h.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_oversize_encrypted_body_413_keeps_slot() {
+        let h = Harness::new();
+        let id = login(&h, "alice").await;
+        let big = vec![b'a'; WSMAN_MAX_BODY + 1];
+        let resp = h.send(enc_req("/wsman", id, &big, big.len())).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(h.seen.lock().unwrap().is_empty());
+        // Nothing was decrypted, so the connection stays authenticated.
+        let ok = h.send(plain_req("/wsman", b"x")).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_oversize_response_not_sent_in_plaintext() {
+        let factory = Arc::new(FakeFactory::default());
+        let router = Router::new()
+            .route(
+                "/wsman",
+                post(|| async { vec![b'z'; WSMAN_MAX_BODY + 1] }),
+            )
+            .layer(middleware::from_fn_with_state(
+                Arc::new(WsmanAuth::new(factory.clone())),
+                wsman_auth_middleware,
+            ));
+        let slot = ConnSlot::default();
+        let mut auth = auth_req("Kerberos", "principal:a", "/wsman", vec![]);
+        auth.extensions_mut().insert(slot.clone());
+        assert_eq!(router.clone().oneshot(auth).await.unwrap().status(), StatusCode::OK);
+        let mut req = enc_req("/wsman", 1, b"abcd", 4);
+        req.extensions_mut().insert(slot);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body_bytes(resp).await.is_empty());
     }
 
     #[tokio::test]

@@ -184,7 +184,7 @@ pub struct SecurityConfig {
     /// queue requests forever with no timeout ever firing — so don't "fix"
     /// it by swapping the two `.layer()` calls.
     ///
-    /// Note this also bounds bulk ingest routes (`/wsman/events`,
+    /// Note this also bounds bulk ingest routes (WEF delivery,
     /// `/syslog`, HEC): at the default 300s against `MAX_BODY_SIZE` (64
     /// MiB), a request must sustain roughly 218 KB/s or better to avoid
     /// timing out.

@@ -768,8 +768,7 @@ mod tests {
             event_record_id: 918273645,
             process_id: Some(656),
             thread_id: Some(29384),
-            // Always empty on the real path: `parse_event_data` never writes
-            // to `channel` (src/protocol/mod.rs:307-323).
+            // Left empty in this fixture.
             channel: String::new(),
             computer: "dc01.corp.example".to_string(),
             security_user_id: None,

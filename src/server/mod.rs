@@ -351,8 +351,10 @@ pub struct Server {
 }
 
 impl Server {
-    /// Replace the GSS backend used for `/wsman/**` Kerberos authentication (tests inject
-    /// fakes here; production uses the libgssapi default).
+    /// Replace the GSS backend used for `/wsman/**` Kerberos authentication.
+    ///
+    /// Testing hook; production uses the libgssapi factory.
+    #[doc(hidden)]
     pub fn with_gss_factory(mut self, factory: Arc<dyn kerberos::GssAcceptorFactory>) -> Self {
         self.gss_factory = Some(factory);
         self
@@ -4344,6 +4346,29 @@ event_parsers:
                 router.oneshot(health).await.unwrap().status(),
                 StatusCode::OK
             );
+        }
+
+        /// No WEF runtime: `/wsman/**` only 404s, behind the regular per-request layer when
+        /// Kerberos is configured (401 without credentials) and bare otherwise.
+        #[tokio::test]
+        async fn test_no_wef_runtime_wsman_keeps_per_request_layer() {
+            let mut config = Config::default();
+            config.tls.enabled = false;
+            let kerberos = cfg!(feature = "kerberos-auth");
+            if kerberos {
+                config.security.kerberos.enabled = true;
+                config.security.kerberos.spn = Some("HTTP/test.invalid@EXAMPLE.COM".into());
+            }
+            let mut server = build_server_unchecked(config).await;
+            Arc::get_mut(&mut server.state).expect("unique state").wef = None;
+            let router = server.create_router(IpWhitelist::empty()).expect("router");
+            let resp = router.oneshot(post("/wsman")).await.unwrap();
+            let expect = if kerberos {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            assert_eq!(resp.status(), expect);
         }
 
         #[tokio::test]

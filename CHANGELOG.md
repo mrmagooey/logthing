@@ -6,6 +6,33 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
+### Added
+
+- WEF subscription manager for real Windows source-initiated clients: `Enumerate` on
+  `/wsman/SubscriptionManager/WEC` serves the subscriptions configured under `wef.*`
+  (`wef.collector_url`, `wef.allow_unauthenticated`, `wef.bookmark_capacity`,
+  `[[wef.subscriptions]]`), and delivery endpoints at `/wsman/subscriptions/<uuid>` Ack events and
+  heartbeats. Per-(machine, subscription) bookmarks are kept in memory and replayed on Enumerate.
+- UTF-16 request/response bodies and SLDC-compressed event batches.
+- Per-connection Kerberos for `/wsman/**` (`Authorization: Kerberos` and `Negotiate`) with
+  MS-WSMV message encryption.
+- HTTPS client-certificate topology for WEF (`tls.require_client_cert` with `tls.ca_file`).
+- Metrics `wef_requests_total{action}` and `wef_auth_failures_total{reason}`.
+- Windows client emulator and a Docker KDC test environment (`scripts/kdc-test-env.sh`) for
+  testing the WEF receiver without Windows.
+- `docs/wef.md` documents GPO client setup, the two topologies and known limits.
+
+### Changed
+
+- WEF event fields are now extracted fully from the event XML.
+- Startup fails when `[[wef.subscriptions]]` are configured without any client authentication,
+  unless `wef.allow_unauthenticated = true`.
+
+### Removed
+
+- `POST /wsman/events` and the bare `POST /wsman/subscriptions` endpoints. A bare `<Events>` body
+  (no SOAP envelope) is now answered with `400`.
+
 ## [0.22.1] - 2026-10-08
 
 ### Fixed
