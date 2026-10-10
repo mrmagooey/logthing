@@ -8,3 +8,4 @@
 pub mod encoding;
 pub mod multipart;
 pub mod sldc;
+pub mod soap;
