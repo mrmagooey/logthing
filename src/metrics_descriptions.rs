@@ -405,6 +405,13 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
          already reached, labelled by source/stream/field — non-zero here means \
          field_distinct_values is undercounting the true cardinality.",
     ),
+    // ── wef ───────────────────────────────────────────────────────────────
+    (
+        Kind::Counter,
+        "wef_requests_total",
+        "Parsed /wsman/** SOAP requests, labelled by action (enumerate|heartbeat|events|\
+         subscription_end|end|unknown). Requests rejected before parsing are not counted.",
+    ),
     // ── spool ─────────────────────────────────────────────────────────────
     (
         Kind::Gauge,

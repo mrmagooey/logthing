@@ -1,5 +1,6 @@
 #[cfg(feature = "otlp")]
 pub mod otlp;
+mod wef_routes;
 
 use crate::config::Config;
 use crate::forwarding::drop_log::{DropKind, DropSite};
@@ -9,9 +10,6 @@ use crate::ingest::handlers::{handle_hec_event, handle_hec_raw, handle_ndjson};
 use crate::middleware::{IpWhitelist, ip_whitelist_middleware};
 use crate::models::WindowsEvent;
 use crate::parser::GenericEventParser;
-use crate::protocol::{
-    WefMessage, WefParser, create_heartbeat_response, create_subscription_response,
-};
 use crate::stats::cardinality::CardinalityWatcher;
 use crate::stats::{ThroughputSnapshot, ThroughputStats};
 use crate::syslog::SyslogMessage;
@@ -38,7 +36,9 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
-use tracing::{debug, error, info, warn};
+#[cfg(feature = "kerberos-auth")]
+use tracing::debug;
+use tracing::{error, info, warn};
 
 /// Handle onto the installed Prometheus recorder, published so profiling can
 /// read counters to verify a sampling window overlapped real traffic.
@@ -303,7 +303,11 @@ pub struct AppState {
     /// startup (`main.rs`) — this is never filtered by source at request
     /// time. Empty unless an operator configured a wef watch.
     pub wef_cardinality_watchers: Vec<Arc<CardinalityWatcher>>,
-    pub parser: WefParser,
+    /// WEF subscription manager runtime; `None` (every `/wsman/**` request is 404) when no
+    /// `[[wef.subscriptions]]` are configured.
+    pub wef: Option<Arc<crate::wef::subscription::WefRuntime>>,
+    /// Last bookmark acknowledged per (machine, subscription), replayed on re-enumeration.
+    pub bookmarks: Arc<crate::wef::bookmarks::BookmarkStore>,
     pub event_parser: Option<GenericEventParser>,
     pub parquet_s3_sender: Option<
         crate::forwarding::buffered_writer::ParquetWriterHandle<
@@ -394,6 +398,17 @@ impl Server {
         // by `main` once every writer has registered.
         if let Some(cfg) = config.spool.as_ref() {
             crate::forwarding::spool::init_global(cfg)?;
+        }
+        let wef_runtime = crate::wef::subscription::validate_wef_topology(
+            &config,
+            config.security.kerberos.enabled && cfg!(feature = "kerberos-auth"),
+        )?
+        .map(Arc::new);
+        if wef_runtime.is_none() {
+            info!(
+                "WEF subscription manager disabled: no [[wef.subscriptions]] configured; \
+                 /wsman/** returns 404"
+            );
         }
         #[cfg(feature = "kerberos-auth")]
         {
@@ -538,7 +553,10 @@ impl Server {
             config: Arc::clone(&shared_config),
             throughput,
             wef_cardinality_watchers,
-            parser: WefParser::new(),
+            wef: wef_runtime,
+            bookmarks: Arc::new(crate::wef::bookmarks::BookmarkStore::new(
+                config.wef.bookmark_capacity,
+            )),
             event_parser,
             parquet_s3_sender,
             parquet_local_sender,
@@ -813,9 +831,7 @@ impl Server {
 
         // Protected routes (require authentication).
         let mut protected_router = Router::new()
-            .route("/wsman", post(handle_wef_request))
-            .route("/wsman/subscriptions", post(handle_subscription))
-            .route("/wsman/events", post(handle_events))
+            .merge(wef_routes::routes())
             // Syslog endpoints
             .route("/syslog", post(handle_syslog_http))
             .route("/syslog/udp", get(handle_syslog_udp_info))
@@ -1242,126 +1258,6 @@ async fn kerberos_auth_middleware(
     }
 }
 
-async fn handle_wef_request(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    _headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, StatusCode> {
-    let body_str = String::from_utf8_lossy(&body);
-    // Use the real peer IP for source attribution.
-    // X-Forwarded-For is client-spoofable and must not be trusted
-    // for security-relevant identity; only the TCP peer address is authoritative.
-    let source_host = addr.ip().to_string();
-
-    match state.parser.parse_message(&body_str, source_host) {
-        Ok(WefMessage::Subscription(sub)) => {
-            // `subscription_id` is the raw text between `<SubscriptionId>` and
-            // `</SubscriptionId>` in the POST body (`extract_xml_value`,
-            // `protocol::mod`), reachable unauthenticated whenever Kerberos is
-            // not configured, and unbounded — a multi-MiB element would log a
-            // single multi-MiB line per request. 128 bytes comfortably covers
-            // any real subscription name while bounding that amplification.
-            info!(
-                "New subscription from {}: {}",
-                sub.source_host,
-                crate::sanitize_for_log(&sub.subscription_id, 128)
-            );
-
-            let response = create_subscription_response(&sub.subscription_id);
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/soap+xml")
-                .body(axum::body::Body::from(response))
-                .unwrap())
-        }
-        Ok(WefMessage::Events(events)) => {
-            info!("Received {} events from {}", events.len(), addr);
-            process_events(&state, events).await;
-
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .body(axum::body::Body::from("Events received"))
-                .unwrap())
-        }
-        Ok(WefMessage::Heartbeat(hb)) => {
-            // Same unbounded, unauthenticated-reachable `subscription_id` as
-            // the Subscription arm above — same 128-byte budget.
-            debug!(
-                "Heartbeat from {} for subscription {}",
-                hb.source_host,
-                crate::sanitize_for_log(&hb.subscription_id, 128)
-            );
-
-            let response = create_heartbeat_response();
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/soap+xml")
-                .body(axum::body::Body::from(response))
-                .unwrap())
-        }
-        Ok(WefMessage::Unknown(content)) => {
-            // Was `truncate_for_log` — bounded but not sanitized, so control
-            // characters (embedded newline, ANSI escape) in the unrecognized
-            // body survived into this warn! line. Switch to `sanitize_for_log`,
-            // keeping the existing 100-byte budget.
-            warn!(
-                "Unknown message type from {}: {}",
-                addr,
-                crate::sanitize_for_log(&content, 100)
-            );
-            Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(axum::body::Body::from("Unknown message type"))
-                .unwrap())
-        }
-        Err(e) => {
-            error!("Failed to parse message from {}: {}", addr, e);
-            Err(StatusCode::BAD_REQUEST)
-        }
-    }
-}
-
-async fn handle_subscription(
-    State(_state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    body: Bytes,
-) -> Result<Response, StatusCode> {
-    info!("Subscription request from {}", addr);
-
-    let _body_str = String::from_utf8_lossy(&body);
-    let subscription_id = format!("sub_{}", uuid::Uuid::new_v4());
-
-    let response = create_subscription_response(&subscription_id);
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "application/soap+xml")
-        .body(axum::body::Body::from(response))
-        .unwrap())
-}
-
-async fn handle_events(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    body: Bytes,
-) -> Result<Response, StatusCode> {
-    info!("Events from {}", addr);
-
-    let body_str = String::from_utf8_lossy(&body);
-    let source_host = addr.ip().to_string();
-
-    match state.parser.parse_message(&body_str, source_host) {
-        Ok(WefMessage::Events(events)) => {
-            process_events(&state, events).await;
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .body(axum::body::Body::from("OK"))
-                .unwrap())
-        }
-        _ => Err(StatusCode::BAD_REQUEST),
-    }
-}
-
 async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
     let event = Arc::new(event);
 
@@ -1487,6 +1383,7 @@ mod tests {
     use axum::body::Bytes;
     use axum::http::HeaderMap;
     use serde_json::Value;
+    use tracing::debug;
 
     fn sample_parsed_event() -> ParsedEvent {
         ParsedEvent {
@@ -1523,7 +1420,8 @@ mod tests {
             config: Arc::new(RwLock::new(config)),
             throughput: Arc::new(ThroughputStats::new()),
             wef_cardinality_watchers,
-            parser: WefParser::new(),
+            wef: None,
+            bookmarks: Arc::new(crate::wef::bookmarks::BookmarkStore::new(16)),
             event_parser: None,
             parquet_s3_sender: None,
             parquet_local_sender: None,
@@ -1618,104 +1516,6 @@ mod tests {
         assert!(!value["powerdns"].as_array().unwrap().is_empty());
     }
 
-    /// WEF is deliberately UNCHANGED by the 503 backpressure work: a full writer channel is a
-    /// counted drop and the request is still answered 200 (the WEF protocol has its own
-    /// redelivery semantics).
-    #[tokio::test]
-    async fn handle_events_full_wef_channel_still_returns_200() {
-        use crate::forwarding::buffered_writer::ParquetWriterHandle;
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let state = Arc::new(AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            throughput: Arc::new(ThroughputStats::new()),
-            wef_cardinality_watchers: Vec::new(),
-            parser: WefParser::new(),
-            event_parser: None,
-            parquet_s3_sender: Some(ParquetWriterHandle::for_test(tx, "wef", "s3")),
-            parquet_local_sender: None,
-        });
-        let event = |id: u32| {
-            format!(
-                "<Event><System><Provider>Security</Provider><EventID>{id}</EventID>\
-                 <Level>4</Level><TimeCreated>2024-01-01T00:00:00Z</TimeCreated>\
-                 <Computer>host</Computer></System></Event>"
-            )
-        };
-        let body = Bytes::from(format!(
-            "<Envelope><Body><Events>{}{}{}</Events></Body></Envelope>",
-            event(4624),
-            event(4625),
-            event(4634)
-        ));
-        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
-        let response = handle_events(State(state), ConnectInfo(addr), body)
-            .await
-            .expect("events accepted");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(rx.try_recv().is_ok());
-        assert!(
-            rx.try_recv().is_err(),
-            "capacity 1: the rest were dropped, not 503'd"
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_events_accepts_valid_payload() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"
-        <Envelope>
-          <Body>
-            <Events>
-              <Event>
-                <System>
-                  <Provider>Security</Provider>
-                  <EventID>4624</EventID>
-                  <Level>4</Level>
-                  <TimeCreated>2024-01-01T00:00:00Z</TimeCreated>
-                  <Computer>host</Computer>
-                </System>
-                <EventData>
-                  <Data Name="TargetUserName">alice</Data>
-                </EventData>
-              </Event>
-            </Events>
-          </Body>
-        </Envelope>
-        "#,
-        );
-        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
-
-        let response = handle_events(State(state), ConnectInfo(addr), body)
-            .await
-            .expect("events accepted");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn handle_wef_request_handles_subscription() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"
-        <Envelope>
-          <Body>
-            <Subscribe>
-              <SubscriptionId>TestSub</SubscriptionId>
-              <Query>*</Query>
-            </Subscribe>
-          </Body>
-        </Envelope>
-        "#,
-        );
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-        let headers = HeaderMap::new();
-
-        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
-            .await
-            .expect("subscription handled");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
     #[tokio::test]
     async fn handle_syslog_http_parses_message() {
         let state = default_state().await;
@@ -1761,192 +1561,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn handle_wef_request_with_heartbeat() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"
-        <Envelope>
-          <Body>
-            <Heartbeat>
-              <SubscriptionId>hb-sub-123</SubscriptionId>
-            </Heartbeat>
-          </Body>
-        </Envelope>
-        "#,
-        );
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-        let headers = HeaderMap::new();
-
-        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
-            .await
-            .expect("heartbeat handled");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn handle_wef_request_with_unknown_message() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"
-        <Envelope>
-          <Body>
-            <UnknownTag>Some unknown content</UnknownTag>
-          </Body>
-        </Envelope>
-        "#,
-        );
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-        let headers = HeaderMap::new();
-
-        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
-            .await
-            .expect("unknown message handled");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
     // -------------------------------------------------------------------
     // Log-injection regressions: wire-derived `subscription_id` / `content`
     // / `formatted_message` must reach their `info!`/`debug!`/`warn!` sites
     // sanitized, not raw. Uses the shared `test_support` capture subscriber
     // (see its doc comment for why a bespoke `set_default` doesn't work).
     // -------------------------------------------------------------------
-
-    /// A `<SubscriptionId>` containing a mid-line `\r`, a `\n`, and an ANSI
-    /// escape must not carry any of them raw into the "New subscription"
-    /// `info!` line, and an oversized id must be truncated rather than
-    /// logged whole (`extract_xml_value` returns the raw slice with no
-    /// length cap of its own).
-    #[tokio::test]
-    async fn handle_wef_subscription_log_sanitizes_and_truncates_subscription_id() {
-        crate::test_support::install_and_clear();
-
-        let state = default_state().await;
-        let forged_id = format!("sub\rFAKE\n\u{1b}[31minjected\u{1b}[0m{}", "y".repeat(200));
-        let body = Bytes::from(format!(
-            r#"
-        <Envelope>
-          <Body>
-            <Subscribe>
-              <SubscriptionId>{forged_id}</SubscriptionId>
-              <Query>*</Query>
-            </Subscribe>
-          </Body>
-        </Envelope>
-        "#
-        ));
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-
-        let response = handle_wef_request(State(state), ConnectInfo(addr), HeaderMap::new(), body)
-            .await
-            .expect("subscription handled");
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let events = crate::test_support::captured_events();
-        let line = events
-            .iter()
-            .find(|m| m.contains("New subscription"))
-            .unwrap_or_else(|| panic!("no matching info! event captured; got: {events:?}"));
-
-        assert!(
-            !line.contains('\r'),
-            "raw CR leaked into the log line: {line:?}"
-        );
-        assert!(
-            !line.contains('\u{1b}'),
-            "raw ESC leaked into the log line: {line:?}"
-        );
-        assert!(
-            line.contains('\u{fffd}'),
-            "expected U+FFFD replacement characters in the log line: {line:?}"
-        );
-        assert!(
-            line.len() < forged_id.len(),
-            "oversized subscription_id must be truncated, not logged whole: {line:?}"
-        );
-    }
-
-    /// Same regression as above, for the Heartbeat arm's `debug!` site.
-    #[tokio::test]
-    async fn handle_wef_heartbeat_log_sanitizes_subscription_id() {
-        crate::test_support::install_and_clear();
-
-        let state = default_state().await;
-        let body = Bytes::from(
-            "\n        <Envelope>\n          <Body>\n            <Heartbeat>\n              \
-             <SubscriptionId>hb\rFAKE\n\u{1b}[31minjected</SubscriptionId>\n            \
-             </Heartbeat>\n          </Body>\n        </Envelope>\n        ",
-        );
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-
-        let response = handle_wef_request(State(state), ConnectInfo(addr), HeaderMap::new(), body)
-            .await
-            .expect("heartbeat handled");
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let events = crate::test_support::captured_events();
-        let line = events
-            .iter()
-            .find(|m| m.contains("Heartbeat from"))
-            .unwrap_or_else(|| panic!("no matching debug! event captured; got: {events:?}"));
-
-        assert!(
-            !line.contains('\r'),
-            "raw CR leaked into the log line: {line:?}"
-        );
-        assert!(
-            !line.contains('\n'),
-            "raw LF leaked into the log line: {line:?}"
-        );
-        assert!(
-            !line.contains('\u{1b}'),
-            "raw ESC leaked into the log line: {line:?}"
-        );
-        assert!(
-            line.contains('\u{fffd}'),
-            "expected U+FFFD replacement characters in the log line: {line:?}"
-        );
-    }
-
-    /// The Unknown-message-type `warn!` site was `truncate_for_log`, not
-    /// `sanitize_for_log` -- bounded but not sanitized. Fails if that site is
-    /// reverted.
-    #[tokio::test]
-    async fn handle_wef_unknown_message_log_sanitizes_content() {
-        crate::test_support::install_and_clear();
-
-        let state = default_state().await;
-        let body = Bytes::from("weird\rcontent\n\u{1b}[31mFAKE\u{1b}[0m not xml at all");
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-
-        let response = handle_wef_request(State(state), ConnectInfo(addr), HeaderMap::new(), body)
-            .await
-            .expect("unknown message handled");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-        let events = crate::test_support::captured_events();
-        let line = events
-            .iter()
-            .find(|m| m.contains("Unknown message type"))
-            .unwrap_or_else(|| panic!("no matching warn! event captured; got: {events:?}"));
-
-        assert!(
-            !line.contains('\r'),
-            "raw CR leaked into the log line: {line:?}"
-        );
-        assert!(
-            !line.contains('\n'),
-            "raw LF leaked into the log line: {line:?}"
-        );
-        assert!(
-            !line.contains('\u{1b}'),
-            "raw ESC leaked into the log line: {line:?}"
-        );
-        assert!(
-            line.contains('\u{fffd}'),
-            "expected U+FFFD replacement characters in the log line: {line:?}"
-        );
-    }
 
     /// `formatted_message` is built by substituting attacker-supplied event
     /// XML field values into an operator-configured output template; a
@@ -1977,7 +1597,8 @@ event_parsers:
             config: Arc::new(RwLock::new(Config::default())),
             throughput: Arc::new(ThroughputStats::new()),
             wef_cardinality_watchers: Vec::new(),
-            parser: WefParser::new(),
+            wef: None,
+            bookmarks: Arc::new(crate::wef::bookmarks::BookmarkStore::new(16)),
             event_parser: Some(event_parser),
             parquet_s3_sender: None,
             parquet_local_sender: None,
@@ -2012,37 +1633,6 @@ event_parsers:
             line.contains('\u{fffd}'),
             "expected U+FFFD replacement characters in the log line: {line:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn handle_wef_request_with_parse_error() {
-        let state = default_state().await;
-        // Invalid XML - parser treats it as Unknown message, not an error
-        let body = Bytes::from("<Invalid XML");
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-        let headers = HeaderMap::new();
-
-        let result = handle_wef_request(State(state), ConnectInfo(addr), headers, body).await;
-        // The parser doesn't fail on invalid XML, it returns Unknown message type
-        // which results in BAD_REQUEST status
-        match result {
-            Ok(response) => {
-                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            }
-            Err(_) => {
-                // Either way is acceptable
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn handle_events_with_invalid_body() {
-        let state = default_state().await;
-        let body = Bytes::from("not valid events");
-        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
-
-        let result = handle_events(State(state), ConnectInfo(addr), body).await;
-        assert!(result.is_err(), "Should return error for invalid body");
     }
 
     #[test]
@@ -2219,60 +1809,6 @@ event_parsers:
             "2 distinct computer values from Security events; the System event's computer \
              must have been excluded by the stream filter"
         );
-    }
-
-    /// XFF header is present but ignored; peer IP is used for source attribution.
-    ///
-    /// After M-9: the `X-Forwarded-For` header is silently ignored so that a
-    /// spoofed header cannot influence the source identity recorded for the
-    /// event.  The request should still succeed (200 OK); only the attribution
-    /// logic changed.
-    #[tokio::test]
-    async fn handle_wef_request_with_x_forwarded_for() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"
-        <Envelope>
-          <Body>
-            <Subscribe>
-              <SubscriptionId>ForwardedTest</SubscriptionId>
-              <Query>*</Query>
-            </Subscribe>
-          </Body>
-        </Envelope>
-        "#,
-        );
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert("X-Forwarded-For", "10.0.0.100".parse().unwrap());
-
-        // XFF is ignored; source attribution uses the peer IP (127.0.0.1).
-        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
-            .await
-            .expect("subscription handled");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn handle_subscription_generates_unique_id() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"
-        <Envelope>
-          <Body>
-            <Subscribe>
-              <Query>*</Query>
-            </Subscribe>
-          </Body>
-        </Envelope>
-        "#,
-        );
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-
-        let response = handle_subscription(State(state), ConnectInfo(addr), body)
-            .await
-            .expect("subscription handled");
-        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -3239,48 +2775,6 @@ event_parsers:
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    /// A WEF POST carrying a valid `<Events>` payload returns 200 and records
-    /// at least one throughput entry (exercises the full handler path, not just
-    /// subscription handling).
-    #[tokio::test]
-    async fn handle_wef_request_events_payload_returns_200() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"<Envelope>
-  <Body>
-    <Events>
-      <Event>
-        <System>
-          <Provider>Security</Provider>
-          <EventID>4625</EventID>
-          <Level>4</Level>
-          <TimeCreated>2024-06-01T00:00:00Z</TimeCreated>
-          <Computer>dc01</Computer>
-        </System>
-        <EventData>
-          <Data Name="TargetUserName">bob</Data>
-        </EventData>
-      </Event>
-    </Events>
-  </Body>
-</Envelope>"#,
-        );
-        let addr: SocketAddr = "10.0.0.1:5985".parse().unwrap();
-        let headers = HeaderMap::new();
-
-        let response = handle_wef_request(State(state.clone()), ConnectInfo(addr), headers, body)
-            .await
-            .expect("events payload accepted");
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // The event should have been recorded in throughput stats.
-        let snapshot = state.throughput.snapshot().await;
-        assert!(
-            !snapshot.is_empty(),
-            "throughput snapshot must be non-empty after event"
-        );
-    }
-
     /// A syslog HTTP POST with a body that exactly meets the body-size limit is
     /// accepted (boundary condition: limit is inclusive).
     /// A body one byte over is rejected with 413 (duplicate of the WEF test, but
@@ -3536,106 +3030,6 @@ event_parsers:
     }
 
     // ------------------------------------------------------------------ //
-    // WEF handler: zero-event events payload                              //
-    // ------------------------------------------------------------------ //
-
-    /// An `<Events>` payload with no `<Event>` children must be accepted (200)
-    /// and must not crash or record any throughput entries.
-    #[tokio::test]
-    async fn handle_wef_request_empty_events_returns_200() {
-        let state = default_state().await;
-        // Body contains <Events> (triggering the events branch in the parser)
-        // but has no <Event> children — results in zero events.
-        let body = Bytes::from(
-            r#"<Envelope>
-  <Body>
-    <Events>
-    </Events>
-  </Body>
-</Envelope>"#,
-        );
-        let addr: SocketAddr = "10.0.0.5:5985".parse().unwrap();
-        let headers = HeaderMap::new();
-
-        let response = handle_wef_request(State(state.clone()), ConnectInfo(addr), headers, body)
-            .await
-            .expect("zero-event events payload should be accepted");
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "zero-event events payload must return 200"
-        );
-
-        // No events were processed, so throughput must remain empty.
-        let snapshot = state.throughput.snapshot().await;
-        assert!(
-            snapshot.is_empty(),
-            "no throughput entries expected for zero-event batch"
-        );
-    }
-
-    // ------------------------------------------------------------------ //
-    // handle_events: subscription body → BAD_REQUEST                     //
-    // ------------------------------------------------------------------ //
-
-    /// `handle_events` must return BAD_REQUEST when the body is a subscription
-    /// (not an events payload), because the handler only accepts events.
-    #[tokio::test]
-    async fn handle_events_with_subscription_body_returns_bad_request() {
-        let state = default_state().await;
-        // A valid subscription body — not an events payload.
-        let body = Bytes::from(
-            r#"<Envelope>
-  <Body>
-    <Subscribe>
-      <SubscriptionId>TestSub</SubscriptionId>
-      <Query>*</Query>
-    </Subscribe>
-  </Body>
-</Envelope>"#,
-        );
-        let addr: SocketAddr = "10.0.0.6:5985".parse().unwrap();
-
-        let result = handle_events(State(state), ConnectInfo(addr), body).await;
-        assert!(
-            result.is_err(),
-            "handle_events must reject a subscription body with BAD_REQUEST"
-        );
-        assert_eq!(
-            result.unwrap_err(),
-            StatusCode::BAD_REQUEST,
-            "status must be 400 for non-events payload"
-        );
-    }
-
-    // ------------------------------------------------------------------ //
-    // handle_events: heartbeat body → BAD_REQUEST                        //
-    // ------------------------------------------------------------------ //
-
-    /// `handle_events` must return BAD_REQUEST when the body is a heartbeat.
-    #[tokio::test]
-    async fn handle_events_with_heartbeat_body_returns_bad_request() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"<Envelope>
-  <Body>
-    <Heartbeat>
-      <SubscriptionId>hb-sub-1</SubscriptionId>
-    </Heartbeat>
-  </Body>
-</Envelope>"#,
-        );
-        let addr: SocketAddr = "10.0.0.7:5985".parse().unwrap();
-
-        let result = handle_events(State(state), ConnectInfo(addr), body).await;
-        assert!(
-            result.is_err(),
-            "handle_events must reject a heartbeat body"
-        );
-        assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
-    }
-
-    // ------------------------------------------------------------------ //
     // /stats/throughput via router oneshot                                //
     // ------------------------------------------------------------------ //
 
@@ -3684,131 +3078,6 @@ event_parsers:
         let arr = parsed.as_array().unwrap();
         assert_eq!(arr.len(), 1, "expected one entry after recording one event");
         assert_eq!(arr[0]["event_type"], "TestProvider:9999");
-    }
-
-    // ------------------------------------------------------------------ //
-    // handle_subscription: check XML response contains subscription id   //
-    // ------------------------------------------------------------------ //
-
-    /// `handle_subscription` must return 200 with a SOAP XML body that
-    /// contains the generated `sub_` prefixed subscription id.
-    #[tokio::test]
-    async fn handle_subscription_response_contains_sub_prefix() {
-        use axum::body::to_bytes;
-
-        let state = default_state().await;
-        let body = Bytes::from("<Envelope><Body></Body></Envelope>");
-        let addr: SocketAddr = "10.0.1.1:5985".parse().unwrap();
-
-        let response = handle_subscription(State(state), ConnectInfo(addr), body)
-            .await
-            .expect("handle_subscription must succeed");
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // Check Content-Type header.
-        let ct = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert!(
-            ct.contains("application/soap+xml"),
-            "Content-Type must be application/soap+xml, got: {ct}"
-        );
-
-        // Check the body contains a subscription id with the `sub_` prefix.
-        let body_bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let body_str = String::from_utf8_lossy(&body_bytes);
-        assert!(
-            body_str.contains("sub_"),
-            "subscription response body must contain generated sub_ id, got: {body_str}"
-        );
-    }
-
-    // ------------------------------------------------------------------ //
-    // handle_wef_request: subscription response Content-Type             //
-    // ------------------------------------------------------------------ //
-
-    /// The subscription branch of `handle_wef_request` must set
-    /// `Content-Type: application/soap+xml`.
-    #[tokio::test]
-    async fn handle_wef_request_subscription_sets_content_type() {
-        use axum::body::to_bytes;
-
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"<Envelope>
-  <Body>
-    <Subscribe>
-      <SubscriptionId>ct-test-sub</SubscriptionId>
-      <Query>*</Query>
-    </Subscribe>
-  </Body>
-</Envelope>"#,
-        );
-        let addr: SocketAddr = "10.0.1.2:5985".parse().unwrap();
-        let headers = HeaderMap::new();
-
-        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
-            .await
-            .expect("subscription must be handled");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let ct = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert!(
-            ct.contains("application/soap+xml"),
-            "subscription response must have Content-Type application/soap+xml, got: {ct}"
-        );
-
-        // Body must include the subscription id (escaping check).
-        let body_bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let body_str = String::from_utf8_lossy(&body_bytes);
-        assert!(
-            body_str.contains("ct-test-sub"),
-            "subscription body must echo the subscription id"
-        );
-    }
-
-    // ------------------------------------------------------------------ //
-    // handle_wef_request: heartbeat Content-Type                         //
-    // ------------------------------------------------------------------ //
-
-    /// The heartbeat branch of `handle_wef_request` must set
-    /// `Content-Type: application/soap+xml`.
-    #[tokio::test]
-    async fn handle_wef_request_heartbeat_sets_content_type() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"<Envelope>
-  <Body>
-    <Heartbeat>
-      <SubscriptionId>hb-ct-sub</SubscriptionId>
-    </Heartbeat>
-  </Body>
-</Envelope>"#,
-        );
-        let addr: SocketAddr = "10.0.1.3:5985".parse().unwrap();
-        let headers = HeaderMap::new();
-
-        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
-            .await
-            .expect("heartbeat must be handled");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let ct = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert!(
-            ct.contains("application/soap+xml"),
-            "heartbeat response must have Content-Type application/soap+xml, got: {ct}"
-        );
     }
 
     // ------------------------------------------------------------------ //
@@ -4071,13 +3340,10 @@ event_parsers:
     }
 
     #[tokio::test]
-    async fn create_router_syslog_and_wef_routes_do_not_decompress_gzip() {
+    async fn create_router_syslog_route_does_not_decompress_gzip() {
         let router = router_with_hec_and_otlp().await;
         let syslog = "<134>Jan 15 10:30:45 dns-server named[1234]: query";
-        let events = r#"<Envelope><Body><Events><Event><System><Provider>Security</Provider>
-            <EventID>4624</EventID><Level>4</Level><TimeCreated>2024-01-01T00:00:00Z</TimeCreated>
-            <Computer>host</Computer></System></Event></Events></Body></Envelope>"#;
-        for (uri, valid) in [("/syslog", syslog), ("/wsman/events", events)] {
+        for (uri, valid) in [("/syslog", syslog)] {
             // Control: the plain payload is accepted.
             let plain = post_status(&router, uri, &[], valid.as_bytes().to_vec()).await;
             assert_eq!(plain, StatusCode::OK, "{uri} control");

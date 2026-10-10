@@ -244,8 +244,12 @@ pub fn parse(xml: &str) -> anyhow::Result<SoapRequest> {
                             }
                         }
                         Some(Field::Action) => req.action_uri = trimmed,
-                        Some(Field::MessageId) => req.message_id = Some(c.text),
-                        Some(Field::Address) => req.reply_to = Some(trimmed),
+                        Some(Field::MessageId) => {
+                            req.message_id = (!trimmed.is_empty()).then_some(c.text)
+                        }
+                        Some(Field::Address) => {
+                            req.reply_to = (!trimmed.is_empty()).then_some(trimmed)
+                        }
                         Some(Field::MachineId) => req.machine_id = Some(trimmed),
                         Some(Field::Identifier) => {
                             req.identifier.get_or_insert(trimmed);
@@ -273,6 +277,9 @@ pub fn parse(xml: &str) -> anyhow::Result<SoapRequest> {
     }
     if !seen_root {
         bail!("not a SOAP envelope");
+    }
+    if depth != 0 {
+        bail!("truncated SOAP envelope");
     }
     req.action = classify(&req.action_uri);
     if req.action != WefAction::Events {
@@ -386,6 +393,38 @@ mod tests {
             bookmark: None,
             events: vec![],
         }
+    }
+
+    const MINI_NS: &str = "xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" \
+         xmlns:a=\"http://schemas.xmlsoap.org/ws/2004/08/addressing\"";
+
+    #[test]
+    fn test_parse_truncated_envelope_errors() {
+        let xml = format!("<s:Envelope {MINI_NS}><s:Header><a:MessageID>uuid:1</a:MessageID>");
+        assert!(parse(&xml).is_err());
+    }
+
+    #[test]
+    fn test_parse_empty_reply_to_address_is_none() {
+        let xml = format!(
+            "<s:Envelope {MINI_NS}><s:Header><a:MessageID>uuid:1</a:MessageID>\
+             <a:ReplyTo><a:Address></a:Address></a:ReplyTo></s:Header><s:Body/></s:Envelope>"
+        );
+        let req = parse(&xml).unwrap();
+        assert_eq!(req.reply_to, None);
+        let ack = decode(&build_ack(&req).unwrap());
+        assert!(ack.contains(ADDRESS_ANONYMOUS));
+    }
+
+    #[test]
+    fn test_parse_empty_message_id_is_none_and_ack_errors() {
+        let xml = format!(
+            "<s:Envelope {MINI_NS}><s:Header><a:MessageID>  </a:MessageID></s:Header>\
+             <s:Body/></s:Envelope>"
+        );
+        let req = parse(&xml).unwrap();
+        assert_eq!(req.message_id, None);
+        assert!(build_ack(&req).is_err());
     }
 
     fn decode(bytes: &[u8]) -> String {
