@@ -64,6 +64,22 @@ pub struct Subscription {
     pub query_xml: String,
 }
 
+/// True for a pre-subscription WEF config: WEF settings are present (a sink, a collector URL
+/// or `allow_unauthenticated`) but no `[[wef.subscriptions]]`, so `/wsman` now answers 404.
+pub fn wef_legacy_config_without_subscriptions(wef: &crate::config::WefConfig) -> bool {
+    wef.subscriptions.is_empty()
+        && (wef.s3.is_some()
+            || wef.local.is_some()
+            || wef.collector_url.is_some()
+            || wef.allow_unauthenticated)
+}
+
+/// True when Kerberos is configured but TLS makes `/wsman` use the client-certificate
+/// topology, which does not apply Kerberos.
+pub fn kerberos_ignored_under_tls(tls_enabled: bool, kerberos_available: bool) -> bool {
+    tls_enabled && kerberos_available
+}
+
 /// Checks the deployment-topology matrix in one place.
 ///
 /// `kerberos_available` = `security.kerberos.enabled && cfg!(feature = "kerberos-auth")`.
@@ -105,6 +121,12 @@ pub fn validate_wef_topology(
         })?;
         if !url.starts_with("https://") {
             bail!("wef.collector_url must use https:// when TLS is enabled");
+        }
+        if kerberos_ignored_under_tls(tls.enabled, kerberos_available) {
+            tracing::warn!(
+                "Kerberos is enabled but TLS is also enabled: Kerberos is not applied to \
+                 /wsman when TLS is enabled (clients authenticate with client certificates)"
+            );
         }
         (WefTopology::HttpsMutual, ca_thumbprints(ca)?)
     } else {
@@ -451,6 +473,33 @@ pub fn ca_thumbprints(pem_path: &Path) -> anyhow::Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_wef_legacy_config_detected_without_subscriptions() {
+        use crate::config::WefConfig;
+        assert!(!wef_legacy_config_without_subscriptions(
+            &WefConfig::default()
+        ));
+        let c = WefConfig {
+            collector_url: Some("http://x".into()),
+            ..Default::default()
+        };
+        assert!(wef_legacy_config_without_subscriptions(&c));
+        let c = WefConfig {
+            allow_unauthenticated: true,
+            ..Default::default()
+        };
+        assert!(wef_legacy_config_without_subscriptions(&c));
+        let local: WefConfig = toml::from_str("[local]\ndirectory = \"/tmp/x\"").unwrap();
+        assert!(wef_legacy_config_without_subscriptions(&local));
+    }
+
+    #[test]
+    fn test_kerberos_ignored_under_tls_only_when_both_enabled() {
+        assert!(kerberos_ignored_under_tls(true, true));
+        assert!(!kerberos_ignored_under_tls(true, false));
+        assert!(!kerberos_ignored_under_tls(false, true));
+    }
     use crate::config::TlsConfig;
     use quick_xml::NsReader;
     use quick_xml::events::Event;

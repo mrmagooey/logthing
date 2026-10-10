@@ -417,6 +417,13 @@ impl Server {
         )?
         .map(Arc::new);
         if wef_runtime.is_none() {
+            if crate::wef::subscription::wef_legacy_config_without_subscriptions(&config.wef) {
+                warn!(
+                    "WEF is configured ([wef.s3]/[wef.local]/collector_url/allow_unauthenticated) \
+                     but no [[wef.subscriptions]] are declared: /wsman/** returns 404. \
+                     Subscriptions must now be declared explicitly; see docs/wef.md"
+                );
+            }
             info!(
                 "WEF subscription manager disabled: no [[wef.subscriptions]] configured; \
                  /wsman/** returns 404"
