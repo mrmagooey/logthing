@@ -465,6 +465,47 @@ mod tests {
         assert_eq!(n, 1);
     }
 
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_extract_events_malformed_batch_logs_once_and_sanitizes_controls() {
+        let ctl = "<Event><System><EventID>7</EventID></System>\
+                   <EventData><Data Name=\"a\">p\u{1}q\u{FFFE}r</Data></EventData></Event>";
+        let bad = "<Event><System><EventID>".to_string();
+        let payloads = [bad.clone(), ctl.to_string(), bad.clone(), golden(0), bad];
+        let buf = LogBuf::default();
+        let sink = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .finish();
+        let evs = tracing::subscriber::with_default(sub, || extract_events(&payloads, "h", "s"));
+        // 3 malformed events are skipped, the 2 good ones survive in order.
+        assert_eq!(evs.len(), 2);
+        assert!(
+            evs.iter()
+                .all(|e| !e.raw_xml.contains(['\u{1}', '\u{FFFE}']))
+        );
+        assert_eq!(
+            evs[0].parsed.as_ref().unwrap().data.as_ref().unwrap()["a"],
+            "p\\u{0001}q\\u{FFFE}r"
+        );
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(log.matches("XML parsing failed").count(), 1, "{log}");
+        assert!(log.contains("3 event(s)"), "{log}");
+    }
+
     #[test]
     fn test_extract_events_sets_subscription_id() {
         let evs = extract_events(&[golden(0)], "host1", "sub-a");
