@@ -61,6 +61,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "wef_multipart"
+path = "fuzz_targets/wef_multipart.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "zeek"
 path = "fuzz_targets/zeek.rs"
 test = false

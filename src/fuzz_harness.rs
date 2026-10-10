@@ -167,6 +167,12 @@ pub fn wef_sldc(data: &[u8]) -> usize {
     crate::wef::sldc::decompress(data, 4 << 20).map_or(0, |v| v.len())
 }
 
+/// Kerberos/SPNEGO encrypted multipart envelope: returns header + data length, 0 on a
+/// parse error.
+pub fn wef_multipart(data: &[u8]) -> usize {
+    crate::wef::multipart::parse(data).map_or(0, |p| p.header.len() + p.data.len())
+}
+
 /// NDJSON listener framing: `\n`-split, trailing `\r` stripped, empty lines
 /// skipped, non-UTF-8 lines dropped (the listeners count and skip them).
 fn ndjson_lines(data: &[u8]) -> impl Iterator<Item = &str> {
@@ -384,6 +390,41 @@ mod tests {
             ("copies.bin", c(b"abcabcabcabcabc")),
             ("long_run.bin", c(&[b'z'; 700])),
             ("utf16_soap.bin", c(&encode_utf16le_bom(&soap))),
+        ];
+        for (name, bytes) in seeds {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_wef_multipart_every_seed_parses() {
+        for (path, bytes) in seeds("wef_multipart") {
+            assert!(
+                wef_multipart(&bytes) > 0,
+                "{} did not parse",
+                path.display()
+            );
+        }
+        assert_eq!(wef_multipart(&[]), 0);
+        assert_eq!(wef_multipart(b"--Encrypted Boundary\r\n"), 0);
+    }
+
+    #[test]
+    #[ignore = "regenerates fuzz/seeds/wef_multipart/*.bin"]
+    fn write_wef_multipart_seeds() {
+        use crate::wef::multipart::{EncProtocol, build};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/seeds/wef_multipart");
+        std::fs::create_dir_all(&dir).unwrap();
+        let seeds = [
+            (
+                "kerberos.bin",
+                build(EncProtocol::Kerberos, 100, &[0x60; 60], &[7; 120]),
+            ),
+            (
+                "spnego.bin",
+                build(EncProtocol::Spnego, 100, &[0x60; 16], b"x\r\n--Enc\r\ny"),
+            ),
+            ("empty_data.bin", build(EncProtocol::Kerberos, 0, b"h", b"")),
         ];
         for (name, bytes) in seeds {
             std::fs::write(dir.join(name), bytes).unwrap();

@@ -17,6 +17,7 @@ fn targets() -> Vec<(&'static str, Target)> {
         ("wef_event", fuzz_harness::wef_event),
         ("wef_envelope", fuzz_harness::wef_envelope),
         ("wef_sldc", fuzz_harness::wef_sldc),
+        ("wef_multipart", fuzz_harness::wef_multipart),
         ("zeek", fuzz_harness::zeek),
         ("suricata", fuzz_harness::suricata),
         ("hec", fuzz_harness::hec),
