@@ -69,11 +69,30 @@ jobs:
     - name: Build (kerberos-auth feature)
       run: cargo build --features kerberos-auth --verbose
 
+    - name: Start test KDC (docker)
+      # The script prints `export K=V K=V ...`; convert to GITHUB_ENV lines.
+      # tests/wef_kerberos_integration.rs hard-fails under CI=true if these
+      # are missing, so the real-Kerberos test cannot silently skip.
+      shell: bash
+      run: |
+        out="$(scripts/kdc-test-env.sh up)"
+        vars="$(printf '%s\n' "$out" | sed 's/^export //' | tr ' ' '\n')"
+        if printf '%s\n' "$vars" | grep -qvE '^[A-Z_0-9]+='; then
+          echo "unexpected kdc-test-env.sh output:" >&2
+          printf '%s\n' "$out" >&2
+          exit 1
+        fi
+        printf '%s\n' "$vars" >> "$GITHUB_ENV"
+
     - name: Run tests (kerberos-auth feature)
       run: cargo test --features kerberos-auth --verbose
 
     - name: Clippy (kerberos-auth feature)
       run: cargo clippy --features kerberos-auth -- -D warnings
+
+    - name: Stop test KDC
+      if: always()
+      run: scripts/kdc-test-env.sh down
 
   build-pprof:
     runs-on: ubuntu-latest

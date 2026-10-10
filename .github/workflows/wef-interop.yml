@@ -1,0 +1,40 @@
+name: WEF interop
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+
+jobs:
+  interop:
+    # Windows-shaped WEF clients (emulator) vs logthing over Kerberos and
+    # client-cert HTTPS, all in docker compose. The Rust image build is long.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run WEF interop e2e
+      run: tests/e2e/simulation-environment/run.sh wef-interop
+
+  emulator-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install emulator (test extras, no kerberos extra)
+      working-directory: tests/e2e/simulation-environment/wef-client-emulator
+      run: |
+        python -m venv .venv
+        .venv/bin/pip install -e '.[test]'
+
+    - name: Run emulator unit tests
+      working-directory: tests/e2e/simulation-environment/wef-client-emulator
+      run: .venv/bin/pytest tests
