@@ -754,11 +754,9 @@ mod tests {
     fn measured_wef_event_bytes_counts_the_pointee_not_the_pointer() {
         use crate::models::{EventLevel, ParsedEvent, WindowsEvent};
         // `parsed` must be `Some(..)`, not `None`: on the real ingest path
-        // `WefParser::parse_single_event` always attaches a `ParsedEvent` --
-        // `parse_event_data` has no `Err` path that fires in practice,
-        // malformed XML just truncates the read loop and still returns
-        // `Ok`. A `parsed: None` fixture measures a record shape that
-        // essentially never reaches the channel.
+        // `wef::event::extract_events` always attaches a `ParsedEvent` (a payload
+        // that fails to parse is dropped before the channel). A `parsed: None` fixture
+        // measures a record shape that essentially never reaches the channel.
         let parsed = ParsedEvent {
             provider: "Microsoft-Windows-Security-Auditing".to_string(),
             event_id: 4624,
@@ -770,8 +768,7 @@ mod tests {
             event_record_id: 918273645,
             process_id: Some(656),
             thread_id: Some(29384),
-            // Always empty on the real path: `parse_event_data` never writes
-            // to `channel` (src/protocol/mod.rs:307-323).
+            // Left empty in this fixture.
             channel: String::new(),
             computer: "dc01.corp.example".to_string(),
             security_user_id: None,

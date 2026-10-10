@@ -1,0 +1,8 @@
+# Override for `run.sh wef-interop --samba`: swaps the MIT kdc service for a Samba AD DC that
+# keeps the same service name, alias (kdc.example.com), realm and keytab contract.
+services:
+  kdc:
+    build:
+      context: ./samba-ad
+    image: logthing-test-samba-ad:latest
+    hostname: kdc.example.com

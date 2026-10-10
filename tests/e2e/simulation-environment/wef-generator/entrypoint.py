@@ -1,8 +1,11 @@
 import json
 import os
+import re
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import requests
 import yaml
@@ -21,6 +24,16 @@ ENV_EXPECTED_EVENT_IDS = [
     if event.strip()
 ]
 TIMEOUT = int(os.environ.get("WEF_TIMEOUT_SECS", "60"))
+MACHINE_ID = os.environ.get("WEF_MACHINE_ID", "TEST-HOST")
+SOAP_HEADERS = {"Content-Type": "application/soap+xml;charset=UTF-16"}
+NAMESPACES = (
+    'xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+    'xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" '
+    'xmlns:n="http://schemas.xmlsoap.org/ws/2004/09/enumeration" '
+    'xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd" '
+    'xmlns:p="http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd"'
+)
+ANONYMOUS = "http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous"
 
 
 def wait_for_health():
@@ -36,14 +49,6 @@ def wait_for_health():
             pass
         time.sleep(2)
     raise SystemExit("WEF server did not become healthy in time")
-
-
-def build_events_payload():
-    if PARSER_DIR and PARSER_DIR.exists():
-        return build_from_parsers(PARSER_DIR)
-    if EVENTS_FIXTURE.exists():
-        return EVENTS_FIXTURE.read_text(), []
-    raise SystemExit("No parser directory or fixture available for generating events")
 
 
 def build_from_parsers(directory: Path):
@@ -74,8 +79,7 @@ def build_from_parsers(directory: Path):
         events_xml.append(build_event_xml(event_id, field_values))
         event_ids.append(str(event_id))
 
-    body = wrap_events(events_xml)
-    return body, event_ids
+    return events_xml, event_ids
 
 
 def sample_value(event_id: int, field_name: str, field_type: str) -> str:
@@ -162,17 +166,17 @@ def sample_value(event_id: int, field_name: str, field_type: str) -> str:
 def build_event_xml(event_id: int, data_pairs):
     timestamp = datetime.now(timezone.utc).isoformat()
     event_data = "\n".join(
-        f'        <Data Name="{name}">{value}</Data>' for name, value in data_pairs
+        f'        <Data Name="{name}">{escape(value)}</Data>' for name, value in data_pairs
     )
     return f"""
     <Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\">
       <System>
-        <Provider Name=\"Microsoft-Windows-Security-Auditing\">Microsoft-Windows-Security-Auditing</Provider>
+        <Provider Name=\"Microsoft-Windows-Security-Auditing\"/>
         <EventID>{event_id}</EventID>
         <Level>0</Level>
         <Task>12544</Task>
         <Keywords>0x8020000000000000</Keywords>
-        <TimeCreated SystemTime=\"{timestamp}\">{timestamp}</TimeCreated>
+        <TimeCreated SystemTime=\"{timestamp}\"/>
         <EventRecordID>{event_id}</EventRecordID>
         <Channel>Security</Channel>
         <Computer>TEST-HOST</Computer>
@@ -184,27 +188,98 @@ def build_event_xml(event_id: int, data_pairs):
     """.strip()
 
 
-def wrap_events(events_xml):
-    inner = "\n".join(events_xml)
-    return f"""<?xml version=\"1.0\" encoding=\"utf-8\"?>
-<Envelope>
-  <Body>
-    <Events>
-{inner}
-    </Events>
-  </Body>
-</Envelope>
-"""
+def utf16(text: str) -> bytes:
+    """UTF-16LE with a BOM, the encoding Windows clients send."""
+    return b"\xff\xfe" + text.encode("utf-16-le")
+
+
+def new_message_id() -> str:
+    return f"uuid:{str(uuid.uuid4()).upper()}"
+
+
+def enumerate_envelope() -> str:
+    return (
+        f"<s:Envelope {NAMESPACES}><s:Header>"
+        f"<a:To>{WEF_ENDPOINT}/wsman/SubscriptionManager/WEC</a:To>"
+        '<w:ResourceURI s:mustUnderstand="true">'
+        "http://schemas.microsoft.com/wbem/wsman/1/SubscriptionManager/Subscription"
+        "</w:ResourceURI>"
+        '<m:MachineID xmlns:m="http://schemas.microsoft.com/wbem/wsman/1/machineid" '
+        f's:mustUnderstand="false">{MACHINE_ID}</m:MachineID>'
+        f'<a:ReplyTo><a:Address s:mustUnderstand="true">{ANONYMOUS}</a:Address></a:ReplyTo>'
+        '<a:Action s:mustUnderstand="true">'
+        "http://schemas.xmlsoap.org/ws/2004/09/enumeration/Enumerate</a:Action>"
+        '<w:MaxEnvelopeSize s:mustUnderstand="true">512000</w:MaxEnvelopeSize>'
+        f"<a:MessageID>{new_message_id()}</a:MessageID>"
+        "<w:OperationTimeout>PT60.000S</w:OperationTimeout></s:Header>"
+        "<s:Body><n:Enumerate><w:OptimizeEnumeration/><w:MaxElements>32000</w:MaxElements>"
+        "</n:Enumerate></s:Body></s:Envelope>"
+    )
+
+
+def events_envelope(delivery_url: str, sub_id: str, events_xml, bookmark_id: int = 1) -> str:
+    """Golden-shaped Events delivery envelope; each event rides in its own CDATA w:Event."""
+    events = "".join(
+        '<w:Event Action="http://schemas.dmtf.org/wbem/wsman/1/wsman/Event">'
+        f"<![CDATA[{e}]]></w:Event>"
+        for e in events_xml
+    )
+    return (
+        f"<s:Envelope {NAMESPACES}><s:Header><a:To>{delivery_url}</a:To>"
+        '<m:MachineID xmlns:m="http://schemas.microsoft.com/wbem/wsman/1/machineid" '
+        f's:mustUnderstand="false">{MACHINE_ID}</m:MachineID>'
+        f'<a:ReplyTo><a:Address s:mustUnderstand="true">{ANONYMOUS}</a:Address></a:ReplyTo>'
+        '<a:Action s:mustUnderstand="true">'
+        "http://schemas.dmtf.org/wbem/wsman/1/wsman/Events</a:Action>"
+        f"<a:MessageID>{new_message_id()}</a:MessageID>"
+        f'<p:OperationID s:mustUnderstand="false">{new_message_id()}</p:OperationID>'
+        '<p:SequenceId s:mustUnderstand="false">1</p:SequenceId>'
+        "<w:OperationTimeout>PT60.000S</w:OperationTimeout>"
+        '<e:Identifier xmlns:e="http://schemas.xmlsoap.org/ws/2004/08/eventing" '
+        f's:mustUnderstand="true">{sub_id}</e:Identifier>'
+        f'<w:Bookmark><BookmarkList><Bookmark Channel="Security" RecordId="{bookmark_id}" '
+        'IsCurrent="true"/></BookmarkList></w:Bookmark><w:AckRequested/></s:Header>'
+        f"<s:Body><w:Events>{events}</w:Events></s:Body></s:Envelope>"
+    )
+
+
+def decode_response(content: bytes) -> str:
+    if content.startswith(b"\xff\xfe"):
+        return content[2:].decode("utf-16-le")
+    return content.decode("utf-8")
+
+
+def learn_delivery_url() -> str:
+    """Enumerate, as a Windows client does, to learn the delivery URL from NotifyTo."""
+    resp = requests.post(
+        f"{WEF_ENDPOINT}/wsman/SubscriptionManager/WEC",
+        data=utf16(enumerate_envelope()),
+        headers=SOAP_HEADERS,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    text = decode_response(resp.content)
+    match = re.search(r"https?://[^<\s]*/wsman/subscriptions/[0-9A-Fa-f-]{36}", text)
+    if not match:
+        raise SystemExit(f"Enumerate response carried no delivery URL: {text[:300]}")
+    return match.group(0)
 
 
 def send_events():
-    body, auto_event_ids = build_events_payload()
-    url = f"{WEF_ENDPOINT}/wsman/events"
-    headers = {"Content-Type": "application/soap+xml"}
-    resp = requests.post(url, data=body.encode("utf-8"), headers=headers, timeout=30)
+    url = learn_delivery_url()
+    sub_id = url.rsplit("/", 1)[1]
+    print(f"Learned delivery URL {url}")
+    if PARSER_DIR and PARSER_DIR.exists():
+        events_xml, event_ids = build_from_parsers(PARSER_DIR)
+        body = events_envelope(url, sub_id, events_xml)
+    elif EVENTS_FIXTURE.exists():
+        body, event_ids = EVENTS_FIXTURE.read_text(), []
+    else:
+        raise SystemExit("No parser directory or fixture available for generating events")
+    resp = requests.post(url, data=utf16(body), headers=SOAP_HEADERS, timeout=30)
     resp.raise_for_status()
-    print("Sent generated WEF events", resp.text)
-    return auto_event_ids
+    print("Sent generated WEF events", resp.status_code)
+    return event_ids
 
 
 def wait_for_stats(expected_ids):

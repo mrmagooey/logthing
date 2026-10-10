@@ -6,6 +6,40 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
+### Added
+
+- WEF subscription manager for real Windows source-initiated clients: `Enumerate` on
+  `/wsman/SubscriptionManager/WEC` serves the subscriptions configured under `wef.*`
+  (`wef.collector_url`, `wef.allow_unauthenticated`, `wef.bookmark_capacity`,
+  `[[wef.subscriptions]]`), and delivery endpoints at `/wsman/subscriptions/<uuid>` Ack events and
+  heartbeats. Per-(machine, subscription) bookmarks are kept in memory and replayed on Enumerate.
+- UTF-16 request/response bodies and SLDC-compressed event batches.
+- Per-connection Kerberos for `/wsman/**` (`Authorization: Kerberos` and `Negotiate`) with
+  MS-WSMV message encryption.
+- HTTPS client-certificate topology for WEF (`tls.require_client_cert` with `tls.ca_file`).
+- Metrics `wef_requests_total{action}` and `wef_auth_failures_total{reason}`.
+- Windows client emulator and a Docker KDC test environment (`scripts/kdc-test-env.sh`) for
+  testing the WEF receiver without Windows.
+- `docs/wef.md` documents GPO client setup, the two topologies and known limits.
+- `/wsman` request bodies larger than 4 MiB are rejected with `413` in all topologies.
+- Tests: a Docker `wef-interop` end-to-end scenario (`run.sh wef-interop`, MIT KDC plus the
+  Windows client emulator over Kerberos-HTTP and HTTPS client certificates) and a real-Kerberos
+  integration test (`tests/wef_kerberos_integration.rs`, needs `scripts/kdc-test-env.sh`).
+
+### Changed
+
+- WEF event fields are now extracted fully from the event XML.
+- Startup fails when `[[wef.subscriptions]]` are configured without any client authentication,
+  unless `wef.allow_unauthenticated = true`.
+
+### Removed
+
+- The legacy bare-`<Events>` ingest. `POST /wsman/events` and `POST /wsman/subscriptions` are no
+  longer ingest endpoints: they are handled as subscription-manager requests, so a bare
+  `<Events>` body (no SOAP envelope) gets `400`. Any other `/wsman/subscriptions/<path>` that is
+  not `<uuid>` or `<uuid>/<number>` gets `404`.
+- The old `kerberos-test` simulation container, replaced by the `wef-interop` scenario.
+
 ## [0.22.1] - 2026-10-08
 
 ### Fixed

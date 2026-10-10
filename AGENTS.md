@@ -21,10 +21,14 @@ This document explains how automated or semi-automated agents should interact wi
 | Lint check | `cargo clippy -- -D warnings` |
 | Coverage report | `scripts/run_coverage.sh` |
 | E2E tests | `tests/e2e/simulation-environment/run.sh` (requires Docker) |
+| WEF interop E2E | `tests/e2e/simulation-environment/run.sh wef-interop` (requires Docker; MIT KDC + Windows WEF client emulator over Kerberos-HTTP and HTTPS client certs) |
 | Fuzz (nightly) | `scripts/fuzz.sh <target|all> [secs]` |
 | Harness real-server test | `cargo build --release --bin logthing && cargo build --release -p loadgen && cargo test --test max_ingest_rate_harness_integration -- --ignored --test-threads=1` |
 | Committer tests | `committer/.venv/bin/pytest committer/tests --ignore=committer/tests/e2e` |
 | Committer E2E test | `committer/tests/e2e/run.sh` (requires Docker) |
+| Test KDC (real Kerberos) | `eval "$(scripts/kdc-test-env.sh up)"` ... `scripts/kdc-test-env.sh down` (requires Docker; exports `LOGTHING_TEST_KRB5_*`) |
+| WEF client emulator tests | `tests/e2e/simulation-environment/wef-client-emulator/.venv/bin/pytest tests/e2e/simulation-environment/wef-client-emulator/tests` |
+| WEF Kerberos integration test | `eval "$(scripts/kdc-test-env.sh up)" && cargo test --features kerberos-auth --test wef_kerberos_integration` (requires Docker) |
 | Object Lock integration test | `MINIO_ENDPOINT=http://host:9000 [MINIO_ACCESS_KEY=.. MINIO_SECRET_KEY=..] cargo test --test object_lock_integration` (skips when `MINIO_ENDPOINT` is unset) |
 | Analytics unit tests | `deploy/analytics/.venv/bin/pytest -c deploy/analytics/tests/pytest.ini deploy/analytics/tests/unit` |
 | Analytics integration test | `deploy/analytics/.venv/bin/pytest -c deploy/analytics/tests/pytest.ini deploy/analytics/tests/integration -m integration` (requires Docker; Trino tests need AVX2 or `TRINO_IMAGE`) |
@@ -147,11 +151,11 @@ src/
   middleware/   # HTTP middleware
   models/       # Data structures
   parser/       # Event parsing logic
-  protocol/     # WEF protocol handlers
   redaction/    # HEC/OTLP drop/hash/mask rules
   server/       # HTTP server implementation (OTLP handler + mapper in otlp.rs)
   stats/        # Metrics and statistics
   syslog/       # Syslog listener
+  wef/          # WEF wire protocol: SOAP, SLDC, Kerberos multipart, subscriptions, bookmarks
   zeek/         # Zeek NDJSON ingestion
 committer/  # Python Iceberg committer (separate image)
 deploy/analytics/  # Compose + Helm analytics stack (Garage, Lakekeeper, Trino, Metabase)

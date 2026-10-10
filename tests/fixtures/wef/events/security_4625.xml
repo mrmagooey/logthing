@@ -1,0 +1,46 @@
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Security-Auditing" Guid="54849625-5478-4994-A5BA-3E3B0328C30D">
+    </Provider>
+    <EventID>4625</EventID>
+    <Version>0</Version>
+    <Level>0</Level>
+    <Task>12544</Task>
+    <Opcode>0</Opcode>
+    <Keywords>0x8010000000000000</Keywords>
+    <TimeCreated SystemTime="2016-06-29T15:24:36.686000Z">
+    </TimeCreated>
+    <EventRecordID>319457832</EventRecordID>
+    <Correlation>
+    </Correlation>
+    <Execution ProcessID="768" ThreadID="2764">
+    </Execution>
+    <Channel>Security</Channel>
+    <Computer>temporal</Computer>
+    <Security>
+    </Security>
+  </System>
+  <EventData>
+    <Data Name="SubjectUserSid">S-1-5-18</Data>
+    <Data Name="SubjectUserName">TEMPORAL$</Data>
+    <Data Name="SubjectDomainName">WORKGROUP</Data>
+    <Data Name="SubjectLogonId">0x3e7</Data>
+    <Data Name="TargetUserSid">S-1-0-0</Data>
+    <Data Name="TargetUserName">Administrator</Data>
+    <Data Name="TargetDomainName">TEMPORAL</Data>
+    <Data Name="Status">0xc000006d</Data>
+    <Data Name="FailureReason">%%2313</Data>
+    <Data Name="SubStatus">0xc000006a</Data>
+    <Data Name="LogonType">10</Data>
+    <Data Name="LogonProcessName">User32 </Data>
+    <Data Name="AuthenticationPackageName">Negotiate</Data>
+    <Data Name="WorkstationName">TEMPORAL</Data>
+    <Data Name="TransmittedServices">-</Data>
+    <Data Name="LmPackageName">-</Data>
+    <Data Name="KeyLength">0</Data>
+    <Data Name="ProcessId">0xc38</Data>
+    <Data Name="ProcessName">C:\Windows\System32\winlogon.exe</Data>
+    <Data Name="IpAddress">23.94.153.202</Data>
+    <Data Name="IpPort">60167</Data>
+  </EventData>
+</Event>

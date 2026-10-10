@@ -39,7 +39,6 @@ mod otlp_e2e {
     use axum::{Extension, Router, routing::post};
     use logthing::config::{Config, OtlpConfig};
     use logthing::ingest::IngestState;
-    use logthing::protocol::WefParser;
     use logthing::server::{AppState, handle_otlp_logs};
     use logthing::stats::ThroughputStats;
     use opentelemetry_proto::tonic::collector::logs::v1::{
@@ -95,7 +94,8 @@ mod otlp_e2e {
             config: Arc::new(RwLock::new(config)),
             throughput: Arc::new(ThroughputStats::new()),
             wef_cardinality_watchers: Vec::new(),
-            parser: WefParser::new(),
+            wef: None,
+            bookmarks: std::sync::Arc::new(logthing::wef::bookmarks::BookmarkStore::new(16)),
             event_parser: None,
             parquet_s3_sender: None,
             parquet_local_sender: None,
@@ -288,7 +288,8 @@ mod otlp_e2e {
             config: Arc::new(RwLock::new(config)),
             throughput: Arc::new(ThroughputStats::new()),
             wef_cardinality_watchers: Vec::new(),
-            parser: WefParser::new(),
+            wef: None,
+            bookmarks: std::sync::Arc::new(logthing::wef::bookmarks::BookmarkStore::new(16)),
             event_parser: None,
             parquet_s3_sender: None,
             parquet_local_sender: None,

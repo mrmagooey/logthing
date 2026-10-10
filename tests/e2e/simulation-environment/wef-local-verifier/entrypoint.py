@@ -28,6 +28,10 @@ import pyarrow.parquet as pq
 WEF_LOCAL_DIR = os.environ.get("WEF_LOCAL_DIR", "/var/log/wef-local")
 TIMEOUT = int(os.environ.get("E2E_TIMEOUT_SECS", "60"))
 MIN_ROWS = int(os.environ.get("EXPECTED_EVENT_TOTAL", "5"))
+# EXPECTED_EXACT=1: the row count must equal EXPECTED_EVENT_TOTAL (not just reach it) and every
+# row's event_data must carry a non-empty provider, a non-zero event_id and a non-zero
+# event_record_id (the wef-interop run, where the exact number sent is known).
+EXACT = os.environ.get("EXPECTED_EXACT") == "1"
 
 ICEBERG_LOCAL_DIR = os.environ.get("ICEBERG_LOCAL_DIR", "/var/log/iceberg-local")
 
@@ -54,6 +58,25 @@ def scan_dir():
         total_rows += table.num_rows
         columns |= set(table.schema.names)
     return total_rows, columns, len(files)
+
+
+def check_rows():
+    """Return a list of problems with the parsed fields of every WEF row (strict mode)."""
+    problems = []
+    pattern = os.path.join(WEF_LOCAL_DIR, "event_type=*", "**", "*.parquet")
+    for path in glob.glob(pattern, recursive=True):
+        table = pq.read_table(path)
+        for row in table.to_pylist():
+            parsed = (json.loads(row["event_data"]) or {}).get("parsed") or {}
+            if not parsed.get("provider"):
+                problems.append(f"{path}: empty provider")
+            if not parsed.get("event_id"):
+                problems.append(f"{path}: zero/missing event_id")
+            if not parsed.get("event_record_id"):
+                problems.append(f"{path}: zero/missing event_record_id")
+            if not row["event_id"]:
+                problems.append(f"{path}: zero event_id column")
+    return problems
 
 
 def scan_iceberg_descriptors():
@@ -93,6 +116,9 @@ def main():
         total_rows, columns, n = scan_dir()
         descriptor_path, descriptor = scan_iceberg_descriptors()
         if total_rows >= MIN_ROWS and descriptor is not None:
+            if EXACT:
+                time.sleep(6)  # let any surplus rows land before the exact count is taken
+                total_rows, columns, n = scan_dir()
             break
         time.sleep(3)
 
@@ -110,6 +136,15 @@ def main():
             file=sys.stderr,
         )
         sys.exit(1)
+    if EXACT:
+        if total_rows != MIN_ROWS:
+            print(f"ERROR: expected exactly {MIN_ROWS} rows, got {total_rows}", file=sys.stderr)
+            sys.exit(1)
+        problems = check_rows()
+        if problems:
+            print("ERROR: bad rows: " + "; ".join(problems[:10]), file=sys.stderr)
+            sys.exit(1)
+        print(f"OK: exactly {total_rows} rows, all with provider/event_id/event_record_id")
     if descriptor is None:
         print(
             f"ERROR: no valid Iceberg descriptor JSON found under {ICEBERG_LOCAL_DIR} "

@@ -1,5 +1,8 @@
+pub mod conn;
+pub mod kerberos;
 #[cfg(feature = "otlp")]
 pub mod otlp;
+mod wef_routes;
 
 use crate::config::Config;
 use crate::forwarding::drop_log::{DropKind, DropSite};
@@ -9,9 +12,6 @@ use crate::ingest::handlers::{handle_hec_event, handle_hec_raw, handle_ndjson};
 use crate::middleware::{IpWhitelist, ip_whitelist_middleware};
 use crate::models::WindowsEvent;
 use crate::parser::GenericEventParser;
-use crate::protocol::{
-    WefMessage, WefParser, create_heartbeat_response, create_subscription_response,
-};
 use crate::stats::cardinality::CardinalityWatcher;
 use crate::stats::{ThroughputSnapshot, ThroughputStats};
 use crate::syslog::SyslogMessage;
@@ -38,7 +38,7 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Handle onto the installed Prometheus recorder, published so profiling can
 /// read counters to verify a sampling window overlapped real traffic.
@@ -303,7 +303,11 @@ pub struct AppState {
     /// startup (`main.rs`) — this is never filtered by source at request
     /// time. Empty unless an operator configured a wef watch.
     pub wef_cardinality_watchers: Vec<Arc<CardinalityWatcher>>,
-    pub parser: WefParser,
+    /// WEF subscription manager runtime; `None` (every `/wsman/**` request is 404) when no
+    /// `[[wef.subscriptions]]` are configured.
+    pub wef: Option<Arc<crate::wef::subscription::WefRuntime>>,
+    /// Last bookmark acknowledged per (machine, subscription), replayed on re-enumeration.
+    pub bookmarks: Arc<crate::wef::bookmarks::BookmarkStore>,
     pub event_parser: Option<GenericEventParser>,
     pub parquet_s3_sender: Option<
         crate::forwarding::buffered_writer::ParquetWriterHandle<
@@ -341,9 +345,21 @@ pub struct Server {
     /// the identical allowlist. `security.allowed_ips` is restart-only —
     /// there is no live-reload path.
     ip_whitelist: IpWhitelist,
+    /// GSS acceptor factory for `/wsman/**` Kerberos auth; `None` builds the libgssapi one
+    /// from `security.kerberos` (only available with the `kerberos-auth` feature).
+    gss_factory: Option<Arc<dyn kerberos::GssAcceptorFactory>>,
 }
 
 impl Server {
+    /// Replace the GSS backend used for `/wsman/**` Kerberos authentication.
+    ///
+    /// Testing hook; production uses the libgssapi factory.
+    #[doc(hidden)]
+    pub fn with_gss_factory(mut self, factory: Arc<dyn kerberos::GssAcceptorFactory>) -> Self {
+        self.gss_factory = Some(factory);
+        self
+    }
+
     /// Create a new logthing server instance.
     ///
     /// Initializes all components including the parser and optional
@@ -395,6 +411,24 @@ impl Server {
         if let Some(cfg) = config.spool.as_ref() {
             crate::forwarding::spool::init_global(cfg)?;
         }
+        let wef_runtime = crate::wef::subscription::validate_wef_topology(
+            &config,
+            config.security.kerberos.enabled && cfg!(feature = "kerberos-auth"),
+        )?
+        .map(Arc::new);
+        if wef_runtime.is_none() {
+            if crate::wef::subscription::wef_legacy_config_without_subscriptions(&config.wef) {
+                warn!(
+                    "WEF is configured ([wef.s3]/[wef.local]/collector_url/allow_unauthenticated) \
+                     but no [[wef.subscriptions]] are declared: /wsman/** returns 404. \
+                     Subscriptions must now be declared explicitly; see docs/wef.md"
+                );
+            }
+            info!(
+                "WEF subscription manager disabled: no [[wef.subscriptions]] configured; \
+                 /wsman/** returns 404"
+            );
+        }
         #[cfg(feature = "kerberos-auth")]
         {
             if config.security.kerberos.enabled {
@@ -415,7 +449,7 @@ impl Server {
                 // 401-ing every request later. We do not keep this
                 // credential around — see `acquire_kerberos_cred` for why a
                 // credential can't be shared across requests with this API.
-                acquire_kerberos_cred(&spn).map_err(|e| {
+                kerberos::acquire_kerberos_cred(&spn).map_err(|e| {
                     anyhow!("Kerberos startup validation failed for SPN {}: {}", spn, e)
                 })?;
 
@@ -538,7 +572,10 @@ impl Server {
             config: Arc::clone(&shared_config),
             throughput,
             wef_cardinality_watchers,
-            parser: WefParser::new(),
+            wef: wef_runtime,
+            bookmarks: Arc::new(crate::wef::bookmarks::BookmarkStore::new(
+                config.wef.bookmark_capacity,
+            )),
             event_parser,
             parquet_s3_sender,
             parquet_local_sender,
@@ -684,6 +721,7 @@ impl Server {
             ingest_state,
             hec_worker_handles,
             ip_whitelist,
+            gss_factory: None,
         })
     }
 
@@ -754,9 +792,10 @@ impl Server {
         // Gap-b: wire graceful shutdown so the axum server stops on SIGTERM,
         // which drops AppState → drops parquet_s3_sender → closes the WEF worker
         // channel → the worker's None arm flushes and exits.
+        // `with_conn_slots`: per-connection auth state for `/wsman/**` Kerberos.
         axum::serve(
             listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
+            conn::with_conn_slots(app.into_make_service_with_connect_info::<SocketAddr>()),
         )
         .with_graceful_shutdown(async move {
             // Wait until the shutdown watch fires (value becomes true).
@@ -813,9 +852,6 @@ impl Server {
 
         // Protected routes (require authentication).
         let mut protected_router = Router::new()
-            .route("/wsman", post(handle_wef_request))
-            .route("/wsman/subscriptions", post(handle_subscription))
-            .route("/wsman/events", post(handle_events))
             // Syslog endpoints
             .route("/syslog", post(handle_syslog_http))
             .route("/syslog/udp", get(handle_syslog_udp_info))
@@ -861,27 +897,41 @@ impl Server {
         // in `src/ingest/handlers.rs`) rather than snapshot at startup. The
         // value is effectively fixed at startup — nothing writes the config at
         // runtime now that the admin interface is read-only.
-        let protected_router = protected_router
-            .layer(axum::Extension(self.ingest_state.clone()))
-            .layer(axum::Extension(self.state.config.clone()))
-            // For routes wrapped by `post_gzip` this limit applies to the DECOMPRESSED stream
-            // (the `Bytes` extractor wraps whatever body the route hands it);
-            // `body_budget_middleware` below charges the WIRE bytes, and `post_gzip`
-            // routes charge the decoded bytes again against the same budget.
-            .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE))
-            .layer(middleware::from_fn_with_state(
-                body_budget,
-                body_budget_middleware,
-            ))
-            .layer(shared_layers)
-            .layer(axum::Extension(ip_whitelist))
-            .with_state(self.state.clone());
+        //
+        // The same stack wraps both the `/wsman/**` routes and everything else, so each
+        // can then get its own authentication layer outermost (see below).
+        let with_common_layers = |router: Router<Arc<AppState>>| -> Router {
+            router
+                .layer(axum::Extension(self.ingest_state.clone()))
+                .layer(axum::Extension(self.state.config.clone()))
+                // For routes wrapped by `post_gzip` this limit applies to the DECOMPRESSED
+                // stream (the `Bytes` extractor wraps whatever body the route hands it);
+                // `body_budget_middleware` below charges the WIRE bytes, and `post_gzip`
+                // routes charge the decoded bytes again against the same budget.
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE))
+                .layer(middleware::from_fn_with_state(
+                    body_budget.clone(),
+                    body_budget_middleware,
+                ))
+                .layer(shared_layers.clone())
+                .layer(axum::Extension(ip_whitelist.clone()))
+                .with_state(self.state.clone())
+        };
+        let protected_router = with_common_layers(protected_router);
+        // Applied innermost (before the common 64 MiB limit) because the innermost
+        // `DefaultBodyLimit` wins; this caps /wsman bodies at 4 MiB in every topology,
+        // not only where the Kerberos layer buffers them.
+        let wsman_router = with_common_layers(wef_routes::routes().layer(
+            axum::extract::DefaultBodyLimit::max(kerberos::WSMAN_MAX_BODY),
+        ));
 
-        // Apply Kerberos only to protected routes
+        // Kerberos wraps the protected routes (outermost). `/wsman/**` instead gets
+        // per-connection auth with message encryption, chosen by deployment topology.
         let protected_router = self.apply_kerberos_layer(protected_router)?;
+        let wsman_router = self.apply_wsman_auth(wsman_router)?;
 
         // Merge public and protected routes
-        let router = public_router.merge(protected_router);
+        let router = public_router.merge(protected_router).merge(wsman_router);
 
         // Server-wide security layers (cover both public and protected
         // routes, on both the plain-HTTP and TLS paths, since both `run`
@@ -976,7 +1026,9 @@ impl Server {
         // Use axum-server for proper TLS handling
         axum_server::bind_rustls(tls_addr, tls_config)
             .handle(axum_handle)
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .serve(conn::with_conn_slots(
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            ))
             .await?;
 
         Ok(())
@@ -1014,8 +1066,45 @@ impl Server {
         let spn_state = Arc::new(spn.clone());
         Ok(router.layer(middleware::from_fn_with_state(
             spn_state,
-            kerberos_auth_middleware,
+            kerberos::kerberos_auth_middleware,
         )))
+    }
+
+    /// Authentication for the `/wsman/**` routes, by deployment topology: Kerberos with
+    /// per-connection state and message encryption (plain + Kerberos), or nothing (plain
+    /// unauthenticated, or HTTPS where mutual TLS already authenticated the peer). With no
+    /// WEF runtime the routes only 404, behind the regular per-request layer.
+    ///
+    /// Like `apply_kerberos_layer`, the layer is outermost, i.e. it runs before the IP
+    /// allowlist.
+    fn apply_wsman_auth(&self, router: Router) -> anyhow::Result<Router> {
+        use crate::wef::subscription::WefTopology;
+        match self.state.wef.as_ref().map(|w| w.topology) {
+            Some(WefTopology::PlainKerberos) => {
+                let factory = self.default_gss_factory()?;
+                Ok(router.layer(middleware::from_fn_with_state(
+                    Arc::new(kerberos::WsmanAuth::new(factory)),
+                    kerberos::wsman_auth_middleware,
+                )))
+            }
+            Some(WefTopology::PlainUnauthenticated | WefTopology::HttpsMutual) => Ok(router),
+            None => self.apply_kerberos_layer(router),
+        }
+    }
+
+    fn default_gss_factory(&self) -> anyhow::Result<Arc<dyn kerberos::GssAcceptorFactory>> {
+        if let Some(f) = &self.gss_factory {
+            return Ok(f.clone());
+        }
+        #[cfg(feature = "kerberos-auth")]
+        {
+            let spn = self.config.security.kerberos.spn.clone().ok_or_else(|| {
+                anyhow!("security.kerberos.spn must be set when Kerberos auth is enabled")
+            })?;
+            Ok(Arc::new(kerberos::LibGssFactory::new(spn)))
+        }
+        #[cfg(not(feature = "kerberos-auth"))]
+        anyhow::bail!("Kerberos topology requires the 'kerberos-auth' feature")
     }
 
     #[cfg(not(feature = "kerberos-auth"))]
@@ -1026,339 +1115,6 @@ impl Server {
             );
         }
         Ok(router)
-    }
-}
-
-/// Acquire a GSSAPI server (acceptor) credential for `spn`, restricted to the
-/// SPNEGO mechanism.
-///
-/// Deliberately re-acquired for every request (see `accept_kerberos_token`)
-/// rather than acquired once and shared, even though that means reading the
-/// local keytab per request:
-///
-/// * `libgssapi::credential::Cred` has no `Clone`/`Copy`, and its raw-handle
-///   constructor/accessor (`from_c`/`to_c`) are `pub(crate)` inside the
-///   `libgssapi` crate (credential.rs:239,243) — application code cannot
-///   duplicate a `Cred` or hand out a borrowed view of one.
-/// * `ServerCtx::new(cred: Cred)` takes the credential by value
-///   (context.rs:506) and never gives it back — no `&Cred` constructor, no
-///   way to reclaim the `Cred` afterward. Whatever `Cred` it's given dies
-///   (releasing the GSSAPI handle via `Cred`'s `Drop`, credential.rs:81-95)
-///   when that `ServerCtx` is dropped at the end of the request.
-/// * Reusing one long-lived `ServerCtx` across many requests instead of
-///   reusing the `Cred` is not a safe workaround either: once `step()`
-///   reaches `ServerCtxState::Complete` it short-circuits and returns
-///   `Ok(None)` without even inspecting the new token (context.rs:522-527).
-///   A second, unrelated client hitting that same already-complete context
-///   would be silently authenticated regardless of what — if anything — it
-///   sent: an auth bypass.
-///
-/// So: one `Cred`, thrown away with its `ServerCtx`, per request.
-/// `Cred::acquire` for an acceptor credential reads the local keytab and
-/// does not contact a KDC, and `/wsman` is a low-QPS endpoint, so this is an
-/// acceptable cost for correctness. Do not add a cache in front of this — a
-/// cache is exactly the shared-handle problem above, just deferred.
-#[cfg(feature = "kerberos-auth")]
-fn acquire_kerberos_cred(spn: &str) -> anyhow::Result<libgssapi::credential::Cred> {
-    use libgssapi::{
-        credential::{Cred, CredUsage},
-        name::Name,
-        oid::{GSS_MECH_KRB5, GSS_MECH_SPNEGO, GSS_NT_KRB5_PRINCIPAL, OidSet},
-    };
-
-    let name = Name::new(spn.as_bytes(), Some(&GSS_NT_KRB5_PRINCIPAL))
-        .map_err(|e| anyhow!("invalid Kerberos SPN {:?}: {}", spn, e))?;
-    // Canonicalize against krb5 so `Cred::acquire` gets an unambiguous
-    // mechanism name, matching the crate's own server-setup example.
-    let name = name
-        .canonicalize(Some(&GSS_MECH_KRB5))
-        .map_err(|e| anyhow!("failed to canonicalize Kerberos SPN {:?}: {}", spn, e))?;
-
-    let mut mechs =
-        OidSet::new().map_err(|e| anyhow!("gssapi OID set allocation failed: {}", e))?;
-    mechs
-        .add(&GSS_MECH_SPNEGO)
-        .map_err(|e| anyhow!("failed to build SPNEGO mechanism set: {}", e))?;
-
-    Cred::acquire(Some(&name), None, CredUsage::Accept, Some(&mechs)).map_err(|e| {
-        anyhow!(
-            "failed to acquire Kerberos credential for SPN {:?}: {}",
-            spn,
-            e
-        )
-    })
-}
-
-/// Outcome of one SPNEGO `accept_sec_context` step.
-#[cfg(feature = "kerberos-auth")]
-enum AcceptOutcome {
-    Authenticated {
-        /// Mutual-auth response token (RFC 4559), if the mechanism produced one.
-        response_token: Option<Vec<u8>>,
-        principal: String,
-    },
-    /// The context needs another leg. Multi-leg negotiation is unsupported
-    /// (see `kerberos_auth_middleware` docs) — callers must reject this.
-    ContinueNeeded,
-}
-
-/// Run one SPNEGO accept step against a freshly acquired credential.
-///
-/// Blocking: `gss_acquire_cred`/`gss_accept_sec_context` are synchronous
-/// GSSAPI calls (keytab I/O, crypto). Callers must run this via
-/// `tokio::task::spawn_blocking`, never directly on the async runtime.
-#[cfg(feature = "kerberos-auth")]
-fn accept_kerberos_token(spn: &str, token: &[u8]) -> anyhow::Result<AcceptOutcome> {
-    use libgssapi::context::{SecurityContext, ServerCtx};
-
-    let cred = acquire_kerberos_cred(spn)?;
-    let mut ctx = ServerCtx::new(cred);
-    let response_token = ctx.step(token)?;
-
-    if !ctx.is_complete() {
-        return Ok(AcceptOutcome::ContinueNeeded);
-    }
-
-    let principal = ctx
-        .source_name()
-        .map(|n| n.to_string())
-        .unwrap_or_else(|_| "<unknown>".to_string());
-
-    Ok(AcceptOutcome::Authenticated {
-        response_token: response_token.map(|tok| tok.to_vec()),
-        principal,
-    })
-}
-
-/// Classification of an `Authorization` header for SPNEGO purposes. Pure and
-/// GSSAPI-free on purpose, so the challenge/rejection logic is unit-testable
-/// without a keytab or KDC.
-#[cfg(feature = "kerberos-auth")]
-#[derive(Debug, PartialEq, Eq)]
-enum NegotiateHeader {
-    Missing,
-    WrongScheme,
-    MalformedBase64,
-    Token(Vec<u8>),
-}
-
-#[cfg(feature = "kerberos-auth")]
-fn classify_negotiate_header(header: Option<&str>) -> NegotiateHeader {
-    let Some(value) = header else {
-        return NegotiateHeader::Missing;
-    };
-    let Some(b64) = value.strip_prefix("Negotiate ") else {
-        return NegotiateHeader::WrongScheme;
-    };
-    use base64::Engine;
-    match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
-        Ok(tok) => NegotiateHeader::Token(tok),
-        Err(_) => NegotiateHeader::MalformedBase64,
-    }
-}
-
-#[cfg(feature = "kerberos-auth")]
-fn kerberos_unauthorized() -> Response {
-    Response::builder()
-        .status(StatusCode::UNAUTHORIZED)
-        .header("WWW-Authenticate", "Negotiate")
-        .body(axum::body::Body::from("Unauthorized"))
-        .unwrap()
-}
-
-/// RFC 4559 SPNEGO ("Negotiate") authentication middleware.
-///
-/// Deliberately two-pass only: real Kerberos-over-HTTP is inherently
-/// two-legged (the client already holds a ticket from the KDC before it
-/// ever talks to us), so a single `Authorization: Negotiate` header carrying
-/// a complete token is all a genuine client ever sends. Multi-leg
-/// negotiation — which NTLM fallback would need — requires carrying GSSAPI
-/// state across requests; this middleware does not do that. A `step()` that
-/// comes back continue-needed is rejected with 401, not tracked for a
-/// follow-up leg. The LGPL `axum-negotiate` crate this replaced documented
-/// the same limitation.
-#[cfg(feature = "kerberos-auth")]
-async fn kerberos_auth_middleware(
-    State(spn): State<Arc<String>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let header = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
-
-    let token = match classify_negotiate_header(header.as_deref()) {
-        NegotiateHeader::Token(tok) => tok,
-        NegotiateHeader::Missing
-        | NegotiateHeader::WrongScheme
-        | NegotiateHeader::MalformedBase64 => {
-            return kerberos_unauthorized();
-        }
-    };
-
-    // GSSAPI work is blocking (keytab I/O + crypto) — never run it inline on
-    // the async runtime.
-    let result = tokio::task::spawn_blocking(move || accept_kerberos_token(&spn, &token)).await;
-
-    match result {
-        Ok(Ok(AcceptOutcome::Authenticated {
-            response_token,
-            principal,
-        })) => {
-            debug!("Kerberos authenticated client principal: {}", principal);
-            let mut response = next.run(request).await;
-            if let Some(tok) = response_token {
-                use base64::Engine;
-                let value = format!(
-                    "Negotiate {}",
-                    base64::engine::general_purpose::STANDARD.encode(tok)
-                );
-                if let Ok(value) = axum::http::HeaderValue::from_str(&value) {
-                    response.headers_mut().insert("WWW-Authenticate", value);
-                }
-            }
-            response
-        }
-        Ok(Ok(AcceptOutcome::ContinueNeeded)) => {
-            warn!(
-                "Kerberos: client at {} needs multi-leg negotiation, which is unsupported; rejecting",
-                addr
-            );
-            kerberos_unauthorized()
-        }
-        Ok(Err(e)) => {
-            // Log server-side only — the response body must not leak GSSAPI
-            // internals to the client.
-            warn!("Kerberos authentication failed for {}: {}", addr, e);
-            kerberos_unauthorized()
-        }
-        Err(join_err) => {
-            error!("Kerberos auth worker task panicked: {}", join_err);
-            kerberos_unauthorized()
-        }
-    }
-}
-
-async fn handle_wef_request(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    _headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, StatusCode> {
-    let body_str = String::from_utf8_lossy(&body);
-    // Use the real peer IP for source attribution.
-    // X-Forwarded-For is client-spoofable and must not be trusted
-    // for security-relevant identity; only the TCP peer address is authoritative.
-    let source_host = addr.ip().to_string();
-
-    match state.parser.parse_message(&body_str, source_host) {
-        Ok(WefMessage::Subscription(sub)) => {
-            // `subscription_id` is the raw text between `<SubscriptionId>` and
-            // `</SubscriptionId>` in the POST body (`extract_xml_value`,
-            // `protocol::mod`), reachable unauthenticated whenever Kerberos is
-            // not configured, and unbounded — a multi-MiB element would log a
-            // single multi-MiB line per request. 128 bytes comfortably covers
-            // any real subscription name while bounding that amplification.
-            info!(
-                "New subscription from {}: {}",
-                sub.source_host,
-                crate::sanitize_for_log(&sub.subscription_id, 128)
-            );
-
-            let response = create_subscription_response(&sub.subscription_id);
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/soap+xml")
-                .body(axum::body::Body::from(response))
-                .unwrap())
-        }
-        Ok(WefMessage::Events(events)) => {
-            info!("Received {} events from {}", events.len(), addr);
-            process_events(&state, events).await;
-
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .body(axum::body::Body::from("Events received"))
-                .unwrap())
-        }
-        Ok(WefMessage::Heartbeat(hb)) => {
-            // Same unbounded, unauthenticated-reachable `subscription_id` as
-            // the Subscription arm above — same 128-byte budget.
-            debug!(
-                "Heartbeat from {} for subscription {}",
-                hb.source_host,
-                crate::sanitize_for_log(&hb.subscription_id, 128)
-            );
-
-            let response = create_heartbeat_response();
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/soap+xml")
-                .body(axum::body::Body::from(response))
-                .unwrap())
-        }
-        Ok(WefMessage::Unknown(content)) => {
-            // Was `truncate_for_log` — bounded but not sanitized, so control
-            // characters (embedded newline, ANSI escape) in the unrecognized
-            // body survived into this warn! line. Switch to `sanitize_for_log`,
-            // keeping the existing 100-byte budget.
-            warn!(
-                "Unknown message type from {}: {}",
-                addr,
-                crate::sanitize_for_log(&content, 100)
-            );
-            Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(axum::body::Body::from("Unknown message type"))
-                .unwrap())
-        }
-        Err(e) => {
-            error!("Failed to parse message from {}: {}", addr, e);
-            Err(StatusCode::BAD_REQUEST)
-        }
-    }
-}
-
-async fn handle_subscription(
-    State(_state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    body: Bytes,
-) -> Result<Response, StatusCode> {
-    info!("Subscription request from {}", addr);
-
-    let _body_str = String::from_utf8_lossy(&body);
-    let subscription_id = format!("sub_{}", uuid::Uuid::new_v4());
-
-    let response = create_subscription_response(&subscription_id);
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "application/soap+xml")
-        .body(axum::body::Body::from(response))
-        .unwrap())
-}
-
-async fn handle_events(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    body: Bytes,
-) -> Result<Response, StatusCode> {
-    info!("Events from {}", addr);
-
-    let body_str = String::from_utf8_lossy(&body);
-    let source_host = addr.ip().to_string();
-
-    match state.parser.parse_message(&body_str, source_host) {
-        Ok(WefMessage::Events(events)) => {
-            process_events(&state, events).await;
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .body(axum::body::Body::from("OK"))
-                .unwrap())
-        }
-        _ => Err(StatusCode::BAD_REQUEST),
     }
 }
 
@@ -1487,6 +1243,7 @@ mod tests {
     use axum::body::Bytes;
     use axum::http::HeaderMap;
     use serde_json::Value;
+    use tracing::debug;
 
     fn sample_parsed_event() -> ParsedEvent {
         ParsedEvent {
@@ -1523,7 +1280,8 @@ mod tests {
             config: Arc::new(RwLock::new(config)),
             throughput: Arc::new(ThroughputStats::new()),
             wef_cardinality_watchers,
-            parser: WefParser::new(),
+            wef: None,
+            bookmarks: Arc::new(crate::wef::bookmarks::BookmarkStore::new(16)),
             event_parser: None,
             parquet_s3_sender: None,
             parquet_local_sender: None,
@@ -1618,104 +1376,6 @@ mod tests {
         assert!(!value["powerdns"].as_array().unwrap().is_empty());
     }
 
-    /// WEF is deliberately UNCHANGED by the 503 backpressure work: a full writer channel is a
-    /// counted drop and the request is still answered 200 (the WEF protocol has its own
-    /// redelivery semantics).
-    #[tokio::test]
-    async fn handle_events_full_wef_channel_still_returns_200() {
-        use crate::forwarding::buffered_writer::ParquetWriterHandle;
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let state = Arc::new(AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            throughput: Arc::new(ThroughputStats::new()),
-            wef_cardinality_watchers: Vec::new(),
-            parser: WefParser::new(),
-            event_parser: None,
-            parquet_s3_sender: Some(ParquetWriterHandle::for_test(tx, "wef", "s3")),
-            parquet_local_sender: None,
-        });
-        let event = |id: u32| {
-            format!(
-                "<Event><System><Provider>Security</Provider><EventID>{id}</EventID>\
-                 <Level>4</Level><TimeCreated>2024-01-01T00:00:00Z</TimeCreated>\
-                 <Computer>host</Computer></System></Event>"
-            )
-        };
-        let body = Bytes::from(format!(
-            "<Envelope><Body><Events>{}{}{}</Events></Body></Envelope>",
-            event(4624),
-            event(4625),
-            event(4634)
-        ));
-        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
-        let response = handle_events(State(state), ConnectInfo(addr), body)
-            .await
-            .expect("events accepted");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(rx.try_recv().is_ok());
-        assert!(
-            rx.try_recv().is_err(),
-            "capacity 1: the rest were dropped, not 503'd"
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_events_accepts_valid_payload() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"
-        <Envelope>
-          <Body>
-            <Events>
-              <Event>
-                <System>
-                  <Provider>Security</Provider>
-                  <EventID>4624</EventID>
-                  <Level>4</Level>
-                  <TimeCreated>2024-01-01T00:00:00Z</TimeCreated>
-                  <Computer>host</Computer>
-                </System>
-                <EventData>
-                  <Data Name="TargetUserName">alice</Data>
-                </EventData>
-              </Event>
-            </Events>
-          </Body>
-        </Envelope>
-        "#,
-        );
-        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
-
-        let response = handle_events(State(state), ConnectInfo(addr), body)
-            .await
-            .expect("events accepted");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn handle_wef_request_handles_subscription() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"
-        <Envelope>
-          <Body>
-            <Subscribe>
-              <SubscriptionId>TestSub</SubscriptionId>
-              <Query>*</Query>
-            </Subscribe>
-          </Body>
-        </Envelope>
-        "#,
-        );
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-        let headers = HeaderMap::new();
-
-        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
-            .await
-            .expect("subscription handled");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
     #[tokio::test]
     async fn handle_syslog_http_parses_message() {
         let state = default_state().await;
@@ -1761,192 +1421,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn handle_wef_request_with_heartbeat() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"
-        <Envelope>
-          <Body>
-            <Heartbeat>
-              <SubscriptionId>hb-sub-123</SubscriptionId>
-            </Heartbeat>
-          </Body>
-        </Envelope>
-        "#,
-        );
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-        let headers = HeaderMap::new();
-
-        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
-            .await
-            .expect("heartbeat handled");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn handle_wef_request_with_unknown_message() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"
-        <Envelope>
-          <Body>
-            <UnknownTag>Some unknown content</UnknownTag>
-          </Body>
-        </Envelope>
-        "#,
-        );
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-        let headers = HeaderMap::new();
-
-        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
-            .await
-            .expect("unknown message handled");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
     // -------------------------------------------------------------------
     // Log-injection regressions: wire-derived `subscription_id` / `content`
     // / `formatted_message` must reach their `info!`/`debug!`/`warn!` sites
     // sanitized, not raw. Uses the shared `test_support` capture subscriber
     // (see its doc comment for why a bespoke `set_default` doesn't work).
     // -------------------------------------------------------------------
-
-    /// A `<SubscriptionId>` containing a mid-line `\r`, a `\n`, and an ANSI
-    /// escape must not carry any of them raw into the "New subscription"
-    /// `info!` line, and an oversized id must be truncated rather than
-    /// logged whole (`extract_xml_value` returns the raw slice with no
-    /// length cap of its own).
-    #[tokio::test]
-    async fn handle_wef_subscription_log_sanitizes_and_truncates_subscription_id() {
-        crate::test_support::install_and_clear();
-
-        let state = default_state().await;
-        let forged_id = format!("sub\rFAKE\n\u{1b}[31minjected\u{1b}[0m{}", "y".repeat(200));
-        let body = Bytes::from(format!(
-            r#"
-        <Envelope>
-          <Body>
-            <Subscribe>
-              <SubscriptionId>{forged_id}</SubscriptionId>
-              <Query>*</Query>
-            </Subscribe>
-          </Body>
-        </Envelope>
-        "#
-        ));
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-
-        let response = handle_wef_request(State(state), ConnectInfo(addr), HeaderMap::new(), body)
-            .await
-            .expect("subscription handled");
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let events = crate::test_support::captured_events();
-        let line = events
-            .iter()
-            .find(|m| m.contains("New subscription"))
-            .unwrap_or_else(|| panic!("no matching info! event captured; got: {events:?}"));
-
-        assert!(
-            !line.contains('\r'),
-            "raw CR leaked into the log line: {line:?}"
-        );
-        assert!(
-            !line.contains('\u{1b}'),
-            "raw ESC leaked into the log line: {line:?}"
-        );
-        assert!(
-            line.contains('\u{fffd}'),
-            "expected U+FFFD replacement characters in the log line: {line:?}"
-        );
-        assert!(
-            line.len() < forged_id.len(),
-            "oversized subscription_id must be truncated, not logged whole: {line:?}"
-        );
-    }
-
-    /// Same regression as above, for the Heartbeat arm's `debug!` site.
-    #[tokio::test]
-    async fn handle_wef_heartbeat_log_sanitizes_subscription_id() {
-        crate::test_support::install_and_clear();
-
-        let state = default_state().await;
-        let body = Bytes::from(
-            "\n        <Envelope>\n          <Body>\n            <Heartbeat>\n              \
-             <SubscriptionId>hb\rFAKE\n\u{1b}[31minjected</SubscriptionId>\n            \
-             </Heartbeat>\n          </Body>\n        </Envelope>\n        ",
-        );
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-
-        let response = handle_wef_request(State(state), ConnectInfo(addr), HeaderMap::new(), body)
-            .await
-            .expect("heartbeat handled");
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let events = crate::test_support::captured_events();
-        let line = events
-            .iter()
-            .find(|m| m.contains("Heartbeat from"))
-            .unwrap_or_else(|| panic!("no matching debug! event captured; got: {events:?}"));
-
-        assert!(
-            !line.contains('\r'),
-            "raw CR leaked into the log line: {line:?}"
-        );
-        assert!(
-            !line.contains('\n'),
-            "raw LF leaked into the log line: {line:?}"
-        );
-        assert!(
-            !line.contains('\u{1b}'),
-            "raw ESC leaked into the log line: {line:?}"
-        );
-        assert!(
-            line.contains('\u{fffd}'),
-            "expected U+FFFD replacement characters in the log line: {line:?}"
-        );
-    }
-
-    /// The Unknown-message-type `warn!` site was `truncate_for_log`, not
-    /// `sanitize_for_log` -- bounded but not sanitized. Fails if that site is
-    /// reverted.
-    #[tokio::test]
-    async fn handle_wef_unknown_message_log_sanitizes_content() {
-        crate::test_support::install_and_clear();
-
-        let state = default_state().await;
-        let body = Bytes::from("weird\rcontent\n\u{1b}[31mFAKE\u{1b}[0m not xml at all");
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-
-        let response = handle_wef_request(State(state), ConnectInfo(addr), HeaderMap::new(), body)
-            .await
-            .expect("unknown message handled");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-        let events = crate::test_support::captured_events();
-        let line = events
-            .iter()
-            .find(|m| m.contains("Unknown message type"))
-            .unwrap_or_else(|| panic!("no matching warn! event captured; got: {events:?}"));
-
-        assert!(
-            !line.contains('\r'),
-            "raw CR leaked into the log line: {line:?}"
-        );
-        assert!(
-            !line.contains('\n'),
-            "raw LF leaked into the log line: {line:?}"
-        );
-        assert!(
-            !line.contains('\u{1b}'),
-            "raw ESC leaked into the log line: {line:?}"
-        );
-        assert!(
-            line.contains('\u{fffd}'),
-            "expected U+FFFD replacement characters in the log line: {line:?}"
-        );
-    }
 
     /// `formatted_message` is built by substituting attacker-supplied event
     /// XML field values into an operator-configured output template; a
@@ -1977,7 +1457,8 @@ event_parsers:
             config: Arc::new(RwLock::new(Config::default())),
             throughput: Arc::new(ThroughputStats::new()),
             wef_cardinality_watchers: Vec::new(),
-            parser: WefParser::new(),
+            wef: None,
+            bookmarks: Arc::new(crate::wef::bookmarks::BookmarkStore::new(16)),
             event_parser: Some(event_parser),
             parquet_s3_sender: None,
             parquet_local_sender: None,
@@ -2012,37 +1493,6 @@ event_parsers:
             line.contains('\u{fffd}'),
             "expected U+FFFD replacement characters in the log line: {line:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn handle_wef_request_with_parse_error() {
-        let state = default_state().await;
-        // Invalid XML - parser treats it as Unknown message, not an error
-        let body = Bytes::from("<Invalid XML");
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-        let headers = HeaderMap::new();
-
-        let result = handle_wef_request(State(state), ConnectInfo(addr), headers, body).await;
-        // The parser doesn't fail on invalid XML, it returns Unknown message type
-        // which results in BAD_REQUEST status
-        match result {
-            Ok(response) => {
-                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            }
-            Err(_) => {
-                // Either way is acceptable
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn handle_events_with_invalid_body() {
-        let state = default_state().await;
-        let body = Bytes::from("not valid events");
-        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
-
-        let result = handle_events(State(state), ConnectInfo(addr), body).await;
-        assert!(result.is_err(), "Should return error for invalid body");
     }
 
     #[test]
@@ -2219,60 +1669,6 @@ event_parsers:
             "2 distinct computer values from Security events; the System event's computer \
              must have been excluded by the stream filter"
         );
-    }
-
-    /// XFF header is present but ignored; peer IP is used for source attribution.
-    ///
-    /// After M-9: the `X-Forwarded-For` header is silently ignored so that a
-    /// spoofed header cannot influence the source identity recorded for the
-    /// event.  The request should still succeed (200 OK); only the attribution
-    /// logic changed.
-    #[tokio::test]
-    async fn handle_wef_request_with_x_forwarded_for() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"
-        <Envelope>
-          <Body>
-            <Subscribe>
-              <SubscriptionId>ForwardedTest</SubscriptionId>
-              <Query>*</Query>
-            </Subscribe>
-          </Body>
-        </Envelope>
-        "#,
-        );
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert("X-Forwarded-For", "10.0.0.100".parse().unwrap());
-
-        // XFF is ignored; source attribution uses the peer IP (127.0.0.1).
-        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
-            .await
-            .expect("subscription handled");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn handle_subscription_generates_unique_id() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"
-        <Envelope>
-          <Body>
-            <Subscribe>
-              <Query>*</Query>
-            </Subscribe>
-          </Body>
-        </Envelope>
-        "#,
-        );
-        let addr: SocketAddr = "127.0.0.1:5985".parse().unwrap();
-
-        let response = handle_subscription(State(state), ConnectInfo(addr), body)
-            .await
-            .expect("subscription handled");
-        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -3239,48 +2635,6 @@ event_parsers:
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    /// A WEF POST carrying a valid `<Events>` payload returns 200 and records
-    /// at least one throughput entry (exercises the full handler path, not just
-    /// subscription handling).
-    #[tokio::test]
-    async fn handle_wef_request_events_payload_returns_200() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"<Envelope>
-  <Body>
-    <Events>
-      <Event>
-        <System>
-          <Provider>Security</Provider>
-          <EventID>4625</EventID>
-          <Level>4</Level>
-          <TimeCreated>2024-06-01T00:00:00Z</TimeCreated>
-          <Computer>dc01</Computer>
-        </System>
-        <EventData>
-          <Data Name="TargetUserName">bob</Data>
-        </EventData>
-      </Event>
-    </Events>
-  </Body>
-</Envelope>"#,
-        );
-        let addr: SocketAddr = "10.0.0.1:5985".parse().unwrap();
-        let headers = HeaderMap::new();
-
-        let response = handle_wef_request(State(state.clone()), ConnectInfo(addr), headers, body)
-            .await
-            .expect("events payload accepted");
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // The event should have been recorded in throughput stats.
-        let snapshot = state.throughput.snapshot().await;
-        assert!(
-            !snapshot.is_empty(),
-            "throughput snapshot must be non-empty after event"
-        );
-    }
-
     /// A syslog HTTP POST with a body that exactly meets the body-size limit is
     /// accepted (boundary condition: limit is inclusive).
     /// A body one byte over is rejected with 413 (duplicate of the WEF test, but
@@ -3536,106 +2890,6 @@ event_parsers:
     }
 
     // ------------------------------------------------------------------ //
-    // WEF handler: zero-event events payload                              //
-    // ------------------------------------------------------------------ //
-
-    /// An `<Events>` payload with no `<Event>` children must be accepted (200)
-    /// and must not crash or record any throughput entries.
-    #[tokio::test]
-    async fn handle_wef_request_empty_events_returns_200() {
-        let state = default_state().await;
-        // Body contains <Events> (triggering the events branch in the parser)
-        // but has no <Event> children — results in zero events.
-        let body = Bytes::from(
-            r#"<Envelope>
-  <Body>
-    <Events>
-    </Events>
-  </Body>
-</Envelope>"#,
-        );
-        let addr: SocketAddr = "10.0.0.5:5985".parse().unwrap();
-        let headers = HeaderMap::new();
-
-        let response = handle_wef_request(State(state.clone()), ConnectInfo(addr), headers, body)
-            .await
-            .expect("zero-event events payload should be accepted");
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "zero-event events payload must return 200"
-        );
-
-        // No events were processed, so throughput must remain empty.
-        let snapshot = state.throughput.snapshot().await;
-        assert!(
-            snapshot.is_empty(),
-            "no throughput entries expected for zero-event batch"
-        );
-    }
-
-    // ------------------------------------------------------------------ //
-    // handle_events: subscription body → BAD_REQUEST                     //
-    // ------------------------------------------------------------------ //
-
-    /// `handle_events` must return BAD_REQUEST when the body is a subscription
-    /// (not an events payload), because the handler only accepts events.
-    #[tokio::test]
-    async fn handle_events_with_subscription_body_returns_bad_request() {
-        let state = default_state().await;
-        // A valid subscription body — not an events payload.
-        let body = Bytes::from(
-            r#"<Envelope>
-  <Body>
-    <Subscribe>
-      <SubscriptionId>TestSub</SubscriptionId>
-      <Query>*</Query>
-    </Subscribe>
-  </Body>
-</Envelope>"#,
-        );
-        let addr: SocketAddr = "10.0.0.6:5985".parse().unwrap();
-
-        let result = handle_events(State(state), ConnectInfo(addr), body).await;
-        assert!(
-            result.is_err(),
-            "handle_events must reject a subscription body with BAD_REQUEST"
-        );
-        assert_eq!(
-            result.unwrap_err(),
-            StatusCode::BAD_REQUEST,
-            "status must be 400 for non-events payload"
-        );
-    }
-
-    // ------------------------------------------------------------------ //
-    // handle_events: heartbeat body → BAD_REQUEST                        //
-    // ------------------------------------------------------------------ //
-
-    /// `handle_events` must return BAD_REQUEST when the body is a heartbeat.
-    #[tokio::test]
-    async fn handle_events_with_heartbeat_body_returns_bad_request() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"<Envelope>
-  <Body>
-    <Heartbeat>
-      <SubscriptionId>hb-sub-1</SubscriptionId>
-    </Heartbeat>
-  </Body>
-</Envelope>"#,
-        );
-        let addr: SocketAddr = "10.0.0.7:5985".parse().unwrap();
-
-        let result = handle_events(State(state), ConnectInfo(addr), body).await;
-        assert!(
-            result.is_err(),
-            "handle_events must reject a heartbeat body"
-        );
-        assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
-    }
-
-    // ------------------------------------------------------------------ //
     // /stats/throughput via router oneshot                                //
     // ------------------------------------------------------------------ //
 
@@ -3684,131 +2938,6 @@ event_parsers:
         let arr = parsed.as_array().unwrap();
         assert_eq!(arr.len(), 1, "expected one entry after recording one event");
         assert_eq!(arr[0]["event_type"], "TestProvider:9999");
-    }
-
-    // ------------------------------------------------------------------ //
-    // handle_subscription: check XML response contains subscription id   //
-    // ------------------------------------------------------------------ //
-
-    /// `handle_subscription` must return 200 with a SOAP XML body that
-    /// contains the generated `sub_` prefixed subscription id.
-    #[tokio::test]
-    async fn handle_subscription_response_contains_sub_prefix() {
-        use axum::body::to_bytes;
-
-        let state = default_state().await;
-        let body = Bytes::from("<Envelope><Body></Body></Envelope>");
-        let addr: SocketAddr = "10.0.1.1:5985".parse().unwrap();
-
-        let response = handle_subscription(State(state), ConnectInfo(addr), body)
-            .await
-            .expect("handle_subscription must succeed");
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // Check Content-Type header.
-        let ct = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert!(
-            ct.contains("application/soap+xml"),
-            "Content-Type must be application/soap+xml, got: {ct}"
-        );
-
-        // Check the body contains a subscription id with the `sub_` prefix.
-        let body_bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let body_str = String::from_utf8_lossy(&body_bytes);
-        assert!(
-            body_str.contains("sub_"),
-            "subscription response body must contain generated sub_ id, got: {body_str}"
-        );
-    }
-
-    // ------------------------------------------------------------------ //
-    // handle_wef_request: subscription response Content-Type             //
-    // ------------------------------------------------------------------ //
-
-    /// The subscription branch of `handle_wef_request` must set
-    /// `Content-Type: application/soap+xml`.
-    #[tokio::test]
-    async fn handle_wef_request_subscription_sets_content_type() {
-        use axum::body::to_bytes;
-
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"<Envelope>
-  <Body>
-    <Subscribe>
-      <SubscriptionId>ct-test-sub</SubscriptionId>
-      <Query>*</Query>
-    </Subscribe>
-  </Body>
-</Envelope>"#,
-        );
-        let addr: SocketAddr = "10.0.1.2:5985".parse().unwrap();
-        let headers = HeaderMap::new();
-
-        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
-            .await
-            .expect("subscription must be handled");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let ct = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert!(
-            ct.contains("application/soap+xml"),
-            "subscription response must have Content-Type application/soap+xml, got: {ct}"
-        );
-
-        // Body must include the subscription id (escaping check).
-        let body_bytes = to_bytes(response.into_body(), 65536).await.unwrap();
-        let body_str = String::from_utf8_lossy(&body_bytes);
-        assert!(
-            body_str.contains("ct-test-sub"),
-            "subscription body must echo the subscription id"
-        );
-    }
-
-    // ------------------------------------------------------------------ //
-    // handle_wef_request: heartbeat Content-Type                         //
-    // ------------------------------------------------------------------ //
-
-    /// The heartbeat branch of `handle_wef_request` must set
-    /// `Content-Type: application/soap+xml`.
-    #[tokio::test]
-    async fn handle_wef_request_heartbeat_sets_content_type() {
-        let state = default_state().await;
-        let body = Bytes::from(
-            r#"<Envelope>
-  <Body>
-    <Heartbeat>
-      <SubscriptionId>hb-ct-sub</SubscriptionId>
-    </Heartbeat>
-  </Body>
-</Envelope>"#,
-        );
-        let addr: SocketAddr = "10.0.1.3:5985".parse().unwrap();
-        let headers = HeaderMap::new();
-
-        let response = handle_wef_request(State(state), ConnectInfo(addr), headers, body)
-            .await
-            .expect("heartbeat must be handled");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let ct = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert!(
-            ct.contains("application/soap+xml"),
-            "heartbeat response must have Content-Type application/soap+xml, got: {ct}"
-        );
     }
 
     // ------------------------------------------------------------------ //
@@ -4071,13 +3200,10 @@ event_parsers:
     }
 
     #[tokio::test]
-    async fn create_router_syslog_and_wef_routes_do_not_decompress_gzip() {
+    async fn create_router_syslog_route_does_not_decompress_gzip() {
         let router = router_with_hec_and_otlp().await;
         let syslog = "<134>Jan 15 10:30:45 dns-server named[1234]: query";
-        let events = r#"<Envelope><Body><Events><Event><System><Provider>Security</Provider>
-            <EventID>4624</EventID><Level>4</Level><TimeCreated>2024-01-01T00:00:00Z</TimeCreated>
-            <Computer>host</Computer></System></Event></Events></Body></Envelope>"#;
-        for (uri, valid) in [("/syslog", syslog), ("/wsman/events", events)] {
+        for (uri, valid) in [("/syslog", syslog)] {
             // Control: the plain payload is accepted.
             let plain = post_status(&router, uri, &[], valid.as_bytes().to_vec()).await;
             assert_eq!(plain, StatusCode::OK, "{uri} control");
@@ -5150,140 +4276,126 @@ event_parsers:
         }
     }
 
-    // ------------------------------------------------------------------ //
-    // Kerberos SPNEGO middleware                                         //
-    //                                                                    //
-    // There is no KDC or keytab in this test environment (deliberate:    //
-    // a full KDC harness was cut as disproportionate, since this sim     //
-    // env isn't invoked by any CI workflow), so only the paths that      //
-    // never need a real GSSAPI exchange are covered here:                //
-    //   * `classify_negotiate_header` — pure, GSSAPI-free header parsing //
-    //   * missing header / wrong scheme / malformed base64 — all three  //
-    //     short-circuit in the middleware before any GSSAPI call runs   //
-    //   * a well-formed-but-bogus token, which still exercises the      //
-    //     "the GSSAPI pipeline failed" branch end to end (whether it     //
-    //     fails at `Cred::acquire` for lack of a keytab, or at `step()`  //
-    //     for lack of a valid token, both map to 401 the same way)       //
-    //                                                                    //
-    // NOT covered, and cannot be from `cargo test`: a real SPNEGO        //
-    // handshake succeeding (needs a live KDC + keytab), and the mutual-  //
-    // auth `WWW-Authenticate` response header on success.                //
-    // ------------------------------------------------------------------ //
-    #[cfg(feature = "kerberos-auth")]
-    mod kerberos_auth_tests {
+    /// `/wsman/**` auth wiring by deployment topology (router level, fake GSS backend).
+    mod wsman_topology_tests {
         use super::*;
-        use axum::body::Body;
+        use crate::config::{ContentFormat, WefSubscriptionConfig};
+        use crate::wef::subscription::{WefTopology, validate_wef_topology};
         use axum::http::Request as HttpRequest;
         use tower::ServiceExt;
 
-        const TEST_SPN: &str = "HTTP/test.invalid@EXAMPLE.COM";
+        /// Backend whose acceptors cannot be built: any attempted handshake is a 401.
+        #[derive(Debug)]
+        struct NoAcceptors;
 
-        fn kerberos_router() -> Router {
-            Router::new()
-                .route("/protected", axum::routing::get(|| async { "ok" }))
-                .layer(middleware::from_fn_with_state(
-                    Arc::new(TEST_SPN.to_string()),
-                    kerberos_auth_middleware,
-                ))
+        impl kerberos::GssAcceptorFactory for NoAcceptors {
+            fn new_acceptor(&self) -> anyhow::Result<Box<dyn kerberos::GssAcceptor>> {
+                anyhow::bail!("no acceptors in this test")
+            }
         }
 
-        fn with_connect_info(mut req: HttpRequest<Body>) -> HttpRequest<Body> {
-            let addr: SocketAddr = "127.0.0.1:40001".parse().unwrap();
-            req.extensions_mut().insert(ConnectInfo(addr));
-            req
+        async fn router_for(topology: WefTopology) -> Router {
+            let mut config = Config::default();
+            config.tls.enabled = false;
+            config.wef.collector_url = Some("http://logthing.example.com:5985".into());
+            config.wef.allow_unauthenticated = true;
+            config.wef.subscriptions = vec![WefSubscriptionConfig {
+                name: "security".into(),
+                uuid: "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0".parse().unwrap(),
+                channels: vec!["Security".into()],
+                query: None,
+                content_format: ContentFormat::Raw,
+                heartbeat_interval_secs: 3600,
+                max_latency_secs: 30,
+                max_envelope_size: 512_000,
+                read_existing_events: false,
+                enabled: true,
+            }];
+            let mut rt = validate_wef_topology(&config, false).unwrap().unwrap();
+            rt.topology = topology;
+            let mut server = build_server(config)
+                .await
+                .with_gss_factory(Arc::new(NoAcceptors));
+            Arc::get_mut(&mut server.state).expect("unique state").wef = Some(Arc::new(rt));
+            server
+                .create_router(IpWhitelist::empty())
+                .expect("router builds")
         }
 
-        #[test]
-        fn classify_missing_header() {
-            assert_eq!(classify_negotiate_header(None), NegotiateHeader::Missing);
+        fn post(uri: &str) -> HttpRequest<Body> {
+            with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
         }
 
-        #[test]
-        fn classify_wrong_scheme() {
+        #[tokio::test]
+        async fn test_plain_kerberos_topology_wsman_requires_auth() {
+            let router = router_for(WefTopology::PlainKerberos).await;
+            let resp = router.clone().oneshot(post("/wsman")).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            let challenges: Vec<_> = resp
+                .headers()
+                .get_all("WWW-Authenticate")
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect();
+            assert_eq!(challenges, ["Kerberos", "Negotiate"]);
+            // Delivery endpoints are covered too, and public routes are not.
+            let sub = "/wsman/subscriptions/0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0";
+            let resp = router.clone().oneshot(post(sub)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            let health = with_connect_info(
+                HttpRequest::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            );
             assert_eq!(
-                classify_negotiate_header(Some("Basic dXNlcjpwYXNz")),
-                NegotiateHeader::WrongScheme
+                router.oneshot(health).await.unwrap().status(),
+                StatusCode::OK
             );
         }
 
-        #[test]
-        fn classify_malformed_base64() {
-            assert_eq!(
-                classify_negotiate_header(Some("Negotiate not-valid-base64!!!")),
-                NegotiateHeader::MalformedBase64
-            );
-        }
-
-        #[test]
-        fn classify_well_formed_token() {
-            assert_eq!(
-                classify_negotiate_header(Some("Negotiate dGVzdA==")),
-                NegotiateHeader::Token(b"test".to_vec())
-            );
-        }
-
-        /// No `Authorization` header at all -> 401 with a `WWW-Authenticate:
-        /// Negotiate` challenge, not a panic or a 5xx.
+        /// No WEF runtime: `/wsman/**` only 404s, behind the regular per-request layer when
+        /// Kerberos is configured (401 without credentials) and bare otherwise.
         #[tokio::test]
-        async fn missing_authorization_header_returns_401_with_challenge() {
-            let req = with_connect_info(
-                HttpRequest::builder()
-                    .uri("/protected")
-                    .body(Body::empty())
-                    .unwrap(),
-            );
-            let resp = kerberos_router().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-            assert_eq!(resp.headers().get("WWW-Authenticate").unwrap(), "Negotiate");
+        async fn test_no_wef_runtime_wsman_keeps_per_request_layer() {
+            let mut config = Config::default();
+            config.tls.enabled = false;
+            let kerberos = cfg!(feature = "kerberos-auth");
+            let mut server = build_server(config).await;
+            if kerberos {
+                // Set after construction: `Server::new` would demand a real keytab.
+                server.config.security.kerberos.enabled = true;
+                server.config.security.kerberos.spn = Some("HTTP/test.invalid@EXAMPLE.COM".into());
+            }
+            Arc::get_mut(&mut server.state).expect("unique state").wef = None;
+            let router = server.create_router(IpWhitelist::empty()).expect("router");
+            let resp = router.oneshot(post("/wsman")).await.unwrap();
+            let expect = if kerberos {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            assert_eq!(resp.status(), expect);
         }
 
-        /// A non-Negotiate scheme (e.g. HTTP Basic) must be rejected with 401.
         #[tokio::test]
-        async fn non_negotiate_scheme_returns_401() {
-            let req = with_connect_info(
-                HttpRequest::builder()
-                    .uri("/protected")
-                    .header("Authorization", "Basic dXNlcjpwYXNz")
-                    .body(Body::empty())
-                    .unwrap(),
-            );
-            let resp = kerberos_router().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        async fn test_plain_unauthenticated_topology_wsman_has_no_auth_layer() {
+            let router = router_for(WefTopology::PlainUnauthenticated).await;
+            let resp = router.oneshot(post("/wsman")).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
         }
 
-        /// Malformed base64 after `Negotiate ` must be rejected with 401, not
-        /// a panic.
         #[tokio::test]
-        async fn malformed_base64_returns_401() {
-            let req = with_connect_info(
-                HttpRequest::builder()
-                    .uri("/protected")
-                    .header("Authorization", "Negotiate not-valid-base64!!!")
-                    .body(Body::empty())
-                    .unwrap(),
-            );
-            let resp = kerberos_router().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        }
-
-        /// A well-formed-but-bogus Negotiate token must be rejected with
-        /// 401 — never the old fail-closed stub's 501, and never a panic.
-        /// In this keytab-less sandbox this exercises "the GSSAPI pipeline
-        /// failed" (acquire or step, whichever fails first), not
-        /// specifically "a live ServerCtx rejected a garbage token" — that
-        /// needs a real credential this environment cannot provide.
-        #[tokio::test]
-        async fn bogus_token_returns_401_not_501_or_panic() {
-            let req = with_connect_info(
-                HttpRequest::builder()
-                    .uri("/protected")
-                    .header("Authorization", "Negotiate dGVzdA==")
-                    .body(Body::empty())
-                    .unwrap(),
-            );
-            let resp = kerberos_router().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-            assert_ne!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        async fn test_https_mutual_topology_wsman_has_no_kerberos_layer() {
+            let router = router_for(WefTopology::HttpsMutual).await;
+            let resp = router.oneshot(post("/wsman")).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
         }
     }
 }

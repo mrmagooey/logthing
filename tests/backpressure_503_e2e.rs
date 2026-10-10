@@ -91,7 +91,6 @@ async fn hec_and_ndjson_answer_503_when_full_and_recover_after_drain() {
 async fn otlp_answers_503_when_full_and_recovers_after_drain() {
     use logthing::config::OtlpConfig;
     use logthing::forwarding::otlp_s3::{OtlpRecord, OtlpSink};
-    use logthing::protocol::WefParser;
     use logthing::server::{AppState, handle_otlp_logs};
     use logthing::stats::ThroughputStats;
     use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
@@ -116,7 +115,8 @@ async fn otlp_answers_503_when_full_and_recovers_after_drain() {
         config: Arc::new(RwLock::new(config)),
         throughput: Arc::new(ThroughputStats::new()),
         wef_cardinality_watchers: Vec::new(),
-        parser: WefParser::new(),
+        wef: None,
+        bookmarks: std::sync::Arc::new(logthing::wef::bookmarks::BookmarkStore::new(16)),
         event_parser: None,
         parquet_s3_sender: None,
         parquet_local_sender: None,

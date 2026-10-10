@@ -1,3 +1,7 @@
+> **STALE:** this environment uses `wecutil` on the Windows clients and checks metric names
+> logthing does not emit. It has not been verified against the WEF subscription manager
+> (GPO-based setup, see `docs/wef.md`).
+
 # WEF Server Real AD Environment Testing
 
 This directory contains the infrastructure-as-code and test automation for running WEF Server integration tests against a real Active Directory environment using [Ludus](https://ludus.cloud).

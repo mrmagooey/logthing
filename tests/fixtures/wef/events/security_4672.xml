@@ -1,0 +1,38 @@
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Security-Auditing" Guid="{54849625-5478-4994-a5ba-3e3b0328c30d}">
+    </Provider>
+    <EventID>4672</EventID>
+    <Version>0</Version>
+    <Level>0</Level>
+    <Task>12548</Task>
+    <Opcode>0</Opcode>
+    <Keywords>0x8020000000000000</Keywords>
+    <TimeCreated SystemTime="2016-10-06T01:47:21.955197Z">
+    </TimeCreated>
+    <EventRecordID>227442</EventRecordID>
+    <Correlation>
+    </Correlation>
+    <Execution ProcessID="572" ThreadID="1244">
+    </Execution>
+    <Channel>Security</Channel>
+    <Computer>WIN-WFBHIBE5GXZ.example.co.jp</Computer>
+    <Security>
+    </Security>
+  </System>
+  <EventData>
+    <Data Name="SubjectUserSid">S-1-5-18</Data>
+    <Data Name="SubjectUserName">WIN-WFBHIBE5GXZ$</Data>
+    <Data Name="SubjectDomainName">EXAMPLE</Data>
+    <Data Name="SubjectLogonId">0x1f9cd52</Data>
+    <Data Name="PrivilegeList">SeSecurityPrivilege
+			SeBackupPrivilege
+			SeRestorePrivilege
+			SeTakeOwnershipPrivilege
+			SeDebugPrivilege
+			SeSystemEnvironmentPrivilege
+			SeLoadDriverPrivilege
+			SeImpersonatePrivilege
+			SeEnableDelegationPrivilege</Data>
+  </EventData>
+</Event>

@@ -47,6 +47,16 @@ Per-source ingest counters:
   own raw event and parsing resumes at the next one, so it doesn't cost the
   rest of the batch
 
+WEF requests (counted in the request handler, not per event):
+
+- `wef_requests_total{action}` - parsed `/wsman/**` SOAP requests by action
+  (`enumerate|heartbeat|events|subscription_end|end|unknown`); requests rejected before parsing
+  are not counted
+- `wef_auth_failures_total{reason}` - rejected Kerberos authentication or message-decryption
+  attempts (`missing|bad_scheme|bad_token|gss_error|missing_flags|decrypt_error|h2_encrypted`).
+  `reason="missing"` increments on the first unauthenticated request of every new connection;
+  that is normal for the Kerberos 401 challenge handshake and is not an attack signal on its own
+
 Parquet persistence (labelled `source="wef"|"syslog"|"ipfix"|"zeek"|"suricata"|"sflow"|"hec"|"otlp"`):
 
 - `parquet_s3_records_written`, `parquet_s3_uploads`, `parquet_s3_upload_errors`.
@@ -163,9 +173,8 @@ Counters are exported with a `_total` suffix by the Prometheus exporter.
 ## API Endpoints
 
 ### WEF Endpoints
-- `POST /wsman` - Main WEF endpoint for subscriptions and events
-- `POST /wsman/subscriptions` - WEF subscription requests
-- `POST /wsman/events` - WEF event delivery
+- `POST /wsman/SubscriptionManager/WEC` - Subscription manager (Enumerate, End)
+- `POST /wsman/subscriptions/<subscription uuid>` - WEF event and heartbeat delivery
 
 ### Syslog Endpoints
 - `POST /syslog` - Receive syslog messages via HTTP

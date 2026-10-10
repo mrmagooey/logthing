@@ -442,9 +442,9 @@ mod tests {
     use logthing::config::{Config, OtlpConfig};
     use logthing::ingest::IngestState;
     use logthing::ingest::decompress::post_gzip;
-    use logthing::protocol::WefParser;
     use logthing::server::{AppState, handle_otlp_logs};
     use logthing::stats::ThroughputStats;
+    use logthing::wef::bookmarks::BookmarkStore;
     use std::net::SocketAddr;
     use tower::ServiceExt;
 
@@ -461,7 +461,8 @@ mod tests {
             config: Arc::new(tokio::sync::RwLock::new(config)),
             throughput: Arc::new(ThroughputStats::new()),
             wef_cardinality_watchers: Vec::new(),
-            parser: WefParser::new(),
+            wef: None,
+            bookmarks: Arc::new(BookmarkStore::new(16)),
             event_parser: None,
             parquet_s3_sender: None,
             parquet_local_sender: None,

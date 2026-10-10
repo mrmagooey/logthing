@@ -7,7 +7,6 @@
 
 use axum::{Router, routing::post};
 use logthing::config::Config;
-use logthing::protocol::WefParser;
 use logthing::server::{AppState, handle_syslog_http};
 use logthing::stats::ThroughputStats;
 use std::net::SocketAddr;
@@ -26,7 +25,8 @@ async fn build_app_state(token: &str) -> Arc<AppState> {
         config: Arc::new(RwLock::new(config)),
         throughput: Arc::new(ThroughputStats::new()),
         wef_cardinality_watchers: Vec::new(),
-        parser: WefParser::new(),
+        wef: None,
+        bookmarks: std::sync::Arc::new(logthing::wef::bookmarks::BookmarkStore::new(16)),
         event_parser: None,
         parquet_s3_sender: None,
         parquet_local_sender: None,

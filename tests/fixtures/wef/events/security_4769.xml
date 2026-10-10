@@ -1,0 +1,36 @@
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Security-Auditing" Guid="{54849625-5478-4994-a5ba-3e3b0328c30d}">
+    </Provider>
+    <EventID>4769</EventID>
+    <Version>0</Version>
+    <Level>0</Level>
+    <Task>14337</Task>
+    <Opcode>0</Opcode>
+    <Keywords>0x8020000000000000</Keywords>
+    <TimeCreated SystemTime="2016-10-06T01:49:00.953431Z">
+    </TimeCreated>
+    <EventRecordID>227518</EventRecordID>
+    <Correlation>
+    </Correlation>
+    <Execution ProcessID="572" ThreadID="1884">
+    </Execution>
+    <Channel>Security</Channel>
+    <Computer>WIN-WFBHIBE5GXZ.example.co.jp</Computer>
+    <Security>
+    </Security>
+  </System>
+  <EventData>
+    <Data Name="TargetUserName">WIN-WFBHIBE5GXZ$@EXAMPLE.CO.JP</Data>
+    <Data Name="TargetDomainName">EXAMPLE.CO.JP</Data>
+    <Data Name="ServiceName">WIN-WFBHIBE5GXZ$</Data>
+    <Data Name="ServiceSid">S-1-5-21-1524084746-3249201829-3114449661-1000</Data>
+    <Data Name="TicketOptions">0x40810000</Data>
+    <Data Name="TicketEncryptionType">0x12</Data>
+    <Data Name="IpAddress">::1</Data>
+    <Data Name="IpPort">0</Data>
+    <Data Name="Status">0x0</Data>
+    <Data Name="LogonGuid">E2B328F6-FCAD-34AA-676C-C5D6385D0098</Data>
+    <Data Name="TransmittedServices">-</Data>
+  </EventData>
+</Event>

@@ -26,7 +26,6 @@ use crate::forwarding::syslog_s3::SyslogSink;
 use crate::forwarding::zeek_s3::ZeekSink;
 use crate::ipfix::decoder::{IpfixDecoder, MAX_CACHED_TEMPLATES};
 use crate::parser::GenericEventParser;
-use crate::protocol::{WefMessage, WefParser};
 use crate::syslog::SyslogMessage;
 use crate::syslog::payload::{self, StructuredSyslogRecord};
 
@@ -145,20 +144,33 @@ pub fn wef_event(data: &[u8]) -> usize {
     )
 }
 
-/// WEF HTTP body: envelope split, per-event generic parse, and WEF mapping.
+/// WEF HTTP body: charset decode, SOAP parse, per-event parse, and WEF mapping.
 pub fn wef_envelope(data: &[u8]) -> usize {
-    let body = String::from_utf8_lossy(data);
-    let Ok(WefMessage::Events(events)) = WefParser.parse_message(&body, "192.0.2.1".into()) else {
+    let Ok(text) = crate::wef::encoding::decode_body(data) else {
         return 0;
     };
+    let Ok(req) = crate::wef::soap::parse(&text) else {
+        return 0;
+    };
+    let events = crate::wef::event::extract_events(&req.events, "192.0.2.1", "fuzz");
     let n = events.len();
     for event in events {
-        if let Some(parsed) = &event.parsed {
-            let _ = event_parser().parse_event(parsed.event_id, &event.raw_xml);
-        }
         map_record(&WefSink, &Arc::new(event));
     }
     n
+}
+
+/// SLDC-compressed WEF body: decode with the production bomb guard (4 MiB); returns the
+/// decoded length, 0 on a decode error.
+pub fn wef_sldc(data: &[u8]) -> usize {
+    crate::wef::sldc::decompress(data, crate::server::kerberos::WSMAN_MAX_BODY)
+        .map_or(0, |v| v.len())
+}
+
+/// Kerberos/SPNEGO encrypted multipart envelope: returns header + data length, 0 on a
+/// parse error.
+pub fn wef_multipart(data: &[u8]) -> usize {
+    crate::wef::multipart::parse(data).map_or(0, |p| p.header.len() + p.data.len())
 }
 
 /// NDJSON listener framing: `\n`-split, trailing `\r` stripped, empty lines
@@ -346,7 +358,9 @@ mod tests {
     #[test]
     fn test_wef_envelope_every_events_seed_yields_events() {
         for (path, bytes) in seeds("wef_envelope") {
-            if path.ends_with("subscribe.xml") {
+            // Non-Events seeds (garbage, a bare subscribe body) exist for coverage only.
+            let name = path.file_name().unwrap().to_string_lossy();
+            if !name.starts_with("events_") {
                 continue;
             }
             assert!(
@@ -354,6 +368,68 @@ mod tests {
                 "{} yielded no events",
                 path.display()
             );
+        }
+    }
+
+    #[test]
+    fn test_wef_sldc_every_seed_decodes() {
+        for (path, bytes) in seeds("wef_sldc") {
+            assert!(wef_sldc(&bytes) > 0, "{} did not decode", path.display());
+        }
+        assert_eq!(wef_sldc(&[]), 0);
+        assert_eq!(wef_sldc(&[0xff; 64]), 0);
+    }
+
+    #[test]
+    #[ignore = "regenerates fuzz/seeds/wef_sldc/*.bin"]
+    fn write_wef_sldc_seeds() {
+        use crate::wef::{encoding::encode_utf16le_bom, sldc::compress_literals_and_copies as c};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/seeds/wef_sldc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let soap = "<s:Envelope><e:Event>logon admin</e:Event></s:Envelope>".repeat(40);
+        let seeds = [
+            ("literals.bin", c(b"AB")),
+            ("copies.bin", c(b"abcabcabcabcabc")),
+            ("long_run.bin", c(&[b'z'; 700])),
+            ("utf16_soap.bin", c(&encode_utf16le_bom(&soap))),
+        ];
+        for (name, bytes) in seeds {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_wef_multipart_every_seed_parses() {
+        for (path, bytes) in seeds("wef_multipart") {
+            assert!(
+                wef_multipart(&bytes) > 0,
+                "{} did not parse",
+                path.display()
+            );
+        }
+        assert_eq!(wef_multipart(&[]), 0);
+        assert_eq!(wef_multipart(b"--Encrypted Boundary\r\n"), 0);
+    }
+
+    #[test]
+    #[ignore = "regenerates fuzz/seeds/wef_multipart/*.bin"]
+    fn write_wef_multipart_seeds() {
+        use crate::wef::multipart::{EncProtocol, build};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/seeds/wef_multipart");
+        std::fs::create_dir_all(&dir).unwrap();
+        let seeds = [
+            (
+                "kerberos.bin",
+                build(EncProtocol::Kerberos, 100, &[0x60; 60], &[7; 120]),
+            ),
+            (
+                "spnego.bin",
+                build(EncProtocol::Spnego, 100, &[0x60; 16], b"x\r\n--Enc\r\ny"),
+            ),
+            ("empty_data.bin", build(EncProtocol::Kerberos, 0, b"h", b"")),
+        ];
+        for (name, bytes) in seeds {
+            std::fs::write(dir.join(name), bytes).unwrap();
         }
     }
 

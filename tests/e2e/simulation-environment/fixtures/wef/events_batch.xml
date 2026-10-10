@@ -1,35 +1,27 @@
-<?xml version="1.0" encoding="utf-8"?>
-<Envelope>
-  <Body>
-    <Events>
-      <Event>
-        <System>
-          <Provider>Microsoft-Windows-Security-Auditing</Provider>
-          <EventID>4624</EventID>
-          <Level>4</Level>
-          <TimeCreated>2024-05-06T12:00:00Z</TimeCreated>
-          <Computer>TEST-HOST</Computer>
-        </System>
-        <EventData>
-          <Data>
-            Successful logon
-          </Data>
-        </EventData>
-      </Event>
-      <Event>
-        <System>
-          <Provider>Microsoft-Windows-Security-Auditing</Provider>
-          <EventID>4668</EventID>
-          <Level>3</Level>
-          <TimeCreated>2024-05-06T12:00:01Z</TimeCreated>
-          <Computer>TEST-HOST</Computer>
-        </System>
-        <EventData>
-          <Data>
-            S4U2Self request
-          </Data>
-        </EventData>
-      </Event>
-    </Events>
-  </Body>
-</Envelope>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:n="http://schemas.xmlsoap.org/ws/2004/09/enumeration" xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd" xmlns:p="http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd" xmlns:b="http://schemas.dmtf.org/wbem/wsman/1/cimbinding.xsd">
+  <s:Header>
+    <a:To>http://logthing.example.com:5985/wsman/subscriptions/0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0/1</a:To>
+    <m:MachineID xmlns:m="http://schemas.microsoft.com/wbem/wsman/1/machineid" s:mustUnderstand="false">
+      TEST-HOST
+    </m:MachineID>
+    <a:ReplyTo>
+      <a:Address s:mustUnderstand="true">http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:Address>
+    </a:ReplyTo>
+    <a:Action s:mustUnderstand="true">http://schemas.dmtf.org/wbem/wsman/1/wsman/Events</a:Action>
+    <a:MessageID>uuid:1C2D3E4F-5061-4728-8394-A5B6C7D8E9F0</a:MessageID>
+    <p:OperationID s:mustUnderstand="false">uuid:3E4F5061-7283-4940-A5B6-C7D8E9F0A1B2</p:OperationID>
+    <p:SequenceId s:mustUnderstand="false">1</p:SequenceId>
+    <w:OperationTimeout>PT60.000S</w:OperationTimeout>
+    <e:Identifier xmlns:e="http://schemas.xmlsoap.org/ws/2004/08/eventing" s:mustUnderstand="true">
+      0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0
+    </e:Identifier>
+    <w:Bookmark><BookmarkList><Bookmark Channel="Security" RecordId="1042" IsCurrent="true"/></BookmarkList></w:Bookmark>
+    <w:AckRequested/>
+  </s:Header>
+  <s:Body>
+    <w:Events>
+      <w:Event Action="http://schemas.dmtf.org/wbem/wsman/1/wsman/Event"><![CDATA[<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Security-Auditing' Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}'/><EventID>4624</EventID><Version>0</Version><Level>0</Level><Task>12544</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime='2024-05-06T12:00:00.0000000Z'/><EventRecordID>1</EventRecordID><Correlation/><Execution ProcessID='636' ThreadID='700'/><Channel>Security</Channel><Computer>TEST-HOST</Computer><Security/></System><EventData><Data Name='Message'>Successful logon</Data></EventData></Event>]]></w:Event>
+      <w:Event Action="http://schemas.dmtf.org/wbem/wsman/1/wsman/Event"><![CDATA[<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Security-Auditing' Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}'/><EventID>4668</EventID><Version>0</Version><Level>0</Level><Task>12544</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime='2024-05-06T12:00:01.0000000Z'/><EventRecordID>2</EventRecordID><Correlation/><Execution ProcessID='636' ThreadID='700'/><Channel>Security</Channel><Computer>TEST-HOST</Computer><Security/></System><EventData><Data Name='Message'>S4U2Self request</Data></EventData></Event>]]></w:Event>
+    </w:Events>
+  </s:Body>
+</s:Envelope>

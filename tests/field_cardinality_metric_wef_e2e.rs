@@ -1,4 +1,4 @@
-//! End-to-end test: real WEF HTTP ingest (`POST /wsman/events`) → real
+//! End-to-end test: real WEF HTTP ingest (`POST /wsman/subscriptions/<uuid>`) → real
 //! production `/metrics` HTTP endpoint, for the `field_distinct_values` /
 //! `field_distinct_values_capped` cardinality-watch gauge, `source = "wef"`.
 //!
@@ -10,7 +10,7 @@
 //! separately, and a short `cardinality_window_secs` so the test does not
 //! wait out the production default. WEF has no separate socket listener —
 //! events arrive over the same real HTTP server the `/metrics` scrape uses,
-//! via `POST /wsman/events` with real WEF XML bodies (see
+//! via Windows-shaped `Events` envelopes (UTF-16LE) POSTed to the delivery URL (see
 //! `tests/wef_s3_integration.rs` / `tests/wef_local_integration.rs` for how
 //! `WindowsEvent`/`ParsedEvent` are shaped, and
 //! `tests/throughput_stats_cap_e2e.rs` for the real-HTTP-POST-of-WEF-XML
@@ -25,6 +25,8 @@
 //! This MUST be the only `#[tokio::test]` in this binary — same reason as
 //! the zeek e2e test: the Prometheus recorder is a process-global,
 //! install-once call.
+
+mod common;
 
 use logthing::config::{CardinalityWatch, Config, MetricsConfig, TlsConfig};
 use logthing::forwarding::flush_registry::FlushIntervalRegistry;
@@ -41,28 +43,25 @@ async fn reserve_port() -> u16 {
     probe.local_addr().unwrap().port()
 }
 
-/// One `<Event>` element with the given channel/computer, matching the
-/// shape real Windows Event Forwarding XML carries in `<System>`.
+/// One Windows `<Event>` with the given channel/computer.
 fn wef_event_xml(channel: &str, computer: &str) -> String {
     format!(
-        r#"<Event>
-          <System>
-            <Provider>Microsoft-Windows-Security-Auditing</Provider>
-            <EventID>4624</EventID>
-            <Level>4</Level>
-            <Channel>{channel}</Channel>
-            <TimeCreated>2024-01-01T00:00:00Z</TimeCreated>
-            <Computer>{computer}</Computer>
-          </System>
-        </Event>"#
+        "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>\
+         <Provider Name='Microsoft-Windows-Security-Auditing'/><EventID>4624</EventID>\
+         <Level>4</Level><TimeCreated SystemTime='2024-01-01T00:00:00.0000000Z'/>\
+         <Channel>{channel}</Channel><Computer>{computer}</Computer></System></Event>"
     )
 }
 
-fn wef_envelope(events: &[String]) -> String {
-    format!(
-        "<Envelope><Body><Events>{}</Events></Body></Envelope>",
-        events.join("\n")
-    )
+/// UTF-16LE `Events` envelope carrying `events`.
+fn wef_envelope(events: &[String]) -> Vec<u8> {
+    let refs: Vec<&str> = events.iter().map(String::as_str).collect();
+    common::utf16(&common::events_envelope(
+        "uuid:1C2D3E4F-5061-4728-8394-A5B6C7D8E9F0",
+        "win10.example.com",
+        1,
+        &refs,
+    ))
 }
 
 fn find_metric_value(body: &str, exact_prefix: &str) -> Option<f64> {
@@ -93,7 +92,12 @@ async fn field_distinct_values_visible_on_real_metrics_endpoint_for_wef_computer
     // needing thousands of real HTTP round trips.
     let max_values = 3;
 
+    let wef_cfg =
+        toml::from_str::<Config>(&common::wef_toml(&format!("http://127.0.0.1:{http_port}")))
+            .unwrap()
+            .wef;
     let config = Config {
+        wef: wef_cfg,
         bind_address: format!("127.0.0.1:{http_port}").parse().unwrap(),
         tls: TlsConfig {
             enabled: false,
@@ -181,11 +185,14 @@ async fn field_distinct_values_visible_on_real_metrics_endpoint_for_wef_computer
         wef_event_xml("System", "WIN-HOST-99"),
     ]);
     let resp = client
-        .post(format!("{base_url}/wsman/events"))
+        .post(format!(
+            "{base_url}/wsman/subscriptions/{}",
+            common::TEST_SUB_UUID
+        ))
         .body(window1)
         .send()
         .await
-        .expect("POST /wsman/events must succeed");
+        .expect("POST delivery must succeed");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -252,11 +259,14 @@ async fn field_distinct_values_visible_on_real_metrics_endpoint_for_wef_computer
         wef_event_xml("Security", "WIN-HOST-05"),
     ]);
     let resp = client
-        .post(format!("{base_url}/wsman/events"))
+        .post(format!(
+            "{base_url}/wsman/subscriptions/{}",
+            common::TEST_SUB_UUID
+        ))
         .body(window2)
         .send()
         .await
-        .expect("POST /wsman/events must succeed");
+        .expect("POST delivery must succeed");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);

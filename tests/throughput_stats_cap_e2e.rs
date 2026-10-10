@@ -3,8 +3,8 @@
 //! Spins up the REAL `Server` (`logthing::server::Server::new` +
 //! `Server::run`), the same entry point `main.rs` uses, on a real TCP
 //! listener. Drives event ingestion through the outermost HTTP interface —
-//! `POST /wsman/events` with real WEF XML bodies, exactly what a Windows
-//! event forwarder would send — with more distinct `Provider:EventID`
+//! a Windows-shaped UTF-16LE `Events` envelope POSTed to the delivery URL, exactly what
+//! a Windows event forwarder would send — with more distinct `Provider:EventID`
 //! combinations than the event-type cap allows, then reads
 //! `GET /stats/throughput` over a real HTTP connection and asserts the
 //! reported event-type count stays bounded rather than growing one row per
@@ -14,6 +14,8 @@
 //! config), so events are accepted, counted, and dropped — this test
 //! validates the HTTP + stats-capping path only. No external dependency
 //! required.
+
+mod common;
 
 use logthing::config::{Config, MetricsConfig, TlsConfig};
 use logthing::forwarding::flush_registry::FlushIntervalRegistry;
@@ -27,29 +29,20 @@ use tokio::sync::RwLock;
 /// Mirror of `stats::MAX_EVENT_TYPES` (private to that module).
 const MAX_EVENT_TYPES: usize = 1024;
 
-fn wef_events_envelope(provider: &str, event_id: u32) -> String {
-    format!(
-        r#"
-        <Envelope>
-          <Body>
-            <Events>
-              <Event>
-                <System>
-                  <Provider>{provider}</Provider>
-                  <EventID>{event_id}</EventID>
-                  <Level>4</Level>
-                  <TimeCreated>2024-01-01T00:00:00Z</TimeCreated>
-                  <Computer>host</Computer>
-                </System>
-                <EventData>
-                  <Data Name="TargetUserName">alice</Data>
-                </EventData>
-              </Event>
-            </Events>
-          </Body>
-        </Envelope>
-        "#
-    )
+fn wef_events_envelope(provider: &str, event_id: u32) -> Vec<u8> {
+    let event = format!(
+        "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>\
+         <Provider Name='{provider}'/><EventID>{event_id}</EventID><Level>4</Level>\
+         <TimeCreated SystemTime='2024-01-01T00:00:00.0000000Z'/><Channel>Security</Channel>\
+         <Computer>host</Computer></System><EventData>\
+         <Data Name='TargetUserName'>alice</Data></EventData></Event>"
+    );
+    common::utf16(&common::events_envelope(
+        "uuid:1C2D3E4F-5061-4728-8394-A5B6C7D8E9F0",
+        "win10.example.com",
+        1,
+        &[&event],
+    ))
 }
 
 #[tokio::test]
@@ -63,7 +56,11 @@ async fn throughput_endpoint_stays_bounded_under_a_flood_of_distinct_event_types
         probe.local_addr().unwrap().port()
     };
 
+    let wef_cfg = toml::from_str::<Config>(&common::wef_toml(&format!("http://127.0.0.1:{port}")))
+        .unwrap()
+        .wef;
     let config = Config {
+        wef: wef_cfg,
         bind_address: format!("127.0.0.1:{port}").parse().unwrap(),
         // Server::run always serves plain HTTP regardless, but keep config honest.
         tls: TlsConfig {
@@ -117,18 +114,21 @@ async fn throughput_endpoint_stays_bounded_under_a_flood_of_distinct_event_types
     assert!(ready, "server did not become ready in time");
 
     // Post more distinct provider/event-id combinations than the cap
-    // allows, each via a real HTTP POST to the real /wsman/events route —
+    // allows, each via a real HTTP POST to the real delivery route —
     // exactly the caller-controlled key space (`describe_event_type`) the
     // cap exists to bound.
     let distinct_events = MAX_EVENT_TYPES + 200;
     for i in 0..distinct_events {
         let body = wef_events_envelope(&format!("Provider-{i}"), 4624);
         let resp = client
-            .post(format!("{base_url}/wsman/events"))
+            .post(format!(
+                "{base_url}/wsman/subscriptions/{}",
+                common::TEST_SUB_UUID
+            ))
             .body(body)
             .send()
             .await
-            .expect("POST /wsman/events must succeed");
+            .expect("POST delivery must succeed");
         assert_eq!(
             resp.status(),
             reqwest::StatusCode::OK,

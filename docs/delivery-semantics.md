@@ -13,7 +13,7 @@ metric shows loss:
 | Source | Behaviour on a full channel | Sender observes | Loss metric |
 |---|---|---|---|
 | HEC (`/services/collector/*`), NDJSON (`/ingest`), OTLP over HTTP | Request rejected | `503` + `Retry-After: 1` (HEC code 9 "Server is busy"); the client is expected to retry | `hec_events_dropped`, `otlp_events_dropped` count records not enqueued |
-| WEF (`/wsman`) | Event dropped, request still answered | `200` (WEF is **not** backpressured: the Windows event forwarder gets no signal) | `parquet_s3_dropped{source="wef"}` |
+| WEF (`/wsman/subscriptions/<uuid>`) | Event dropped, request still Acked | `200` with an Ack (WEF is **not** backpressured: Windows advances its bookmark and does not resend, so the loss is silent). Bookmarks are held in memory, so after a restart clients have no bookmark and resume from now, or from the earliest event if `read_existing_events = true` (duplicates or gaps) | `parquet_s3_dropped{source="wef"}` |
 | Syslog UDP, IPFIX, sFlow | Kernel socket buffer overflows before logthing reads | Nothing (UDP has no feedback) | `syslog_udp_socket_drops`, `ipfix_socket_drops`, `sflow_socket_drops`; `parquet_s3_dropped{source}` for records that were read but not enqueued |
 | Syslog TCP | Record dropped when the channel is full (non-blocking enqueue) | Nothing; the connection stays open | `parquet_s3_dropped{source="syslog"}` |
 | Zeek, Suricata (TCP) | The connection task waits up to 5 s for channel space, so the sensor sees TCP backpressure; after the wait the record is dropped | Slow socket, then silence | `parquet_s3_dropped{source="zeek"\|"suricata"}` |

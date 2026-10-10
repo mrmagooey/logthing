@@ -11,7 +11,7 @@ declare -A dict=(
     [syslog]=syslog [wef_event]=xml [wef_envelope]=xml
     [zeek]=json [suricata]=json [hec]=json [otlp]=json
 )
-all=(ipfix sflow syslog wef_event wef_envelope zeek suricata hec otlp)
+all=(ipfix sflow syslog wef_event wef_envelope wef_sldc wef_multipart zeek suricata hec otlp)
 if [[ "${1:-}" == "all" ]]; then targets=("${all[@]}"); else targets=("${1:?target or all}"); fi
 
 for t in "${targets[@]}"; do
