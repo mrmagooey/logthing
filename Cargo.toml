@@ -84,7 +84,7 @@ socket2 = "0.6"
 libc = "0.2"
 
 # Utilities
-uuid = { version = "1.7", features = ["v4", "v7", "serde"] }
+uuid = { version = "1.7", features = ["v4", "v5", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
 futures = "0.3"
@@ -113,6 +113,7 @@ regex = "1.10"
 regex-syntax = "0.8"
 hmac = "0.12"
 sha2 = "0.10"
+sha1 = "0.10"
 async-trait = "0.1"
 hex = "0.4.3"
 aho-corasick = "1.1"

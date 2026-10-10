@@ -5,8 +5,10 @@
 //! payloads are expanded, others pass through) -> charset decode (UTF-16LE or UTF-8, see
 //! [`encoding`]) -> SOAP parse.
 
+pub mod bookmarks;
 pub mod encoding;
 pub mod event;
 pub mod multipart;
 pub mod sldc;
 pub mod soap;
+pub mod subscription;

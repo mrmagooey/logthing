@@ -843,7 +843,7 @@ pub struct WefLocalConfig {
 }
 
 /// Top-level [wef] config section (WEF ingest + optional S3 persistence).
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WefConfig {
     /// Optional S3 persistence. Absent from TOML → `None` → no S3 persistence.
     #[serde(default)]
@@ -853,6 +853,93 @@ pub struct WefConfig {
     /// simultaneously, in which case events are written to both.
     #[serde(default)]
     pub local: Option<WefLocalConfig>,
+    /// Public base URL Windows clients use to reach this collector
+    /// (required iff `subscriptions` is non-empty).
+    #[serde(default)]
+    pub collector_url: Option<String>,
+    /// Allow the subscription manager and delivery endpoints without any
+    /// client authentication (plain HTTP, no Kerberos).
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
+    /// Maximum number of per-(machine, subscription) bookmarks kept in memory.
+    #[serde(default = "default_wef_bookmark_capacity")]
+    pub bookmark_capacity: usize,
+    /// Subscriptions served to enumerating Windows clients.
+    #[serde(default)]
+    pub subscriptions: Vec<WefSubscriptionConfig>,
+}
+
+impl Default for WefConfig {
+    fn default() -> Self {
+        Self {
+            s3: None,
+            local: None,
+            collector_url: None,
+            allow_unauthenticated: false,
+            bookmark_capacity: default_wef_bookmark_capacity(),
+            subscriptions: Vec::new(),
+        }
+    }
+}
+
+fn default_wef_bookmark_capacity() -> usize {
+    10_000
+}
+
+/// How Windows renders events before forwarding them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum ContentFormat {
+    /// Raw event XML only.
+    #[default]
+    Raw,
+    /// Event XML plus the rendered (localized) message text.
+    RenderedText,
+}
+
+/// One `[[wef.subscriptions]]` entry.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WefSubscriptionConfig {
+    /// Unique name, 1..=128 chars of `[A-Za-z0-9_.-]`.
+    pub name: String,
+    /// Unique subscription identifier.
+    pub uuid: uuid::Uuid,
+    /// Channels to subscribe to (exclusive with `query`).
+    #[serde(default)]
+    pub channels: Vec<String>,
+    /// Verbatim `<QueryList>` XML (exclusive with `channels`).
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Raw or RenderedText.
+    #[serde(default)]
+    pub content_format: ContentFormat,
+    /// Heartbeat interval in seconds (default 3600).
+    #[serde(default = "default_wef_sub_heartbeat")]
+    pub heartbeat_interval_secs: u64,
+    /// Maximum batching latency in seconds (default 30).
+    #[serde(default = "default_wef_sub_latency")]
+    pub max_latency_secs: u64,
+    /// Maximum SOAP envelope size in bytes (default 512000, minimum 8192).
+    #[serde(default = "default_wef_sub_envelope")]
+    pub max_envelope_size: u32,
+    /// Replay existing events when no bookmark is known.
+    #[serde(default)]
+    pub read_existing_events: bool,
+    /// Disabled subscriptions are not served.
+    #[serde(default = "default_wef_sub_enabled")]
+    pub enabled: bool,
+}
+
+fn default_wef_sub_heartbeat() -> u64 {
+    3600
+}
+fn default_wef_sub_latency() -> u64 {
+    30
+}
+fn default_wef_sub_envelope() -> u32 {
+    512_000
+}
+fn default_wef_sub_enabled() -> bool {
+    true
 }
 
 /// Per-source S3 persistence config for HEC ingest.
@@ -2078,6 +2165,30 @@ pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_config_wef_subscriptions_deserialize_defaults() {
+        let wef: WefConfig = toml::from_str(
+            r#"
+collector_url = "http://c.example:5985"
+[[subscriptions]]
+name = "security"
+uuid = "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0"
+channels = ["Security"]
+"#,
+        )
+        .unwrap();
+        let s = &wef.subscriptions[0];
+        assert_eq!(s.content_format, ContentFormat::Raw);
+        assert_eq!(s.heartbeat_interval_secs, 3600);
+        assert_eq!(s.max_latency_secs, 30);
+        assert_eq!(s.max_envelope_size, 512_000);
+        assert!(!s.read_existing_events && s.enabled);
+        assert_eq!(wef.bookmark_capacity, 10_000);
+        assert!(!wef.allow_unauthenticated);
+        let empty: WefConfig = toml::from_str("").unwrap();
+        assert!(empty.subscriptions.is_empty() && empty.collector_url.is_none());
+    }
+
     use super::*;
     use crate::forwarding::channel_budget::{
         GENERIC_RECORD_BYTES, IPFIX_DATAGRAM_BYTES, SFLOW_RECORD_BYTES, SURICATA_RECORD_BYTES,

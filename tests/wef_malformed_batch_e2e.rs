@@ -94,6 +94,7 @@ async fn malformed_batch_returns_200_counts_the_error_and_keeps_the_good_events(
                 channel_capacity: 256,
                 max_buffer_rows: 100_000,
             }),
+            ..WefConfig::default()
         },
         ..Config::default()
     };
