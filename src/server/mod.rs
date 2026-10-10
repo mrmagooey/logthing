@@ -2,6 +2,7 @@ pub mod conn;
 pub mod kerberos;
 #[cfg(feature = "otlp")]
 pub mod otlp;
+mod tls_identity;
 mod wef_routes;
 
 use crate::config::Config;
@@ -1024,7 +1025,12 @@ impl Server {
         });
 
         // Use axum-server for proper TLS handling
-        axum_server::bind_rustls(tls_addr, tls_config)
+        // The acceptor records each connection's client-certificate fingerprint so WEF
+        // bookmarks are keyed by it (see `tls_identity`).
+        axum_server::bind(tls_addr)
+            .acceptor(tls_identity::IdentityAcceptor::new(
+                axum_server::tls_rustls::RustlsAcceptor::new(tls_config),
+            ))
             .handle(axum_handle)
             .serve(conn::with_conn_slots(
                 app.into_make_service_with_connect_info::<SocketAddr>(),

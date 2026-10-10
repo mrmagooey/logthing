@@ -298,6 +298,112 @@ async fn test_mtls_events_flow_lands_rows() {
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
 }
 
+impl Harness {
+    /// Deliver an EVENTS batch (one fixture event) bookmarking `record_id` as `machine`.
+    async fn store_bookmark(&self, c: &reqwest::Client, mid: &str, machine: &str, record_id: u64) {
+        let ev = common::wef_fixture("security_4624");
+        let url = format!(
+            "{}/wsman/subscriptions/{}",
+            self.base,
+            common::TEST_SUB_UUID
+        );
+        let (st, body) = self
+            .post(
+                c,
+                &url,
+                &common::events_envelope(mid, machine, record_id, &[&ev]),
+            )
+            .await;
+        assert_eq!(st, 200, "{body}");
+    }
+
+    /// Enumerate as `machine` and return the response body (carries the replayed bookmark).
+    async fn enumerate(&self, c: &reqwest::Client, mid: &str, machine: &str) -> String {
+        let (st, body) = self
+            .post(
+                c,
+                &format!("{}/wsman", self.base),
+                &common::enumerate_envelope(mid, machine),
+            )
+            .await;
+        assert_eq!(st, 200, "{body}");
+        body
+    }
+
+    /// A (CN win10) stores bookmark 100; B (CN win11) claims A's MachineID with 999999. Each
+    /// certificate keeps its own bookmark; B cannot overwrite A's.
+    async fn assert_spoof_blocked(&self) {
+        let a = client(&self.ca, Some(&self.ca.issue("win10.example.com", false)));
+        let b = client(&self.ca, Some(&self.ca.issue("win11.example.com", false)));
+        self.store_bookmark(&a, "aa01", MACHINE, 100).await;
+        self.store_bookmark(&b, "bb01", MACHINE, 999999).await;
+        let for_a = self.enumerate(&a, "aa02", MACHINE).await;
+        assert!(for_a.contains("RecordId=\"100\""), "{for_a}");
+        assert!(!for_a.contains("999999"), "{for_a}");
+        let for_b = self.enumerate(&b, "bb02", MACHINE).await;
+        assert!(for_b.contains("RecordId=\"999999\""), "{for_b}");
+    }
+}
+
+#[tokio::test]
+async fn test_mtls_spoofed_machine_id_cannot_overwrite_bookmark() {
+    let h = Harness::start().await;
+    h.assert_spoof_blocked().await;
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn test_mtls_reconnect_same_cert_replays_bookmark() {
+    let h = Harness::start().await;
+    let leaf = h.ca.issue("win10.example.com", false);
+    let first = client(&h.ca, Some(&leaf));
+    h.store_bookmark(&first, "r001", MACHINE, 100).await;
+    // A fresh client: new TCP and TLS connection, empty session cache.
+    let second = client(&h.ca, Some(&leaf));
+    let body = h.enumerate(&second, "r002", MACHINE).await;
+    assert!(body.contains("RecordId=\"100\""), "{body}");
+    // One connection per request, with rustls' default session cache, so later handshakes
+    // can resume the session; the identity must still be attached.
+    let resuming = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(h.ca.pem().as_bytes()).unwrap())
+        .identity(
+            reqwest::Identity::from_pem(format!("{}\n{}", leaf.cert_pem, leaf.key_pem).as_bytes())
+                .unwrap(),
+        )
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
+    for i in 0..2 {
+        let body = h.enumerate(&resuming, &format!("r01{i}"), MACHINE).await;
+        assert!(body.contains("RecordId=\"100\""), "{body}");
+    }
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn test_mtls_concurrent_connections_keep_distinct_identities() {
+    let h = Harness::start().await;
+    let a = client(&h.ca, Some(&h.ca.issue("win10.example.com", false)));
+    let b = client(&h.ca, Some(&h.ca.issue("win11.example.com", false)));
+    h.store_bookmark(&a, "ca01", MACHINE, 100).await;
+    h.store_bookmark(&b, "cb01", MACHINE, 200).await;
+    let calls = (0..20).map(|i| {
+        let (c, mid, is_a) = if i % 2 == 0 {
+            (&a, format!("ca1{i}"), true)
+        } else {
+            (&b, format!("cb1{i}"), false)
+        };
+        let h = &h;
+        async move { (is_a, h.enumerate(c, &mid, MACHINE).await) }
+    });
+    for (is_a, body) in futures::future::join_all(calls).await {
+        let (want, other) = if is_a { ("100", "200") } else { ("200", "100") };
+        assert!(body.contains(&format!("RecordId=\"{want}\"")), "{body}");
+        assert!(!body.contains(&format!("RecordId=\"{other}\"")), "{body}");
+    }
+    h.finish().await;
+}
+
 #[tokio::test]
 async fn test_mtls_no_client_cert_handshake_rejected() {
     let h = Harness::start().await;
@@ -419,5 +525,31 @@ async fn test_mtls_syslog_still_requires_kerberos_when_enabled() {
         )
         .await;
     assert_eq!(st, 200);
+    h.finish().await;
+}
+
+#[cfg(feature = "kerberos-auth")]
+#[tokio::test]
+async fn test_tls_with_kerberos_configured_keys_by_certificate() {
+    let keytab_dir = tempfile::tempdir().unwrap();
+    let keytab = keytab_dir.path().join("test.keytab");
+    let spn = "HTTP/wec.example.com@EXAMPLE.COM";
+    write_dummy_keytab(&keytab, spn);
+    let kt = keytab.clone();
+    let h = Harness::start_with(
+        move |mut c| {
+            c.security.kerberos.enabled = true;
+            c.security.kerberos.spn = Some(spn.to_string());
+            c.security.kerberos.keytab = Some(kt.clone());
+            c
+        },
+        |t| t,
+    )
+    .await;
+    let c = h.good_client();
+    let body = h.enumerate(&c, "k001", MACHINE).await;
+    assert!(body.contains("Thumbprint"), "{body}");
+    assert!(common::notify_to(&body).starts_with("https://"), "{body}");
+    h.assert_spoof_blocked().await;
     h.finish().await;
 }
