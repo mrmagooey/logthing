@@ -309,6 +309,35 @@ async fn test_bookmark_replayed_on_reenumerate() {
 }
 
 #[tokio::test]
+async fn test_unauthenticated_bookmark_keyed_by_machine_id_and_replayed() {
+    let h = Harness::start(|t| t).await;
+    let wsman = format!("{}/wsman", h.base);
+    let url = format!("{}/wsman/subscriptions/{}", h.base, common::TEST_SUB_UUID);
+    let ev = common::wef_fixture("security_4624");
+    let (st, _, _, _) = h
+        .post(
+            &url,
+            &common::events_envelope("b1", MACHINE, 1042, &[&ev]),
+            false,
+        )
+        .await;
+    assert_eq!(st, 200);
+    let (_, same, _, _) = h
+        .post(&wsman, &common::enumerate_envelope("b2", MACHINE), false)
+        .await;
+    assert!(same.contains("RecordId=\"1042\""), "{same}");
+    let (_, other, _, _) = h
+        .post(
+            &wsman,
+            &common::enumerate_envelope("b3", "other.example.com"),
+            false,
+        )
+        .await;
+    assert!(!other.contains("RecordId=\"1042\""), "{other}");
+    h.finish().await;
+}
+
+#[tokio::test]
 async fn test_version_changes_after_config_change() {
     // The advertised collector_url is part of the version hash, so pin it across runs: only
     // the channel list may differ.

@@ -6,6 +6,13 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
+### Fixed
+
+- WEF bookmarks are keyed by the authenticated client identity (Kerberos principal or
+  client-certificate fingerprint) instead of the client-asserted MachineID, so a client can no
+  longer overwrite another machine's resume position. New `wef_auth_failures_total` reason
+  `missing_identity`.
+
 ### Added
 
 - WEF subscription manager for real Windows source-initiated clients: `Enumerate` on

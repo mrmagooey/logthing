@@ -417,7 +417,7 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
         "wef_auth_failures_total",
         "Rejected /wsman/** Kerberos authentication or message-decryption attempts, labelled by \
          reason (missing|bad_scheme|bad_token|gss_error|missing_flags|decrypt_error|\
-         h2_encrypted).",
+         h2_encrypted|missing_identity).",
     ),
     // ── spool ─────────────────────────────────────────────────────────────
     (

@@ -8,11 +8,12 @@
 
 use super::kerberos::WSMAN_MAX_BODY;
 use super::{AppState, process_events};
+use crate::wef::identity::{ClientIdentity, machine_key};
 use crate::wef::soap::{self, SoapRequest, WefAction};
-use crate::wef::subscription::{Subscription, render_subscription_item};
+use crate::wef::subscription::{Subscription, WefTopology, render_subscription_item};
 use crate::wef::{encoding, event, sldc};
 use axum::{
-    Router,
+    Extension, Router,
     body::{Body, Bytes},
     extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode, Uri, header},
@@ -112,12 +113,44 @@ async fn decode_sldc_body(body: Bytes, max_out: usize) -> Option<Vec<u8>> {
         .ok()
 }
 
+/// Bookmark-store key for this request, or `None` when no bookmark may be read or written.
+///
+/// Authenticated topologies key by the verified identity only; the client-asserted MachineID
+/// is used solely on the explicit opt-in unauthenticated topology.
+fn bookmark_key(
+    topology: WefTopology,
+    identity: Option<&ClientIdentity>,
+    machine_id: Option<&str>,
+) -> Option<String> {
+    match topology {
+        WefTopology::PlainUnauthenticated => machine_id.map(machine_key),
+        WefTopology::PlainKerberos | WefTopology::HttpsMutual => {
+            identity.map(ClientIdentity::bookmark_key)
+        }
+    }
+}
+
+/// True when an authenticated topology served a bookmark-bearing request with no verified
+/// identity attached (a wiring fault: the auth layer should always have inserted one).
+fn missing_identity(
+    topology: Option<WefTopology>,
+    identity: Option<&ClientIdentity>,
+    action: WefAction,
+) -> bool {
+    matches!(
+        topology,
+        Some(WefTopology::PlainKerberos | WefTopology::HttpsMutual)
+    ) && identity.is_none()
+        && matches!(action, WefAction::Enumerate | WefAction::Events)
+}
+
 /// Entry point for every `POST /wsman` and `POST /wsman/**`.
 async fn handle_wsman(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     uri: Uri,
     headers: HeaderMap,
+    identity: Option<Extension<ClientIdentity>>,
     body: Bytes,
 ) -> Response {
     if state.wef.is_none() {
@@ -169,13 +202,30 @@ async fn handle_wsman(
     };
     metrics::counter!("wef_requests_total", "action" => action_label(req.action)).increment(1);
 
+    let topology = state.wef.as_ref().map(|w| w.topology);
+    let identity = identity.map(|Extension(i)| i);
+    let key = topology.and_then(|t| bookmark_key(t, identity.as_ref(), req.machine_id.as_deref()));
+    if missing_identity(topology, identity.as_ref(), req.action) {
+        warn!(
+            "WEF request from {} (MachineID {}) has no authenticated identity; bookmark skipped",
+            addr.ip(),
+            crate::sanitize_for_log(req.machine_id.as_deref().unwrap_or("-"), 128)
+        );
+        metrics::counter!("wef_auth_failures_total", "reason" => "missing_identity").increment(1);
+    }
+    debug!(
+        "WEF {} via {} identity",
+        action_label(req.action),
+        identity.as_ref().map_or("none", ClientIdentity::kind)
+    );
+
     match target {
-        Target::Delivery(uuid) => delivery(&state, addr, uuid, &req).await,
-        _ => manager(&state, &req),
+        Target::Delivery(uuid) => delivery(&state, addr, uuid, &req, key.as_deref()).await,
+        _ => manager(&state, &req, key.as_deref()),
     }
 }
 
-fn manager(state: &AppState, req: &SoapRequest) -> Response {
+fn manager(state: &AppState, req: &SoapRequest, key: Option<&str>) -> Response {
     match req.action {
         WefAction::Enumerate => {
             if req.message_id.is_none() {
@@ -188,10 +238,7 @@ fn manager(state: &AppState, req: &SoapRequest) -> Response {
                 .subscriptions
                 .iter()
                 .map(|s| {
-                    let bookmark = req
-                        .machine_id
-                        .as_deref()
-                        .and_then(|m| state.bookmarks.get(m, s.cfg.uuid));
+                    let bookmark = key.and_then(|k| state.bookmarks.get(k, s.cfg.uuid));
                     render_subscription_item(rt, s, bookmark.as_deref())
                 })
                 .collect();
@@ -210,6 +257,7 @@ async fn delivery(
     addr: SocketAddr,
     uuid: Uuid,
     req: &SoapRequest,
+    key: Option<&str>,
 ) -> Response {
     let Some(sub) = state
         .wef
@@ -232,7 +280,7 @@ async fn delivery(
             if req.message_id.is_none() {
                 return status(StatusCode::BAD_REQUEST);
             }
-            ingest(state, addr, sub, req).await;
+            ingest(state, addr, sub, req, key).await;
             ack(req)
         }
         WefAction::SubscriptionEnd | WefAction::End => empty_ok(),
@@ -240,7 +288,13 @@ async fn delivery(
     }
 }
 
-async fn ingest(state: &Arc<AppState>, addr: SocketAddr, sub: &Subscription, req: &SoapRequest) {
+async fn ingest(
+    state: &Arc<AppState>,
+    addr: SocketAddr,
+    sub: &Subscription,
+    req: &SoapRequest,
+    key: Option<&str>,
+) {
     let events = event::extract_events(&req.events, &addr.ip().to_string(), &sub.cfg.name);
     debug!(
         "WEF: {} events from {} for subscription {}",
@@ -249,12 +303,12 @@ async fn ingest(state: &Arc<AppState>, addr: SocketAddr, sub: &Subscription, req
         crate::sanitize_for_log(&sub.cfg.name, 128)
     );
     process_events(state, events).await;
-    if let (Some(bookmark), Some(machine)) = (&req.bookmark, &req.machine_id)
-        && !state.bookmarks.put(machine, sub.cfg.uuid, bookmark.clone())
+    if let (Some(bookmark), Some(k)) = (&req.bookmark, key)
+        && !state.bookmarks.put(k, sub.cfg.uuid, bookmark.clone())
     {
         debug!(
             "WEF bookmark from {} rejected",
-            crate::sanitize_for_log(machine, 128)
+            crate::sanitize_for_log(req.machine_id.as_deref().unwrap_or("-"), 128)
         );
     }
 }
@@ -327,6 +381,22 @@ mod tests {
         })
     }
 
+    fn state_with_topology(topology: WefTopology) -> Arc<AppState> {
+        let state = state_with(true, None);
+        let mut rt = (**state.wef.as_ref().unwrap()).clone();
+        rt.topology = topology;
+        Arc::new(AppState {
+            config: state.config.clone(),
+            throughput: state.throughput.clone(),
+            wef_cardinality_watchers: Vec::new(),
+            wef: Some(Arc::new(rt)),
+            bookmarks: state.bookmarks.clone(),
+            event_parser: None,
+            parquet_s3_sender: None,
+            parquet_local_sender: None,
+        })
+    }
+
     fn app(state: &Arc<AppState>) -> Router {
         let addr: SocketAddr = "192.0.2.7:5985".parse().unwrap();
         routes()
@@ -356,6 +426,43 @@ mod tests {
         let (parts, body) = resp.into_parts();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         (parts.status, parts.headers, bytes.to_vec())
+    }
+
+    async fn post_as(
+        app: &Router,
+        path: &str,
+        identity: Option<ClientIdentity>,
+        body: Vec<u8>,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let mut req = Request::post(path)
+            .header(header::CONTENT_TYPE, "application/soap+xml;charset=UTF-16")
+            .body(Body::from(body))
+            .unwrap();
+        if let Some(id) = identity {
+            req.extensions_mut().insert(id);
+        }
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let (parts, body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        (parts.status, parts.headers, bytes.to_vec())
+    }
+
+    fn win10() -> ClientIdentity {
+        ClientIdentity::Kerberos("WIN10$@EXAMPLE.COM".into())
+    }
+
+    fn win11() -> ClientIdentity {
+        ClientIdentity::Kerberos("WIN11$@EXAMPLE.COM".into())
+    }
+
+    async fn ingested_total(state: &Arc<AppState>) -> u64 {
+        state
+            .throughput
+            .snapshot()
+            .await
+            .iter()
+            .map(|e| e.total_events)
+            .sum()
     }
 
     fn text(bytes: &[u8]) -> String {
@@ -456,7 +563,10 @@ mod tests {
         let app = app(&state);
         post(&app, &delivery_path(), &[], utf16(EVENTS)).await;
         let uuid: Uuid = SUB_UUID.parse().unwrap();
-        let stored = state.bookmarks.get("win10.example.com", uuid).unwrap();
+        let stored = state
+            .bookmarks
+            .get("machine:win10.example.com", uuid)
+            .unwrap();
         assert!(stored.contains("RecordId=\"1042\""));
         let (_, _, body) = post(&app, "/wsman", &[], utf16(ENUMERATE)).await;
         // The replayed bookmark is embedded as verbatim XML in the Subscribe envelope.
@@ -467,6 +577,131 @@ mod tests {
             ),
             "{s}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_bookmark_keyed_by_identity_not_machine_id() {
+        let state = state_with_topology(WefTopology::PlainKerberos);
+        let app = app(&state);
+        // WIN11$ sends EVENTS claiming MachineID win10.example.com.
+        let (st, _, _) = post_as(&app, &delivery_path(), Some(win11()), utf16(EVENTS)).await;
+        assert_eq!(st, StatusCode::OK);
+        let uuid: Uuid = SUB_UUID.parse().unwrap();
+        assert!(
+            state
+                .bookmarks
+                .get("krb:WIN11$@EXAMPLE.COM", uuid)
+                .is_some()
+        );
+        assert!(
+            state
+                .bookmarks
+                .get("machine:win10.example.com", uuid)
+                .is_none()
+        );
+        // WIN10$ (the real owner of that MachineID) gets no bookmark from the spoof.
+        let (_, _, body) = post_as(&app, "/wsman", Some(win10()), utf16(ENUMERATE)).await;
+        assert!(
+            !text(&body).contains("RecordId=\"1042\""),
+            "{}",
+            text(&body)
+        );
+        // WIN11$ gets its own bookmark back.
+        let (_, _, body) = post_as(&app, "/wsman", Some(win11()), utf16(ENUMERATE)).await;
+        assert!(text(&body).contains("RecordId=\"1042\""));
+    }
+
+    #[tokio::test]
+    async fn test_bookmark_same_identity_different_machine_id_same_slot() {
+        let state = state_with_topology(WefTopology::HttpsMutual);
+        let app = app(&state);
+        let id = ClientIdentity::Certificate([7; 32]);
+        post_as(&app, &delivery_path(), Some(id.clone()), utf16(EVENTS)).await;
+        let other = ENUMERATE.replace("win10.example.com", "renamed.example.com");
+        let (_, _, body) = post_as(&app, "/wsman", Some(id), utf16(&other)).await;
+        assert!(text(&body).contains("RecordId=\"1042\""));
+    }
+
+    #[tokio::test]
+    async fn test_missing_identity_under_auth_topology_skips_bookmark_but_ingests() {
+        let state = state_with_topology(WefTopology::PlainKerberos);
+        let app = app(&state);
+        let (st, _, _) = post_as(&app, &delivery_path(), None, utf16(EVENTS)).await;
+        assert_eq!(st, StatusCode::OK); // still acked
+        assert_eq!(state.bookmarks.len(), 0);
+        assert_eq!(ingested_total(&state).await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_topology_keys_by_machine_id() {
+        let state = state_with_topology(WefTopology::PlainUnauthenticated);
+        let app = app(&state);
+        // An identity extension is ignored on the unauthenticated topology.
+        post_as(&app, &delivery_path(), Some(win11()), utf16(EVENTS)).await;
+        let uuid: Uuid = SUB_UUID.parse().unwrap();
+        assert!(
+            state
+                .bookmarks
+                .get("machine:win10.example.com", uuid)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_overlong_identity_key_not_stored_events_still_acked() {
+        let state = state_with_topology(WefTopology::PlainKerberos);
+        let app = app(&state);
+        let long = ClientIdentity::Kerberos(format!("{}@EXAMPLE.COM", "A".repeat(1100)));
+        let (st, _, _) = post_as(&app, &delivery_path(), Some(long), utf16(EVENTS)).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(state.bookmarks.len(), 0);
+    }
+
+    #[test]
+    fn test_bookmark_key_selection() {
+        use WefTopology::*;
+        let id = win10();
+        assert_eq!(
+            bookmark_key(PlainKerberos, Some(&id), Some("x")).as_deref(),
+            Some("krb:WIN10$@EXAMPLE.COM")
+        );
+        assert_eq!(bookmark_key(HttpsMutual, None, Some("x")), None);
+        assert_eq!(
+            bookmark_key(PlainUnauthenticated, Some(&id), Some("x")).as_deref(),
+            Some("machine:x")
+        );
+        assert_eq!(bookmark_key(PlainUnauthenticated, None, None), None);
+    }
+
+    #[test]
+    fn test_missing_identity_decision() {
+        use WefTopology::*;
+        let id = win10();
+        let m = |t, i: Option<&ClientIdentity>, a| missing_identity(t, i, a);
+        assert!(m(Some(PlainKerberos), None, WefAction::Events));
+        assert!(m(Some(HttpsMutual), None, WefAction::Enumerate));
+        assert!(!m(Some(HttpsMutual), Some(&id), WefAction::Events));
+        assert!(!m(Some(PlainUnauthenticated), None, WefAction::Events));
+        assert!(!m(Some(PlainKerberos), None, WefAction::Heartbeat));
+        assert!(!m(None, None, WefAction::Events));
+    }
+
+    #[test]
+    fn test_missing_identity_counter_increments_once_per_events_request() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let app = app(&state_with_topology(WefTopology::PlainKerberos));
+                post_as(&app, &delivery_path(), None, utf16(EVENTS)).await;
+                post_as(&app, &delivery_path(), Some(win10()), utf16(EVENTS)).await;
+            })
+        });
+        let got = counter(snap, "wef_auth_failures_total");
+        assert_eq!(got, [("reason=missing_identity".to_string(), 1)], "{got:?}");
     }
 
     #[tokio::test]
