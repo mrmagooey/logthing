@@ -28,6 +28,7 @@ pub mod suricata;
 pub mod syslog;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod wef;
 pub mod zeek;
 
 /// Truncate `s` to at most `max_bytes` bytes, walking back to the nearest
