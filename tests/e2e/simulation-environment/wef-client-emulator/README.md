@@ -15,7 +15,19 @@ python -m wefemu flow --mode kerberos-http --server http://wec:5985/wsman/Subscr
 python -m wefemu flow --mode https-mtls --server https://wec:5986/wsman/SubscriptionManager/WEC \
     --machine-id win10.example.com --events-dir DIR --ca ca.pem --cert client.pem --key client.key
 python -m wefemu checks --server http://wec:5985 --kerberos     # auth negative/positive checks
+python -m wefemu spoof --mode kerberos-http --server http://wec:5985/wsman/SubscriptionManager/WEC \
+    --machine-id win10.example.com --events-dir DIR \
+    --victim-principal 'WIN10$@EXAMPLE.COM' --attacker-principal 'WIN11$@EXAMPLE.COM'
+python -m wefemu spoof --mode https-mtls --server https://wec:5986/wsman/SubscriptionManager/WEC \
+    --machine-id win10.example.com --events-dir DIR --ca ca.pem \
+    --victim-cert win10.pem --victim-key win10.key --attacker-cert win11.pem --attacker-key win11.key
 ```
+
+`spoof` checks that resume positions (bookmarks) belong to the authenticated identity, not the
+client-asserted MachineID: the victim stores bookmark RecordId 100, an attacker with different
+credentials sends Events claiming the victim's MachineID with RecordId 999999, and the victim's next
+Enumerate must still replay 100 (and the attacker's own Enumerate 999999). Kerberos principals are
+picked from `KRB5_CLIENT_KEYTAB`. Exit 0 only if both hold.
 
 Both commands print one JSON summary line and exit 0 only if every validation passed.
 `flow` reads `*.xml` from `--events-dir`: bare `<Event>` documents, or WEF Events envelopes

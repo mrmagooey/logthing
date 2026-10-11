@@ -34,6 +34,10 @@ wef_interop() {
   "${dc[@]}" run --rm wefemu-krb
   echo "== HTTPS client-certificate client flow"
   "${dc[@]}" run --rm wefemu-mtls
+  echo "== Bookmark spoofing (Kerberos)"
+  "${dc[@]}" run --rm wefemu-krb-spoof
+  echo "== Bookmark spoofing (HTTPS client certificate)"
+  "${dc[@]}" run --rm wefemu-mtls-spoof
   echo "== Verifying what logthing wrote"
   "${dc[@]}" run --rm wef-interop-verifier
   echo "wef-interop passed"

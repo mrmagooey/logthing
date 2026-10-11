@@ -19,12 +19,32 @@ MODES = ("kerberos-http", "https-mtls")
 USER_AGENT = "Microsoft WinRM Client"
 
 
-def default_context_factory(hostname: str):
-    """pyspnego Kerberos initiator for the WEF client: raw Kerberos GSS token (not SPNEGO)."""
+def default_context_factory(hostname: str, principal: str | None = None):
+    """pyspnego Kerberos initiator for the WEF client: raw Kerberos GSS token (not SPNEGO).
+
+    `principal` picks which client-keytab identity to authenticate as (default: the ccache's)."""
     import spnego  # guarded: needs the Kerberos backend (libkrb5) at call time only
 
-    return spnego.client(username=None, password=None, hostname=hostname, service="HTTP",
-                         protocol="kerberos", options=spnego.NegotiateOptions.wrapping_winrm)
+    def make():
+        return spnego.client(username=principal, password=None, hostname=hostname, service="HTTP",
+                             protocol="kerberos", options=spnego.NegotiateOptions.wrapping_winrm)
+
+    if not principal:
+        return make()
+    # A named principal that is not the one already in the default ccache is acquired from the
+    # client keytab into its own ccache (MIT will not fall back to the keytab while the default
+    # ccache holds a different principal). Credentials are resolved when the context is built.
+    keytab = os.environ.get("KRB5_CLIENT_KTNAME") or os.environ.get("KRB5_CLIENT_KEYTAB", "")
+    saved = {k: os.environ.get(k) for k in ("KRB5CCNAME", "KRB5_CLIENT_KTNAME")}
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", principal)
+    os.environ["KRB5CCNAME"] = f"FILE:/tmp/wefemu-{os.getpid()}-{safe}.ccache"
+    if keytab.startswith("/"):
+        os.environ["KRB5_CLIENT_KTNAME"] = keytab
+    try:
+        return make()
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
 
 
 def load_events(events_dir) -> list[str]:
@@ -62,7 +82,7 @@ class _Conn:
 
 class WefClient:
     def __init__(self, mode, server_url, machine_id, ca=None, cert=None, key=None, compress=True,
-                 context_factory=None, timeout=30, notify_host=None):
+                 context_factory=None, timeout=30, notify_host=None, principal=None):
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}")
         self.mode, self.server_url, self.machine_id = mode, server_url, machine_id
@@ -71,7 +91,9 @@ class WefClient:
         self.context_factory = context_factory or default_context_factory
         self.timeout = timeout
         self.notify_host = notify_host
+        self.principal = principal  # Kerberos identity; None keeps the factory's default
         self.validations = 0
+        self.acks = 0
 
     # ------------------------------------------------------------------ connections
     def _check(self, cond, msg):
@@ -88,7 +110,10 @@ class WefClient:
             if self.ca:
                 s.verify = self.ca
             return _Conn(s)
-        conn = _Conn(s, self.context_factory(urlsplit(url).hostname))
+        host = urlsplit(url).hostname
+        ctx = self.context_factory(host, principal=self.principal) if self.principal \
+            else self.context_factory(host)
+        conn = _Conn(s, ctx)
         self._authenticate(conn, url)
         return conn
 
@@ -253,6 +278,74 @@ class WefClient:
             "subscription_version": sub.version, "subscription_name": sub.name,
             "validations": self.validations,
         }
+
+
+# ---------------------------------------------------------------------- bookmark spoofing
+def _bm(record_id: str) -> str:
+    return (f'<BookmarkList><Bookmark Channel="Security" RecordId="{record_id}" '
+            'IsCurrent="true"/></BookmarkList>')
+
+
+def _same_sub(subs, sub):
+    same = [s for s in subs if s.version == sub.version or s.name == sub.name]
+    if len(same) != 1:
+        raise ValidationError("subscription missing from re-Enumerate")
+    return same[0]
+
+
+def _enumerate_first(client: WefClient):
+    """Enumerate on a fresh connection; returns the first subscription."""
+    conn = client._open(client.server_url)
+    try:
+        subs = client._enumerate(conn, client.server_url)
+        client._check(len(subs) >= 1, "EnumerateResponse carries no subscription")
+        client._check_subscription(subs[0])
+        client._end(conn, client.server_url)
+    finally:
+        conn.close()
+    return subs, subs[0]
+
+
+def _send_bookmark(client: WefClient, sub, events, record_id: str, heartbeat: bool) -> None:
+    notify = client._normalise_notify(sub)
+    ident = sub.identifier or sub.version.removeprefix("uuid:")
+    dconn = client._open(notify)
+    try:
+        if heartbeat:
+            client._ack_post(dconn, notify, E.build_heartbeat(sub.notify_to, client.machine_id, ident))
+        client._ack_post(dconn, notify, E.build_events(sub.notify_to, client.machine_id, ident,
+                                                       events[:1], _bm(record_id)))
+        client._end(dconn, notify)
+    finally:
+        dconn.close()
+
+
+def run_spoof(victim: WefClient, attacker: WefClient, events_dir,
+              victim_record="100", attacker_record="999999") -> dict:
+    """Bookmarks belong to the authenticated identity, not the client-asserted MachineID.
+
+    `victim` and `attacker` authenticate differently but assert the same MachineID. The attacker's
+    Events must not change what the victim gets back on Enumerate."""
+    if victim.machine_id != attacker.machine_id:
+        raise ValueError("victim and attacker must assert the same MachineID")
+    events = load_events(events_dir)
+    _, vsub = _enumerate_first(victim)
+    _send_bookmark(victim, vsub, events, victim_record, heartbeat=True)
+    _, asub = _enumerate_first(attacker)
+    _send_bookmark(attacker, asub, events, attacker_record, heartbeat=False)
+
+    vsubs, _ = _enumerate_first(victim)
+    got = _same_sub(vsubs, vsub).bookmark_entries()
+    if got != [("Security", victim_record)]:
+        raise ValidationError(f"spoofed bookmark replayed to victim: expected "
+                              f"{[('Security', victim_record)]}, got {got}")
+    asubs, _ = _enumerate_first(attacker)
+    got = _same_sub(asubs, asub).bookmark_entries()
+    if got != [("Security", attacker_record)]:
+        raise ValidationError(f"attacker's own bookmark not kept: expected "
+                              f"{[('Security', attacker_record)]}, got {got}")
+    return {"ok": True, "mode": victim.mode, "victim_bookmark": victim_record,
+            "attacker_bookmark": attacker_record}
 
 
 # ---------------------------------------------------------------------- negative / positive checks

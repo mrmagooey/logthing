@@ -27,14 +27,16 @@ FAKE_HEADER = b"FAKEGSS!" * 7 + b"abcd"  # 60 bytes, like a CFX sealed token hea
 class FakeContext:
     """Mimics the pyspnego context surface the client uses."""
 
-    def __init__(self):
+    def __init__(self, principal=None):
         self.steps = []
         self.complete = False
+        self.principal = principal
 
     def step(self, in_token=None):
         self.steps.append(in_token)
         if in_token is None:
-            return AP_REQ
+            # the fake "ticket" carries the principal so the stub can tell clients apart
+            return AP_REQ + (b":" + self.principal.encode() if self.principal else b"")
         assert in_token == AP_REP, in_token
         self.complete = True
         return None
@@ -151,11 +153,14 @@ class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 class StubWec:
-    def __init__(self, mode="kerberos", faults=(), tls=None, notify_scheme="HTTP"):
+    def __init__(self, mode="kerberos", faults=(), tls=None, notify_scheme="HTTP", key_by="identity"):
         self.mode, self.faults, self.tls = mode, set(faults), tls
         self.notify_scheme = notify_scheme
         self.log: list[dict] = []
-        self.bookmark: str | None = None
+        # key_by="identity": bookmarks per authenticated principal / client cert (correct);
+        # key_by="machine": per client-asserted MachineID (the vulnerable behaviour).
+        self.key_by = key_by
+        self.bookmarks: dict[str, str] = {}
         self.version = SUB_VERSION
         self.lock = threading.Lock()
         stub = self
@@ -167,6 +172,7 @@ class StubWec:
             def setup(self):
                 super().setup()
                 self.authed = False
+                self.identity = ""
 
             def log_message(self, *a):
                 pass
@@ -200,6 +206,23 @@ class StubWec:
         self.url = self.origin + "/wsman/SubscriptionManager/WEC"
         self.thread = threading.Thread(target=lambda: self.httpd.serve_forever(poll_interval=0.02), daemon=True)
 
+    @property
+    def bookmark(self):
+        return next(iter(self.bookmarks.values()), None)
+
+    @bookmark.setter
+    def bookmark(self, value):
+        assert value is None, "only clearing is supported"
+        self.bookmarks.clear()
+
+    def _bookmark_key(self, h, msg):
+        if self.key_by == "machine":
+            return msg.machine_id
+        if self.mode == "kerberos":
+            return h.identity
+        import hashlib
+        return hashlib.sha256(h.request.getpeercert(binary_form=True)).hexdigest()
+
     def __enter__(self):
         self.thread.start()
         return self
@@ -219,9 +242,11 @@ class StubWec:
         if self.mode == "kerberos":
             if rec["auth"]:
                 scheme, _, tok = rec["auth"].partition(" ")
-                if scheme != "Kerberos" or base64.b64decode(tok) != AP_REQ:
+                raw_tok = base64.b64decode(tok) if tok else b""
+                if scheme != "Kerberos" or raw_tok.partition(b":")[0] != AP_REQ:
                     return h._send(401, headers=[("WWW-Authenticate", "Kerberos"), ("WWW-Authenticate", "Negotiate")])
                 h.authed = True
+                h.identity = raw_tok.partition(b":")[2].decode()
                 rec["action"] = "AUTH"
                 if "auth_401" in f:
                     return h._send(401)
@@ -258,12 +283,12 @@ class StubWec:
             if self.mode == "https-mtls" and self.notify_scheme == "HTTP":
                 notify = f"HTTPS://{origin}/wsman/subscriptions/{SUB_GUID}/1"
             fault = next((x for x in ("bad_action", "bad_relates", "lower_mid", "no_eos") if x in f), None)
-            out = enumerate_response_xml(msg.message_id, self.bookmark, self.mode == "https-mtls", fault,
+            out = enumerate_response_xml(msg.message_id, self.bookmarks.get(self._bookmark_key(h, msg)), self.mode == "https-mtls", fault,
                                          notify, self.version)
             return self._reply(h, out)
         if msg.action in (E.ACTION_HEARTBEAT, E.ACTION_EVENTS):
             if msg.action == E.ACTION_EVENTS and msg.bookmark:
-                self.bookmark = msg.bookmark
+                self.bookmarks[self._bookmark_key(h, msg)] = msg.bookmark
             fault = next((x for x in f if x.startswith("ack_")), None)
             return self._reply(h, ack_xml(msg.message_id, fault), bom="ack_no_bom" not in f)
         if msg.action in (E.ACTION_END, E.ACTION_SUBSCRIPTION_END):
@@ -336,6 +361,7 @@ def make_pki(d):
         ("server", "localhost", ExtendedKeyUsageOID.SERVER_AUTH,
          [x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
         ("client", "win10.example.com", ExtendedKeyUsageOID.CLIENT_AUTH, None),
+        ("client2", "win11.example.com", ExtendedKeyUsageOID.CLIENT_AUTH, None),
     ):
         k = ec.generate_private_key(ec.SECP256R1())
         c = issue(cn, ca.subject, ca_key, k, eku=eku, san=san)
@@ -347,6 +373,6 @@ def make_pki(d):
     return out
 
 
-def fake_factory(hostname=None):
+def fake_factory(hostname=None, principal=None):
     """Target of the CLI's --context-factory option in subprocess tests."""
-    return FakeContext()
+    return FakeContext(principal)
