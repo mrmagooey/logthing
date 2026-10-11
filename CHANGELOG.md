@@ -6,6 +6,8 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-10-10
+
 ### Fixed
 
 - WEF bookmarks are keyed by the authenticated client identity (Kerberos principal or
@@ -40,6 +42,8 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 - WEF event fields are now extracted fully from the event XML.
 - Startup fails when `[[wef.subscriptions]]` are configured without any client authentication,
   unless `wef.allow_unauthenticated = true`.
+- Analytics stack default image pins move to 0.23.0 for both logthing and the committer (still in
+  lockstep); Helm chart version 0.2.2. No schema or config changes for the analytics stack.
 
 ### Removed
 
