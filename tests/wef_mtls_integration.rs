@@ -362,9 +362,9 @@ async fn test_mtls_reconnect_same_cert_replays_bookmark() {
     let second = client(&h.ca, Some(&leaf));
     let body = h.enumerate(&second, "r002", MACHINE).await;
     assert!(body.contains("RecordId=\"100\""), "{body}");
-    // One connection per request, with rustls' default session cache, so later handshakes
-    // can resume the session; the identity must still be attached.
-    let resuming = reqwest::Client::builder()
+    // Each request below is a new connection with no shared rustls client config, so each is a
+    // full handshake. Resumption is covered by the test that follows.
+    let fresh = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(h.ca.pem().as_bytes()).unwrap())
         .identity(
             reqwest::Identity::from_pem(format!("{}\n{}", leaf.cert_pem, leaf.key_pem).as_bytes())
@@ -374,9 +374,85 @@ async fn test_mtls_reconnect_same_cert_replays_bookmark() {
         .build()
         .unwrap();
     for i in 0..2 {
-        let body = h.enumerate(&resuming, &format!("r01{i}"), MACHINE).await;
+        let body = h.enumerate(&fresh, &format!("r01{i}"), MACHINE).await;
         assert!(body.contains("RecordId=\"100\""), "{body}");
     }
+    h.finish().await;
+}
+
+/// POST the ENUMERATE envelope over a fresh TLS connection made with `connector` and return the
+/// decoded response body and whether the handshake resumed a session.
+async fn raw_enumerate(
+    connector: &tokio_rustls::TlsConnector,
+    port: &str,
+    mid: &str,
+) -> (String, Option<rustls::HandshakeKind>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let tcp = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+    let mut tls = connector.connect(name, tcp).await.expect("TLS handshake");
+    let body = common::utf16(&common::enumerate_envelope(mid, MACHINE));
+    let head = format!(
+        "POST /wsman HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+         Content-Type: application/soap+xml;charset=UTF-16\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    tls.write_all(head.as_bytes()).await.unwrap();
+    tls.write_all(&body).await.unwrap();
+    // Reading to the end also processes the post-handshake session tickets.
+    let mut resp = Vec::new();
+    let _ = tls.read_to_end(&mut resp).await;
+    let kind = tls.get_ref().1.handshake_kind();
+    let split = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("headers")
+        + 4;
+    assert!(
+        resp.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&resp)
+    );
+    (common::decode_utf16(&resp[split..]), kind)
+}
+
+#[tokio::test]
+async fn test_mtls_resumed_tls_session_keeps_client_identity() {
+    let h = Harness::start().await;
+    let leaf = h.ca.issue("win10.example.com", false);
+    let stored = client(&h.ca, Some(&leaf));
+    h.store_bookmark(&stored, "s001", MACHINE, 100).await;
+
+    let mut roots = rustls::RootCertStore::empty();
+    for c in rustls_pemfile::certs(&mut h.ca.pem().as_bytes()) {
+        roots.add(c.unwrap()).unwrap();
+    }
+    let chain = rustls_pemfile::certs(&mut leaf.cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let key = rustls_pemfile::private_key(&mut leaf.key_pem.as_bytes())
+        .unwrap()
+        .unwrap();
+    // One config shared by both connections, with the default in-memory resumption store.
+    let cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(chain, key)
+        .unwrap();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+    let port = h.base.rsplit(':').next().unwrap().to_string();
+
+    let (first, kind1) = raw_enumerate(&connector, &port, "s002").await;
+    assert_eq!(kind1, Some(rustls::HandshakeKind::Full));
+    assert!(first.contains("RecordId=\"100\""), "{first}");
+    let (second, kind2) = raw_enumerate(&connector, &port, "s003").await;
+    assert_eq!(
+        kind2,
+        Some(rustls::HandshakeKind::Resumed),
+        "second handshake must resume"
+    );
+    assert!(second.contains("RecordId=\"100\""), "{second}");
     h.finish().await;
 }
 
