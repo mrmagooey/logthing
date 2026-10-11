@@ -861,7 +861,7 @@ pub struct WefConfig {
     /// client authentication (plain HTTP, no Kerberos).
     #[serde(default)]
     pub allow_unauthenticated: bool,
-    /// Maximum number of per-(machine, subscription) bookmarks kept in memory.
+    /// Maximum number of per (client identity, subscription) bookmarks kept in memory.
     #[serde(default = "default_wef_bookmark_capacity")]
     pub bookmark_capacity: usize,
     /// Subscriptions served to enumerating Windows clients.

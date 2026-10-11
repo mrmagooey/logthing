@@ -11,7 +11,8 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 - WEF bookmarks are keyed by the authenticated client identity (Kerberos principal or
   client-certificate fingerprint) instead of the client-asserted MachineID, so a client can no
   longer overwrite another machine's resume position. New `wef_auth_failures_total` reason
-  `missing_identity`.
+  `missing_identity`. After a client certificate is renewed, that machine starts once with no
+  bookmark; machines that share one credential or certificate share one bookmark.
 
 ### Added
 
@@ -19,7 +20,7 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   `/wsman/SubscriptionManager/WEC` serves the subscriptions configured under `wef.*`
   (`wef.collector_url`, `wef.allow_unauthenticated`, `wef.bookmark_capacity`,
   `[[wef.subscriptions]]`), and delivery endpoints at `/wsman/subscriptions/<uuid>` Ack events and
-  heartbeats. Per-(machine, subscription) bookmarks are kept in memory and replayed on Enumerate.
+  heartbeats. Per-(client identity, subscription) bookmarks are kept in memory and replayed on Enumerate.
 - UTF-16 request/response bodies and SLDC-compressed event batches.
 - Per-connection Kerberos for `/wsman/**` (`Authorization: Kerberos` and `Negotiate`) with
   MS-WSMV message encryption.
