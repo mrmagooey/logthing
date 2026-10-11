@@ -20,7 +20,8 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   `/wsman/SubscriptionManager/WEC` serves the subscriptions configured under `wef.*`
   (`wef.collector_url`, `wef.allow_unauthenticated`, `wef.bookmark_capacity`,
   `[[wef.subscriptions]]`), and delivery endpoints at `/wsman/subscriptions/<uuid>` Ack events and
-  heartbeats. Per-(client identity, subscription) bookmarks are kept in memory and replayed on Enumerate.
+  heartbeats. Per-(client identity, subscription) bookmarks are kept in memory and replayed on
+  Enumerate.
 - UTF-16 request/response bodies and SLDC-compressed event batches.
 - Per-connection Kerberos for `/wsman/**` (`Authorization: Kerberos` and `Negotiate`) with
   MS-WSMV message encryption.
