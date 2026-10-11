@@ -8,7 +8,7 @@ import pytest
 
 from stubwec import FakeContext, StubWec, make_pki
 from wefemu import envelope as E
-from wefemu.client import WefClient, load_events, run_checks
+from wefemu.client import WefClient, load_events, run_checks, run_spoof
 
 GOLDEN = Path(__file__).resolve().parents[4] / "fixtures" / "wef" / "golden"
 CWD = Path(__file__).resolve().parents[1]
@@ -262,3 +262,59 @@ def test_load_events_skips_a_fixture_that_is_not_well_formed_xml(tmp_path):
     (tmp_path / "a_good.xml").write_text(good, encoding="utf-8")
     (tmp_path / "b_illegal.xml").write_text("<Event>\x04</Event>", encoding="utf-8")
     assert load_events(tmp_path) == [good]
+
+
+# ---------------------------------------------------------------------- bookmark spoofing
+def _krb_pair(stub):
+    mk = lambda p: WefClient("kerberos-http", stub.url, "win10.example.com", principal=p,
+                             context_factory=lambda host, principal=None: FakeContext(principal))
+    return mk("WIN10$@EXAMPLE.COM"), mk("WIN11$@EXAMPLE.COM")
+
+
+def test_spoof_passes_when_server_keys_bookmarks_by_identity(events_dir):
+    with StubWec(key_by="identity") as stub:
+        out = run_spoof(*_krb_pair(stub), events_dir)
+        assert len(stub.bookmarks) == 2
+    assert out == {"ok": True, "mode": "kerberos-http", "victim_bookmark": "100",
+                   "attacker_bookmark": "999999"}
+
+
+def test_spoof_fails_when_server_keys_bookmarks_by_machine_id(events_dir):
+    with StubWec(key_by="machine") as stub:
+        with pytest.raises(E.ValidationError, match="spoofed bookmark replayed to victim"):
+            run_spoof(*_krb_pair(stub), events_dir)
+
+
+def test_spoof_mtls_identity_vs_machine_id(events_dir, tmp_path):
+    pki = make_pki(tmp_path)
+
+    def pair(stub):
+        mk = lambda c: WefClient("https-mtls", stub.url, "win10.example.com", ca=pki["ca"],
+                                 cert=pki[f"{c}_cert"], key=pki[f"{c}_key"])
+        return mk("client"), mk("client2")
+
+    with StubWec(mode="https-mtls", tls=pki, key_by="identity") as stub:
+        assert run_spoof(*pair(stub), events_dir)["ok"]
+    with StubWec(mode="https-mtls", tls=pki, key_by="machine") as stub:
+        with pytest.raises(E.ValidationError, match="spoofed bookmark"):
+            run_spoof(*pair(stub), events_dir)
+
+
+def test_spoof_cli(events_dir):
+    with StubWec() as stub:
+        r = subprocess.run(
+            [sys.executable, "-m", "wefemu", "spoof", "--mode", "kerberos-http", "--server", stub.url,
+             "--machine-id", "win10.example.com", "--events-dir", str(events_dir),
+             "--victim-principal", "WIN10$@EXAMPLE.COM", "--attacker-principal", "WIN11$@EXAMPLE.COM",
+             "--context-factory", "stubwec:fake_factory"],
+            cwd=CWD, capture_output=True, text=True, env=ENV)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads(r.stdout.strip().splitlines()[-1])["attacker_bookmark"] == "999999"
+    with StubWec(key_by="machine") as stub:
+        r = subprocess.run(
+            [sys.executable, "-m", "wefemu", "spoof", "--mode", "kerberos-http", "--server", stub.url,
+             "--machine-id", "win10.example.com", "--events-dir", str(events_dir),
+             "--victim-principal", "WIN10$@EXAMPLE.COM", "--attacker-principal", "WIN11$@EXAMPLE.COM",
+             "--context-factory", "stubwec:fake_factory"],
+            cwd=CWD, capture_output=True, text=True, env=ENV)
+    assert r.returncode != 0 and json.loads(r.stdout.strip().splitlines()[-1])["ok"] is False

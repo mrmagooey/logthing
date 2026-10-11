@@ -88,7 +88,7 @@ Other `[wef]` keys:
 |---|---|---|
 | `collector_url` | none | Public base URL clients use. Required when any subscription is configured; must be `http://` without TLS and `https://` with TLS |
 | `allow_unauthenticated` | `false` | Accept clients with no authentication (plain HTTP, no Kerberos). Anyone who can reach the port can then submit events; `security.allowed_ips` is the only remaining control |
-| `bookmark_capacity` | `10000` | Maximum number of per-(machine, subscription) bookmarks held in memory |
+| `bookmark_capacity` | `10000` | Maximum number of per (client identity, subscription) bookmarks held in memory |
 
 Changing any client-visible parameter changes the subscription's version, so clients pick up
 the change at their next refresh. Settings are read at startup.
@@ -181,11 +181,14 @@ normal clients stay far below this).
   `read_existing_events = true`), which can duplicate or skip events.
 - **Any client certificate issued by the configured CA can read every subscription** and submit
   events for any of them. Use a dedicated CA for event forwarding clients.
-- **Bookmarks are not bound to the authenticated client.** The MachineID in Heartbeat/Events
-  bookmarks is not tied to the authenticated Kerberos principal or client certificate, so an
-  authenticated client can overwrite another machine's stored bookmark, causing that machine to
-  resend or skip events after a reconnect. Each bookmark is capped at 8 KiB, so memory is bounded
-  by `bookmark_capacity` x 8 KiB. Binding the principal to the MachineID is a planned follow-up.
+- **Bookmarks are keyed by the authenticated client.** With Kerberos or client certificates,
+  a bookmark is stored under the client's Kerberos principal or the SHA-256 fingerprint of its
+  certificate, never under the MachineID it asserts. One client therefore cannot read or
+  overwrite another's resume position. The consequences: a renewed client certificate starts
+  with no bookmark once (as after a restart); machines that share one credential or certificate
+  share one bookmark, so issue per-machine certificates; on the unauthenticated topology
+  (`allow_unauthenticated = true`) bookmarks are keyed by the asserted MachineID and remain
+  spoofable. Each bookmark is capped at 8 KiB, so memory is bounded by `bookmark_capacity` x 8 KiB.
 - Windows Server 2025 clients requesting `host/<fqdn>` and NTLM are not supported.
 - Topologies (a) and (b) cannot be combined on one instance.
 

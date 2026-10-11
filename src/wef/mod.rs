@@ -8,6 +8,7 @@
 pub mod bookmarks;
 pub mod encoding;
 pub mod event;
+pub mod identity;
 pub mod multipart;
 pub mod sldc;
 pub mod soap;

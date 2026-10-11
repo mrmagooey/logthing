@@ -52,8 +52,19 @@ openssl x509 -req -in wef-client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
     -out wef-client.crt -days 3650 \
     -extfile <(printf "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\nsubjectAltName=DNS:win10.example.com") 2>/dev/null
 
+# Second WEF client (a different machine, win11): used by the bookmark-spoofing e2e, where it
+# claims win10's MachineID while presenting its own certificate.
+openssl genrsa -out wef-client2.key 2048 2>/dev/null
+
+openssl req -new -key wef-client2.key -out wef-client2.csr \
+    -subj "/C=US/ST=Test/L=Test/O=WEF Server Test/CN=win11.example.com" 2>/dev/null
+
+openssl x509 -req -in wef-client2.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+    -out wef-client2.crt -days 3650 \
+    -extfile <(printf "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\nsubjectAltName=DNS:win11.example.com") 2>/dev/null
+
 # Clean up intermediate files
-rm -f server.csr client.csr wef-client.csr ca.srl
+rm -f server.csr client.csr wef-client.csr wef-client2.csr ca.srl
 
 echo "TLS certificates generated successfully:"
 ls -la "$CERT_DIR/"*.crt "$CERT_DIR/"*.key "$CERT_DIR/"*.pem 2>/dev/null || true

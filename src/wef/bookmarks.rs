@@ -1,4 +1,5 @@
-//! In-memory LRU store of the last bookmark acknowledged per (machine, subscription).
+//! In-memory LRU store of the last bookmark acknowledged per (client key,
+//! subscription).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -9,8 +10,9 @@ use crate::wef::subscription::validate_xml_fragment;
 
 /// Largest bookmark accepted by [`BookmarkStore::put`].
 pub const MAX_BOOKMARK_BYTES: usize = 8 * 1024;
-/// Largest machine id accepted by [`BookmarkStore::put`].
-pub const MAX_MACHINE_ID_BYTES: usize = 255;
+/// Largest store key accepted by [`BookmarkStore::put`] (an identity key such as
+/// `krb:<principal>`, or `machine:<MachineID>` on the unauthenticated topology).
+pub const MAX_KEY_BYTES: usize = 1024;
 
 type Key = (String, Uuid);
 
@@ -55,41 +57,41 @@ impl BookmarkStore {
         }
     }
 
-    /// Returns the bookmark for `(machine_id, sub)` and marks it most recently used.
-    pub fn get(&self, machine_id: &str, sub: Uuid) -> Option<String> {
-        let key = (machine_id.to_string(), sub);
+    /// Returns the bookmark for `(key, sub)` and marks it most recently used.
+    pub fn get(&self, key: &str, sub: Uuid) -> Option<String> {
+        let lookup_key = (key.to_string(), sub);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let (value, old) = inner.map.get(&key).cloned()?;
-        let g = inner.bump(&key, Some(old));
-        inner.map.insert(key, (value.clone(), g));
+        let (value, old) = inner.map.get(&lookup_key).cloned()?;
+        let g = inner.bump(&lookup_key, Some(old));
+        inner.map.insert(lookup_key, (value.clone(), g));
         Some(value)
     }
 
     /// Stores a bookmark, evicting the least recently used entry when full.
     ///
-    /// Returns `false` (and stores nothing) when `machine_id` is not 1..=255 bytes or the
-    /// bookmark exceeds 64 KiB or is not a complete, well-formed XML fragment with a single
+    /// Returns `false` (and stores nothing) when `key` is not 1..=1024 bytes or the
+    /// bookmark exceeds 8 KiB or is not a complete, well-formed XML fragment with a single
     /// `BookmarkList` root.
     #[must_use]
-    pub fn put(&self, machine_id: &str, sub: Uuid, bookmark: String) -> bool {
-        if machine_id.is_empty()
-            || machine_id.len() > MAX_MACHINE_ID_BYTES
+    pub fn put(&self, key: &str, sub: Uuid, bookmark: String) -> bool {
+        if key.is_empty()
+            || key.len() > MAX_KEY_BYTES
             || bookmark.len() > MAX_BOOKMARK_BYTES
             || validate_xml_fragment(&bookmark, "BookmarkList").is_err()
         {
             return false;
         }
-        let key = (machine_id.to_string(), sub);
+        let lookup_key = (key.to_string(), sub);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let old = inner.map.get(&key).map(|(_, g)| *g);
+        let old = inner.map.get(&lookup_key).map(|(_, g)| *g);
         if old.is_none()
             && inner.map.len() >= self.capacity
             && let Some((_, oldest)) = inner.order.pop_first()
         {
             inner.map.remove(&oldest);
         }
-        let g = inner.bump(&key, old);
-        inner.map.insert(key, (bookmark, g));
+        let g = inner.bump(&lookup_key, old);
+        inner.map.insert(lookup_key, (bookmark, g));
         true
     }
 
@@ -200,12 +202,35 @@ mod tests {
     }
 
     #[test]
+    fn test_put_key_length_boundaries() {
+        let s = BookmarkStore::new(4);
+        let u = Uuid::nil();
+        let bm_str = "<BookmarkList><Bookmark Channel=\"Security\" RecordId=\"1\"/></BookmarkList>";
+        assert!(!s.put("", u, bm_str.into()));
+        assert!(s.put(&"k".repeat(MAX_KEY_BYTES), u, bm_str.into()));
+        assert!(!s.put(&"k".repeat(MAX_KEY_BYTES + 1), u, bm_str.into()));
+        assert_eq!(MAX_KEY_BYTES, 1024);
+    }
+
+    #[test]
+    fn test_keys_are_isolated_per_identity() {
+        let s = BookmarkStore::new(4);
+        let u = Uuid::nil();
+        let a = "<BookmarkList><Bookmark Channel=\"Security\" RecordId=\"1\"/></BookmarkList>";
+        let b = "<BookmarkList><Bookmark Channel=\"Security\" RecordId=\"2\"/></BookmarkList>";
+        assert!(s.put("krb:WIN10$@EXAMPLE.COM", u, a.into()));
+        assert!(s.put("krb:WIN11$@EXAMPLE.COM", u, b.into()));
+        assert_eq!(s.get("krb:WIN10$@EXAMPLE.COM", u).as_deref(), Some(a));
+        assert_eq!(s.get("machine:win10.example.com", u), None);
+    }
+
+    #[test]
     fn test_bookmark_store_rejects_invalid_input() {
         let s = BookmarkStore::new(4);
         let u = Uuid::nil();
         assert!(!s.put("", u, bm(1)));
-        assert!(!s.put(&"m".repeat(256), u, bm(1)));
-        assert!(s.put(&"m".repeat(255), u, bm(1)));
+        assert!(!s.put(&"m".repeat(MAX_KEY_BYTES + 1), u, bm(1)));
+        assert!(s.put(&"m".repeat(MAX_KEY_BYTES), u, bm(1)));
         let big = format!(
             "<BookmarkList>{}</BookmarkList>",
             " ".repeat(MAX_BOOKMARK_BYTES)

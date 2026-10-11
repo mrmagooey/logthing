@@ -298,6 +298,188 @@ async fn test_mtls_events_flow_lands_rows() {
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
 }
 
+impl Harness {
+    /// Deliver an EVENTS batch (one fixture event) bookmarking `record_id` as `machine`.
+    async fn store_bookmark(&self, c: &reqwest::Client, mid: &str, machine: &str, record_id: u64) {
+        let ev = common::wef_fixture("security_4624");
+        let url = format!(
+            "{}/wsman/subscriptions/{}",
+            self.base,
+            common::TEST_SUB_UUID
+        );
+        let (st, body) = self
+            .post(
+                c,
+                &url,
+                &common::events_envelope(mid, machine, record_id, &[&ev]),
+            )
+            .await;
+        assert_eq!(st, 200, "{body}");
+    }
+
+    /// Enumerate as `machine` and return the response body (carries the replayed bookmark).
+    async fn enumerate(&self, c: &reqwest::Client, mid: &str, machine: &str) -> String {
+        let (st, body) = self
+            .post(
+                c,
+                &format!("{}/wsman", self.base),
+                &common::enumerate_envelope(mid, machine),
+            )
+            .await;
+        assert_eq!(st, 200, "{body}");
+        body
+    }
+
+    /// A (CN win10) stores bookmark 100; B (CN win11) claims A's MachineID with 999999. Each
+    /// certificate keeps its own bookmark; B cannot overwrite A's.
+    async fn assert_spoof_blocked(&self) {
+        let a = client(&self.ca, Some(&self.ca.issue("win10.example.com", false)));
+        let b = client(&self.ca, Some(&self.ca.issue("win11.example.com", false)));
+        self.store_bookmark(&a, "aa01", MACHINE, 100).await;
+        self.store_bookmark(&b, "bb01", MACHINE, 999999).await;
+        let for_a = self.enumerate(&a, "aa02", MACHINE).await;
+        assert!(for_a.contains("RecordId=\"100\""), "{for_a}");
+        assert!(!for_a.contains("999999"), "{for_a}");
+        let for_b = self.enumerate(&b, "bb02", MACHINE).await;
+        assert!(for_b.contains("RecordId=\"999999\""), "{for_b}");
+    }
+}
+
+#[tokio::test]
+async fn test_mtls_spoofed_machine_id_cannot_overwrite_bookmark() {
+    let h = Harness::start().await;
+    h.assert_spoof_blocked().await;
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn test_mtls_reconnect_same_cert_replays_bookmark() {
+    let h = Harness::start().await;
+    let leaf = h.ca.issue("win10.example.com", false);
+    let first = client(&h.ca, Some(&leaf));
+    h.store_bookmark(&first, "r001", MACHINE, 100).await;
+    // A fresh client: new TCP and TLS connection, empty session cache.
+    let second = client(&h.ca, Some(&leaf));
+    let body = h.enumerate(&second, "r002", MACHINE).await;
+    assert!(body.contains("RecordId=\"100\""), "{body}");
+    // Each request below is a new connection with no shared rustls client config, so each is a
+    // full handshake. Resumption is covered by the test that follows.
+    let fresh = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(h.ca.pem().as_bytes()).unwrap())
+        .identity(
+            reqwest::Identity::from_pem(format!("{}\n{}", leaf.cert_pem, leaf.key_pem).as_bytes())
+                .unwrap(),
+        )
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
+    for i in 0..2 {
+        let body = h.enumerate(&fresh, &format!("r01{i}"), MACHINE).await;
+        assert!(body.contains("RecordId=\"100\""), "{body}");
+    }
+    h.finish().await;
+}
+
+/// POST the ENUMERATE envelope over a fresh TLS connection made with `connector` and return the
+/// decoded response body and whether the handshake resumed a session.
+async fn raw_enumerate(
+    connector: &tokio_rustls::TlsConnector,
+    port: &str,
+    mid: &str,
+) -> (String, Option<rustls::HandshakeKind>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let tcp = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+    let mut tls = connector.connect(name, tcp).await.expect("TLS handshake");
+    let body = common::utf16(&common::enumerate_envelope(mid, MACHINE));
+    let head = format!(
+        "POST /wsman HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+         Content-Type: application/soap+xml;charset=UTF-16\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    tls.write_all(head.as_bytes()).await.unwrap();
+    tls.write_all(&body).await.unwrap();
+    // Reading to the end also processes the post-handshake session tickets.
+    let mut resp = Vec::new();
+    let _ = tls.read_to_end(&mut resp).await;
+    let kind = tls.get_ref().1.handshake_kind();
+    let split = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("headers")
+        + 4;
+    assert!(
+        resp.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&resp)
+    );
+    (common::decode_utf16(&resp[split..]), kind)
+}
+
+#[tokio::test]
+async fn test_mtls_resumed_tls_session_keeps_client_identity() {
+    let h = Harness::start().await;
+    let leaf = h.ca.issue("win10.example.com", false);
+    let stored = client(&h.ca, Some(&leaf));
+    h.store_bookmark(&stored, "s001", MACHINE, 100).await;
+
+    let mut roots = rustls::RootCertStore::empty();
+    for c in rustls_pemfile::certs(&mut h.ca.pem().as_bytes()) {
+        roots.add(c.unwrap()).unwrap();
+    }
+    let chain = rustls_pemfile::certs(&mut leaf.cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let key = rustls_pemfile::private_key(&mut leaf.key_pem.as_bytes())
+        .unwrap()
+        .unwrap();
+    // One config shared by both connections, with the default in-memory resumption store.
+    let cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(chain, key)
+        .unwrap();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+    let port = h.base.rsplit(':').next().unwrap().to_string();
+
+    let (first, kind1) = raw_enumerate(&connector, &port, "s002").await;
+    assert_eq!(kind1, Some(rustls::HandshakeKind::Full));
+    assert!(first.contains("RecordId=\"100\""), "{first}");
+    let (second, kind2) = raw_enumerate(&connector, &port, "s003").await;
+    assert_eq!(
+        kind2,
+        Some(rustls::HandshakeKind::Resumed),
+        "second handshake must resume"
+    );
+    assert!(second.contains("RecordId=\"100\""), "{second}");
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn test_mtls_concurrent_connections_keep_distinct_identities() {
+    let h = Harness::start().await;
+    let a = client(&h.ca, Some(&h.ca.issue("win10.example.com", false)));
+    let b = client(&h.ca, Some(&h.ca.issue("win11.example.com", false)));
+    h.store_bookmark(&a, "ca01", MACHINE, 100).await;
+    h.store_bookmark(&b, "cb01", MACHINE, 200).await;
+    let calls = (0..20).map(|i| {
+        let (c, mid, is_a) = if i % 2 == 0 {
+            (&a, format!("ca1{i}"), true)
+        } else {
+            (&b, format!("cb1{i}"), false)
+        };
+        let h = &h;
+        async move { (is_a, h.enumerate(c, &mid, MACHINE).await) }
+    });
+    for (is_a, body) in futures::future::join_all(calls).await {
+        let (want, other) = if is_a { ("100", "200") } else { ("200", "100") };
+        assert!(body.contains(&format!("RecordId=\"{want}\"")), "{body}");
+        assert!(!body.contains(&format!("RecordId=\"{other}\"")), "{body}");
+    }
+    h.finish().await;
+}
+
 #[tokio::test]
 async fn test_mtls_no_client_cert_handshake_rejected() {
     let h = Harness::start().await;
@@ -419,5 +601,31 @@ async fn test_mtls_syslog_still_requires_kerberos_when_enabled() {
         )
         .await;
     assert_eq!(st, 200);
+    h.finish().await;
+}
+
+#[cfg(feature = "kerberos-auth")]
+#[tokio::test]
+async fn test_tls_with_kerberos_configured_keys_by_certificate() {
+    let keytab_dir = tempfile::tempdir().unwrap();
+    let keytab = keytab_dir.path().join("test.keytab");
+    let spn = "HTTP/wec.example.com@EXAMPLE.COM";
+    write_dummy_keytab(&keytab, spn);
+    let kt = keytab.clone();
+    let h = Harness::start_with(
+        move |mut c| {
+            c.security.kerberos.enabled = true;
+            c.security.kerberos.spn = Some(spn.to_string());
+            c.security.kerberos.keytab = Some(kt.clone());
+            c
+        },
+        |t| t,
+    )
+    .await;
+    let c = h.good_client();
+    let body = h.enumerate(&c, "k001", MACHINE).await;
+    assert!(body.contains("Thumbprint"), "{body}");
+    assert!(common::notify_to(&body).starts_with("https://"), "{body}");
+    h.assert_spoof_blocked().await;
     h.finish().await;
 }

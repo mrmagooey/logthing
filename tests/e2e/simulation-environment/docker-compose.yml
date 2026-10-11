@@ -250,6 +250,54 @@ services:
     networks:
       - e2e
 
+  # Bookmark spoofing: the attacker (WIN11$ / wef-client2) asserts the victim's MachineID; the
+  # victim's resume position on Enumerate must not change.
+  wefemu-krb-spoof:
+    profiles: ["wef-interop"]
+    image: wef-client-emulator:e2e
+    environment:
+      - KRB5_CLIENT_KEYTAB=/keytabs/clients.keytab
+    command:
+      - spoof
+      - --mode=kerberos-http
+      - --server=http://logthing.example.com:5985/wsman/SubscriptionManager/WEC
+      - --machine-id=win10.example.com
+      - --events-dir=/events
+      - --victim-principal=WIN10$$@EXAMPLE.COM
+      - --attacker-principal=WIN11$$@EXAMPLE.COM
+    volumes:
+      - ./kdc/krb5.conf:/etc/krb5.conf:ro
+      - keytabs:/keytabs:ro
+      - ../../fixtures/wef/events:/events:ro
+    depends_on:
+      logthing-wef-krb:
+        condition: service_healthy
+    networks:
+      - e2e
+
+  wefemu-mtls-spoof:
+    profiles: ["wef-interop"]
+    image: wef-client-emulator:e2e
+    command:
+      - spoof
+      - --mode=https-mtls
+      - --server=https://logthing-tls.example.com:5986/wsman/SubscriptionManager/WEC
+      - --machine-id=win10.example.com
+      - --events-dir=/events
+      - --ca=/certs/ca.crt
+      - --victim-cert=/certs/wef-client.crt
+      - --victim-key=/certs/wef-client.key
+      - --attacker-cert=/certs/wef-client2.crt
+      - --attacker-key=/certs/wef-client2.key
+    volumes:
+      - ./certs:/certs:ro
+      - ../../fixtures/wef/events:/events:ro
+    depends_on:
+      logthing-wef-mtls:
+        condition: service_healthy
+    networks:
+      - e2e
+
   wef-interop-verifier:
     profiles: ["wef-interop"]
     # Same image as wef-local-verifier; reads the volume both interop servers write to.
@@ -259,7 +307,8 @@ services:
     environment:
       - WEF_LOCAL_DIR=/var/log/wef-local
       - ICEBERG_LOCAL_DIR=/var/log/iceberg-local
-      - EXPECTED_EVENT_TOTAL=30
+      # 2 flows x 15 events + 2 spoof scenarios x 2 events (victim + attacker, one each)
+      - EXPECTED_EVENT_TOTAL=34
       - EXPECTED_EXACT=1
       - E2E_TIMEOUT_SECS=60
     volumes:

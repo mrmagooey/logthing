@@ -2,6 +2,7 @@ pub mod conn;
 pub mod kerberos;
 #[cfg(feature = "otlp")]
 pub mod otlp;
+mod tls_identity;
 mod wef_routes;
 
 use crate::config::Config;
@@ -306,7 +307,7 @@ pub struct AppState {
     /// WEF subscription manager runtime; `None` (every `/wsman/**` request is 404) when no
     /// `[[wef.subscriptions]]` are configured.
     pub wef: Option<Arc<crate::wef::subscription::WefRuntime>>,
-    /// Last bookmark acknowledged per (machine, subscription), replayed on re-enumeration.
+    /// Last bookmark acknowledged per (client identity, subscription), replayed on re-enumeration.
     pub bookmarks: Arc<crate::wef::bookmarks::BookmarkStore>,
     pub event_parser: Option<GenericEventParser>,
     pub parquet_s3_sender: Option<
@@ -1024,7 +1025,12 @@ impl Server {
         });
 
         // Use axum-server for proper TLS handling
-        axum_server::bind_rustls(tls_addr, tls_config)
+        // The acceptor records each connection's client-certificate fingerprint so WEF
+        // bookmarks are keyed by it (see `tls_identity`).
+        axum_server::bind(tls_addr)
+            .acceptor(tls_identity::IdentityAcceptor::new(
+                axum_server::tls_rustls::RustlsAcceptor::new(tls_config),
+            ))
             .handle(axum_handle)
             .serve(conn::with_conn_slots(
                 app.into_make_service_with_connect_info::<SocketAddr>(),
