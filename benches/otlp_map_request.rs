@@ -106,7 +106,8 @@ mod imp {
             // GenericRecord per LogRecord before benching, so a malformed
             // request can't silently time an empty mapping.
             let sanity =
-                logthing::server::otlp::map_otlp_request(req.clone(), "10.0.0.1".to_string());
+                logthing::server::otlp::map_otlp_request(req.clone(), "10.0.0.1".to_string())
+                    .unwrap();
             assert_eq!(sanity.len(), batch_size);
 
             group.throughput(Throughput::Elements(batch_size as u64));
@@ -117,7 +118,8 @@ mod imp {
                         let records = logthing::server::otlp::map_otlp_request(
                             black_box(req),
                             black_box("10.0.0.1".to_string()),
-                        );
+                        )
+                        .unwrap();
                         black_box(records);
                     },
                     BatchSize::SmallInput,
