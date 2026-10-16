@@ -3,6 +3,9 @@ version: '3.8'
 services:
   logthing:
     build: .
+    # Shutdown drains HTTP/listeners then flushes writers (~22 s worst case); Docker's
+    # 10 s default would SIGKILL mid-flush.
+    stop_grace_period: 30s
     ports:
       - "5985:5985"       # HTTP WEF endpoint
       - "5986:5986"       # HTTPS WEF endpoint
