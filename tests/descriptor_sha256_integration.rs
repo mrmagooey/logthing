@@ -97,4 +97,6 @@ async fn local_descriptor_sha256_and_size_match_parquet_file_bytes() {
     let bytes = std::fs::read(&parquet[0]).unwrap();
     assert_eq!(v["sha256"], hex::encode(Sha256::digest(&bytes)));
     assert_eq!(v["file_size_in_bytes"], bytes.len() as u64);
+    // Stable, nullability-aware hash of the 10-column HEC schema.
+    assert_eq!(v["schema_version"], "5443403d335eba27");
 }

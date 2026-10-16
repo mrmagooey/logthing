@@ -16,6 +16,13 @@ that were uploaded, next to `file_size_in_bytes`. It is a corruption / consisten
 only: it is stored beside the data it describes, so it is NOT tamper evidence. The bundled
 committer ignores fields it does not use, so it is unaffected.
 
+`schema_version` is the first 16 hex characters of a SHA-256 over the Arrow schema's
+columns (name, type, and whether the column is nullable, in order). It is stable across
+logthing releases and toolchains and changes only when a source's schema changes, so a
+nullability-only change is now visible. Upgrading from a release that used the older
+hash changes every source's `schema_version` once; the bundled committer does not read
+the field, so nothing needs to be done.
+
 ## Suggested deployment pattern
 
 logthing only ever writes Parquet + descriptor files — it never talks to
