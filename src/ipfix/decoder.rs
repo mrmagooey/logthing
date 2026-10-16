@@ -717,6 +717,11 @@ fn parse_ipfix_template_set(
                 decoder.remove_template(&(exporter, obs_domain_id, template_id));
                 continue;
             }
+            // Zero padding (RFC 7011 §3.3.1) after the last record: ignore it, as the
+            // options-template and v9 parsers do, rather than rejecting the whole set.
+            if template_id == 0 {
+                continue;
+            }
         }
 
         if template_id < 256 {
@@ -3362,6 +3367,25 @@ mod tests {
             v.extend_from_slice(&len.to_be_bytes());
         }
         v
+    }
+
+    #[test]
+    fn test_template_set_trailing_zero_padding_keeps_template_and_later_data_set() {
+        let mut dec = IpfixDecoder::new();
+        let mut tmpl = tmpl_record(256, &[(8u16, 4u16)]);
+        tmpl.extend_from_slice(&[0, 0, 0, 0]); // 4-byte alignment padding
+        let buf = ipfix_msg(0, &[set_bytes(2, &tmpl), set_bytes(256, &[10, 0, 0, 1])]);
+        let records =
+            decode_ipfix(&mut dec, &buf, test_exporter()).expect("padding is not an error");
+        assert_eq!(
+            records.len(),
+            1,
+            "the data set after the padded template set decodes"
+        );
+        assert_eq!(
+            records[0].src_addr,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        );
     }
 
     fn test_exporter() -> IpAddr {

@@ -17,7 +17,7 @@ bind_address = "0.0.0.0"
 **Template Model**:
 Each exporter maintains a stateful template cache keyed on `(exporter IP, observation domain ID, template ID)`. Data records are decoded only once the matching template has been received; data sets referencing an uncached template are silently skipped (counter `ipfix_templates_missing` is incremented). The cache is bounded at 100,000 entries to guard against template floods from spoofed UDP sources.
 
-Template withdrawals (RFC 7011 §8.1) are honoured: a template record with zero fields removes that template, and template ID 2 (in a Template Set) or 3 (in an Options Template Set) with zero fields removes all templates or all options templates for that exporter and observation domain.
+Template withdrawals (RFC 7011 §8.1) are honoured: a template record with zero fields removes that template, and template ID 2 (in a Template Set) or 3 (in an Options Template Set) with zero fields removes all templates or all options templates for that exporter and observation domain. Withdrawals are accepted from any source address (UDP, so spoofable), the same trust model as templates.
 
 **Options data**: data sets described by an Options Template carry exporter metadata (scope and option values), not flows, so they produce no rows. They are counted in `ipfix_options_records_skipped`.
 

@@ -144,10 +144,81 @@ pub async fn drain_listener_handles(handles: Vec<JoinHandle<()>>, total_timeout:
     }
 }
 
+/// Await the HTTP server task during shutdown, for at most `timeout`.
+///
+/// Returns the error that should make the process exit non-zero: the server's own error, or a
+/// panic/cancellation of its task. A drain timeout is NOT an error (the task is aborted and a
+/// warning logged), because a connection held open past the grace period is an operational
+/// condition rather than a server failure.
+///
+/// Note on the timeout case: aborting the server task does not abort axum's per-connection tasks,
+/// which may still hold `AppState` (and so the writer senders). The writers then only stop at
+/// their own deadline, without seeing end-of-stream.
+pub async fn drain_http_server(
+    server_task: &mut JoinHandle<anyhow::Result<()>>,
+    timeout: Duration,
+) -> Option<anyhow::Error> {
+    let abort = server_task.abort_handle();
+    match tokio::time::timeout(timeout, &mut *server_task).await {
+        Ok(Ok(Ok(()))) => None,
+        Ok(Ok(Err(e))) => {
+            tracing::error!("Server error during shutdown: {}", e);
+            Some(e.context("HTTP server failed"))
+        }
+        Ok(Err(e)) => {
+            tracing::error!("Server task panicked or was cancelled: {e}");
+            Some(anyhow::anyhow!("HTTP server task failed: {e}"))
+        }
+        Err(_) => {
+            tracing::warn!("HTTP server did not drain within {timeout:?}; aborting it");
+            abort.abort();
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn test_drain_http_server_panic_is_an_error() {
+        let mut t: JoinHandle<anyhow::Result<()>> = tokio::spawn(async { panic!("boom") });
+        let err = drain_http_server(&mut t, Duration::from_secs(5)).await;
+        assert!(err.is_some(), "a panicked server task must fail the exit");
+    }
+
+    #[tokio::test]
+    async fn test_drain_http_server_clean_exit_is_ok() {
+        let mut t: JoinHandle<anyhow::Result<()>> = tokio::spawn(async { Ok(()) });
+        assert!(
+            drain_http_server(&mut t, Duration::from_secs(5))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drain_http_server_error_return_is_an_error() {
+        let mut t: JoinHandle<anyhow::Result<()>> =
+            tokio::spawn(async { Err(anyhow::anyhow!("bind lost")) });
+        assert!(
+            drain_http_server(&mut t, Duration::from_secs(5))
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_http_server_timeout_aborts_but_is_not_an_error() {
+        let mut t: JoinHandle<anyhow::Result<()>> = tokio::spawn(std::future::pending());
+        let abort = t.abort_handle();
+        let err = drain_http_server(&mut t, Duration::from_secs(10)).await;
+        assert!(err.is_none(), "a drain timeout must keep exit code 0");
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished(), "timed-out server task must be aborted");
+    }
 
     /// Several never-finishing listeners must cost one deadline in total, not one each.
     #[tokio::test(start_paused = true)]

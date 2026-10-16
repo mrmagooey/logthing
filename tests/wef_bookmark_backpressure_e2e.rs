@@ -25,6 +25,15 @@ async fn post(
     url: &str,
     envelope: &str,
 ) -> (reqwest::StatusCode, String) {
+    let (st, _, text) = post_with_headers(client, url, envelope).await;
+    (st, text)
+}
+
+async fn post_with_headers(
+    client: &reqwest::Client,
+    url: &str,
+    envelope: &str,
+) -> (reqwest::StatusCode, reqwest::header::HeaderMap, String) {
     let resp = client
         .post(url)
         .header("Content-Type", "application/soap+xml;charset=UTF-16")
@@ -33,13 +42,14 @@ async fn post(
         .await
         .expect("POST");
     let status = resp.status();
+    let headers = resp.headers().clone();
     let bytes = resp.bytes().await.unwrap();
     let text = if bytes.is_empty() {
         String::new()
     } else {
         common::decode_utf16(&bytes)
     };
-    (status, text)
+    (status, headers, text)
 }
 
 #[tokio::test]
@@ -70,13 +80,18 @@ async fn test_e2e_sink_drop_returns_503_and_enumerate_keeps_previous_bookmark() 
 
     // A flood against a capacity-1 channel must drop events: 503, no bookmark movement.
     let flood: Vec<&str> = std::iter::repeat_n(one.as_str(), 1000).collect();
-    let (st, body) = post(
+    let (st, headers, body) = post_with_headers(
         &client,
         &url,
         &common::events_envelope("e3", MACHINE, 99_999, &flood),
     )
     .await;
     assert_eq!(st, 503, "{}", p.logs());
+    assert_eq!(
+        headers.get("retry-after").and_then(|v| v.to_str().ok()),
+        Some("1"),
+        "WEF 503 must carry Retry-After like OTLP"
+    );
     assert!(!common::acks(&body, "e3"), "{body}");
 
     let (st, body) = post(

@@ -283,7 +283,11 @@ async fn delivery(
             if !ingest(state, addr, sub, req, key).await {
                 // A sink refused part of the batch: the bookmark stays put and the client
                 // re-sends from it.
-                return status(StatusCode::SERVICE_UNAVAILABLE);
+                return Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header(header::RETRY_AFTER, "1")
+                    .body(Body::empty())
+                    .expect("static response");
             }
             ack(req)
         }
@@ -608,8 +612,15 @@ mod tests {
         ));
         let app = app(&state);
         // Two events into a capacity-1 channel: the second is dropped.
-        let (st, _, _) = post(&app, &delivery_path(), &[], utf16(EVENTS)).await;
+        let (st, headers, _) = post(&app, &delivery_path(), &[], utf16(EVENTS)).await;
         assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            headers
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "a 503 must tell the client when to retry"
+        );
         let kept = state.bookmarks.get(key, uuid).unwrap();
         assert!(kept.contains("RecordId=\"7\""), "{kept}");
     }

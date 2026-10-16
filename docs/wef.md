@@ -276,7 +276,10 @@ output_format: |
 
 > **Note:** The legacy aggregated `config/event_parsers.yaml` file format is still supported for backward compatibility, but the directory layout makes it easier to version and swap individual event definitions.
 
-> **Value handling:** `integer` fields accept decimal or `0x`-prefixed hexadecimal (`0x1a4` becomes `420`). Extracted values are XML-unescaped (`AT&amp;T` becomes `AT&T`; a malformed entity leaves the raw text). `Data Name='X'` matches with either quote style, and System tags that carry attributes (`<EventID Qualifiers="16384">`) are matched.
+> **Value handling:** `integer` fields accept decimal or `0x`-prefixed hexadecimal (`0x1a4` becomes
+> `420`). Extracted values are XML-unescaped (`AT&amp;T` becomes `AT&T`; a malformed entity leaves
+> the raw text). `Data Name='X'` matches with either quote style, and System tags that carry
+> attributes (`<EventID Qualifiers="16384">`) are matched.
 
 The parser supports:
 - **Field Extraction**: Extract specific fields from EventData, System, RenderingInfo, or UserData sections

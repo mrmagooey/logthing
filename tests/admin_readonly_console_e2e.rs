@@ -51,6 +51,10 @@ async fn console_is_read_only_and_reports_the_env_var_that_configured_it() {
         ("LOGTHING_ADMIN_ENABLE_RATE_LIMIT", "bogus"),
         "LOGTHING_ADMIN_ENABLE_RATE_LIMIT",
     );
+    assert_startup_refused(
+        ("LOGTHING_ADMIN_TRUST_PROXY_HEADERS", "bogus"),
+        "LOGTHING_ADMIN_TRUST_PROXY_HEADERS",
+    );
 
     // -----------------------------------------------------------------
     // 1. Set a LOGTHING__* override before loading config, then prove

@@ -330,30 +330,45 @@ fn validate_pass_hash(hash: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Parse `LOGTHING_ADMIN_ENABLE_RATE_LIMIT`: `true|1|yes|on` and
-/// `false|0|no|off`, case-insensitive; unset means enabled; anything else is
-/// an error naming the variable.
-fn parse_rate_limit_flag(raw: Option<&str>) -> anyhow::Result<bool> {
+/// Parse a boolean admin env var: `true|1|yes|on` and `false|0|no|off`,
+/// case-insensitive; unset yields `default`; anything else is an error naming
+/// the variable.
+fn parse_bool_env(name: &str, raw: Option<&str>, default: bool) -> anyhow::Result<bool> {
     let Some(raw) = raw else {
-        return Ok(true);
+        return Ok(default);
     };
     match raw.trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" | "on" => Ok(true),
         "false" | "0" | "no" | "off" => Ok(false),
         _ => Err(anyhow::anyhow!(
-            "LOGTHING_ADMIN_ENABLE_RATE_LIMIT={raw:?} is not a boolean \
-             (use true/false, 1/0, yes/no, on/off)"
+            "{name}={raw:?} is not a boolean (use true/false, 1/0, yes/no, on/off)"
         )),
     }
 }
 
+/// Parse `LOGTHING_ADMIN_ENABLE_RATE_LIMIT` (unset means enabled).
+fn parse_rate_limit_flag(raw: Option<&str>) -> anyhow::Result<bool> {
+    parse_bool_env("LOGTHING_ADMIN_ENABLE_RATE_LIMIT", raw, true)
+}
+
+/// Parse `LOGTHING_ADMIN_TRUST_PROXY_HEADERS` (unset means disabled).
+fn parse_trust_proxy_flag(raw: Option<&str>) -> anyhow::Result<bool> {
+    parse_bool_env("LOGTHING_ADMIN_TRUST_PROXY_HEADERS", raw, false)
+}
+
 /// Check the admin environment variables that must stop the process when
-/// malformed (`LOGTHING_ADMIN_PASS_HASH`, `LOGTHING_ADMIN_ENABLE_RATE_LIMIT`).
+/// malformed (`LOGTHING_ADMIN_PASS_HASH`, `LOGTHING_ADMIN_ENABLE_RATE_LIMIT`,
+/// `LOGTHING_ADMIN_TRUST_PROXY_HEADERS`).
 /// Cheap and side-effect free, so `main` can fail startup before the admin
 /// server is spawned in the background.
 pub fn validate_admin_env() -> anyhow::Result<()> {
     parse_rate_limit_flag(
         std::env::var("LOGTHING_ADMIN_ENABLE_RATE_LIMIT")
+            .ok()
+            .as_deref(),
+    )?;
+    parse_trust_proxy_flag(
+        std::env::var("LOGTHING_ADMIN_TRUST_PROXY_HEADERS")
             .ok()
             .as_deref(),
     )?;
@@ -658,9 +673,11 @@ pub fn load_admin_config() -> anyhow::Result<AdminServerConfig> {
             .ok()
             .as_deref(),
     )?;
-    let trust_proxy_headers = std::env::var("LOGTHING_ADMIN_TRUST_PROXY_HEADERS")
-        .map(|s| s == "true" || s == "1")
-        .unwrap_or(false);
+    let trust_proxy_headers = parse_trust_proxy_flag(
+        std::env::var("LOGTHING_ADMIN_TRUST_PROXY_HEADERS")
+            .ok()
+            .as_deref(),
+    )?;
     let trusted_username_header = std::env::var("LOGTHING_ADMIN_TRUSTED_HEADER").ok();
     let trusted_groups_header = std::env::var("LOGTHING_ADMIN_TRUSTED_GROUPS_HEADER").ok();
     let trusted_secret_header = std::env::var("LOGTHING_ADMIN_TRUSTED_SECRET_HEADER").ok();
@@ -854,6 +871,27 @@ mod tests {
         for bad in ["bogus", "", "2", "tru"] {
             let err = parse_rate_limit_flag(Some(bad)).unwrap_err().to_string();
             assert!(err.contains("LOGTHING_ADMIN_ENABLE_RATE_LIMIT"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_trust_proxy_env_parsing() {
+        for (input, want) in [
+            (None, false),
+            (Some("true"), true),
+            (Some("TRUE"), true),
+            (Some("1"), true),
+            (Some("yes"), true),
+            (Some("On"), true),
+            (Some("false"), false),
+            (Some("0"), false),
+            (Some("off"), false),
+        ] {
+            assert_eq!(parse_trust_proxy_flag(input).unwrap(), want, "{input:?}");
+        }
+        for bad in ["bogus", "", "2", "ture"] {
+            let err = parse_trust_proxy_flag(Some(bad)).unwrap_err().to_string();
+            assert!(err.contains("LOGTHING_ADMIN_TRUST_PROXY_HEADERS"), "{err}");
         }
     }
 
