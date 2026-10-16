@@ -85,7 +85,8 @@ async fn run_admin_server(
 /// Build the admin router: every route plus the two security layers, in
 /// their deliberate order. Split out of `run_admin_server` so tests can
 /// exercise the exact production routing table (see `config_write_endpoints_are_gone`).
-pub(crate) fn build_admin_router(state: AdminState) -> Router {
+#[doc(hidden)]
+pub fn build_admin_router(state: AdminState) -> Router {
     axum::Router::new()
         .route("/", axum::routing::get(admin_page))
         .route("/config", axum::routing::get(get_config))
@@ -201,14 +202,16 @@ async fn get_config(
     let username =
         ensure_authorized(&state, trusted.map(|Extension(t)| t), auth, &client_ip).await?;
 
-    let cfg = state.config.read().await;
+    // Own the redacted copy and drop the read guard before awaiting the audit
+    // log: a slow audit write must not block config writers behind this guard.
+    let redacted = redacted_config(&*state.config.read().await);
 
     state
         .audit_logger
         .log("CONFIG_READ", &username, &client_ip, None)
         .await;
 
-    Ok(Json(redacted_config(&cfg)))
+    Ok(Json(redacted))
 }
 
 /// Admin page endpoint
@@ -559,6 +562,37 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The config read guard must not be held while the audit log is awaited.
+    #[tokio::test]
+    async fn test_get_config_releases_read_guard_before_audit_log() {
+        let state = test_state().await;
+        // Park the audit logger so get_config blocks inside `log(...)`.
+        let audit_gate = state.audit_logger.write_lock.clone().lock_owned().await;
+
+        // A pre-resolved identity skips Argon2, so the handler reaches the audit log in ms.
+        let mut request = create_request_without_auth(Method::GET, "/config");
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+        request.extensions_mut().insert(TrustedIdentity {
+            username: "alice".to_string(),
+        });
+        let app = axum::Router::new()
+            .route("/config", axum::routing::get(get_config))
+            .with_state(state.clone());
+        let handler = tokio::spawn(app.oneshot(request));
+
+        // Give the handler time to reach the audit log, then demand the write lock.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let writer =
+            tokio::time::timeout(std::time::Duration::from_secs(2), state.config.write()).await;
+        assert!(
+            writer.is_ok(),
+            "config write lock starved while get_config awaits the audit log"
+        );
+        drop(writer);
+        drop(audit_gate);
+        assert_eq!(handler.await.unwrap().unwrap().status(), StatusCode::OK);
     }
 
     #[tokio::test]

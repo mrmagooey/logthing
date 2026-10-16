@@ -12,14 +12,46 @@
 //! that safe, and also keeps the process-global `LOGTHING__*` env var
 //! manipulation below from racing any other test.
 
+mod common;
+
 use logthing::admin::spawn_admin_server;
 use logthing::stats::SourceHourlyStats;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+const BIN: &str = env!("CARGO_BIN_EXE_logthing");
+
+/// Run the real binary with a malformed admin env var; it must exit non-zero and say why.
+fn assert_startup_refused(env: (&str, &str), expect_in_stderr: &str) {
+    let port = common::free_port();
+    let toml = format!(
+        "bind_address = \"127.0.0.1:{port}\"\n[tls]\nenabled = false\n\
+         [syslog]\nenabled = false\n[metrics]\nenabled = false\n"
+    );
+    let (status, stderr) = common::run_to_exit(BIN, &toml, &[env]);
+    assert!(
+        !status.success(),
+        "{env:?} must fail startup; stderr:\n{stderr}"
+    );
+    assert!(stderr.contains(expect_in_stderr), "stderr was:\n{stderr}");
+}
+
 #[tokio::test]
 async fn console_is_read_only_and_reports_the_env_var_that_configured_it() {
+    // -----------------------------------------------------------------
+    // 0. Malformed admin env must stop the real binary at startup. Runs
+    //    first, before this test mutates its own environment.
+    // -----------------------------------------------------------------
+    assert_startup_refused(
+        ("LOGTHING_ADMIN_PASS_HASH", "notahash"),
+        "LOGTHING_ADMIN_PASS_HASH is not a valid PHC string",
+    );
+    assert_startup_refused(
+        ("LOGTHING_ADMIN_ENABLE_RATE_LIMIT", "bogus"),
+        "LOGTHING_ADMIN_ENABLE_RATE_LIMIT",
+    );
+
     // -----------------------------------------------------------------
     // 1. Set a LOGTHING__* override before loading config, then prove
     //    Config::load() actually picked it up over logthing.toml's

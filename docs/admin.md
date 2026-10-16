@@ -58,7 +58,14 @@ LOGTHING_ADMIN_USER=admin
 LOGTHING_ADMIN_PASS_HASH=$argon2id$v=19$m=19456,t=2,p=1$...
 ```
 
+Every failed login costs one Argon2 hash (also for unknown usernames), so keep
+rate limiting enabled on exposed deployments.
+
 To generate a hashed password, use the Argon2 CLI tool or a compatible library.
+`LOGTHING_ADMIN_PASS_HASH` must be a valid PHC string; otherwise logthing exits
+at startup. A shell expands `$argon2id`, `$v` and friends inside double quotes
+(and in unquoted `.env` / compose files), so single-quote the value or escape
+each `$` (`$$` in Docker Compose).
 
 ### 5. Audit Logging
 
@@ -133,8 +140,9 @@ the current trust model.
 allowlist — but only on requests where the shared secret verified.** When
 trust mode is enabled, every request is checked against the same shared
 secret used for identity headers; only if that check passes does the server
-read `X-Forwarded-For` (its leftmost hop) to resolve the real end-user IP for
-`AuditEntry.client_ip`, the rate limiter's bucket key, and
+read `X-Forwarded-For` (its **rightmost** hop — the address your proxy
+appended; if the header is split over several lines, the last line) to resolve
+the real end-user IP for `AuditEntry.client_ip`, the rate limiter's bucket key, and
 `LOGTHING_ADMIN_ALLOWED_IPS` matching. If the secret is missing or wrong, the
 header is never even inspected and the raw TCP peer address (i.e. the
 proxy's own IP) is used instead — this is what stops a client who lacks the
@@ -145,7 +153,10 @@ appending its own hop.** If it does not, a request that also happens to
 guess or obtain a valid shared secret could still forge its logged and
 rate-limited IP — the shared secret is what makes `X-Forwarded-For`
 trustworthy at all, but only if the proxy guarantees the header it forwards
-is proxy-authored, not attacker-authored.
+is proxy-authored, not attacker-authored. Exactly one trusted proxy is
+assumed: with `X-Forwarded-For: 10.0.0.5, 198.51.100.7` the client is
+`198.51.100.7`, and any hops to its left are ignored because the client can
+forge them. A chain of several trusted proxies is not supported.
 
 ## Read-only interface
 
@@ -201,7 +212,7 @@ take effect. See the CHANGELOG for the breaking-change details.
 | `LOGTHING_ADMIN_ALLOWED_IPS` | Comma-separated allowed IPs/CIDRs | - |
 | `LOGTHING_ADMIN_TLS_CERT` | TLS certificate file path | - |
 | `LOGTHING_ADMIN_TLS_KEY` | TLS private key file path | - |
-| `LOGTHING_ADMIN_ENABLE_RATE_LIMIT` | Enable rate limiting | `true` |
+| `LOGTHING_ADMIN_ENABLE_RATE_LIMIT` | Enable rate limiting: `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off` (case-insensitive); any other value stops startup | `true` |
 | `LOGTHING_ADMIN_TRUST_PROXY_HEADERS` | Enable trusted reverse-proxy header auth | `false` |
 | `LOGTHING_ADMIN_TRUSTED_HEADER` | Header carrying the trusted username | `X-authentik-username` |
 | `LOGTHING_ADMIN_TRUSTED_GROUPS_HEADER` | Header carrying the trusted group list | `X-authentik-groups` |

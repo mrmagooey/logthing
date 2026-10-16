@@ -11,7 +11,11 @@ mod routes;
 mod state;
 
 // Re-export public API
-pub use routes::spawn_admin_server;
+pub use routes::{build_admin_router, spawn_admin_server};
+pub use state::{
+    AdminServerConfig, AdminState, AuditLogger, PasswordHash, TrustedHeaderConfig,
+    validate_admin_env,
+};
 
 #[cfg(test)]
 mod tests {
@@ -56,7 +60,7 @@ mod tests {
     fn password_hash_from_string_works() {
         let password = "testpassword";
         let hash1 = PasswordHash::hash(password).unwrap();
-        let hash2 = PasswordHash::from_hash(&hash1.hash);
+        let hash2 = PasswordHash::from_hash(&hash1.hash).unwrap();
 
         assert!(hash2.verify(password));
     }
