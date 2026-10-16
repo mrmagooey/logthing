@@ -101,7 +101,6 @@ fn canonical_type(dt: &arrow_schema::DataType) -> Option<String> {
         D::UInt64 => "u64",
         D::Float16 => "f16",
         D::Float32 => "f32",
-
         D::Float64 => "f64",
         D::Utf8 => "utf8",
         D::LargeUtf8 => "large_utf8",
@@ -126,6 +125,10 @@ fn canonical_type(dt: &arrow_schema::DataType) -> Option<String> {
                 canonical_field(f)?,
                 u8::from(*sorted)
             ));
+        }
+        D::Struct(fields) => {
+            let parts: Option<Vec<String>> = fields.iter().map(|f| canonical_field(f)).collect();
+            return Some(format!("struct<{}>", parts?.join(",")));
         }
         _ => return None,
     };
@@ -345,11 +348,23 @@ mod tests {
         );
         let entries = Arc::new(Field::new(
             "entries",
-            DataType::Struct(vec![Field::new("k", DataType::Utf8, false)].into()),
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Int64, true),
+                ]
+                .into(),
+            ),
             false,
         ));
-        // Struct is not mapped, so a map over it is not either.
-        assert!(canonical_type(&DataType::Map(entries, false)).is_none());
+        let map = DataType::Map(entries, false);
+        assert_eq!(
+            canonical_type(&map).unwrap(),
+            "map<entries:struct<key:utf8:0,value:i64:1>:0,0>"
+        );
+        let schema = Schema::new(vec![Field::new("m", map, true)]);
+        assert!(!canonical_schema(&schema).contains("unmapped"));
+        assert_eq!(schema_version(&schema), "a9d89f7044a6630a");
         assert_eq!(canonical_type(&DataType::Boolean).as_deref(), Some("bool"));
     }
 
@@ -399,7 +414,8 @@ mod tests {
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
             &mut files,
         );
-        let re = regex::Regex::new(r"DataType::([A-Za-z0-9]+)").unwrap();
+        let re = regex::Regex::new(r"\bDataType::([A-Za-z0-9]+)").unwrap();
+        let alias_re = regex::Regex::new(r"\bD::([A-Za-z0-9]+)").unwrap();
         let mapped = [
             "Null",
             "Boolean",
@@ -418,6 +434,7 @@ mod tests {
             "LargeUtf8",
             "Binary",
             "LargeBinary",
+            "Struct",
             "Date32",
             "Date64",
             "Timestamp",
@@ -433,6 +450,12 @@ mod tests {
             let text = std::fs::read_to_string(f).unwrap();
             for c in re.captures_iter(&text) {
                 seen.insert(c[1].to_string());
+            }
+            // Files aliasing the type (`DataType as D`) name variants as `D::X`.
+            if text.contains("DataType as D") {
+                for c in alias_re.captures_iter(&text) {
+                    seen.insert(c[1].to_string());
+                }
             }
         }
         assert!(
