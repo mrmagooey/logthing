@@ -102,6 +102,13 @@ def verify_hec(cat, marker: str) -> None:
     assert uuid.UUID(fresh[0]["event_uuid"]).version == 7
     assert fresh[0]["source"] == "committer-e2e" and fresh[0]["index"] == "main"
     assert json.loads(fresh[0]["indexed_fields"]) == {"env": "e2e"}
+    # A file carrying a brand-new NON-NULLABLE column (run.sh step 3d) must evolve the table
+    # (column added as optional) and be committed, not quarantined.
+    req_field = table.schema().find_field("e2e_required_col")
+    assert req_field.required is False, "new column must be added as optional"
+    req_rows = [r for r in rows if "required-col-row" in r["fields"]]
+    assert len(req_rows) == 1 and req_rows[0]["e2e_required_col"] == "rc-1", req_rows
+    assert prefix_object_count(s3_client(), "_quarantine/") == 0, "nothing may be quarantined"
     print(f"OK: hec evolved ({len(table.metadata.schemas)} schemas), legacy NULL, new row typed")
 
 
