@@ -7,7 +7,7 @@ import tempfile
 import pytest
 import yaml
 
-from conftest import ANALYTICS, CHART
+from conftest import ANALYTICS, CHART, cargo_version
 
 if not shutil.which("helm"):
     pytest.skip("helm not available", allow_module_level=True)
@@ -264,10 +264,11 @@ def test_default_images_pinned():
         if d["kind"] in ("Deployment", "StatefulSet", "Job", "CronJob")
         for c in pod_spec(d)["containers"] + pod_spec(d).get("initContainers", [])
     }
+    v = cargo_version()
     assert images == {
         "postgres:17", "dxflrs/garage:v2.4.1", "python:3.12-slim",
-        "quay.io/lakekeeper/catalog:v0.13.6", "ghcr.io/mrmagooey/logthing:0.23.0",
-        "ghcr.io/mrmagooey/logthing-committer:0.23.0", "trinodb/trino:483",
+        "quay.io/lakekeeper/catalog:v0.13.6", f"ghcr.io/mrmagooey/logthing:{v}",
+        f"ghcr.io/mrmagooey/logthing-committer:{v}", "trinodb/trino:483",
         "httpd:2.4.69-alpine", "metabase/metabase:v0.64.1",
     }
 

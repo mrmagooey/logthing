@@ -2,6 +2,8 @@
 import re
 from pathlib import Path
 
+from conftest import cargo_version
+
 ANALYTICS = Path(__file__).resolve().parents[2]
 ROOT = ANALYTICS.parents[1]
 
@@ -10,11 +12,6 @@ SINCE_RE = re.compile(
     r"(?<![\w.])(?:[Ss]ince|[Ff]rom|[Bb]efore) (\d+\.\d+\.\d+)(?![\d.]*\d)(?!\.\d)"
 )
 FIRST_SHIPPED = (0, 22, 0)  # the release that introduced the strings; never decreases
-
-
-def cargo_version() -> str:
-    text = (ROOT / "Cargo.toml").read_text()
-    return re.search(r'^version\s*=\s*"([^"]+)"', text, re.M).group(1)
 
 
 def read(rel: str) -> str:
@@ -47,6 +44,25 @@ def test_readme_image_table_pins_the_cargo_version():
     t = read("README.md")
     assert f"ghcr.io/mrmagooey/logthing:{v}" in t
     assert f"ghcr.io/mrmagooey/logthing-committer:{v}" in t
+
+
+def test_root_readme_image_pins_match_the_cargo_version():
+    v = cargo_version()
+    t = (ROOT / "README.md").read_text()
+    assert f"ghcr.io/mrmagooey/logthing:{v}" in t
+    assert f"for tag `v{v}`" in t and f"`:{v}`" in t
+    stale = {
+        m for m in re.findall(r"ghcr\.io/mrmagooey/logthing(?:-committer)?:(\d+\.\d+\.\d+)", t)
+        if m != v
+    }
+    assert not stale, stale
+
+
+def test_fuzz_lock_logthing_entry_matches_the_cargo_version():
+    lock = (ROOT / "fuzz" / "Cargo.lock").read_text()
+    m = re.search(r'^name = "logthing"\nversion = "([^"]+)"', lock, re.M)
+    assert m, "fuzz/Cargo.lock has no logthing entry"
+    assert m.group(1) == cargo_version()
 
 
 def test_no_stale_older_pin_anywhere_in_the_stack():

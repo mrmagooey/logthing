@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import pathlib
+import re
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,6 +12,14 @@ import pytest
 ANALYTICS = pathlib.Path(__file__).resolve().parents[1]
 CHART = ANALYTICS / "helm" / "logthing-analytics"
 BOOTSTRAP = CHART / "files" / "bootstrap.py"
+ROOT = ANALYTICS.parents[1]
+
+
+def cargo_version() -> str:
+    """The `[package]` version in the root Cargo.toml."""
+    text = (ROOT / "Cargo.toml").read_text()
+    pkg = re.search(r"^\[package\]\s*$(.*?)(?=^\[|\Z)", text, re.M | re.S).group(1)
+    return re.search(r'^version\s*=\s*"([^"]+)"', pkg, re.M).group(1)
 
 
 def _load_bootstrap():
