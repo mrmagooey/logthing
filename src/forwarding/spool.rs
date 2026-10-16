@@ -711,11 +711,11 @@ impl Spool {
                     (Some(d), Some(bytes)) => {
                         d.upload(dkey, bytes).await.context("descriptor upload")?;
                     }
-                    _ => warn!(
-                        sink = %meta.sink_id,
-                        "spool entry has a descriptor but no descriptor sink is configured; \
-                         treating it as delivered"
-                    ),
+                    _ => {
+                        counter!("spool_descriptor_sink_missing", "sink" => meta.sink_id.clone())
+                            .increment(1);
+                        anyhow::bail!("descriptor sink not configured for spooled descriptor");
+                    }
                 }
             }
             anyhow::Ok(())
@@ -1792,6 +1792,63 @@ mod tests {
         assert_eq!(s3.calls.lock().unwrap().len(), 1, "exactly one parquet PUT");
         assert_eq!(ds.calls.lock().unwrap().len(), 4, "3 failures + 1 success");
         assert_eq!(ds.keys(), vec!["a.json"]);
+    }
+
+    #[tokio::test]
+    async fn test_replay_retains_entry_when_descriptor_sink_missing() {
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let dir = tempfile::tempdir().unwrap();
+        let spool = fast_spool(dir.path());
+        let s3 = Mem::build("s3", "parquet", Events::default());
+        spool.register("hec.s3", s3.sink.clone(), None).unwrap();
+        spool
+            .commit("hec.s3", "hec/a.parquet", b"PAR1", Some(&desc("a.json")))
+            .await
+            .unwrap();
+        let files = sorted_names(dir.path());
+        assert_eq!(files.len(), 3, "parquet, json and meta: {files:?}");
+        for _ in 0..2 {
+            assert_eq!(spool.drain(Duration::from_secs(5)).await, 1);
+        }
+        assert_eq!(sorted_names(dir.path()), files, "entry must stay on disk");
+        assert_eq!(spool.pending_entries(), 1);
+        assert_eq!(
+            s3.calls.lock().unwrap().len(),
+            1,
+            "parquet PUT exactly once"
+        );
+        assert_eq!(
+            counter(&snap, "spool_descriptor_sink_missing", Some("hec.s3")),
+            2
+        );
+        assert_eq!(counter(&snap, "spool_uploaded", None), 0);
+    }
+
+    #[tokio::test]
+    async fn test_replay_deletes_entry_after_descriptor_sink_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = fast_spool(dir.path());
+        let s3 = Mem::build("s3", "parquet", Events::default());
+        first.register("hec.s3", s3.sink.clone(), None).unwrap();
+        first
+            .commit("hec.s3", "hec/a.parquet", b"PAR1", Some(&desc("a.json")))
+            .await
+            .unwrap();
+        assert_eq!(first.drain(Duration::from_secs(5)).await, 1);
+        drop(first);
+
+        let second = fast_spool(dir.path());
+        let s3 = Mem::build("s3", "parquet", Events::default());
+        let ds = Mem::build("s3", "descriptor", Events::default());
+        second
+            .register("hec.s3", s3.sink.clone(), Some(ds.sink.clone()))
+            .unwrap();
+        assert_eq!(second.pending_entries(), 1);
+        assert_eq!(second.drain(Duration::from_secs(5)).await, 0);
+        assert!(sorted_names(dir.path()).is_empty());
+        assert_eq!(ds.keys(), vec!["a.json"], "descriptor delivered once");
     }
 
     async fn drain_fixture(k: usize, delay_ms: u64) -> (Arc<Spool>, Mem, tempfile::TempDir) {
