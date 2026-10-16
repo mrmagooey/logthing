@@ -40,7 +40,10 @@ async fn credentials_valid(state: &AdminState, username: &str, password: &str) -
     let password = password.to_string();
     let pass_ok = tokio::task::spawn_blocking(move || hash.verify(&password))
         .await
-        .unwrap_or(false);
+        .unwrap_or_else(|e| {
+            tracing::error!("admin password verification task failed: {e}");
+            false
+        });
     user_ok & pass_ok
 }
 
@@ -80,7 +83,8 @@ fn secret_header_matches(state: &AdminState, headers: &HeaderMap) -> bool {
 /// Earlier hops are client-supplied and can be forged, so they are never
 /// believed. This assumes exactly one trusted proxy in front of the admin
 /// server. Falls back to the peer address if the header is absent, empty, or
-/// fails to parse.
+/// fails to parse. If the header appears on several lines, only the last line
+/// (the one nearest the proxy) is read.
 pub fn resolve_client_ip(
     state: &AdminState,
     addr: std::net::SocketAddr,
@@ -90,7 +94,14 @@ pub fn resolve_client_ip(
         return addr.ip();
     }
 
-    let xff = match headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+    // A proxy may append its hop as a separate header line rather than extending
+    // the first one, so the first line is client-controlled: read the LAST line.
+    let xff = match headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .next_back()
+        .and_then(|v| v.to_str().ok())
+    {
         Some(v) => v,
         None => return addr.ip(),
     };
@@ -409,13 +420,16 @@ mod tests {
             // Warm the dummy-hash LazyLock so its one-time cost is not measured.
             let _ = credentials_valid(&st, "nobody", "x").await;
 
-            let t = Instant::now();
-            assert!(!credentials_valid(&st, "admin", "wrong").await);
-            let wrong_pass = t.elapsed();
-
-            let t = Instant::now();
-            assert!(!credentials_valid(&st, "nobody", "wrong").await);
-            let wrong_user = t.elapsed();
+            let mut wrong_pass = std::time::Duration::MAX;
+            let mut wrong_user = std::time::Duration::MAX;
+            for _ in 0..3 {
+                let t = Instant::now();
+                assert!(!credentials_valid(&st, "admin", "wrong").await);
+                wrong_pass = wrong_pass.min(t.elapsed());
+                let t = Instant::now();
+                assert!(!credentials_valid(&st, "nobody", "wrong").await);
+                wrong_user = wrong_user.min(t.elapsed());
+            }
 
             assert!(
                 wrong_user * 5 > wrong_pass,
@@ -524,6 +538,18 @@ mod tests {
             ]);
             let ip = resolve_client_ip(&state, peer_addr(), &h);
             assert_eq!(ip, "10.0.0.2".parse::<IpAddr>().unwrap());
+        }
+
+        /// A proxy that appends its hop as a second header line: the first
+        /// line is client-forged and must be ignored.
+        #[tokio::test]
+        async fn test_resolve_client_ip_uses_last_xff_header_line() {
+            let state = state_with(Some(trusted_cfg())).await;
+            let mut h = headers(&[("x-admin-proxy-secret", "shhh")]);
+            h.append("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+            h.append("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
+            let ip = resolve_client_ip(&state, peer_addr(), &h);
+            assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
         }
 
         /// The security boundary: a wrong/missing secret must mean

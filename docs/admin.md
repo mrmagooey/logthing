@@ -58,6 +58,9 @@ LOGTHING_ADMIN_USER=admin
 LOGTHING_ADMIN_PASS_HASH=$argon2id$v=19$m=19456,t=2,p=1$...
 ```
 
+Every failed login costs one Argon2 hash (also for unknown usernames), so keep
+rate limiting enabled on exposed deployments.
+
 To generate a hashed password, use the Argon2 CLI tool or a compatible library.
 `LOGTHING_ADMIN_PASS_HASH` must be a valid PHC string; otherwise logthing exits
 at startup. A shell expands `$argon2id`, `$v` and friends inside double quotes
@@ -137,8 +140,9 @@ the current trust model.
 allowlist — but only on requests where the shared secret verified.** When
 trust mode is enabled, every request is checked against the same shared
 secret used for identity headers; only if that check passes does the server
-read `X-Forwarded-For` (its **rightmost** hop — the address your proxy appended) to resolve the real end-user IP for
-`AuditEntry.client_ip`, the rate limiter's bucket key, and
+read `X-Forwarded-For` (its **rightmost** hop — the address your proxy
+appended; if the header is split over several lines, the last line) to resolve
+the real end-user IP for `AuditEntry.client_ip`, the rate limiter's bucket key, and
 `LOGTHING_ADMIN_ALLOWED_IPS` matching. If the secret is missing or wrong, the
 header is never even inspected and the raw TCP peer address (i.e. the
 proxy's own IP) is used instead — this is what stops a client who lacks the

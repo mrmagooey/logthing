@@ -85,6 +85,7 @@ async fn run_admin_server(
 /// Build the admin router: every route plus the two security layers, in
 /// their deliberate order. Split out of `run_admin_server` so tests can
 /// exercise the exact production routing table (see `config_write_endpoints_are_gone`).
+#[doc(hidden)]
 pub fn build_admin_router(state: AdminState) -> Router {
     axum::Router::new()
         .route("/", axum::routing::get(admin_page))

@@ -46,6 +46,7 @@ impl AuditLogger {
 
     /// Like [`AuditLogger::new`] but writing to an explicit file instead of
     /// the `LOGTHING_ADMIN_AUDIT_LOG` / default location.
+    #[doc(hidden)]
     pub async fn with_log_file(max_entries: usize, log_file: PathBuf) -> Self {
         let logger = Self {
             entries: Arc::new(RwLock::new(Vec::new())),
@@ -311,12 +312,22 @@ impl PasswordHash {
 
 /// Error for a `LOGTHING_ADMIN_PASS_HASH` value that is not a PHC string.
 fn validate_pass_hash(hash: &str) -> anyhow::Result<()> {
-    argon2::PasswordHash::new(hash).map(|_| ()).map_err(|e| {
+    let parsed = argon2::PasswordHash::new(hash).map_err(|e| {
         anyhow::anyhow!(
             "LOGTHING_ADMIN_PASS_HASH is not a valid PHC string ({e}) — check for shell `$` \
              interpolation"
         )
-    })
+    })?;
+    anyhow::ensure!(
+        matches!(
+            parsed.algorithm.as_str(),
+            "argon2id" | "argon2i" | "argon2d"
+        ),
+        "LOGTHING_ADMIN_PASS_HASH uses algorithm {:?}; only argon2id, argon2i and argon2d \
+         hashes are supported",
+        parsed.algorithm.as_str()
+    );
+    Ok(())
 }
 
 /// Parse `LOGTHING_ADMIN_ENABLE_RATE_LIMIT`: `true|1|yes|on` and
@@ -811,6 +822,16 @@ mod tests {
         .expect("invalid hash must refuse to start")
         .to_string();
         assert!(err.contains("LOGTHING_ADMIN_PASS_HASH"), "{err}");
+    }
+
+    #[test]
+    fn test_pass_hash_rejects_non_argon2_phc() {
+        // Syntactically valid PHC (a bcrypt-style id), but verify() could never match it.
+        let err = PasswordHash::from_hash("$scrypt$ln=16,r=8,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNo")
+            .err()
+            .expect("non-argon2 hash must be rejected")
+            .to_string();
+        assert!(err.contains("argon2"), "{err}");
     }
 
     #[test]
