@@ -2122,6 +2122,14 @@ pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
         }
     }
 
+    if cfg.hec.enabled && cfg.hec.max_sourcetype_partitions == 0 {
+        errors.push(
+            "[hec] max_sourcetype_partitions must be greater than 0 (0 would let any client \
+             mint unbounded sourcetype partitions)"
+                .to_string(),
+        );
+    }
+
     if cfg.hec.enabled
         && let Err(e) = crate::redaction::Redactor::compile_optional(
             &cfg.hec.redaction,
@@ -3894,6 +3902,22 @@ directory = "/tmp/otlp"
             ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_hec_sourcetype_partitions() {
+        let mut cfg = valid_base();
+        cfg.hec.enabled = true;
+        cfg.hec.local = sink_dir();
+        assert_eq!(validate_config_invariants(&cfg), Ok(()));
+        cfg.hec.max_sourcetype_partitions = 0;
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert!(
+            err.contains("[hec] max_sourcetype_partitions must be greater than 0"),
+            "{err}"
+        );
+        cfg.hec.enabled = false;
+        assert_eq!(validate_config_invariants(&cfg), Ok(()));
     }
 
     #[test]

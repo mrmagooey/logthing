@@ -27,10 +27,10 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or(4);
 
     // Check for environment override
-    let worker_threads = std::env::var("WEF_WORKER_THREADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(num_cpus);
+    let worker_threads = logthing::shutdown::parse_worker_threads(
+        std::env::var("WEF_WORKER_THREADS").ok(),
+        num_cpus,
+    )?;
 
     info!(
         "Starting logthing with {} worker threads ({} CPUs available)",
@@ -885,29 +885,46 @@ async fn async_main() -> anyhow::Result<()> {
     // -----------------------------------------------------------------------
     // Run server until shutdown
     // -----------------------------------------------------------------------
+    // The server runs as its own task so that, on shutdown, it can be awaited (and its
+    // `AppState`, which holds the WEF/HEC/OTLP writer senders, dropped) before the writers
+    // are awaited.
+    let mut server_task = tokio::spawn(server.run_tls(shutdown_rx.clone()));
+    let mut server_done = false;
+    let mut exit_error: Option<anyhow::Error> = None;
+
     tokio::select! {
-        result = server.run_tls(shutdown_rx.clone()) => {
-            if let Err(e) = result {
-                error!("Server error: {}", e);
-                std::process::exit(1);
+        joined = &mut server_task => {
+            server_done = true;
+            match joined {
+                Ok(Ok(())) => warn!("HTTP server exited without a shutdown signal"),
+                Ok(Err(e)) => {
+                    error!("Server error: {}", e);
+                    exit_error = Some(e.context("HTTP server failed"));
+                }
+                Err(e) => {
+                    error!("Server task panicked or was cancelled: {e}");
+                    exit_error = Some(anyhow::anyhow!("HTTP server task failed: {e}"));
+                }
             }
         }
         _ = shutdown_signal => {
             info!("Shutting down gracefully");
         }
-        // H-3: Supervise listener tasks — log if any exits unexpectedly. Pends
-        // forever when `listener_handles` is empty (HTTP-only deployments)
-        // rather than resolving immediately — see `supervise_listener_handles`.
+        // H-3: Supervise listener tasks. Pends forever when `listener_handles` is empty
+        // (HTTP-only deployments) rather than resolving immediately — see
+        // `supervise_listener_handles`. An unexpected exit is a failure: run the normal
+        // shutdown (flush writers, drain spool) and then exit non-zero.
         result = supervise_listener_handles(&mut listener_handles) => {
             match result {
                 Some(Ok(())) => {
-                    warn!("A listener task exited unexpectedly (returned Ok); check logs");
+                    error!("A listener task exited unexpectedly (returned Ok); check logs");
                 }
                 Some(Err(e)) => {
                     error!("A listener task panicked or was cancelled: {e}");
                 }
                 None => {}
             }
+            exit_error = Some(anyhow::anyhow!("listener exited unexpectedly"));
         }
     }
 
@@ -923,38 +940,46 @@ async fn async_main() -> anyhow::Result<()> {
         warn!("Failed to send shutdown signal: {e}");
     }
 
-    // 2. Wait briefly for listeners to exit. Each listener's accept loop holds
-    //    Arc<dyn Handler> clones, so aborting it releases those — but for Zeek
-    //    and Suricata it does NOT release every clone: each accepted connection
-    //    runs in a detached `tokio::spawn` holding its own clone
-    //    (`zeek/listener.rs:107-117`), and nothing here signals or aborts those
-    //    tasks. See step 3.
-    //
-    //    R-2: `drain_listener_handles` (src/shutdown.rs) captures
-    //    abort_handle() before awaiting so that a timed-out listener task is
-    //    truly cancelled (not just detached) — releasing the Arc<dyn Handler>
-    //    which closes the writer's channel. It also skips any handle already
-    //    polled to completion by the H-3 supervision arm above: awaiting the
-    //    same `JoinHandle` twice panics ("JoinHandle polled after
-    //    completion"), which is exactly what happens when a listener exits
-    //    (e.g. a bind failure) before shutdown is signalled.
-    drain_listener_handles(listener_handles, Duration::from_secs(2)).await;
+    // 2. Drain the HTTP server: it stops accepting, closes idle keep-alive connections and
+    //    finishes in-flight requests, then drops `AppState` (the WEF/HEC/OTLP senders). This
+    //    must complete before the writers are awaited, or those senders keep the channels
+    //    open and the writers never see end-of-stream.
+    if !server_done {
+        let abort = server_task.abort_handle();
+        match tokio::time::timeout(Duration::from_secs(10), &mut server_task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => {
+                error!("Server error during shutdown: {}", e);
+                exit_error.get_or_insert(e.context("HTTP server failed"));
+            }
+            Ok(Err(e)) => error!("Server task panicked or was cancelled: {e}"),
+            Err(_) => {
+                warn!("HTTP server did not drain within 10s; aborting it");
+                abort.abort();
+            }
+        }
+    }
 
-    // 3. Await all writer tasks (plus the optional WEF worker) with a shared 10s
-    //    combined timeout via `await_handles_with_deadline`.
+    // 3. Wait for listeners to exit. Each one drains its tracked connection tasks for up to
+    //    `CONNECTION_DRAIN_GRACE` after the shutdown signal, so allow that plus a margin
+    //    before aborting (a shorter wait would cut the drain short). They drain
+    //    concurrently, so the worst case is roughly one grace period, not one per listener.
     //
-    //    A writer task only returns once its channel closes, i.e. once the LAST
-    //    Sender drops. That happens promptly for sources whose handler Arcs live
-    //    solely in the listener task just aborted. It does NOT happen for Zeek or
-    //    Suricata while any sensor holds its TCP connection open: those
-    //    per-connection tasks are detached and keep an Arc<dyn Handler>, so the
-    //    channel stays open, the writer keeps looping, and the 10s deadline below
-    //    expires with the warning rather than a clean flush. The buffered rows are
-    //    then whatever the last periodic flush did not cover.
-    //
-    //    Fixing that means giving connection tasks a shutdown signal or tracked
-    //    JoinHandles — a lifetime change deliberately out of scope here; recorded
-    //    in the final review of `feat/ingest-backpressure`.
+    //    R-2: `drain_listener_handles` (src/shutdown.rs) captures abort_handle() before
+    //    awaiting so a timed-out listener is truly cancelled, releasing its
+    //    `Arc<dyn Handler>` clones (which closes the writer's channel). It skips handles
+    //    already polled to completion by the supervision arm above: awaiting the same
+    //    `JoinHandle` twice panics.
+    drain_listener_handles(
+        listener_handles,
+        logthing::net::CONNECTION_DRAIN_GRACE + Duration::from_secs(1),
+    )
+    .await;
+
+    // 4. Await all writer tasks (plus the WEF/HEC workers) under a shared 10s deadline.
+    //    A writer task returns once its channel closes, i.e. once the last Sender drops;
+    //    the server and the listeners are gone by now, so that is prompt and the writers
+    //    flush every partition on the way out.
     info!("Waiting for S3 writer tasks to flush (up to 10s)...");
 
     // 4. Gap-b: Bundle the WEF→S3 Parquet worker handle (if present) into the
@@ -1005,5 +1030,8 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     info!("Shutdown complete");
-    Ok(())
+    match exit_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }

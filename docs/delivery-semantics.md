@@ -50,6 +50,11 @@ is counted in `zeek_partial_lines_dropped_at_shutdown`,
 A dropped shutdown channel is treated the same as a shutdown signal, so a listener can never
 keep running (or spin) after the rest of the process has stopped.
 
+The order is: the HTTP server drains first (up to 10 s), then the listeners (each given 6 s
+in total: the 5 s connection drain plus 1 s margin, after which it is aborted), then the
+writers (shared 10 s deadline), then the spool. If a listener or the HTTP server fails on
+its own, the same sequence runs and the process exits non-zero.
+
 UDP listeners (syslog, IPFIX, sFlow) that hit a persistent receive error pause 10 ms, doubling
 to at most 1 s, between attempts instead of spinning, and log the error at most once every
 10 s with a count of the repeats suppressed.
@@ -139,7 +144,9 @@ in-memory requeue described above. `spool_rejected{reason="full"|"io"}` counts t
 **Shutdown.** The final flush of every writer lands in the spool (a local write, fast even
 with S3 down). The uploader is then given whatever remains of the 10 s writer deadline, but
 at least 2 s, to drain; anything left replays on the next start. The real worst-case shutdown
-time is therefore about the writer deadline plus the 2 s drain floor (about 12 s), not 10 s.
+time is therefore about the HTTP drain (up to 10 s) plus the listener wait (up to 6 s) plus the
+writer deadline (10 s) plus the 2 s drain floor; in practice the first two finish in well under a
+second unless a client holds a request open, so expect about 12 s, with a hard worst case near 28 s.
 A drain that is cut short logs `spool not fully drained at shutdown`.
 
 **An upload cancelled after its PUT** (shutdown, timeout) leaves the entry on disk; the next

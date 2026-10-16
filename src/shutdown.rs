@@ -24,6 +24,24 @@ pub async fn wait_for_shutdown_signal() {
     }
 }
 
+/// Resolve the tokio worker-thread count from the `WEF_WORKER_THREADS` value.
+///
+/// `None` (variable unset) yields `default`. A value that is not a positive integer is a
+/// startup error naming the variable: `0` would panic inside tokio's runtime builder, and
+/// silently falling back would hide a typo.
+pub fn parse_worker_threads(raw: Option<String>, default: usize) -> anyhow::Result<usize> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => anyhow::bail!(
+            "WEF_WORKER_THREADS must be a positive integer (got {raw:?}); unset it to use \
+             all {default} CPUs"
+        ),
+    }
+}
+
 /// Await a list of `JoinHandle<()>` tasks, respecting a shared wall-clock
 /// deadline.
 ///
@@ -126,6 +144,30 @@ pub async fn drain_listener_handles(handles: Vec<JoinHandle<()>>, per_handle_tim
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn test_worker_threads_env_unset_uses_default() {
+        assert_eq!(parse_worker_threads(None, 7).unwrap(), 7);
+        assert_eq!(parse_worker_threads(Some("3".into()), 7).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_worker_threads_env_zero_rejected() {
+        let err = parse_worker_threads(Some("0".into()), 7)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("WEF_WORKER_THREADS"), "{err}");
+    }
+
+    #[test]
+    fn test_worker_threads_env_garbage_rejected() {
+        for bad in ["abc", "", "-2", "1.5"] {
+            let err = parse_worker_threads(Some(bad.into()), 7)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("WEF_WORKER_THREADS"), "{err}");
+        }
+    }
 
     /// Regression for the HTTP-only-deployment bug: an empty handle set must
     /// never resolve. Before the fix, `FuturesUnordered::next()` on an empty

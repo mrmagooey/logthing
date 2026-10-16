@@ -107,3 +107,63 @@ async fn http_only_deployment_stays_up_then_shuts_down_cleanly() {
         .expect("server task must join after shutdown")
         .expect("server task must not panic");
 }
+
+/// With an idle keep-alive client still connected, the plain-HTTP server future must complete
+/// promptly once shutdown is signalled (idle connections are closed, `AppState` dropped).
+#[tokio::test]
+async fn plain_http_server_drains_idle_keepalive_client_on_shutdown() {
+    let port = {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let config = Config {
+        bind_address: format!("127.0.0.1:{port}").parse().unwrap(),
+        tls: TlsConfig {
+            enabled: false,
+            ..TlsConfig::default()
+        },
+        metrics: MetricsConfig {
+            enabled: false,
+            ..MetricsConfig::default()
+        },
+        ..Config::default()
+    };
+    let shared_config = Arc::new(RwLock::new(config.clone()));
+    let server = Server::new(
+        config,
+        shared_config,
+        Arc::new(ThroughputStats::new()),
+        Arc::new(SourceHourlyStats::new()),
+        FlushIntervalRegistry::new(),
+        IpWhitelist::empty(),
+        Vec::new(),
+    )
+    .await
+    .expect("Server::new");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server_task = tokio::spawn(server.run_tls(shutdown_rx));
+
+    // One pooled keep-alive connection, left open and idle for the rest of the test.
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{port}/health");
+    let mut up = false;
+    for _ in 0..100 {
+        if let Ok(r) = client.get(&url).send().await
+            && r.status().is_success()
+        {
+            up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(up, "server never became healthy");
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), server_task)
+        .await
+        .expect("server future must complete within 3s with an idle keep-alive client")
+        .expect("server task must not panic")
+        .expect("server must exit Ok");
+    drop(client);
+}

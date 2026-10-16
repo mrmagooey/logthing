@@ -105,3 +105,29 @@ async fn otlp_with_local_sink_starts() {
     );
     p.wait_healthy().await;
 }
+
+#[test]
+fn worker_threads_zero_fails_startup() {
+    for bad_value in ["0", "lots"] {
+        let (status, stderr) = bad("", &[("WEF_WORKER_THREADS", bad_value)]);
+        assert!(!status.success(), "{bad_value}: {stderr}");
+        assert!(
+            stderr.contains("WEF_WORKER_THREADS"),
+            "stderr was:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn hec_zero_sourcetype_partitions_fails_startup() {
+    let (status, stderr) = bad(
+        "[hec]\nenabled = true\nmax_sourcetype_partitions = 0\n\
+         [hec.local]\ndirectory = \"/tmp/logthing-test-hec\"\n",
+        &[],
+    );
+    assert!(!status.success());
+    assert!(
+        stderr.contains("[hec] max_sourcetype_partitions must be greater than 0"),
+        "stderr was:\n{stderr}"
+    );
+}

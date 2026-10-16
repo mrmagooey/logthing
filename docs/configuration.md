@@ -108,7 +108,22 @@ Every top-level section of the configuration, with the page that documents its k
 `[hec] enabled = true` needs `[hec.s3]` or `[hec.local]`, and `[otlp] enabled = true` needs
 `[otlp.s3]` or `[otlp.local]`. Without one, startup fails with a message naming the missing
 table. Environment overrides are validated the same way: `LOGTHING__HEC__ENABLED=true` with no
-HEC sink configured also fails startup. See [hec.md](hec.md) and [otlp.md](otlp.md).
+HEC sink configured also fails startup. `hec.max_sourcetype_partitions = 0` (with HEC enabled)
+and `otlp.max_service_partitions = 0` (with OTLP enabled) are rejected too: 0 would not mean
+"none", it would remove the cap on partitions. See [hec.md](hec.md) and [otlp.md](otlp.md).
+
+## Process settings and shutdown
+
+`WEF_WORKER_THREADS` (environment only) sets the number of async worker threads; unset means one
+per CPU. It must be a positive integer: `0` or a non-number fails startup with an error naming
+the variable, rather than being ignored.
+
+On `SIGTERM`/Ctrl-C the HTTP server stops accepting and closes idle keep-alive connections
+(up to 10 s for in-flight requests), listeners stop and drain their open connections (up to
+5 s each), and only then are the buffered writers flushed. If the HTTP server or any
+wire-protocol listener (syslog, IPFIX, Zeek, Suricata, sFlow) stops on its own, for example
+because its port could not be bound, the same shutdown sequence runs and the process then exits
+with a non-zero status so a supervisor restarts it.
 
 ## Shared S3 connection keys
 

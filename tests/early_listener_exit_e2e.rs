@@ -98,7 +98,7 @@ tcp_port = {syslog_tcp_port}
     // reachable, so there is nothing to poll for readiness on. That failure
     // makes the syslog listener task return early, the H-3 supervision arm
     // in `main.rs` fires, and the graceful-shutdown sequence begins on its
-    // own — no signal needed. The process should exit cleanly rather than
+    // own — no signal needed. The process should exit non-zero rather than
     // panicking.
     let exit_deadline = Instant::now() + EXIT_TIMEOUT;
     let exit_status = loop {
@@ -144,8 +144,16 @@ tcp_port = {syslog_tcp_port}
         "child was terminated by signal {:?} instead of shutting down on its own",
         exit_status.signal()
     );
+    // The listener failure is a startup/runtime fault: the shutdown sequence runs, then the
+    // process must exit non-zero (via `Err`, i.e. status 1, not a panic's 101) so a
+    // supervisor restarts it instead of treating it as a clean stop.
+    assert_eq!(
+        exit_status.code(),
+        Some(1),
+        "listener failure must exit with status 1: {exit_status:?}\nstderr:\n{stderr}"
+    );
     assert!(
-        exit_status.success(),
-        "child exited uncleanly: {exit_status:?}\nstderr:\n{stderr}"
+        stderr.contains("listener exited unexpectedly"),
+        "stderr must name the failure:\n{stderr}"
     );
 }
