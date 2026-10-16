@@ -33,10 +33,10 @@ comes first. Only one flush per partition is in flight at a time: rows that cros
 `max_buffer_rows` / `flush_threshold_bytes` while a flush is running are flushed as soon as
 that flush completes, while rows below the thresholds wait for the next trigger, up to one
 flush interval (checked on each arriving record and on a periodic tick of a quarter of the
-flush interval, between 1 and 30 seconds, so an idle buffer is flushed within one interval plus
-one tick). A crash, `SIGKILL` or power loss loses everything in that window; the spool does not change
-this, because it sits **after** the flush. To shrink the window, lower `flush_interval_secs`
-and `flush_threshold_bytes`. The trade-off is more, smaller Parquet files and more work for the
+flush interval, between 1 and 30 seconds, so an idle buffer is flushed within one interval
+plus one tick). A crash, `SIGKILL` or power loss loses everything in that window; the spool
+does not change this, because it sits **after** the flush. To shrink the window, lower
+`flush_interval_secs` and `flush_threshold_bytes`. The trade-off is more, smaller Parquet files and more work for the
 Iceberg committer.
 
 A graceful stop (`SIGTERM`/Ctrl-C) flushes every buffer first, with one exception. A writer
@@ -64,7 +64,10 @@ A failed flush is retried with exponential backoff: 1 s, 2 s, 4 s and so on, cap
 at `flush_interval_secs`. No flush starts inside the backoff window, whatever the row and byte
 thresholds say; the hard cap above still applies. A successful flush resets the backoff. If a
 flush task panics (a bug in a sink), its rows are put back and retried the same way, and
-`parquet_s3_flush_panics` is incremented.
+`parquet_s3_flush_panics` is incremented. A task that panics after its
+upload succeeded is retried too, so that object can be written twice (at-least-once). At
+shutdown the final flush makes a single descriptor attempt per partition, so a descriptor
+outage cannot delay the Parquet uploads of later partitions.
 
 When `[iceberg]` descriptors are enabled and the Parquet object was uploaded directly (not
 spooled), a failed descriptor upload is retried three more times, after 200 ms, 1 s and 5 s.

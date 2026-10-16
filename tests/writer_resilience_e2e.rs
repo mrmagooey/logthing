@@ -16,7 +16,7 @@ use tokio::time::timeout;
 const BIN: &str = env!("CARGO_BIN_EXE_logthing");
 const ENVS: [(&str, &str); 1] = [("AWS_MAX_ATTEMPTS", "1")];
 const REQ: Duration = Duration::from_secs(10);
-const FLUSH_INTERVAL_SECS: u64 = 4;
+const FLUSH_INTERVAL_SECS: u64 = 8;
 
 fn toml(endpoint: &str) -> String {
     format!(
@@ -95,8 +95,8 @@ async fn test_idle_buffer_flushes_within_one_interval_plus_tick_and_failures_bac
     p.wait_healthy().await;
 
     // Round 1 lands at a tick instant; round 2 then starts ~1.5 s after a tick, the phase
-    // where a tick period of one full interval would delay the flush to ~1.6 intervals.
-    let limit = Duration::from_secs(FLUSH_INTERVAL_SECS + 2); // interval + tick + slack
+    // where a tick period of one full interval would delay it to ~1.8 intervals.
+    let limit = Duration::from_secs(FLUSH_INTERVAL_SECS + 3); // interval + tick (2 s) + slack
     let first = time_to_deliver(&p, &fake, 10, 10).await;
     assert!(first <= limit * 2, "first flush took {first:?}");
     tokio::time::sleep(Duration::from_millis(1500)).await;

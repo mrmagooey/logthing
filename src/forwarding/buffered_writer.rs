@@ -55,7 +55,8 @@ pub trait UploadSink: Send + Sync {
     /// instead. A panicking upload is survivable: the writer recovers the
     /// partition's batches from its in-flight registry, clears `in_flight`,
     /// counts `parquet_s3_flush_panics` and retries with backoff. It is still
-    /// a bug in the sink.
+    /// a bug in the sink. If the panic comes after the PUT succeeded, the rows are
+    /// uploaded again and the object is duplicated (at-least-once).
     async fn upload(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()>;
 
     /// Stable label for the `target` metric dimension, e.g. `"s3"` | `"local"`.
@@ -1241,6 +1242,10 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 self.config.prefix.clone(),
                 self.sink.source(),
                 self.flush_semaphore.clone(),
+                // Shutdown flushes partitions one after another under a deadline: a
+                // descriptor outage must cost one fast attempt per partition, not
+                // seconds of retries, or later partitions never get their upload.
+                false,
             )
             .await;
 
@@ -1398,6 +1403,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             self.config.prefix.clone(),
             source,
             self.flush_semaphore.clone(),
+            true,
         ));
         self.in_flight_flushes.insert(task.id(), restore);
     }
@@ -1430,9 +1436,19 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 self.apply_flush_outcome(outcome);
             }
             Err(join_err) => {
-                tracing::warn!(source, target, "parquet_s3 flush task panicked: {join_err}");
-                metrics::counter!("parquet_s3_flush_panics", "source" => source, "target" => target)
+                if join_err.is_panic() {
+                    tracing::warn!(source, target, "parquet_s3 flush task panicked: {join_err}");
+                    metrics::counter!(
+                        "parquet_s3_flush_panics", "source" => source, "target" => target
+                    )
                     .increment(1);
+                } else {
+                    tracing::warn!(
+                        source,
+                        target,
+                        "parquet_s3 flush task cancelled: {join_err}"
+                    );
+                }
                 match self.in_flight_flushes.remove(&join_err.id()) {
                     Some(f) => self.apply_flush_outcome(FlushOutcome::Failure {
                         key: f.key,
@@ -1750,6 +1766,7 @@ async fn encode_and_upload(
     prefix: String,
     source: &'static str,
     semaphore: Arc<tokio::sync::Semaphore>,
+    descriptor_retries: bool,
 ) -> FlushOutcome {
     let permit = semaphore
         .acquire_owned()
@@ -1849,10 +1866,13 @@ async fn encode_and_upload(
                 metrics::counter!("parquet_s3_uploads", "source" => source, "target" => target)
                     .increment(1);
                 if let (Some(sink), Some(payload)) = (descriptor_sink, descriptor_payload) {
-                    // Descriptor retries can sleep for seconds; do not hold a
-                    // flush slot while a descriptor outage plays out.
+                    // Descriptor retries can sleep for seconds and this partition stays
+                    // `in_flight` meanwhile (its pushes accumulate under the hard cap).
+                    // The permit bounds concurrent parquet encode+upload, which is
+                    // finished, so release it: otherwise a descriptor outage would
+                    // starve every other partition's flush.
                     drop(permit);
-                    upload_descriptor_bytes(sink, payload, source).await;
+                    upload_descriptor_bytes(sink, payload, source, descriptor_retries).await;
                 }
             }
             FlushOutcome::Success { key }
@@ -1957,10 +1977,13 @@ async fn upload_descriptor_bytes(
     descriptor_sink: Arc<dyn UploadSink>,
     payload: DescriptorPayload,
     source: &'static str,
+    retries: bool,
 ) {
     // The Parquet is already delivered, so a descriptor failure is retried a few
     // times (the committer never sees the file without it) before it is counted.
-    let mut delays = DESCRIPTOR_RETRY_DELAYS.iter();
+    let mut delays = DESCRIPTOR_RETRY_DELAYS
+        .iter()
+        .take(if retries { usize::MAX } else { 0 });
     loop {
         match descriptor_sink
             .upload(&payload.key, payload.body.clone())
@@ -2081,8 +2104,8 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
             let mut ticker = tokio::time::interval(flush_check);
             // Separate, deliberately short ticker for the channel-depth gauge.
             // It used to ride on `ticker`, whose period is
-            // `flush_check_interval(flush_interval)` -- 900s at every source's
-            // default `flush_interval_secs`, which makes a queue-depth alert
+            // `flush_check_interval(flush_interval)` -- up to 30s, a quarter of the
+            // flush interval, which makes a queue-depth alert
             // useless (operators are expected to alert on this gauge). One
             // timer wakeup per second per writer is cheap; sampling it on the
             // `recv` arm instead would be per-record work in the hot loop and
@@ -4435,8 +4458,8 @@ max_partitions = 128
 
     /// The channel-depth gauges are the recommended queue-depth alert signal,
     /// so their cadence must stay short and, crucially, independent of
-    /// `flush_check_interval` — which is 900s at every source's default
-    /// `flush_interval_secs`.
+    /// `flush_check_interval` — which is up to 30s (a quarter of the flush
+    /// interval) at every source's default `flush_interval_secs`.
     #[test]
     fn channel_gauge_interval_is_short_and_independent_of_the_flush_interval() {
         assert!(CHANNEL_GAUGE_INTERVAL <= Duration::from_secs(5));
@@ -6082,5 +6105,73 @@ secret_key  = "SECRET"
         let (attempts, objects, errors) = flush_with_flaky_descriptor(usize::MAX).await;
         assert_eq!((attempts, objects), (4, 0));
         assert_eq!(errors, 1.0);
+    }
+
+    #[derive(Clone)]
+    struct FivePartitionSink;
+    impl ParquetSink for FivePartitionSink {
+        type Record = (String, String);
+        fn source(&self) -> &'static str {
+            "test"
+        }
+        fn partition(&self, r: &Self::Record) -> Option<String> {
+            Some(r.0.clone())
+        }
+        fn schema(&self, _p: Option<&str>) -> Arc<Schema> {
+            test_schema()
+        }
+        fn to_record_batch(
+            &self,
+            record: &Self::Record,
+            schema: &Arc<Schema>,
+        ) -> anyhow::Result<RecordBatch> {
+            let col = Arc::new(StringArray::from(vec![record.1.as_str()]));
+            Ok(RecordBatch::try_new(schema.clone(), vec![col])?)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_flush_skips_descriptor_retries_so_every_partition_uploads() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let descriptor: Arc<dyn UploadSink> = Arc::new(FlakyDescriptorSink {
+            fail_first: usize::MAX,
+            attempts: attempts.clone(),
+            objects: Arc::default(),
+        });
+        let uploads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let parquet: Arc<dyn UploadSink> = Arc::new(RecordingSink {
+            uploads: uploads.clone(),
+        });
+        let (cfg, policy) = test_config(1_000_000); // nothing flushes before shutdown
+        let mut w = PartitionedParquetWriter::with_source_stats(
+            FivePartitionSink,
+            parquet,
+            cfg,
+            policy,
+            Arc::new(crate::stats::SourceHourlyStats::default()),
+            Some(descriptor),
+        );
+        for i in 0..5 {
+            w.push((format!("p{i}"), "v".to_string())).await.unwrap();
+        }
+
+        let start = Instant::now();
+        w.flush_all().await.unwrap();
+
+        assert_eq!(
+            uploads.lock().unwrap().len(),
+            5,
+            "every partition must be uploaded"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            5,
+            "one descriptor attempt per partition"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "shutdown flush slept in descriptor retries: {:?}",
+            start.elapsed()
+        );
     }
 }
