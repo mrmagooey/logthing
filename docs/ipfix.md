@@ -23,7 +23,7 @@ Template withdrawals (RFC 7011 §8.1) are honoured: a template record with zero 
 
 **Partial datagrams**: if a later set in a datagram is malformed, the flow records already decoded from earlier sets are kept and the error is counted in `ipfix_decode_errors`. A datagram with a malformed set before any record decoded is dropped whole.
 
-**Per-message cap**: at most 8192 flow records are decoded from one message; the rest are dropped and `ipfix_records_capped` is incremented once per capped message.
+**Per-message cap**: at most 8192 flow records are decoded from one message; the rest are dropped and `ipfix_records_capped` is incremented once per capped message. The rest of a capped message is skipped, including any template sets after the cap point; those templates are learned from the exporter's next re-send.
 
 **Information Elements**:
 A curated set of IANA IEs (source/destination address/port, protocol, byte/packet counts, flow start/end, TCP flags, interfaces, etc.) is mapped directly to `FlowRecord` fields. Unknown or enterprise IEs are hex-encoded and stored in the `extra` JSON column. The post-NAT elements (`postNATSourceIPv4Address`, `postNATDestinationIPv4Address`, `postNAPTSourceTransportPort`, `postNAPTDestinationTransportPort`) are stored in `extra` under those names and never overwrite the original `src_addr`/`dst_addr`/`src_port`/`dst_port`. Unsigned elements sent wider than their usual width (for example `tcpControlBits` as two bytes) use the low-order bytes.

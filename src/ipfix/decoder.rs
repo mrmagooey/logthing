@@ -577,7 +577,10 @@ pub fn decode_ipfix(
 
 /// Upper bound on flow records decoded from one message. A 64 KiB datagram
 /// can legally pack tens of thousands of tiny records; decoding them all
-/// would let one packet allocate far more than a normal message does.
+/// would let one packet allocate far more than a normal message does. Once
+/// the cap is hit the rest of the message is skipped, later template sets
+/// included, so those templates are only learned from the exporter's next
+/// re-send.
 const MAX_RECORDS_PER_MESSAGE: usize = 8192;
 
 /// Append `set` to `records` without exceeding `MAX_RECORDS_PER_MESSAGE`.
@@ -3654,28 +3657,66 @@ mod tests {
         )
     }
 
+    /// Value of unlabelled counter `name` after running `f` under a local recorder.
+    #[allow(clippy::mutable_key_type)] // CompositeKey's AtomicBool is never hashed
+    fn counter_during<T>(name: &str, f: impl FnOnce() -> T) -> (T, u64) {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let out = metrics::with_local_recorder(&recorder, f);
+        let total = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == name)
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum();
+        (out, total)
+    }
+
+    fn cap_message_v9(records: usize) -> Vec<u8> {
+        let mut v = vec![0x00, 0x09, 0x00, 0x02, 0, 0, 0, 0, 0x67, 0x5C, 0xB0, 0x20];
+        v.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 5]);
+        v.extend_from_slice(&set_bytes(0, &tmpl_record(256, &[(4, 1)])));
+        v.extend_from_slice(&set_bytes(256, &vec![6u8; records]));
+        v
+    }
+
     #[test]
     fn test_record_cap_per_message() {
         let mut dec = IpfixDecoder::new();
-        let records = decode_ipfix(
-            &mut dec,
-            &cap_message(MAX_RECORDS_PER_MESSAGE + 100),
-            test_exporter(),
-        )
-        .unwrap();
+        let buf = cap_message(MAX_RECORDS_PER_MESSAGE + 100);
+        let (records, capped) = counter_during("ipfix_records_capped", || {
+            decode_ipfix(&mut dec, &buf, test_exporter()).unwrap()
+        });
         assert_eq!(records.len(), MAX_RECORDS_PER_MESSAGE);
+        assert_eq!(capped, 1, "one capped message counts once");
     }
 
     #[test]
     fn test_record_cap_not_hit_at_exactly_the_limit() {
         let mut dec = IpfixDecoder::new();
-        let records = decode_ipfix(
-            &mut dec,
-            &cap_message(MAX_RECORDS_PER_MESSAGE),
-            test_exporter(),
-        )
-        .unwrap();
+        let buf = cap_message(MAX_RECORDS_PER_MESSAGE);
+        let (records, capped) = counter_during("ipfix_records_capped", || {
+            decode_ipfix(&mut dec, &buf, test_exporter()).unwrap()
+        });
         assert_eq!(records.len(), MAX_RECORDS_PER_MESSAGE);
+        assert_eq!(capped, 0, "exactly the limit is not capped");
+    }
+
+    #[test]
+    fn test_record_cap_per_message_v9() {
+        let mut dec = IpfixDecoder::new();
+        let buf = cap_message_v9(MAX_RECORDS_PER_MESSAGE + 100);
+        let (records, capped) = counter_during("ipfix_records_capped", || {
+            decode_netflow_v9(&mut dec, &buf, test_exporter()).unwrap()
+        });
+        assert_eq!(records.len(), MAX_RECORDS_PER_MESSAGE);
+        assert!(records.iter().all(|r| r.protocol_version == 9));
+        assert_eq!(capped, 1);
     }
 
     #[test]
