@@ -430,3 +430,112 @@ async fn test_rfc5424_nilvalue_sd_message_column_has_no_leading_dash() {
         .unwrap();
     assert_eq!(col.value(0), "'su root' failed");
 }
+
+/// RFC 6587 octet-counted frames over a real TCP listener reach the local Parquet sink
+/// intact, including one whose body contains a newline.
+#[tokio::test]
+async fn syslog_tcp_octet_counted_frames_land_as_rows_with_embedded_newline() {
+    use logthing::syslog::listener::{SyslogListener, SyslogListenerConfig};
+    use tokio::io::AsyncWriteExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = std::sync::Arc::new(
+        LocalDiskSink::new(tmp.path().to_path_buf())
+            .await
+            .expect("LocalDiskSink constructs"),
+    );
+    let cfg = SyslogLocalConfig {
+        directory: tmp.path().to_path_buf(),
+        prefix: "syslog".to_string(),
+        max_buffer_rows: 1,
+        flush_interval_secs: 1,
+        channel_capacity: 4096,
+    };
+    let (handler, _join) = syslog_local_start(
+        &cfg,
+        sink,
+        std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+
+    let tcp_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let udp_port = {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.local_addr().unwrap().port()
+    };
+    let listener = SyslogListener::new(
+        SyslogListenerConfig {
+            bind_address: "127.0.0.1".to_string(),
+            udp_port,
+            tcp_port,
+            recv_tasks: 1,
+            ..SyslogListenerConfig::default()
+        },
+        std::sync::Arc::new(handler),
+    );
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(async move { listener.start_with_shutdown(rx).await });
+
+    let bodies = [
+        "<134>Jan 15 10:30:45 host-a app: one\ntwo",
+        "<134>Jan 15 10:30:46 host-b app: three",
+    ];
+    let mut payload = Vec::new();
+    for b in bodies {
+        payload.extend_from_slice(format!("{} {}", b.len(), b).as_bytes());
+    }
+    let mut stream = None;
+    for _ in 0..100 {
+        if let Ok(s) = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port)).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let mut stream = stream.expect("syslog TCP listener must accept");
+    stream.write_all(&payload).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut messages: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        messages.clear();
+        let mut files = Vec::new();
+        walk_all_files(tmp.path(), &mut files);
+        for f in files
+            .iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+        {
+            let raw = Bytes::from(std::fs::read(f).unwrap());
+            for rb in ParquetRecordBatchReaderBuilder::try_new(raw)
+                .unwrap()
+                .build()
+                .unwrap()
+            {
+                let rb = rb.unwrap();
+                let col = rb
+                    .column_by_name("message")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                messages.extend((0..rb.num_rows()).map(|i| col.value(i).to_string()));
+            }
+        }
+        if messages.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    server.abort();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    // The newline stays inside one row. (The RFC 3164 parser leaves the header in
+    // `message` when the body is multi-line, so match the tail, not equality.)
+    assert!(
+        messages.iter().any(|m| m.ends_with("one\ntwo")),
+        "{messages:?}"
+    );
+    assert!(messages.iter().any(|m| m == "three"), "{messages:?}");
+}
