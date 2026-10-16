@@ -109,7 +109,7 @@ Basic Auth credentials. This is opt-in and additive — Basic Auth keeps
 working unchanged as a fallback.
 
 ```bash
-LOGTHING_ADMIN_TRUST_PROXY_HEADERS=true
+LOGTHING_ADMIN_TRUST_PROXY_HEADERS=true                       # true/1/yes/on; other values stop startup
 LOGTHING_ADMIN_TRUSTED_HEADER=X-authentik-username           # default shown
 LOGTHING_ADMIN_TRUSTED_GROUPS_HEADER=X-authentik-groups       # default shown
 LOGTHING_ADMIN_TRUSTED_SECRET_HEADER=X-Admin-Proxy-Secret     # default shown
@@ -213,7 +213,7 @@ take effect. See the CHANGELOG for the breaking-change details.
 | `LOGTHING_ADMIN_TLS_CERT` | TLS certificate file path | - |
 | `LOGTHING_ADMIN_TLS_KEY` | TLS private key file path | - |
 | `LOGTHING_ADMIN_ENABLE_RATE_LIMIT` | Enable rate limiting: `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off` (case-insensitive); any other value stops startup | `true` |
-| `LOGTHING_ADMIN_TRUST_PROXY_HEADERS` | Enable trusted reverse-proxy header auth | `false` |
+| `LOGTHING_ADMIN_TRUST_PROXY_HEADERS` | Enable trusted reverse-proxy header auth: `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off` (case-insensitive); any other value stops startup | `false` |
 | `LOGTHING_ADMIN_TRUSTED_HEADER` | Header carrying the trusted username | `X-authentik-username` |
 | `LOGTHING_ADMIN_TRUSTED_GROUPS_HEADER` | Header carrying the trusted group list | `X-authentik-groups` |
 | `LOGTHING_ADMIN_TRUSTED_SECRET_HEADER` | Header carrying the shared secret | `X-Admin-Proxy-Secret` |
