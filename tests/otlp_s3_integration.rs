@@ -109,7 +109,7 @@ mod tests {
 
         // Map the OTLP request, assign ids like the production handler does.
         let req = make_otlp_request();
-        let mut records: Vec<OtlpRecord> = map_otlp_request(req, "127.0.0.1".to_string());
+        let mut records: Vec<OtlpRecord> = map_otlp_request(req, "127.0.0.1".to_string()).unwrap();
         assert_eq!(records.len(), 1);
         logthing::ingest::assign_event_uuids(&mut records);
 

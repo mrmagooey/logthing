@@ -252,6 +252,14 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     ),
     (
         Kind::Counter,
+        "otlp_requests_rejected_too_large",
+        concat!(
+            "OTLP requests answered 413 because they held too many log records or would expand ",
+            "beyond the per-request mapped-size cap."
+        ),
+    ),
+    (
+        Kind::Counter,
         "otlp_auth_failures",
         "OTLP requests rejected for a missing or incorrect token.",
     ),

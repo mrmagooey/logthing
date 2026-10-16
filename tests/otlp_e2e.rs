@@ -4,7 +4,7 @@
 //! tokio::spawn so there is no race on the port number).  Real reqwest POSTs
 //! are fired at that port and the HTTP status + body are inspected.
 //!
-//! No external services required (no MinIO).  The HTTP-behaviour tests use an empty
+//! No external services required (no MinIO).  The HTTP-behaviour tests use a drained-sink
 //! `IngestState` (records are accepted and not persisted); the typed-column tests wire a real
 //! local-disk OTLP sink and read the written Parquet back.
 //!
@@ -109,7 +109,18 @@ mod otlp_e2e {
         bearer_token: Option<String>,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let app_state = build_app_state(bearer_token).await;
-        let ingest_state = IngestState::default();
+        // A sink whose receiver is drained: exports are acknowledged only when a writer
+        // accepts them (no sink, or a closed one, answers 503).
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let ingest_state = IngestState {
+            otlp_local: Some(
+                logthing::forwarding::buffered_writer::ParquetWriterHandle::for_test(
+                    tx, "otlp", "test",
+                ),
+            ),
+            ..Default::default()
+        };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -440,6 +451,71 @@ mod otlp_e2e {
             .await
             .unwrap();
         assert_eq!(resp.status(), 400);
+    }
+}
+
+#[cfg(feature = "otlp")]
+mod otlp_binary_e2e {
+    use super::common;
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use prost::Message;
+    use std::time::Duration;
+
+    const BIN: &str = env!("CARGO_BIN_EXE_logthing");
+
+    const TOML: &str = r#"
+bind_address = "127.0.0.1:{HTTP}"
+[tls]
+enabled = false
+[syslog]
+enabled = false
+[metrics]
+enabled = false
+
+[otlp]
+enabled = true
+[otlp.local]
+directory = "{DIR}/otlp"
+flush_threshold_bytes = 1
+flush_interval_secs = 1
+"#;
+
+    fn request(n: usize) -> Vec<u8> {
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord::default(); n],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec()
+    }
+
+    #[tokio::test]
+    async fn test_otlp_e2e_oversized_request_413() {
+        let mut p = common::Proc::spawn(BIN, TOML, &[]);
+        p.wait_healthy().await;
+        let c = reqwest::Client::new();
+        let post = |body: Vec<u8>| {
+            c.post(format!("{}/v1/logs", p.base()))
+                .header("content-type", "application/x-protobuf")
+                .body(body)
+                .send()
+        };
+        let too_big = post(request(100_001)).await.unwrap();
+        assert_eq!(too_big.status(), 413);
+        assert!(too_big.text().await.unwrap().contains("100000"));
+        assert_eq!(post(request(2)).await.unwrap().status(), 200);
+        let dir = p.dir().join("otlp");
+        common::wait_for_rows(&dir, 2, Duration::from_secs(20)).await;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let rows: usize = common::read_all(&dir).iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2, "only the accepted request's rows are written");
     }
 }
 

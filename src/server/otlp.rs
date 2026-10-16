@@ -14,6 +14,50 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value as AnyVal};
 use serde_json::{Map, Value};
 
+/// Maximum number of log records one OTLP request may carry.
+pub const MAX_OTLP_RECORDS_PER_REQUEST: usize = 100_000;
+
+/// Maximum estimated in-memory size (bytes) of one request after mapping, i.e. each record's
+/// own encoded size plus its share of the resource and scope that are cloned into it.
+pub const MAX_OTLP_MAPPED_BYTES: usize = 256 * 1024 * 1024;
+
+/// An OTLP request exceeded the per-request expansion limits.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum OtlpLimitError {
+    /// More than [`MAX_OTLP_RECORDS_PER_REQUEST`] records.
+    #[error("OTLP request exceeds {MAX_OTLP_RECORDS_PER_REQUEST} log records")]
+    TooManyRecords,
+    /// Estimated mapped size above [`MAX_OTLP_MAPPED_BYTES`].
+    #[error("OTLP request would expand beyond {MAX_OTLP_MAPPED_BYTES} bytes once mapped")]
+    TooLarge,
+}
+
+/// Walk the decoded request once and reject it if mapping would exceed the limits.
+fn check_request_limits(req: &ExportLogsServiceRequest) -> Result<(), OtlpLimitError> {
+    use prost::Message;
+    let mut total_records: usize = 0;
+    let mut est_bytes: usize = 0;
+    for rl in &req.resource_logs {
+        let resource_len = rl.resource.as_ref().map_or(0, |r| r.encoded_len());
+        for sl in &rl.scope_logs {
+            let n = sl.log_records.len();
+            total_records = total_records.saturating_add(n);
+            if total_records > MAX_OTLP_RECORDS_PER_REQUEST {
+                return Err(OtlpLimitError::TooManyRecords);
+            }
+            let scope_len = sl.scope.as_ref().map_or(0, |s| s.encoded_len());
+            est_bytes = est_bytes.saturating_add(n.saturating_mul(resource_len + scope_len));
+            for lr in &sl.log_records {
+                est_bytes = est_bytes.saturating_add(lr.encoded_len());
+            }
+            if est_bytes > MAX_OTLP_MAPPED_BYTES {
+                return Err(OtlpLimitError::TooLarge);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn non_empty(s: String) -> Option<String> {
     Some(s).filter(|s| !s.is_empty())
 }
@@ -44,7 +88,18 @@ fn body_to_string(av: AnyValue) -> Option<String> {
 /// verbatim, any other AnyValue as JSON text, absent -> `None`. OTLP "unset" defaults (zero
 /// timestamps, severity 0, empty ids/strings, flags 0) map to `None`. `peer_addr` is the TCP
 /// peer IP. `event_uuid` is NOT assigned here (see `crate::ingest::assign_event_uuids`).
-pub fn map_otlp_request(req: ExportLogsServiceRequest, peer_addr: String) -> Vec<OtlpRecord> {
+///
+/// # Errors
+///
+/// Returns [`OtlpLimitError`] (before any record is built) when the request holds more than
+/// [`MAX_OTLP_RECORDS_PER_REQUEST`] records or its estimated mapped size exceeds
+/// [`MAX_OTLP_MAPPED_BYTES`]. Mapping clones the resource and scope attributes into every
+/// record, so a small body can otherwise expand into many times its wire size.
+pub fn map_otlp_request(
+    req: ExportLogsServiceRequest,
+    peer_addr: String,
+) -> Result<Vec<OtlpRecord>, OtlpLimitError> {
+    check_request_limits(&req)?;
     let received_at = Utc::now();
     let mut records = Vec::new();
 
@@ -99,7 +154,7 @@ pub fn map_otlp_request(req: ExportLogsServiceRequest, peer_addr: String) -> Vec
         }
     }
 
-    records
+    Ok(records)
 }
 
 /// Convert an OTLP nanosecond timestamp to `DateTime<Utc>`.
@@ -291,7 +346,7 @@ mod tests {
             1_700_000_000_000_000_000,
             "hello world",
         );
-        let records = map_otlp_request(req, "10.0.0.1".to_string());
+        let records = map_otlp_request(req, "10.0.0.1".to_string()).unwrap();
         assert_eq!(records.len(), 1);
         let r = &records[0];
         assert_eq!(
@@ -327,7 +382,7 @@ mod tests {
             0,
             "collision",
         );
-        let r = &map_otlp_request(req, "h".to_string())[0];
+        let r = &map_otlp_request(req, "h".to_string()).unwrap()[0];
         assert_eq!(r.attributes["key"], "from-log");
         assert_eq!(r.attributes["s"], "2");
         assert_eq!(r.attributes["http.status_code"], 200);
@@ -351,7 +406,7 @@ mod tests {
                 schema_url: String::new(),
             }],
         };
-        let r = &map_otlp_request(req, "h".to_string())[0];
+        let r = &map_otlp_request(req, "h".to_string()).unwrap()[0];
         assert!(r.time.is_none() && r.observed_time.is_none());
         assert!(r.severity_number.is_none() && r.severity_text.is_none());
         assert!(r.body.is_none());
@@ -372,7 +427,7 @@ mod tests {
             vec![make_int_kv("service.name", 42)],
         ] {
             let req = make_request(attrs, vec![], vec![], 0, "x");
-            let r = &map_otlp_request(req, "h".to_string())[0];
+            let r = &map_otlp_request(req, "h".to_string()).unwrap()[0];
             assert!(
                 r.service_name.is_none(),
                 "unusable service.name must map to NULL"
@@ -385,7 +440,7 @@ mod tests {
             0,
             "x",
         );
-        let r = &map_otlp_request(req, "h".to_string())[0];
+        let r = &map_otlp_request(req, "h".to_string()).unwrap()[0];
         assert_eq!(
             r.resource_attributes["service.name"], 42,
             "raw value kept in the JSON"
@@ -416,7 +471,7 @@ mod tests {
                 schema_url: String::new(),
             }],
         };
-        let r = &map_otlp_request(req, "h".to_string())[0];
+        let r = &map_otlp_request(req, "h".to_string()).unwrap()[0];
         assert_eq!(
             r.trace_id.as_deref(),
             Some("abababababababababababababababab")
@@ -445,7 +500,7 @@ mod tests {
                 schema_url: String::new(),
             }],
         };
-        map_otlp_request(req, "h".to_string()).remove(0)
+        map_otlp_request(req, "h".to_string()).unwrap().remove(0)
     }
 
     /// Nest `depth` levels of array (or kvlist) around an int leaf.
@@ -535,7 +590,7 @@ mod tests {
             0,
             "x",
         );
-        let r = &map_otlp_request(req, "h".to_string())[0];
+        let r = &map_otlp_request(req, "h".to_string()).unwrap()[0];
         assert!(r.attributes["deep.kv"].is_object());
         assert!(r.resource_attributes["deep.arr"].is_array());
     }
@@ -553,7 +608,7 @@ mod tests {
             0,
             "x",
         );
-        let r = &map_otlp_request(req, "h".to_string())[0];
+        let r = &map_otlp_request(req, "h".to_string()).unwrap()[0];
         assert!(r.attributes["nan"].is_null());
         assert!(r.attributes["neg_inf"].is_null());
         assert_eq!(r.attributes["ok"], 1.5);
@@ -569,7 +624,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let r = &map_otlp_request(make_request(vec![], vec![], vec![kv], 0, "x"), "h".into())[0];
+        let r = &map_otlp_request(make_request(vec![], vec![], vec![kv], 0, "x"), "h".into())
+            .unwrap()[0];
         assert_eq!(r.attributes["raw"], "cafe");
     }
 
@@ -577,7 +633,7 @@ mod tests {
     fn map_huge_attribute_value_does_not_panic_or_truncate() {
         let big = "x".repeat(1024 * 1024);
         let req = make_request(vec![], vec![], vec![make_kv("blob", &big)], 0, "b");
-        let r = &map_otlp_request(req, "h".to_string())[0];
+        let r = &map_otlp_request(req, "h".to_string()).unwrap()[0];
         assert_eq!(r.attributes["blob"].as_str().unwrap().len(), 1024 * 1024);
     }
 
@@ -606,7 +662,7 @@ mod tests {
         let req = ExportLogsServiceRequest {
             resource_logs: vec![mk("a", &["msg1", "msg2"]), mk("b", &["msg3"])],
         };
-        let records = map_otlp_request(req, "h".to_string());
+        let records = map_otlp_request(req, "h".to_string()).unwrap();
         let got: Vec<(&str, &str)> = records
             .iter()
             .map(|r| {
@@ -648,7 +704,7 @@ mod tests {
                 rl("b", &[("msg3", 3_000)]),
             ],
         };
-        let records = map_otlp_request(req, "10.0.0.5".to_string());
+        let records = map_otlp_request(req, "10.0.0.5".to_string()).unwrap();
         assert_eq!(records.len(), 3, "3 log records across 2 resource groups");
         let bodies: Vec<&str> = records
             .iter()
@@ -780,7 +836,53 @@ mod tests {
         let req = ExportLogsServiceRequest {
             resource_logs: vec![],
         };
-        let records = map_otlp_request(req, "host".to_string());
+        let records = map_otlp_request(req, "host".to_string()).unwrap();
         assert!(records.is_empty());
+    }
+
+    fn request_with_records(n: usize, resource: Option<Resource>) -> ExportLogsServiceRequest {
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource,
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord::default(); n],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_map_otlp_request_rejects_too_many_records() {
+        let req = request_with_records(MAX_OTLP_RECORDS_PER_REQUEST + 1, None);
+        assert_eq!(
+            map_otlp_request(req, "h".to_string()).unwrap_err(),
+            OtlpLimitError::TooManyRecords
+        );
+    }
+
+    #[test]
+    fn test_map_otlp_request_rejects_amplified_resource() {
+        let resource = Resource {
+            attributes: vec![make_kv("big", &"x".repeat(64 * 1024))],
+            ..Default::default()
+        };
+        let req = request_with_records(5_000, Some(resource));
+        assert_eq!(
+            map_otlp_request(req, "h".to_string()).unwrap_err(),
+            OtlpLimitError::TooLarge
+        );
+    }
+
+    #[test]
+    fn test_map_otlp_request_accepts_normal_batch() {
+        let resource = Resource {
+            attributes: vec![make_kv("service.name", "svc")],
+            ..Default::default()
+        };
+        let req = request_with_records(3, Some(resource));
+        assert_eq!(map_otlp_request(req, "h".to_string()).unwrap().len(), 3);
     }
 }

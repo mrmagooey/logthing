@@ -48,7 +48,17 @@ When the writer channel is full logthing answers `503 Service Unavailable` with
 enqueued before the channel filled, the whole request is rejected and the retry duplicates the
 enqueued prefix with different `event_uuid`s. `otlp_events_dropped` counts records that were
 not enqueued; `otlp_logs_received` counts only enqueued records. A closed channel (writer gone)
-is still answered 200 with a counted drop. WEF is unchanged (200 and a counted drop).
+or a server with no OTLP sink configured is also answered `503`: an export is never
+acknowledged unless every configured sink accepted it. WEF is unchanged (200 and a counted
+drop).
+
+## Request size limits
+
+A single request may carry at most 100,000 log records, and its estimated size once mapped
+(each record plus the resource and scope attributes that are copied into every record) may not
+exceed 256 MiB. Larger requests get `413 Payload Too Large` with a short text body and nothing is
+enqueued; the `otlp_requests_rejected_too_large` counter records each rejection. Exporters
+should lower their batch size (for example the OpenTelemetry Collector `send_batch_max_size`).
 
 ## Redaction
 

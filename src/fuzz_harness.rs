@@ -242,7 +242,10 @@ pub fn otlp(data: &[u8]) -> usize {
     let Some(req) = req else {
         return 0;
     };
-    let mut records = crate::server::otlp::map_otlp_request(req, "192.0.2.1".to_string());
+    let Ok(mut records) = crate::server::otlp::map_otlp_request(req, "192.0.2.1".to_string())
+    else {
+        return 0;
+    };
     // Mirror the production handler: redaction (no rules here), then ids after mapping.
     let ingest = crate::ingest::IngestState::default();
     if let Some(r) = &ingest.otlp_redactor {
