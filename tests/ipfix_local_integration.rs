@@ -308,3 +308,114 @@ async fn ipfix_flows_crossing_builder_batch_rows_land_exact_row_count_on_disk() 
          would silently drop rows from this total well before it ever surfaced as a lost file"
     );
 }
+
+// ---- decoder-level fixes carried through the real writer ----
+
+fn ipfix_set(set_id: u16, body: &[u8]) -> Vec<u8> {
+    let mut v = set_id.to_be_bytes().to_vec();
+    v.extend_from_slice(&((body.len() + 4) as u16).to_be_bytes());
+    v.extend_from_slice(body);
+    v
+}
+
+fn ipfix_message(sets: &[Vec<u8>]) -> Vec<u8> {
+    let body: Vec<u8> = sets.concat();
+    let mut v = vec![0x00, 0x0A];
+    v.extend_from_slice(&((16 + body.len()) as u16).to_be_bytes());
+    v.extend_from_slice(&[0x67, 0x5C, 0xB0, 0x20, 0, 0, 0, 1, 0, 0, 0, 0]);
+    v.extend_from_slice(&body);
+    v
+}
+
+/// A post-NAT datagram must keep the pre-NAT tuple in the curated columns
+/// (post-NAT values go to `extra`), and an options data set must not become
+/// a null-tuple row.
+#[tokio::test]
+async fn ipfix_post_nat_keeps_original_tuple_and_options_data_adds_no_row() {
+    use arrow::array::{Array, StringArray, UInt16Array};
+    use logthing::ipfix::decoder::{IpfixDecoder, decode_datagram};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = Arc::new(
+        LocalDiskSink::new(dir.path().to_path_buf())
+            .await
+            .expect("LocalDiskSink::new"),
+    );
+    let cfg = IpfixLocalConfig {
+        directory: dir.path().to_path_buf(),
+        prefix: "ipfix".to_string(),
+        max_buffer_rows: 100_000,
+        flush_threshold_bytes: usize::MAX,
+        flush_interval_secs: 3600,
+        channel_capacity: 256,
+    };
+    let (handler, writer_task) = ipfix_local_start(
+        &cfg,
+        sink,
+        Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+
+    let exporter: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+    let src: std::net::SocketAddr = "10.0.0.1:4739".parse().unwrap();
+    let mut decoder = IpfixDecoder::new();
+
+    // Datagram 1: template [8, 225, 7, 227] + one data record.
+    let template = [
+        &[1u8, 0, 0, 4][..],
+        &[0, 8, 0, 4, 0, 225, 0, 4, 0, 7, 0, 2, 0, 227, 0, 2],
+    ]
+    .concat();
+    let data = [10, 0, 0, 1, 203, 0, 113, 9, 0x1F, 0x90, 0xC3, 0x50];
+    let d1 = ipfix_message(&[ipfix_set(2, &template), ipfix_set(256, &data)]);
+    let flows = decode_datagram(&mut decoder, &d1, exporter).expect("datagram 1");
+    assert_eq!(flows.len(), 1);
+    handler.handle_flows(flows, src).await;
+
+    // Datagram 2: options template (id 300, scope 1) + options data.
+    let opt_tmpl = [1u8, 0x2C, 0, 2, 0, 1, 0, 144, 0, 4, 0, 160, 0, 8];
+    let opt_data = [0u8, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2];
+    let d2 = ipfix_message(&[ipfix_set(3, &opt_tmpl), ipfix_set(300, &opt_data)]);
+    let flows = decode_datagram(&mut decoder, &d2, exporter).expect("datagram 2");
+    handler.handle_flows(flows, src).await;
+
+    drop(handler);
+    tokio::time::timeout(std::time::Duration::from_secs(5), writer_task)
+        .await
+        .expect("writer task exits within 5s")
+        .expect("writer task must not panic");
+
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let files: Vec<_> = walk_all_files(&dir.path().join("ipfix"))
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|ext| ext == "parquet"))
+        .collect();
+    let mut rows = 0;
+    for f in files {
+        let bytes = bytes::Bytes::from(std::fs::read(f).unwrap());
+        for batch in ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .unwrap()
+            .build()
+            .unwrap()
+        {
+            let b = batch.unwrap();
+            rows += b.num_rows();
+            let col = |n: &str| b.column_by_name(n).unwrap().clone();
+            let src_addr = col("src_addr");
+            let src_addr = src_addr.as_any().downcast_ref::<StringArray>().unwrap();
+            let src_port = col("src_port");
+            let src_port = src_port.as_any().downcast_ref::<UInt16Array>().unwrap();
+            let extra = col("extra");
+            let extra = extra.as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..b.num_rows() {
+                assert!(!src_addr.is_null(i), "no null-tuple row from options data");
+                assert_eq!(src_addr.value(i), "10.0.0.1");
+                assert_eq!(src_port.value(i), 8080);
+                let extra: serde_json::Value = serde_json::from_str(extra.value(i)).unwrap();
+                assert_eq!(extra["postNATSourceIPv4Address"], "203.0.113.9");
+                assert_eq!(extra["postNAPTSourceTransportPort"], 50000);
+            }
+        }
+    }
+    assert_eq!(rows, 1, "exactly the one flow row, none for options data");
+}

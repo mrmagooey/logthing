@@ -109,6 +109,16 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
         "ipfix_templates_evicted",
         "IPFIX templates evicted from the cache after going unused past their TTL.",
     ),
+    (
+        Kind::Counter,
+        "ipfix_options_records_skipped",
+        "Options-template data records skipped (exporter metadata, not flows); a variable-length options data set counts once.",
+    ),
+    (
+        Kind::Counter,
+        "ipfix_records_capped",
+        "IPFIX/NetFlow v9 messages whose flow records beyond the per-message cap (8192) were not decoded; counted once per message.",
+    ),
     // ── sflow ─────────────────────────────────────────────────────────────
     (
         Kind::Counter,
