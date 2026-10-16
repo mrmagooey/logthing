@@ -95,3 +95,61 @@ async fn test_redacted_fields_never_reach_parquet_files() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn test_envelope_numeric_and_case_redaction_reach_parquet() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = GenericLocalConfig {
+        directory: dir.path().to_path_buf(),
+        prefix: "hec".to_string(),
+        flush_threshold_bytes: usize::MAX,
+        flush_interval_secs: 3600,
+        channel_capacity: 64,
+        max_buffer_rows: 100_000,
+    };
+    let sink = Arc::new(
+        LocalDiskSink::new(cfg.directory.clone())
+            .await
+            .expect("LocalDiskSink constructs"),
+    );
+    let (handler, writer) = hec_local_start(
+        &cfg,
+        sink,
+        64,
+        Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+    let redactor = Redactor::compile_with_env(
+        &RedactionConfig {
+            drop_fields: vec!["password".into()],
+            hash_fields: vec![],
+            hash_key_env: None,
+            mask_patterns: vec![r"\S+@\S+".into(), r"\d{13,16}".into()],
+        },
+        RedactorKind::Hec,
+        &|_| None,
+    )
+    .unwrap();
+
+    let mut rec = GenericRecord {
+        sourcetype: "app".into(),
+        host: Some("alice@corp.com".into()),
+        fields: serde_json::json!({"card": 4111111111111111u64, "Password": "x", "n": 7}),
+        received_at: chrono::Utc::now(),
+        ..Default::default()
+    };
+    redactor.redact_generic(&mut rec);
+    assign_event_uuids(std::slice::from_mut(&mut rec));
+    handler.try_send(rec).expect("send");
+    drop(handler);
+    tokio::time::timeout(Duration::from_secs(15), writer)
+        .await
+        .expect("writer shuts down")
+        .unwrap();
+
+    let batches = common::wait_for_rows(dir.path(), 1, Duration::from_secs(15)).await;
+    assert_eq!(common::str_col(&batches[0], "host").value(0), "[REDACTED]");
+    let fields: serde_json::Value =
+        serde_json::from_str(common::str_col(&batches[0], "fields").value(0)).unwrap();
+    assert_eq!(fields, serde_json::json!({"card": "[REDACTED]", "n": 7}));
+}

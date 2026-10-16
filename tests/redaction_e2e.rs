@@ -111,6 +111,43 @@ async fn test_hec_raw_and_ndjson_redaction_over_real_http() {
     );
 }
 
+#[tokio::test]
+async fn test_hec_envelope_numeric_and_case_redaction_over_real_http() {
+    let toml = HEC_TOML.replace(
+        r"mask_patterns = ['\d{3}-\d{2}-\d{4}']",
+        r"mask_patterns = ['\S+@\S+', '\d{13,16}']",
+    );
+    let mut p = common::Proc::spawn(BIN, &toml, &[KEY_ENV]);
+    p.wait_healthy().await;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/services/collector/event", p.base()))
+        .header("Authorization", "Splunk tok")
+        .json(&serde_json::json!({
+            "sourcetype": "app", "host": "alice@corp.com", "source": "bob@corp.com",
+            "event": {"card": 4111111111111111u64, "Password": "x", "n": 7}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let dir = p.dir().join("hec");
+    let batches = common::wait_for_rows(&dir, 1, Duration::from_secs(20)).await;
+    let b = &batches[0];
+    assert_eq!(common::str_col(b, "host").value(0), "[REDACTED]");
+    assert_eq!(common::str_col(b, "source").value(0), "[REDACTED]");
+    let fields: serde_json::Value =
+        serde_json::from_str(common::str_col(b, "fields").value(0)).unwrap();
+    assert_eq!(fields, serde_json::json!({"card": "[REDACTED]", "n": 7}));
+    let bytes: Vec<u8> = common::parquet_files(&dir)
+        .iter()
+        .flat_map(|f| std::fs::read(f).unwrap())
+        .collect();
+    let hay = String::from_utf8_lossy(&bytes);
+    for secret in ["alice@corp.com", "bob@corp.com", "4111111111111111"] {
+        assert!(!hay.contains(secret), "{secret} leaked");
+    }
+}
+
 /// `run_to_exit` does not expand placeholders; the process must fail before binding anyway.
 fn no_placeholders(toml: &str) -> String {
     toml.replace("{HTTP}", &common::free_port().to_string())

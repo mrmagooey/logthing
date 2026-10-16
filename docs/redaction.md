@@ -54,8 +54,11 @@ needs a restart.
   `{"user":{"email":..}}` and a literal key `"user.email"`. Arrays are traversed
   transparently: the path is applied to every element.
 - **HEC** rules apply to `fields` (the event, or `{"raw": "<body>"}` for `/services/collector/raw`)
-  and to the envelope's indexed fields (the HEC `fields` object). Other envelope columns
-  (`host`, `source`, `sourcetype`, `index`, time) are not redacted.
+  and to the envelope's indexed fields (the HEC `fields` object). The envelope columns `host`
+  and `source` are addressed with `@host` and `@source` (drop sets NULL, hash replaces the
+  text) and are also covered by `mask_patterns`. `sourcetype` and `index` choose the partition
+  and are never redacted (masking them would scatter data across partitions); time is not
+  redacted either.
 - **OTLP** unprefixed paths apply to BOTH `attributes` (log and scope attributes) and
   `resource_attributes`. Resource attributes are stored losslessly, so promoted keys such as
   `host.name` and `service.name` appear in `resource_attributes` as well as in their typed
@@ -63,9 +66,16 @@ needs a restart.
   must not be stored, an unprefixed `host.name` rule for the repeated copy.
 - **Typed OTLP columns** are addressed with `@body`, `@host_name` and `@peer_addr` (drop sets
   NULL, hash replaces the text). `@body.<path>` reaches into a body that is JSON text. Other
-  typed columns (`service_name`, severity, trace and span ids, timestamps, ...) cannot be
-  redacted: they drive partitioning and statistics or are not free text. Masks do not touch
-  typed columns other than `body`.
+  typed columns (`service_name`, trace and span ids, timestamps, ...) cannot be
+  redacted: they drive partitioning and statistics or are not free text. Masks apply to the
+  free-text columns `body`, `host_name`, `event_name`, `severity_text` and `scope_name`; they
+  do not touch `peer_addr` (set by the server from the connection), `service_name` or the
+  other typed columns.
+- **Key matching is case-insensitive:** drop and hash paths match object keys ASCII
+  case-insensitively at every segment, so `password` also removes `Password` and `PASSWORD`,
+  and `user.email` matches `User.Email`. This is a behaviour change from earlier releases,
+  which matched keys exactly: rules now remove or hash more keys than before. Typed `@`
+  targets are unaffected.
 - **Fail closed:** if an `@body.<path>` drop or hash rule is configured and the body looks like
   JSON (starts with `{` or `[`) but does not parse (too deeply nested, trailing comma, NaN, ...),
   logthing cannot locate the value, so it replaces the WHOLE body with `[REDACTED]` and counts
@@ -84,8 +94,10 @@ needs a restart.
   redaction).
 - **Order:** drop, then hash, then mask. Masks therefore see hash output; a pattern broad
   enough to match 64 hex characters would mask a pseudonym.
-- **Mask scope:** masks apply to string values only. Object keys and non-string leaves
-  (numbers, booleans) are never masked. A JSON `@body` is masked leaf by leaf and re-serialised
+- **Mask scope:** masks apply to string values and to numbers. A number is tested against the
+  patterns as its decimal text (`4111111111111111`); on a match it is replaced by the masked
+  string, so the leaf changes type from number to string (`"[REDACTED]"`). Numbers that do not
+  match are left untouched. Object keys and booleans are never masked. A JSON `@body` is masked leaf by leaf and re-serialised
   (compact, sorted keys) only if a rule actually changed it; an untouched body stays
   byte-identical. A plain-text body is masked as one string. Replacement text is literal
   (`$1` is not expanded).

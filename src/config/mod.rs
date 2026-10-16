@@ -1016,7 +1016,7 @@ pub struct GenericLocalConfig {
 /// See `docs/redaction.md` for exact semantics.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct RedactionConfig {
-    /// Dotted paths removed from the record (OTLP: `@body`, `@host_name`, `@peer_addr` address
+    /// Dotted paths removed from the record (HEC: `@host`, `@source`; OTLP: `@body`, `@host_name`, `@peer_addr` address
     /// typed columns).
     #[serde(default)]
     pub drop_fields: Vec<String>,
