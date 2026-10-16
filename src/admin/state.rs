@@ -30,6 +30,9 @@ pub struct AuditLogger {
     entries: Arc<RwLock<Vec<AuditEntry>>>,
     max_entries: usize,
     log_file: PathBuf,
+    /// Serialises rotate-check, rotation and append so concurrent `log()`
+    /// calls cannot rotate the same file twice or write into a half-rotated one.
+    pub(crate) write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AuditLogger {
@@ -38,11 +41,17 @@ impl AuditLogger {
         let log_file = std::env::var("LOGTHING_ADMIN_AUDIT_LOG")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("log/admin-audit.log"));
+        Self::with_log_file(max_entries, log_file).await
+    }
 
+    /// Like [`AuditLogger::new`] but writing to an explicit file instead of
+    /// the `LOGTHING_ADMIN_AUDIT_LOG` / default location.
+    pub async fn with_log_file(max_entries: usize, log_file: PathBuf) -> Self {
         let logger = Self {
             entries: Arc::new(RwLock::new(Vec::new())),
             max_entries,
             log_file,
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         // Load existing entries from file on startup
@@ -125,7 +134,10 @@ impl AuditLogger {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Check if rotation is needed
+        // Hold the lock across rotate-check and append: otherwise concurrent
+        // callers each see the same stale size, each rotate, and later
+        // rotations push freshly written entries out to higher backups.
+        let _guard = self.write_lock.lock().await;
         self.check_and_rotate().await?;
 
         // Append entry as JSON Line
@@ -149,20 +161,19 @@ impl AuditLogger {
             Err(_) => return Ok(()), // File doesn't exist yet
         };
 
-        let size = metadata.len();
         let max_size: u64 = 10 * 1024 * 1024; // 10 MB
-
-        // Check if size-based rotation needed
-        if size > max_size {
-            self.rotate_files().await?;
-        }
-
-        // Check if time-based rotation needed (daily)
-        let modified = metadata.modified()?;
-        let now = std::time::SystemTime::now();
         let day_duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-        if now.duration_since(modified)? > day_duration {
+        // A clock set before the file's mtime counts as "not old".
+        let age = metadata
+            .modified()
+            .ok()
+            .and_then(|m| std::time::SystemTime::now().duration_since(m).ok())
+            .unwrap_or_default();
+
+        // One decision from one stat: size and age both mean "rotate once".
+        // Rotating moves the file away, so there is nothing left to re-check.
+        if metadata.len() > max_size || age > day_duration {
             self.rotate_files().await?;
         }
 
@@ -242,7 +253,7 @@ pub struct TrustedIdentity {
 /// The client IP `trusted_header_middleware` resolved for this request,
 /// inserted into request extensions on every request (regardless of whether
 /// trusted-header verification succeeded). This is `X-Forwarded-For`'s
-/// leftmost hop only when the request's shared secret verified; otherwise
+/// rightmost hop only when the request's shared secret verified; otherwise
 /// it's the raw `ConnectInfo` peer address. See `auth::resolve_client_ip`
 /// for the security boundary this enforces.
 #[derive(Clone)]
@@ -288,12 +299,57 @@ impl PasswordHash {
             .is_ok()
     }
 
-    /// Create a password hash from an already-hashed string
-    pub fn from_hash(hash: &str) -> Self {
-        Self {
+    /// Create a password hash from an already-hashed PHC string, rejecting
+    /// strings that do not parse.
+    pub fn from_hash(hash: &str) -> anyhow::Result<Self> {
+        validate_pass_hash(hash)?;
+        Ok(Self {
             hash: hash.to_string(),
-        }
+        })
     }
+}
+
+/// Error for a `LOGTHING_ADMIN_PASS_HASH` value that is not a PHC string.
+fn validate_pass_hash(hash: &str) -> anyhow::Result<()> {
+    argon2::PasswordHash::new(hash).map(|_| ()).map_err(|e| {
+        anyhow::anyhow!(
+            "LOGTHING_ADMIN_PASS_HASH is not a valid PHC string ({e}) — check for shell `$` \
+             interpolation"
+        )
+    })
+}
+
+/// Parse `LOGTHING_ADMIN_ENABLE_RATE_LIMIT`: `true|1|yes|on` and
+/// `false|0|no|off`, case-insensitive; unset means enabled; anything else is
+/// an error naming the variable.
+fn parse_rate_limit_flag(raw: Option<&str>) -> anyhow::Result<bool> {
+    let Some(raw) = raw else {
+        return Ok(true);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(anyhow::anyhow!(
+            "LOGTHING_ADMIN_ENABLE_RATE_LIMIT={raw:?} is not a boolean \
+             (use true/false, 1/0, yes/no, on/off)"
+        )),
+    }
+}
+
+/// Check the admin environment variables that must stop the process when
+/// malformed (`LOGTHING_ADMIN_PASS_HASH`, `LOGTHING_ADMIN_ENABLE_RATE_LIMIT`).
+/// Cheap and side-effect free, so `main` can fail startup before the admin
+/// server is spawned in the background.
+pub fn validate_admin_env() -> anyhow::Result<()> {
+    parse_rate_limit_flag(
+        std::env::var("LOGTHING_ADMIN_ENABLE_RATE_LIMIT")
+            .ok()
+            .as_deref(),
+    )?;
+    if let Ok(hash) = std::env::var("LOGTHING_ADMIN_PASS_HASH") {
+        validate_pass_hash(&hash)?;
+    }
+    Ok(())
 }
 
 /// Admin state shared across handlers
@@ -512,6 +568,7 @@ pub fn build_admin_config_from_parts(
     };
 
     let password_hash = if let Some(hashed) = pass_hash {
+        validate_pass_hash(hashed)?;
         // Pre-hashed path: pass the hash string as the "pass" argument so the guard
         // only fires on exact "admin"/"admin" (which cannot occur here since the hash
         // value is never the literal string "admin").
@@ -519,7 +576,7 @@ pub fn build_admin_config_from_parts(
             tracing::error!("{}", msg);
             anyhow::anyhow!("{}", msg)
         })?;
-        PasswordHash::from_hash(hashed)
+        PasswordHash::from_hash(hashed)?
     } else {
         // Plain-password path.
         admin_start_allowed(bind_address, username, plain_pass).map_err(|msg| {
@@ -585,9 +642,11 @@ pub fn load_admin_config() -> anyhow::Result<AdminServerConfig> {
     let allowed_ips_str = std::env::var("LOGTHING_ADMIN_ALLOWED_IPS").ok();
     let tls_cert = std::env::var("LOGTHING_ADMIN_TLS_CERT").ok();
     let tls_key = std::env::var("LOGTHING_ADMIN_TLS_KEY").ok();
-    let enable_rate_limiting = std::env::var("LOGTHING_ADMIN_ENABLE_RATE_LIMIT")
-        .map(|s| s == "true" || s == "1")
-        .unwrap_or(true);
+    let enable_rate_limiting = parse_rate_limit_flag(
+        std::env::var("LOGTHING_ADMIN_ENABLE_RATE_LIMIT")
+            .ok()
+            .as_deref(),
+    )?;
     let trust_proxy_headers = std::env::var("LOGTHING_ADMIN_TRUST_PROXY_HEADERS")
         .map(|s| s == "true" || s == "1")
         .unwrap_or(false);
@@ -713,16 +772,109 @@ mod tests {
     #[test]
     fn password_hash_from_hash_roundtrip() {
         let original = PasswordHash::hash("secret").unwrap();
-        let restored = PasswordHash::from_hash(&original.hash);
+        let restored = PasswordHash::from_hash(&original.hash).unwrap();
         assert!(restored.verify("secret"));
         assert!(!restored.verify("not-secret"));
     }
 
     #[test]
-    fn password_hash_verify_bad_hash_returns_false() {
-        // A structurally invalid hash string must not panic — it should just return false.
-        let bad = PasswordHash::from_hash("not-a-valid-argon2-hash");
+    fn password_hash_verify_unparseable_hash_returns_false() {
+        // A structurally invalid stored hash must not panic — verify just fails.
+        let bad = PasswordHash {
+            hash: "not-a-valid-argon2-hash".to_string(),
+        };
         assert!(!bad.verify("anything"));
+    }
+
+    #[test]
+    fn test_invalid_pass_hash_rejected_at_startup() {
+        let err = PasswordHash::from_hash("notahash")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("LOGTHING_ADMIN_PASS_HASH"), "{err}");
+        assert!(err.contains("PHC"), "{err}");
+
+        // The startup path (not just the constructor) refuses it too.
+        let err = build_admin_config_from_parts(
+            None,
+            "admin",
+            "ignored",
+            Some("notahash"),
+            None,
+            None,
+            None,
+            true,
+            TrustedHeaderEnvArgs::default(),
+        )
+        .err()
+        .expect("invalid hash must refuse to start")
+        .to_string();
+        assert!(err.contains("LOGTHING_ADMIN_PASS_HASH"), "{err}");
+    }
+
+    #[test]
+    fn test_rate_limit_env_parsing() {
+        for (input, want) in [
+            (None, true),
+            (Some("true"), true),
+            (Some("TRUE"), true),
+            (Some("1"), true),
+            (Some("yes"), true),
+            (Some("On"), true),
+            (Some("false"), false),
+            (Some("0"), false),
+            (Some("no"), false),
+            (Some("Off"), false),
+            (Some("FALSE"), false),
+        ] {
+            assert_eq!(parse_rate_limit_flag(input).unwrap(), want, "{input:?}");
+        }
+        for bad in ["bogus", "", "2", "tru"] {
+            let err = parse_rate_limit_flag(Some(bad)).unwrap_err().to_string();
+            assert!(err.contains("LOGTHING_ADMIN_ENABLE_RATE_LIMIT"), "{err}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_audit_rotation_concurrent_logs_lose_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin-audit.log");
+        // Pre-fill past the 10 MB size threshold.
+        let line = format!("{}\n", "x".repeat(1023));
+        std::fs::write(&path, line.repeat(10 * 1024 + 16)).unwrap();
+
+        let logger = AuditLogger::with_log_file(100, path.clone()).await;
+        let mut tasks = Vec::new();
+        for i in 0..20 {
+            let logger = logger.clone();
+            tasks.push(tokio::spawn(async move {
+                let entry = AuditEntry {
+                    timestamp: Utc::now().to_rfc3339(),
+                    action: format!("A{i}"),
+                    username: "u".into(),
+                    client_ip: "127.0.0.1".into(),
+                    details: None,
+                };
+                logger.append_to_file(&entry).await
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap().expect("append must not fail");
+        }
+
+        let count = |p: &std::path::Path| {
+            std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| serde_json::from_str::<AuditEntry>(l).is_ok())
+                .count()
+        };
+        let current = count(&path);
+        let backup = count(&dir.path().join("admin-audit.log.1"));
+        assert_eq!(current + backup, 20, "current={current} backup={backup}");
+        assert_eq!(current, 20, "only one rotation may occur");
+        assert!(!dir.path().join("admin-audit.log.2").exists());
     }
 
     // ── build_admin_config_from_parts — pure-function branch coverage ─────────

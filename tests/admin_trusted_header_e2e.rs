@@ -56,6 +56,9 @@ async fn get_config_over_real_http_succeeds_with_trusted_headers_alone_no_basic_
         std::env::set_var("LOGTHING_ADMIN_BIND", format!("127.0.0.1:{port}"));
         std::env::set_var("LOGTHING_ADMIN_ENABLE_RATE_LIMIT", "false");
         std::env::set_var("LOGTHING_ADMIN_TRUST_PROXY_HEADERS", "true");
+        // Loopback (the real peer) plus the XFF address step 5 asserts on. Step 6 relies on
+        // the allowlist being judged against the XFF hop, not the loopback peer.
+        std::env::set_var("LOGTHING_ADMIN_ALLOWED_IPS", "127.0.0.1/32,203.0.113.77/32");
         std::env::set_var("LOGTHING_ADMIN_TRUSTED_HEADER_SECRET", trusted_secret);
         std::env::set_var("LOGTHING_ADMIN_TRUSTED_GROUPS", "admins");
         // LOGTHING_ADMIN_TRUSTED_HEADER / LOGTHING_ADMIN_TRUSTED_GROUPS_HEADER /
@@ -182,4 +185,25 @@ async fn get_config_over_real_http_succeeds_with_trusted_headers_alone_no_basic_
          runs before security_middleware in the real production router, not \
          just in an isolated middleware-chain test double; got entry: {entry:?}"
     );
+
+    // ---------------------------------------------------------------------
+    // 6. The IP allowlist judges the RIGHTMOST X-Forwarded-For hop (the one
+    //    the trusted proxy appended). The real peer is loopback, which is
+    //    allowlisted, so only the hop choice can produce these outcomes.
+    // ---------------------------------------------------------------------
+    for (xff, want) in [
+        ("10.9.9.9, 127.0.0.1", reqwest::StatusCode::OK),
+        ("127.0.0.1, 10.9.9.9", reqwest::StatusCode::FORBIDDEN),
+    ] {
+        let response = client
+            .get(format!("{base_url}/config"))
+            .header("X-authentik-username", "xff-hop")
+            .header("X-authentik-groups", "admins")
+            .header("X-Admin-Proxy-Secret", trusted_secret)
+            .header("X-Forwarded-For", xff)
+            .send()
+            .await
+            .expect("GET /config request should succeed over the network");
+        assert_eq!(response.status(), want, "X-Forwarded-For: {xff}");
+    }
 }
