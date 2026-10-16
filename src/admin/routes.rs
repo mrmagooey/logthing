@@ -570,15 +570,19 @@ mod tests {
         // Park the audit logger so get_config blocks inside `log(...)`.
         let audit_gate = state.audit_logger.write_lock.clone().lock_owned().await;
 
-        let mut request = create_request_with_auth(Method::GET, "/config", "admin", "admin", None);
+        // A pre-resolved identity skips Argon2, so the handler reaches the audit log in ms.
+        let mut request = create_request_without_auth(Method::GET, "/config");
         inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+        request.extensions_mut().insert(TrustedIdentity {
+            username: "alice".to_string(),
+        });
         let app = axum::Router::new()
             .route("/config", axum::routing::get(get_config))
             .with_state(state.clone());
         let handler = tokio::spawn(app.oneshot(request));
 
         // Give the handler time to reach the audit log, then demand the write lock.
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let writer =
             tokio::time::timeout(std::time::Duration::from_secs(2), state.config.write()).await;
         assert!(
