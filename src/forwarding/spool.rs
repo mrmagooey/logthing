@@ -1653,7 +1653,10 @@ mod tests {
         );
         s3.fail.store(false, Ordering::SeqCst);
         assert_eq!(spool.drain(Duration::from_secs(5)).await, 0);
-        assert_eq!(s3.keys(), vec!["k1", "k2"]);
+        // Entries upload concurrently, so arrival order is not deterministic.
+        let mut keys = s3.keys();
+        keys.sort();
+        assert_eq!(keys, vec!["k1", "k2"]);
         assert!(sorted_names(dir.path()).is_empty());
     }
 
