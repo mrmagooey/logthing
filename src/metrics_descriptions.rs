@@ -454,6 +454,12 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     ),
     (
         Kind::Counter,
+        "spool_descriptor_sink_missing",
+        "Spool upload attempts blocked because the entry carries an Iceberg descriptor but no \
+         descriptor sink is configured, labelled by sink; the entry is kept and retried.",
+    ),
+    (
+        Kind::Counter,
         "spool_corrupt",
         "Spool entries quarantined to corrupt/ (missing file, size or sha256 mismatch, \
          unknown meta version), at the startup scan or at upload time.",

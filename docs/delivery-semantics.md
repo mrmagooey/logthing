@@ -84,6 +84,13 @@ outage does not re-PUT the Parquet each time; this is remembered in memory only,
 in the middle of retries may PUT the Parquet once more. Failures retry with exponential
 backoff, 1 s doubling to 60 s (`spool_upload_errors`).
 
+An entry that carries a descriptor is never deleted without delivering it. If the descriptor
+sink is not configured (for example `[iceberg]` was removed from the config), the Parquet is
+still uploaded once, but the entry stays on disk and is retried with the normal backoff
+(`spool_descriptor_sink_missing`, `spool_upload_errors`) until the descriptor sink is
+configured again; then the descriptor is uploaded and the entry removed. Entries written by
+earlier releases follow the same rule.
+
 **Concurrency.** Up to 4 entries upload at the same time, in the steady-state uploader and in
 the shutdown drain. Entries are started oldest first; one entry is never attempted twice at
 once; within an entry the Parquet always precedes the descriptor. Backoff is per entry. A

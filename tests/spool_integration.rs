@@ -365,3 +365,62 @@ async fn test_restart_replays_complete_entries_and_discards_partial_tmp() {
     assert_eq!(fake.body("hec/x.json").unwrap(), b"{\"sha256\":\"x\"}");
     assert!(spool_files(dir.path()).is_empty());
 }
+
+#[tokio::test]
+async fn test_replay_without_descriptor_sink_keeps_entry_until_sink_is_restored() {
+    let fake = FakeS3::start().await;
+    fake.set_failing(true);
+    let dir = tempfile::tempdir().unwrap();
+    let s3 = s3(&fake).await;
+
+    // Run 1: descriptors on, S3 down; the flush lands in the spool.
+    {
+        let spool = fast_spool(dir.path(), 1 << 20);
+        spool
+            .register("hec.s3", s3.clone(), Some(s3.clone()))
+            .unwrap();
+        let sink = Arc::new(SpoolingUploadSink::new(s3.clone(), spool.clone(), "hec.s3"));
+        let (handle, task) = start_hec(sink, Some(s3.clone()));
+        handle.try_send(record("carol")).expect("send");
+        assert!(common::wait_until(WAIT, || spool.pending_entries() == 1).await);
+        join(handle, task).await;
+    }
+    let entry_files = spool_files(dir.path());
+    assert_eq!(entry_files.len(), 3, "parquet, json, meta: {entry_files:?}");
+
+    // Run 2: S3 healthy but the descriptor sink is disabled. The Parquet is delivered once;
+    // the entry (and its descriptor) must stay for a later run.
+    fake.set_failing(false);
+    {
+        let spool = fast_spool(dir.path(), 1 << 20);
+        spool.register("hec.s3", s3.clone(), None).unwrap();
+        let up = spool.spawn_uploader();
+        assert!(common::wait_until(WAIT, || fake.put_count() == 1).await);
+        // Several backoff cycles (20-100 ms) pass.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        up.shutdown().await;
+        assert_eq!(spool.pending_entries(), 1);
+    }
+    let keys = fake.put_keys();
+    assert_eq!(fake.put_count(), 1, "parquet once, no descriptor: {keys:?}");
+    assert!(keys[0].ends_with(".parquet"));
+    assert_eq!(
+        spool_files(dir.path()),
+        entry_files,
+        "entry must be retained"
+    );
+
+    // Run 3: descriptors back on; the descriptor is delivered and the spool empties.
+    let spool = fast_spool(dir.path(), 1 << 20);
+    spool
+        .register("hec.s3", s3.clone(), Some(s3.clone()))
+        .unwrap();
+    let up = spool.spawn_uploader();
+    let done = common::wait_until(WAIT, || {
+        spool.pending_entries() == 0 && fake.put_keys().iter().any(|k| k.ends_with(".json"))
+    })
+    .await;
+    up.shutdown().await;
+    assert!(done, "keys: {:?}", fake.put_keys());
+    assert!(spool_files(dir.path()).is_empty());
+}
