@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 
 static COMBINED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"^(\S+)\s+(\S+)\s+(\S+)\s+\[([^\]]+)\]\s+"(\S+)\s+(\S+)\s+(\S+)"\s+(\d{3})\s+(\S+)\s+"([^"]*)"\s+"([^"]*)""#,
+        r#"^(\S+)\s+(\S+)\s+(\S+)\s+\[([^\]]+)\]\s+"(?:(\S+)\s+(\S+)\s+(\S+)|-)"\s+(\d{3})\s+(\S+)\s+"((?:[^"\\]|\\.)*)"\s+"((?:[^"\\]|\\.)*)""#,
     )
     .unwrap()
 });
@@ -21,9 +21,10 @@ pub struct WebAccessRecord {
     pub ident: Option<String>,
     pub authuser: Option<String>,
     pub timestamp_str: String,
-    pub method: String,
-    pub path: String,
-    pub protocol: String,
+    /// `None` when the request line was `"-"` (e.g. a 408 with no request read).
+    pub method: Option<String>,
+    pub path: Option<String>,
+    pub protocol: Option<String>,
     pub status: u16,
     pub bytes: Option<u64>,
     pub referer: Option<String>,
@@ -43,9 +44,9 @@ pub fn try_parse(msg: &SyslogMessage) -> Option<WebAccessRecord> {
     let ident = caps.get(2).map(|m| m.as_str().to_string());
     let authuser = caps.get(3).and_then(|m| opt_hyphen(m.as_str()));
     let timestamp_str = caps.get(4)?.as_str().to_string();
-    let method = caps.get(5)?.as_str().to_string();
-    let path = caps.get(6)?.as_str().to_string();
-    let protocol = caps.get(7)?.as_str().to_string();
+    let method = caps.get(5).map(|m| m.as_str().to_string());
+    let path = caps.get(6).map(|m| m.as_str().to_string());
+    let protocol = caps.get(7).map(|m| m.as_str().to_string());
     let status: u16 = caps.get(8)?.as_str().parse().ok()?;
     let bytes = caps.get(9).and_then(|m| {
         let s = m.as_str();
@@ -108,9 +109,9 @@ mod tests {
         assert_eq!(rec.client_ip, "192.168.1.100");
         assert_eq!(rec.ident, Some("-".into()));
         assert_eq!(rec.authuser, Some("bob".into()));
-        assert_eq!(rec.method, "GET");
-        assert_eq!(rec.path, "/api/v1/users");
-        assert_eq!(rec.protocol, "HTTP/1.1");
+        assert_eq!(rec.method.as_deref(), Some("GET"));
+        assert_eq!(rec.path.as_deref(), Some("/api/v1/users"));
+        assert_eq!(rec.protocol.as_deref(), Some("HTTP/1.1"));
         assert_eq!(rec.status, 200);
         assert_eq!(rec.bytes, Some(4523));
         assert_eq!(rec.referer.as_deref(), Some("https://example.com/page"));
@@ -122,7 +123,7 @@ mod tests {
         let rec = try_parse(&msg(ANON)).expect("must parse");
         assert_eq!(rec.client_ip, "10.0.0.1");
         assert_eq!(rec.authuser, None);
-        assert_eq!(rec.method, "POST");
+        assert_eq!(rec.method.as_deref(), Some("POST"));
         assert_eq!(rec.status, 302);
         assert_eq!(rec.bytes, Some(0));
         assert_eq!(rec.referer, None);
@@ -132,7 +133,7 @@ mod tests {
     fn parses_404_response() {
         let rec = try_parse(&msg(NOT_FOUND)).expect("must parse");
         assert_eq!(rec.status, 404);
-        assert_eq!(rec.path, "/missing");
+        assert_eq!(rec.path.as_deref(), Some("/missing"));
     }
 
     #[test]
@@ -150,5 +151,20 @@ mod tests {
     fn hyphen_user_agent_becomes_none() {
         let rec = try_parse(&msg(NOT_FOUND)).expect("must parse");
         assert!(rec.user_agent.is_none(), "'-' user agent must become None");
+    }
+
+    #[test]
+    fn test_request_line_hyphen_parses_with_no_method_or_path() {
+        let line = r#"10.0.0.9 - - [15/Jan/2024:10:33:00 +0000] "-" 408 0 "-" "-""#;
+        let rec = try_parse(&msg(line)).expect("408 with '-' request line must parse");
+        assert_eq!(rec.status, 408);
+        assert!(rec.method.is_none() && rec.path.is_none() && rec.protocol.is_none());
+    }
+
+    #[test]
+    fn test_user_agent_with_escaped_quote_kept_intact() {
+        let line = r#"10.0.0.9 - - [15/Jan/2024:10:33:00 +0000] "GET / HTTP/1.1" 200 5 "-" "Evil \"agent\" 1.0""#;
+        let rec = try_parse(&msg(line)).expect("must parse");
+        assert_eq!(rec.user_agent.as_deref(), Some(r#"Evil \"agent\" 1.0"#));
     }
 }

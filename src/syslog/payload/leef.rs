@@ -26,7 +26,7 @@ pub struct LeefRecord {
 /// Decode the LEEF 2.0 delimiter field.
 /// Accepts: `0x<HH>` hex notation, a single literal character, or empty → `\t`.
 fn decode_delimiter(s: &str) -> char {
-    let s = s.trim();
+    // No trim(): a literal tab is itself a valid delimiter field.
     if s.is_empty() || s == "\\t" || s == "\t" {
         return '\t';
     }
@@ -63,48 +63,45 @@ pub fn try_parse(msg: &SyslogMessage) -> Option<LeefRecord> {
     // Split on '|' to extract the fixed header fields.
     // splitn(7) gives at most 7 parts; the 7th part contains all remaining content
     // (including any embedded '|' delimiters in the attribute blob).
-    let mut parts = rest.splitn(7, '|');
+    let mut parts = rest.splitn(6, '|');
     let leef_version = parts.next()?.to_string();
     let vendor = parts.next()?.to_string();
     let product = parts.next()?.to_string();
     let version = parts.next()?.to_string();
     let event_id = parts.next()?.to_string();
 
-    // seg6 is the 6th pipe-segment:
+    // Everything after the 5th '|' (embedded '|' in attribute data included):
     //   LEEF 1.0 → the entire tab-separated attribute blob
-    //   LEEF 2.0 pipe delimiter → just the delimiter field (e.g. "0x7C")
-    //   LEEF 2.0 non-pipe delimiter → delimiter_char + attribute blob (e.g. "\tsrc=…\tdst=…")
-    let seg6 = parts.next().unwrap_or("");
+    //   LEEF 2.0 → `<delimiter field>|<attribute blob>`, or, when the delimiter field is a
+    //              literal tab, `\t<attribute blob>` with no separating '|'.
+    let tail = parts.next().unwrap_or("");
 
     let (delimiter, attributes) = if leef_version == "2.0" {
-        // Try to consume a 7th segment. When the LEEF 2.0 delimiter is '|', the
-        // fixed-field separator already split delimiter-field from the pairs blob, so
-        // splitn puts the pairs blob in seg7. When the delimiter is not '|' (e.g. '\t'),
-        // no additional pipe exists and everything after the 5th '|' is in seg6.
-        if let Some(pairs_blob) = parts.next() {
-            // seg6 = delimiter field only; seg7 = attribute pairs
-            let delim = decode_delimiter(seg6);
-            let attrs = parse_attributes(pairs_blob, delim);
-            (Some(delim), attrs)
-        } else if seg6.is_empty() {
+        if let Some(blob) = tail.strip_prefix('\t') {
+            // Literal tab delimiter field (not trimmed away). Everything after it, including
+            // later '|', is attribute data; an optional '|' separator is dropped.
+            let blob = blob.strip_prefix('|').unwrap_or(blob);
+            (Some('\t'), parse_attributes(blob, '\t'))
+        } else if let Some((field, blob)) = tail.split_once('|') {
+            // field = delimiter only; blob = attribute pairs
+            let delim = decode_delimiter(field);
+            (Some(delim), parse_attributes(blob, delim))
+        } else if tail.is_empty() {
             // Empty delimiter field, no pairs → default tab delimiter.
             (Some('\t'), HashMap::new())
-        } else if seg6.starts_with("0x") || seg6.starts_with("0X") {
-            // Hex delimiter spec (e.g. "0x7C") with no trailing pipe and no pairs blob.
-            // Decode the hex; attributes are empty.
-            (Some(decode_delimiter(seg6)), HashMap::new())
+        } else if tail.starts_with("0x") || tail.starts_with("0X") {
+            // Hex delimiter spec with no trailing pipe and no pairs blob.
+            (Some(decode_delimiter(tail)), HashMap::new())
         } else {
-            // Literal first-char delimiter convention: the first char of seg6 IS the
-            // delimiter and the rest of seg6 is the attribute pairs blob
-            // (e.g. "\tsrc=…\tdst=…").
-            let delim = seg6.chars().next().unwrap_or('\t');
-            let pairs_blob = &seg6[delim.len_utf8()..];
-            let attrs = parse_attributes(pairs_blob, delim);
+            // Literal first-char delimiter convention: the first char IS the delimiter and
+            // the rest is the attribute pairs blob.
+            let delim = tail.chars().next().unwrap_or('\t');
+            let attrs = parse_attributes(&tail[delim.len_utf8()..], delim);
             (Some(delim), attrs)
         }
     } else {
         // LEEF 1.0: seg6 is the entire attribute blob, tab-delimited.
-        let attrs = parse_attributes(seg6, '\t');
+        let attrs = parse_attributes(tail, '\t');
         (None, attrs)
     };
 
@@ -221,5 +218,20 @@ mod tests {
     fn rejects_truncated_leef() {
         // Only 3 pipe fields
         assert!(try_parse(&msg("LEEF:1.0|Vendor|Product")).is_none());
+    }
+
+    #[test]
+    fn test_leef_2_0_literal_tab_delimiter_keeps_pipe_in_attribute_data() {
+        let rec = try_parse(&msg("LEEF:2.0|V|P|1|E|\tsrc=1\turl=a|b")).expect("must parse");
+        assert_eq!(rec.delimiter, Some('\t'));
+        assert_eq!(rec.attributes.get("src").map(String::as_str), Some("1"));
+        assert_eq!(rec.attributes.get("url").map(String::as_str), Some("a|b"));
+    }
+
+    #[test]
+    fn test_leef_2_0_hex_tab_delimiter_still_splits_on_pipe_field() {
+        let rec = try_parse(&msg("LEEF:2.0|V|P|1|E|0x09|src=1\tdst=2")).expect("must parse");
+        assert_eq!(rec.delimiter, Some('\t'));
+        assert_eq!(rec.attributes.get("dst").map(String::as_str), Some("2"));
     }
 }
