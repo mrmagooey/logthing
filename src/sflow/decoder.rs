@@ -427,6 +427,13 @@ pub fn decode_datagram(buf: &[u8], _exporter: IpAddr) -> anyhow::Result<Vec<Sflo
 
 // ── Flow sample decoder ──────────────────────────────────────────────────────
 
+/// Decode a compact flow_sample interface word: the top two bits are the
+/// format (0 = ifIndex, 1 = packet discarded, 2 = multiple interfaces) and
+/// the low 30 bits the value. Only format 0 names an interface.
+fn compact_ifindex(word: u32) -> Option<u32> {
+    (word >> 30 == 0).then_some(word & 0x3FFF_FFFF)
+}
+
 fn decode_flow_sample(
     body: &[u8],
     format: u32,
@@ -448,8 +455,8 @@ fn decode_flow_sample(
             bail!("sflow: flow_sample body too short ({} < 32)", body.len());
         }
         let sampling_rate = read_u32(body, 8)?;
-        let input_ifindex = read_u32(body, 20)?;
-        let output_ifindex = read_u32(body, 24)?;
+        let input_ifindex = compact_ifindex(read_u32(body, 20)?);
+        let output_ifindex = compact_ifindex(read_u32(body, 24)?);
         let num_records = read_u32(body, 28)?;
         (
             sampling_rate,
@@ -468,8 +475,8 @@ fn decode_flow_sample(
         }
         let sampling_rate = read_u32(body, 12)?;
         // input: format(4) + value(4) at [24..32]; output at [32..40]
-        let input_ifindex = read_u32(body, 28)?; // input if_value
-        let output_ifindex = read_u32(body, 36)?; // output if_value
+        let input_ifindex = Some(read_u32(body, 28)?); // input if_value
+        let output_ifindex = Some(read_u32(body, 36)?); // output if_value
         let num_records = read_u32(body, 40)?;
         (
             sampling_rate,
@@ -491,8 +498,8 @@ fn decode_flow_sample(
         dst_port: None,
         ip_protocol: None,
         sampling_rate: Some(sampling_rate),
-        input_ifindex: Some(input_ifindex),
-        output_ifindex: Some(output_ifindex),
+        input_ifindex,
+        output_ifindex,
         if_index: None,
         if_type: None,
         if_speed: None,
@@ -642,6 +649,8 @@ fn parse_ipv4(buf: &[u8], rec: &mut SflowRecord) -> anyhow::Result<()> {
         bail!("ipv4: invalid IHL {ihl}");
     }
     let protocol = buf[9];
+    // Fragments after the first carry no transport header.
+    let non_first_fragment = (u16::from_be_bytes([buf[6], buf[7]]) & 0x1FFF) != 0;
     let src = IpAddr::V4(Ipv4Addr::new(buf[12], buf[13], buf[14], buf[15]));
     let dst = IpAddr::V4(Ipv4Addr::new(buf[16], buf[17], buf[18], buf[19]));
 
@@ -649,8 +658,9 @@ fn parse_ipv4(buf: &[u8], rec: &mut SflowRecord) -> anyhow::Result<()> {
     rec.dst_addr = Some(dst);
     rec.ip_protocol = Some(protocol);
 
-    let transport = &buf[ihl..];
-    parse_transport(protocol, transport, rec);
+    if !non_first_fragment {
+        parse_transport(protocol, &buf[ihl..], rec);
+    }
     Ok(())
 }
 
@@ -669,10 +679,39 @@ fn parse_ipv6(buf: &[u8], rec: &mut SflowRecord) -> anyhow::Result<()> {
     rec.dst_addr = Some(IpAddr::V6(Ipv6Addr::from(dst_bytes)));
     rec.ip_protocol = Some(next_header);
 
-    let transport = &buf[40..];
-    parse_transport(next_header, transport, rec);
+    // Walk the extension-header chain to the upper-layer protocol.
+    let mut proto = next_header;
+    let mut off = 40usize;
+    for _ in 0..MAX_IPV6_EXT_HEADERS {
+        let hdr_len = match proto {
+            // hop-by-hop, routing, destination options: (len + 1) * 8
+            0 | 43 | 60 => buf.get(off + 1).map(|l| (*l as usize + 1) * 8),
+            // authentication header: (len + 2) * 4
+            51 => buf.get(off + 1).map(|l| (*l as usize + 2) * 4),
+            // fragment header: fixed 8 bytes
+            44 => Some(8),
+            _ => break,
+        };
+        let Some(hdr_len) = hdr_len.filter(|l| off + l <= buf.len()) else {
+            // Truncated chain: the upper-layer protocol is unknowable.
+            rec.ip_protocol = Some(proto);
+            return Ok(());
+        };
+        if proto == 44 && (u16::from_be_bytes([buf[off + 2], buf[off + 3]]) >> 3) != 0 {
+            // Non-first fragment: no transport header present.
+            rec.ip_protocol = Some(buf[off]);
+            return Ok(());
+        }
+        proto = buf[off];
+        off += hdr_len;
+    }
+    rec.ip_protocol = Some(proto);
+    parse_transport(proto, &buf[off..], rec);
     Ok(())
 }
+
+/// Maximum IPv6 extension headers walked before giving up on transport parsing.
+const MAX_IPV6_EXT_HEADERS: usize = 8;
 
 fn parse_transport(protocol: u8, buf: &[u8], rec: &mut SflowRecord) {
     match protocol {
@@ -815,9 +854,10 @@ fn decode_counter_sample(
         if rec_enterprise != 0 || rec_format != 1 {
             // Non-generic counter record — store raw in extra, up to the
             // per-sample/per-datagram budget, with the body hex-capped (see
-            // MAX_UNKNOWN_RECORD_BODY_BYTES).
+            // MAX_UNKNOWN_RECORD_BODY_BYTES). Standard (enterprise 0) records
+            // carry no `enterprise` key, matching flow records.
             unknown.push(unknown_record_json(
-                Some(rec_enterprise),
+                (rec_enterprise != 0).then_some(rec_enterprise),
                 rec_format,
                 counter_data_length,
                 rec_body,
@@ -848,7 +888,13 @@ fn decode_counter_sample(
         //   ifPromiscuous(u32) @ 84
         //   Total = 88 bytes
         if rec_body.len() < 88 {
-            bail!("generic_if_counters too short ({} < 88)", rec_body.len());
+            // One short record must not discard the rest of the sample.
+            tracing::debug!(
+                "sflow: generic_if_counters too short ({} < 88), skipped",
+                rec_body.len()
+            );
+            metrics::counter!("sflow_counter_records_skipped").increment(1);
+            continue;
         }
         rec.if_index = Some(read_u32(rec_body, 0)?);
         rec.if_type = Some(read_u32(rec_body, 4)?);
@@ -1654,5 +1700,203 @@ pub(crate) mod tests {
             &serde_json::json!({ "truncated": true_total_dropped, "reason": "datagram_budget" }),
             "counter-sample path must also report the true aggregate, not a local slice"
         );
+    }
+
+    // ── builders for the decoder-correctness tests ──
+
+    fn be(v: u32) -> [u8; 4] {
+        v.to_be_bytes()
+    }
+
+    /// One v5 datagram holding `samples` (each already enveloped).
+    fn datagram(samples: &[Vec<u8>]) -> Vec<u8> {
+        let mut d = Vec::new();
+        for w in [5, 1, 0x0A00_0001, 0, 1, 1000, samples.len() as u32] {
+            d.extend_from_slice(&be(w));
+        }
+        for s in samples {
+            d.extend_from_slice(s);
+        }
+        d
+    }
+
+    fn envelope(tag: u32, body: &[u8]) -> Vec<u8> {
+        let mut v = be(tag).to_vec();
+        v.extend_from_slice(&be(body.len() as u32));
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn counter_sample(records: &[Vec<u8>]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for w in [1, 1, records.len() as u32] {
+            b.extend_from_slice(&be(w));
+        }
+        for r in records {
+            b.extend_from_slice(r);
+        }
+        envelope(2, &b)
+    }
+
+    fn generic_if_record(if_index: u32) -> Vec<u8> {
+        let mut body = vec![0u8; 88];
+        body[0..4].copy_from_slice(&be(if_index));
+        body[4..8].copy_from_slice(&be(6));
+        envelope(1, &body)
+    }
+
+    fn flow_sample(input: u32, output: u32, records: &[Vec<u8>]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for w in [1, 1, 512, 512, 0, input, output, records.len() as u32] {
+            b.extend_from_slice(&be(w));
+        }
+        for r in records {
+            b.extend_from_slice(r);
+        }
+        envelope(1, &b)
+    }
+
+    fn raw_header_record(frame: &[u8]) -> Vec<u8> {
+        let mut padded = frame.to_vec();
+        while !padded.len().is_multiple_of(4) {
+            padded.push(0);
+        }
+        let mut body = Vec::new();
+        for w in [1, frame.len() as u32 + 4, 0, frame.len() as u32] {
+            body.extend_from_slice(&be(w));
+        }
+        body.extend_from_slice(&padded);
+        envelope(1, &body)
+    }
+
+    fn eth_ipv6(ext_and_transport: &[u8], next_header: u8) -> Vec<u8> {
+        let mut f = vec![0u8; 12];
+        f.extend_from_slice(&[0x86, 0xDD]);
+        f.extend_from_slice(&[0x60, 0, 0, 0, 0, 0, next_header, 64]);
+        f.extend_from_slice(&[0x20, 0x01, 0xdb, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        f.extend_from_slice(&[0x20, 0x01, 0xdb, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        f.extend_from_slice(ext_and_transport);
+        f
+    }
+
+    const TCP_PORTS: [u8; 8] = [0x1F, 0x90, 0x00, 0x50, 0, 0, 0, 0];
+
+    fn decode_one_flow(frame: &[u8]) -> SflowRecord {
+        let d = datagram(&[flow_sample(1, 2, &[raw_header_record(frame)])]);
+        decode_datagram(&d, exporter()).unwrap().remove(0)
+    }
+
+    #[test]
+    fn test_short_generic_if_counters_skipped_others_kept() {
+        let short = envelope(1, &[0u8; 40]);
+        let ethernet = envelope(2, &[0u8; 52]);
+        let d = datagram(&[counter_sample(&[short, ethernet, generic_if_record(7)])]);
+        let recs = decode_datagram(&d, exporter()).expect("short record must not fail the sample");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].if_index,
+            Some(7),
+            "valid record after the short one kept"
+        );
+        let extra = recs[0].extra.as_array().unwrap();
+        assert_eq!(extra.len(), 1, "ethernet record kept in extra: {extra:?}");
+        assert_eq!(extra[0]["format"], 2);
+    }
+
+    #[test]
+    fn test_ipv4_non_first_fragment_has_no_ports() {
+        let mut f = vec![0u8; 12];
+        f.extend_from_slice(&[0x08, 0x00]);
+        f.extend_from_slice(&[0x45, 0, 0, 40, 0, 1, 0x00, 0x08, 64, 6, 0, 0]);
+        f.extend_from_slice(&[10, 0, 0, 1, 10, 0, 0, 2]);
+        f.extend_from_slice(&TCP_PORTS);
+        let r = decode_one_flow(&f);
+        assert_eq!(r.src_addr, Some("10.0.0.1".parse().unwrap()));
+        assert_eq!(r.ip_protocol, Some(6));
+        assert_eq!((r.src_port, r.dst_port), (None, None));
+
+        // First fragment (MF set, offset 0) still has ports.
+        f[14 + 6] = 0x20;
+        f[14 + 7] = 0x00;
+        let r = decode_one_flow(&f);
+        assert_eq!((r.src_port, r.dst_port), (Some(8080), Some(80)));
+    }
+
+    #[test]
+    fn test_ipv6_hop_by_hop_then_tcp_ports_parsed() {
+        // HBH (len 0 -> 8 bytes) -> destination options (len 1 -> 16 bytes) -> TCP
+        let mut ext = vec![60, 0, 0, 0, 0, 0, 0, 0];
+        ext.extend_from_slice(&[6, 1]);
+        ext.extend_from_slice(&[0; 14]);
+        ext.extend_from_slice(&TCP_PORTS);
+        let r = decode_one_flow(&eth_ipv6(&ext, 0));
+        assert_eq!(r.ip_protocol, Some(6), "final upper-layer protocol");
+        assert_eq!((r.src_port, r.dst_port), (Some(8080), Some(80)));
+    }
+
+    #[test]
+    fn test_ipv6_authentication_header_uses_its_own_length_formula() {
+        // AH len field 4 -> (4 + 2) * 4 = 24 bytes
+        let mut ext = vec![17, 4];
+        ext.extend_from_slice(&[0; 22]);
+        ext.extend_from_slice(&TCP_PORTS);
+        let r = decode_one_flow(&eth_ipv6(&ext, 51));
+        assert_eq!(r.ip_protocol, Some(17));
+        assert_eq!((r.src_port, r.dst_port), (Some(8080), Some(80)));
+    }
+
+    #[test]
+    fn test_ipv6_fragment_nonzero_offset_no_ports() {
+        let mut ext = vec![6, 0, 0x00, 0x08, 0, 0, 0, 1]; // offset = 1 (8-byte units)
+        ext.extend_from_slice(&TCP_PORTS);
+        let r = decode_one_flow(&eth_ipv6(&ext, 44));
+        assert_eq!(r.ip_protocol, Some(6));
+        assert_eq!((r.src_port, r.dst_port), (None, None));
+
+        // Offset 0 (first fragment) keeps ports.
+        ext[2] = 0;
+        ext[3] = 1; // MF flag only
+        let r = decode_one_flow(&eth_ipv6(&ext, 44));
+        assert_eq!((r.src_port, r.dst_port), (Some(8080), Some(80)));
+    }
+
+    #[test]
+    fn test_ipv6_truncated_or_endless_extension_chain_is_bounded() {
+        // Truncated: HBH header claims 16 bytes but the frame ends first.
+        let r = decode_one_flow(&eth_ipv6(&[6, 1, 0, 0], 0));
+        assert_eq!((r.src_port, r.dst_port), (None, None));
+        // More than 8 chained headers: no ports, no panic.
+        let ext: Vec<u8> = (0..10).flat_map(|_| [0u8, 0, 0, 0, 0, 0, 0, 0]).collect();
+        let r = decode_one_flow(&eth_ipv6(&ext, 0));
+        assert_eq!((r.src_port, r.dst_port), (None, None));
+    }
+
+    #[test]
+    fn test_unknown_standard_counter_record_has_no_enterprise_key() {
+        let d = datagram(&[counter_sample(&[
+            envelope(2, &[0u8; 8]),
+            envelope((4300 << 12) | 5, &[0u8; 8]),
+        ])]);
+        let recs = decode_datagram(&d, exporter()).unwrap();
+        let extra = recs[0].extra.as_array().unwrap();
+        assert_eq!(extra.len(), 2);
+        assert!(extra[0].get("enterprise").is_none(), "{:?}", extra[0]);
+        assert_eq!(extra[1]["enterprise"], 4300);
+    }
+
+    #[test]
+    fn test_compact_flow_sample_discard_ifindex_none() {
+        let d = datagram(&[flow_sample(1 << 30, 2 << 30, &[])]);
+        let r = decode_datagram(&d, exporter()).unwrap().remove(0);
+        assert_eq!(r.input_ifindex, None);
+        assert_eq!(r.output_ifindex, None);
+    }
+
+    #[test]
+    fn test_compact_flow_sample_ifindex_masked() {
+        let d = datagram(&[flow_sample(0x0000_0123, 0x3FFF_FFFF, &[])]);
+        let r = decode_datagram(&d, exporter()).unwrap().remove(0);
+        assert_eq!(r.input_ifindex, Some(0x123));
+        assert_eq!(r.output_ifindex, Some(0x3FFF_FFFF));
     }
 }

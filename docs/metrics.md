@@ -136,6 +136,8 @@ IPFIX and sFlow:
 - `ipfix_templates_dropped` - templates not cached because the cache was at its maximum size
 - `ipfix_templates_evicted` - templates evicted after going unused past their TTL
 - `ipfix_recv_task_failed`, `sflow_recv_task_failed` - UDP receive tasks that exited with an error
+- `sflow_counter_records_skipped` - generic_if_counters records skipped for being shorter than
+  88 bytes (the rest of the sample still decodes)
 - `sflow_unknown_records_dropped` - records discarded because the per-datagram unknown-record
   budget was exhausted
 

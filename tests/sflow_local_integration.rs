@@ -381,3 +381,46 @@ async fn sflow_samples_crossing_builder_batch_rows_land_exact_row_count_on_disk(
         "exact total row count in the 'counter' partition must match every counter sample pushed"
     );
 }
+
+mod common;
+mod sflow_fixture;
+
+/// A datagram mixing a short generic_if_counters record, an ethernet counter
+/// record and an IPv6 hop-by-hop TCP flow sample decodes into both rows, which
+/// land in Parquet with the ports intact.
+#[tokio::test]
+async fn sflow_mixed_validity_datagram_lands_counter_and_flow_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = Arc::new(
+        LocalDiskSink::new(dir.path().to_path_buf())
+            .await
+            .expect("LocalDiskSink::new"),
+    );
+    let cfg = SflowLocalConfig {
+        directory: dir.path().to_path_buf(),
+        prefix: "sflow".to_string(),
+        max_buffer_rows: 1,
+        flush_threshold_bytes: 1,
+        flush_interval_secs: 3600,
+        channel_capacity: 256,
+    };
+    let (handler, _writer_task) = sflow_local_start(
+        &cfg,
+        sink,
+        Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+
+    let records = logthing::sflow::decoder::decode_datagram(
+        &sflow_fixture::mixed_datagram(7),
+        "10.0.0.1".parse().unwrap(),
+    )
+    .expect("datagram decodes");
+    assert_eq!(records.len(), 2);
+    handler
+        .handle_samples(records, "127.0.0.1:6343".parse().unwrap())
+        .await;
+
+    let batches = common::wait_for_rows(dir.path(), 2, std::time::Duration::from_secs(20)).await;
+    sflow_fixture::assert_rows(&batches, 7);
+}
