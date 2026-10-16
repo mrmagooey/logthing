@@ -1016,8 +1016,8 @@ pub struct GenericLocalConfig {
 /// See `docs/redaction.md` for exact semantics.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct RedactionConfig {
-    /// Dotted paths removed from the record (OTLP: `@body`, `@host_name`, `@peer_addr` address
-    /// typed columns).
+    /// Dotted paths removed from the record (`@` paths address typed columns: HEC `@host`,
+    /// `@source`; OTLP `@body`, `@host_name`, `@peer_addr`).
     #[serde(default)]
     pub drop_fields: Vec<String>,
     /// Dotted paths replaced by the lowercase-hex HMAC-SHA256 of the value.

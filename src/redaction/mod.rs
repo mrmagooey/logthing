@@ -70,6 +70,10 @@ enum Column {
     Body,
     HostName,
     PeerAddr,
+    /// HEC envelope `host`.
+    Host,
+    /// HEC envelope `source`.
+    Source,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,22 +130,23 @@ fn parse_target(
         validate_path(section, rule, raw)?;
         return Ok(Target::Json(raw.to_string()));
     };
-    if kind != RedactorKind::Otlp {
-        bail!(
-            "{section}.{rule}: {raw:?}: '@' typed-column paths are only valid for [otlp.redaction]"
-        );
-    }
     let (name, sub) = match rest.split_once('.') {
         Some((n, s)) => (n, Some(s)),
         None => (rest, None),
     };
-    let column = match name {
-        "body" => Column::Body,
-        "host_name" => Column::HostName,
-        "peer_addr" => Column::PeerAddr,
-        other => bail!(
+    let column = match (kind, name) {
+        (RedactorKind::Otlp, "body") => Column::Body,
+        (RedactorKind::Otlp, "host_name") => Column::HostName,
+        (RedactorKind::Otlp, "peer_addr") => Column::PeerAddr,
+        (RedactorKind::Hec, "host") => Column::Host,
+        (RedactorKind::Hec, "source") => Column::Source,
+        (RedactorKind::Otlp, other) => bail!(
             "{section}.{rule}: @{other} is not redactable (allowed: @body, @host_name, \
              @peer_addr; service_name is the partition key and ids are join keys)"
+        ),
+        (RedactorKind::Hec, other) => bail!(
+            "{section}.{rule}: @{other} is not redactable (allowed: @host, @source; \
+             sourcetype and index select the partition and are not redactable)"
         ),
     };
     if let Some(s) = sub {
@@ -289,22 +294,49 @@ impl Redactor {
     pub fn redact_generic(&self, rec: &mut GenericRecord) -> RedactionCounts {
         let mut c = RedactionCounts::default();
         for t in &self.drops {
-            if let Target::Json(p) = t {
-                c.dropped += apply_path(&mut rec.fields, p, &PathOp::Drop);
-                if let Some(v) = rec.indexed_fields.as_mut() {
-                    c.dropped += apply_path(v, p, &PathOp::Drop);
+            match t {
+                Target::Json(p) => {
+                    c.dropped += apply_path(&mut rec.fields, p, &PathOp::Drop);
+                    if let Some(v) = rec.indexed_fields.as_mut() {
+                        c.dropped += apply_path(v, p, &PathOp::Drop);
+                    }
+                }
+                Target::Column(col, _) => {
+                    if let Some(slot) = generic_slot(rec, *col)
+                        && slot.take().is_some()
+                    {
+                        c.dropped += 1;
+                    }
                 }
             }
         }
         for t in &self.hashes {
-            if let Target::Json(p) = t {
-                c.hashed += apply_path(&mut rec.fields, p, &PathOp::Hash(self));
-                if let Some(v) = rec.indexed_fields.as_mut() {
-                    c.hashed += apply_path(v, p, &PathOp::Hash(self));
+            match t {
+                Target::Json(p) => {
+                    c.hashed += apply_path(&mut rec.fields, p, &PathOp::Hash(self));
+                    if let Some(v) = rec.indexed_fields.as_mut() {
+                        c.hashed += apply_path(v, p, &PathOp::Hash(self));
+                    }
+                }
+                Target::Column(col, _) => {
+                    if let Some(slot) = generic_slot(rec, *col)
+                        && let Some(s) = slot.as_deref()
+                    {
+                        let h = self.hmac_hex(s.as_bytes());
+                        *slot = Some(h);
+                        c.hashed += 1;
+                    }
                 }
             }
         }
         for re in &self.masks {
+            // Envelope columns that carry client data. `sourcetype` and `index` select the
+            // partition and are deliberately not masked.
+            for col in [Column::Host, Column::Source] {
+                if let Some(s) = generic_slot(rec, col).and_then(|o| o.as_mut()) {
+                    c.masked += mask_str(s, re, MASK_REPLACEMENT);
+                }
+            }
             c.masked += mask_value(&mut rec.fields, re);
             if let Some(v) = rec.indexed_fields.as_mut() {
                 c.masked += mask_value(v, re);
@@ -323,8 +355,9 @@ impl Redactor {
                     c.dropped += apply_path(&mut rec.resource_attributes, p, &PathOp::Drop);
                 }
                 Target::Column(col, None) => {
-                    let slot = column_slot(rec, *col);
-                    if slot.take().is_some() {
+                    if let Some(slot) = column_slot(rec, *col)
+                        && slot.take().is_some()
+                    {
                         c.dropped += 1;
                     }
                 }
@@ -343,8 +376,9 @@ impl Redactor {
                     c.hashed += apply_path(&mut rec.resource_attributes, p, &PathOp::Hash(self));
                 }
                 Target::Column(col, None) => {
-                    let slot = column_slot(rec, *col);
-                    if let Some(s) = slot.as_deref() {
+                    if let Some(slot) = column_slot(rec, *col)
+                        && let Some(s) = slot.as_deref()
+                    {
                         let h = self.hmac_hex(s.as_bytes());
                         *slot = Some(h);
                         c.hashed += 1;
@@ -363,16 +397,38 @@ impl Redactor {
             c.masked += mask_value(&mut rec.attributes, re);
             c.masked += mask_value(&mut rec.resource_attributes, re);
             c.masked += mask_body(&mut rec.body, re);
+            // Free-text columns. `service_name` (partition key), ids and `peer_addr`
+            // (server-observed) are deliberately not masked.
+            for s in [
+                &mut rec.host_name,
+                &mut rec.event_name,
+                &mut rec.severity_text,
+                &mut rec.scope_name,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                c.masked += mask_str(s, re, MASK_REPLACEMENT);
+            }
         }
         self.emit(c)
     }
 }
 
-fn column_slot(rec: &mut OtlpRecord, col: Column) -> &mut Option<String> {
+fn column_slot(rec: &mut OtlpRecord, col: Column) -> Option<&mut Option<String>> {
     match col {
-        Column::Body => &mut rec.body,
-        Column::HostName => &mut rec.host_name,
-        Column::PeerAddr => &mut rec.peer_addr,
+        Column::Body => Some(&mut rec.body),
+        Column::HostName => Some(&mut rec.host_name),
+        Column::PeerAddr => Some(&mut rec.peer_addr),
+        Column::Host | Column::Source => None,
+    }
+}
+
+fn generic_slot(rec: &mut GenericRecord, col: Column) -> Option<&mut Option<String>> {
+    match col {
+        Column::Host => Some(&mut rec.host),
+        Column::Source => Some(&mut rec.source),
+        Column::Body | Column::HostName | Column::PeerAddr => None,
     }
 }
 
@@ -382,6 +438,7 @@ enum PathOp<'a> {
 }
 
 /// Apply `op` at every location matching `path` below `v`; returns locations changed.
+/// Keys match ASCII case-insensitively at every segment.
 fn apply_path(v: &mut Value, path: &str, op: &PathOp<'_>) -> u64 {
     match v {
         Value::Array(items) => items.iter_mut().map(|i| apply_path(i, path, op)).sum(),
@@ -389,25 +446,29 @@ fn apply_path(v: &mut Value, path: &str, op: &PathOp<'_>) -> u64 {
             let mut n = 0;
             // The whole remaining path as one literal key (OTLP keys contain dots).
             match op {
-                PathOp::Drop => {
-                    if map.remove(path).is_some() {
-                        n += 1;
-                    }
-                }
+                PathOp::Drop => map.retain(|k, _| {
+                    let hit = k.eq_ignore_ascii_case(path);
+                    n += u64::from(hit);
+                    !hit
+                }),
                 PathOp::Hash(r) => {
-                    if let Some(slot) = map.get_mut(path)
-                        && let Some(h) = r.hash_value(slot)
-                    {
-                        *slot = Value::String(h);
-                        n += 1;
+                    for (k, slot) in map.iter_mut() {
+                        if k.eq_ignore_ascii_case(path)
+                            && let Some(h) = r.hash_value(slot)
+                        {
+                            *slot = Value::String(h);
+                            n += 1;
+                        }
                     }
                 }
             }
             // Every '.'-prefix that is itself a key: descend with the remainder.
             for (i, _) in path.match_indices('.') {
                 let (prefix, rest) = (&path[..i], &path[i + 1..]);
-                if let Some(child) = map.get_mut(prefix) {
-                    n += apply_path(child, rest, op);
+                for (k, child) in map.iter_mut() {
+                    if k.eq_ignore_ascii_case(prefix) {
+                        n += apply_path(child, rest, op);
+                    }
                 }
             }
             n
@@ -447,10 +508,19 @@ fn canonical_json(v: &Value, out: &mut String) {
     }
 }
 
-/// Replace regex matches in every string leaf; returns number of matches replaced.
+/// Replace regex matches in every string leaf; returns number of matches replaced. A numeric
+/// leaf whose decimal text matches is replaced by the masked string.
 fn mask_value(v: &mut Value, re: &Regex) -> u64 {
     match v {
         Value::String(s) => mask_str(s, re, MASK_REPLACEMENT),
+        Value::Number(num) => {
+            let mut text = num.to_string();
+            let n = mask_str(&mut text, re, MASK_REPLACEMENT);
+            if n > 0 {
+                *v = Value::String(text);
+            }
+            n
+        }
         Value::Array(a) => a.iter_mut().map(|e| mask_value(e, re)).sum(),
         Value::Object(m) => m.values_mut().map(|e| mask_value(e, re)).sum(),
         _ => 0,
@@ -680,6 +750,119 @@ mod tests {
         );
         assert_eq!(rec.fields["num"], json!(123456789));
         assert_eq!(c.masked, 3);
+    }
+
+    #[test]
+    fn test_mask_applies_to_hec_host_and_source() {
+        let r = hec(&[], &[], &[r"\S+@\S+"]);
+        let mut rec = generic(json!({}));
+        rec.host = Some("alice@corp.com".into());
+        rec.source = Some("/home/bob@x.io/log".into());
+        let c = r.redact_generic(&mut rec);
+        assert_eq!(rec.host.as_deref(), Some("[REDACTED]"));
+        assert_eq!(rec.source.as_deref(), Some("[REDACTED]"));
+        assert_eq!(c.masked, 2);
+    }
+
+    #[test]
+    fn test_mask_does_not_touch_sourcetype_or_index() {
+        let r = hec(&[], &[], &["secret"]);
+        let mut rec = generic(json!({}));
+        rec.sourcetype = "secret-type".into();
+        rec.index = Some("secret-index".into());
+        r.redact_generic(&mut rec);
+        assert_eq!(rec.sourcetype, "secret-type");
+        assert_eq!(rec.index.as_deref(), Some("secret-index"));
+    }
+
+    #[test]
+    fn test_hec_host_and_source_drop_and_hash_targets() {
+        let r = hec(&["@host"], &["@source"], &[]);
+        let mut rec = generic(json!({}));
+        rec.host = Some("h".into());
+        rec.source = Some("s".into());
+        let c = r.redact_generic(&mut rec);
+        assert_eq!(rec.host, None);
+        assert_eq!(rec.source.as_deref().map(str::len), Some(64));
+        assert_eq!((c.dropped, c.hashed), (1, 1));
+        for bad in ["@sourcetype", "@index", "@body"] {
+            assert!(
+                Redactor::compile_with_env(&cfg(&[bad], &[], &[]), RedactorKind::Hec, &env)
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        assert!(
+            Redactor::compile_with_env(&cfg(&["@host"], &[], &[]), RedactorKind::Otlp, &env)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_mask_applies_to_otlp_free_text_columns() {
+        let r = otlp(&[], &[], &["secret"]);
+        let mut rec = otlp_rec();
+        rec.host_name = Some("secret-host".into());
+        rec.event_name = Some("secret.event".into());
+        rec.severity_text = Some("secret".into());
+        rec.scope_name = Some("my.secret.lib".into());
+        rec.peer_addr = Some("secret".into());
+        let c = r.redact_otlp(&mut rec);
+        assert_eq!(rec.host_name.as_deref(), Some("[REDACTED]-host"));
+        assert_eq!(rec.event_name.as_deref(), Some("[REDACTED].event"));
+        assert_eq!(rec.severity_text.as_deref(), Some("[REDACTED]"));
+        assert_eq!(rec.scope_name.as_deref(), Some("my.[REDACTED].lib"));
+        assert_eq!(rec.peer_addr.as_deref(), Some("secret"), "server-observed");
+        assert_eq!(c.masked, 4);
+    }
+
+    #[test]
+    fn test_mask_numeric_leaf_matching_pattern() {
+        let r = hec(&[], &[], &[r"\d{13,16}"]);
+        let mut rec = generic(json!({"card": 4111111111111111u64, "n": [4111111111111111u64]}));
+        let c = r.redact_generic(&mut rec);
+        assert_eq!(
+            rec.fields,
+            json!({"card": "[REDACTED]", "n": ["[REDACTED]"]})
+        );
+        assert_eq!(c.masked, 2);
+    }
+
+    #[test]
+    fn test_mask_numeric_leaf_not_matching_untouched() {
+        let r = hec(&[], &[], &[r"\d{13,16}"]);
+        let mut rec = generic(json!({"a": 42, "b": 1.5, "c": -7, "d": true}));
+        let c = r.redact_generic(&mut rec);
+        assert_eq!(rec.fields, json!({"a": 42, "b": 1.5, "c": -7, "d": true}));
+        assert_eq!(c.masked, 0);
+    }
+
+    #[test]
+    fn test_drop_field_case_insensitive() {
+        let r = hec(&["password", "User.SSN"], &[], &[]);
+        let mut rec = generic(json!({
+            "Password": "a", "PASSWORD": "b", "password": "c", "keep": 1,
+            "user": {"ssn": "1", "Name": "n"}, "USER2": 0, "Admins": [{"x": 1}]
+        }));
+        let c = r.redact_generic(&mut rec);
+        assert_eq!(
+            rec.fields,
+            json!({"keep": 1, "user": {"Name": "n"}, "USER2": 0, "Admins": [{"x": 1}]})
+        );
+        assert_eq!(c.dropped, 4);
+    }
+
+    #[test]
+    fn test_hash_field_case_insensitive_nested() {
+        let r = hec(&[], &["user.email"], &[]);
+        let mut rec = generic(json!({
+            "USER": {"Email": "alice@example.com"}, "user": {"EMAIL": "alice@example.com"}
+        }));
+        let c = r.redact_generic(&mut rec);
+        assert_eq!(c.hashed, 2);
+        let h = "f3d6ddc7dbf9be2eb667360a5a9a43434c54e345f522bbb433afeba094d74aa2";
+        assert_eq!(rec.fields["USER"]["Email"], h);
+        assert_eq!(rec.fields["user"]["EMAIL"], h);
     }
 
     #[test]
