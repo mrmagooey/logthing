@@ -1438,10 +1438,8 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             Err(join_err) => {
                 if join_err.is_panic() {
                     tracing::warn!(source, target, "parquet_s3 flush task panicked: {join_err}");
-                    metrics::counter!(
-                        "parquet_s3_flush_panics", "source" => source, "target" => target
-                    )
-                    .increment(1);
+                    metrics::counter!("parquet_s3_flush_panics", "source" => source, "target" => target)
+                        .increment(1);
                 } else {
                     tracing::warn!(
                         source,
