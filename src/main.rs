@@ -896,7 +896,10 @@ async fn async_main() -> anyhow::Result<()> {
         joined = &mut server_task => {
             server_done = true;
             match joined {
-                Ok(Ok(())) => warn!("HTTP server exited without a shutdown signal"),
+                Ok(Ok(())) => {
+                    error!("HTTP server exited without a shutdown signal");
+                    exit_error = Some(anyhow::anyhow!("HTTP server exited unexpectedly"));
+                }
                 Ok(Err(e)) => {
                     error!("Server error: {}", e);
                     exit_error = Some(e.context("HTTP server failed"));
@@ -940,11 +943,23 @@ async fn async_main() -> anyhow::Result<()> {
         warn!("Failed to send shutdown signal: {e}");
     }
 
-    // 2. Drain the HTTP server: it stops accepting, closes idle keep-alive connections and
-    //    finishes in-flight requests, then drops `AppState` (the WEF/HEC/OTLP senders). This
-    //    must complete before the writers are awaited, or those senders keep the channels
-    //    open and the writers never see end-of-stream.
-    if !server_done {
+    // 2. Drain the HTTP server and the listeners concurrently, so the pre-writer wait is
+    //    max(HTTP 10 s, listener grace + margin) rather than their sum.
+    //
+    //    HTTP: it stops accepting, closes idle keep-alive connections and finishes in-flight
+    //    requests, then drops `AppState` (the WEF/HEC/OTLP senders). This must complete (or be
+    //    aborted) before the writers are awaited, or those senders keep the channels open and
+    //    the writers never see end-of-stream.
+    //
+    //    Listeners: each drains its tracked connection tasks for up to `CONNECTION_DRAIN_GRACE`
+    //    after the shutdown signal, so allow that plus a margin before aborting. One shared
+    //    deadline covers all of them. `drain_listener_handles` skips handles already polled to
+    //    completion by the supervision arm above (awaiting one twice panics) and aborts
+    //    stragglers so their `Arc<dyn Handler>` clones are released.
+    let drain_http = async {
+        if server_done {
+            return;
+        }
         let abort = server_task.abort_handle();
         match tokio::time::timeout(Duration::from_secs(10), &mut server_task).await {
             Ok(Ok(Ok(()))) => {}
@@ -958,31 +973,22 @@ async fn async_main() -> anyhow::Result<()> {
                 abort.abort();
             }
         }
-    }
+    };
+    tokio::join!(
+        drain_http,
+        drain_listener_handles(
+            listener_handles,
+            logthing::net::CONNECTION_DRAIN_GRACE + Duration::from_secs(1),
+        )
+    );
 
-    // 3. Wait for listeners to exit. Each one drains its tracked connection tasks for up to
-    //    `CONNECTION_DRAIN_GRACE` after the shutdown signal, so allow that plus a margin
-    //    before aborting (a shorter wait would cut the drain short). They drain
-    //    concurrently, so the worst case is roughly one grace period, not one per listener.
-    //
-    //    R-2: `drain_listener_handles` (src/shutdown.rs) captures abort_handle() before
-    //    awaiting so a timed-out listener is truly cancelled, releasing its
-    //    `Arc<dyn Handler>` clones (which closes the writer's channel). It skips handles
-    //    already polled to completion by the supervision arm above: awaiting the same
-    //    `JoinHandle` twice panics.
-    drain_listener_handles(
-        listener_handles,
-        logthing::net::CONNECTION_DRAIN_GRACE + Duration::from_secs(1),
-    )
-    .await;
-
-    // 4. Await all writer tasks (plus the WEF/HEC workers) under a shared 10s deadline.
+    // 3. Await all writer tasks (plus the WEF/HEC workers) under a shared 10s deadline.
     //    A writer task returns once its channel closes, i.e. once the last Sender drops;
     //    the server and the listeners are gone by now, so that is prompt and the writers
     //    flush every partition on the way out.
     info!("Waiting for S3 writer tasks to flush (up to 10s)...");
 
-    // 4. Gap-b: Bundle the WEF→S3 Parquet worker handle (if present) into the
+    // Gap-b: Bundle the WEF→S3 Parquet worker handle (if present) into the
     //    same flush batch so the entire set shares a single 10s deadline.
     //    The worker exits when the axum server drops AppState (closing the channel)
     //    and its None arm calls shutdown_flush.

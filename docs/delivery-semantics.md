@@ -50,10 +50,10 @@ is counted in `zeek_partial_lines_dropped_at_shutdown`,
 A dropped shutdown channel is treated the same as a shutdown signal, so a listener can never
 keep running (or spin) after the rest of the process has stopped.
 
-The order is: the HTTP server drains first (up to 10 s), then the listeners (each given 6 s
-in total: the 5 s connection drain plus 1 s margin, after which it is aborted), then the
-writers (shared 10 s deadline), then the spool. If a listener or the HTTP server fails on
-its own, the same sequence runs and the process exits non-zero.
+The order is: the HTTP server and the listeners drain concurrently (HTTP up to 10 s; listeners
+share one 6 s deadline, the 5 s connection drain plus 1 s margin, after which stragglers are
+aborted), then the writers (shared 10 s deadline), then the spool. If the HTTP server or a
+listener stops on its own, the same sequence runs and the process exits non-zero.
 
 UDP listeners (syslog, IPFIX, sFlow) that hit a persistent receive error pause 10 ms, doubling
 to at most 1 s, between attempts instead of spinning, and log the error at most once every
@@ -144,9 +144,12 @@ in-memory requeue described above. `spool_rejected{reason="full"|"io"}` counts t
 **Shutdown.** The final flush of every writer lands in the spool (a local write, fast even
 with S3 down). The uploader is then given whatever remains of the 10 s writer deadline, but
 at least 2 s, to drain; anything left replays on the next start. The real worst-case shutdown
-time is therefore about the HTTP drain (up to 10 s) plus the listener wait (up to 6 s) plus the
-writer deadline (10 s) plus the 2 s drain floor; in practice the first two finish in well under a
-second unless a client holds a request open, so expect about 12 s, with a hard worst case near 28 s.
+time is therefore bounded by 10 s (HTTP and listeners, concurrently) + 10 s (writers) + 2 s
+(spool floor) = about 22 s; normally the first stage takes well under a second. **Give the
+container at least that long to stop**: Docker's default stop timeout is 10 s, which is shorter,
+so set `stop_grace_period: 30s` (Compose) or `--stop-timeout 30`; in Kubernetes keep
+`terminationGracePeriodSeconds` at 30 (the default) or higher. A SIGKILL before the writers
+finish loses whatever they had not yet flushed.
 A drain that is cut short logs `spool not fully drained at shutdown`.
 
 **An upload cancelled after its PUT** (shutdown, timeout) leaves the entry on disk; the next

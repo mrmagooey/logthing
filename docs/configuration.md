@@ -119,11 +119,13 @@ per CPU. It must be a positive integer: `0` or a non-number fails startup with a
 the variable, rather than being ignored.
 
 On `SIGTERM`/Ctrl-C the HTTP server stops accepting and closes idle keep-alive connections
-(up to 10 s for in-flight requests), listeners stop and drain their open connections (up to
-5 s each), and only then are the buffered writers flushed. If the HTTP server or any
+(up to 10 s for in-flight requests) while listeners stop and drain their open connections (one
+shared 6 s deadline), and only then are the buffered writers flushed. If the HTTP server or any
 wire-protocol listener (syslog, IPFIX, Zeek, Suricata, sFlow) stops on its own, for example
 because its port could not be bound, the same shutdown sequence runs and the process then exits
-with a non-zero status so a supervisor restarts it.
+with a non-zero status so a supervisor restarts it. Allow at least 30 s for a stop (Docker `--stop-timeout`/Compose
+`stop_grace_period`, Kubernetes `terminationGracePeriodSeconds`); Docker's 10 s default is shorter
+than the worst-case drain. See [delivery-semantics.md](delivery-semantics.md).
 
 ## Shared S3 connection keys
 
