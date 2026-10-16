@@ -829,8 +829,8 @@ impl SyslogListener {
     /// octet-counted frame (see [`read_tcp_frame`]).
     ///
     /// Each frame read buffers at most `SYSLOG_MAX_LINE_BYTES + 1` bytes (a `take`
-    /// adapter for lines, the checked count for octet frames), so heap growth per connection is provably bounded by that
-    /// constant regardless of client behaviour.  If the cap is hit without a
+    /// adapter for lines, the checked count for octet frames), so heap growth per
+    /// connection is provably bounded by that constant regardless of client behaviour.  If the cap is hit without a
     /// terminating `\n` the connection is closed immediately; resyncing would
     /// itself require unbounded buffering.
     async fn handle_tcp_connection(
@@ -1074,11 +1074,15 @@ async fn read_tcp_frame(
             Ok(TcpFrame::Octets)
         }
         _ => {
-            let remaining = (SYSLOG_MAX_LINE_BYTES + 1).saturating_sub(buf.len()) as u64;
-            (&mut *reader)
-                .take(remaining)
-                .read_until(b'\n', buf)
-                .await?;
+            // The byte that decided the framing may itself be the line's `\n`: the line is
+            // then complete, and reading on would merge it with the next one.
+            if buf.last() != Some(&b'\n') {
+                let remaining = (SYSLOG_MAX_LINE_BYTES + 1).saturating_sub(buf.len()) as u64;
+                (&mut *reader)
+                    .take(remaining)
+                    .read_until(b'\n', buf)
+                    .await?;
+            }
             // Hitting the cap without a terminating newline means the line is too long;
             // resyncing would itself need unbounded buffering.
             if buf.len() > SYSLOG_MAX_LINE_BYTES && buf.last() != Some(&b'\n') {
@@ -2696,8 +2700,9 @@ mod tests {
                 .unwrap();
         }
     }
-    /// Send `payload`, close the write side, and return what the connection task dispatched
-    /// plus the connection task's own end (it must end on EOF).
+
+    /// Send `payload`, close the write side, wait for the connection task to end (it must,
+    /// on EOF), and return what it dispatched.
     async fn run_frames(payload: &[u8]) -> Vec<SyslogMessage> {
         let (mut client, task, _tx, handler) = shutdown_conn_setup().await;
         client.write_all(payload).await.unwrap();
@@ -2768,12 +2773,33 @@ mod tests {
         ] {
             let payload = format!("{lead}\n<134>Jan 15 10:30:45 host app: after\n");
             let msgs = run_frames(payload.as_bytes()).await;
-            let last = msgs
-                .last()
-                .expect("the line after must still be dispatched");
-            assert_eq!(
-                last.message, "after",
-                "lead {lead:?} swallowed the next line"
+            // The lead line may or may not parse as syslog; it must never absorb the next.
+            let texts: Vec<_> = msgs.iter().map(|m| m.message.as_str()).collect();
+            assert!(
+                texts == ["after"] || (texts.len() == 2 && texts[1] == "after"),
+                "lead {lead:?} produced {texts:?}"
+            );
+        }
+    }
+
+    /// A newline that is itself the byte deciding "not octet-counted" ends its line; the
+    /// next line must not be merged into it.
+    #[tokio::test]
+    async fn test_newline_deciding_byte_does_not_merge_lines() {
+        for lead in ["12", "5 "] {
+            let payload = format!("{lead}\n<134>Jan 15 10:30:45 host app: after\n");
+            let (mut client, task, _tx, handler) = shutdown_conn_setup().await;
+            client.write_all(payload.as_bytes()).await.unwrap();
+            client.shutdown().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            let msgs = handler.take_messages();
+            assert!(
+                msgs.last().is_some_and(|m| m.message == "after"),
+                "lead {lead:?}: next line merged: {:?}",
+                msgs.iter().map(|m| &m.message).collect::<Vec<_>>()
             );
         }
     }

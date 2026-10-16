@@ -62,21 +62,36 @@ async fn test_octet_counted_tcp_frames_written_to_parquet_by_real_binary() {
     stream.flush().await.unwrap();
 
     let dir = p.dir().join("syslog");
-    let batches = common::wait_for_rows(&dir, 3, Duration::from_secs(20)).await;
-    let mut rows = Vec::new();
-    for b in &batches {
-        let host = common::str_col(b, "hostname");
-        let msg = common::str_col(b, "message");
-        for i in 0..b.num_rows() {
-            rows.push((host.value(i).to_string(), msg.value(i).to_string()));
-        }
-    }
-    rows.sort();
     let want = [
         ("host-a", "alpha\nbeta"),
         ("host-b", "gamma"),
         ("host-c", "delta"),
     ];
+    // More than 3 rows can land (the dated line may parse), so poll until every wanted
+    // message is present rather than for a row count.
+    let mut rows: Vec<(String, String)> = Vec::new();
+    let end = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        rows.clear();
+        for b in &common::read_all(&dir) {
+            let host = common::str_col(b, "hostname");
+            let msg = common::str_col(b, "message");
+            for i in 0..b.num_rows() {
+                rows.push((host.value(i).to_string(), msg.value(i).to_string()));
+            }
+        }
+        if want
+            .iter()
+            .all(|(_, m)| rows.iter().any(|(_, rm)| rm.ends_with(m)))
+        {
+            break;
+        }
+        if std::time::Instant::now() > end {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    rows.sort();
     for (h, m) in want {
         // Multi-line RFC 3164 bodies keep the header text in `message` and leave `hostname`
         // empty (parser behaviour, same over UDP), so match on the message tail only.
