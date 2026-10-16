@@ -11,11 +11,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 
 use crate::forwarding::drop_log::{DropKind, DropLogThrottles, DropSite};
 
@@ -50,14 +51,12 @@ pub trait UploadSink: Send + Sync {
     /// Upload `body` at `key` (a relative path, e.g.
     /// `zeek/conn/year=2026/month=07/day=04/<uuid>.parquet`).
     ///
-    /// Implementations MUST NOT panic from `upload` -- always return `Err`
-    /// instead. A panicking upload surfaces as a `JoinError` from the
-    /// `flush_tasks` `JoinSet` (in `ParquetWriterHandle::start_with_stats`'s
-    /// `select!` loop and in `drain_pending_flushes`), which is logged but
-    /// loses the partition key -- that partition's `in_flight` flag and
-    /// `parquet_s3_flushes_in_flight` gauge entry would never be cleared,
-    /// permanently stranding it (every future threshold crossing would fall
-    /// through to `drop_oldest_to_cap` instead of ever flushing again).
+    /// Implementations should not panic from `upload` -- return `Err`
+    /// instead. A panicking upload is survivable: the writer recovers the
+    /// partition's batches from its in-flight registry, clears `in_flight`,
+    /// counts `parquet_s3_flush_panics` and retries with backoff. It is still
+    /// a bug in the sink. If the panic comes after the PUT succeeded, the rows are
+    /// uploaded again and the object is duplicated (at-least-once).
     async fn upload(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()>;
 
     /// Stable label for the `target` metric dimension, e.g. `"s3"` | `"local"`.
@@ -675,6 +674,13 @@ pub(crate) struct PartitionBuffer<R> {
     /// buffered data. At most one flush is ever in-flight per partition —
     /// see `try_flush_partition_async`.
     pub(crate) in_flight: bool,
+    /// After a failed flush, the earliest instant the next attempt may start.
+    /// While `now < next_retry_at` no flush trigger (size or age) fires; once
+    /// it passes the buffer is due regardless of thresholds. `None` when the
+    /// last flush succeeded or an attempt is in flight.
+    pub(crate) next_retry_at: Option<Instant>,
+    /// Consecutive failed flushes of this buffer; drives the backoff.
+    pub(crate) retry_attempt: u32,
     /// Live, in-progress amortized builder for this partition. `None` for
     /// every adapter that doesn't opt in (`ParquetSink::new_batch` returns
     /// `None`), and `None` even for an opted-in adapter until its first
@@ -692,9 +698,38 @@ impl<R> PartitionBuffer<R> {
             last_flush: Instant::now(),
             last_drop_warn: None,
             in_flight: false,
+            next_retry_at: None,
+            retry_attempt: 0,
             live_builder: None,
         }
     }
+
+    /// True while a failed flush's backoff window is still open.
+    fn backing_off(&self) -> bool {
+        self.next_retry_at.is_some_and(|t| Instant::now() < t)
+    }
+
+    /// Whether this buffer is due for a flush attempt. After a failed flush
+    /// the backoff alone decides (size triggers included, so a dead backend is
+    /// not hammered; the hard cap still bounds memory): not due until
+    /// `next_retry_at`, then always due. Otherwise any of the row, byte or
+    /// age triggers.
+    fn should_flush(&self, policy: &FlushPolicy) -> bool {
+        if let Some(t) = self.next_retry_at {
+            return Instant::now() >= t;
+        }
+        self.row_count >= policy.max_rows
+            || self.byte_count >= policy.max_bytes
+            || self.last_flush.elapsed() >= policy.interval.get()
+    }
+}
+
+/// Delay before retrying a buffer whose `attempt`-th consecutive flush just
+/// failed (0-based): `min(1s * 2^attempt, 60s, flush_interval)`.
+fn retry_backoff(attempt: u32, flush_interval: Duration) -> Duration {
+    Duration::from_secs(1u64 << attempt.min(6))
+        .min(Duration::from_secs(60))
+        .min(flush_interval)
 }
 
 // ---------------------------------------------------------------------------
@@ -766,8 +801,7 @@ pub(crate) fn build_key(prefix: &str, partition: Option<&str>, day: chrono::Naiv
 /// to run concurrently. Bounds worst-case memory/network footprint when
 /// many partitions cross their flush threshold around the same time (e.g.
 /// Zeek's up to 256 partitions all created near service start) and, after
-/// a failed flush's `last_flush` is deliberately re-staled to retry almost
-/// immediately (see `apply_flush_outcome`), prevents a systemic backend
+/// a failed flush backs off (see `retry_backoff`), prevents a systemic backend
 /// outage from causing many partitions to retry in lockstep.
 const MAX_CONCURRENT_FLUSHES_PER_WRITER: usize = 4;
 
@@ -822,6 +856,16 @@ enum FlushOutcome {
     },
 }
 
+/// What a spawned flush task took from its buffer, kept by the writer so a
+/// task that panics (and so returns no `FlushOutcome`) can be restored. The
+/// batches are `Arc`-backed, so this is a cheap clone, not a copy of the data.
+struct InFlightFlush {
+    key: BufKey,
+    batches: VecDeque<(arrow_array::RecordBatch, usize)>,
+    row_count: usize,
+    byte_count: usize,
+}
+
 pub struct PartitionedParquetWriter<S: ParquetSink> {
     sink: S,
     s3: Arc<dyn UploadSink>,
@@ -850,6 +894,9 @@ pub struct PartitionedParquetWriter<S: ParquetSink> {
     /// `ParquetWriterHandle::start_with_stats` (steady state) or by
     /// `drain_pending_flushes` (shutdown / tests).
     flush_tasks: JoinSet<FlushOutcome>,
+    /// One entry per task in `flush_tasks`, keyed by its task id; removed when
+    /// the task is reaped. See `InFlightFlush`.
+    in_flight_flushes: HashMap<tokio::task::Id, InFlightFlush>,
     /// Bounds concurrent flushes across all of this writer's partitions.
     /// Acquired INSIDE the spawned task (`encode_and_upload`), never
     /// before spawning — see `MAX_CONCURRENT_FLUSHES_PER_WRITER`.
@@ -918,6 +965,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             source_stats,
             descriptor_sink,
             flush_tasks: JoinSet::new(),
+            in_flight_flushes: HashMap::new(),
             flush_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_FLUSHES_PER_WRITER,
             )),
@@ -1145,12 +1193,13 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         }
 
         // Check flush policy.
-        let should_flush = buf.row_count >= self.policy.max_rows
-            || buf.byte_count >= self.policy.max_bytes
-            || buf.last_flush.elapsed() >= self.policy.interval.get();
-
-        if should_flush {
+        if buf.should_flush(&self.policy) {
             self.try_flush_partition_async(&effective_key);
+        } else if buf.backing_off() {
+            // No flush may start during a retry backoff, so the hard cap that
+            // `try_flush_partition_async` enforces for in-flight partitions
+            // must be enforced here too.
+            self.enforce_hard_cap(&effective_key);
         }
         Ok(())
     }
@@ -1193,6 +1242,10 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 self.config.prefix.clone(),
                 self.sink.source(),
                 self.flush_semaphore.clone(),
+                // Shutdown flushes partitions one after another under a deadline: a
+                // descriptor outage must cost one fast attempt per partition, not
+                // seconds of retries, or later partitions never get their upload.
+                false,
             )
             .await;
 
@@ -1266,10 +1319,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                     } else {
                         Action::Reap
                     }
-                } else if buf.row_count >= self.policy.max_rows
-                    || buf.byte_count >= self.policy.max_bytes
-                    || buf.last_flush.elapsed() >= self.policy.interval.get()
-                {
+                } else if buf.should_flush(&self.policy) {
                     Action::Flush
                 } else {
                     Action::None
@@ -1296,27 +1346,29 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
     /// instead, exactly as today's flush-failure path already does, just
     /// from a second call site.
     fn try_flush_partition_async(&mut self, key: &BufKey) {
-        if let Some(buf) = self.buffers.get_mut(key) {
-            Self::materialize_live_builder(buf);
-        }
-
         let in_flight = self.buffers.get(key).map(|b| b.in_flight).unwrap_or(false);
         let source = self.sink.source();
         let target = self.s3.target_label();
 
         if in_flight {
-            let cap = self.config.max_buffer_rows.saturating_mul(4);
-            if cap > 0
-                && let Some(b) = self.buffers.get_mut(key)
+            // Every push lands here while an upload runs: materialize the
+            // live builder only when it is large enough to matter, otherwise
+            // each push would turn it into a one-row batch.
+            if let Some(b) = self.buffers.get_mut(key)
+                && b.live_builder
+                    .as_ref()
+                    .is_some_and(|l| l.len() >= BUILDER_BATCH_ROWS)
             {
-                Self::drop_oldest_to_cap(b, cap, source, target);
+                Self::materialize_live_builder(b);
             }
+            self.enforce_hard_cap(key);
             return;
         }
 
         let Some(buf) = self.buffers.get_mut(key) else {
             return;
         };
+        Self::materialize_live_builder(buf);
         if buf.buffer.is_empty() {
             return;
         }
@@ -1328,12 +1380,19 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
         buf.row_count = 0;
         buf.byte_count = 0;
         buf.last_flush = Instant::now();
+        buf.next_retry_at = None;
         buf.in_flight = true;
 
         metrics::gauge!("parquet_s3_flushes_in_flight", "source" => source, "target" => target)
             .increment(1.0);
 
-        self.flush_tasks.spawn(encode_and_upload(
+        let restore = InFlightFlush {
+            key: key.clone(),
+            batches: taken_batches.clone(),
+            row_count,
+            byte_count,
+        };
+        let task = self.flush_tasks.spawn(encode_and_upload(
             key.clone(),
             taken_batches,
             row_count,
@@ -1344,7 +1403,69 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             self.config.prefix.clone(),
             source,
             self.flush_semaphore.clone(),
+            true,
         ));
+        self.in_flight_flushes.insert(task.id(), restore);
+    }
+
+    /// Drop the oldest rows of `key`'s buffer if it exceeds the hard cap
+    /// (4x `max_buffer_rows`).
+    fn enforce_hard_cap(&mut self, key: &BufKey) {
+        let cap = self.config.max_buffer_rows.saturating_mul(4);
+        let (source, target) = (self.sink.source(), self.s3.target_label());
+        if cap > 0
+            && let Some(b) = self.buffers.get_mut(key)
+            && b.row_count > cap
+        {
+            Self::drop_oldest_to_cap(b, cap, source, target);
+        }
+    }
+
+    /// Handle one finished (or panicked/cancelled) flush task. A task that
+    /// returns no outcome is restored from `in_flight_flushes` and handled as
+    /// a failed flush, so its rows are retried and its partition is not left
+    /// permanently `in_flight`.
+    fn reap_flush(
+        &mut self,
+        result: Result<(tokio::task::Id, FlushOutcome), tokio::task::JoinError>,
+    ) {
+        let (source, target) = (self.sink.source(), self.s3.target_label());
+        match result {
+            Ok((id, outcome)) => {
+                self.in_flight_flushes.remove(&id);
+                self.apply_flush_outcome(outcome);
+            }
+            Err(join_err) => {
+                if join_err.is_panic() {
+                    tracing::warn!(source, target, "parquet_s3 flush task panicked: {join_err}");
+                    metrics::counter!(
+                        "parquet_s3_flush_panics", "source" => source, "target" => target
+                    )
+                    .increment(1);
+                } else {
+                    tracing::warn!(
+                        source,
+                        target,
+                        "parquet_s3 flush task cancelled: {join_err}"
+                    );
+                }
+                match self.in_flight_flushes.remove(&join_err.id()) {
+                    Some(f) => self.apply_flush_outcome(FlushOutcome::Failure {
+                        key: f.key,
+                        batches: f.batches,
+                        row_count: f.row_count,
+                        byte_count: f.byte_count,
+                        error: format!("flush task failed: {join_err}"),
+                    }),
+                    None => {
+                        metrics::gauge!(
+                            "parquet_s3_flushes_in_flight", "source" => source, "target" => target
+                        )
+                        .decrement(1.0);
+                    }
+                }
+            }
+        }
     }
 
     /// Apply one completed background flush's outcome. On success, clears
@@ -1352,12 +1473,9 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
     /// merges the returned batches back onto the FRONT of the (possibly
     /// already-refilling) live buffer -- they're older, so
     /// `drop_oldest_to_cap` (which pops from the front) drops the stalest
-    /// data first if the merged total exceeds the cap -- then re-stales
-    /// `last_flush` so the age-based flush trigger fires on the very next
-    /// check, reproducing today's behavior (a failed flush's `last_flush`
-    /// is simply never touched, so it's already stale and retries almost
-    /// immediately) that the fresh-buffer-gets-"now"-at-swap-time design
-    /// would otherwise silently break.
+    /// data first if the merged total exceeds the cap -- then schedules the
+    /// retry with exponential backoff (`retry_backoff`), so a dead backend is
+    /// not hammered on every tick or arriving record.
     fn apply_flush_outcome(&mut self, outcome: FlushOutcome) {
         let source = self.sink.source();
         let target = self.s3.target_label();
@@ -1382,6 +1500,10 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                                 || buf.byte_count >= self.policy.max_bytes)
                     })
                     .unwrap_or(false);
+                if let Some(buf) = self.buffers.get_mut(&key) {
+                    buf.retry_attempt = 0;
+                    buf.next_retry_at = None;
+                }
                 if over_threshold {
                     self.try_flush_partition_async(&key);
                     return;
@@ -1429,10 +1551,10 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 buf.row_count += row_count;
                 buf.byte_count += byte_count;
 
-                let interval = self.policy.interval.get();
-                buf.last_flush = Instant::now()
-                    .checked_sub(interval + std::time::Duration::from_secs(1))
-                    .unwrap_or_else(Instant::now);
+                buf.next_retry_at = Some(
+                    Instant::now() + retry_backoff(buf.retry_attempt, self.policy.interval.get()),
+                );
+                buf.retry_attempt = buf.retry_attempt.saturating_add(1);
 
                 let cap = self.config.max_buffer_rows.saturating_mul(4);
                 if cap > 0 {
@@ -1547,17 +1669,8 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
     /// reused by tests for deterministic waiting instead of sleep-based
     /// polling.
     pub(crate) async fn drain_pending_flushes(&mut self) {
-        while let Some(result) = self.flush_tasks.join_next().await {
-            match result {
-                Ok(outcome) => self.apply_flush_outcome(outcome),
-                Err(join_err) => {
-                    tracing::warn!(
-                        source = self.sink.source(),
-                        target = self.s3.target_label(),
-                        "parquet_s3 flush task panicked: {join_err}"
-                    );
-                }
-            }
+        while let Some(result) = self.flush_tasks.join_next_with_id().await {
+            self.reap_flush(result);
         }
     }
 
@@ -1653,8 +1766,9 @@ async fn encode_and_upload(
     prefix: String,
     source: &'static str,
     semaphore: Arc<tokio::sync::Semaphore>,
+    descriptor_retries: bool,
 ) -> FlushOutcome {
-    let _permit = semaphore
+    let permit = semaphore
         .acquire_owned()
         .await
         .expect("flush semaphore is never closed");
@@ -1752,7 +1866,13 @@ async fn encode_and_upload(
                 metrics::counter!("parquet_s3_uploads", "source" => source, "target" => target)
                     .increment(1);
                 if let (Some(sink), Some(payload)) = (descriptor_sink, descriptor_payload) {
-                    upload_descriptor_bytes(sink, payload, source).await;
+                    // Descriptor retries can sleep for seconds and this partition stays
+                    // `in_flight` meanwhile (its pushes accumulate under the hard cap).
+                    // The permit bounds concurrent parquet encode+upload, which is
+                    // finished, so release it: otherwise a descriptor outage would
+                    // starve every other partition's flush.
+                    drop(permit);
+                    upload_descriptor_bytes(sink, payload, source, descriptor_retries).await;
                 }
             }
             FlushOutcome::Success { key }
@@ -1857,17 +1977,42 @@ async fn upload_descriptor_bytes(
     descriptor_sink: Arc<dyn UploadSink>,
     payload: DescriptorPayload,
     source: &'static str,
+    retries: bool,
 ) {
-    match descriptor_sink.upload(&payload.key, payload.body).await {
-        Ok(()) => {
-            metrics::counter!("iceberg_descriptor_uploads", "source" => source).increment(1);
-        }
-        Err(e) => {
-            tracing::warn!(source, "iceberg descriptor upload failed: {e}");
-            metrics::counter!("iceberg_descriptor_upload_errors", "source" => source).increment(1);
+    // The Parquet is already delivered, so a descriptor failure is retried a few
+    // times (the committer never sees the file without it) before it is counted.
+    let mut delays = DESCRIPTOR_RETRY_DELAYS
+        .iter()
+        .take(if retries { usize::MAX } else { 0 });
+    loop {
+        match descriptor_sink
+            .upload(&payload.key, payload.body.clone())
+            .await
+        {
+            Ok(()) => {
+                metrics::counter!("iceberg_descriptor_uploads", "source" => source).increment(1);
+                return;
+            }
+            Err(e) => {
+                let Some(delay) = delays.next() else {
+                    tracing::warn!(source, "iceberg descriptor upload failed: {e}");
+                    metrics::counter!("iceberg_descriptor_upload_errors", "source" => source)
+                        .increment(1);
+                    return;
+                };
+                tracing::debug!(source, "iceberg descriptor upload failed, retrying: {e}");
+                tokio::time::sleep(*delay).await;
+            }
         }
     }
 }
+
+/// Waits between the up-to-three retries of a failed descriptor upload.
+const DESCRIPTOR_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(200),
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+];
 
 // ---------------------------------------------------------------------------
 // ParquetWriterHandle<S>
@@ -1959,8 +2104,8 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
             let mut ticker = tokio::time::interval(flush_check);
             // Separate, deliberately short ticker for the channel-depth gauge.
             // It used to ride on `ticker`, whose period is
-            // `flush_check_interval(flush_interval)` -- 900s at every source's
-            // default `flush_interval_secs`, which makes a queue-depth alert
+            // `flush_check_interval(flush_interval)` -- up to 30s, a quarter of the
+            // flush interval, which makes a queue-depth alert
             // useless (operators are expected to alert on this gauge). One
             // timer wakeup per second per writer is cheap; sampling it on the
             // `recv` arm instead would be per-record work in the hot loop and
@@ -2040,13 +2185,8 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                     // guard is load-bearing: `JoinSet::join_next()` on an
                     // empty set resolves immediately to `None`, so an
                     // unguarded branch would busy-spin this loop.
-                    Some(result) = writer.flush_tasks.join_next(), if !writer.flush_tasks.is_empty() => {
-                        match result {
-                            Ok(outcome) => writer.apply_flush_outcome(outcome),
-                            Err(join_err) => {
-                                tracing::warn!(source, target, "parquet_s3 flush task panicked: {join_err}");
-                            }
-                        }
+                    Some(result) = writer.flush_tasks.join_next_with_id(), if !writer.flush_tasks.is_empty() => {
+                        writer.reap_flush(result);
                     }
                 }
             }
@@ -4318,8 +4458,8 @@ max_partitions = 128
 
     /// The channel-depth gauges are the recommended queue-depth alert signal,
     /// so their cadence must stay short and, crucially, independent of
-    /// `flush_check_interval` — which is 900s at every source's default
-    /// `flush_interval_secs`.
+    /// `flush_check_interval` — which is up to 30s (a quarter of the flush
+    /// interval) at every source's default `flush_interval_secs`.
     #[test]
     fn channel_gauge_interval_is_short_and_independent_of_the_flush_interval() {
         assert!(CHANNEL_GAUGE_INTERVAL <= Duration::from_secs(5));
@@ -5494,13 +5634,11 @@ secret_key  = "SECRET"
     }
 
     /// A failed flush's data must be merged back onto the live buffer
-    /// (prepended -- older data first) AND `last_flush` must be re-staled
-    /// so the age trigger fires on the very next check, matching today's
-    /// behavior where a failed flush simply never touches `last_flush`
-    /// (spec decision #12).
+    /// (prepended -- older data first) AND a retry must be scheduled after the
+    /// first backoff step (1s), not on the very next check.
     #[tokio::test]
     #[allow(clippy::mutable_key_type)]
-    async fn failed_flush_merges_batches_back_and_restales_last_flush_for_prompt_retry() {
+    async fn failed_flush_merges_batches_back_and_schedules_a_backed_off_retry() {
         use metrics::set_default_local_recorder;
         use metrics_util::CompositeKey;
         use metrics_util::MetricKind;
@@ -5560,35 +5698,13 @@ secret_key  = "SECRET"
             buf.row_count, 2,
             "both records must still be present after the failed flush merges back"
         );
+        let wait = buf
+            .next_retry_at
+            .expect("a failed flush must schedule a retry")
+            .saturating_duration_since(Instant::now());
         assert!(
-            buf.last_flush.elapsed() >= std::time::Duration::from_secs(900),
-            "last_flush must be re-staled past the interval so the next check retries almost immediately, not after a full 900s wait"
-        );
-    }
-
-    /// `apply_flush_outcome`'s last_flush re-staling must not panic when
-    /// `Instant::now()` hasn't been running long enough to subtract a large
-    /// configured interval from (e.g. shortly after process start with a
-    /// long flush_interval_secs) -- it must fall back to "not re-staled"
-    /// instead (spec decision #12's checked_sub fix).
-    #[tokio::test]
-    async fn restale_last_flush_does_not_panic_when_interval_exceeds_process_uptime() {
-        let s3 = unreachable_s3().await;
-        let max_rows = 1usize;
-        let (cfg, mut policy) = test_config(max_rows);
-        // A deliberately enormous interval -- far longer than this test (or
-        // realistically, this process) has been running.
-        policy.interval = LiveInterval::new(std::time::Duration::from_secs(365 * 24 * 3600));
-        let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
-
-        // Triggers and fails a flush; must not panic during outcome handling.
-        w.push("r0".to_string()).await.unwrap();
-        w.drain_pending_flushes().await;
-
-        assert_eq!(
-            w.buffer_by_partition("").unwrap().row_count,
-            1,
-            "the record must still be present after the (non-panicking) failed flush"
+            wait > Duration::from_millis(500) && wait <= Duration::from_secs(1),
+            "first retry must be ~1s out, got {wait:?}"
         );
     }
 
@@ -5664,6 +5780,398 @@ secret_key  = "SECRET"
             clone.drop_log_due(DropSite::Wef, DropKind::Full),
             None,
             "a clone must share the throttle, not reset it"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Flush resilience: panic recovery, retry backoff, in-flight cost,
+    // descriptor retries
+    // -----------------------------------------------------------------------
+
+    /// What a `ScriptedSink` upload does, in order; `Ok` once the script runs out.
+    #[derive(Clone, Copy)]
+    enum Step {
+        Panic,
+        Fail,
+    }
+
+    /// Records every attempt (including failed ones) and the bodies it accepted.
+    struct ScriptedSink {
+        script: std::sync::Mutex<VecDeque<Step>>,
+        always_fail: bool,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+        accepted: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl ScriptedSink {
+        #[allow(clippy::type_complexity)]
+        fn build(
+            script: &[Step],
+            always_fail: bool,
+        ) -> (
+            Arc<dyn UploadSink>,
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        ) {
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let accepted = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink: Arc<dyn UploadSink> = Arc::new(Self {
+                script: std::sync::Mutex::new(script.iter().copied().collect()),
+                always_fail,
+                attempts: attempts.clone(),
+                accepted: accepted.clone(),
+            });
+            (sink, attempts, accepted)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UploadSink for ScriptedSink {
+        async fn upload(&self, _key: &str, body: Vec<u8>) -> anyhow::Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let step = self.script.lock().unwrap().pop_front();
+            match step {
+                Some(Step::Panic) => panic!("scripted upload panic"),
+                Some(Step::Fail) => anyhow::bail!("scripted upload failure"),
+                None if self.always_fail => anyhow::bail!("scripted upload failure"),
+                None => {
+                    self.accepted.lock().unwrap().push(body);
+                    Ok(())
+                }
+            }
+        }
+        fn target_label(&self) -> &'static str {
+            "scripted"
+        }
+        fn location_hint(&self) -> String {
+            "scripted://test".to_string()
+        }
+    }
+
+    fn parquet_rows(body: &[u8]) -> i64 {
+        let bytes = bytes::Bytes::copy_from_slice(body);
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .unwrap()
+            .metadata()
+            .file_metadata()
+            .num_rows()
+    }
+
+    /// Sum of every sample of the named counter/gauge in `snapshotter`.
+    fn metric_total(snapshotter: &metrics_util::debugging::Snapshotter, name: &str) -> f64 {
+        use metrics_util::debugging::DebugValue;
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == name)
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => c as f64,
+                DebugValue::Gauge(g) => g.into_inner(),
+                DebugValue::Histogram(_) => 0.0,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn test_retry_backoff_doubles_and_is_capped_by_minute_and_interval() {
+        let secs = Duration::from_secs;
+        assert_eq!(retry_backoff(0, secs(900)), secs(1));
+        assert_eq!(retry_backoff(1, secs(900)), secs(2));
+        assert_eq!(retry_backoff(3, secs(900)), secs(8));
+        assert_eq!(retry_backoff(10, secs(900)), secs(60));
+        assert_eq!(retry_backoff(u32::MAX, secs(900)), secs(60));
+        assert_eq!(retry_backoff(5, secs(2)), secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_flush_task_panic_restores_batches_and_clears_in_flight() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (sink, attempts, accepted) = ScriptedSink::build(&[Step::Panic], false);
+        let (cfg, policy) = test_config(1); // flush on first row
+        let mut w = PartitionedParquetWriter::new(MockSink, sink, cfg, policy);
+
+        w.push("a".to_string()).await.unwrap();
+        w.drain_pending_flushes().await;
+
+        let buf = w.buffer_by_partition("").unwrap();
+        assert!(
+            !buf.in_flight,
+            "a panicked flush must not leave in_flight set"
+        );
+        assert_eq!(
+            (buf.row_count, buf.buffer.len()),
+            (1, 1),
+            "batches must be restored"
+        );
+        assert_eq!(
+            metric_total(&snapshotter, "parquet_s3_flushes_in_flight"),
+            0.0
+        );
+        assert_eq!(metric_total(&snapshotter, "parquet_s3_flush_panics"), 1.0);
+
+        // The retry honours the backoff, then delivers the row exactly once.
+        w.flush_all_if_needed().await.unwrap();
+        w.drain_pending_flushes().await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "retry must wait out the backoff"
+        );
+        tokio::time::advance(Duration::from_millis(1100)).await;
+        w.flush_all_if_needed().await.unwrap();
+        w.drain_pending_flushes().await;
+
+        let accepted = accepted.lock().unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(parquet_rows(&accepted[0]), 1);
+        assert_eq!(w.total_buffered_rows(), 0);
+        assert_eq!(
+            metric_total(&snapshotter, "parquet_s3_flushes_in_flight"),
+            0.0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_failed_flush_backs_off() {
+        let (sink, attempts, _) = ScriptedSink::build(&[], true);
+        let (cfg, policy) = test_config(1); // every record is over the row threshold
+        let (handle, _join) = ParquetWriterHandle::start(MockSink, sink, cfg, policy);
+
+        for i in 0..100 {
+            handle.try_send(format!("r{i}")).unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let n = attempts.load(Ordering::SeqCst);
+        assert!(
+            (1..=2).contains(&n),
+            "expected 1-2 upload attempts in 1.5s, got {n}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_failed_flush_backoff_grows_and_success_resets_it() {
+        let (sink, _, _) = ScriptedSink::build(&[Step::Fail, Step::Fail], false);
+        let (cfg, mut policy) = test_config(1_000_000);
+        policy.max_rows = 2;
+        let mut w = PartitionedParquetWriter::new(MockSink, sink, cfg, policy);
+
+        w.push("r0".to_string()).await.unwrap();
+        w.push("r1".to_string()).await.unwrap();
+        w.drain_pending_flushes().await;
+        assert_eq!(w.buffer_by_partition("").unwrap().retry_attempt, 1);
+
+        tokio::time::advance(Duration::from_millis(1100)).await;
+        w.flush_all_if_needed().await.unwrap();
+        w.drain_pending_flushes().await;
+        assert_eq!(w.buffer_by_partition("").unwrap().retry_attempt, 2);
+
+        // Third attempt succeeds while a new row has arrived; the backoff resets.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        w.flush_all_if_needed().await.unwrap();
+        w.push("r2".to_string()).await.unwrap();
+        w.drain_pending_flushes().await;
+        let buf = w.buffer_by_partition("").unwrap();
+        assert_eq!(buf.row_count, 1);
+        assert_eq!(buf.retry_attempt, 0, "success must reset the retry counter");
+        assert!(buf.next_retry_at.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_backoff_window_still_enforces_hard_cap() {
+        let (sink, _, _) = ScriptedSink::build(&[], true);
+        let (cfg, policy) = test_config(1); // hard cap = 4 rows
+        let mut w = PartitionedParquetWriter::new(MockSink, sink, cfg, policy);
+
+        w.push("r0".to_string()).await.unwrap();
+        w.drain_pending_flushes().await; // fails; backoff window opens
+        for i in 1..30 {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+
+        let buf = w.buffer_by_partition("").unwrap();
+        assert!(
+            buf.row_count <= 4,
+            "rows must stay under the hard cap, got {}",
+            buf.row_count
+        );
+        assert!(
+            !buf.in_flight,
+            "no flush may start inside the backoff window"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_push_does_not_materialize_small_builder() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let sink: Arc<dyn UploadSink> = Arc::new(BlockingSink { gate });
+        let (cfg, mut policy) = test_config(100); // hard cap 400
+        policy.max_rows = 1;
+        let mut w = PartitionedParquetWriter::new(AmortizingMockSink, sink, cfg, policy);
+
+        w.push("r0".to_string()).await.unwrap(); // starts the (blocked) flush
+        assert!(w.buffer_by_partition("").unwrap().in_flight);
+        for i in 1..=50 {
+            w.push(format!("r{i}")).await.unwrap();
+        }
+
+        let buf = w.buffer_by_partition("").unwrap();
+        assert_eq!(buf.row_count, 50);
+        assert_eq!(
+            buf.buffer.len(),
+            0,
+            "pushes during a flush must stay in the live builder"
+        );
+    }
+
+    /// Descriptor sink failing its first `fail_first` attempts.
+    struct FlakyDescriptorSink {
+        fail_first: usize,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+        objects: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl UploadSink for FlakyDescriptorSink {
+        async fn upload(&self, key: &str, _body: Vec<u8>) -> anyhow::Result<()> {
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_first {
+                anyhow::bail!("descriptor store unavailable");
+            }
+            self.objects.lock().unwrap().push(key.to_string());
+            Ok(())
+        }
+        fn target_label(&self) -> &'static str {
+            "descriptor"
+        }
+        fn location_hint(&self) -> String {
+            "descriptor://test".to_string()
+        }
+    }
+
+    /// Flush one row to a recording parquet sink with a `FlakyDescriptorSink`;
+    /// returns `(descriptor attempts, descriptor objects, error counter)`.
+    async fn flush_with_flaky_descriptor(fail_first: usize) -> (usize, usize, f64) {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let objects = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let descriptor: Arc<dyn UploadSink> = Arc::new(FlakyDescriptorSink {
+            fail_first,
+            attempts: attempts.clone(),
+            objects: objects.clone(),
+        });
+        let parquet: Arc<dyn UploadSink> = Arc::new(RecordingSink {
+            uploads: Arc::default(),
+        });
+        let (cfg, policy) = test_config(1);
+        let mut w = PartitionedParquetWriter::with_source_stats(
+            MockSink,
+            parquet,
+            cfg,
+            policy,
+            Arc::new(crate::stats::SourceHourlyStats::default()),
+            Some(descriptor),
+        );
+        w.push("a".to_string()).await.unwrap();
+        w.drain_pending_flushes().await;
+        let errors = metric_total(&snapshotter, "iceberg_descriptor_upload_errors");
+        let (n, objs) = (
+            attempts.load(Ordering::SeqCst),
+            objects.lock().unwrap().len(),
+        );
+        (n, objs, errors)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_descriptor_upload_retried_then_succeeds() {
+        let (attempts, objects, errors) = flush_with_flaky_descriptor(2).await;
+        assert_eq!((attempts, objects), (3, 1));
+        assert_eq!(
+            errors, 0.0,
+            "a retried-then-delivered descriptor is not an error"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_descriptor_upload_gives_up_after_three_retries() {
+        let (attempts, objects, errors) = flush_with_flaky_descriptor(usize::MAX).await;
+        assert_eq!((attempts, objects), (4, 0));
+        assert_eq!(errors, 1.0);
+    }
+
+    #[derive(Clone)]
+    struct FivePartitionSink;
+    impl ParquetSink for FivePartitionSink {
+        type Record = (String, String);
+        fn source(&self) -> &'static str {
+            "test"
+        }
+        fn partition(&self, r: &Self::Record) -> Option<String> {
+            Some(r.0.clone())
+        }
+        fn schema(&self, _p: Option<&str>) -> Arc<Schema> {
+            test_schema()
+        }
+        fn to_record_batch(
+            &self,
+            record: &Self::Record,
+            schema: &Arc<Schema>,
+        ) -> anyhow::Result<RecordBatch> {
+            let col = Arc::new(StringArray::from(vec![record.1.as_str()]));
+            Ok(RecordBatch::try_new(schema.clone(), vec![col])?)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_flush_skips_descriptor_retries_so_every_partition_uploads() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let descriptor: Arc<dyn UploadSink> = Arc::new(FlakyDescriptorSink {
+            fail_first: usize::MAX,
+            attempts: attempts.clone(),
+            objects: Arc::default(),
+        });
+        let uploads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let parquet: Arc<dyn UploadSink> = Arc::new(RecordingSink {
+            uploads: uploads.clone(),
+        });
+        let (cfg, policy) = test_config(1_000_000); // nothing flushes before shutdown
+        let mut w = PartitionedParquetWriter::with_source_stats(
+            FivePartitionSink,
+            parquet,
+            cfg,
+            policy,
+            Arc::new(crate::stats::SourceHourlyStats::default()),
+            Some(descriptor),
+        );
+        for i in 0..5 {
+            w.push((format!("p{i}"), "v".to_string())).await.unwrap();
+        }
+
+        let start = Instant::now();
+        w.flush_all().await.unwrap();
+
+        assert_eq!(
+            uploads.lock().unwrap().len(),
+            5,
+            "every partition must be uploaded"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            5,
+            "one descriptor attempt per partition"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "shutdown flush slept in descriptor retries: {:?}",
+            start.elapsed()
         );
     }
 }

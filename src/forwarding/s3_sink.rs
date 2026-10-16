@@ -182,10 +182,15 @@ impl crate::forwarding::buffered_writer::UploadSink for S3Sink {
 }
 
 /// The cadence at which a writer's background task checks whether a time-based
-/// flush is due. Honors the configured flush interval, but never ticks more
-/// often than once per second (avoids a busy loop for very small intervals).
+/// flush or a retry is due: a quarter of the flush interval, clamped to
+/// 1..=30 s. Ticking at the full interval would let a buffer created just
+/// after a tick wait nearly two intervals; the floor avoids a busy loop for
+/// tiny intervals and the ceiling keeps retries prompt for huge ones.
 pub(crate) fn flush_check_interval(flush_interval: std::time::Duration) -> std::time::Duration {
-    flush_interval.max(std::time::Duration::from_secs(1))
+    (flush_interval / 4).clamp(
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(30),
+    )
 }
 
 #[cfg(test)]
@@ -193,19 +198,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn flush_check_interval_respects_configured_interval() {
-        assert_eq!(
-            flush_check_interval(std::time::Duration::from_secs(5)),
-            std::time::Duration::from_secs(5)
-        );
-    }
-
-    #[test]
-    fn flush_check_interval_respects_large_interval() {
-        assert_eq!(
-            flush_check_interval(std::time::Duration::from_secs(900)),
-            std::time::Duration::from_secs(900)
-        );
+    fn test_flush_tick_period_is_quarter_interval_clamped() {
+        let secs = std::time::Duration::from_secs;
+        assert_eq!(flush_check_interval(secs(900)), secs(30));
+        assert_eq!(flush_check_interval(secs(2)), secs(1));
+        assert_eq!(flush_check_interval(secs(60)), secs(15));
+        assert_eq!(flush_check_interval(secs(120)), secs(30));
     }
 
     #[test]

@@ -283,7 +283,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
 
 /// Line 1067: a flush task panics while the writer's background task is
 /// still in its steady-state select! loop (not shutdown) -- the panic must
-/// surface via the outer `Some(result) = writer.flush_tasks.join_next()`
+/// surface via the outer `Some(result) = writer.flush_tasks.join_next_with_id()`
 /// branch with `source`/`target` fields attached. Uses default
 /// (current-thread) `#[tokio::test]` flavor so the background task's
 /// tracing events land on the same thread this test's subscriber guard

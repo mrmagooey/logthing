@@ -367,6 +367,11 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     ),
     (
         Kind::Counter,
+        "parquet_s3_flush_panics",
+        "Buffer flush tasks that panicked; their rows were restored and retried.",
+    ),
+    (
+        Kind::Counter,
         "iceberg_descriptor_uploads",
         "Iceberg descriptor objects uploaded alongside a Parquet object.",
     ),
