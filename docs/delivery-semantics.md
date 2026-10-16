@@ -36,8 +36,8 @@ flush interval (checked on each arriving record and on a periodic tick of a quar
 flush interval, between 1 and 30 seconds, so an idle buffer is flushed within one interval
 plus one tick). A crash, `SIGKILL` or power loss loses everything in that window; the spool
 does not change this, because it sits **after** the flush. To shrink the window, lower
-`flush_interval_secs` and `flush_threshold_bytes`. The trade-off is more, smaller Parquet files and more work for the
-Iceberg committer.
+`flush_interval_secs` and `flush_threshold_bytes`. The trade-off is more, smaller Parquet files
+and more work for the Iceberg committer.
 
 A graceful stop (`SIGTERM`/Ctrl-C) flushes every buffer first. A writer only finishes once
 every sender of its channel is gone, so on shutdown each listener also stops its per-connection
