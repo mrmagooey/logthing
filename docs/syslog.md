@@ -86,6 +86,12 @@ is configured (same keys as `[syslog.s3]`); without it the parse result is disca
 alongside `[syslog.s3]`/`[syslog.local]`: the raw message goes to those targets, the structured
 record to `structured_s3`.
 
+Parser edge cases: a LEEF 2.0 header whose delimiter field is a literal tab keeps any `|` in the
+attribute data; a CEF extension key is recognised only at the start or after a space, so
+`msg=a=b src=1.2.3.4` yields `msg` = `a=b`; auditd bare tokens without `=` are skipped; a web
+access request line of `"-"` (e.g. a 408) parses with no method/path, and `\"` inside the user
+agent is kept as-is.
+
 ## Syslog S3 Persistence
 
 Syslog messages can be persisted directly to S3-compatible storage as compressed Parquet files:

@@ -43,8 +43,12 @@ fn parse_kv_pairs(body: &str) -> HashMap<String, String> {
         while i < len && bytes[i] != b'=' && bytes[i] != b' ' {
             i += 1;
         }
-        if i >= len || bytes[i] != b'=' {
+        if i >= len {
             break;
+        }
+        if bytes[i] != b'=' {
+            // Bare token without '=': skip it and keep parsing.
+            continue;
         }
         let key = body[key_start..i].to_string();
         i += 1; // skip '='
@@ -168,5 +172,14 @@ mod tests {
     #[test]
     fn rejects_auditd_without_msg_field() {
         assert!(try_parse(&msg(MISSING_MSG_FIELD)).is_none());
+    }
+
+    #[test]
+    fn test_bare_token_mid_body_is_skipped_not_terminating() {
+        let line = "type=SYSCALL msg=audit(1:2): arch=c000003e garbage syscall=59";
+        let rec = try_parse(&msg(line)).expect("must parse");
+        assert_eq!(rec.fields.get("arch").map(String::as_str), Some("c000003e"));
+        assert_eq!(rec.fields.get("syscall").map(String::as_str), Some("59"));
+        assert!(!rec.fields.contains_key("garbage"));
     }
 }
