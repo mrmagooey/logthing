@@ -308,7 +308,9 @@ async fn ingest(
     );
     let outcome = process_events(state, events).await;
     if outcome.dropped > 0 {
-        warn!(
+        // debug, not warn: this fires once per retried request during an outage; the per-sink
+        // drop in `process_single_event` already logs through the throttled `drop_log_due`.
+        debug!(
             dropped = outcome.dropped,
             accepted = outcome.accepted,
             "WEF batch not fully handed to the sinks; bookmark kept, answering 503"

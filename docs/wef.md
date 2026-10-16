@@ -177,7 +177,10 @@ normal clients stay far below this).
 - **A full sink buffer makes the client retry.** If any event of a delivery cannot be handed
   to a sink (buffer full or closed), logthing answers `503` and does not store the batch's
   bookmark, so Windows re-sends from the previous bookmark; events accepted before the drop
-  may be delivered twice. Events whose XML cannot be parsed are counted
+  may be delivered twice. While a sink stays full or closed, every client retry re-enqueues
+  the accepted prefix of the batch again (repeated duplicates; delivery is at-least-once), and
+  a permanently closed sink makes clients retry indefinitely with `503` instead of the old
+  silent ack-and-lose. Events whose XML cannot be parsed are counted
   (`wef_xml_parse_errors`) and skipped, and do not block the bookmark. Watch
   `parquet_s3_dropped{source="wef"}` and size `channel_capacity`/`max_buffer_rows`.
 - **Bookmarks are held in memory.** After a logthing restart (or when `bookmark_capacity` is

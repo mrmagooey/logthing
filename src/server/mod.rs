@@ -1218,6 +1218,7 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) -> boo
 }
 
 /// Result of handing one batch of events to the sinks.
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProcessOutcome {
     /// Events enqueued to every configured sink.
@@ -1373,7 +1374,14 @@ mod tests {
         let event =
             WindowsEvent::new("host".into(), "<Event/>".into()).with_parsed(sample_parsed_event());
 
-        process_events(&state, vec![event]).await;
+        let outcome = process_events(&state, vec![event]).await;
+        assert_eq!(
+            outcome,
+            ProcessOutcome {
+                accepted: 1,
+                dropped: 0
+            }
+        );
 
         let summary = state.throughput.snapshot().await;
         assert_eq!(summary.len(), 1);

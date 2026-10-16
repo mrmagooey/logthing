@@ -1346,6 +1346,21 @@ mod tests {
         assert_eq!(next.status(), StatusCode::UNAUTHORIZED);
     }
 
+    #[test]
+    fn test_decrypt_body_without_conf_flags_is_missing_flags() {
+        let ctx = Box::new(FakeAcceptor {
+            id: 1,
+            complete: true,
+            principal: "alice".into(),
+            flags_ok: false,
+            violated: Arc::new(AtomicBool::new(false)),
+        });
+        let (h, d) = fake_wrap(1, b"abcd");
+        let body = multipart::build(EncProtocol::Kerberos, 4, &h, &d);
+        let (_, result) = decrypt_body(ctx, &body);
+        assert!(matches!(result, Err(DecryptError::MissingFlags)));
+    }
+
     #[tokio::test]
     async fn test_handshake_without_conf_flags_401_and_no_session() {
         let h = Harness::new();
