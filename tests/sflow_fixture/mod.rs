@@ -61,14 +61,25 @@ fn flow_sample() -> Vec<u8> {
     envelope(1, &b)
 }
 
-/// One datagram: the mixed-validity counter sample, then the IPv6 HBH flow sample.
+/// Expanded flow sample: input is a discard (format 1), output is ifIndex 9.
+fn expanded_flow_sample() -> Vec<u8> {
+    let mut b = Vec::new();
+    for w in [1, 0, 1, 512, 512, 0, 1, 2, 0, 9, 0] {
+        b.extend_from_slice(&be(w));
+    }
+    envelope(3, &b)
+}
+
+/// One datagram: the mixed-validity counter sample, the IPv6 HBH flow sample
+/// and an expanded flow sample with a discard input interface.
 pub fn mixed_datagram(if_index: u32) -> Vec<u8> {
     let mut d = Vec::new();
-    for w in [5, 1, 0x0A00_0001, 0, 1, 1000, 2] {
+    for w in [5, 1, 0x0A00_0001, 0, 1, 1000, 3] {
         d.extend_from_slice(&be(w));
     }
     d.extend_from_slice(&counter_sample(if_index));
     d.extend_from_slice(&flow_sample());
+    d.extend_from_slice(&expanded_flow_sample());
     d
 }
 
@@ -76,12 +87,16 @@ pub fn mixed_datagram(if_index: u32) -> Vec<u8> {
 /// decoded values.
 pub fn assert_rows(batches: &[arrow::record_batch::RecordBatch], if_index: u32) {
     use arrow::util::display::array_value_to_string;
-    let (mut flow, mut counter) = (0, 0);
+    let (mut flow, mut counter, mut expanded) = (0, 0, 0);
     for b in batches {
         let col =
             |n: &str, i: usize| array_value_to_string(b.column_by_name(n).unwrap(), i).unwrap();
         for i in 0..b.num_rows() {
             match col("sample_type", i).as_str() {
+                "flow" if col("output_ifindex", i) == "9" => {
+                    expanded += 1;
+                    assert_eq!(col("input_ifindex", i), "", "discard input has no ifindex");
+                }
                 "flow" => {
                     flow += 1;
                     assert_eq!(col("src_port", i), "8080");
@@ -97,5 +112,5 @@ pub fn assert_rows(batches: &[arrow::record_batch::RecordBatch], if_index: u32) 
             }
         }
     }
-    assert_eq!((flow, counter), (1, 1), "one flow row and one counter row");
+    assert_eq!((flow, counter, expanded), (1, 1, 1), "one row of each kind");
 }

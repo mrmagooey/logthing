@@ -112,8 +112,9 @@ Without `[sflow.s3]`/`[sflow.local]` each datagram is decoded and logged only; n
 
 Decoding notes: ports are left empty for IPv4 non-first fragments and IPv6 fragments with a
 non-zero offset. For IPv6, hop-by-hop, routing, fragment, authentication and destination-options
-headers (up to 8) are skipped, and `ip_protocol` is the final upper-layer protocol. A compact flow
-sample whose interface word is a discard or "multiple interfaces" marker gets a null
+headers (up to 8) are skipped, and `ip_protocol` is the final upper-layer protocol (on a truncated
+or over-long chain, the last extension-header number reached). A flow sample
+(compact or expanded) whose interface is a discard or "multiple interfaces" marker gets a null
 `input_ifindex`/`output_ifindex`. A generic_if_counters record shorter than 88 bytes is skipped
 (`sflow_counter_records_skipped`) without losing the other records in the sample. Unrecognised
 standard counter records in `extra` carry no `enterprise` key.

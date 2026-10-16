@@ -474,9 +474,14 @@ fn decode_flow_sample(
             );
         }
         let sampling_rate = read_u32(body, 12)?;
-        // input: format(4) + value(4) at [24..32]; output at [32..40]
-        let input_ifindex = Some(read_u32(body, 28)?); // input if_value
-        let output_ifindex = Some(read_u32(body, 36)?); // output if_value
+        // input: format(4) + value(4) at [24..32]; output at [32..40]. Only
+        // format 0 names an interface; 1 = discard reason, 2 = multiple.
+        let input_ifindex = (read_u32(body, 24)? == 0)
+            .then(|| read_u32(body, 28))
+            .transpose()?;
+        let output_ifindex = (read_u32(body, 32)? == 0)
+            .then(|| read_u32(body, 36))
+            .transpose()?;
         let num_records = read_u32(body, 40)?;
         (
             sampling_rate,
@@ -693,7 +698,8 @@ fn parse_ipv6(buf: &[u8], rec: &mut SflowRecord) -> anyhow::Result<()> {
             _ => break,
         };
         let Some(hdr_len) = hdr_len.filter(|l| off + l <= buf.len()) else {
-            // Truncated chain: the upper-layer protocol is unknowable.
+            // Truncated chain: the upper-layer protocol is unknowable, so
+            // ip_protocol keeps the last extension-header number reached.
             rec.ip_protocol = Some(proto);
             return Ok(());
         };
@@ -1898,5 +1904,74 @@ pub(crate) mod tests {
         let r = decode_datagram(&d, exporter()).unwrap().remove(0);
         assert_eq!(r.input_ifindex, Some(0x123));
         assert_eq!(r.output_ifindex, Some(0x3FFF_FFFF));
+    }
+
+    fn expanded_flow_sample(in_fmt: u32, in_val: u32, out_fmt: u32, out_val: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        for w in [1, 0, 1, 512, 512, 0, in_fmt, in_val, out_fmt, out_val, 0] {
+            b.extend_from_slice(&be(w));
+        }
+        envelope(3, &b)
+    }
+
+    #[test]
+    fn test_expanded_flow_sample_interface_format_honoured() {
+        let cases = [
+            ((0, 5, 0, 6), (Some(5), Some(6))),
+            ((1, 5, 0, 6), (None, Some(6))),
+            ((0, 5, 2, 6), (Some(5), None)),
+            ((2, 5, 1, 6), (None, None)),
+        ];
+        for ((a, b, c, d), (want_in, want_out)) in cases {
+            let dg = datagram(&[expanded_flow_sample(a, b, c, d)]);
+            let r = decode_datagram(&dg, exporter()).unwrap().remove(0);
+            assert_eq!(
+                (r.input_ifindex, r.output_ifindex),
+                (want_in, want_out),
+                "{a} {c}"
+            );
+        }
+    }
+
+    fn v6_with_n_hbh(n: usize) -> Vec<u8> {
+        // n chained hop-by-hop headers (each 8 bytes), the last pointing at TCP.
+        let mut ext = Vec::new();
+        for i in 0..n {
+            ext.extend_from_slice(&[if i + 1 == n { 6 } else { 0 }, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        ext.extend_from_slice(&TCP_PORTS);
+        eth_ipv6(&ext, 0)
+    }
+
+    #[test]
+    fn test_ipv6_extension_header_cap_is_eight() {
+        let r = decode_one_flow(&v6_with_n_hbh(8));
+        assert_eq!((r.src_port, r.dst_port), (Some(8080), Some(80)));
+        let r = decode_one_flow(&v6_with_n_hbh(9));
+        assert_eq!((r.src_port, r.dst_port), (None, None));
+    }
+
+    #[test]
+    fn test_short_generic_if_counters_increments_skipped_metric() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let d = datagram(&[counter_sample(&[
+            envelope(1, &[0u8; 40]),
+            envelope(1, &[0u8; 8]),
+        ])]);
+        decode_datagram(&d, exporter()).unwrap();
+        let total: u64 = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == "sflow_counter_records_skipped")
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(total, 2);
     }
 }

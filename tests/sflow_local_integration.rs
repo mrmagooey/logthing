@@ -6,6 +6,9 @@
 //! needs no external service — local disk is always available — so it runs
 //! unconditionally in CI.
 
+mod common;
+mod sflow_fixture;
+
 use logthing::config::SflowLocalConfig;
 use logthing::forwarding::local_sink::LocalDiskSink;
 use logthing::forwarding::sflow_s3::sflow_local_start;
@@ -382,9 +385,6 @@ async fn sflow_samples_crossing_builder_batch_rows_land_exact_row_count_on_disk(
     );
 }
 
-mod common;
-mod sflow_fixture;
-
 /// A datagram mixing a short generic_if_counters record, an ethernet counter
 /// record and an IPv6 hop-by-hop TCP flow sample decodes into both rows, which
 /// land in Parquet with the ports intact.
@@ -416,11 +416,11 @@ async fn sflow_mixed_validity_datagram_lands_counter_and_flow_rows() {
         "10.0.0.1".parse().unwrap(),
     )
     .expect("datagram decodes");
-    assert_eq!(records.len(), 2);
+    assert_eq!(records.len(), 3);
     handler
         .handle_samples(records, "127.0.0.1:6343".parse().unwrap())
         .await;
 
-    let batches = common::wait_for_rows(dir.path(), 2, std::time::Duration::from_secs(20)).await;
+    let batches = common::wait_for_rows(dir.path(), 3, std::time::Duration::from_secs(20)).await;
     sflow_fixture::assert_rows(&batches, 7);
 }

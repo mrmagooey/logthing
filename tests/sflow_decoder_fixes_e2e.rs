@@ -47,6 +47,6 @@ flush_interval_secs = 3600
     .await
     .unwrap();
 
-    let batches = wait_for_rows(&out, 2, Duration::from_secs(20)).await;
+    let batches = wait_for_rows(&out, 3, Duration::from_secs(20)).await;
     sflow_fixture::assert_rows(&batches, 7);
 }
