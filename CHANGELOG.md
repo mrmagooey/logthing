@@ -6,6 +6,147 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
+### Fixed
+
+- OTLP: a request is rejected with `413` when it holds more than 100,000 log records or its
+  heap-weighted size estimate once mapped exceeds 256 MiB (counted in
+  `otlp_requests_rejected_too_large`). The estimate is computed from the decoded protobuf before
+  any JSON is built, so a request with a huge resource or scope can no longer exhaust memory
+  first. An export is no longer acknowledged with `200` when no OTLP sink is configured or a sink
+  channel is closed (see Changed), and `otlp_logs_received` now counts only records that were
+  enqueued.
+- WEF: the bookmark is no longer advanced past events a sink dropped; the request is answered
+  `503` so the client re-sends. After Kerberos authentication a non-empty body that is not
+  `multipart/encrypted` is refused with `400` (`wef_plaintext_on_kerberos_rejected`), closing a
+  protocol-downgrade path.
+- Event field extraction: integer fields accept `0x` hexadecimal values (`0x1a4` becomes `420`),
+  extracted values are XML-unescaped, and `Data Name='X'` and System tags that carry attributes
+  (`<EventID Qualifiers="16384">`) now match.
+- Admin UI: the client IP behind a proxy comes from the rightmost `X-Forwarded-For` hop, which
+  the client cannot forge; failed logins cost the same work for unknown and known usernames;
+  audit-log rotation is serialised; non-Argon2 password hashes are rejected.
+- IP allowlists: on a dual-stack `[::]` bind IPv4 peers appear as `::ffff:a.b.c.d` and never
+  matched plain IPv4 `allowed_ips` entries, so every IPv4 client was rejected once an allowlist
+  was set. Peers are now canonicalised before matching in the HTTP middleware, all listeners and
+  the admin UI; existing `::ffff:` entries keep matching.
+- Redaction: `drop_fields`/`hash_fields` keys now match case-insensitively; `mask_patterns` also
+  cover the HEC `host` and `source` columns and the OTLP `host_name`, `event_name`,
+  `severity_text` and `scope_name` columns, and numeric leaves that match a pattern are masked.
+  Previously these values passed through unredacted.
+- HEC: `time` handling is exact. Epoch milliseconds (>= 1e11) and numeric strings are accepted,
+  negative fractions keep a non-negative sub-second part, integer times are converted without
+  floating-point rounding, an out-of-range time is stored as NULL, and a leading UTF-8
+  byte-order mark on `/services/collector/event` and `/ingest` bodies is ignored.
+- Syslog: RFC 5424 structured data is parsed correctly (`-` no longer leaks into the message;
+  adjacent elements and `\"`, `\\`, `\]` escapes are honoured; malformed structured data keeps
+  the remainder as the message), an RFC 3164 tag must be a single token (so
+  `Failed password for root port 22: x` and auditd lines are not split at a colon), and CEF/LEEF
+  payloads directly after a 3164 header reach their parsers. Lines with a valid `<PRI>` that
+  match neither header format, and lines with a PRI above 191, are kept instead of dropped. A
+  line is no longer merged into the next when `\n` decides TCP framing.
+- Syslog payloads: LEEF 2.0 headers with a literal tab delimiter keep `|` in attribute data, CEF
+  extension keys are recognised only at a key boundary (`msg=a=b src=1.2.3.4` yields
+  `msg` = `a=b`), auditd bare tokens without `=` are skipped, and a web access request line of
+  `"-"` (for example a 408) parses without method or path.
+- IPFIX/NetFlow: post-NAT elements (IEs 225-228) are stored in `extra` and no longer overwrite
+  the original address and port tuple; options data sets produce no flow rows
+  (`ipfix_options_records_skipped`); template withdrawal (RFC 7011 section 8.1) is honoured;
+  flow records decoded before a malformed set are kept; unsigned fields sent wider than declared
+  use the low-order bytes; truncated options templates are errors; a message decodes at most
+  8192 records (`ipfix_records_capped`).
+- sFlow: short `generic_if_counters` records are skipped (`sflow_counter_records_skipped`)
+  instead of failing the whole counter sample, IPv4 and IPv6 non-first fragments carry no ports,
+  IPv6 extension headers are walked to the real upper-layer protocol, unknown standard counter
+  records no longer carry an `enterprise` key, and interface words honour the format bits in
+  compact and expanded flow samples.
+- Listeners: a dropped shutdown channel is treated as shutdown instead of busy-looping; UDP
+  receive loops (syslog, IPFIX, sFlow) back off 10 ms to 1 s on persistent receive errors and
+  log at most once per 10 s; Zeek, Suricata and syslog TCP connections are stopped at shutdown
+  after dispatching the lines already received, so their writers can finish and flush. An
+  unterminated final line is dropped and counted in `zeek_partial_lines_dropped_at_shutdown`,
+  `suricata_partial_lines_dropped_at_shutdown` or `syslog_partial_lines_dropped_at_shutdown`.
+- Shutdown order: the HTTP server and the listeners now drain concurrently before the writers
+  are flushed, so rows from still-open connections are no longer lost on a graceful stop.
+- Parquet/S3 writer: a panicking flush task restores its rows and is retried instead of leaving
+  the partition stuck (`parquet_s3_flush_panics`); the age tick runs at a quarter of the flush
+  interval (1-30 s); failed flushes back off exponentially (1 s doubling, capped at 60 s and at
+  `flush_interval_secs`) and a backed-off partition retries when its backoff expires; the final
+  shutdown flush makes one descriptor attempt per partition; a failed Iceberg descriptor upload
+  is retried three times (200 ms, 1 s, 5 s) before `iceberg_descriptor_upload_errors` counts it.
+- Spool: an entry that carries an Iceberg descriptor is kept and retried, not deleted, while no
+  descriptor sink is configured (`spool_descriptor_sink_missing`).
+- Iceberg descriptors: `schema_version` now reflects column nullability and no longer depends on
+  the Rust toolchain.
+- Committer: transient botocore and `requests` I/O errors abort the run for retry instead of
+  quarantining the descriptor, required columns that are new to a table are added as optional,
+  and a failure to move a descriptor to the done or quarantine prefix no longer retries or
+  quarantines a file that was already committed.
+- Helm: the generated Trino TLS certificate is renewed before it expires. The Secret carries a
+  `logthing.io/not-after` annotation and is reused only while more than 30 days remain.
+- Startup: `WEF_WORKER_THREADS=0` or a non-number, and `hec.max_sourcetype_partitions = 0` or
+  `otlp.max_service_partitions = 0` with that source enabled, now fail with a clear error instead
+  of being ignored or silently removing the partition cap.
+
+### Added
+
+- Syslog TCP accepts RFC 6587 octet-counted frames (`LEN SP MSG`), chosen per frame and mixable
+  with newline-terminated lines on one connection. A frame is octet-counted only when it starts
+  with 1-7 digits (first digit 1-9), one space and `<`, so lines that merely begin with a digit
+  stay newline-framed. A length above 256 KiB closes the connection and counts in
+  `syslog_oversized_lines`.
+- Metrics `otlp_requests_rejected_too_large`, `wef_plaintext_on_kerberos_rejected`,
+  `parquet_s3_flush_panics`, `spool_descriptor_sink_missing`, `ipfix_options_records_skipped`,
+  `ipfix_records_capped`, `sflow_counter_records_skipped`, and
+  `{zeek,suricata,syslog}_partial_lines_dropped_at_shutdown`.
+- `@host` and `@source` redaction targets for `[hec.redaction]` `drop_fields` and `hash_fields`.
+- The release workflow now fails before building when the git tag does not match the
+  `Cargo.toml` version.
+
+### Changed
+
+Behaviour changes to check before upgrading:
+
+- OTLP: requests over 100,000 records or over the 256 MiB heap-weighted estimate get `413`
+  (lower the exporter batch size, for example `send_batch_max_size`). An export is answered
+  `503` instead of `200` when no OTLP sink is configured or a sink channel is closed. Retries
+  can duplicate records another sink already accepted (at-least-once).
+- WEF: when a sink drops any event of an Events batch (buffer full or closed), the request is
+  answered `503` and the bookmark is not advanced; the client re-sends, so duplicates are
+  possible and a permanently closed sink makes clients retry indefinitely. Unparsable event XML
+  is counted and skipped and does not block the bookmark. After Kerberos authentication, a
+  non-empty non-encrypted body is rejected with `400`.
+- Admin UI: behind a proxy the client IP is the rightmost `X-Forwarded-For` hop (the last header
+  line); exactly one trusted proxy is assumed. `LOGTHING_ADMIN_ENABLE_RATE_LIMIT` accepts only
+  `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off` (case-insensitive), any other value stops
+  startup. An invalid or non-Argon2 `LOGTHING_ADMIN_PASS_HASH` stops startup; single-quote the
+  value or double each `$` in Docker Compose.
+- Redaction: drop and hash keys match case-insensitively, so rules remove or hash more keys than
+  before. Masks now also apply to HEC `host`/`source` and OTLP `host_name`, `event_name`,
+  `severity_text` and `scope_name`. Numeric leaves that match a mask pattern become masked
+  strings (a type change for those leaves). `@host` and `@source` are new HEC targets.
+- HEC: a `time` of 1e11 or more is epoch milliseconds (it was read as seconds); numeric string
+  times are accepted; out-of-range times are treated as unparsable and stored as NULL. A leading
+  UTF-8 BOM is stripped from `/services/collector/event` and `/ingest` bodies.
+- Syslog: lines with a PRI above 191 are kept (raw line as the message, default priority) instead
+  of dropped; lines with a valid PRI that match neither RFC 5424 nor RFC 3164 are kept with their
+  real priority. On TCP, a frame starting with digits, a space and `<` is now read as an
+  octet-counted frame.
+- Iceberg descriptors: every table's `schema_version` changes once (now the first 16 hex
+  characters of a SHA-256 over column names, types and nullability). The bundled committer does
+  not read it.
+- Helm: an existing Trino TLS Secret without the `logthing.io/not-after` annotation is
+  regenerated once on the first upgrade, and every renewal regenerates the CA as well as the
+  server certificate. Clients that pin the old CA (for example dbt's `TRINO_CA_CERT`) must
+  re-fetch `ca.pem`. Provide `trino.tls.existingSecret` for a stable CA.
+- Shutdown and exit codes: if the HTTP server or any wire-protocol listener exits on its own (for
+  example a port that cannot be bound), logthing performs the graceful shutdown and then exits
+  non-zero. Worst-case shutdown is about 22 s, so the bundled compose files now set
+  `stop_grace_period: 30s`; give your own supervisor at least 30 s (Kubernetes
+  `terminationGracePeriodSeconds`, Docker `--stop-timeout`).
+- Startup now fails for `WEF_WORKER_THREADS=0` or garbage, and for
+  `hec.max_sourcetype_partitions = 0` (with HEC enabled).
+- Release: the release workflow fails if the tag does not match the `Cargo.toml` version.
+
 ## [0.23.0] - 2026-10-10
 
 ### Fixed
