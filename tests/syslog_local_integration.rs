@@ -348,3 +348,85 @@ async fn syslog_local_start_emits_iceberg_descriptor_when_configured() {
         "expected at least one descriptor .json file under {descriptor_dir:?}"
     );
 }
+
+/// An RFC 5424 line with a NILVALUE (`-`) structured-data field, received over a real UDP
+/// listener, reaches Parquet with the `message` column holding only the body.
+#[tokio::test]
+async fn test_rfc5424_nilvalue_sd_message_column_has_no_leading_dash() {
+    use arrow::array::{Array, StringArray};
+    use logthing::syslog::listener::{SyslogListener, SyslogListenerConfig};
+    use tokio::net::{TcpListener, UdpSocket};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = std::sync::Arc::new(LocalDiskSink::new(tmp.path().to_path_buf()).await.unwrap());
+    let cfg = SyslogLocalConfig {
+        directory: tmp.path().to_path_buf(),
+        prefix: "syslog".to_string(),
+        max_buffer_rows: 10_000,
+        flush_interval_secs: 1,
+        channel_capacity: 4096,
+    };
+    let (handler, _writer) = syslog_local_start(
+        &cfg,
+        sink,
+        std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp_port = udp.local_addr().unwrap().port();
+    drop(udp);
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_port = tcp.local_addr().unwrap().port();
+    drop(tcp);
+
+    let listener = SyslogListener::new(
+        SyslogListenerConfig {
+            udp_port,
+            tcp_port,
+            bind_address: "127.0.0.1".to_string(),
+            parse_dns_logs: false,
+            ..SyslogListenerConfig::default()
+        },
+        std::sync::Arc::new(handler),
+    );
+    let task = tokio::spawn(async move {
+        listener.start().await.ok();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.send_to(
+        b"<34>1 2003-10-11T22:14:15.003Z host su - ID47 - 'su root' failed",
+        format!("127.0.0.1:{udp_port}"),
+    )
+    .await
+    .unwrap();
+    // The writer flushes on its 1s interval; poll for the file rather than sleeping blindly.
+    let mut parquet = None;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut files = Vec::new();
+        walk_all_files(tmp.path(), &mut files);
+        parquet = files
+            .into_iter()
+            .find(|p| p.extension().is_some_and(|e| e == "parquet"));
+        if parquet.is_some() {
+            break;
+        }
+    }
+    task.abort();
+    let parquet = parquet.expect("one parquet file within 10s");
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(Bytes::from(std::fs::read(&parquet).unwrap()))
+            .unwrap();
+    let idx = builder.schema().index_of("message").unwrap();
+    let rb = builder.build().unwrap().next().unwrap().unwrap();
+    assert_eq!(rb.num_rows(), 1);
+    let col = rb
+        .column(idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(col.value(0), "'su root' failed");
+}

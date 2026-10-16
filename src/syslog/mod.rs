@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-type StructuredData = Option<HashMap<String, HashMap<String, String>>>;
+type SdElements = HashMap<String, HashMap<String, String>>;
+type StructuredData = Option<SdElements>;
 
 // --- Module-level static regexes (compiled once per process) ---
 
@@ -29,9 +30,10 @@ static RFC3164_NOPRI_RE: LazyLock<Regex> = LazyLock::new(|| {
 static RFC3164_TS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})$").unwrap());
 
-/// RFC 3164 tag + pid: "tag[pid]: message" or "tag: message"
+/// RFC 3164 tag + pid: "tag[pid]: message" or "tag: message". The tag is a single token:
+/// no whitespace, `=` or `(`, so prose or `key=value` text with a later colon is not a tag.
 static RFC3164_TAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^([^:\[]+)(?:\[(\d+)\])?:\s*(.*)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^([^:\[\s=(]+)(?:\[(\d+)\])?:\s*(.*)$").unwrap());
 
 /// DNS BIND format
 static DNS_BIND_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -275,16 +277,7 @@ impl SyslogMessage {
             let hostname = Some(caps.get(2)?.as_str().to_string());
 
             let rest = caps.get(3)?.as_str();
-            // If the hostname is immediately followed by a bare CEF/LEEF
-            // payload with no separate app-tag (e.g. UDM-style forwarding),
-            // don't let parse_rfc3164_tag's greedy tag regex eat the "CEF"/
-            // "LEEF" prefix off the message.
-            let (app_name, proc_id, message) =
-                if rest.starts_with("CEF:") || rest.starts_with("LEEF:") {
-                    (None, None, rest.to_string())
-                } else {
-                    Self::parse_rfc3164_tag(rest)
-                };
+            let (app_name, proc_id, message) = Self::split_tag_or_payload(rest);
 
             return Some(SyslogMessage {
                 priority,
@@ -321,7 +314,49 @@ impl SyslogMessage {
             });
         }
 
+        // A `<PRI>` prefix with a value above 191 (facility > 23) is not valid; keep the
+        // whole line, prefix included, as the message instead of dropping it.
+        if Self::has_pri_prefix(input) {
+            let priority = DEFAULT_PRIORITY;
+            return Some(SyslogMessage {
+                priority,
+                severity: priority & 0x07,
+                facility: (priority >> 3) & 0x1f,
+                timestamp: None,
+                hostname: None,
+                app_name: None,
+                proc_id: None,
+                msg_id: None,
+                message: input.to_string(),
+                structured_data: None,
+                protocol: SyslogProtocol::Unknown,
+            });
+        }
+
         None
+    }
+
+    /// True when `input` starts with `<` 1-3 digits `>`.
+    fn has_pri_prefix(input: &str) -> bool {
+        let b = input.as_bytes();
+        let digits = b.iter().skip(1).take_while(|c| c.is_ascii_digit()).count();
+        b.first() == Some(&b'<') && (1..=3).contains(&digits) && b.get(digits + 1) == Some(&b'>')
+    }
+
+    /// Parse the `<PRI>` digits; `None` when above 191 (the maximum valid PRI, 23 * 8 + 7).
+    fn parse_pri(s: &str) -> Option<u8> {
+        s.parse::<u8>().ok().filter(|p| *p <= 191)
+    }
+
+    /// Split an RFC 3164 body into tag/pid/message, except that a bare CEF/LEEF payload is
+    /// never treated as a tag (some devices, e.g. UDM-style forwarding, send it right after
+    /// the hostname).
+    fn split_tag_or_payload(rest: &str) -> (Option<String>, Option<String>, String) {
+        if rest.starts_with("CEF:") || rest.starts_with("LEEF:") {
+            (None, None, rest.to_string())
+        } else {
+            Self::parse_rfc3164_tag(rest)
+        }
     }
 
     /// Parse RFC 5424 formatted syslog message
@@ -331,7 +366,7 @@ impl SyslogMessage {
 
         let caps = RFC5424_RE.captures(input)?;
 
-        let priority: u8 = caps.get(1)?.as_str().parse().ok()?;
+        let priority = Self::parse_pri(caps.get(1)?.as_str())?;
         let severity = priority & 0x07;
         let facility = (priority >> 3) & 0x1f;
 
@@ -387,7 +422,7 @@ impl SyslogMessage {
 
         let caps = RFC3164_RE.captures(input)?;
 
-        let priority: u8 = caps.get(1)?.as_str().parse().ok()?;
+        let priority = Self::parse_pri(caps.get(1)?.as_str())?;
         let severity = priority & 0x07;
         let facility = (priority >> 3) & 0x1f;
 
@@ -398,8 +433,7 @@ impl SyslogMessage {
 
         let rest = caps.get(4)?.as_str();
 
-        // Parse tag and message
-        let (app_name, proc_id, message) = Self::parse_rfc3164_tag(rest);
+        let (app_name, proc_id, message) = Self::split_tag_or_payload(rest);
 
         Some(SyslogMessage {
             priority,
@@ -482,53 +516,85 @@ impl SyslogMessage {
 
     /// Parse structured data from RFC 5424
     fn parse_structured_data(rest: &str) -> (StructuredData, String) {
-        static SD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]+)\]").unwrap());
-        static PARAM_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r#"(\S+)="([^"]*)""#).unwrap());
+        let strip_bom = |m: &str| m.strip_prefix('\u{feff}').unwrap_or(m).to_string();
 
-        let mut structured_data = HashMap::new();
-        let mut remaining = rest;
+        // NILVALUE: no structured data, the message follows.
+        if rest == "-" {
+            return (None, String::new());
+        }
+        if let Some(msg) = rest.strip_prefix("- ") {
+            return (None, strip_bom(msg));
+        }
+        if rest.starts_with('[')
+            && let Some((sd, end)) = Self::scan_structured_data(rest)
+        {
+            return (Some(sd), strip_bom(rest[end..].trim_start()));
+        }
+        // No SD, or malformed SD: the whole remainder is the message.
+        (None, strip_bom(rest))
+    }
 
-        // Check if it starts with structured data
-        if rest.starts_with('[') {
-            // Extract SD elements
-            let mut last_end = 0;
-
-            for cap in SD_RE.captures_iter(rest) {
-                let sd_element = cap.get(1).unwrap().as_str();
-                let mut params = HashMap::new();
-
-                // Parse SD-ID and parameters
-                let parts: Vec<&str> = sd_element.split_whitespace().collect();
-                if !parts.is_empty() {
-                    let sd_id = parts[0].to_string();
-
-                    // Parse param="value" pairs
-                    for param_cap in PARAM_RE.captures_iter(sd_element) {
-                        let key = param_cap.get(1).unwrap().as_str().to_string();
-                        let value = param_cap.get(2).unwrap().as_str().to_string();
-                        params.insert(key, value);
+    /// Scan the adjacent leading `[...]` SD elements of `rest`. Returns the parsed elements
+    /// and the byte offset just past the last `]`, or `None` if an element is malformed.
+    /// Only ASCII delimiters are inspected, so offsets are always char boundaries.
+    fn scan_structured_data(rest: &str) -> Option<(SdElements, usize)> {
+        let b = rest.as_bytes();
+        let mut sd = HashMap::new();
+        let mut pos = 0;
+        while b.get(pos) == Some(&b'[') {
+            pos += 1;
+            let id_start = pos;
+            while pos < b.len() && b[pos] != b' ' && b[pos] != b']' {
+                pos += 1;
+            }
+            if pos == id_start || pos >= b.len() {
+                return None;
+            }
+            let mut params = HashMap::new();
+            let id = rest[id_start..pos].to_string();
+            loop {
+                match b.get(pos)? {
+                    b']' => {
+                        pos += 1;
+                        break;
                     }
-
-                    structured_data.insert(sd_id, params);
-                    last_end = cap.get(0).unwrap().end();
+                    b' ' => pos += 1,
+                    _ => {
+                        let name_start = pos;
+                        while *b.get(pos)? != b'=' {
+                            if matches!(b[pos], b' ' | b']') {
+                                return None;
+                            }
+                            pos += 1;
+                        }
+                        let name = rest[name_start..pos].to_string();
+                        pos += 1;
+                        if *b.get(pos)? != b'"' {
+                            return None;
+                        }
+                        pos += 1;
+                        let mut value = Vec::new();
+                        loop {
+                            match *b.get(pos)? {
+                                b'"' => break,
+                                b'\\' if matches!(b.get(pos + 1), Some(b'"' | b'\\' | b']')) => {
+                                    value.push(b[pos + 1]);
+                                    pos += 2;
+                                }
+                                c => {
+                                    value.push(c);
+                                    pos += 1;
+                                }
+                            }
+                        }
+                        pos += 1;
+                        params.insert(name, String::from_utf8(value).ok()?);
+                    }
                 }
             }
-
-            remaining = rest[last_end..].trim_start();
+            sd.insert(id, params);
         }
-
-        // Strip BOM if present
-        let message = remaining
-            .strip_prefix('\u{feff}')
-            .unwrap_or(remaining)
-            .to_string();
-
-        if structured_data.is_empty() {
-            (None, message)
-        } else {
-            (Some(structured_data), message)
-        }
+        Some((sd, pos))
     }
 
     /// Get severity as enum
@@ -679,7 +745,7 @@ mod tests {
         assert_eq!(parsed.facility, 4);
         assert_eq!(parsed.hostname, Some("mymachine.example.com".to_string()));
         assert_eq!(parsed.app_name, Some("su".to_string()));
-        assert!(parsed.message.contains("'su root' failed"));
+        assert_eq!(parsed.message, "'su root' failed for lonvick");
         assert!(matches!(parsed.protocol, SyslogProtocol::Rfc5424));
     }
 
@@ -695,6 +761,119 @@ mod tests {
         let params = sd.get("example@32473").unwrap();
         assert_eq!(params.get("iut"), Some(&"3".to_string()));
         assert_eq!(params.get("eventID"), Some(&"1011".to_string()));
+    }
+
+    #[test]
+    fn test_parse_rfc5424_nilvalue_sd_stripped() {
+        let m = SyslogMessage::parse(
+            "<34>1 2003-10-11T22:14:15.003Z host su - ID47 - 'su root' failed",
+        )
+        .unwrap();
+        assert_eq!(m.message, "'su root' failed");
+        assert!(m.structured_data.is_none());
+        let m = SyslogMessage::parse("<34>1 2003-10-11T22:14:15.003Z host su - ID47 -").unwrap();
+        assert_eq!(m.message, "");
+    }
+
+    #[test]
+    fn test_parse_rfc5424_sd_stops_at_first_non_bracket() {
+        let m =
+            SyslogMessage::parse(r#"<1>1 - h a - - [a@1 x="1"] user [admin] logged in"#).unwrap();
+        assert_eq!(m.message, "user [admin] logged in");
+        let sd = m.structured_data.unwrap();
+        assert_eq!(sd.len(), 1);
+        assert_eq!(sd["a@1"]["x"], "1");
+
+        let m = SyslogMessage::parse(r#"<1>1 - h a - - [a@1 x="1"][b@2 y="2"]msg"#).unwrap();
+        assert_eq!(m.structured_data.unwrap().len(), 2);
+        assert_eq!(m.message, "msg");
+    }
+
+    #[test]
+    fn test_parse_rfc5424_sd_escapes_unescaped() {
+        let m = SyslogMessage::parse(r#"<1>1 - h a - - [a@1 x="q\"uote\]d\\"] m"#).unwrap();
+        assert_eq!(m.structured_data.unwrap()["a@1"]["x"], r#"q"uote]d\"#);
+        assert_eq!(m.message, "m");
+    }
+
+    #[test]
+    fn test_parse_rfc5424_sd_non_ascii_value() {
+        let m = SyslogMessage::parse(r#"<1>1 - h a - - [a@1 x="héllo"] msg"#).unwrap();
+        assert_eq!(m.structured_data.unwrap()["a@1"]["x"], "héllo");
+        assert_eq!(m.message, "msg");
+    }
+
+    #[test]
+    fn test_parse_rfc5424_sd_unterminated_is_message() {
+        for body in [r#"[a@1 x="1" tail"#, r#"[a@1 x="1"#, "[a@1", "[]"] {
+            let m = SyslogMessage::parse(&format!("<1>1 - h a - - {body}")).unwrap();
+            assert!(m.structured_data.is_none(), "{body}");
+            assert_eq!(m.message, body);
+        }
+    }
+
+    #[test]
+    fn test_parse_rfc3164_cef_payload_not_eaten_as_tag() {
+        let m =
+            SyslogMessage::parse("<134>Jan 15 10:30:45 host CEF:0|V|P|1|100|Name|5|src=1.2.3.4")
+                .unwrap();
+        assert_eq!(m.app_name, None);
+        assert!(m.message.starts_with("CEF:0|"));
+        let rec = crate::syslog::payload::dispatch(&m);
+        assert!(matches!(rec, crate::syslog::payload::SyslogPayload::Cef(_)));
+    }
+
+    #[test]
+    fn test_parse_rfc3164_leef_payload_not_eaten_as_tag() {
+        let m = SyslogMessage::parse("<134>Jan 15 10:30:45 host LEEF:1.0|V|P|1|Evt|src=1.2.3.4")
+            .unwrap();
+        assert_eq!(m.app_name, None);
+        assert!(m.message.starts_with("LEEF:1.0|"));
+    }
+
+    #[test]
+    fn test_parse_rfc3164_auditd_untagged() {
+        let line = "type=SYSCALL msg=audit(1609459200.000:1234): arch=c000003e";
+        let m = SyslogMessage::parse(&format!("<134>Jan 15 10:30:45 host {line}")).unwrap();
+        assert_eq!(m.app_name, None);
+        assert_eq!(m.message, line);
+        let rec = crate::syslog::payload::dispatch(&m);
+        assert!(matches!(
+            rec,
+            crate::syslog::payload::SyslogPayload::Auditd(_)
+        ));
+    }
+
+    #[test]
+    fn test_parse_rfc3164_colon_in_text_not_tag() {
+        let line = "Failed password for root from 1.2.3.4 port 22: x";
+        let m = SyslogMessage::parse(&format!("<134>Jan 15 10:30:45 host {line}")).unwrap();
+        assert_eq!(m.app_name, None);
+        assert_eq!(m.message, line);
+    }
+
+    #[test]
+    fn test_parse_rfc3164_tag_with_pid_regression() {
+        let m = SyslogMessage::parse("<134>Jan 15 10:30:45 host sshd[123]: Accepted").unwrap();
+        assert_eq!(m.app_name.as_deref(), Some("sshd"));
+        assert_eq!(m.proc_id.as_deref(), Some("123"));
+        assert_eq!(m.message, "Accepted");
+    }
+
+    #[test]
+    fn test_parse_pri_over_191_falls_back() {
+        let line = "<200>Jan 15 10:30:45 h msg";
+        let m = SyslogMessage::parse(line).unwrap();
+        assert_eq!(m.message, line);
+        assert_eq!((m.priority, m.facility, m.severity), (13, 1, 5));
+        assert!(matches!(m.protocol, SyslogProtocol::Unknown));
+        let m = SyslogMessage::parse("<200>1 - h a - - - x").unwrap();
+        assert_eq!(m.message, "<200>1 - h a - - - x");
+        // 191 is the highest valid PRI.
+        let m = SyslogMessage::parse("<191>Jan 15 10:30:45 h msg").unwrap();
+        assert_eq!((m.facility, m.severity), (23, 7));
+        // Non-PRI garbage still returns None.
+        assert!(SyslogMessage::parse("<abc>garbage").is_none());
     }
 
     #[test]

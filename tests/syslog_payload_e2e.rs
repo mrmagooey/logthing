@@ -305,3 +305,69 @@ async fn non_matching_datagram_produces_no_structured_record() {
         "non-matching message must produce no structured record"
     );
 }
+
+/// Starts a real UDP+TCP listener on ephemeral ports, sends `line` as one UDP datagram and
+/// returns the structured records the dispatching handler captured.
+async fn send_udp_line_and_collect(line: &str) -> Vec<StructuredSyslogRecord> {
+    let udp_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp_port = udp_socket.local_addr().unwrap().port();
+    drop(udp_socket);
+    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_port = tcp_listener.local_addr().unwrap().port();
+    drop(tcp_listener);
+
+    let store = CapturingStore::new();
+    let handler = Arc::new(DispatchingTestHandler {
+        store: store.clone(),
+    });
+    let cfg = SyslogListenerConfig {
+        udp_port,
+        tcp_port,
+        bind_address: "127.0.0.1".to_string(),
+        parse_dns_logs: false,
+        ..SyslogListenerConfig::default()
+    };
+    let listener = SyslogListener::new(cfg, handler);
+    let task = tokio::spawn(async move {
+        listener.start().await.ok();
+    });
+    sleep(Duration::from_millis(100)).await;
+
+    let send_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    send_sock
+        .send_to(line.as_bytes(), format!("127.0.0.1:{udp_port}"))
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(200)).await;
+    task.abort();
+    store.take()
+}
+
+#[tokio::test]
+async fn test_cef_after_rfc3164_header_produces_structured_record() {
+    // PRI + timestamp + host directly followed by CEF: the CEF prefix must not be
+    // consumed as an RFC 3164 tag.
+    let line = "<134>Jan 15 10:30:45 fw01 CEF:0|Vendor|FW|1.0|SIG001|Firewall Accept|6|\
+                src=10.0.0.1 dst=8.8.8.8";
+    let records = send_udp_line_and_collect(line).await;
+    assert_eq!(records.len(), 1, "expected 1 structured record");
+    assert_eq!(records[0].payload_type, "cef");
+    assert_eq!(
+        records[0].parsed["device_vendor"].as_str().unwrap_or(""),
+        "Vendor"
+    );
+}
+
+#[tokio::test]
+async fn test_cef_over_rfc5424_nilvalue_produces_structured_record() {
+    // The "-" NILVALUE structured-data field must not stay in front of the CEF payload.
+    let line = "<134>1 2024-01-15T10:30:45.000Z fw01 - - - - CEF:0|Vendor|FW|1.0|SIG001|\
+                Firewall Accept|6|src=10.0.0.1 dst=8.8.8.8";
+    let records = send_udp_line_and_collect(line).await;
+    assert_eq!(records.len(), 1, "expected 1 structured record");
+    assert_eq!(records[0].payload_type, "cef");
+    assert_eq!(
+        records[0].parsed["device_vendor"].as_str().unwrap_or(""),
+        "Vendor"
+    );
+}
