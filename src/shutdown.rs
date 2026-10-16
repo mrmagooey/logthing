@@ -192,14 +192,22 @@ mod tests {
     #[tokio::test]
     async fn test_drain_http_server_clean_exit_is_ok() {
         let mut t: JoinHandle<anyhow::Result<()>> = tokio::spawn(async { Ok(()) });
-        assert!(drain_http_server(&mut t, Duration::from_secs(5)).await.is_none());
+        assert!(
+            drain_http_server(&mut t, Duration::from_secs(5))
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn test_drain_http_server_error_return_is_an_error() {
         let mut t: JoinHandle<anyhow::Result<()>> =
             tokio::spawn(async { Err(anyhow::anyhow!("bind lost")) });
-        assert!(drain_http_server(&mut t, Duration::from_secs(5)).await.is_some());
+        assert!(
+            drain_http_server(&mut t, Duration::from_secs(5))
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test(start_paused = true)]

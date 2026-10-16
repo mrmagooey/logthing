@@ -615,7 +615,9 @@ mod tests {
         let (st, headers, _) = post(&app, &delivery_path(), &[], utf16(EVENTS)).await;
         assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            headers.get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            headers
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
             Some("1"),
             "a 503 must tell the client when to retry"
         );
