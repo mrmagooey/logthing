@@ -162,6 +162,7 @@ impl IpfixDecoder {
         Self::default()
     }
 
+    #[cfg(test)]
     pub(crate) fn cache_get(&self, key: &TemplateKey) -> Option<Vec<FieldSpecifier>> {
         self.cache_get_entry(key).map(|(fields, _)| fields)
     }
@@ -950,6 +951,9 @@ fn parse_varlen_records(
     records
 }
 
+// The argument list mirrors the wire context (template key parts, export time, v9/v10
+// switch, record budget); bundling them would only add a one-use struct.
+#[allow(clippy::too_many_arguments)]
 fn parse_ipfix_data_set(
     decoder: &mut IpfixDecoder,
     body: &[u8],
