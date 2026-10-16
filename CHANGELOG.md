@@ -74,7 +74,10 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   shutdown flush makes one descriptor attempt per partition; a failed Iceberg descriptor upload
   is retried three times (200 ms, 1 s, 5 s) before `iceberg_descriptor_upload_errors` counts it.
 - Spool: an entry that carries an Iceberg descriptor is kept and retried, not deleted, while no
-  descriptor sink is configured (`spool_descriptor_sink_missing`).
+  descriptor sink is configured (`spool_descriptor_sink_missing`; alert on it, and see
+  `docs/delivery-semantics.md` for how to discard stuck entries). Without `[spool]`, a descriptor
+  that still fails after its retries (or at shutdown) leaves the Parquet uploaded but never
+  committed to Iceberg; only `iceberg_descriptor_upload_errors` shows it.
 - Iceberg descriptors: `schema_version` now reflects column nullability and no longer depends on
   the Rust toolchain.
 - Committer: transient botocore and `requests` I/O errors abort the run for retry instead of
@@ -83,9 +86,6 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   quarantines a file that was already committed.
 - Helm: the generated Trino TLS certificate is renewed before it expires. The Secret carries a
   `logthing.io/not-after` annotation and is reused only while more than 30 days remain.
-- Startup: `WEF_WORKER_THREADS=0` or a non-number, and `hec.max_sourcetype_partitions = 0` or
-  `otlp.max_service_partitions = 0` with that source enabled, now fail with a clear error instead
-  of being ignored or silently removing the partition cap.
 
 ### Added
 
@@ -107,12 +107,14 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 Behaviour changes to check before upgrading:
 
 - OTLP: requests over 100,000 records or over the 256 MiB heap-weighted estimate get `413`
-  (lower the exporter batch size, for example `send_batch_max_size`). An export is answered
+  (lower the exporter batch size, for example `send_batch_max_size`). Records with many
+  attributes reach the 256 MiB estimate well before 100,000 records (roughly 28,000 records per
+  request for attribute-heavy shapes), so size batches by shape. An export is answered
   `503` instead of `200` when no OTLP sink is configured or a sink channel is closed. Retries
   can duplicate records another sink already accepted (at-least-once).
 - WEF: when a sink drops any event of an Events batch (buffer full or closed), the request is
-  answered `503` and the bookmark is not advanced; the client re-sends, so duplicates are
-  possible and a permanently closed sink makes clients retry indefinitely. Unparsable event XML
+  answered `503` with `Retry-After: 1` and the bookmark is not advanced; the client re-sends, so
+  duplicates are possible and a permanently closed sink makes clients retry indefinitely. Unparsable event XML
   is counted and skipped and does not block the bookmark. After Kerberos authentication, a
   non-empty non-encrypted body is rejected with `400`.
 - Admin UI: behind a proxy the client IP is the rightmost `X-Forwarded-For` hop (the last header
@@ -142,10 +144,17 @@ Behaviour changes to check before upgrading:
   example a port that cannot be bound), logthing performs the graceful shutdown and then exits
   non-zero. Worst-case shutdown is about 22 s, so the bundled compose files now set
   `stop_grace_period: 30s`; give your own supervisor at least 30 s (Kubernetes
-  `terminationGracePeriodSeconds`, Docker `--stop-timeout`).
-- Startup now fails for `WEF_WORKER_THREADS=0` or garbage, and for
-  `hec.max_sourcetype_partitions = 0` (with HEC enabled).
-- Release: the release workflow fails if the tag does not match the `Cargo.toml` version.
+  `terminationGracePeriodSeconds`, Docker `--stop-timeout`). A panic of the HTTP server task
+  during the drain also exits non-zero; a drain timeout (10 s, then abort) exits 0. After such
+  a timeout the aborted server's per-connection tasks can still hold the writers' senders, so
+  the writers hit their own 10 s deadline without end-of-stream and rows received since the last
+  periodic flush can be lost; only requests still in flight 10 s after the signal trigger this.
+- Startup now fails (with an error naming the setting) for `WEF_WORKER_THREADS=0` or a
+  non-number, `hec.max_sourcetype_partitions = 0` (with HEC enabled) and
+  `otlp.max_service_partitions = 0` (with OTLP enabled), instead of ignoring them or silently
+  removing the partition cap. `LOGTHING_ADMIN_TRUST_PROXY_HEADERS` is parsed like
+  `LOGTHING_ADMIN_ENABLE_RATE_LIMIT` (`true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off`); any
+  other value, including one that used to read as false, stops startup.
 
 ## [0.23.0] - 2026-10-10
 
