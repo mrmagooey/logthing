@@ -145,8 +145,8 @@ erasure procedure are in [redaction.md](redaction.md).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `drop_fields` | list of paths | `[]` | Remove these paths (OTLP also `@body`, `@host_name`, `@peer_addr`). |
-| `hash_fields` | list of paths | `[]` | Replace with lowercase-hex HMAC-SHA256. Needs `hash_key_env`. |
+| `drop_fields` | list of paths | `[]` | Remove these paths (`@` targets: HEC `@host`, `@source`; OTLP `@body`, `@host_name`, `@peer_addr`). Keys match case-insensitively. |
+| `hash_fields` | list of paths | `[]` | Replace with lowercase-hex HMAC-SHA256 (same `@` targets). Needs `hash_key_env`. |
 | `hash_key_env` | string | unset | NAME of the environment variable holding the HMAC key (16+ bytes). |
 | `mask_patterns` | list of regexes | `[]` | Matches inside string values become `[REDACTED]`. |
 

@@ -253,3 +253,109 @@ async fn test_otlp_redaction_applies_over_real_http() {
     );
     assert!(!common::str_col(b, "event_uuid").value(0).is_empty());
 }
+
+#[cfg(feature = "otlp")]
+#[tokio::test]
+async fn test_otlp_free_text_numeric_and_case_redaction_over_real_http() {
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::{
+        AnyValue, InstrumentationScope, KeyValue, any_value::Value,
+    };
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+
+    let toml = OTLP_TOML
+        .replace(
+            r#"drop_fields = ["user.email"]"#,
+            r#"drop_fields = ["password"]"#,
+        )
+        .replace(
+            r#"hash_fields = ["@host_name"]"#,
+            r#"hash_fields = ["token"]"#,
+        )
+        .replace(
+            r#"mask_patterns = ["secret"]"#,
+            r#"mask_patterns = ["secret", '\d{13,16}', '127\.0\.0\.1']"#,
+        );
+    let sv = |s: &str| AnyValue {
+        value: Some(Value::StringValue(s.into())),
+    };
+    let kv = |k: &str, v: &str| KeyValue {
+        key: k.into(),
+        value: Some(sv(v)),
+        ..Default::default()
+    };
+    let req = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![
+                    kv("service.name", "checkout"),
+                    kv("host.name", "secret-host"),
+                ],
+                ..Default::default()
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: "secret.lib".into(),
+                    ..Default::default()
+                }),
+                log_records: vec![LogRecord {
+                    body: Some(sv(r#"{"card":4111111111111111,"n":7}"#)),
+                    severity_text: "secret-sev".into(),
+                    event_name: "secret.event".into(),
+                    attributes: vec![kv("Password", "hunter2"), kv("TOKEN", "tok-1")],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+
+    let mut p = common::Proc::spawn(BIN, &toml, &[KEY_ENV]);
+    p.wait_healthy().await;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/logs", p.base()))
+        .header("Content-Type", "application/json")
+        .body(serde_json::to_vec(&req).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let dir = p.dir().join("otlp");
+    let batches = common::wait_for_rows(&dir, 1, Duration::from_secs(20)).await;
+    let b = &batches[0];
+    assert_eq!(common::str_col(b, "host_name").value(0), "[REDACTED]-host");
+    assert_eq!(
+        common::str_col(b, "event_name").value(0),
+        "[REDACTED].event"
+    );
+    assert_eq!(
+        common::str_col(b, "severity_text").value(0),
+        "[REDACTED]-sev"
+    );
+    assert_eq!(common::str_col(b, "scope_name").value(0), "[REDACTED].lib");
+    assert_eq!(common::str_col(b, "peer_addr").value(0), "127.0.0.1");
+    let body: serde_json::Value =
+        serde_json::from_str(common::str_col(b, "body").value(0)).unwrap();
+    assert_eq!(body, serde_json::json!({"card": "[REDACTED]", "n": 7}));
+    let attrs: serde_json::Value =
+        serde_json::from_str(common::str_col(b, "attributes").value(0)).unwrap();
+    assert!(attrs.get("Password").is_none(), "{attrs}");
+    assert_eq!(attrs["TOKEN"].as_str().map(str::len), Some(64), "{attrs}");
+    let bytes: Vec<u8> = common::parquet_files(&dir)
+        .iter()
+        .flat_map(|f| std::fs::read(f).unwrap())
+        .collect();
+    let hay = String::from_utf8_lossy(&bytes);
+    for secret in [
+        "secret-host",
+        "secret.event",
+        "secret-sev",
+        "secret.lib",
+        "hunter2",
+    ] {
+        assert!(!hay.contains(secret), "{secret} leaked");
+    }
+}

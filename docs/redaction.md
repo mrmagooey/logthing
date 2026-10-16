@@ -33,8 +33,8 @@ mask_patterns = ['\b\d{16}\b']
 
 | Key | Meaning |
 |---|---|
-| `drop_fields` | Paths removed from the record (typed OTLP columns are set to NULL). |
-| `hash_fields` | Paths replaced by the lowercase-hex HMAC-SHA256 of the value (64 characters). |
+| `drop_fields` | Paths removed from the record. `@` targets set a typed column to NULL: HEC `@host`, `@source`; OTLP `@body`, `@host_name`, `@peer_addr`. |
+| `hash_fields` | Paths replaced by the lowercase-hex HMAC-SHA256 of the value (64 characters); accepts the same `@` targets. |
 | `hash_key_env` | Name of the environment variable holding the HMAC key. Required when `hash_fields` is non-empty; at least 16 bytes. |
 | `mask_patterns` | Regexes; every match inside a string value becomes `[REDACTED]`. |
 
@@ -43,8 +43,10 @@ Rules are validated at startup, only for enabled sections (`[hec] enabled = true
 invalid regex or one over the size cap, a regex that can match the empty string (`x*`, `^`,
 `\b`, ...), an empty path or empty path segment, a duplicate `hash_fields` path, `hash_fields`
 without `hash_key_env`, a `hash_key_env` that is not a valid variable name (the value is never
-echoed back), an unset variable or a key shorter than 16 bytes, and `@`-paths in
-`[hec.redaction]` or unknown ones such as `@service_name`. Like all configuration, a change
+echoed back), an unset variable or a key shorter than 16 bytes, and unknown `@` targets (for
+`[hec.redaction]` anything but `@host` and `@source`, such as `@sourcetype`; for
+`[otlp.redaction]` anything but `@body`, `@host_name` and `@peer_addr`, such as
+`@service_name`). Like all configuration, a change
 needs a restart.
 
 ## Rule semantics
@@ -97,10 +99,10 @@ needs a restart.
 - **Mask scope:** masks apply to string values and to numbers. A number is tested against the
   patterns as its decimal text (`4111111111111111`); on a match it is replaced by the masked
   string, so the leaf changes type from number to string (`"[REDACTED]"`). Numbers that do not
-  match are left untouched. Object keys and booleans are never masked. A JSON `@body` is masked leaf by leaf and re-serialised
-  (compact, sorted keys) only if a rule actually changed it; an untouched body stays
-  byte-identical. A plain-text body is masked as one string. Replacement text is literal
-  (`$1` is not expanded).
+  match are left untouched. Object keys and booleans are never masked. A JSON `@body` is masked
+  leaf by leaf and re-serialised (compact, sorted keys) only if a rule actually changed it; an
+  untouched body stays byte-identical. A plain-text body is masked as one string. Replacement
+  text is literal (`$1` is not expanded).
 - **Cost:** the regex engine is Rust's `regex` crate, which runs in time linear in the input,
   so a hostile payload cannot cause catastrophic backtracking.
 
