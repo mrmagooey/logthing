@@ -70,24 +70,30 @@ async fn test_leef_tab_and_cef_equals_payloads_parsed_by_real_binary() {
     let (udp, tcp) = (common::free_port(), common::free_port());
     let mut p = common::Proc::spawn(BIN, &toml(&fake.endpoint(), udp, tcp), &[]);
     p.wait_healthy().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    for l in [
+    let lines = [
         "<134>Jan 15 10:30:45 h1 LEEF:2.0|V|P|1|E|\tsrc=1\turl=a|b",
         "<134>Jan 15 10:30:45 h2 CEF:0|V|P|1|100|N|5|msg=a=b src=1.2.3.4",
-    ] {
-        sock.send_to(l.as_bytes(), format!("127.0.0.1:{udp}"))
-            .await
-            .unwrap();
-    }
+    ];
+    let dest = format!("127.0.0.1:{udp}");
 
+    // Resend every poll: the UDP socket may bind after the health check. Assertions are
+    // idempotent (map keyed by payload type).
     let mut got = HashMap::new();
-    let ok = common::wait_until(Duration::from_secs(30), || {
+    let end = std::time::Instant::now() + Duration::from_secs(30);
+    let mut ok = false;
+    while std::time::Instant::now() < end {
+        for l in &lines {
+            sock.send_to(l.as_bytes(), &dest).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
         got = parsed_by_type(&fake);
-        got.contains_key("leef") && got.contains_key("cef")
-    })
-    .await;
+        if got.contains_key("leef") && got.contains_key("cef") {
+            ok = true;
+            break;
+        }
+    }
     assert!(ok, "payloads never reached S3: {got:?}\n{}", p.logs());
     assert_eq!(got["leef"]["delimiter"], "\t");
     assert_eq!(got["leef"]["attributes"]["src"], "1");

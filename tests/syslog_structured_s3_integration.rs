@@ -4,14 +4,14 @@
 //!
 //! Gated on MINIO_ENDPOINT.  Skip gracefully if the env var is absent.
 
+mod common;
+
+use common::fake_s3::FakeS3;
 use logthing::config::{S3ConnectionConfig, SyslogS3Config};
 use logthing::forwarding::s3_sink::S3Sink;
 use logthing::forwarding::structured_syslog_s3::structured_syslog_start;
 use logthing::syslog::SyslogMessage;
 use logthing::syslog::listener::{DefaultSyslogHandler, SyslogHandler as SyslogHandlerTrait};
-mod common;
-
-use common::fake_s3::FakeS3;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -19,7 +19,7 @@ fn skip_if_no_minio() -> Option<String> {
     std::env::var("MINIO_ENDPOINT").ok()
 }
 
-fn minio_cfg(endpoint: &str, prefix: &str) -> SyslogS3Config {
+fn s3_cfg(endpoint: &str, prefix: &str) -> SyslogS3Config {
     SyslogS3Config {
         connection: S3ConnectionConfig {
             endpoint: endpoint.to_string(),
@@ -51,7 +51,7 @@ async fn cef_record_appears_as_parquet_under_cef_partition() {
     };
 
     let prefix = "structured-syslog-int-test";
-    let cfg = minio_cfg(&endpoint, prefix);
+    let cfg = s3_cfg(&endpoint, prefix);
     let s3 = Arc::new(
         S3Sink::from_connection(&cfg.connection)
             .await
@@ -145,7 +145,7 @@ async fn multiple_payload_types_land_in_separate_partitions() {
     };
 
     let prefix = "structured-syslog-multi-test";
-    let cfg = minio_cfg(&endpoint, prefix);
+    let cfg = s3_cfg(&endpoint, prefix);
     let s3 = Arc::new(
         S3Sink::from_connection(&cfg.connection)
             .await
@@ -206,7 +206,7 @@ async fn multiple_payload_types_land_in_separate_partitions() {
 #[tokio::test]
 async fn test_payload_edge_cases_land_with_expected_parsed_fields() {
     let fake = FakeS3::start().await;
-    let mut cfg = minio_cfg(&fake.endpoint(), "edge");
+    let mut cfg = s3_cfg(&fake.endpoint(), "edge"); // pointed at the in-process fake S3
     cfg.connection.bucket = "b".into();
     cfg.connection.access_key = "k".into();
     cfg.connection.secret_key = "s".into();

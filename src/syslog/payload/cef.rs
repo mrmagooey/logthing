@@ -320,4 +320,38 @@ mod tests {
             Some("1.2.3.4")
         );
     }
+
+    #[test]
+    fn test_extension_value_with_spaces_is_kept_whole() {
+        let rec =
+            try_parse(&msg("CEF:0|V|P|1|100|N|5|msg=hello world src=1.2.3.4")).expect("must parse");
+        assert_eq!(
+            rec.extensions.get("msg").map(String::as_str),
+            Some("hello world")
+        );
+        assert_eq!(
+            rec.extensions.get("src").map(String::as_str),
+            Some("1.2.3.4")
+        );
+    }
+
+    #[test]
+    fn test_extension_escaped_equals_and_backslash_unescape() {
+        let rec = try_parse(&msg(
+            r"CEF:0|V|P|1|100|N|5|cs1=foo\=bar fname=C:\\x src=1.2.3.4",
+        ))
+        .expect("must parse");
+        assert_eq!(
+            rec.extensions.get("cs1").map(String::as_str),
+            Some("foo=bar")
+        );
+        assert_eq!(
+            rec.extensions.get("fname").map(String::as_str),
+            Some(r"C:\x")
+        );
+        assert_eq!(
+            rec.extensions.get("src").map(String::as_str),
+            Some("1.2.3.4")
+        );
+    }
 }

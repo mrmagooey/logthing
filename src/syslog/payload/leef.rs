@@ -26,7 +26,8 @@ pub struct LeefRecord {
 /// Decode the LEEF 2.0 delimiter field.
 /// Accepts: `0x<HH>` hex notation, a single literal character, or empty → `\t`.
 fn decode_delimiter(s: &str) -> char {
-    // No trim(): a literal tab is itself a valid delimiter field.
+    // Trim only space/CR/LF (never tab: a literal tab is itself a valid delimiter field).
+    let s = s.trim_matches(|c| c == ' ' || c == '\r' || c == '\n');
     if s.is_empty() || s == "\\t" || s == "\t" {
         return '\t';
     }
@@ -233,5 +234,15 @@ mod tests {
         let rec = try_parse(&msg("LEEF:2.0|V|P|1|E|0x09|src=1\tdst=2")).expect("must parse");
         assert_eq!(rec.delimiter, Some('\t'));
         assert_eq!(rec.attributes.get("dst").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn test_decode_delimiter_literal_hex_empty_and_tab() {
+        assert_eq!(decode_delimiter("^"), '^');
+        assert_eq!(decode_delimiter(""), '\t');
+        assert_eq!(decode_delimiter("0x5E"), '^');
+        assert_eq!(decode_delimiter("0x5E "), '^');
+        assert_eq!(decode_delimiter("^\r"), '^');
+        assert_eq!(decode_delimiter("\t"), '\t');
     }
 }
