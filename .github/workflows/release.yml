@@ -38,6 +38,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The image tags come from the git tag, the binary's version from Cargo.toml.
+      # A tag pushed without bumping Cargo.toml would publish a mislabelled image,
+      # so fail before anything is built or pushed.
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          cargo_version=$(awk '
+            /^\[/ { in_pkg = ($0 == "[package]") }
+            in_pkg && /^version[[:space:]]*=/ { gsub(/^[^"]*"|".*$/, ""); print; exit }
+          ' Cargo.toml)
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ -z "$cargo_version" ] || [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version '${cargo_version}'"
+            exit 1
+          fi
+
       # No setup-qemu-action: needing it would mean a platform is being emulated
       # again, which is the ~2h regression this split exists to prevent.
       - name: Set up Docker Buildx
