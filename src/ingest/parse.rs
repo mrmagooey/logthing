@@ -10,7 +10,8 @@ use chrono::{DateTime, TimeZone, Utc};
 /// Parse one or more newline-delimited HEC event envelopes.
 ///
 /// Each line must be a JSON object with at minimum an `"event"` key.
-/// Optional keys: `"time"` (Unix epoch float), `"host"`, `"sourcetype"`, `"source"`, `"index"`
+/// Optional keys: `"time"` (epoch seconds, or milliseconds when >= 1e11; number or numeric
+/// string), `"host"`, `"sourcetype"`, `"source"`, `"index"`
 /// and `"fields"`.
 /// Blank / whitespace-only lines are skipped.
 ///
@@ -20,6 +21,7 @@ pub fn parse_hec_event_body(
     body: &[u8],
     default_sourcetype: &str,
 ) -> anyhow::Result<Vec<GenericRecord>> {
+    let body = body.strip_prefix(UTF8_BOM).unwrap_or(body);
     let text = std::str::from_utf8(body)?;
     let now = Utc::now();
     let mut records = Vec::new();
@@ -50,7 +52,7 @@ pub fn parse_hec_event_body(
 
         let time = obj
             .get("time")
-            .and_then(|v| v.as_f64())
+            .and_then(envelope_time_secs)
             .map(epoch_float_to_datetime);
 
         let source = obj
@@ -139,15 +141,43 @@ pub fn parse_ndjson_body(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// UTF-8 byte-order mark some Windows forwarders prepend to a request body.
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
+/// Magnitude at or above which an envelope `time` is epoch milliseconds, not seconds
+/// (1e11 s is year 5138; 1e11 ms is 1973).
+const EPOCH_MILLIS_THRESHOLD: f64 = 1e11;
+
+/// Read an envelope `time` (JSON number or numeric string) as epoch seconds.
+///
+/// Values with magnitude >= [`EPOCH_MILLIS_THRESHOLD`] are treated as milliseconds.
+/// Returns `None` for anything unparsable or non-finite.
+fn envelope_time_secs(v: &serde_json::Value) -> Option<f64> {
+    let raw = match v {
+        serde_json::Value::Number(n) => n.as_f64()?,
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    if !raw.is_finite() {
+        return None;
+    }
+    Some(if raw.abs() >= EPOCH_MILLIS_THRESHOLD {
+        raw / 1000.0
+    } else {
+        raw
+    })
+}
+
 /// Convert a Unix epoch float (seconds, possibly fractional) to `DateTime<Utc>`.
 ///
+/// The sub-second part is always non-negative (`-1.5` is 1969-12-31T23:59:58.5Z).
 /// Out-of-range or non-finite values fall back to `Utc::now()` rather than
-/// panicking.  The saturating f64→i64/u32 casts (stable since Rust 1.45) mean
-/// no cast can panic; `timestamp_opt` handles the out-of-range case.
+/// panicking.  The saturating f64->i64 cast means no cast can panic;
+/// `timestamp_opt` handles the out-of-range case.
 fn epoch_float_to_datetime(epoch_secs: f64) -> DateTime<Utc> {
-    let secs = epoch_secs.trunc() as i64;
-    let nanos = ((epoch_secs.fract()).abs() * 1_000_000_000.0).round() as u32;
-    Utc.timestamp_opt(secs, nanos)
+    let whole = epoch_secs.floor();
+    let nanos = (((epoch_secs - whole) * 1_000_000_000.0).round() as u32).min(999_999_999);
+    Utc.timestamp_opt(whole as i64, nanos)
         .single()
         .unwrap_or_else(Utc::now)
 }
@@ -157,6 +187,64 @@ mod tests {
     use super::*;
 
     // ---- parse_hec_event_body ----
+
+    // ---- HEC time parsing / BOM ----
+
+    fn time_of(json_time: &str) -> Option<DateTime<Utc>> {
+        let body = format!(r#"{{"event":{{"x":1}},"time":{json_time}}}"#);
+        parse_hec_event_body(body.as_bytes(), "t").unwrap()[0].time
+    }
+
+    /// f64 seconds near 1.7e9 carry ~0.2us of error; allow 1us.
+    fn assert_near_nanos(t: DateTime<Utc>, want: u32) {
+        let got = t.timestamp_subsec_nanos();
+        assert!(got.abs_diff(want) < 1_000, "subsec {got} not near {want}");
+    }
+
+    #[test]
+    fn test_time_string_parses_like_number() {
+        let t = time_of(r#""1700000000.123""#).unwrap();
+        assert_eq!(t.timestamp(), 1_700_000_000);
+        assert_near_nanos(t, 123_000_000);
+        assert_eq!(t, time_of("1700000000.123").unwrap());
+    }
+
+    #[test]
+    fn test_time_millis_at_or_above_1e11_is_epoch_millis() {
+        let t = time_of("1700000000123").unwrap();
+        assert_eq!(t.timestamp(), 1_700_000_000);
+        assert_near_nanos(t, 123_000_000);
+        assert_eq!(t.date_naive().to_string(), "2023-11-14");
+        let t = time_of("1.7e12").unwrap();
+        assert_eq!(t.timestamp(), 1_700_000_000);
+        assert_eq!(time_of("99999999999").unwrap().timestamp(), 99_999_999_999);
+        assert_eq!(time_of("100000000000").unwrap().timestamp(), 100_000_000);
+    }
+
+    #[test]
+    fn test_time_negative_fraction_has_nonnegative_subsecond() {
+        let t = time_of("-1.5").unwrap();
+        assert_eq!(t.timestamp(), -2);
+        assert_eq!(t.timestamp_subsec_nanos(), 500_000_000);
+    }
+
+    #[test]
+    fn test_time_unparsable_string_is_none() {
+        assert!(time_of(r#""yesterday""#).is_none());
+        assert!(time_of(r#""""#).is_none());
+        assert!(time_of("true").is_none());
+        assert!(time_of(r#""NaN""#).is_none());
+        assert!(time_of(r#""inf""#).is_none());
+    }
+
+    #[test]
+    fn test_hec_event_leading_bom_is_stripped() {
+        let mut body = vec![0xEF, 0xBB, 0xBF];
+        body.extend_from_slice(b"{\"event\":{\"a\":1}}\n{\"event\":{\"a\":2}}\n");
+        let records = parse_hec_event_body(&body, "t").unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].fields["a"], 2);
+    }
 
     #[test]
     fn hec_event_single_envelope() {

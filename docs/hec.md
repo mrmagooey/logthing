@@ -31,7 +31,7 @@ Stored in the Iceberg table `hec` (partition path segment = sanitized `sourcetyp
 |---|---|---|
 | `sourcetype` | string, not null | |
 | `host` | string | envelope `host` / none for raw and NDJSON |
-| `time` | timestamp(us, UTC) | envelope `time` (epoch seconds) |
+| `time` | timestamp(us, UTC) | envelope `time`: epoch seconds, or epoch milliseconds when >= 1e11 (see below) |
 | `received_at` | timestamp(us, UTC), not null | |
 | `fields` | string (JSON), not null | the event payload (envelope `event`, the NDJSON object, or `{"raw": ...}`) |
 | `partition_time` | timestamp(us, UTC), not null | |
@@ -39,6 +39,13 @@ Stored in the Iceberg table `hec` (partition path segment = sanitized `sourcetyp
 | `source` | string | envelope `source` |
 | `index` | string | envelope `index` |
 | `indexed_fields` | string (JSON) | envelope `fields` object (Splunk "indexed fields") |
+
+Envelope `time` may be a JSON number or a numeric string (`"1700000000.123"`), with a
+fractional part. A magnitude of 1e11 or more is read as epoch **milliseconds** (so
+`1700000000123` is 2023-11-14T22:13:20.123Z); anything smaller is seconds. Negative
+fractional times keep a non-negative sub-second part (`-1.5` is 1969-12-31T23:59:58.5Z).
+An unparsable `time` is stored as NULL. A leading UTF-8 byte-order mark on a
+`/services/collector/event` body is ignored.
 
 Payloads are free-form, so no keys are promoted out of `fields`; extract them in SQL, e.g.
 `json_extract_scalar(fields, '$.user')`. The four new columns were appended in 0.22.0; the

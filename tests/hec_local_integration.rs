@@ -542,3 +542,74 @@ async fn hec_typed_columns_and_event_uuid_land_in_local_parquet() {
         r#"{"env":"prod"}"#
     );
 }
+
+/// A BOM-prefixed two-line HEC body whose envelopes carry string and millisecond times is
+/// accepted over HTTP and lands as two rows with the right `time` values.
+#[tokio::test]
+async fn hec_bom_body_with_string_and_millis_times_lands_two_rows() {
+    use arrow::array::{Array, TimestampMicrosecondArray};
+    use axum::{Extension, Router, routing::post};
+    use logthing::config::Config;
+    use logthing::ingest::{IngestState, handlers::handle_hec_event};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let sink = std::sync::Arc::new(LocalDiskSink::new(tmp.path().to_path_buf()).await.unwrap());
+    let cfg = GenericLocalConfig {
+        directory: tmp.path().to_path_buf(),
+        prefix: "hec".to_string(),
+        flush_threshold_bytes: 1,
+        flush_interval_secs: 1,
+        channel_capacity: 256,
+        max_buffer_rows: 100_000,
+    };
+    let (handler, _join) = hec_local_start(
+        &cfg,
+        sink,
+        64,
+        std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+    let state = IngestState {
+        generic_local: Some(handler),
+        ..Default::default()
+    };
+    let router: Router = Router::new()
+        .route("/services/collector/event", post(handle_hec_event))
+        .layer(Extension(std::sync::Arc::new(tokio::sync::RwLock::new(
+            Config::default(),
+        ))))
+        .layer(Extension(state));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let mut body = vec![0xEF, 0xBB, 0xBF];
+    body.extend_from_slice(
+        b"{\"event\":{\"n\":1},\"time\":\"1700000000.5\"}\n{\"event\":{\"n\":2},\"time\":1700000001000}\n",
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/services/collector/event"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let batches = common::wait_for_rows(tmp.path(), 2, std::time::Duration::from_secs(15)).await;
+    let mut times: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| {
+            let col = b
+                .column_by_name("time")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
+        })
+        .collect();
+    times.sort();
+    assert_eq!(times.len(), 2);
+    assert!((times[0] - 1_700_000_000_500_000).abs() < 10, "{times:?}");
+    assert!((times[1] - 1_700_000_001_000_000).abs() < 10, "{times:?}");
+}
