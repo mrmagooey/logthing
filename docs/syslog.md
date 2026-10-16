@@ -47,8 +47,10 @@ Header parsing details:
   Text such as `Failed password for root port 22: x` or an auditd `type=SYSCALL ...` line has
   no tag and is kept whole as the message. A CEF/LEEF payload directly after the hostname is
   likewise never treated as a tag, so it reaches the CEF/LEEF parser.
-- A `<PRI>` above 191 is not valid. Such a line is kept whole (prefix included) as the message
-  with the RFC 3164 default priority (facility user, severity notice) instead of being dropped.
+- A line with a `<PRI>` that matches neither header format is kept, not dropped. A valid PRI
+  (0-191) is honoured and removed from the message (`<34>free text` -> priority 34, message
+  `free text`). A PRI above 191 is not valid: the whole raw line, prefix included, becomes the
+  message with the RFC 3164 default priority (facility user, severity notice).
 
 **HTTP Endpoints**:
 - `POST /syslog` - Submit syslog messages via HTTP

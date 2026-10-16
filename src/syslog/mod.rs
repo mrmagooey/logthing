@@ -314,10 +314,14 @@ impl SyslogMessage {
             });
         }
 
-        // A `<PRI>` prefix with a value above 191 (facility > 23) is not valid; keep the
-        // whole line, prefix included, as the message instead of dropping it.
-        if Self::has_pri_prefix(input) {
-            let priority = DEFAULT_PRIORITY;
+        // A `<PRI>` prefix that the 5424/3164 header regexes rejected. Keep the line rather
+        // than drop it: a valid PRI is honoured and stripped from the message; a PRI above 191
+        // is not valid, so the raw line (prefix included) is kept with the default priority.
+        if let Some((digits, body)) = Self::split_pri_prefix(input) {
+            let (priority, message) = match Self::parse_pri(digits) {
+                Some(p) => (p, body),
+                None => (DEFAULT_PRIORITY, input),
+            };
             return Some(SyslogMessage {
                 priority,
                 severity: priority & 0x07,
@@ -327,7 +331,7 @@ impl SyslogMessage {
                 app_name: None,
                 proc_id: None,
                 msg_id: None,
-                message: input.to_string(),
+                message: message.to_string(),
                 structured_data: None,
                 protocol: SyslogProtocol::Unknown,
             });
@@ -336,11 +340,14 @@ impl SyslogMessage {
         None
     }
 
-    /// True when `input` starts with `<` 1-3 digits `>`.
-    fn has_pri_prefix(input: &str) -> bool {
-        let b = input.as_bytes();
-        let digits = b.iter().skip(1).take_while(|c| c.is_ascii_digit()).count();
-        b.first() == Some(&b'<') && (1..=3).contains(&digits) && b.get(digits + 1) == Some(&b'>')
+    /// Split `<1-3 digits>rest` into the digits and `rest`.
+    fn split_pri_prefix(input: &str) -> Option<(&str, &str)> {
+        let inner = input.strip_prefix('<')?;
+        let digits = inner.bytes().take_while(u8::is_ascii_digit).count();
+        if !(1..=3).contains(&digits) {
+            return None;
+        }
+        Some((&inner[..digits], inner[digits..].strip_prefix('>')?))
     }
 
     /// Parse the `<PRI>` digits; `None` when above 191 (the maximum valid PRI, 23 * 8 + 7).
@@ -569,32 +576,39 @@ impl SyslogMessage {
                         }
                         let name = rest[name_start..pos].to_string();
                         pos += 1;
-                        if *b.get(pos)? != b'"' {
-                            return None;
-                        }
-                        pos += 1;
-                        let mut value = Vec::new();
-                        loop {
-                            match *b.get(pos)? {
-                                b'"' => break,
-                                b'\\' if matches!(b.get(pos + 1), Some(b'"' | b'\\' | b']')) => {
-                                    value.push(b[pos + 1]);
-                                    pos += 2;
-                                }
-                                c => {
-                                    value.push(c);
-                                    pos += 1;
-                                }
-                            }
-                        }
-                        pos += 1;
-                        params.insert(name, String::from_utf8(value).ok()?);
+                        let value = Self::scan_param_value(b, &mut pos)?;
+                        params.insert(name, value);
                     }
                 }
             }
             sd.insert(id, params);
         }
         Some((sd, pos))
+    }
+
+    /// Scan a quoted PARAM-VALUE starting at the opening `"` (`*pos`), unescaping `\"`, `\\`
+    /// and `\]`. Leaves `*pos` just past the closing quote.
+    fn scan_param_value(b: &[u8], pos: &mut usize) -> Option<String> {
+        if *b.get(*pos)? != b'"' {
+            return None;
+        }
+        *pos += 1;
+        let mut value = Vec::new();
+        loop {
+            match *b.get(*pos)? {
+                b'"' => break,
+                b'\\' if matches!(b.get(*pos + 1), Some(b'"' | b'\\' | b']')) => {
+                    value.push(b[*pos + 1]);
+                    *pos += 2;
+                }
+                c => {
+                    value.push(c);
+                    *pos += 1;
+                }
+            }
+        }
+        *pos += 1;
+        String::from_utf8(value).ok()
     }
 
     /// Get severity as enum
@@ -874,6 +888,45 @@ mod tests {
         assert_eq!((m.facility, m.severity), (23, 7));
         // Non-PRI garbage still returns None.
         assert!(SyslogMessage::parse("<abc>garbage").is_none());
+    }
+
+    #[test]
+    fn test_parse_valid_pri_unparsable_header_keeps_real_priority() {
+        let m = SyslogMessage::parse("<34>free text").unwrap();
+        assert_eq!((m.priority, m.facility, m.severity), (34, 4, 2));
+        assert_eq!(m.message, "free text");
+        assert!(matches!(m.protocol, SyslogProtocol::Unknown));
+        let m = SyslogMessage::parse("<200>x").unwrap();
+        assert_eq!(m.priority, 13);
+        assert_eq!(m.message, "<200>x");
+    }
+
+    #[test]
+    fn test_parse_pri_edge_forms() {
+        let m = SyslogMessage::parse("<013>free text").unwrap();
+        assert_eq!(m.priority, 13);
+        assert_eq!(m.message, "free text");
+        let m = SyslogMessage::parse("<0>free text").unwrap();
+        assert_eq!((m.priority, m.facility, m.severity), (0, 0, 0));
+        // Four digits is not a PRI at all: unchanged behaviour, line is not parsed.
+        assert!(SyslogMessage::parse("<1000>free text").is_none());
+    }
+
+    #[test]
+    fn test_parse_rfc5424_sd_malformed_forms_are_message() {
+        for body in [
+            r#"[a@1 x=1] m"#,
+            r#"[a@1 x=v" y="2"] m"#,
+            r#"[a@1 x="a\"] m"#,
+            r#"[a@1 x="1"][b@2 y=2] m"#,
+        ] {
+            let m = SyslogMessage::parse(&format!("<1>1 - h a - - {body}")).unwrap();
+            assert!(m.structured_data.is_none(), "{body}");
+            assert_eq!(m.message, body);
+        }
+        // An escaped backslash right before the closing quote is a complete value.
+        let m = SyslogMessage::parse(r#"<1>1 - h a - - [a@1 x="a\\"] m"#).unwrap();
+        assert_eq!(m.structured_data.unwrap()["a@1"]["x"], r"a\");
     }
 
     #[test]
