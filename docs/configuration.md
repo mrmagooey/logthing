@@ -125,9 +125,9 @@ wire-protocol listener (syslog, IPFIX, Zeek, Suricata, sFlow) stops on its own, 
 because its port could not be bound, the same shutdown sequence runs and the process then exits
 with a non-zero status so a supervisor restarts it. Allow at least 30 s for a stop (Docker
 `--stop-timeout`/Compose `stop_grace_period`, Kubernetes `terminationGracePeriodSeconds`);
-Docker's 10 s default is shorter than the worst-case drain. If an HTTP request is still in flight 10 s after the signal, the
-server is aborted without ending that connection's task; the writers then time out without
-end-of-stream and rows received since the last periodic flush can be lost. See
+Docker's 10 s default is shorter than the worst-case drain. If an HTTP request is still in
+flight 10 s after the signal, the server is aborted without ending that connection's task; the
+writers then time out without end-of-stream and rows received since the last periodic flush can be lost. See
 [delivery-semantics.md](delivery-semantics.md).
 
 ## Shared S3 connection keys

@@ -109,7 +109,7 @@ Basic Auth credentials. This is opt-in and additive — Basic Auth keeps
 working unchanged as a fallback.
 
 ```bash
-LOGTHING_ADMIN_TRUST_PROXY_HEADERS=true                       # true/1/yes/on; other values stop startup
+LOGTHING_ADMIN_TRUST_PROXY_HEADERS=true                       # other non-boolean values stop startup
 LOGTHING_ADMIN_TRUSTED_HEADER=X-authentik-username           # default shown
 LOGTHING_ADMIN_TRUSTED_GROUPS_HEADER=X-authentik-groups       # default shown
 LOGTHING_ADMIN_TRUSTED_SECRET_HEADER=X-Admin-Proxy-Secret     # default shown
