@@ -21,6 +21,21 @@ tasks help only with many distinct senders (or source ports); `recv_batch_size` 
 helps a single high-rate sender. `0` is treated as `1` for both. Values above the built-in maximum for
 `recv_tasks` or `recv_batch_size` are rejected at config load.
 
+**TCP framing:** the TCP listener accepts both RFC 6587 framings, chosen per frame, so
+they may be mixed on one connection:
+
+- *Octet-counting* (§3.4.1): `LEN SP MSG`, e.g. `57 <34>1 2024-01-15T10:30:45Z ...`. The
+  message is exactly `LEN` bytes, so it may contain newlines. A frame is treated as
+  octet-counted only when it starts with 1-7 digits (first digit 1-9), one space, and `<` (the
+  message's PRI).
+- *Newline-terminated* (§3.4.2): everything else. A line that merely begins with a digit
+  (for example `2026-10-16 12:00 host app: msg` or `12 apples`) stays newline-framed.
+
+A length above 256 KiB, like a newline-framed line above 256 KiB, is counted in
+`syslog_oversized_lines` and the connection is closed. An octet-counted frame still incomplete
+at idle timeout or shutdown is dropped (at shutdown it counts in
+`syslog_partial_lines_dropped_at_shutdown`).
+
 **TCP idle timeout:** a TCP connection to the syslog listener (and, the same
 way, to the Zeek TCP listener — see [zeek.md](zeek.md) — and the Suricata TCP
 listener) is closed if it goes 300 seconds (5 minutes) without delivering a

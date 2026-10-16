@@ -751,10 +751,11 @@ impl SyslogListener {
         }
     }
 
-    /// Start TCP syslog listener (newline framing only).
+    /// Start TCP syslog listener (newline and octet-counting framing).
     ///
-    /// Each message is terminated by a `\n` byte (RFC 6587 §3.4.2 non-transparent
-    /// framing).  RFC 6587 octet-counting framing (§3.4.1) is **not** implemented.
+    /// Each frame is either newline-terminated (RFC 6587 §3.4.2 non-transparent
+    /// framing) or octet-counted (§3.4.1, `LEN SP MSG`); see [`read_tcp_frame`] for how
+    /// the two are told apart.
     async fn start_tcp_listener(&self) -> anyhow::Result<()> {
         let addr: SocketAddr =
             format!("{}:{}", self.config.bind_address, self.config.tcp_port).parse()?;
@@ -824,10 +825,11 @@ impl SyslogListener {
         }
     }
 
-    /// Handle a TCP connection for syslog: bounded read_until loop, one message per line.
+    /// Handle a TCP connection for syslog: one message per newline-terminated line or
+    /// octet-counted frame (see [`read_tcp_frame`]).
     ///
-    /// Each iteration reads at most `SYSLOG_MAX_LINE_BYTES + 1` bytes via a
-    /// `take` adapter, so heap growth per connection is provably bounded by that
+    /// Each frame read buffers at most `SYSLOG_MAX_LINE_BYTES + 1` bytes (a `take`
+    /// adapter for lines, the checked count for octet frames), so heap growth per connection is provably bounded by that
     /// constant regardless of client behaviour.  If the cap is hit without a
     /// terminating `\n` the connection is closed immediately; resyncing would
     /// itself require unbounded buffering.
@@ -841,20 +843,20 @@ impl SyslogListener {
     ) -> anyhow::Result<()> {
         let mut reader = BufReader::new(stream);
         let mut buf: Vec<u8> = Vec::new();
+        let mut mode = FrameMode::Undecided;
         // Set once shutdown is signalled: the connection then reads only what is already
-        // available (zero-length read timeout), dispatching every complete line, and ends.
+        // available (zero-length read timeout), dispatching every complete frame, and ends.
         let mut draining = false;
-        // The previous read was cancelled by shutdown: keep its partial line in `buf`.
+        // The previous read was cancelled by shutdown: keep its partial frame in `buf`/`mode`.
         let mut resume = false;
 
         loop {
             if !resume {
                 buf.clear();
+                mode = FrameMode::Undecided;
             }
             resume = false;
-            let remaining = (SYSLOG_MAX_LINE_BYTES + 1).saturating_sub(buf.len()) as u64;
-            let mut limited = (&mut reader).take(remaining);
-            let read = limited.read_until(b'\n', &mut buf);
+            let read = read_tcp_frame(&mut reader, &mut buf, &mut mode);
             let timed = if draining {
                 tokio::time::timeout(Duration::ZERO, read).await
             } else {
@@ -873,7 +875,7 @@ impl SyslogListener {
                     }
                 }
             };
-            let n = match timed {
+            let frame = match timed {
                 Err(_elapsed) if draining => {
                     if !buf.is_empty() {
                         metrics::counter!("syslog_partial_lines_dropped_at_shutdown").increment(1);
@@ -890,33 +892,44 @@ impl SyslogListener {
                     debug!("TCP connection from {} idle past timeout; closing", src);
                     break;
                 }
-                Ok(Ok(n)) => n,
+                Ok(Ok(frame)) => frame,
                 Ok(Err(e)) => {
                     error!("TCP read error from {}: {}", src, e);
                     break;
                 }
             };
-            if n == 0 && buf.is_empty() {
-                // Connection closed cleanly.
-                debug!("TCP connection from {} closed", src);
-                break;
-            }
-            // If we read SYSLOG_MAX_LINE_BYTES+1 bytes and the last byte is NOT
-            // a newline, the line exceeded the cap — close immediately.
-            if buf.len() > SYSLOG_MAX_LINE_BYTES && buf.last() != Some(&b'\n') {
-                metrics::counter!("syslog_oversized_lines").increment(1);
-                warn!(
-                    "Syslog: line from {} exceeded {} bytes; closing connection",
-                    src, SYSLOG_MAX_LINE_BYTES
-                );
-                break;
-            }
-            // Trim trailing \r\n / \n.
-            if buf.last() == Some(&b'\n') {
-                buf.pop();
-            }
-            if buf.last() == Some(&b'\r') {
-                buf.pop();
+            match frame {
+                TcpFrame::Closed => {
+                    debug!("TCP connection from {} closed", src);
+                    break;
+                }
+                TcpFrame::Oversize => {
+                    metrics::counter!("syslog_oversized_lines").increment(1);
+                    warn!(
+                        "Syslog: frame from {} exceeded {} bytes; closing connection",
+                        src, SYSLOG_MAX_LINE_BYTES
+                    );
+                    break;
+                }
+                TcpFrame::Truncated => {
+                    warn!(
+                        "Syslog: octet-counted frame from {} cut short ({} bytes read); closing",
+                        src,
+                        buf.len()
+                    );
+                    break;
+                }
+                TcpFrame::Line => {
+                    // Trim trailing \r\n / \n.
+                    if buf.last() == Some(&b'\n') {
+                        buf.pop();
+                    }
+                    if buf.last() == Some(&b'\r') {
+                        buf.pop();
+                    }
+                }
+                // The count defines the message: embedded newlines are content.
+                TcpFrame::Octets => {}
             }
             if buf.is_empty() {
                 continue;
@@ -947,6 +960,135 @@ impl SyslogListener {
         }
 
         Ok(())
+    }
+}
+
+/// Framing state of the TCP syslog frame currently being read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameMode {
+    /// Not enough bytes seen yet to choose a framing.
+    Undecided,
+    /// Newline-terminated line.
+    Newline,
+    /// RFC 6587 octet-counted frame: the body is exactly this many bytes.
+    Octets(usize),
+}
+
+/// Outcome of one [`read_tcp_frame`] call.
+#[derive(Debug, PartialEq, Eq)]
+enum TcpFrame {
+    /// Peer closed cleanly between frames.
+    Closed,
+    /// A newline-framed line is in the buffer (terminator possibly still attached).
+    Line,
+    /// An octet-counted message body is in the buffer.
+    Octets,
+    /// The peer closed in the middle of an octet-counted frame.
+    Truncated,
+    /// The line, or the declared octet count, exceeds `SYSLOG_MAX_LINE_BYTES`.
+    Oversize,
+}
+
+/// Decide the framing from the bytes of a frame seen so far (all of them leading
+/// digits-and-space candidates). `None` means more bytes are needed.
+///
+/// Octet-counting is chosen only for `1-7 digits (first 1-9), one space, '<'`: a
+/// newline-framed line without a PRI can legitimately start with a digit (a
+/// timestamp, `12 apples`), and must not be mistaken for a length.
+fn classify_frame_prefix(prefix: &[u8]) -> Option<FrameMode> {
+    let &first = prefix.first()?;
+    if !(b'1'..=b'9').contains(&first) {
+        return Some(FrameMode::Newline);
+    }
+    let digits = prefix.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits > 7 {
+        return Some(FrameMode::Newline);
+    }
+    match prefix.get(digits) {
+        None => None,
+        Some(b' ') => match prefix.get(digits + 1) {
+            None => None,
+            Some(b'<') => {
+                let len = std::str::from_utf8(&prefix[..digits]).ok()?.parse().ok()?;
+                Some(FrameMode::Octets(len))
+            }
+            Some(_) => Some(FrameMode::Newline),
+        },
+        Some(_) => Some(FrameMode::Newline),
+    }
+}
+
+/// Read one TCP syslog frame into `buf`, choosing between newline and octet-counting
+/// framing (see [`classify_frame_prefix`]).
+///
+/// Cancel-safe: progress lives in `buf` and `mode`, so a cancelled call can be
+/// re-issued with the same arguments and continues where it stopped. For an
+/// octet-counted frame `buf` holds only the message body. Memory per connection is
+/// bounded by `SYSLOG_MAX_LINE_BYTES + 1`.
+async fn read_tcp_frame(
+    reader: &mut BufReader<TcpStream>,
+    buf: &mut Vec<u8>,
+    mode: &mut FrameMode,
+) -> std::io::Result<TcpFrame> {
+    // Choose the framing. Bytes are consumed one at a time and only while the prefix is
+    // still ambiguous (at most 9 bytes), so a newline-framed line simply continues.
+    while *mode == FrameMode::Undecided {
+        if let Some(decided) = classify_frame_prefix(buf) {
+            *mode = decided;
+            if let FrameMode::Octets(len) = decided {
+                if len > SYSLOG_MAX_LINE_BYTES {
+                    return Ok(TcpFrame::Oversize);
+                }
+                // Drop the "LEN SP" header; keep the '<' that starts the message.
+                buf.clear();
+                buf.push(b'<');
+            }
+            break;
+        }
+        let avail = reader.fill_buf().await?;
+        let Some(&next) = avail.first() else {
+            if buf.is_empty() {
+                return Ok(TcpFrame::Closed);
+            }
+            *mode = FrameMode::Newline;
+            break;
+        };
+        if buf.is_empty() && !(b'1'..=b'9').contains(&next) {
+            *mode = FrameMode::Newline;
+            break;
+        }
+        buf.push(next);
+        reader.consume(1);
+    }
+    match *mode {
+        FrameMode::Octets(len) => {
+            while buf.len() < len {
+                let avail = reader.fill_buf().await?;
+                if avail.is_empty() {
+                    return Ok(TcpFrame::Truncated);
+                }
+                let take = avail.len().min(len - buf.len());
+                buf.extend_from_slice(&avail[..take]);
+                reader.consume(take);
+            }
+            Ok(TcpFrame::Octets)
+        }
+        _ => {
+            let remaining = (SYSLOG_MAX_LINE_BYTES + 1).saturating_sub(buf.len()) as u64;
+            (&mut *reader)
+                .take(remaining)
+                .read_until(b'\n', buf)
+                .await?;
+            // Hitting the cap without a terminating newline means the line is too long;
+            // resyncing would itself need unbounded buffering.
+            if buf.len() > SYSLOG_MAX_LINE_BYTES && buf.last() != Some(&b'\n') {
+                Ok(TcpFrame::Oversize)
+            } else if buf.is_empty() {
+                Ok(TcpFrame::Closed)
+            } else {
+                Ok(TcpFrame::Line)
+            }
+        }
     }
 }
 
@@ -2553,5 +2695,134 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+    /// Send `payload`, close the write side, and return what the connection task dispatched
+    /// plus the connection task's own end (it must end on EOF).
+    async fn run_frames(payload: &[u8]) -> Vec<SyslogMessage> {
+        let (mut client, task, _tx, handler) = shutdown_conn_setup().await;
+        client.write_all(payload).await.unwrap();
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("connection task must end on EOF")
+            .unwrap();
+        handler.take_messages()
+    }
+
+    fn octet_frame(body: &str) -> Vec<u8> {
+        format!("{} {}", body.len(), body).into_bytes()
+    }
+
+    #[tokio::test]
+    async fn test_octet_counted_frame_with_embedded_newline() {
+        let body = "<134>Jan 15 10:30:45 host app: first\nsecond line";
+        let msgs = run_frames(&octet_frame(body)).await;
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            msgs[0].message.contains("first\nsecond line"),
+            "embedded newline must be preserved: {:?}",
+            msgs[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_octet_counted_then_newline_frame_same_conn() {
+        let mut payload = octet_frame("<134>Jan 15 10:30:45 host app: counted");
+        payload.extend_from_slice(b"<134>Jan 15 10:30:46 host app: lined\n");
+        payload.extend(octet_frame("<134>Jan 15 10:30:47 host app: counted again"));
+        let msgs = run_frames(&payload).await;
+        let texts: Vec<_> = msgs.iter().map(|m| m.message.as_str()).collect();
+        assert_eq!(texts, ["counted", "lined", "counted again"]);
+    }
+
+    #[tokio::test]
+    async fn test_octet_count_over_limit_closes() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let payload = format!(
+            "{} <134>Jan 15 10:30:45 host app: x\n",
+            SYSLOG_MAX_LINE_BYTES + 1
+        );
+        let valid = "<134>Jan 15 10:30:45 host app: after\n";
+        let msgs = run_frames(format!("{payload}{valid}").as_bytes()).await;
+        assert!(msgs.is_empty(), "connection must close, nothing dispatched");
+        let oversized = snapshotter
+            .snapshot()
+            .into_vec()
+            .iter()
+            .any(|(k, _, _, _)| k.key().name() == "syslog_oversized_lines");
+        assert!(oversized, "syslog_oversized_lines must be counted");
+    }
+
+    /// A line that merely starts with digits is newline-framed, not an octet count: only
+    /// `DIGITS SP '<'` is a length prefix.
+    #[tokio::test]
+    async fn test_digit_leading_newline_lines_stay_newline_framed() {
+        for lead in [
+            "2026-10-16 12:00 host app: dated",
+            "12 apples and a very long tail",
+        ] {
+            let payload = format!("{lead}\n<134>Jan 15 10:30:45 host app: after\n");
+            let msgs = run_frames(payload.as_bytes()).await;
+            let last = msgs
+                .last()
+                .expect("the line after must still be dispatched");
+            assert_eq!(
+                last.message, "after",
+                "lead {lead:?} swallowed the next line"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_frame_prefix_requires_digits_space_pri() {
+        use FrameMode::*;
+        assert_eq!(classify_frame_prefix(b""), None);
+        assert_eq!(classify_frame_prefix(b"57"), None);
+        assert_eq!(classify_frame_prefix(b"57 "), None);
+        assert_eq!(classify_frame_prefix(b"57 <"), Some(Octets(57)));
+        assert_eq!(classify_frame_prefix(b"2026-10-16 12:00"), Some(Newline));
+        assert_eq!(classify_frame_prefix(b"12 apples"), Some(Newline));
+        assert_eq!(classify_frame_prefix(b"12x"), Some(Newline));
+        assert_eq!(classify_frame_prefix(b"0 <1>"), Some(Newline));
+        assert_eq!(classify_frame_prefix(b"<34>1"), Some(Newline));
+        assert_eq!(classify_frame_prefix(b"12345678 <"), Some(Newline));
+        assert_eq!(classify_frame_prefix(b"1234567 <"), Some(Octets(1234567)));
+    }
+
+    /// An octet frame cut short by shutdown is counted as a partial line.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn test_partial_octet_frame_counted_at_shutdown() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let (mut client, task, tx, handler) = shutdown_conn_setup().await;
+        client
+            .write_all(b"100 <134>Jan 15 10:30:45 host app: cut")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("task must end within 1 s of shutdown")
+            .unwrap();
+        assert!(handler.take_messages().is_empty());
+        let counted = snapshotter
+            .snapshot()
+            .into_vec()
+            .iter()
+            .any(|(k, _, _, _)| k.key().name() == "syslog_partial_lines_dropped_at_shutdown");
+        assert!(counted, "partial octet frame must be counted");
+        drop(client);
     }
 }
