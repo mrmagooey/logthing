@@ -185,20 +185,28 @@ client = boto3.client(
 )
 ts = pa.timestamp("us", tz="UTC")
 now = datetime.now(timezone.utc)
+# Same columns/nullability logthing writes for HEC (src/forwarding/generic_s3.rs) minus the
+# post-0.22 optional columns, plus one brand-new NON-NULLABLE column.
 schema = pa.schema(
     [
         pa.field("sourcetype", pa.string(), nullable=False),
+        pa.field("host", pa.string(), nullable=True),
+        pa.field("time", ts, nullable=True),
+        pa.field("received_at", ts, nullable=False),
         pa.field("fields", pa.string(), nullable=False),
-        pa.field("e2e_required_col", pa.string(), nullable=False),
         pa.field("partition_time", ts, nullable=False),
+        pa.field("e2e_required_col", pa.string(), nullable=False),
     ]
 )
 table = pa.Table.from_arrays(
     [
         pa.array(["required"], pa.string()),
-        pa.array(['{"marker":"required-col-row"}'], pa.string()),
-        pa.array(["rc-1"], pa.string()),
+        pa.array([None], pa.string()),
+        pa.array([None], ts),
         pa.array([now], ts),
+        pa.array(['{"marker":"required-col-row"}'], pa.string()),
+        pa.array([now], ts),
+        pa.array(["rc-1"], pa.string()),
     ],
     schema=schema,
 )
