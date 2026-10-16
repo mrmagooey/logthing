@@ -949,7 +949,12 @@ async fn async_main() -> anyhow::Result<()> {
     //    HTTP: it stops accepting, closes idle keep-alive connections and finishes in-flight
     //    requests, then drops `AppState` (the WEF/HEC/OTLP senders). This must complete (or be
     //    aborted) before the writers are awaited, or those senders keep the channels open and
-    //    the writers never see end-of-stream.
+    //    the writers never see end-of-stream. A panic of the server task fails the exit code; a
+    //    drain timeout (abort after 10 s) does not. Caveat: aborting the server task does not
+    //    abort axum's per-connection tasks, which may still hold `AppState` and so the writer
+    //    senders; the writers then hit their own 10 s deadline without end-of-stream and rows
+    //    received since the last periodic flush can be lost. Only requests still in flight
+    //    after 10 s at shutdown trigger this.
     //
     //    Listeners: each drains its tracked connection tasks for up to `CONNECTION_DRAIN_GRACE`
     //    after the shutdown signal, so allow that plus a margin before aborting. One shared
@@ -960,18 +965,10 @@ async fn async_main() -> anyhow::Result<()> {
         if server_done {
             return;
         }
-        let abort = server_task.abort_handle();
-        match tokio::time::timeout(Duration::from_secs(10), &mut server_task).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(e))) => {
-                error!("Server error during shutdown: {}", e);
-                exit_error.get_or_insert(e.context("HTTP server failed"));
-            }
-            Ok(Err(e)) => error!("Server task panicked or was cancelled: {e}"),
-            Err(_) => {
-                warn!("HTTP server did not drain within 10s; aborting it");
-                abort.abort();
-            }
+        if let Some(e) =
+            logthing::shutdown::drain_http_server(&mut server_task, Duration::from_secs(10)).await
+        {
+            exit_error.get_or_insert(e);
         }
     };
     tokio::join!(
