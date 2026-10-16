@@ -108,15 +108,16 @@ Behaviour changes to check before upgrading:
 
 - OTLP: requests over 100,000 records or over the 256 MiB heap-weighted estimate get `413`
   (lower the exporter batch size, for example `send_batch_max_size`). Records with many
-  attributes reach the 256 MiB estimate well before 100,000 records (roughly 28,000 records per
-  request for attribute-heavy shapes), so size batches by shape. An export is answered
+  attributes reach the 256 MiB estimate well before 100,000 records (an estimated ceiling of
+  about 28,000 records per request for attribute-heavy shapes; not a hard limit, the bound is
+  the 256 MiB heap estimate), so size batches by shape. An export is answered
   `503` instead of `200` when no OTLP sink is configured or a sink channel is closed. Retries
   can duplicate records another sink already accepted (at-least-once).
 - WEF: when a sink drops any event of an Events batch (buffer full or closed), the request is
   answered `503` with `Retry-After: 1` and the bookmark is not advanced; the client re-sends, so
-  duplicates are possible and a permanently closed sink makes clients retry indefinitely. Unparsable event XML
-  is counted and skipped and does not block the bookmark. After Kerberos authentication, a
-  non-empty non-encrypted body is rejected with `400`.
+  duplicates are possible and a permanently closed sink makes clients retry indefinitely.
+  Unparsable event XML is counted and skipped and does not block the bookmark. After Kerberos
+  authentication, a non-empty non-encrypted body is rejected with `400`.
 - Admin UI: behind a proxy the client IP is the rightmost `X-Forwarded-For` hop (the last header
   line); exactly one trusted proxy is assumed. `LOGTHING_ADMIN_ENABLE_RATE_LIMIT` accepts only
   `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off` (case-insensitive), any other value stops
