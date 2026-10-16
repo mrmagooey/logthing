@@ -122,6 +122,11 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     // ── sflow ─────────────────────────────────────────────────────────────
     (
         Kind::Counter,
+        "sflow_counter_records_skipped",
+        "sFlow generic_if_counters records skipped because they were shorter than 88 bytes.",
+    ),
+    (
+        Kind::Counter,
         "sflow_datagrams_received",
         "sFlow datagrams received by the UDP listener.",
     ),
