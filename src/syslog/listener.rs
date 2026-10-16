@@ -402,15 +402,18 @@ impl SyslogListener {
             // runs per process (recv_batch_size <= 1 returns early), so one
             // instance is enough to cover the TCP accept arm in either.
             let mut accept_backoff = crate::net::AcceptBackoff::new("syslog_tcp");
+            let mut conns = crate::net::ConnectionTasks::new();
 
             if self.config.recv_batch_size <= 1 {
                 let mut buf = vec![0u8; 65535];
+                let mut backoff = crate::net::RecvErrorBackoff::new("syslog");
                 loop {
                     tokio::select! {
                         // UDP receive arm
                         result = udp_socket.recv_from(&mut buf) => {
                             match result {
                                 Ok((len, src)) => {
+                                    backoff.reset();
                                     // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
                                     if !self.allowed_ips.is_allowed(&src) {
                                         metrics::counter!("listener_source_rejected", "protocol" => "syslog_udp").increment(1);
@@ -432,7 +435,7 @@ impl SyslogListener {
                                     }
                                 }
                                 Err(e) => {
-                                    error!("UDP receive error: {}", e);
+                                    backoff.on_error(&e).await;
                                 }
                             }
                         }
@@ -450,9 +453,10 @@ impl SyslogListener {
                                         Ok(permit) => {
                                             let handler = handler_tcp.clone();
                                             let cardinality = cardinality_tcp.clone();
-                                            tokio::spawn(async move {
+                                            let conn_shutdown = shutdown_rx.clone();
+                                            conns.spawn(async move {
                                                 let _permit = permit; // held for connection lifetime
-                                                if let Err(e) = Self::handle_tcp_connection(stream, src, handler, tcp_idle_timeout, cardinality).await {
+                                                if let Err(e) = Self::handle_tcp_connection(stream, src, handler, tcp_idle_timeout, cardinality, conn_shutdown).await {
                                                     error!("TCP connection error from {}: {}", src, e);
                                                 }
                                             });
@@ -477,8 +481,8 @@ impl SyslogListener {
                             socket_stats.poll().await;
                         }
                         // Shutdown arm
-                        _ = shutdown_rx.changed() => {
-                            if *shutdown_rx.borrow() {
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
                                 info!("Syslog listener: shutdown signal received");
                                 break;
                             }
@@ -486,6 +490,7 @@ impl SyslogListener {
                     }
                 }
 
+                conns.drain(crate::net::CONNECTION_DRAIN_GRACE).await;
                 return Ok(());
             }
 
@@ -493,12 +498,14 @@ impl SyslogListener {
             // accept arm, stats arm and shutdown arm are byte-for-byte the
             // same as the recv_batch_size <= 1 loop above.
             let mut batch = crate::net::RecvMmsgBatch::new(self.config.recv_batch_size);
+            let mut backoff = crate::net::RecvErrorBackoff::new("syslog");
             loop {
                 tokio::select! {
                     // UDP receive arm (batched)
                     result = batch.recv(&udp_socket) => {
                         match result {
                             Ok(n) => {
+                                backoff.reset();
                                 for i in 0..n {
                                     let Some(src) = batch.src(i) else {
                                         warn!("syslog: batch message with unparseable source address, skipping");
@@ -537,7 +544,7 @@ impl SyslogListener {
                                 // sits beside (this file's `Err(e) => {
                                 // error!("UDP receive error: {}", e); }`
                                 // above) -- not a gap introduced by batching.
-                                error!("Syslog UDP batched receive error: {}", e);
+                                backoff.on_error(&e).await;
                             }
                         }
                     }
@@ -555,7 +562,8 @@ impl SyslogListener {
                                     Ok(permit) => {
                                         let handler = handler_tcp.clone();
                                         let cardinality = cardinality_tcp.clone();
-                                        tokio::spawn(async move {
+                                        let conn_shutdown = shutdown_rx.clone();
+                                        conns.spawn(async move {
                                             let _permit = permit; // held for connection lifetime
                                             if let Err(e) = Self::handle_tcp_connection(
                                                 stream,
@@ -563,6 +571,7 @@ impl SyslogListener {
                                                 handler,
                                                 tcp_idle_timeout,
                                                 cardinality,
+                                                conn_shutdown,
                                             )
                                             .await
                                             {
@@ -590,8 +599,8 @@ impl SyslogListener {
                         socket_stats.poll().await;
                     }
                     // Shutdown arm
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
                             info!("Syslog listener: shutdown signal received");
                             break;
                         }
@@ -599,6 +608,7 @@ impl SyslogListener {
                 }
             }
 
+            conns.drain(crate::net::CONNECTION_DRAIN_GRACE).await;
             return Ok(());
         }
 
@@ -698,11 +708,13 @@ impl SyslogListener {
         let mut socket_stats = crate::net::SocketDropStats::new(&socket, "syslog_udp");
         let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
+        let mut backoff = crate::net::RecvErrorBackoff::new("syslog");
         loop {
             tokio::select! {
                 result = socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, src)) => {
+                            backoff.reset();
                             if !self.allowed_ips.is_allowed(&src) {
                                 metrics::counter!("listener_source_rejected", "protocol" => "syslog_udp")
                                     .increment(1);
@@ -728,7 +740,7 @@ impl SyslogListener {
                             }
                         }
                         Err(e) => {
-                            error!("UDP receive error: {}", e);
+                            backoff.on_error(&e).await;
                         }
                     }
                 }
@@ -758,6 +770,8 @@ impl SyslogListener {
         info!("Syslog TCP listener started on {}", bound);
 
         let semaphore = Arc::new(Semaphore::new(MAX_SYSLOG_TCP_CONNECTIONS));
+        // Never fires: this entry point has no shutdown signal.
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let mut accept_backoff = crate::net::AcceptBackoff::new("syslog_tcp");
 
         loop {
@@ -777,6 +791,7 @@ impl SyslogListener {
                             let handler = self.handler.clone();
                             let tcp_idle_timeout = self.config.tcp_idle_timeout;
                             let cardinality = self.cardinality.clone();
+                            let conn_shutdown = shutdown_rx.clone();
                             tokio::spawn(async move {
                                 let _permit = permit; // held for connection lifetime
                                 if let Err(e) = Self::handle_tcp_connection(
@@ -785,6 +800,7 @@ impl SyslogListener {
                                     handler,
                                     tcp_idle_timeout,
                                     cardinality,
+                                    conn_shutdown,
                                 )
                                 .await
                                 {
@@ -821,16 +837,54 @@ impl SyslogListener {
         handler: Arc<dyn SyslogHandler>,
         idle_timeout: Duration,
         cardinality: Vec<Arc<CardinalityWatcher>>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let mut reader = BufReader::new(stream);
         let mut buf: Vec<u8> = Vec::new();
+        // Set once shutdown is signalled: the connection then reads only what is already
+        // available (zero-length read timeout), dispatching every complete line, and ends.
+        let mut draining = false;
+        // The previous read was cancelled by shutdown: keep its partial line in `buf`.
+        let mut resume = false;
 
         loop {
-            buf.clear();
-            let mut limited = (&mut reader).take((SYSLOG_MAX_LINE_BYTES as u64) + 1);
-            let n = match tokio::time::timeout(idle_timeout, limited.read_until(b'\n', &mut buf))
-                .await
-            {
+            if !resume {
+                buf.clear();
+            }
+            resume = false;
+            let remaining = (SYSLOG_MAX_LINE_BYTES + 1).saturating_sub(buf.len()) as u64;
+            let mut limited = (&mut reader).take(remaining);
+            let read = limited.read_until(b'\n', &mut buf);
+            let timed = if draining {
+                tokio::time::timeout(Duration::ZERO, read).await
+            } else {
+                let cancelled = tokio::select! {
+                    o = tokio::time::timeout(idle_timeout, read) => Ok(o),
+                    changed = shutdown_rx.changed() => {
+                        Err(changed.is_err() || *shutdown_rx.borrow())
+                    }
+                };
+                match cancelled {
+                    Ok(o) => o,
+                    Err(shutdown) => {
+                        draining = shutdown;
+                        resume = true;
+                        continue;
+                    }
+                }
+            };
+            let n = match timed {
+                Err(_elapsed) if draining => {
+                    if !buf.is_empty() {
+                        metrics::counter!("syslog_partial_lines_dropped_at_shutdown").increment(1);
+                        warn!(
+                            "Syslog: dropped partial line ({} bytes) from {} at shutdown",
+                            buf.len(),
+                            src
+                        );
+                    }
+                    break;
+                }
                 Err(_elapsed) => {
                     metrics::counter!("syslog_tcp_idle_timeouts").increment(1);
                     debug!("TCP connection from {} idle past timeout; closing", src);
@@ -842,7 +896,7 @@ impl SyslogListener {
                     break;
                 }
             };
-            if n == 0 {
+            if n == 0 && buf.is_empty() {
                 // Connection closed cleanly.
                 debug!("TCP connection from {} closed", src);
                 break;
@@ -914,11 +968,13 @@ async fn syslog_udp_recv_loop(
 
     if recv_batch_size <= 1 {
         let mut buf = vec![0u8; 65535];
+        let mut backoff = crate::net::RecvErrorBackoff::new("syslog");
         loop {
             tokio::select! {
                 result = socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, src)) => {
+                            backoff.reset();
                             // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
                             if !allowed_ips.is_allowed(&src) {
                                 metrics::counter!("listener_source_rejected", "protocol" => "syslog_udp").increment(1);
@@ -940,7 +996,7 @@ async fn syslog_udp_recv_loop(
                             }
                         }
                         Err(e) => {
-                            error!("UDP receive error: {}", e);
+                            backoff.on_error(&e).await;
                         }
                     }
                 }
@@ -949,8 +1005,8 @@ async fn syslog_udp_recv_loop(
                         stats.poll().await;
                     }
                 }
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
                         info!("Syslog UDP listener: shutdown signal received");
                         break;
                     }
@@ -961,11 +1017,13 @@ async fn syslog_udp_recv_loop(
     }
 
     let mut batch = crate::net::RecvMmsgBatch::new(recv_batch_size);
+    let mut backoff = crate::net::RecvErrorBackoff::new("syslog");
     loop {
         tokio::select! {
             result = batch.recv(&socket) => {
                 match result {
                     Ok(n) => {
+                        backoff.reset();
                         for i in 0..n {
                             let Some(src) = batch.src(i) else {
                                 warn!("syslog: batch message with unparseable source address, skipping");
@@ -998,7 +1056,7 @@ async fn syslog_udp_recv_loop(
                         // same parity note as the inline loop's batched arm
                         // in start_with_shutdown. Retried on the next loop
                         // iteration via batch.recv()'s own readable() await.
-                        error!("Syslog UDP batched receive error: {}", e);
+                        backoff.on_error(&e).await;
                     }
                 }
             }
@@ -1007,8 +1065,8 @@ async fn syslog_udp_recv_loop(
                     stats.poll().await;
                 }
             }
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
                     info!("Syslog UDP listener: shutdown signal received");
                     break;
                 }
@@ -1032,6 +1090,7 @@ async fn syslog_tcp_accept_loop(
     cardinality: Vec<Arc<CardinalityWatcher>>,
 ) {
     let mut accept_backoff = crate::net::AcceptBackoff::new("syslog_tcp");
+    let mut conns = crate::net::ConnectionTasks::new();
     loop {
         tokio::select! {
             result = accept_backoff.accept(&listener) => {
@@ -1047,7 +1106,8 @@ async fn syslog_tcp_accept_loop(
                             Ok(permit) => {
                                 let handler = handler.clone();
                                 let cardinality = cardinality.clone();
-                                tokio::spawn(async move {
+                                let conn_shutdown = shutdown_rx.clone();
+                                conns.spawn(async move {
                                     let _permit = permit; // held for connection lifetime
                                     if let Err(e) = SyslogListener::handle_tcp_connection(
                                         stream,
@@ -1055,6 +1115,7 @@ async fn syslog_tcp_accept_loop(
                                         handler,
                                         idle_timeout,
                                         cardinality,
+                                        conn_shutdown,
                                     )
                                     .await
                                     {
@@ -1077,14 +1138,15 @@ async fn syslog_tcp_accept_loop(
                     }
                 }
             }
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
                     info!("Syslog TCP listener: shutdown signal received");
                     break;
                 }
             }
         }
     }
+    conns.drain(crate::net::CONNECTION_DRAIN_GRACE).await;
 }
 
 /// Example DNS syslog records for testing
@@ -1137,6 +1199,14 @@ pub mod examples {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shutdown receiver that never fires (its sender is leaked, not dropped).
+    fn never_shutdown() -> tokio::sync::watch::Receiver<bool> {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        std::mem::forget(tx);
+        rx
+    }
+
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
@@ -2073,6 +2143,7 @@ mod tests {
             handler,
             Duration::from_secs(5),
             Vec::new(),
+            never_shutdown(),
         )
         .await
         .unwrap();
@@ -2325,5 +2396,162 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// Open a TCP pair and run one `handle_tcp_connection` server task on it.
+    async fn shutdown_conn_setup() -> (
+        tokio::net::TcpStream,
+        tokio::task::JoinHandle<()>,
+        tokio::sync::watch::Sender<bool>,
+        Arc<CapturingHandler>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, src) = listener.accept().await.unwrap();
+        let handler = CapturingHandler::new();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let h: Arc<dyn SyslogHandler> = handler.clone();
+        let task = tokio::spawn(async move {
+            SyslogListener::handle_tcp_connection(
+                stream,
+                src,
+                h,
+                Duration::from_secs(60),
+                Vec::new(),
+                rx,
+            )
+            .await
+            .unwrap();
+        });
+        (client, task, tx, handler)
+    }
+
+    /// An idle-but-open connection holding one complete line plus half a line: on
+    /// shutdown the task ends promptly, the complete line was dispatched, and the
+    /// partial line is counted as dropped.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn test_connection_task_exits_on_shutdown() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let (mut client, task, tx, handler) = shutdown_conn_setup().await;
+        client
+            .write_all(b"<134>Jan 15 10:30:45 host app: test message\n")
+            .await
+            .unwrap();
+        client.write_all(b"<134>Jan 15 10:30:4").await.unwrap();
+        client.flush().await.unwrap();
+        // Let the task read both writes, then stay idle (connection open).
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "connection task must still be idle-open"
+        );
+
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("connection task must end within 1 s of shutdown")
+            .unwrap();
+
+        assert_eq!(
+            handler.take_messages().len(),
+            1,
+            "the complete line must be dispatched"
+        );
+        let map = snapshotter.snapshot().into_hashmap();
+        let partial = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("syslog_partial_lines_dropped_at_shutdown"),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert_eq!(partial, 1, "the half line must be counted as dropped");
+        drop(client);
+    }
+
+    /// A dropped shutdown sender means shutdown (it must not spin or hang the task).
+    #[tokio::test]
+    async fn test_connection_task_exits_when_shutdown_sender_dropped() {
+        let (mut client, task, tx, handler) = shutdown_conn_setup().await;
+        client
+            .write_all(b"<134>Jan 15 10:30:45 host app: test message\n")
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("connection task must end within 1 s of the sender dropping")
+            .unwrap();
+        assert_eq!(handler.take_messages().len(), 1);
+        drop(client);
+    }
+
+    /// Lines already queued when shutdown fires are still dispatched, not discarded.
+    #[tokio::test]
+    async fn test_connection_task_dispatches_queued_lines_on_shutdown() {
+        let (mut client, task, tx, handler) = shutdown_conn_setup().await;
+        let mut payload = Vec::new();
+        for _ in 0..5 {
+            payload.extend_from_slice(b"<134>Jan 15 10:30:45 host app: test message\n");
+        }
+        client.write_all(&payload).await.unwrap();
+        client.flush().await.unwrap();
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("connection task must end within 1 s of shutdown")
+            .unwrap();
+        assert_eq!(handler.take_messages().len(), 5);
+        drop(client);
+    }
+
+    /// A dropped shutdown sender means shutdown, in every receive-loop shape
+    /// (single/fan-out sockets, single/batched receive). It used to busy-loop.
+    #[tokio::test]
+    async fn test_syslog_exits_when_shutdown_sender_dropped() {
+        for (recv_tasks, recv_batch_size) in [(1, 1), (1, 4), (2, 1), (2, 4)] {
+            let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let udp_port = tmp.local_addr().unwrap().port();
+            drop(tmp);
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let tcp_port = tcp.local_addr().unwrap().port();
+            drop(tcp);
+            let config = SyslogListenerConfig {
+                udp_port,
+                tcp_port,
+                bind_address: "127.0.0.1".to_string(),
+                recv_tasks,
+                recv_batch_size,
+                ..SyslogListenerConfig::default()
+            };
+            let handler: Arc<dyn SyslogHandler> =
+                Arc::new(DefaultSyslogHandler::new(false, false, None));
+            let listener = SyslogListener::new(config, handler);
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let task = tokio::spawn(async move {
+                listener.start_with_shutdown(rx).await.ok();
+            });
+            sleep(Duration::from_millis(100)).await;
+            drop(tx);
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("recv_tasks={recv_tasks} batch={recv_batch_size}: no exit")
+                })
+                .unwrap();
+        }
     }
 }

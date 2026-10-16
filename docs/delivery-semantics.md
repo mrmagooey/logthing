@@ -39,12 +39,20 @@ does not change this, because it sits **after** the flush. To shrink the window,
 `flush_interval_secs` and `flush_threshold_bytes`. The trade-off is more, smaller Parquet files and more work for the
 Iceberg committer.
 
-A graceful stop (`SIGTERM`/Ctrl-C) flushes every buffer first, with one exception. A writer
-only finishes once every sender of its channel is gone. Zeek and Suricata connections run in
-detached tasks that keep a sender, so while a sensor is still connected at shutdown those
-writers do not finish: the 10 s writer deadline expires (`S3 writer flush timed out`), the
-process exits, and rows buffered since the last periodic flush are lost (they never reach the
-spool). Other sources release their senders when their listeners are aborted.
+A graceful stop (`SIGTERM`/Ctrl-C) flushes every buffer first. A writer only finishes once
+every sender of its channel is gone, so on shutdown each listener also stops its per-connection
+tasks (Zeek, Suricata and syslog TCP) and waits up to 5 s for them. A connection that is still
+open and idle at that moment is not an obstacle: the lines it has already received, including
+any the client has sent that are still queued on the socket, are dispatched and flushed. An
+unterminated final line (a client that was mid-write) cannot be completed and is dropped; it
+is counted in `zeek_partial_lines_dropped_at_shutdown`,
+`suricata_partial_lines_dropped_at_shutdown` or `syslog_partial_lines_dropped_at_shutdown`.
+A dropped shutdown channel is treated the same as a shutdown signal, so a listener can never
+keep running (or spin) after the rest of the process has stopped.
+
+UDP listeners (syslog, IPFIX, sFlow) that hit a persistent receive error pause 10 ms, doubling
+to at most 1 s, between attempts instead of spinning, and log the error at most once every
+10 s with a count of the repeats suppressed.
 
 ## Local sink
 
