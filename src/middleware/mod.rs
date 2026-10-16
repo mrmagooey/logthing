@@ -114,7 +114,9 @@ impl IpWhitelist {
         // canonical IPv4 form so IPv4 entries match, while `::ffff:` entries keep working.
         let raw = addr.ip();
         let ip = raw.to_canonical();
-        networks.iter().any(|net| net.contains(&ip) || net.contains(&raw))
+        networks
+            .iter()
+            .any(|net| net.contains(&ip) || net.contains(&raw))
     }
 }
 
