@@ -210,8 +210,7 @@ async fn more_than_builder_batch_rows_per_service_keep_exact_counts_and_bodies()
 mod oversized_request {
     use super::common;
     use axum::{Extension, Router, routing::post};
-    use logthing::config::OtlpLocalConfig;
-    use logthing::config::{Config, OtlpConfig};
+    use logthing::config::{Config, OtlpConfig, OtlpLocalConfig};
     use logthing::forwarding::local_sink::LocalDiskSink;
     use logthing::forwarding::otlp_s3::otlp_local_start;
     use logthing::ingest::IngestState;

@@ -49,14 +49,20 @@ enqueued before the channel filled, the whole request is rejected and the retry 
 enqueued prefix with different `event_uuid`s. `otlp_events_dropped` counts records that were
 not enqueued; `otlp_logs_received` counts only enqueued records. A closed channel (writer gone)
 or a server with no OTLP sink configured is also answered `503`: an export is never
-acknowledged unless every configured sink accepted it. WEF is unchanged (200 and a counted
+acknowledged unless every configured sink accepted it. Consequently, if one of two sinks is
+permanently closed, every request is answered `503` while the healthy sink keeps accepting the
+records that precede the failure, so client retries re-deliver them there (at-least-once
+duplicates), exactly as for a full channel. WEF is unchanged (200 and a counted
 drop).
 
 ## Request size limits
 
-A single request may carry at most 100,000 log records, and its estimated size once mapped
-(each record plus the resource and scope attributes that are copied into every record) may not
-exceed 256 MiB. Larger requests get `413 Payload Too Large` with a short text body and nothing is
+A single request may carry at most 100,000 log records, and its estimated heap size once mapped
+may not exceed 256 MiB. The estimate is heap-weighted, not wire-weighted: every record carries its
+own copy of the resource and scope attributes as JSON, and JSON objects cost far more memory than
+their protobuf encoding (a small nested attribute can be 50 times larger in memory), so the
+resource and scope are measured as in-memory JSON and multiplied by the record count, plus a bound
+on each record's own attributes and body. Larger requests get `413 Payload Too Large` with a short text body and nothing is
 enqueued; the `otlp_requests_rejected_too_large` counter records each rejection. Exporters
 should lower their batch size (for example the OpenTelemetry Collector `send_batch_max_size`).
 

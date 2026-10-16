@@ -5083,7 +5083,15 @@ fn dispatch_otlp_records(
             (None, Some(h)) => offer_otlp(h, record, "local"),
             (None, None) => {
                 metrics::counter!("otlp_events_dropped").increment(total);
-                error!("OTLP export received but no OTLP sink is configured");
+                static NO_SINK_LOG: std::sync::LazyLock<
+                    crate::forwarding::drop_log::DropLogThrottles,
+                > = std::sync::LazyLock::new(Default::default);
+                if let Some(dropped_total) = NO_SINK_LOG.check(DropSite::Otlp, DropKind::Closed) {
+                    error!(
+                        dropped_total,
+                        "OTLP export received but no OTLP sink is configured"
+                    );
+                }
                 return Err(total);
             }
         };
