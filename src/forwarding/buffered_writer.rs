@@ -905,6 +905,10 @@ pub struct PartitionedParquetWriter<S: ParquetSink> {
     last_skip_warn: Option<Instant>,
     /// Records `push()` could not buffer over this writer's lifetime.
     skipped_total: u64,
+    /// Earliest instant a partition's retry backoff expires, so the writer task can wake
+    /// then instead of waiting for the next tick (which can be 30 s away). Set on a flush
+    /// failure, recomputed by `flush_all_if_needed`.
+    pub(crate) retry_wakeup: Option<Instant>,
 }
 
 /// Bytes a batch's data actually occupies, as opposed to the capacity its
@@ -971,6 +975,7 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
             )),
             last_skip_warn: None,
             skipped_total: 0,
+            retry_wakeup: None,
         }
     }
 
@@ -1334,6 +1339,15 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 Action::None => {}
             }
         }
+        // Only future expiries: one already due was handled above, and waking for it
+        // again would spin.
+        let now = Instant::now();
+        self.retry_wakeup = self
+            .buffers
+            .values()
+            .filter_map(|b| b.next_retry_at)
+            .filter(|t| *t > now)
+            .min();
         Ok(())
     }
 
@@ -1549,9 +1563,10 @@ impl<S: ParquetSink> PartitionedParquetWriter<S> {
                 buf.row_count += row_count;
                 buf.byte_count += byte_count;
 
-                buf.next_retry_at = Some(
-                    Instant::now() + retry_backoff(buf.retry_attempt, self.policy.interval.get()),
-                );
+                let retry_at =
+                    Instant::now() + retry_backoff(buf.retry_attempt, self.policy.interval.get());
+                buf.next_retry_at = Some(retry_at);
+                self.retry_wakeup = Some(self.retry_wakeup.map_or(retry_at, |w| w.min(retry_at)));
                 buf.retry_attempt = buf.retry_attempt.saturating_add(1);
 
                 let cap = self.config.max_buffer_rows.saturating_mul(4);
@@ -2172,6 +2187,16 @@ impl<S: ParquetSink> ParquetWriterHandle<S> {
                         // flush_all_if_needed() always returns Ok now (flush failures surface
                         // async via apply_flush_outcome) -- kept as Result to avoid churning
                         // callers; this branch is currently unreachable.
+                        if let Err(e) = writer.flush_all_if_needed().await {
+                            tracing::warn!(source, target, "parquet_s3 flush_all_if_needed: {e}");
+                        }
+                    }
+                    // A partition's retry backoff expired: retry now rather than at the
+                    // next tick. `retry_wakeup` is cleared first and recomputed by
+                    // `flush_all_if_needed`, so this cannot spin.
+                    _ = tokio::time::sleep_until(writer.retry_wakeup.unwrap_or_else(Instant::now)),
+                        if writer.retry_wakeup.is_some() => {
+                        writer.retry_wakeup = None;
                         if let Err(e) = writer.flush_all_if_needed().await {
                             tracing::warn!(source, target, "parquet_s3 flush_all_if_needed: {e}");
                         }
@@ -6171,5 +6196,24 @@ secret_key  = "SECRET"
             "shutdown flush slept in descriptor retries: {:?}",
             start.elapsed()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_backed_off_partition_retries_at_expiry_not_at_next_tick() {
+        let (sink, attempts, accepted) = ScriptedSink::build(&[Step::Fail], false);
+        let (cfg, policy) = test_config(1); // 3600 s interval -> 30 s tick
+        let (handle, _join) = ParquetWriterHandle::start(MockSink, sink, cfg, policy);
+
+        handle.try_send("a".to_string()).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await; // fails; 1 s backoff opens
+        handle.try_send("b".to_string()).unwrap(); // size trigger suppressed
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "retry must fire at backoff expiry"
+        );
+        assert_eq!(accepted.lock().unwrap().len(), 1);
     }
 }
