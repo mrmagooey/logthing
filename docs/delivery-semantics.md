@@ -53,7 +53,13 @@ keep running (or spin) after the rest of the process has stopped.
 The order is: the HTTP server and the listeners drain concurrently (HTTP up to 10 s; listeners
 share one 6 s deadline, the 5 s connection drain plus 1 s margin, after which stragglers are
 aborted), then the writers (shared 10 s deadline), then the spool. If the HTTP server or a
-listener stops on its own, the same sequence runs and the process exits non-zero.
+listener stops on its own, or the HTTP server task panics during the drain, the same sequence
+runs and the process exits non-zero. A drain timeout alone still exits 0 with a warning.
+
+When the HTTP drain times out and the server task is aborted, axum's per-connection tasks may
+still hold the application state and so the writers' senders. The writers then reach their
+own 10 s deadline without seeing end-of-stream, and rows received since the last periodic
+flush can be lost. Only requests still in flight 10 s after the shutdown signal trigger this.
 
 UDP listeners (syslog, IPFIX, sFlow) that hit a persistent receive error pause 10 ms, doubling
 to at most 1 s, between attempts instead of spinning, and log the error at most once every
@@ -84,8 +90,10 @@ outage cannot delay the Parquet uploads of later partitions.
 
 When `[iceberg]` descriptors are enabled and the Parquet object was uploaded directly (not
 spooled), a failed descriptor upload is retried three more times, after 200 ms, 1 s and 5 s.
-Only then is `iceberg_descriptor_upload_errors` incremented; the Parquet object counts as
-delivered either way.
+Only then is `iceberg_descriptor_upload_errors` incremented. Without `[spool]` the Parquet
+object is uploaded either way, but if the descriptor still fails (including the single attempt
+made at shutdown) the Parquet is never committed to Iceberg; `iceberg_descriptor_upload_errors`
+is the only sign. With `[spool]` the descriptor is retried until it is delivered (see Spool).
 
 With `[spool]`, every S3 flush is first written to local disk and acknowledged to the writer,
 then uploaded in the background:
@@ -117,7 +125,19 @@ sink is not configured (for example `[iceberg]` was removed from the config), th
 still uploaded once, but the entry stays on disk and is retried with the normal backoff
 (`spool_descriptor_sink_missing`, `spool_upload_errors`) until the descriptor sink is
 configured again; then the descriptor is uploaded and the entry removed. Entries written by
-earlier releases follow the same rule.
+earlier releases follow the same rule. Alert on any increase of
+`spool_descriptor_sink_missing`: the spool then grows until `max_bytes`, after which flushes
+fall back to direct upload.
+
+*Discarding entries stuck on a missing descriptor sink.* If the descriptor sink is gone for
+good, stop logthing, then for each stuck entry delete `<id>.meta` first and then
+`<id>.parquet` and `<id>.json` (an entry is `<id>.parquet`, `<id>.json` and `<id>.meta`;
+stuck entries are the ones that have a `.json`). Start logthing again; the spool rescans on
+open. Deleting the `.meta` un-commits the entry, so a half-finished deletion is cleaned up as
+an orphan at the next start. The consequence: the Parquet objects were already uploaded to the
+data bucket but are never committed to Iceberg, so those rows will not appear in the tables
+until you register the objects yourself. Leave entries that have no `.json` alone; they do
+not depend on the descriptor sink.
 
 **Concurrency.** Up to 4 entries upload at the same time, in the steady-state uploader and in
 the shutdown drain. Entries are started oldest first; one entry is never attempted twice at
