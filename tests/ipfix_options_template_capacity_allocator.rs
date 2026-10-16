@@ -121,9 +121,14 @@ fn hostile_options_template_flood_does_not_amplify_retained_memory() {
     });
     let (decode_result, _decoder) = result;
 
+    // Truncated options templates are now rejected (nothing cached), so the
+    // first hostile set ends the decode with an error.
     assert!(
-        decode_result.is_ok(),
-        "decode should succeed: {decode_result:?}"
+        matches!(
+            decode_result,
+            Err(logthing::ipfix::decoder::DecodeError::Truncated { .. })
+        ),
+        "decode should report Truncated: {decode_result:?}"
     );
 
     const MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024; // a few MB, not gigabytes

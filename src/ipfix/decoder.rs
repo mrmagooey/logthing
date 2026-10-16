@@ -119,6 +119,9 @@ fn now_secs() -> u64 {
 #[derive(Debug)]
 pub(crate) struct TemplateEntry {
     fields: Vec<FieldSpecifier>,
+    /// True for an Options Template (RFC 7011 §3.4.2): its data sets carry
+    /// exporter metadata (scope + option values), not flows.
+    is_options: bool,
     /// Unix seconds. Refreshed on insert and on every successful lookup via a
     /// `Relaxed` store through a shared reference, so the read-mostly
     /// invariant documented on `IpfixDecoder` is preserved — no write lock on
@@ -160,11 +163,37 @@ impl IpfixDecoder {
     }
 
     pub(crate) fn cache_get(&self, key: &TemplateKey) -> Option<Vec<FieldSpecifier>> {
+        self.cache_get_entry(key).map(|(fields, _)| fields)
+    }
+
+    /// Like `cache_get`, also returning whether the template is an options template.
+    pub(crate) fn cache_get_entry(&self, key: &TemplateKey) -> Option<(Vec<FieldSpecifier>, bool)> {
         let guard = self.cache.read().expect("template cache lock poisoned");
         let entry = guard.map.get(key)?;
         // AtomicU64::store takes &self, so this needs no write lock.
         entry.last_seen.store(now_secs(), Ordering::Relaxed);
-        Some(entry.fields.clone())
+        Some((entry.fields.clone(), entry.is_options))
+    }
+
+    /// Remove one template (RFC 7011 §8.1 withdrawal). Removal only frees space, so it
+    /// never goes through the capacity check.
+    pub(crate) fn remove_template(&self, key: &TemplateKey) {
+        self.cache
+            .write()
+            .expect("template cache lock poisoned")
+            .map
+            .remove(key);
+    }
+
+    /// Remove every template (`is_options == false`) or every options template
+    /// (`is_options == true`) of one exporter and observation domain (RFC 7011 §8.1
+    /// "withdraw all" records).
+    pub(crate) fn remove_all_templates(&self, exporter: IpAddr, domain: u32, is_options: bool) {
+        self.cache
+            .write()
+            .expect("template cache lock poisoned")
+            .map
+            .retain(|k, e| !(k.0 == exporter && k.1 == domain && e.is_options == is_options));
     }
 
     pub(crate) fn cache_len(&self) -> usize {
@@ -203,6 +232,16 @@ impl IpfixDecoder {
     ///   `ipfix_templates_dropped` is incremented, and a warning is logged (at
     ///   most once until capacity drops below the limit).
     pub(crate) fn try_insert_template(&self, key: TemplateKey, fields: Vec<FieldSpecifier>) {
+        self.insert_template(key, fields, false);
+    }
+
+    /// `try_insert_template` with the template kind made explicit.
+    pub(crate) fn insert_template(
+        &self,
+        key: TemplateKey,
+        fields: Vec<FieldSpecifier>,
+        is_options: bool,
+    ) {
         let mut guard = self.cache.write().expect("template cache lock poisoned");
 
         if !guard.map.contains_key(&key) && guard.map.len() >= MAX_CACHED_TEMPLATES {
@@ -244,6 +283,7 @@ impl IpfixDecoder {
             key,
             TemplateEntry {
                 fields,
+                is_options,
                 last_seen: AtomicU64::new(now_secs()),
             },
         );
@@ -523,6 +563,71 @@ pub fn decode_ipfix(
     let msg = &buf[..total_len];
 
     let mut records: Vec<FlowRecord> = Vec::new();
+    let result = decode_ipfix_sets(
+        decoder,
+        msg,
+        exporter,
+        obs_domain_id,
+        export_time,
+        &mut records,
+    );
+    keep_partial(result, records)
+}
+
+/// Upper bound on flow records decoded from one message. A 64 KiB datagram
+/// can legally pack tens of thousands of tiny records; decoding them all
+/// would let one packet allocate far more than a normal message does.
+const MAX_RECORDS_PER_MESSAGE: usize = 8192;
+
+/// Append `set` to `records` without exceeding `MAX_RECORDS_PER_MESSAGE`.
+/// Returns true when the set held more records than fit (see `decode_limit`).
+fn extend_capped(records: &mut Vec<FlowRecord>, mut set: Vec<FlowRecord>) -> bool {
+    let room = MAX_RECORDS_PER_MESSAGE - records.len();
+    let over = set.len() > room;
+    set.truncate(room);
+    records.append(&mut set);
+    over
+}
+
+/// Room left under the cap, plus one: asking a data-set parser for one record
+/// more than fits is how the caller learns the cap was hit.
+fn decode_limit(records: &[FlowRecord]) -> usize {
+    MAX_RECORDS_PER_MESSAGE - records.len() + 1
+}
+
+fn note_capped() {
+    metrics::counter!("ipfix_records_capped").increment(1);
+}
+
+/// A decode error after at least one record was decoded must not discard
+/// those records: the exporter's earlier sets were valid. The error is still
+/// counted as a decode error.
+fn keep_partial(
+    result: Result<(), DecodeError>,
+    records: Vec<FlowRecord>,
+) -> Result<Vec<FlowRecord>, DecodeError> {
+    match result {
+        Ok(()) => Ok(records),
+        Err(e) if !records.is_empty() => {
+            tracing::debug!(
+                "ipfix: {e}; keeping the {} records decoded before it",
+                records.len()
+            );
+            metrics::counter!("ipfix_decode_errors").increment(1);
+            Ok(records)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn decode_ipfix_sets(
+    decoder: &mut IpfixDecoder,
+    msg: &[u8],
+    exporter: IpAddr,
+    obs_domain_id: u32,
+    export_time: DateTime<Utc>,
+    records: &mut Vec<FlowRecord>,
+) -> Result<(), DecodeError> {
     let mut pos = 16usize;
 
     while pos + 4 <= msg.len() {
@@ -559,7 +664,7 @@ pub fn decode_ipfix(
             }
             id if id >= 256 => {
                 // Data Set
-                let mut set_records = parse_ipfix_data_set(
+                let set_records = parse_ipfix_data_set(
                     decoder,
                     set_body,
                     set_id,
@@ -567,8 +672,12 @@ pub fn decode_ipfix(
                     obs_domain_id,
                     export_time,
                     true,
+                    decode_limit(records),
                 )?;
-                records.append(&mut set_records);
+                if extend_capped(records, set_records) {
+                    note_capped();
+                    break;
+                }
             }
             other => {
                 tracing::warn!("ipfix: ignoring reserved set id {other} at offset {pos}");
@@ -578,7 +687,7 @@ pub fn decode_ipfix(
         pos = set_end;
     }
 
-    Ok(records)
+    Ok(())
 }
 
 fn parse_ipfix_template_set(
@@ -592,6 +701,19 @@ fn parse_ipfix_template_set(
         let template_id = read_u16_be(body, pos)?;
         let field_count = read_u16_be(body, pos + 2)? as usize;
         pos += 4;
+
+        if field_count == 0 {
+            // RFC 7011 §8.1 template withdrawal: id 2 withdraws every template of
+            // this exporter and domain, any other id withdraws just that one.
+            if template_id == 2 {
+                decoder.remove_all_templates(exporter, obs_domain_id, false);
+                continue;
+            }
+            if template_id >= 256 {
+                decoder.remove_template(&(exporter, obs_domain_id, template_id));
+                continue;
+            }
+        }
 
         if template_id < 256 {
             return Err(DecodeError::Malformed {
@@ -653,9 +775,23 @@ fn parse_ipfix_options_template_set(
 ) -> Result<(), DecodeError> {
     // RFC 7011 §3.4.2: Options Template Record header has an extra scope_field_count u16.
     let mut pos = 0usize;
-    while pos + 6 <= body.len() {
+    while pos + 4 <= body.len() {
         let template_id = read_u16_be(body, pos)?;
         let field_count = read_u16_be(body, pos + 2)? as usize;
+
+        if field_count == 0 {
+            // RFC 7011 §8.1 withdrawal record (4 bytes, no scope count): id 3
+            // withdraws every options template of this exporter and domain.
+            // Zero padding lands here too and is ignored (id < 256).
+            pos += 4;
+            if template_id == 3 {
+                decoder.remove_all_templates(exporter, obs_domain_id, true);
+            } else if template_id >= 256 {
+                decoder.remove_template(&(exporter, obs_domain_id, template_id));
+            }
+            continue;
+        }
+
         let _scope_count = read_u16_be(body, pos + 4)?;
         pos += 6;
 
@@ -667,15 +803,16 @@ fn parse_ipfix_options_template_set(
         let mut fields = Vec::with_capacity(cap);
         for _ in 0..field_count {
             if pos + 4 > body.len() {
-                break;
+                return Err(DecodeError::Truncated {
+                    offset: pos,
+                    need: 4,
+                    have: body.len().saturating_sub(pos),
+                });
             }
             let raw_ie = read_u16_be(body, pos)?;
             let field_len = read_u16_be(body, pos + 2)?;
             pos += 4;
             let enterprise = if raw_ie & 0x8000 != 0 {
-                if pos + 4 > body.len() {
-                    break;
-                }
                 let pen = read_u32_be(body, pos)?;
                 pos += 4;
                 Some(pen)
@@ -689,12 +826,7 @@ fn parse_ipfix_options_template_set(
             });
         }
         if template_id >= 256 {
-            // The loop above can `break` before filling `cap` (e.g. an
-            // enterprise-numbered field pushes consumption past what the
-            // upper-bound estimate assumed), which would otherwise leave a
-            // vec with capacity > length sitting in the cache indefinitely.
-            fields.shrink_to_fit();
-            decoder.try_insert_template((exporter, obs_domain_id, template_id), fields);
+            decoder.insert_template((exporter, obs_domain_id, template_id), fields, true);
         }
     }
     Ok(())
@@ -747,6 +879,7 @@ fn parse_varlen_records(
     exporter: IpAddr,
     obs_domain_id: u32,
     export_time: DateTime<Utc>,
+    limit: usize,
 ) -> Vec<FlowRecord> {
     // Padding (RFC 7011 §3.3.1) is shorter than any record, so stopping below
     // the minimum record size never decodes it. Every varlen field costs at
@@ -783,7 +916,7 @@ fn parse_varlen_records(
     );
     let mut records = Vec::new();
     let mut pos = 0usize;
-    'records: while body.len().saturating_sub(pos) >= min_record_len {
+    'records: while records.len() < limit && body.len().saturating_sub(pos) >= min_record_len {
         let mut rec = new_flow_record(obs_domain_id, set_id, exporter, export_time);
         let mut p = pos;
         for field in fields {
@@ -825,9 +958,10 @@ fn parse_ipfix_data_set(
     obs_domain_id: u32,
     export_time: DateTime<Utc>,
     allow_varlen: bool,
+    limit: usize,
 ) -> Result<Vec<FlowRecord>, DecodeError> {
     let key: TemplateKey = (exporter, obs_domain_id, set_id);
-    let fields = match decoder.cache_get(&key) {
+    let (fields, is_options) = match decoder.cache_get_entry(&key) {
         Some(f) => f,
         None => {
             metrics::counter!("ipfix_templates_missing").increment(1);
@@ -837,6 +971,19 @@ fn parse_ipfix_data_set(
             return Ok(Vec::new());
         }
     };
+
+    // Options data sets carry exporter metadata (scope + option values), not
+    // flows; decoding them as flows would emit rows with a null 5-tuple.
+    if is_options {
+        let record_len: usize = fields.iter().map(|f| f.length as usize).sum();
+        let skipped = if fields.iter().any(|f| f.length == VARLEN) || record_len == 0 {
+            1
+        } else {
+            body.len() / record_len
+        };
+        metrics::counter!("ipfix_options_records_skipped").increment(skipped as u64);
+        return Ok(Vec::new());
+    }
 
     // RFC 7011 §7: a field length of 0xFFFF means variable-length encoding.
     // RFC 3954 (NetFlow v9) has no such encoding, so `allow_varlen` is false
@@ -850,6 +997,7 @@ fn parse_ipfix_data_set(
             exporter,
             obs_domain_id,
             export_time,
+            limit,
         ));
     }
 
@@ -861,7 +1009,7 @@ fn parse_ipfix_data_set(
     let mut records = Vec::new();
     let mut pos = 0usize;
 
-    while pos + record_len <= body.len() {
+    while records.len() < limit && pos + record_len <= body.len() {
         let mut rec = new_flow_record(obs_domain_id, set_id, exporter, export_time);
 
         for field in &fields {
@@ -954,12 +1102,14 @@ fn apply_field_to_record(rec: &mut FlowRecord, field: &FieldSpecifier, raw: &[u8
                 }
             }
             IeType::U8 => {
-                let val = raw.first().copied().unwrap_or(0);
+                // Wider than declared (e.g. tcpControlBits as unsigned16): keep the
+                // low-order (last) byte.
+                let val = raw.last().copied().unwrap_or(0);
                 set_u8_field(rec, field.ie_id, val);
             }
             IeType::U16 => {
                 let val = if raw.len() >= 2 {
-                    u16::from_be_bytes([raw[0], raw[1]])
+                    u16::from_be_bytes([raw[raw.len() - 2], raw[raw.len() - 1]])
                 } else {
                     raw.first().copied().unwrap_or(0) as u16
                 };
@@ -967,7 +1117,7 @@ fn apply_field_to_record(rec: &mut FlowRecord, field: &FieldSpecifier, raw: &[u8
             }
             IeType::U32 => {
                 let val = if raw.len() >= 4 {
-                    u32::from_be_bytes(raw[..4].try_into().unwrap())
+                    u32::from_be_bytes(raw[raw.len() - 4..].try_into().unwrap())
                 } else {
                     // Pad to 4 bytes
                     let mut b = [0u8; 4];
@@ -1020,8 +1170,8 @@ fn apply_field_to_record(rec: &mut FlowRecord, field: &FieldSpecifier, raw: &[u8
 
 fn set_addr_field(rec: &mut FlowRecord, ie_id: u16, addr: IpAddr) {
     match ie_id {
-        8 | 225 => rec.src_addr = Some(addr),
-        12 | 226 => rec.dst_addr = Some(addr),
+        8 => rec.src_addr = Some(addr),
+        12 => rec.dst_addr = Some(addr),
         _ => {
             if let Some((name, _)) = ie_info(ie_id) {
                 rec.extra[name] = serde_json::json!(addr.to_string());
@@ -1044,8 +1194,8 @@ fn set_u8_field(rec: &mut FlowRecord, ie_id: u16, val: u8) {
 
 fn set_u16_field(rec: &mut FlowRecord, ie_id: u16, val: u16) {
     match ie_id {
-        7 | 227 => rec.src_port = Some(val),
-        11 | 228 => rec.dst_port = Some(val),
+        7 => rec.src_port = Some(val),
+        11 => rec.dst_port = Some(val),
         _ => {
             if let Some((name, _)) = ie_info(ie_id) {
                 rec.extra[name] = serde_json::json!(val);
@@ -1109,6 +1259,18 @@ pub fn decode_netflow_v9(
         .unwrap_or_else(Utc::now);
 
     let mut records: Vec<FlowRecord> = Vec::new();
+    let result = decode_v9_flowsets(decoder, buf, exporter, source_id, export_time, &mut records);
+    keep_partial(result, records)
+}
+
+fn decode_v9_flowsets(
+    decoder: &mut IpfixDecoder,
+    buf: &[u8],
+    exporter: IpAddr,
+    source_id: u32,
+    export_time: DateTime<Utc>,
+    records: &mut Vec<FlowRecord>,
+) -> Result<(), DecodeError> {
     let mut pos = 20usize;
 
     while pos + 4 <= buf.len() {
@@ -1151,12 +1313,16 @@ pub fn decode_netflow_v9(
                     source_id,
                     export_time,
                     false,
+                    decode_limit(records),
                 )?;
                 // Correct protocol version (parse_ipfix_data_set sets it to 10)
                 for r in &mut set_records {
                     r.protocol_version = 9;
                 }
-                records.append(&mut set_records);
+                if extend_capped(records, set_records) {
+                    note_capped();
+                    break;
+                }
             }
             _ => {
                 tracing::warn!("v9: ignoring reserved flowset id {flowset_id}");
@@ -1166,7 +1332,7 @@ pub fn decode_netflow_v9(
         pos = flowset_end;
     }
 
-    Ok(records)
+    Ok(())
 }
 
 fn parse_v9_template_flowset(
@@ -2671,7 +2837,8 @@ mod tests {
         body.extend_from_slice(&1000u16.to_be_bytes());
         body.extend(vec![0x42u8; 1000]);
 
-        let records = parse_varlen_records(&fields, &body, 256, exporter, 0, Utc::now());
+        let records =
+            parse_varlen_records(&fields, &body, 256, exporter, 0, Utc::now(), usize::MAX);
         assert_eq!(records.len(), 1);
         let hex_val = records[0].extra["ie97"].as_str().expect("hex string");
         assert_eq!(hex_val.len(), 256);
@@ -3136,7 +3303,7 @@ mod tests {
     // ---- parse_ipfix_options_template_set: field_count is clamped to the body ----
 
     #[test]
-    fn options_template_truncated_field_count_does_not_over_allocate() {
+    fn options_template_truncated_field_count_is_rejected_not_cached() {
         use std::net::{IpAddr, Ipv4Addr};
         let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let mut dec = IpfixDecoder::new();
@@ -3144,9 +3311,8 @@ mod tests {
         // Options Template Set (set_id=3) declaring field_count=0xFFFF with a
         // 6-byte body (template_id + field_count + scope_count, no room for
         // even one 4-byte field specifier). Before the fix this allocated
-        // Vec::with_capacity(0xFFFF) -- ~786 KB -- and cached it anyway; the
-        // field loop breaks on its first iteration either way, so the cached
-        // template must end up with zero fields and (near-)zero capacity.
+        // Vec::with_capacity(0xFFFF) -- ~786 KB; the clamp keeps that small,
+        // and the truncated template is rejected rather than cached.
         // set: 4 header + 6 body = 10; msg: 16 + 10 = 26 bytes
         let buf: &[u8] = &[
             0x00, 0x0A, 0x00, 0x1A, // version=10, total_len=26
@@ -3157,87 +3323,371 @@ mod tests {
             0xFF, 0xFF, // field_count=65535 (attacker-controlled)
             0x00, 0x01, // scope_count=1
         ];
-        let records = decode_ipfix(&mut dec, buf, exporter)
-            .expect("truncated options template must not error, only truncate the field list");
-        assert_eq!(records.len(), 0);
+        let err = decode_ipfix(&mut dec, buf, exporter).unwrap_err();
+        assert!(matches!(err, DecodeError::Truncated { .. }), "got {err}");
+        assert!(dec.cache_is_empty(), "a truncated template caches nothing");
+    }
 
-        let key: TemplateKey = (exporter, 0, 320);
-        let fields = dec
-            .cache_get(&key)
-            .expect("truncated options template is still cached with what it got");
-        assert_eq!(fields.len(), 0, "no field specifier fit in the 6-byte body");
+    // ---- test byte builders for withdrawal / partial / cap tests ----
 
-        // Inspect the capacity of the vec actually sitting in the cache
-        // (cache_get clones, and Vec::clone allocates exactly at `len`, so
-        // this must read the cached entry directly to catch a stale
-        // capacity that shrink_to_fit failed to trim).
-        let guard = dec.cache.read().expect("template cache lock poisoned");
-        let entry = guard.map.get(&key).expect("template 320 must be cached");
+    fn set_bytes(set_id: u16, body: &[u8]) -> Vec<u8> {
+        let mut v = set_id.to_be_bytes().to_vec();
+        v.extend_from_slice(&((body.len() + 4) as u16).to_be_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn ipfix_msg(domain: u32, sets: &[Vec<u8>]) -> Vec<u8> {
+        let body: Vec<u8> = sets.concat();
+        let mut v = vec![0x00, 0x0A];
+        v.extend_from_slice(&((16 + body.len()) as u16).to_be_bytes());
+        v.extend_from_slice(&[0x67, 0x5C, 0xB0, 0x20, 0, 0, 0, 1]);
+        v.extend_from_slice(&domain.to_be_bytes());
+        v.extend_from_slice(&body);
+        v
+    }
+
+    fn tmpl_record(id: u16, fields: &[(u16, u16)]) -> Vec<u8> {
+        let mut v = id.to_be_bytes().to_vec();
+        v.extend_from_slice(&(fields.len() as u16).to_be_bytes());
+        for (ie, len) in fields {
+            v.extend_from_slice(&ie.to_be_bytes());
+            v.extend_from_slice(&len.to_be_bytes());
+        }
+        v
+    }
+
+    fn test_exporter() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
+    }
+
+    // ---- postNAT / postNAPT IEs must not overwrite the original tuple ----
+
+    #[test]
+    fn test_post_nat_fields_do_not_overwrite_original_tuple() {
+        for order in [[(8u16, 4u16), (225, 4)], [(225, 4), (8, 4)]] {
+            let mut dec = IpfixDecoder::new();
+            let original = [10, 0, 0, 1];
+            let translated = [203, 0, 113, 9];
+            let data: Vec<u8> = if order[0].0 == 8 {
+                [original, translated].concat()
+            } else {
+                [translated, original].concat()
+            };
+            let buf = ipfix_msg(
+                0,
+                &[
+                    set_bytes(2, &tmpl_record(256, &order)),
+                    set_bytes(256, &data),
+                ],
+            );
+            let records = decode_ipfix(&mut dec, &buf, test_exporter()).expect("decode");
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].src_addr,
+                Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+            );
+            assert_eq!(records[0].extra["postNATSourceIPv4Address"], "203.0.113.9");
+        }
+    }
+
+    #[test]
+    fn test_post_nat_destination_and_ports_go_to_extra() {
+        let mut dec = IpfixDecoder::new();
+        let fields = [(12u16, 4u16), (226, 4), (11, 2), (228, 2), (7, 2), (227, 2)];
+        let data: Vec<u8> = [
+            &[10u8, 0, 0, 2][..],
+            &[203, 0, 113, 10],
+            &[0, 80],
+            &[0x1F, 0x90],
+            &[0xC3, 0x50],
+            &[0xC3, 0x51],
+        ]
+        .concat();
+        let buf = ipfix_msg(
+            0,
+            &[
+                set_bytes(2, &tmpl_record(256, &fields)),
+                set_bytes(256, &data),
+            ],
+        );
+        let records = decode_ipfix(&mut dec, &buf, test_exporter()).expect("decode");
+        let r = &records[0];
+        assert_eq!(r.dst_addr, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
+        assert_eq!(r.dst_port, Some(80));
+        assert_eq!(r.src_port, Some(50000));
+        assert_eq!(r.extra["postNATDestinationIPv4Address"], "203.0.113.10");
+        assert_eq!(r.extra["postNAPTDestinationTransportPort"], 8080);
+        assert_eq!(r.extra["postNAPTSourceTransportPort"], 50001);
+    }
+
+    #[test]
+    fn test_post_nat_alone_leaves_tuple_unset() {
+        let mut dec = IpfixDecoder::new();
+        let buf = ipfix_msg(
+            0,
+            &[
+                set_bytes(2, &tmpl_record(256, &[(225, 4)])),
+                set_bytes(256, &[192, 168, 2, 1]),
+            ],
+        );
+        let records = decode_ipfix(&mut dec, &buf, test_exporter()).expect("decode");
+        assert_eq!(records[0].src_addr, None);
+        assert_eq!(records[0].extra["postNATSourceIPv4Address"], "192.168.2.1");
+    }
+
+    // ---- options data sets are not flows ----
+
+    fn options_template_set_body(id: u16) -> Vec<u8> {
+        // id, field_count=2, scope_count=1, scope ie 144 (exportingProcessId) len 4,
+        // option ie 160 len 8
+        let mut v = id.to_be_bytes().to_vec();
+        v.extend_from_slice(&[0, 2, 0, 1, 0, 144, 0, 4, 0, 160, 0, 8]);
+        v
+    }
+
+    #[test]
+    fn test_options_data_set_emits_no_flow_records() {
+        let mut dec = IpfixDecoder::new();
+        let buf = ipfix_msg(
+            0,
+            &[
+                set_bytes(3, &options_template_set_body(300)),
+                set_bytes(300, &[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2]),
+            ],
+        );
+        let records = decode_ipfix(&mut dec, &buf, test_exporter()).expect("decode");
+        assert!(records.is_empty(), "options data must not become flows");
+        let (_, is_options) = dec
+            .cache_get_entry(&(test_exporter(), 0, 300))
+            .expect("options template cached");
+        assert!(is_options);
+    }
+
+    #[test]
+    fn test_options_data_set_does_not_block_flow_sets_in_same_message() {
+        let mut dec = IpfixDecoder::new();
+        let buf = ipfix_msg(
+            0,
+            &[
+                set_bytes(3, &options_template_set_body(300)),
+                set_bytes(2, &tmpl_record(256, &[(8, 4)])),
+                set_bytes(300, &[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2]),
+                set_bytes(256, &[10, 0, 0, 1]),
+            ],
+        );
+        let records = decode_ipfix(&mut dec, &buf, test_exporter()).expect("decode");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].template_id, 256);
+    }
+
+    // ---- partial datagrams keep what was decoded ----
+
+    #[test]
+    fn test_decode_error_after_data_set_keeps_decoded_records() {
+        let mut dec = IpfixDecoder::new();
+        // Truncated template set (declares 2 fields, carries 1) after a valid data set.
+        let mut bad = tmpl_record(257, &[(8, 4), (12, 4)]);
+        bad.truncate(8);
+        let buf = ipfix_msg(
+            0,
+            &[
+                set_bytes(2, &tmpl_record(256, &[(8, 4)])),
+                set_bytes(256, &[10, 0, 0, 1]),
+                set_bytes(2, &bad),
+            ],
+        );
+        let records = decode_ipfix(&mut dec, &buf, test_exporter())
+            .expect("records decoded before the bad set must survive");
+        assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn test_decode_error_with_no_records_is_still_an_error() {
+        let mut dec = IpfixDecoder::new();
+        let mut bad = tmpl_record(257, &[(8, 4), (12, 4)]);
+        bad.truncate(8);
+        let buf = ipfix_msg(0, &[set_bytes(2, &bad)]);
+        assert!(decode_ipfix(&mut dec, &buf, test_exporter()).is_err());
+    }
+
+    #[test]
+    fn test_decode_error_after_data_set_keeps_decoded_records_v9() {
+        let mut dec = IpfixDecoder::new();
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&[0x00, 0x09, 0x00, 0x03, 0, 0, 0, 0, 0x67, 0x5C, 0xB0, 0x20]);
+        body.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 5]);
+        body.extend_from_slice(&set_bytes(0, &tmpl_record(256, &[(8, 4)])));
+        body.extend_from_slice(&set_bytes(256, &[10, 0, 0, 1]));
+        // Flowset header claims 100 bytes but the packet ends: Truncated.
+        body.extend_from_slice(&[0x01, 0x00, 0x00, 100, 1, 2]);
+        let records = decode_netflow_v9(&mut dec, &body, test_exporter())
+            .expect("v9 records decoded before the bad flowset must survive");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].protocol_version, 9);
+    }
+
+    // ---- template withdrawal (RFC 7011 §8.1) ----
+
+    #[test]
+    fn test_template_withdrawal_removes_template() {
+        let mut dec = IpfixDecoder::new();
+        let ex = test_exporter();
+        let define = ipfix_msg(0, &[set_bytes(2, &tmpl_record(256, &[(8, 4)]))]);
+        decode_ipfix(&mut dec, &define, ex).unwrap();
+        assert!(dec.cache_contains_key(&(ex, 0, 256)));
+        let withdraw = ipfix_msg(0, &[set_bytes(2, &tmpl_record(256, &[]))]);
+        decode_ipfix(&mut dec, &withdraw, ex).expect("withdrawal is not an error");
+        assert!(!dec.cache_contains_key(&(ex, 0, 256)));
+    }
+
+    #[test]
+    fn test_withdraw_all_templates_for_domain() {
+        let mut dec = IpfixDecoder::new();
+        let ex = test_exporter();
+        let other: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9));
+        for (exporter, domain) in [(ex, 0), (ex, 1), (other, 0)] {
+            let define = ipfix_msg(
+                domain,
+                &[
+                    set_bytes(2, &tmpl_record(256, &[(8, 4)])),
+                    set_bytes(3, &options_template_set_body(300)),
+                ],
+            );
+            decode_ipfix(&mut dec, &define, exporter).unwrap();
+        }
+        // withdraw-all templates: id 2, field count 0
+        let withdraw = ipfix_msg(0, &[set_bytes(2, &tmpl_record(2, &[]))]);
+        decode_ipfix(&mut dec, &withdraw, ex).unwrap();
+        assert!(!dec.cache_contains_key(&(ex, 0, 256)));
         assert!(
-            entry.fields.capacity() < 16,
-            "cached template retained an over-sized capacity of {} for 0 fields \
-             (field_count=0xFFFF should have been clamped to the 0 bytes remaining)",
-            entry.fields.capacity()
+            dec.cache_contains_key(&(ex, 0, 300)),
+            "options templates survive a data-template withdraw-all"
         );
+        assert!(dec.cache_contains_key(&(ex, 1, 256)), "other domain kept");
+        assert!(
+            dec.cache_contains_key(&(other, 0, 256)),
+            "other exporter kept"
+        );
+
+        // withdraw-all options templates: set 3, id 3, field count 0
+        let withdraw = ipfix_msg(0, &[set_bytes(3, &[0, 3, 0, 0])]);
+        decode_ipfix(&mut dec, &withdraw, ex).unwrap();
+        assert!(!dec.cache_contains_key(&(ex, 0, 300)));
+        assert!(dec.cache_contains_key(&(ex, 1, 300)));
+        assert!(dec.cache_contains_key(&(other, 0, 300)));
     }
 
-    // ---- postNAT src/dst IEs route to src_addr/dst_addr ----
-
     #[test]
-    fn post_nat_src_dst_ies_map_to_addr_fields() {
-        use std::net::{IpAddr, Ipv4Addr};
-        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    fn test_withdrawal_is_accepted_when_cache_is_full() {
         let mut dec = IpfixDecoder::new();
-
-        // ie_id=225 (postNATSourceIPv4Address) and ie_id=226 (postNATDestinationIPv4Address)
-        // msg: 16 + (4+4+4+4 = 16 tmpl set) + (4+8 = 12 data set) = 44 bytes
-        let buf: &[u8] = &[
-            0x00, 0x0A, 0x00, 0x2C, 0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
-            0x00, 0x00, // Template Set: set_id=2, len=16
-            0x00, 0x02, 0x00, 0x10, 0x01, 0x00, 0x00, 0x02, // tmpl_id=256, field_count=2
-            0x00, 0xE1, 0x00, 0x04, // ie_id=225 (postNATSrc), len=4
-            0x00, 0xE2, 0x00, 0x04, // ie_id=226 (postNATDst), len=4
-            // Data Set: set_id=256, len=12
-            0x01, 0x00, 0x00, 0x0C, 0xC0, 0xA8, 0x02, 0x01, // 192.168.2.1
-            0x0A, 0x01, 0x00, 0x01, // 10.1.0.1
-        ];
-        let records = decode_ipfix(&mut dec, buf, exporter).expect("postNAT decode");
-        assert_eq!(records.len(), 1);
-        assert_eq!(
-            records[0].src_addr,
-            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 1)))
-        );
-        assert_eq!(
-            records[0].dst_addr,
-            Some(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 1)))
-        );
+        let ex = test_exporter();
+        for i in 0..MAX_CACHED_TEMPLATES as u32 {
+            dec.try_insert_template((ex, i, 256), vec![test_field()]);
+        }
+        let withdraw = ipfix_msg(0, &[set_bytes(2, &tmpl_record(256, &[]))]);
+        decode_ipfix(&mut dec, &withdraw, ex).unwrap();
+        assert_eq!(dec.cache_len(), MAX_CACHED_TEMPLATES - 1);
+        assert!(!dec.cache_contains_key(&(ex, 0, 256)));
     }
 
-    // ---- postNAPT src/dst port IEs route to src_port/dst_port ----
+    // ---- wider-than-declared unsigned fields ----
 
     #[test]
-    fn post_napt_port_ies_map_to_port_fields() {
-        use std::net::{IpAddr, Ipv4Addr};
-        let exporter: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    fn test_tcp_control_bits_two_byte_encoding() {
         let mut dec = IpfixDecoder::new();
+        let buf = ipfix_msg(
+            0,
+            &[
+                set_bytes(2, &tmpl_record(256, &[(6, 2)])),
+                set_bytes(256, &[0x00, 0x18]),
+            ],
+        );
+        let records = decode_ipfix(&mut dec, &buf, test_exporter()).unwrap();
+        assert_eq!(records[0].tcp_flags, Some(0x18));
+    }
 
-        // ie_id=227 (postNAPTSourceTransportPort) and ie_id=228 (postNAPTDestinationTransportPort)
-        // msg: 16 msg_hdr + 16 tmpl_set + 8 data_set = 40 bytes
-        let buf: &[u8] = &[
-            0x00, 0x0A, 0x00, 0x28, // total_len=40
-            0x67, 0x5C, 0xB0, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-            // Template Set: set_id=2, len=16
-            0x00, 0x02, 0x00, 0x10, 0x01, 0x00, 0x00, 0x02, // tmpl_id=256, field_count=2
-            0x00, 0xE3, 0x00, 0x02, // ie_id=227, len=2
-            0x00, 0xE4, 0x00, 0x02, // ie_id=228, len=2
-            // Data Set: set_id=256, len=8
-            0x01, 0x00, 0x00, 0x08, 0x1F, 0x90, // 8080
-            0x00, 0x50, // 80
-        ];
-        let records = decode_ipfix(&mut dec, buf, exporter).expect("postNAPT decode");
-        assert_eq!(records.len(), 1);
+    #[test]
+    fn test_wide_u16_and_u32_take_low_order_bytes() {
+        let mut dec = IpfixDecoder::new();
+        let buf = ipfix_msg(
+            0,
+            &[
+                set_bytes(2, &tmpl_record(256, &[(7, 4), (10, 8)])),
+                set_bytes(256, &[0, 0, 0x1F, 0x90, 0, 0, 0, 0, 0, 0, 0, 7]),
+            ],
+        );
+        let records = decode_ipfix(&mut dec, &buf, test_exporter()).unwrap();
         assert_eq!(records[0].src_port, Some(8080));
-        assert_eq!(records[0].dst_port, Some(80));
+        assert_eq!(records[0].input_interface, Some(7));
+    }
+
+    // ---- truncated options template ----
+
+    #[test]
+    fn test_truncated_options_template_is_error() {
+        let mut dec = IpfixDecoder::new();
+        // field_count=3 but only one 4-byte specifier follows
+        let mut body = vec![0x01, 0x40, 0, 3, 0, 1];
+        body.extend_from_slice(&[0, 144, 0, 4]);
+        let buf = ipfix_msg(0, &[set_bytes(3, &body)]);
+        let err = decode_ipfix(&mut dec, &buf, test_exporter()).unwrap_err();
+        assert!(matches!(err, DecodeError::Truncated { .. }), "got {err}");
+        assert!(dec.cache_is_empty(), "a truncated template caches nothing");
+    }
+
+    // ---- per-message record cap ----
+
+    fn cap_message(records: usize) -> Vec<u8> {
+        // 1-byte records keep the datagram under the 16-bit length limit
+        // (8193 + headers).
+        ipfix_msg(
+            0,
+            &[
+                set_bytes(2, &tmpl_record(256, &[(4, 1)])),
+                set_bytes(256, &vec![6u8; records]),
+            ],
+        )
+    }
+
+    #[test]
+    fn test_record_cap_per_message() {
+        let mut dec = IpfixDecoder::new();
+        let records = decode_ipfix(
+            &mut dec,
+            &cap_message(MAX_RECORDS_PER_MESSAGE + 100),
+            test_exporter(),
+        )
+        .unwrap();
+        assert_eq!(records.len(), MAX_RECORDS_PER_MESSAGE);
+    }
+
+    #[test]
+    fn test_record_cap_not_hit_at_exactly_the_limit() {
+        let mut dec = IpfixDecoder::new();
+        let records = decode_ipfix(
+            &mut dec,
+            &cap_message(MAX_RECORDS_PER_MESSAGE),
+            test_exporter(),
+        )
+        .unwrap();
+        assert_eq!(records.len(), MAX_RECORDS_PER_MESSAGE);
+    }
+
+    #[test]
+    fn test_record_cap_spans_data_sets() {
+        let mut dec = IpfixDecoder::new();
+        let half = MAX_RECORDS_PER_MESSAGE / 2 + 10;
+        let buf = ipfix_msg(
+            0,
+            &[
+                set_bytes(2, &tmpl_record(256, &[(4, 1)])),
+                set_bytes(256, &vec![6u8; half]),
+                set_bytes(256, &vec![6u8; half]),
+            ],
+        );
+        let records = decode_ipfix(&mut dec, &buf, test_exporter()).unwrap();
+        assert_eq!(records.len(), MAX_RECORDS_PER_MESSAGE);
     }
 
     // ---- NetFlow v9 source_id stored as observation_domain_id ----
@@ -3329,8 +3779,17 @@ mod tests {
         body.push(0x03);
         body.extend_from_slice(b"abc");
 
-        let records = parse_ipfix_data_set(&mut dec, &body, 256, exporter, 0, export_time, true)
-            .expect("varlen decode must not error");
+        let records = parse_ipfix_data_set(
+            &mut dec,
+            &body,
+            256,
+            exporter,
+            0,
+            export_time,
+            true,
+            usize::MAX,
+        )
+        .expect("varlen decode must not error");
 
         assert_eq!(records.len(), 1, "expected exactly 1 record");
         assert_eq!(
@@ -3349,8 +3808,17 @@ mod tests {
         let mut body = vec![0xFF, 0x01, 0x2C];
         body.extend(std::iter::repeat_n(0xABu8, 300));
 
-        let records = parse_ipfix_data_set(&mut dec, &body, 256, exporter, 0, export_time, true)
-            .expect("varlen 3-byte-length decode must not error");
+        let records = parse_ipfix_data_set(
+            &mut dec,
+            &body,
+            256,
+            exporter,
+            0,
+            export_time,
+            true,
+            usize::MAX,
+        )
+        .expect("varlen 3-byte-length decode must not error");
 
         assert_eq!(records.len(), 1);
         let hex = records[0].extra["ie97"]
@@ -3379,8 +3847,17 @@ mod tests {
         dec.try_insert_template((exporter, 0, 256), fields);
         let body = vec![0x00u8];
 
-        let records = parse_ipfix_data_set(&mut dec, &body, 256, exporter, 0, export_time, true)
-            .expect("varlen zero-length decode must not error");
+        let records = parse_ipfix_data_set(
+            &mut dec,
+            &body,
+            256,
+            exporter,
+            0,
+            export_time,
+            true,
+            usize::MAX,
+        )
+        .expect("varlen zero-length decode must not error");
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].extra["ie97"], "");
@@ -3400,8 +3877,17 @@ mod tests {
         body.push(0x00);
         body.push(0xFF); // 1 padding byte, shorter than min_record_len
 
-        let records = parse_ipfix_data_set(&mut dec, &body, 256, exporter, 0, export_time, true)
-            .expect("varlen padding decode must not error");
+        let records = parse_ipfix_data_set(
+            &mut dec,
+            &body,
+            256,
+            exporter,
+            0,
+            export_time,
+            true,
+            usize::MAX,
+        )
+        .expect("varlen padding decode must not error");
 
         assert_eq!(
             records.len(),
@@ -3422,8 +3908,17 @@ mod tests {
         body.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // record 2: declares 65535 bytes
         body.extend_from_slice(&[0u8; 7]); // only 7 more bytes follow (10 total left)
 
-        let records = parse_ipfix_data_set(&mut dec, &body, 256, exporter, 0, export_time, true)
-            .expect("truncated varlen record must not surface as Err");
+        let records = parse_ipfix_data_set(
+            &mut dec,
+            &body,
+            256,
+            exporter,
+            0,
+            export_time,
+            true,
+            usize::MAX,
+        )
+        .expect("truncated varlen record must not surface as Err");
 
         assert_eq!(
             records.len(),
@@ -3440,8 +3935,17 @@ mod tests {
         dec.try_insert_template((exporter, 0, 256), fields);
         let body = vec![0x00u8, 0x00, 0x00, 0x00];
 
-        let records = parse_ipfix_data_set(&mut dec, &body, 256, exporter, 0, export_time, true)
-            .expect("all-varlen template decode must not error");
+        let records = parse_ipfix_data_set(
+            &mut dec,
+            &body,
+            256,
+            exporter,
+            0,
+            export_time,
+            true,
+            usize::MAX,
+        )
+        .expect("all-varlen template decode must not error");
 
         assert_eq!(records.len(), 2);
     }
@@ -3458,8 +3962,17 @@ mod tests {
         body.push(0x03);
         body.extend_from_slice(b"abc");
 
-        let records = parse_ipfix_data_set(&mut dec, &body, 256, exporter, 0, export_time, false)
-            .expect("v9 path must not error");
+        let records = parse_ipfix_data_set(
+            &mut dec,
+            &body,
+            256,
+            exporter,
+            0,
+            export_time,
+            false,
+            usize::MAX,
+        )
+        .expect("v9 path must not error");
 
         assert_eq!(
             records.len(),
