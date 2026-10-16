@@ -37,6 +37,21 @@ well-behaved forwarder simply reconnects and resumes sending.
 - **RFC 3164** (BSD syslog): `<priority>timestamp hostname tag[pid]: message`
 - **RFC 5424**: `<priority>version timestamp hostname app-name procid msgid [structured-data] message`
 
+Header parsing details:
+- RFC 5424 structured data is either `-` (none; the message is the text after `- `) or one or
+  more *adjacent* `[id name="value"]` elements. Inside a quoted value `\"`, `\\` and `\]` are
+  unescaped. Brackets in the message text after the elements (`... ] user [admin] logged in`)
+  stay in the message. Malformed or unterminated structured data is not dropped: the whole
+  remainder becomes the message.
+- In an RFC 3164 line the tag is a single token before the first `:` (no spaces, `=` or `(`).
+  Text such as `Failed password for root port 22: x` or an auditd `type=SYSCALL ...` line has
+  no tag and is kept whole as the message. A CEF/LEEF payload directly after the hostname is
+  likewise never treated as a tag, so it reaches the CEF/LEEF parser.
+- A line with a `<PRI>` that matches neither header format is kept, not dropped. A valid PRI
+  (0-191) is honoured and removed from the message (`<34>free text` -> priority 34, message
+  `free text`). A PRI above 191 is not valid: the whole raw line, prefix included, becomes the
+  message with the RFC 3164 default priority (facility user, severity notice).
+
 **HTTP Endpoints**:
 - `POST /syslog` - Submit syslog messages via HTTP
 - `GET /syslog/udp` - Get UDP listener info
