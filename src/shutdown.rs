@@ -24,6 +24,24 @@ pub async fn wait_for_shutdown_signal() {
     }
 }
 
+/// Resolve the tokio worker-thread count from the `WEF_WORKER_THREADS` value.
+///
+/// `None` (variable unset) yields `default`. A value that is not a positive integer is a
+/// startup error naming the variable: `0` would panic inside tokio's runtime builder, and
+/// silently falling back would hide a typo.
+pub fn parse_worker_threads(raw: Option<String>, default: usize) -> anyhow::Result<usize> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => anyhow::bail!(
+            "WEF_WORKER_THREADS must be a positive integer (got {raw:?}); unset it to use \
+             all {default} CPUs"
+        ),
+    }
+}
+
 /// Await a list of `JoinHandle<()>` tasks, respecting a shared wall-clock
 /// deadline.
 ///
@@ -98,8 +116,8 @@ pub async fn supervise_listener_handles(
     futs.next().await
 }
 
-/// Wait for each listener task to exit, up to `per_handle_timeout` each,
-/// aborting any that overruns so its `Arc<dyn Handler>` clones are released.
+/// Wait for all listener tasks to exit, up to `total_timeout` in total (one shared deadline),
+/// aborting any that overrun so its `Arc<dyn Handler>` clones are released.
 ///
 /// Skips handles that have already finished. That is not an optimisation: the
 /// H-3 supervision arm in `main.rs` polls `&mut` borrows of these same handles
@@ -107,17 +125,21 @@ pub async fn supervise_listener_handles(
 /// after completion" if such a handle is awaited a second time. Any listener
 /// failing to bind — a port collision, not just a privileged port — would
 /// otherwise take the whole process down instead of shutting down gracefully.
-pub async fn drain_listener_handles(handles: Vec<JoinHandle<()>>, per_handle_timeout: Duration) {
+pub async fn drain_listener_handles(handles: Vec<JoinHandle<()>>, total_timeout: Duration) {
+    let mut aborts = Vec::new();
+    let mut pending = Vec::new();
     for handle in handles {
         if handle.is_finished() {
             continue;
         }
-        let abort_handle = handle.abort_handle();
-        if tokio::time::timeout(per_handle_timeout, handle)
-            .await
-            .is_err()
-        {
-            abort_handle.abort();
+        aborts.push(handle.abort_handle());
+        pending.push(handle);
+    }
+    // One shared deadline for the whole set, so N wedged listeners cost one timeout, not N.
+    let all = futures::future::join_all(pending);
+    if tokio::time::timeout(total_timeout, all).await.is_err() {
+        for a in aborts {
+            a.abort();
         }
     }
 }
@@ -126,6 +148,47 @@ pub async fn drain_listener_handles(handles: Vec<JoinHandle<()>>, per_handle_tim
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// Several never-finishing listeners must cost one deadline in total, not one each.
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_listener_handles_shares_one_deadline() {
+        let handles: Vec<JoinHandle<()>> = (0..5)
+            .map(|_| tokio::spawn(std::future::pending::<()>()))
+            .collect();
+        let aborts: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
+        let started = tokio::time::Instant::now();
+        drain_listener_handles(handles, Duration::from_secs(6)).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(6));
+        tokio::task::yield_now().await;
+        assert!(
+            aborts.iter().all(|a| a.is_finished()),
+            "stragglers must be aborted"
+        );
+    }
+
+    #[test]
+    fn test_worker_threads_env_unset_uses_default() {
+        assert_eq!(parse_worker_threads(None, 7).unwrap(), 7);
+        assert_eq!(parse_worker_threads(Some("3".into()), 7).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_worker_threads_env_zero_rejected() {
+        let err = parse_worker_threads(Some("0".into()), 7)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("WEF_WORKER_THREADS"), "{err}");
+    }
+
+    #[test]
+    fn test_worker_threads_env_garbage_rejected() {
+        for bad in ["abc", "", "-2", "1.5"] {
+            let err = parse_worker_threads(Some(bad.into()), 7)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("WEF_WORKER_THREADS"), "{err}");
+        }
+    }
 
     /// Regression for the HTTP-only-deployment bug: an empty handle set must
     /// never resolve. Before the fix, `FuturesUnordered::next()` on an empty

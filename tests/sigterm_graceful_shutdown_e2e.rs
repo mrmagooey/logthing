@@ -419,3 +419,60 @@ async fn sigterm_flushes_lines_from_idle_open_zeek_tcp_connection() {
     )
     .await;
 }
+
+/// A plain-HTTP HEC client that sent events and then idles on a kept-alive connection must not
+/// stop SIGTERM from flushing: the server task is drained (closing idle connections and
+/// dropping the HEC writer's senders) before the writers are awaited, so the writer sees
+/// end-of-stream and flushes well inside its own 10 s deadline.
+#[tokio::test]
+async fn sigterm_flushes_hec_events_with_idle_keepalive_client() {
+    const EVENTS: usize = 6;
+    let toml = "bind_address = \"127.0.0.1:{HTTP}\"\n[tls]\nenabled = false\n\
+                [syslog]\nenabled = false\n[metrics]\nenabled = false\n\
+                [hec]\nenabled = true\ntoken = \"\"\n\
+                [hec.local]\ndirectory = \"{DIR}/hec\"\nmax_buffer_rows = 100000\n\
+                flush_interval_secs = 3600\n";
+    let mut proc = common::Proc::spawn_healthy(env!("CARGO_BIN_EXE_logthing"), toml, &[]).await;
+
+    // One client, one pooled keep-alive connection; it stays alive (idle) until the test ends.
+    let client = reqwest::Client::new();
+    let mut body = String::new();
+    for i in 0..EVENTS {
+        body.push_str(&format!("{{\"event\":{{\"n\":{i}}}}}\n"));
+    }
+    let resp = client
+        .post(format!("{}/services/collector/event", proc.base()))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "logs:\n{}", proc.logs());
+    let _ = resp.bytes().await.unwrap();
+
+    let out_dir = proc.dir().join("hec");
+    assert!(
+        common::parquet_files(&out_dir).is_empty(),
+        "a Parquet file existed before shutdown; only the drain may flush here"
+    );
+
+    let started = Instant::now();
+    let status = proc.terminate(Duration::from_secs(12));
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "shutdown took {:?} with an idle keep-alive client:\n{}",
+        started.elapsed(),
+        proc.logs()
+    );
+    assert!(
+        status.success(),
+        "unclean exit: {status:?}\n{}",
+        proc.logs()
+    );
+
+    let rows: usize = common::read_all(&out_dir)
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(rows, EVENTS, "logs:\n{}", proc.logs());
+    drop(client);
+}
