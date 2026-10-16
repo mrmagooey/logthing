@@ -37,6 +37,8 @@
 //! `lo` interface, so binding a client socket to 127.0.0.2 works without
 //! any extra interface configuration.
 
+mod common;
+
 use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::{Child, Command, Stdio};
@@ -411,4 +413,33 @@ tcp_port = {suricata_tcp}
         None,
         "suricata_records_received must not increment for a source outside allowed_ips"
     );
+}
+
+/// A `[::]` dual-stack bind reports IPv4 clients as `::ffff:a.b.c.d`; an IPv4-only allowlist
+/// must still admit them.
+#[tokio::test]
+async fn allowed_ips_ipv4_entry_admits_ipv4_client_on_dual_stack_bind() {
+    if let Err(e) = std::net::TcpListener::bind("[::]:0") {
+        eprintln!("SKIP: host cannot bind [::]:0 ({e}); dual-stack e2e not applicable");
+        return;
+    }
+    let toml = r#"
+bind_address = "[::]:{HTTP}"
+
+[tls]
+enabled = false
+
+[metrics]
+enabled = false
+
+[syslog]
+enabled = false
+
+[security]
+allowed_ips = ["127.0.0.1/32"]
+"#;
+    // `wait_healthy` polls http://127.0.0.1:<port>/health, an IPv4 peer of a `[::]` socket.
+    let p = common::Proc::spawn_healthy(env!("CARGO_BIN_EXE_logthing"), toml, &[]).await;
+    let r = reqwest::get(format!("{}/health", p.base())).await.unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::OK);
 }

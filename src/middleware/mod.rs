@@ -110,7 +110,9 @@ impl IpWhitelist {
             return true;
         }
 
-        let ip = addr.ip();
+        // A `[::]` dual-stack socket reports IPv4 peers as `::ffff:a.b.c.d`; fold them back to
+        // IPv4 so IPv4 allowlist entries match.
+        let ip = addr.ip().to_canonical();
         networks.iter().any(|net| net.contains(&ip))
     }
 }
@@ -146,6 +148,21 @@ mod tests {
         assert!(whitelist.is_allowed(&addr_in_range));
         assert!(whitelist.is_allowed(&addr_ip));
         assert!(!whitelist.is_allowed(&addr_outside));
+    }
+
+    #[test]
+    fn test_is_allowed_matches_ipv4_mapped_ipv6_peer() {
+        let whitelist = IpWhitelist::new(vec!["10.0.0.0/24".into()]).unwrap();
+        let mapped_in: SocketAddr = "[::ffff:10.0.0.5]:1234".parse().unwrap();
+        let mapped_out: SocketAddr = "[::ffff:10.0.1.5]:1".parse().unwrap();
+        assert!(whitelist.is_allowed(&mapped_in));
+        assert!(!whitelist.is_allowed(&mapped_out));
+
+        // An entry written in mapped form never matches: the peer is canonicalised to IPv4
+        // first and an IPv4 address is not contained in an IPv6 network. Operators must write
+        // IPv4 entries as plain IPv4.
+        let mapped_entry = IpWhitelist::new(vec!["::ffff:10.0.0.0/120".into()]).unwrap();
+        assert!(!mapped_entry.is_allowed(&mapped_in));
     }
 
     #[test]

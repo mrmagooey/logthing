@@ -31,6 +31,8 @@ require_client_cert = false           # Set to true to enforce mTLS
 # process restart, and there is no LOGTHING__SECURITY__ALLOWED_IPS
 # equivalent — this is a list, and the env loader sets no list separator.
 # See "Live vs. restart-required config changes" below.
+# IPv4 clients of a dual-stack ("[::]") bind are matched as plain IPv4, so list IPv4
+# sources as IPv4 entries (not "::ffff:a.b.c.d" form).
 allowed_ips = ["192.168.1.0/24", "10.0.0.0/8"]
 max_connections = 10000
 connection_timeout_secs = 300

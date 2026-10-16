@@ -39,7 +39,7 @@ pub async fn security_middleware(
             .server_config
             .allowed_ips
             .iter()
-            .any(|net| net.contains(&ip));
+            .any(|net| net.contains(&ip.to_canonical()));
 
         if !allowed {
             tracing::warn!("Admin access denied from {} - not in whitelist", client_ip);
