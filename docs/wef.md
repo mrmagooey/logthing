@@ -172,10 +172,12 @@ normal clients stay far below this).
 
 ### Known limits
 
-- **Acknowledged events can still be lost.** logthing answers a delivery with an Ack even when
-  an event is dropped because the sink buffer is full. Windows then advances its bookmark and
-  does not resend it. Watch `parquet_s3_dropped{source="wef"}` and size
-  `channel_capacity`/`max_buffer_rows` accordingly.
+- **A full sink buffer makes the client retry.** If any event of a delivery cannot be handed
+  to a sink (buffer full or closed), logthing answers `503` and does not store the batch's
+  bookmark, so Windows re-sends from the previous bookmark; events accepted before the drop
+  may be delivered twice. Events whose XML cannot be parsed are counted
+  (`wef_xml_parse_errors`) and skipped, and do not block the bookmark. Watch
+  `parquet_s3_dropped{source="wef"}` and size `channel_capacity`/`max_buffer_rows`.
 - **Bookmarks are held in memory.** After a logthing restart (or when `bookmark_capacity` is
   exceeded) clients have no bookmark and resume from now (or from the earliest event if
   `read_existing_events = true`), which can duplicate or skip events.
