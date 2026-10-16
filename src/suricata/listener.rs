@@ -252,6 +252,7 @@ impl SuricataListener {
 
         let semaphore = Arc::new(Semaphore::new(MAX_SURICATA_TCP_CONNECTIONS));
         let byte_budget = Arc::new(Semaphore::new(SURICATA_BYTE_BUDGET_PERMITS));
+        let mut conns = crate::net::ConnectionTasks::new();
         let mut accept_backoff = crate::net::AcceptBackoff::new("suricata");
 
         loop {
@@ -271,9 +272,10 @@ impl SuricataListener {
                                     let idle_timeout = TCP_IDLE_TIMEOUT;
                                     let byte_budget = byte_budget.clone();
                                     let cardinality = self.cardinality.clone();
-                                    tokio::spawn(async move {
+                                    let conn_shutdown = shutdown_rx.clone();
+                                    conns.spawn(async move {
                                         let _permit = permit; // held for connection lifetime
-                                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler, idle_timeout, byte_budget, cardinality).await {
+                                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler, idle_timeout, byte_budget, cardinality, conn_shutdown).await {
                                             error!("Suricata TCP connection error from {}: {}", src, e);
                                         }
                                     });
@@ -292,8 +294,8 @@ impl SuricataListener {
                         }
                     }
                 }
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
                         info!("Suricata listener: shutdown signal received");
                         break;
                     }
@@ -301,6 +303,7 @@ impl SuricataListener {
             }
         }
 
+        conns.drain(crate::net::CONNECTION_DRAIN_GRACE).await;
         Ok(())
     }
 
@@ -312,6 +315,8 @@ impl SuricataListener {
 
         let semaphore = Arc::new(Semaphore::new(MAX_SURICATA_TCP_CONNECTIONS));
         let byte_budget = Arc::new(Semaphore::new(SURICATA_BYTE_BUDGET_PERMITS));
+        // Never fires: this entry point has no shutdown signal.
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let mut accept_backoff = crate::net::AcceptBackoff::new("suricata");
 
         loop {
@@ -332,6 +337,7 @@ impl SuricataListener {
                             let idle_timeout = TCP_IDLE_TIMEOUT;
                             let byte_budget = byte_budget.clone();
                             let cardinality = self.cardinality.clone();
+                            let conn_shutdown = shutdown_rx.clone();
                             tokio::spawn(async move {
                                 let _permit = permit; // held for connection lifetime
                                 if let Err(e) = Self::handle_tcp_connection(
@@ -341,6 +347,7 @@ impl SuricataListener {
                                     idle_timeout,
                                     byte_budget,
                                     cardinality,
+                                    conn_shutdown,
                                 )
                                 .await
                                 {
@@ -379,6 +386,7 @@ impl SuricataListener {
         idle_timeout: Duration,
         byte_budget: Arc<Semaphore>,
         cardinality: Vec<Arc<CardinalityWatcher>>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let mut reader = BufReader::new(stream);
         let mut buf: Vec<u8> = Vec::new();
@@ -386,62 +394,98 @@ impl SuricataListener {
         // SURICATA_BUDGET_CHUNK_BYTES` bytes of headroom. Dropped (releasing the permits)
         // whenever `buf` is cleared.
         let mut permits: Vec<tokio::sync::OwnedSemaphorePermit> = Vec::new();
-        let mut held_units: usize;
+        let mut held_units: usize = 0;
+        // Set once shutdown is signalled: the connection then reads only what is already
+        // available (zero-length read timeout), dispatching every complete line, and ends.
+        let mut draining = false;
+        // The previous read was cancelled by shutdown: keep its partial line in `buf`.
+        let mut resume = false;
 
         loop {
-            buf.clear();
-            shrink_oversized_buffer(&mut buf);
-            permits.clear();
-            held_units = 0;
+            if !resume {
+                buf.clear();
+                shrink_oversized_buffer(&mut buf);
+                permits.clear();
+                held_units = 0;
+            }
+            resume = false;
 
-            let outcome: Result<std::io::Result<LineReadOutcome>, _> =
-                tokio::time::timeout(idle_timeout, async {
-                    loop {
-                        let available = reader.fill_buf().await?;
-                        if available.is_empty() {
-                            // True EOF. `read_until`'s original contract returns `Ok(n)` with
-                            // whatever was accumulated (n > 0) on a mid-line EOF, not `Ok(0)` —
-                            // an ordinary client that writes its final record with no trailing
-                            // newline and then closes must still have it parsed and dispatched.
-                            // Only a clean EOF with nothing accumulated ends the connection
-                            // silently.
-                            return Ok(if buf.is_empty() {
-                                LineReadOutcome::Eof
-                            } else {
-                                LineReadOutcome::Line
-                            });
-                        }
-                        let remaining_cap = SURICATA_MAX_LINE_BYTES + 1 - buf.len();
-                        let take_len = available.len().min(remaining_cap);
-                        let newline_pos = available[..take_len].iter().position(|&b| b == b'\n');
-                        let consume_len = newline_pos.map_or(take_len, |pos| pos + 1);
+            let read = async {
+                loop {
+                    let available = reader.fill_buf().await?;
+                    if available.is_empty() {
+                        // True EOF. `read_until`'s original contract returns `Ok(n)` with
+                        // whatever was accumulated (n > 0) on a mid-line EOF, not `Ok(0)` —
+                        // an ordinary client that writes its final record with no trailing
+                        // newline and then closes must still have it parsed and dispatched.
+                        // Only a clean EOF with nothing accumulated ends the connection
+                        // silently.
+                        return Ok(if buf.is_empty() {
+                            LineReadOutcome::Eof
+                        } else {
+                            LineReadOutcome::Line
+                        });
+                    }
+                    let remaining_cap = SURICATA_MAX_LINE_BYTES + 1 - buf.len();
+                    let take_len = available.len().min(remaining_cap);
+                    let newline_pos = available[..take_len].iter().position(|&b| b == b'\n');
+                    let consume_len = newline_pos.map_or(take_len, |pos| pos + 1);
 
-                        buf.extend_from_slice(&available[..consume_len]);
-                        reader.consume(consume_len);
+                    buf.extend_from_slice(&available[..consume_len]);
+                    reader.consume(consume_len);
 
-                        let needed_units = buf.len().div_ceil(SURICATA_BUDGET_CHUNK_BYTES);
-                        if needed_units > held_units {
-                            let extra = (needed_units - held_units) as u32;
-                            match byte_budget.clone().try_acquire_many_owned(extra) {
-                                Ok(permit) => {
-                                    permits.push(permit);
-                                    held_units = needed_units;
-                                }
-                                Err(_) => return Ok(LineReadOutcome::BudgetExhausted),
+                    let needed_units = buf.len().div_ceil(SURICATA_BUDGET_CHUNK_BYTES);
+                    if needed_units > held_units {
+                        let extra = (needed_units - held_units) as u32;
+                        match byte_budget.clone().try_acquire_many_owned(extra) {
+                            Ok(permit) => {
+                                permits.push(permit);
+                                held_units = needed_units;
                             }
-                        }
-
-                        if newline_pos.is_some() {
-                            return Ok(LineReadOutcome::Line);
-                        }
-                        if buf.len() > SURICATA_MAX_LINE_BYTES {
-                            return Ok(LineReadOutcome::Oversized);
+                            Err(_) => return Ok(LineReadOutcome::BudgetExhausted),
                         }
                     }
-                })
-                .await;
+
+                    if newline_pos.is_some() {
+                        return Ok(LineReadOutcome::Line);
+                    }
+                    if buf.len() > SURICATA_MAX_LINE_BYTES {
+                        return Ok(LineReadOutcome::Oversized);
+                    }
+                }
+            };
+            let outcome: Result<std::io::Result<LineReadOutcome>, _> = if draining {
+                tokio::time::timeout(Duration::ZERO, read).await
+            } else {
+                let cancelled = tokio::select! {
+                    o = tokio::time::timeout(idle_timeout, read) => Ok(o),
+                    changed = shutdown_rx.changed() => {
+                        Err(changed.is_err() || *shutdown_rx.borrow())
+                    }
+                };
+                match cancelled {
+                    Ok(o) => o,
+                    Err(shutdown) => {
+                        draining = shutdown;
+                        resume = true;
+                        continue;
+                    }
+                }
+            };
 
             let outcome = match outcome {
+                Err(_elapsed) if draining => {
+                    if !buf.is_empty() {
+                        metrics::counter!("suricata_partial_lines_dropped_at_shutdown")
+                            .increment(1);
+                        warn!(
+                            "Suricata: dropped partial line ({} bytes) from {} at shutdown",
+                            buf.len(),
+                            src
+                        );
+                    }
+                    break;
+                }
                 Err(_elapsed) => {
                     metrics::counter!("suricata_tcp_idle_timeouts").increment(1);
                     debug!(
@@ -541,6 +585,14 @@ impl SuricataListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shutdown receiver that never fires (its sender is leaked, not dropped).
+    fn never_shutdown() -> tokio::sync::watch::Receiver<bool> {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        std::mem::forget(tx);
+        rx
+    }
+
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
@@ -973,6 +1025,7 @@ mod tests {
             TCP_IDLE_TIMEOUT,
             full_byte_budget(),
             Vec::new(),
+            never_shutdown(),
         )
         .await
         .unwrap();
@@ -1046,6 +1099,7 @@ mod tests {
             TCP_IDLE_TIMEOUT,
             full_byte_budget(),
             Vec::new(),
+            never_shutdown(),
         )
         .await
         .unwrap();
@@ -1163,6 +1217,7 @@ mod tests {
             Duration::from_millis(100),
             full_byte_budget(),
             Vec::new(),
+            never_shutdown(),
         )
         .await
         .unwrap();
@@ -1294,6 +1349,7 @@ mod tests {
             Duration::from_secs(5),
             full_byte_budget(),
             Vec::new(),
+            never_shutdown(),
         )
         .await
         .unwrap();
@@ -1378,6 +1434,7 @@ mod tests {
                     TCP_IDLE_TIMEOUT,
                     budget,
                     Vec::new(),
+                    never_shutdown(),
                 )
                 .await
             }));
@@ -1606,6 +1663,7 @@ mod tests {
             TCP_IDLE_TIMEOUT,
             full_byte_budget(),
             vec![watcher.clone()],
+            never_shutdown(),
         )
         .await
         .unwrap();
@@ -1645,5 +1703,150 @@ mod tests {
             "2 distinct src_ip values from dns records; the alert record's src_ip must have \
              been excluded by the stream filter"
         );
+    }
+
+    /// Open a TCP pair and run one `handle_tcp_connection` server task on it.
+    async fn shutdown_conn_setup() -> (
+        tokio::net::TcpStream,
+        tokio::task::JoinHandle<()>,
+        tokio::sync::watch::Sender<bool>,
+        Arc<CapturingHandler>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, src) = listener.accept().await.unwrap();
+        let handler = CapturingHandler::new();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let h: Arc<dyn SuricataHandler> = handler.clone();
+        let task = tokio::spawn(async move {
+            SuricataListener::handle_tcp_connection(
+                stream,
+                src,
+                h,
+                Duration::from_secs(60),
+                full_byte_budget(),
+                Vec::new(),
+                rx,
+            )
+            .await
+            .unwrap();
+        });
+        (client, task, tx, handler)
+    }
+
+    /// An idle-but-open connection holding one complete line plus half a line: on
+    /// shutdown the task ends promptly, the complete line was dispatched, and the
+    /// partial line is counted as dropped.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn test_connection_task_exits_on_shutdown() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let (mut client, task, tx, handler) = shutdown_conn_setup().await;
+        client
+            .write_all(b"{\"event_type\":\"alert\",\"src_ip\":\"1.1.1.1\"}\n")
+            .await
+            .unwrap();
+        client.write_all(b"{\"event_type\":\"al").await.unwrap();
+        client.flush().await.unwrap();
+        // Let the task read both writes, then stay idle (connection open).
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "connection task must still be idle-open"
+        );
+
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("connection task must end within 1 s of shutdown")
+            .unwrap();
+
+        assert_eq!(
+            handler.take_records().len(),
+            1,
+            "the complete line must be dispatched"
+        );
+        let map = snapshotter.snapshot().into_hashmap();
+        let partial = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("suricata_partial_lines_dropped_at_shutdown"),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert_eq!(partial, 1, "the half line must be counted as dropped");
+        drop(client);
+    }
+
+    /// A dropped shutdown sender means shutdown (it must not spin or hang the task).
+    #[tokio::test]
+    async fn test_connection_task_exits_when_shutdown_sender_dropped() {
+        let (mut client, task, tx, handler) = shutdown_conn_setup().await;
+        client
+            .write_all(b"{\"event_type\":\"alert\",\"src_ip\":\"1.1.1.1\"}\n")
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("connection task must end within 1 s of the sender dropping")
+            .unwrap();
+        assert_eq!(handler.take_records().len(), 1);
+        drop(client);
+    }
+
+    /// Lines already queued when shutdown fires are still dispatched, not discarded.
+    #[tokio::test]
+    async fn test_connection_task_dispatches_queued_lines_on_shutdown() {
+        let (mut client, task, tx, handler) = shutdown_conn_setup().await;
+        let mut payload = Vec::new();
+        for _ in 0..5 {
+            payload.extend_from_slice(b"{\"event_type\":\"alert\",\"src_ip\":\"1.1.1.1\"}\n");
+        }
+        client.write_all(&payload).await.unwrap();
+        client.flush().await.unwrap();
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("connection task must end within 1 s of shutdown")
+            .unwrap();
+        assert_eq!(handler.take_records().len(), 5);
+        drop(client);
+    }
+
+    /// A dropped shutdown sender ends the accept loop (it used to spin forever).
+    #[tokio::test]
+    async fn test_suricata_exits_when_shutdown_sender_dropped() {
+        let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tmp.local_addr().unwrap().port();
+        drop(tmp);
+        let config = SuricataListenerConfig {
+            tcp_port,
+            bind_address: "127.0.0.1".to_string(),
+        };
+        let handler: Arc<dyn SuricataHandler> = CapturingHandler::new();
+        let listener = SuricataListener::new(config, handler);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            listener.start_with_shutdown(rx).await.ok();
+        });
+        sleep(Duration::from_millis(50)).await;
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("listener must exit within 1 s of the sender dropping")
+            .unwrap();
     }
 }

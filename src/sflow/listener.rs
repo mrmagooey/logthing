@@ -180,11 +180,13 @@ impl SflowListener {
 
             if self.config.recv_batch_size <= 1 {
                 let mut buf = vec![0u8; 65535];
+                let mut backoff = crate::net::RecvErrorBackoff::new("sflow");
                 loop {
                     tokio::select! {
                         result = socket.recv_from(&mut buf) => {
                             match result {
                                 Ok((len, src)) => {
+                                    backoff.reset();
                                     // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
                                     if !self.allowed_ips.is_allowed(&src) {
                                         metrics::counter!("listener_source_rejected", "protocol" => "sflow").increment(1);
@@ -206,15 +208,15 @@ impl SflowListener {
                                     }
                                 }
                                 Err(e) => {
-                                    error!("sFlow UDP receive error: {}", e);
+                                    backoff.on_error(&e).await;
                                 }
                             }
                         }
                         _ = socket_stats_ticker.tick() => {
                             socket_stats.poll().await;
                         }
-                        _ = shutdown_rx.changed() => {
-                            if *shutdown_rx.borrow() {
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
                                 info!("sFlow listener: shutdown signal received");
                                 break;
                             }
@@ -226,11 +228,13 @@ impl SflowListener {
 
             // Batched-recv path: recv_batch_size > 1.
             let mut batch = crate::net::RecvMmsgBatch::new(self.config.recv_batch_size);
+            let mut backoff = crate::net::RecvErrorBackoff::new("sflow");
             loop {
                 tokio::select! {
                     result = batch.recv(&socket) => {
                         match result {
                             Ok(n) => {
+                                backoff.reset();
                                 for i in 0..n {
                                     let Some(src) = batch.src(i) else {
                                         warn!("sflow: batch message with unparseable source address, skipping");
@@ -269,15 +273,15 @@ impl SflowListener {
                                 // sits beside (this file's `Err(e) => {
                                 // error!("sFlow UDP receive error: {}", e); }`
                                 // above) -- not a gap introduced by batching.
-                                error!("sFlow UDP batched receive error: {}", e);
+                                backoff.on_error(&e).await;
                             }
                         }
                     }
                     _ = socket_stats_ticker.tick() => {
                         socket_stats.poll().await;
                     }
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
                             info!("sFlow listener: shutdown signal received");
                             break;
                         }
@@ -360,11 +364,13 @@ impl SflowListener {
         let mut socket_stats = crate::net::SocketDropStats::new(&socket, "sflow");
         let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
+        let mut backoff = crate::net::RecvErrorBackoff::new("sflow");
         loop {
             tokio::select! {
                 result = socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, src)) => {
+                            backoff.reset();
                             if !self.allowed_ips.is_allowed(&src) {
                                 metrics::counter!("listener_source_rejected", "protocol" => "sflow")
                                     .increment(1);
@@ -386,7 +392,7 @@ impl SflowListener {
                             }
                         }
                         Err(e) => {
-                            error!("sFlow UDP receive error: {}", e);
+                            backoff.on_error(&e).await;
                         }
                     }
                 }
@@ -416,11 +422,13 @@ async fn sflow_recv_loop(
 
     if recv_batch_size <= 1 {
         let mut buf = vec![0u8; 65535];
+        let mut backoff = crate::net::RecvErrorBackoff::new("sflow");
         loop {
             tokio::select! {
                 result = socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, src)) => {
+                            backoff.reset();
                             // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
                             if !allowed_ips.is_allowed(&src) {
                                 metrics::counter!("listener_source_rejected", "protocol" => "sflow").increment(1);
@@ -442,7 +450,7 @@ async fn sflow_recv_loop(
                             }
                         }
                         Err(e) => {
-                            error!("sFlow UDP receive error: {}", e);
+                            backoff.on_error(&e).await;
                         }
                     }
                 }
@@ -451,8 +459,8 @@ async fn sflow_recv_loop(
                         stats.poll().await;
                     }
                 }
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
                         info!("sFlow listener: shutdown signal received");
                         break;
                     }
@@ -463,11 +471,13 @@ async fn sflow_recv_loop(
     }
 
     let mut batch = crate::net::RecvMmsgBatch::new(recv_batch_size);
+    let mut backoff = crate::net::RecvErrorBackoff::new("sflow");
     loop {
         tokio::select! {
             result = batch.recv(&socket) => {
                 match result {
                     Ok(n) => {
+                        backoff.reset();
                         for i in 0..n {
                             let Some(src) = batch.src(i) else {
                                 warn!("sflow: batch message with unparseable source address, skipping");
@@ -500,7 +510,7 @@ async fn sflow_recv_loop(
                         // same parity note as the inline loop's batched arm
                         // in start_with_shutdown. Retried on the next loop
                         // iteration via batch.recv()'s own readable() await.
-                        error!("sFlow UDP batched receive error: {}", e);
+                        backoff.on_error(&e).await;
                     }
                 }
             }
@@ -509,8 +519,8 @@ async fn sflow_recv_loop(
                     stats.poll().await;
                 }
             }
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
                     info!("sFlow listener: shutdown signal received");
                     break;
                 }
@@ -1536,5 +1546,37 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(5), listener).await;
+    }
+
+    /// A dropped shutdown sender means shutdown, in every receive-loop shape
+    /// (single/fan-out sockets, single/batched receive). It used to busy-loop.
+    #[tokio::test]
+    async fn test_sflow_exits_when_shutdown_sender_dropped() {
+        for (recv_tasks, recv_batch_size) in [(1, 1), (1, 4), (2, 1), (2, 4)] {
+            let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let udp_port = tmp.local_addr().unwrap().port();
+            drop(tmp);
+            let config = SflowListenerConfig {
+                udp_port,
+                bind_address: "127.0.0.1".to_string(),
+                recv_tasks,
+                recv_batch_size,
+                ..SflowListenerConfig::default()
+            };
+            let handler: Arc<dyn SflowHandler> = Arc::new(DefaultSflowHandler);
+            let listener = SflowListener::new(config, handler);
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let task = tokio::spawn(async move {
+                listener.start_with_shutdown(rx).await.ok();
+            });
+            sleep(Duration::from_millis(100)).await;
+            drop(tx);
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("recv_tasks={recv_tasks} batch={recv_batch_size}: no exit")
+                })
+                .unwrap();
+        }
     }
 }

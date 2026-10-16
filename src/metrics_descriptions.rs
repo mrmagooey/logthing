@@ -50,6 +50,11 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     ),
     (
         Kind::Counter,
+        "syslog_partial_lines_dropped_at_shutdown",
+        "Syslog TCP connections that still held an unterminated line when shutdown ended them; the partial line is dropped.",
+    ),
+    (
+        Kind::Counter,
         "syslog_recv_task_failed",
         "Syslog UDP receive tasks that exited with an error.",
     ),
@@ -173,6 +178,11 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     ),
     (
         Kind::Counter,
+        "zeek_partial_lines_dropped_at_shutdown",
+        "Zeek TCP connections that still held an unterminated line when shutdown ended them; the partial line is dropped.",
+    ),
+    (
+        Kind::Counter,
         "zeek_tcp_budget_exhausted",
         "Zeek TCP connections closed because the aggregate line-buffer memory budget was exhausted.",
     ),
@@ -211,6 +221,11 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
         Kind::Counter,
         "suricata_oversized_lines",
         "Suricata TCP lines that exceeded the maximum line length; the connection is closed.",
+    ),
+    (
+        Kind::Counter,
+        "suricata_partial_lines_dropped_at_shutdown",
+        "Suricata TCP connections that still held an unterminated line when shutdown ended them; the partial line is dropped.",
     ),
     (
         Kind::Counter,
