@@ -97,7 +97,7 @@ pub const fn capacity_for(bytes_per_record: usize) -> usize {
 /// so this can understate by up to ~2x for maps large enough to have split.
 /// Accepted — the accuracy contract is 2x, and every fixture measured in
 /// `tests/channel_budget_allocator.rs` lands on the exact byte.
-pub fn btreemap_node_bytes(entries: usize) -> usize {
+pub(crate) fn btreemap_node_bytes(entries: usize) -> usize {
     // An empty `BTreeMap` allocates no root node at all.
     if entries == 0 {
         return 0;

@@ -60,10 +60,11 @@ drop).
 A single request may carry at most 100,000 log records, and its estimated heap size once mapped
 may not exceed 256 MiB. The estimate is heap-weighted, not wire-weighted: every record carries its
 own copy of the resource and scope attributes as JSON, and JSON objects cost far more memory than
-their protobuf encoding (a small nested attribute can be 50 times larger in memory), so the
-resource and scope are measured as in-memory JSON and multiplied by the record count, plus a bound
-on each record's own attributes and body. Larger requests get `413 Payload Too Large` with a short text body and nothing is
-enqueued; the `otlp_requests_rejected_too_large` counter records each rejection. Exporters
+their protobuf encoding (a small nested attribute can be 50 times larger in memory). The estimate
+is computed from the decoded protobuf, before any JSON is built: an upper bound on the resource
+and scope in-memory cost, multiplied by the record count, plus a bound on each record's own
+attributes and body. Larger requests get `413 Payload Too Large` with a short text body and
+nothing is enqueued; the `otlp_requests_rejected_too_large` counter records each rejection. Exporters
 should lower their batch size (for example the OpenTelemetry Collector `send_batch_max_size`).
 
 ## Redaction
