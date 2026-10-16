@@ -757,3 +757,49 @@ def test_require_tokens_init_container_guards_empty_tokens():
             assert "value" not in refs[name]
             assert refs[name]["valueFrom"]["secretKeyRef"] == {"name": secret, "key": key}
         assert "exit 1" in " ".join(init["command"])
+
+
+def test_trino_tls_secret_has_not_after_annotation():
+    import datetime
+    secret = by(render(), "Secret", f"{FULL}-trino-tls")
+    stamp = secret["metadata"]["annotations"]["logthing.io/not-after"]
+    expiry = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=datetime.timezone.utc)
+    days = (expiry - datetime.datetime.now(datetime.timezone.utc)).days
+    assert 823 <= days <= 825  # matches the 825-day server certificate
+
+
+def _tls_reusable(annotations, offset_days):
+    """Render the `la.tlsReusable` helper (`lookup` is empty under `helm template`, so the
+    template's reuse decision is tested with explicit annotations). `offset_days` is the expiry
+    relative to now; None omits the annotation, a string is used verbatim."""
+    import datetime
+    import json
+    if isinstance(offset_days, (int, float)):
+        when = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=offset_days)
+        annotations = {"logthing.io/not-after": when.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    elif offset_days is not None:
+        annotations = {"logthing.io/not-after": offset_days}
+    with tempfile.TemporaryDirectory() as d:
+        chart = shutil.copytree(CHART, f"{d}/chart")
+        with open(f"{chart}/templates/probe.yaml", "w") as f:
+            f.write('apiVersion: v1\nkind: ConfigMap\nmetadata: {name: probe}\ndata:\n'
+                    '  r: {{ include "la.tlsReusable" (dict "annotations" (fromJson .Values.ann)'
+                    ' "now" now) | quote }}\n')
+        out = subprocess.run(
+            ["helm", "template", "lt", chart, "--show-only", "templates/probe.yaml",
+             "--set-json", "ann=" + json.dumps(json.dumps(annotations or {}))],
+            capture_output=True, text=True, check=True, timeout=TIMEOUT).stdout
+    return yaml.safe_load(out)["data"]["r"] == "true"
+
+
+@pytest.mark.parametrize("annotations,offset,expected", [
+    (None, 100, True),       # plenty of life left
+    (None, 31, True),
+    (None, 29, False),       # inside the 30-day renewal window
+    (None, -5, False),       # already expired
+    ({}, None, False),       # pre-annotation secret: regenerate once
+    (None, "not-a-date", False),
+])
+def test_trino_tls_reuse_decision(annotations, offset, expected):
+    assert _tls_reusable(annotations, offset) is expected
