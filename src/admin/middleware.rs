@@ -39,7 +39,7 @@ pub async fn security_middleware(
             .server_config
             .allowed_ips
             .iter()
-            .any(|net| net.contains(&ip.to_canonical()));
+            .any(|net| net.contains(&ip.to_canonical()) || net.contains(&ip));
 
         if !allowed {
             tracing::warn!("Admin access denied from {} - not in whitelist", client_ip);
@@ -290,6 +290,35 @@ mod tests {
         let response: axum::http::Response<axum::body::Body> = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_security_middleware_allows_ipv4_mapped_peer_for_ipv4_entry() {
+        for (entry, expected) in [
+            ("10.0.0.0/24", StatusCode::OK),
+            ("::ffff:10.0.0.0/120", StatusCode::OK),
+            ("10.0.1.0/24", StatusCode::FORBIDDEN),
+        ] {
+            let state = test_state_with_config(vec![entry.parse().unwrap()], false).await;
+            let addr: SocketAddr = "[::ffff:10.0.0.5]:12345".parse().unwrap();
+            let mut request = axum::http::Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(addr));
+            let app = axum::Router::new()
+                .route("/test", axum::routing::get(|| async { "OK" }))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    security_middleware,
+                ))
+                .with_state(state);
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected, "entry {entry}");
+        }
     }
 
     #[tokio::test]
