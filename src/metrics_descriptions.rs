@@ -462,6 +462,12 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
          reason (missing|bad_scheme|bad_token|gss_error|missing_flags|decrypt_error|\
          h2_encrypted|missing_identity).",
     ),
+    (
+        Kind::Counter,
+        "wef_plaintext_on_kerberos_rejected",
+        "Non-empty, non-encrypted /wsman/** bodies refused (400) on a connection whose Kerberos \
+         context is complete. Such bodies are a protocol downgrade; legitimate clients encrypt.",
+    ),
     // ── spool ─────────────────────────────────────────────────────────────
     (
         Kind::Gauge,

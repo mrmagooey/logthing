@@ -1124,7 +1124,9 @@ impl Server {
     }
 }
 
-async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
+/// Returns true when the event was enqueued to every configured sink.
+async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) -> bool {
+    let mut enqueued = true;
     let event = Arc::new(event);
 
     if let (Some(event_parser), Some(parsed)) = (&state.event_parser, &event.parsed)
@@ -1180,6 +1182,7 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
     if let Some(ref sender) = state.parquet_s3_sender
         && let Err(e) = sender.try_send(event.clone())
     {
+        enqueued = false;
         let kind = DropKind::from(&e);
         if let Some(dropped_total) = sender.drop_log_due(DropSite::Wef, kind) {
             match kind {
@@ -1195,6 +1198,7 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
     if let Some(ref sender) = state.parquet_local_sender
         && let Err(e) = sender.try_send(event.clone())
     {
+        enqueued = false;
         let kind = DropKind::from(&e);
         if let Some(dropped_total) = sender.drop_log_due(DropSite::Wef, kind) {
             match kind {
@@ -1210,16 +1214,39 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
             }
         }
     }
+    enqueued
 }
 
-async fn process_events(state: &Arc<AppState>, events: Vec<WindowsEvent>) {
+/// Result of handing one batch of events to the sinks.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessOutcome {
+    /// Events enqueued to every configured sink.
+    pub accepted: usize,
+    /// Events a sink refused (channel full or closed).
+    pub dropped: usize,
+}
+
+async fn process_events(state: &Arc<AppState>, events: Vec<WindowsEvent>) -> ProcessOutcome {
     // Process events concurrently with a limit of 16 concurrent tasks
     // This leverages multi-core CPUs for better throughput
+    let accepted = std::sync::atomic::AtomicUsize::new(0);
+    let total = events.len();
     stream::iter(events)
-        .for_each_concurrent(MAX_CONCURRENT_EVENT_PROCESSING, |event| async move {
-            process_single_event(state, event).await;
+        .for_each_concurrent(MAX_CONCURRENT_EVENT_PROCESSING, |event| {
+            let accepted = &accepted;
+            async move {
+                if process_single_event(state, event).await {
+                    accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
         })
         .await;
+    let accepted = accepted.into_inner();
+    ProcessOutcome {
+        accepted,
+        dropped: total - accepted,
+    }
 }
 
 fn describe_event_type(event: &WindowsEvent) -> String {
@@ -1347,7 +1374,14 @@ mod tests {
         let event =
             WindowsEvent::new("host".into(), "<Event/>".into()).with_parsed(sample_parsed_event());
 
-        process_events(&state, vec![event]).await;
+        let outcome = process_events(&state, vec![event]).await;
+        assert_eq!(
+            outcome,
+            ProcessOutcome {
+                accepted: 1,
+                dropped: 0
+            }
+        );
 
         let summary = state.throughput.snapshot().await;
         assert_eq!(summary.len(), 1);

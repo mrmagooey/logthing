@@ -153,7 +153,9 @@ add NETWORK SERVICE to the local `Event Log Readers` group or grant it access wi
 - After authentication, Windows sends each SOAP message encrypted
   (`multipart/encrypted`); logthing decrypts it and encrypts its responses. Contexts that do not
   provide confidentiality, integrity and mutual authentication are refused. Encrypted bodies are
-  refused on HTTP/2 connections (`400`); Windows uses HTTP/1.1.
+  refused on HTTP/2 connections (`400`); Windows uses HTTP/1.1. Once a connection is
+  authenticated, a non-empty body that is not `multipart/encrypted` is refused with `400`
+  (counter `wef_plaintext_on_kerberos_rejected`); empty-body handshake requests are unaffected.
 - The service principal must be `HTTP/<fqdn>` for the name in `collector_url` (see the Active
   Directory setup above). Windows Server 2025 clients may request `host/<fqdn>` instead; that is
   not supported yet.
@@ -172,10 +174,15 @@ normal clients stay far below this).
 
 ### Known limits
 
-- **Acknowledged events can still be lost.** logthing answers a delivery with an Ack even when
-  an event is dropped because the sink buffer is full. Windows then advances its bookmark and
-  does not resend it. Watch `parquet_s3_dropped{source="wef"}` and size
-  `channel_capacity`/`max_buffer_rows` accordingly.
+- **A full sink buffer makes the client retry.** If any event of a delivery cannot be handed
+  to a sink (buffer full or closed), logthing answers `503` and does not store the batch's
+  bookmark, so Windows re-sends from the previous bookmark; events accepted before the drop
+  may be delivered twice. While a sink stays full or closed, every client retry re-enqueues
+  the accepted prefix of the batch again (repeated duplicates; delivery is at-least-once), and
+  a permanently closed sink makes clients retry indefinitely with `503` instead of the old
+  silent ack-and-lose. Events whose XML cannot be parsed are counted
+  (`wef_xml_parse_errors`) and skipped, and do not block the bookmark. Watch
+  `parquet_s3_dropped{source="wef"}` and size `channel_capacity`/`max_buffer_rows`.
 - **Bookmarks are held in memory.** After a logthing restart (or when `bookmark_capacity` is
   exceeded) clients have no bookmark and resume from now (or from the earliest event if
   `read_existing_events = true`), which can duplicate or skip events.
