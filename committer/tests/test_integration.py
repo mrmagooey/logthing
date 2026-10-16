@@ -630,3 +630,79 @@ def test_otlp_files_for_different_services_share_one_table(cfg, s3, catalog, pa_
     assert commit.run(cfg, s3, catalog, pa_fs) == 0
     assert catalog.list_tables("logs") == [("logs", "otlp")]
     assert catalog.load_table(("logs", "otlp")).scan().to_arrow().num_rows == 2
+
+
+# ---------------------------------------------------------------------------
+# New non-nullable columns + relocation failures
+# ---------------------------------------------------------------------------
+
+
+def test_new_non_nullable_column_evolves_table_instead_of_quarantining(cfg, s3, catalog, pa_fs):
+    old_key = "hec/legacy/year=2026/month=01/day=01/old.parquet"
+    write_parquet(
+        s3, cfg.bucket, old_key, {"sourcetype": ["legacy"], "fields": ["{}"]}, "2026-01-01"
+    )
+    put_descriptor(s3, cfg, "old.json", source="hec", data_key=old_key, record_count=1)
+    assert commit.run(cfg, s3, catalog, pa_fs) == 0
+
+    # A Rust-written file whose NEW column is declared non-nullable.
+    ts = pa.scalar(0, PARTITION_TIME).as_py()
+    schema = pa.schema(
+        [
+            pa.field("sourcetype", pa.string(), nullable=False),
+            pa.field("fields", pa.string(), nullable=False),
+            pa.field("event_uuid", pa.string(), nullable=False),
+            pa.field("partition_time", PARTITION_TIME, nullable=False),
+        ]
+    )
+    table = pa.table(
+        {
+            "sourcetype": ["fresh"],
+            "fields": ["{}"],
+            "event_uuid": ["u-1"],
+            "partition_time": pa.array([ts], PARTITION_TIME),
+        },
+        schema=schema,
+    )
+    buf = io.BytesIO()
+    pq.write_table(table, buf)
+    new_key = "hec/app/year=2026/month=01/day=02/new.parquet"
+    s3.put_object(Bucket=cfg.bucket, Key=new_key, Body=buf.getvalue())
+    put_descriptor(s3, cfg, "new.json", source="hec", data_key=new_key, record_count=1)
+
+    assert commit.run(cfg, s3, catalog, pa_fs) == 0
+
+    tbl = catalog.load_table(("logs", "hec"))
+    field = tbl.schema().find_field("event_uuid")
+    assert field.required is False
+    assert list_keys(s3, cfg, cfg.quarantine_prefix) == []
+    assert tbl.scan().to_arrow().num_rows == 2
+
+
+def test_relocation_failure_after_commit_leaves_descriptor_and_rerun_dedupes(
+    cfg, s3, catalog, pa_fs, monkeypatch
+):
+    key = "syslog/day=2026-01-01/a.parquet"
+    write_parquet(s3, cfg.bucket, key, {"message": ["m1"]}, "2026-01-01")
+    put_descriptor(s3, cfg, "a.json", source="syslog", data_key=key, record_count=1)
+
+    real_relocate = commit._relocate
+
+    def failing(s3_, cfg_, dkey, dest):
+        raise ClientError(
+            {"Error": {"Code": "InvalidRequest"}, "ResponseMetadata": {"HTTPStatusCode": 400}},
+            "CopyObject",
+        )
+
+    monkeypatch.setattr(commit, "_relocate", failing)
+    assert commit.run(cfg, s3, catalog, pa_fs) == 0
+    # Committed once, NOT quarantined, descriptor still queued.
+    assert catalog.load_table(("logs", "syslog")).scan().to_arrow().num_rows == 1
+    assert list_keys(s3, cfg, cfg.quarantine_prefix) == []
+    assert list_keys(s3, cfg, cfg.desc_prefix) == [cfg.desc_prefix + "a.json"]
+
+    monkeypatch.setattr(commit, "_relocate", real_relocate)
+    assert commit.run(cfg, s3, catalog, pa_fs) == 0
+    assert catalog.load_table(("logs", "syslog")).scan().to_arrow().num_rows == 1
+    assert list_keys(s3, cfg, cfg.desc_prefix) == []
+    assert list_keys(s3, cfg, cfg.done_prefix) == [cfg.done_prefix + "a.json"]

@@ -38,7 +38,16 @@ import boto3
 import pyarrow as pa
 import pyarrow.fs as pafs
 import pyarrow.parquet as pq
-from botocore.exceptions import ClientError, ConnectionClosedError, EndpointConnectionError
+from botocore.exceptions import (
+    ClientError,
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    IncompleteReadError,
+    ReadTimeoutError,
+    ResponseStreamingError,
+)
+from botocore.exceptions import ConnectionError as BotoConnectionError
 from pyiceberg.catalog import Catalog
 from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.exceptions import (
@@ -52,6 +61,7 @@ from pyiceberg.exceptions import (
 from pyiceberg.io.pyarrow import PyArrowFileIO
 from pyiceberg.table import Table
 from pyiceberg.transforms import DayTransform
+from requests.exceptions import ChunkedEncodingError as RequestsChunkedEncodingError
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import Timeout as RequestsTimeout
 
@@ -216,9 +226,20 @@ def should_abort(exc: BaseException) -> bool:
         # excluded: that's a bad request for one specific table/commit, not a
         # systemic problem, so it stays permanent.
         return True
-    if isinstance(exc, (RequestsConnectionError, RequestsTimeout)):
+    if isinstance(exc, (RequestsConnectionError, RequestsTimeout, RequestsChunkedEncodingError)):
         return True
-    if isinstance(exc, (EndpointConnectionError, ConnectionClosedError)):
+    if isinstance(
+        exc,
+        (
+            BotoConnectionError,
+            EndpointConnectionError,
+            ConnectionClosedError,
+            ReadTimeoutError,
+            ConnectTimeoutError,
+            IncompleteReadError,
+            ResponseStreamingError,
+        ),
+    ):
         return True
     if isinstance(exc, ClientError):
         error = exc.response.get("Error", {}) or {}
@@ -509,9 +530,15 @@ def evolve_schema(
                     # `__exit__` commits even when the body raised, which would persist
                     # columns `union_by_name` had already staged before it hit the conflict,
                     # evolving the table on behalf of a file we are about to quarantine.
+                    # Columns the table lacks are added as optional: old rows read NULL for
+                    # them, so a new non-nullable column in the file must not be required.
+                    evolving = pa.schema(
+                        [f.with_nullable(True) if f.name not in have else f for f in fschema],
+                        metadata=fschema.metadata,
+                    )
                     try:
                         upd = tbl.update_schema()
-                        upd.union_by_name(fschema)
+                        upd.union_by_name(evolving)
                         upd.commit()
                     except (ValidationError, ValueError, BadRequestError) as exc:
                         logger.error(
@@ -550,13 +577,37 @@ def _relocate(s3: Any, cfg: Config, dkey: str, dest_prefix: str) -> None:
     s3.delete_object(Bucket=cfg.bucket, Key=dkey)
 
 
-def _mark_done(s3: Any, cfg: Config, dkey: str) -> None:
-    _relocate(s3, cfg, dkey, cfg.done_prefix)
+def _move_descriptor(s3: Any, cfg: Config, dkey: str, dest_prefix: str) -> bool:
+    """Relocate one descriptor, isolating any failure to that descriptor.
+
+    Returns True when the descriptor is no longer in the queue (moved, or already gone because a
+    concurrent committer or an earlier half-finished move relocated it). Returns False when the
+    move failed for a non-systemic reason: the descriptor stays queued and the next run
+    re-processes it, deduped via `committed_file_set`. Abort-class failures raise `_Abort`.
+    """
+    try:
+        _relocate(s3, cfg, dkey, dest_prefix)
+        return True
+    except Exception as exc:  # noqa: BLE001 - classified immediately below
+        if isinstance(exc, ClientError) and exc.response.get("Error", {}).get("Code") in (
+            "NoSuchKey",
+            "404",
+        ):
+            logger.info("descriptor %s already relocated", dkey)
+            return True
+        if should_abort(exc):
+            raise _Abort(exc) from exc
+        logger.error("cannot relocate descriptor %s, leaving it queued: %r", dkey, exc)
+        return False
 
 
-def _mark_quarantined(s3: Any, cfg: Config, dkey: str) -> None:
+def _mark_done(s3: Any, cfg: Config, dkey: str) -> bool:
+    return _move_descriptor(s3, cfg, dkey, cfg.done_prefix)
+
+
+def _mark_quarantined(s3: Any, cfg: Config, dkey: str) -> bool:
     logger.warning("quarantining descriptor: %s", dkey)
-    _relocate(s3, cfg, dkey, cfg.quarantine_prefix)
+    return _move_descriptor(s3, cfg, dkey, cfg.quarantine_prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -611,8 +662,8 @@ def _commit_batch(
                 "table %s.%s unusable, quarantining its whole batch: %r", cfg.namespace, name, exc
             )
             for dkey, _uri in batch:
-                _mark_quarantined(s3, cfg, dkey)
-            counts.quarantined += len(batch)
+                if _mark_quarantined(s3, cfg, dkey):
+                    counts.quarantined += 1
             return counts
         table_cache[name] = tbl
         committed_cache[name] = committed_files
@@ -644,19 +695,13 @@ def _commit_batch(
         _mark_done(s3, cfg, dkey)
         counts.skipped += 1
     for dkey, _uri in conflicted:
-        _mark_quarantined(s3, cfg, dkey)
-        counts.quarantined += 1
+        if _mark_quarantined(s3, cfg, dkey):
+            counts.quarantined += 1
     if not to_add:
         return counts
 
     try:
         tbl.add_files([uri for _dkey, uri in to_add])
-        for dkey, uri in to_add:
-            _mark_done(s3, cfg, dkey)
-            committed_files.add(uri)
-            logger.info("committed %s -> %s.%s", uri, cfg.namespace, name)
-        counts.committed += len(to_add)
-        return counts
     except Exception as exc:  # noqa: BLE001 - classified immediately below
         if should_abort(exc):
             raise _Abort(exc) from exc
@@ -693,17 +738,27 @@ def _commit_batch(
         for dkey, uri in to_add:
             try:
                 tbl.add_files([uri])
-                _mark_done(s3, cfg, dkey)
-                committed_files.add(uri)
-                counts.committed += 1
-                logger.info("committed %s -> %s.%s", uri, cfg.namespace, name)
             except Exception as exc2:  # noqa: BLE001 - classified immediately below
                 if should_abort(exc2):
                     raise _Abort(exc2) from exc2
                 logger.error("permanent error committing %s: %r", uri, exc2)
-                _mark_quarantined(s3, cfg, dkey)
-                counts.quarantined += 1
+                if _mark_quarantined(s3, cfg, dkey):
+                    counts.quarantined += 1
+                continue
+            committed_files.add(uri)
+            counts.committed += 1
+            logger.info("committed %s -> %s.%s", uri, cfg.namespace, name)
+            _mark_done(s3, cfg, dkey)
         return counts
+
+    # Relocation happens outside the try above: a failed copy/delete after a successful
+    # add_files must never be mistaken for a bad data file (and retried/quarantined).
+    for dkey, uri in to_add:
+        committed_files.add(uri)
+        logger.info("committed %s -> %s.%s", uri, cfg.namespace, name)
+        _mark_done(s3, cfg, dkey)
+    counts.committed += len(to_add)
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -768,8 +823,8 @@ def run(cfg: Config, s3: Any, catalog: Catalog, pa_fs: pafs.S3FileSystem) -> int
                     if should_abort(exc):
                         raise _Abort(exc) from exc
                     logger.error("permanent error reading descriptor %s: %r", dkey, exc)
-                    _mark_quarantined(s3, cfg, dkey)
-                    totals.quarantined += 1
+                    if _mark_quarantined(s3, cfg, dkey):
+                        totals.quarantined += 1
                     continue
 
                 pending[name].append((dkey, uri))
