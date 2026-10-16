@@ -153,7 +153,9 @@ add NETWORK SERVICE to the local `Event Log Readers` group or grant it access wi
 - After authentication, Windows sends each SOAP message encrypted
   (`multipart/encrypted`); logthing decrypts it and encrypts its responses. Contexts that do not
   provide confidentiality, integrity and mutual authentication are refused. Encrypted bodies are
-  refused on HTTP/2 connections (`400`); Windows uses HTTP/1.1.
+  refused on HTTP/2 connections (`400`); Windows uses HTTP/1.1. Once a connection is
+  authenticated, a non-empty body that is not `multipart/encrypted` is refused with `400`
+  (counter `wef_plaintext_on_kerberos_rejected`); empty-body handshake requests are unaffected.
 - The service principal must be `HTTP/<fqdn>` for the name in `collector_url` (see the Active
   Directory setup above). Windows Server 2025 clients may request `host/<fqdn>` instead; that is
   not supported yet.
