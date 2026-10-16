@@ -31,8 +31,18 @@ async fn binary_hec_event_accepts_bom_string_and_millis_times() {
         .unwrap();
     assert_eq!(resp.status(), 200, "logs:\n{}", proc.logs());
 
+    let mut ndjson = vec![0xEF, 0xBB, 0xBF];
+    ndjson.extend_from_slice(b"{\"n\":4}\n{\"n\":5}\n");
+    let resp = reqwest::Client::new()
+        .post(format!("{}/ingest", proc.base()))
+        .body(ndjson)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "logs:\n{}", proc.logs());
+
     let dir = proc.dir().join("hec");
-    let batches = common::wait_for_rows(&dir, 3, Duration::from_secs(20)).await;
+    let batches = common::wait_for_rows(&dir, 5, Duration::from_secs(20)).await;
     let mut times: Vec<i64> = batches
         .iter()
         .flat_map(|b| {
@@ -42,12 +52,15 @@ async fn binary_hec_event_accepts_bom_string_and_millis_times() {
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap();
-            (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
+            (0..col.len())
+                .filter(|&i| col.is_valid(i))
+                .map(|i| col.value(i))
+                .collect::<Vec<_>>()
         })
         .collect();
     times.sort();
     assert_eq!(times.len(), 3, "{times:?}");
     assert_eq!(times[0], -1_500_000);
     assert!((times[1] - 1_700_000_000_500_000).abs() < 10, "{times:?}");
-    assert!((times[2] - 1_700_000_001_000_000).abs() < 10, "{times:?}");
+    assert_eq!(times[2], 1_700_000_001_000_000);
 }

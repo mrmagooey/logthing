@@ -611,5 +611,5 @@ async fn hec_bom_body_with_string_and_millis_times_lands_two_rows() {
     times.sort();
     assert_eq!(times.len(), 2);
     assert!((times[0] - 1_700_000_000_500_000).abs() < 10, "{times:?}");
-    assert!((times[1] - 1_700_000_001_000_000).abs() < 10, "{times:?}");
+    assert_eq!(times[1], 1_700_000_001_000_000);
 }

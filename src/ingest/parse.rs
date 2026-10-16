@@ -50,10 +50,7 @@ pub fn parse_hec_event_body(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let time = obj
-            .get("time")
-            .and_then(envelope_time_secs)
-            .map(epoch_float_to_datetime);
+        let time = obj.get("time").and_then(envelope_time);
 
         let source = obj
             .get("source")
@@ -112,6 +109,7 @@ pub fn parse_ndjson_body(
     body: &[u8],
     default_sourcetype: &str,
 ) -> anyhow::Result<Vec<GenericRecord>> {
+    let body = body.strip_prefix(UTF8_BOM).unwrap_or(body);
     let text = std::str::from_utf8(body)?;
     let now = Utc::now();
     let mut records = Vec::new();
@@ -148,20 +146,29 @@ const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 /// (1e11 s is year 5138; 1e11 ms is 1973).
 const EPOCH_MILLIS_THRESHOLD: f64 = 1e11;
 
-/// Read an envelope `time` (JSON number or numeric string) as epoch seconds.
+/// Read an envelope `time` (JSON number or numeric string) as a timestamp.
 ///
-/// Values with magnitude >= [`EPOCH_MILLIS_THRESHOLD`] are treated as milliseconds.
-/// Returns `None` for anything unparsable or non-finite.
-fn envelope_time_secs(v: &serde_json::Value) -> Option<f64> {
-    let raw = match v {
-        serde_json::Value::Number(n) => n.as_f64()?,
-        serde_json::Value::String(s) => s.trim().parse::<f64>().ok()?,
+/// Magnitudes >= [`EPOCH_MILLIS_THRESHOLD`] are epoch milliseconds, smaller ones seconds.
+/// Integers are converted exactly; only fractional values go through `f64`.
+/// Returns `None` for anything unparsable, non-finite or outside the representable range.
+fn envelope_time(v: &serde_json::Value) -> Option<DateTime<Utc>> {
+    let (int, float) = match v {
+        serde_json::Value::Number(n) => (n.as_i64(), n.as_f64()),
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            (s.parse::<i64>().ok(), s.parse::<f64>().ok())
+        }
         _ => return None,
     };
-    if !raw.is_finite() {
-        return None;
+    if let Some(i) = int {
+        return if (i as f64).abs() >= EPOCH_MILLIS_THRESHOLD {
+            Utc.timestamp_millis_opt(i).single()
+        } else {
+            Utc.timestamp_opt(i, 0).single()
+        };
     }
-    Some(if raw.abs() >= EPOCH_MILLIS_THRESHOLD {
+    let raw = float.filter(|f| f.is_finite())?;
+    epoch_float_to_datetime(if raw.abs() >= EPOCH_MILLIS_THRESHOLD {
         raw / 1000.0
     } else {
         raw
@@ -171,15 +178,11 @@ fn envelope_time_secs(v: &serde_json::Value) -> Option<f64> {
 /// Convert a Unix epoch float (seconds, possibly fractional) to `DateTime<Utc>`.
 ///
 /// The sub-second part is always non-negative (`-1.5` is 1969-12-31T23:59:58.5Z).
-/// Out-of-range or non-finite values fall back to `Utc::now()` rather than
-/// panicking.  The saturating f64->i64 cast means no cast can panic;
-/// `timestamp_opt` handles the out-of-range case.
-fn epoch_float_to_datetime(epoch_secs: f64) -> DateTime<Utc> {
+/// Returns `None` when the value is outside the representable range.
+fn epoch_float_to_datetime(epoch_secs: f64) -> Option<DateTime<Utc>> {
     let whole = epoch_secs.floor();
     let nanos = (((epoch_secs - whole) * 1_000_000_000.0).round() as u32).min(999_999_999);
-    Utc.timestamp_opt(whole as i64, nanos)
-        .single()
-        .unwrap_or_else(Utc::now)
+    Utc.timestamp_opt(whole as i64, nanos).single()
 }
 
 #[cfg(test)]
@@ -212,13 +215,60 @@ mod tests {
     #[test]
     fn test_time_millis_at_or_above_1e11_is_epoch_millis() {
         let t = time_of("1700000000123").unwrap();
-        assert_eq!(t.timestamp(), 1_700_000_000);
-        assert_near_nanos(t, 123_000_000);
+        assert_eq!(t.timestamp_micros(), 1_700_000_000_123_000);
         assert_eq!(t.date_naive().to_string(), "2023-11-14");
+        let t = time_of(r#""1700000000123""#).unwrap();
+        assert_eq!(t.timestamp_micros(), 1_700_000_000_123_000);
         let t = time_of("1.7e12").unwrap();
-        assert_eq!(t.timestamp(), 1_700_000_000);
+        assert_eq!(t.timestamp_micros(), 1_700_000_000_000_000);
         assert_eq!(time_of("99999999999").unwrap().timestamp(), 99_999_999_999);
         assert_eq!(time_of("100000000000").unwrap().timestamp(), 100_000_000);
+    }
+
+    #[test]
+    fn test_time_integer_seconds_are_exact() {
+        assert_eq!(
+            time_of("1700000000").unwrap().timestamp_micros(),
+            1_700_000_000_000_000
+        );
+        assert_eq!(
+            time_of(" 1700000000 ").unwrap().timestamp_micros(),
+            1_700_000_000_000_000
+        );
+        assert_eq!(
+            time_of(r#"" 1700000000 ""#).unwrap().timestamp_micros(),
+            1_700_000_000_000_000
+        );
+    }
+
+    #[test]
+    fn test_time_plus_sign_and_negative_millis() {
+        let t = time_of(r#""+1.5""#).unwrap();
+        assert_eq!(t.timestamp_micros(), 1_500_000);
+        let t = time_of("-1.7e12").unwrap();
+        assert_eq!(t.timestamp_micros(), -1_700_000_000_000_000);
+        assert_eq!(
+            time_of("-1700000000123").unwrap().timestamp_micros(),
+            -1_700_000_000_123_000
+        );
+    }
+
+    #[test]
+    fn test_time_out_of_range_is_none() {
+        assert!(time_of("1e300").is_none());
+        assert!(time_of("-1e300").is_none());
+        assert!(time_of(r#""1e300""#).is_none());
+        assert!(time_of("9223372036854775807").is_none());
+        assert!(time_of("18446744073709551615").is_none());
+    }
+
+    #[test]
+    fn test_ndjson_leading_bom_is_stripped() {
+        let mut body = vec![0xEF, 0xBB, 0xBF];
+        body.extend_from_slice(b"{\"a\":1}\n{\"a\":2}\n");
+        let records = parse_ndjson_body(&body, "t").unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].fields["a"], 1);
     }
 
     #[test]

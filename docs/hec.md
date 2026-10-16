@@ -44,8 +44,9 @@ Envelope `time` may be a JSON number or a numeric string (`"1700000000.123"`), w
 fractional part. A magnitude of 1e11 or more is read as epoch **milliseconds** (so
 `1700000000123` is 2023-11-14T22:13:20.123Z); anything smaller is seconds. Negative
 fractional times keep a non-negative sub-second part (`-1.5` is 1969-12-31T23:59:58.5Z).
-An unparsable `time` is stored as NULL. A leading UTF-8 byte-order mark on a
-`/services/collector/event` body is ignored.
+Integer times are converted exactly. An unparsable or out-of-range `time` (for example
+`1e300`) is stored as NULL. A leading UTF-8 byte-order mark on a `/services/collector/event`
+or `/ingest` body is ignored (the raw endpoint stores the body verbatim).
 
 Payloads are free-form, so no keys are promoted out of `fields`; extract them in SQL, e.g.
 `json_extract_scalar(fields, '$.user')`. The four new columns were appended in 0.22.0; the
