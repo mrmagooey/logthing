@@ -111,12 +111,12 @@ logthing keeps no state shared between instances; to run several behind a load b
 The container image is published to GitHub Container Registry on every `v*` tag push:
 
 ```bash
-docker pull ghcr.io/mrmagooey/logthing:0.23.0   # pin to an exact release
+docker pull ghcr.io/mrmagooey/logthing:0.23.1   # pin to an exact release
 docker pull ghcr.io/mrmagooey/logthing:latest  # most recent non-prerelease release
 ```
 
-**Tags** (produced by the release workflow for tag `v0.23.0`):
-- `:0.23.0` — exact version
+**Tags** (produced by the release workflow for tag `v0.23.1`):
+- `:0.23.1` — exact version
 - `:0.23` — minor series
 - `:0` — major series
 - `:latest` — the most recent non-prerelease release. `docker/metadata-action`'s

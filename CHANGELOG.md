@@ -6,6 +6,8 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-10-16
+
 ### Fixed
 
 - OTLP: a request is rejected with `413` when it holds more than 100,000 log records or its
@@ -156,6 +158,8 @@ Behaviour changes to check before upgrading:
   removing the partition cap. `LOGTHING_ADMIN_TRUST_PROXY_HEADERS` is parsed like
   `LOGTHING_ADMIN_ENABLE_RATE_LIMIT` (`true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off`); any
   other value, including one that used to read as false, stops startup.
+- Analytics stack default image pins move to 0.23.1 for both logthing and the committer (still in
+  lockstep); Helm chart version 0.2.3 (Trino TLS certificate renewal, above).
 
 ## [0.23.0] - 2026-10-10
 
