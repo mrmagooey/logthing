@@ -23,6 +23,8 @@ async fn test_descriptor_schema_version_matches_hard_coded_hec_value() {
 bind_address = "127.0.0.1:{{HTTP}}"
 [tls]
 enabled = false
+[metrics]
+enabled = false
 [syslog]
 enabled = false
 [hec]

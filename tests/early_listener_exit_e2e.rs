@@ -71,6 +71,9 @@ bind_address = "127.0.0.1:{http_port}"
 [tls]
 enabled = false
 
+[metrics]
+enabled = false
+
 [syslog]
 enabled = true
 udp_port = {syslog_udp_port}
