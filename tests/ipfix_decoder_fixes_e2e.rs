@@ -45,6 +45,8 @@ bind_address = "127.0.0.1:{{HTTP}}"
 
 [tls]
 enabled = false
+[metrics]
+enabled = false
 
 [syslog]
 enabled = false
