@@ -129,9 +129,19 @@ fn keys_with(fake: &FakeS3, prefix: &str, suffix: &str) -> Vec<String> {
         .collect()
 }
 
-/// Rows across every delivered `hec/` Parquet object.
+/// Like [`keys_with`], but each key once: a spool retry re-PUTs the same key (idempotent
+/// overwrite), which is not another delivered object.
+fn distinct_keys_with(fake: &FakeS3, prefix: &str, suffix: &str) -> Vec<String> {
+    let mut keys = keys_with(fake, prefix, suffix);
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Rows across every distinct delivered `hec/` Parquet object (a re-PUT of the same key
+/// overwrites it and is counted once).
 fn delivered_rows(fake: &FakeS3) -> usize {
-    keys_with(fake, "hec/", ".parquet")
+    distinct_keys_with(fake, "hec/", ".parquet")
         .iter()
         .map(|k| parquet_rows(fake.body(k).unwrap()))
         .sum()
@@ -372,7 +382,7 @@ async fn test_restart_with_descriptors_disabled_keeps_spooled_descriptor_until_r
         "descriptor written"
     );
     assert_eq!(
-        keys_with(&fake, "hec/", ".parquet").len(),
+        distinct_keys_with(&fake, "hec/", ".parquet").len(),
         1,
         "parquet re-PUT"
     );
