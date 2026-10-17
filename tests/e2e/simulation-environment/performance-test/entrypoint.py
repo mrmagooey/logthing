@@ -41,6 +41,7 @@ TOTAL_EVENTS = int(os.environ.get("PERF_TEST_TOTAL_EVENTS", "0"))  # 0 = use dur
 DURATION_SECS = int(
     os.environ.get("PERF_TEST_DURATION_SECS", "0")
 )  # 0 = use total events
+MAX_BACKPRESSURE_RETRIES = 60
 BATCH_SIZE = int(os.environ.get("PERF_TEST_BATCH_SIZE", "1000"))
 TIMEOUT = int(os.environ.get("PERF_TEST_TIMEOUT_SECS", "600"))
 TARGET_EPS = int(os.environ.get("PERF_TEST_TARGET_EPS", "0"))  # 0 = no throttling
@@ -131,13 +132,20 @@ def send_batch(
 
     headers = {"Content-Type": "application/soap+xml;charset=UTF-16"}
 
-    try:
-        resp = requests.post(EVENTS_URL, data=payload, headers=headers, timeout=30)
-        resp.raise_for_status()
-        return True
-    except requests.RequestException as e:
-        print(f"  Batch {batch_num + 1} failed: {e}")
-        return False
+    # 503 + Retry-After is the server's backpressure signal (a sink channel was full and
+    # the bookmark was not advanced): re-send the batch, as a real WEF client would.
+    for _attempt in range(MAX_BACKPRESSURE_RETRIES + 1):
+        try:
+            resp = requests.post(EVENTS_URL, data=payload, headers=headers, timeout=30)
+            if resp.status_code == 503 and _attempt < MAX_BACKPRESSURE_RETRIES:
+                time.sleep(float(resp.headers.get("Retry-After", "1")))
+                continue
+            resp.raise_for_status()
+            return True
+        except requests.RequestException as e:
+            print(f"  Batch {batch_num + 1} failed: {e}")
+            return False
+    return False
 
 
 def get_stats() -> list:
@@ -194,10 +202,12 @@ def verify_s3_files(expected_event_type: int, min_expected_files: int = 1) -> di
 
         # List all objects in the bucket
         print(f"  [DEBUG] Listing objects in bucket '{S3_BUCKET}'...", flush=True)
-        response = s3_client.list_objects_v2(
-            Bucket=S3_BUCKET,
-            MaxKeys=1000,  # Get more files
-        )
+        # Paginate: list_objects_v2 returns at most 1000 keys per page, and the bucket can
+        # hold more (one prefix per event type after the unthrottled run).
+        contents = []
+        for page in s3_client.get_paginator("list_objects_v2").paginate(Bucket=S3_BUCKET):
+            contents.extend(page.get("Contents", []))
+        response = {"Contents": contents} if contents else {}
 
         print(f"  [DEBUG] Response keys: {response.keys()}", flush=True)
 
