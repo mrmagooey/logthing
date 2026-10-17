@@ -14,6 +14,10 @@ STATS_ENDPOINT = os.environ.get(
 EXPECTED_TOTAL = int(os.environ.get("EXPECTED_EVENT_TOTAL", "2"))
 TIMEOUT = int(os.environ.get("E2E_TIMEOUT_SECS", "120"))
 
+SYSLOG_COLUMNS = {
+    "priority", "severity", "facility", "timestamp", "hostname", "app_name", "proc_id",
+    "msg_id", "message", "structured_data", "protocol", "received_at", "partition_time",
+}
 WEF_COLUMNS = {"event_id", "timestamp", "source_host", "subscription_id", "event_data",
                "partition_time"}
 
@@ -86,14 +90,18 @@ def wait_for_syslog_parquet():
         )
         sys.exit(1)
 
-    # Verify the first object is readable Parquet with 11 columns
+    # Verify the first object is readable Parquet with the exact syslog column set
     key = resp["Contents"][0]["Key"]
     obj = client.get_object(Bucket=BUCKET, Key=key)
 
     import pyarrow.parquet as pq
 
     table = pq.read_table(io.BytesIO(obj["Body"].read()))
-    assert table.num_columns == 11, f"Expected 11 columns, got {table.num_columns}"
+    actual_columns = set(table.schema.names)
+    assert table.num_columns == len(SYSLOG_COLUMNS) and actual_columns == SYSLOG_COLUMNS, (
+        f"syslog columns mismatch: missing {SYSLOG_COLUMNS - actual_columns}, "
+        f"unexpected {actual_columns - SYSLOG_COLUMNS}"
+    )
     assert table.num_rows > 0, "Expected at least one row in syslog Parquet"
     print(
         f"OK: syslog Parquet verified: {table.num_rows} row(s) under {syslog_prefix}"
