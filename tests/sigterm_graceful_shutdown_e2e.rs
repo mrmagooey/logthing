@@ -19,6 +19,8 @@
 //! exit assertion checks the process was *not* signal-terminated rather than
 //! merely that it exited.
 
+mod common;
+
 use std::fs::File;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -273,4 +275,204 @@ flush_interval_secs = 3600
         "expected all {MESSAGE_COUNT} buffered records to be flushed by the \
          shutdown drain, found {rows}"
     );
+}
+
+/// Config for one TCP listener (`syslog` or `zeek`) writing to a local sink that only the
+/// shutdown drain can flush, plus a metrics endpoint to observe ingestion.
+fn tcp_listener_toml(kind: &str, tcp_port: u16, metrics_port: u16) -> String {
+    // The syslog listener is on by default and its default TCP port (601) is privileged.
+    let extra = if kind == "syslog" {
+        format!("udp_port = {}\n", common::free_port())
+    } else {
+        "\n[syslog]\nenabled = false\n".to_string()
+    };
+    format!(
+        r#"
+bind_address = "127.0.0.1:{{HTTP}}"
+
+[tls]
+enabled = false
+
+[metrics]
+enabled = true
+port = {metrics_port}
+
+[{kind}]
+enabled = true
+tcp_port = {tcp_port}
+bind_address = "127.0.0.1"
+{extra}
+[{kind}.local]
+directory = "{{DIR}}/out"
+max_buffer_rows = 100000
+flush_interval_secs = 3600
+"#
+    )
+}
+
+/// A TCP connection that stays open and idle (never closed by the client) after sending
+/// `LINES` complete lines plus half a line must not stop SIGTERM from flushing the complete
+/// lines: the process exits 0 within the deadline and the lines are on disk.
+///
+/// The child process receives the signal, not the test process, so these tests do not share
+/// signal-handler state and can live in separate test functions.
+async fn idle_tcp_connection_sigterm_case(kind: &str, line: impl Fn(usize) -> String, half: &str) {
+    use tokio::io::AsyncWriteExt;
+
+    const LINES: usize = 5;
+    let tcp_port = common::free_port();
+    let metrics_port = common::free_port();
+    let toml = tcp_listener_toml(kind, tcp_port, metrics_port);
+    let mut proc = common::Proc::spawn_healthy(env!("CARGO_BIN_EXE_logthing"), &toml, &[]).await;
+
+    let mut conn = loop {
+        match tokio::net::TcpStream::connect(("127.0.0.1", tcp_port)).await {
+            Ok(c) => break c,
+            Err(_) => sleep(POLL_INTERVAL).await,
+        }
+    };
+    for i in 0..LINES {
+        conn.write_all(line(i).as_bytes()).await.unwrap();
+    }
+    conn.write_all(half.as_bytes()).await.unwrap();
+    conn.flush().await.unwrap();
+
+    // Wait until the server has actually read the complete lines (connection stays open).
+    let metrics_url = format!("http://127.0.0.1:{metrics_port}/metrics");
+    let counter = if kind == "syslog" {
+        "syslog_messages_received"
+    } else {
+        "zeek_records_received"
+    };
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        if let Ok(resp) = reqwest::get(&metrics_url).await
+            && let Ok(body) = resp.text().await
+            && logthing::profiling::parse_counter(&body, counter).unwrap_or(0) >= LINES as u64
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{counter} never reached {LINES}");
+        sleep(POLL_INTERVAL).await;
+    }
+    let out_dir = proc.dir().join("out");
+    assert!(
+        common::parquet_files(&out_dir).is_empty(),
+        "a Parquet file existed before shutdown; only the drain may flush here"
+    );
+
+    // 12 s: just above the binary's own 10 s writer-flush deadline, so a connection task
+    // that keeps the writer channel open (the bug) cannot pass by waiting out the deadline.
+    let started = Instant::now();
+    let status = proc.terminate(Duration::from_secs(12));
+    // A connection task that ignores shutdown is only reaped by the listener's bounded
+    // drain (several seconds); honouring shutdown makes the exit near-immediate.
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "shutdown took {:?}; the open connection task did not stop on shutdown:\n{}",
+        started.elapsed(),
+        proc.logs()
+    );
+    assert!(
+        status.success(),
+        "unclean exit: {status:?}\n{}",
+        proc.logs()
+    );
+
+    // Deterministic evidence that the connection task itself saw the shutdown with the
+    // half line still buffered (rather than being reaped by a deadline-driven abort).
+    assert!(
+        proc.logs().contains("dropped partial line"),
+        "the connection task never reported the partial line at shutdown:\n{}",
+        proc.logs()
+    );
+
+    let rows: usize = common::read_all(&out_dir)
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(
+        rows,
+        LINES,
+        "the {LINES} complete lines must be flushed, not the partial one:\n{}",
+        proc.logs()
+    );
+    drop(conn);
+}
+
+#[tokio::test]
+async fn sigterm_flushes_lines_from_idle_open_syslog_tcp_connection() {
+    idle_tcp_connection_sigterm_case(
+        "syslog",
+        |i| format!("<134>Jan 15 10:30:45 host-e2e idle-tcp: record {i}\n"),
+        "<134>Jan 15 10:30:45 host-e2e idle-tcp: par",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sigterm_flushes_lines_from_idle_open_zeek_tcp_connection() {
+    idle_tcp_connection_sigterm_case(
+        "zeek",
+        |i| format!("{{\"_path\":\"conn\",\"uid\":\"C{i}\"}}\n"),
+        "{\"_path\":\"conn\",\"ui",
+    )
+    .await;
+}
+
+/// A plain-HTTP HEC client that sent events and then idles on a kept-alive connection must not
+/// stop SIGTERM from flushing: the server task is drained (closing idle connections and
+/// dropping the HEC writer's senders) before the writers are awaited, so the writer sees
+/// end-of-stream and flushes well inside its own 10 s deadline.
+#[tokio::test]
+async fn sigterm_flushes_hec_events_with_idle_keepalive_client() {
+    const EVENTS: usize = 6;
+    let toml = "bind_address = \"127.0.0.1:{HTTP}\"\n[tls]\nenabled = false\n\
+                [syslog]\nenabled = false\n[metrics]\nenabled = false\n\
+                [hec]\nenabled = true\ntoken = \"\"\n\
+                [hec.local]\ndirectory = \"{DIR}/hec\"\nmax_buffer_rows = 100000\n\
+                flush_interval_secs = 3600\n";
+    let mut proc = common::Proc::spawn_healthy(env!("CARGO_BIN_EXE_logthing"), toml, &[]).await;
+
+    // One client, one pooled keep-alive connection; it stays alive (idle) until the test ends.
+    let client = reqwest::Client::new();
+    let mut body = String::new();
+    for i in 0..EVENTS {
+        body.push_str(&format!("{{\"event\":{{\"n\":{i}}}}}\n"));
+    }
+    let resp = client
+        .post(format!("{}/services/collector/event", proc.base()))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "logs:\n{}", proc.logs());
+    let _ = resp.bytes().await.unwrap();
+
+    let out_dir = proc.dir().join("hec");
+    assert!(
+        common::parquet_files(&out_dir).is_empty(),
+        "a Parquet file existed before shutdown; only the drain may flush here"
+    );
+
+    let started = Instant::now();
+    let status = proc.terminate(Duration::from_secs(12));
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "shutdown took {:?} with an idle keep-alive client:\n{}",
+        started.elapsed(),
+        proc.logs()
+    );
+    assert!(
+        status.success(),
+        "unclean exit: {status:?}\n{}",
+        proc.logs()
+    );
+
+    let rows: usize = common::read_all(&out_dir)
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(rows, EVENTS, "logs:\n{}", proc.logs());
+    drop(client);
 }

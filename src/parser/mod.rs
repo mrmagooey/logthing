@@ -290,8 +290,7 @@ impl GenericEventParser {
         // Convert to appropriate type
         let converted = match field_def.field_type {
             FieldType::String => serde_json::Value::String(value),
-            FieldType::Integer => value
-                .parse::<i64>()
+            FieldType::Integer => parse_integer(&value)
                 .map(|n| serde_json::Value::Number(serde_json::Number::from(n)))
                 .map_err(|e| anyhow::anyhow!("Failed to parse integer: {}", e))?,
             FieldType::Boolean => {
@@ -311,10 +310,15 @@ impl GenericEventParser {
             .trim_start_matches("Data[@Name='")
             .trim_end_matches("']");
 
-        // Look for Data element with the specified Name attribute
-        let search_pattern = format!(r#"Data Name="{}""#, attr_name);
+        // Look for Data element with the specified Name attribute (either quote style)
+        let double = format!(r#"Data Name="{}""#, attr_name);
+        let single = format!("Data Name='{}'", attr_name);
+        let found = match (xml.find(&double), xml.find(&single)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
 
-        if let Some(pos) = xml.find(&search_pattern) {
+        if let Some(pos) = found {
             // Find the start of this element
             let start = xml[..pos]
                 .rfind('<')
@@ -337,7 +341,7 @@ impl GenericEventParser {
 
             if let Some(end_pos) = xml[content_start..].find(end_tag) {
                 let value = xml[content_start..content_start + end_pos].trim();
-                return Ok(value.to_string());
+                return Ok(unescape_text(value));
             }
         }
 
@@ -349,14 +353,8 @@ impl GenericEventParser {
 
     /// Extract a value from System section
     fn extract_from_system(&self, xml: &str, field_name: &str) -> anyhow::Result<String> {
-        let start_tag = format!("<{}>", field_name);
-        let end_tag = format!("</{}>", field_name);
-
-        if let Some(start) = xml.find(&start_tag) {
-            let content_start = start + start_tag.len();
-            if let Some(end) = xml[content_start..].find(&end_tag) {
-                return Ok(xml[content_start..content_start + end].to_string());
-            }
+        if let Some(value) = extract_tag_text(xml, field_name) {
+            return Ok(value);
         }
 
         Err(anyhow::anyhow!(
@@ -368,12 +366,8 @@ impl GenericEventParser {
     /// Extract a value from RenderingInfo section
     fn extract_from_rendering_info(&self, xml: &str, _field_name: &str) -> anyhow::Result<String> {
         // RenderingInfo contains the message template
-        let message_pattern = "<Message>";
-        if let Some(start) = xml.find(message_pattern) {
-            let content_start = start + message_pattern.len();
-            if let Some(end) = xml[content_start..].find("</Message>") {
-                return Ok(xml[content_start..content_start + end].to_string());
-            }
+        if let Some(value) = extract_tag_text(xml, "Message") {
+            return Ok(value);
         }
 
         Err(anyhow::anyhow!("RenderingInfo Message not found"))
@@ -444,6 +438,48 @@ struct EventParserFile {
     event_id: u32,
     #[serde(flatten)]
     definition: EventParserDefinition,
+}
+
+/// Parse an integer field value, accepting decimal or `0x`/`0X` hexadecimal.
+fn parse_integer(value: &str) -> anyhow::Result<i64> {
+    let v = value.trim();
+    if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        return Ok(i64::from_str_radix(hex, 16)?);
+    }
+    Ok(v.parse::<i64>()?)
+}
+
+/// Decode XML entities; on a malformed entity keep the raw text.
+fn unescape_text(raw: &str) -> String {
+    match quick_xml::escape::unescape(raw) {
+        Ok(s) => s.into_owned(),
+        Err(_) => raw.to_string(),
+    }
+}
+
+/// Text of the first `<name>...</name>` element, where the start tag may carry
+/// attributes (`<EventID Qualifiers="16384">`). Self-closing tags are skipped.
+fn extract_tag_text(xml: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}");
+    let close = format!("</{name}>");
+    let mut from = 0;
+    while let Some(rel) = xml[from..].find(&open) {
+        let after = from + rel + open.len();
+        from = after;
+        let rest = &xml[after..];
+        match rest.chars().next()? {
+            '>' | ' ' | '\t' | '\r' | '\n' => {}
+            _ => continue,
+        }
+        let tag_end = rest.find('>')?;
+        if rest[..tag_end].ends_with('/') {
+            continue;
+        }
+        let content_start = after + tag_end + 1;
+        let end = xml[content_start..].find(&close)?;
+        return Some(unescape_text(&xml[content_start..content_start + end]));
+    }
+    None
 }
 
 #[cfg(test)]

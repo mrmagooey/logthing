@@ -4,6 +4,9 @@
 //!
 //! Gated on MINIO_ENDPOINT.  Skip gracefully if the env var is absent.
 
+mod common;
+
+use common::fake_s3::FakeS3;
 use logthing::config::{S3ConnectionConfig, SyslogS3Config};
 use logthing::forwarding::s3_sink::S3Sink;
 use logthing::forwarding::structured_syslog_s3::structured_syslog_start;
@@ -16,7 +19,7 @@ fn skip_if_no_minio() -> Option<String> {
     std::env::var("MINIO_ENDPOINT").ok()
 }
 
-fn minio_cfg(endpoint: &str, prefix: &str) -> SyslogS3Config {
+fn s3_cfg(endpoint: &str, prefix: &str) -> SyslogS3Config {
     SyslogS3Config {
         connection: S3ConnectionConfig {
             endpoint: endpoint.to_string(),
@@ -48,7 +51,7 @@ async fn cef_record_appears_as_parquet_under_cef_partition() {
     };
 
     let prefix = "structured-syslog-int-test";
-    let cfg = minio_cfg(&endpoint, prefix);
+    let cfg = s3_cfg(&endpoint, prefix);
     let s3 = Arc::new(
         S3Sink::from_connection(&cfg.connection)
             .await
@@ -142,7 +145,7 @@ async fn multiple_payload_types_land_in_separate_partitions() {
     };
 
     let prefix = "structured-syslog-multi-test";
-    let cfg = minio_cfg(&endpoint, prefix);
+    let cfg = s3_cfg(&endpoint, prefix);
     let s3 = Arc::new(
         S3Sink::from_connection(&cfg.connection)
             .await
@@ -195,4 +198,77 @@ async fn multiple_payload_types_land_in_separate_partitions() {
         !dhcp_objs.is_empty(),
         "DHCP partition must have at least one object"
     );
+}
+
+/// Edge-case payloads (LEEF tab + pipe in data, CEF `=` in a value, auditd bare token, web
+/// access `"-"` request line with an escaped-quote user agent) flow through the real handler
+/// and structured sink and land as the right `parsed` JSON in Parquet on a fake S3.
+#[tokio::test]
+async fn test_payload_edge_cases_land_with_expected_parsed_fields() {
+    let fake = FakeS3::start().await;
+    let mut cfg = s3_cfg(&fake.endpoint(), "edge"); // pointed at the in-process fake S3
+    cfg.connection.bucket = "b".into();
+    cfg.connection.access_key = "k".into();
+    cfg.connection.secret_key = "s".into();
+    let s3 = Arc::new(
+        S3Sink::from_connection(&cfg.connection)
+            .await
+            .expect("S3Sink::from_connection"),
+    );
+    let (sh, writer_task) = structured_syslog_start(
+        &cfg,
+        s3,
+        std::sync::Arc::new(logthing::stats::SourceHourlyStats::new()),
+        None,
+    );
+    let sh = Arc::new(sh);
+    let handler = DefaultSyslogHandler::new(false, true, Some(sh.clone()));
+    let src: SocketAddr = "127.0.0.1:5514".parse().unwrap();
+    let lines = [
+        "<134>Jan 15 10:30:45 h1 LEEF:2.0|V|P|1|E|\tsrc=1\turl=a|b",
+        "<134>Jan 15 10:30:45 h2 CEF:0|V|P|1|100|N|5|msg=a=b src=1.2.3.4",
+        "<134>Jan 15 10:30:45 h3 type=SYSCALL msg=audit(1:2): arch=c000003e garbage syscall=59",
+        r#"<134>Jan 15 10:30:45 h4 10.0.0.9 - - [15/Jan/2024:10:33:00 +0000] "-" 408 0 "-" "UA \"q\"""#,
+    ];
+    for l in lines {
+        handler
+            .handle_message(SyslogMessage::parse(l).unwrap(), src)
+            .await;
+    }
+    drop(sh);
+    drop(handler);
+    tokio::time::timeout(std::time::Duration::from_secs(30), writer_task)
+        .await
+        .expect("writer done")
+        .expect("no panic");
+
+    let mut found = std::collections::HashMap::new();
+    for (key, body) in fake.puts() {
+        if !key.ends_with(".parquet") {
+            continue;
+        }
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            bytes::Bytes::from(body),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        for b in reader {
+            let b = b.unwrap();
+            let t = common::str_col(&b, "payload_type");
+            let p = common::str_col(&b, "parsed");
+            for i in 0..b.num_rows() {
+                let v: serde_json::Value = serde_json::from_str(p.value(i)).unwrap();
+                found.insert(t.value(i).to_string(), v);
+            }
+        }
+    }
+    assert_eq!(found["leef"]["delimiter"], "\t");
+    assert_eq!(found["leef"]["attributes"]["url"], "a|b");
+    assert_eq!(found["cef"]["extensions"]["msg"], "a=b");
+    assert_eq!(found["cef"]["extensions"]["src"], "1.2.3.4");
+    assert_eq!(found["auditd"]["fields"]["syscall"], "59");
+    assert!(found["web_access"]["method"].is_null());
+    assert_eq!(found["web_access"]["status"], 408);
+    assert_eq!(found["web_access"]["user_agent"], "UA \\\"q\\\"");
 }

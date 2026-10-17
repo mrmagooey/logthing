@@ -469,6 +469,36 @@ async fn test_real_kerberos_encrypted_events_ingested() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_real_kerberos_plaintext_body_after_handshake_400_then_encrypted_still_works() {
+    let Some(env) = krb_env() else { return };
+    let h = Harness::start(&env).await;
+    let mut conn = h.conn().await;
+    let mut ctx = authenticate(&mut conn, "WIN10$@EXAMPLE.COM", HOST).await;
+
+    let r = conn
+        .post(
+            "/wsman",
+            Some("application/soap+xml;charset=UTF-16"),
+            None,
+            plain_enumerate(),
+        )
+        .await;
+    assert_eq!(r.status, 400, "plaintext SOAP on a Kerberos session");
+
+    // The rejected request did not tear down the GSS context.
+    let (st, text) = exchange(
+        &mut conn,
+        &mut ctx,
+        "/wsman",
+        &common::enumerate_envelope("11111111-0000-4000-8000-000000000009", MACHINE),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert!(text.expect("encrypted reply").contains("EnumerateResponse"));
+    h.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_real_kerberos_new_principal_on_same_connection_authenticates_as_new() {
     let Some(env) = krb_env() else { return };
     let h = Harness::start(&env).await;

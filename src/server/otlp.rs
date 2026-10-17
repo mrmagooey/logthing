@@ -8,11 +8,132 @@
 //!
 //! This module is compiled only when the `otlp` Cargo feature is enabled.
 
+use crate::forwarding::channel_budget::btreemap_node_bytes;
 use crate::forwarding::otlp_s3::OtlpRecord;
 use chrono::{DateTime, TimeZone, Utc};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value as AnyVal};
+use opentelemetry_proto::tonic::logs::v1::LogRecord;
 use serde_json::{Map, Value};
+
+/// Maximum number of log records one OTLP request may carry.
+pub const MAX_OTLP_RECORDS_PER_REQUEST: usize = 100_000;
+
+/// Maximum estimated heap (bytes) of one request after mapping: per record, one clone of the
+/// resource and scope JSON (an upper bound on the `json_heap_bytes` cost, B-tree nodes
+/// included, not wire size) plus a bound on the record's own attributes and body.
+pub const MAX_OTLP_MAPPED_BYTES: usize = 256 * 1024 * 1024;
+
+/// An OTLP request exceeded the per-request expansion limits.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum OtlpLimitError {
+    /// More than [`MAX_OTLP_RECORDS_PER_REQUEST`] records.
+    #[error("OTLP request exceeds {MAX_OTLP_RECORDS_PER_REQUEST} log records")]
+    TooManyRecords,
+    /// Estimated mapped size above [`MAX_OTLP_MAPPED_BYTES`].
+    #[error("OTLP request would expand beyond {MAX_OTLP_MAPPED_BYTES} bytes once mapped")]
+    TooLarge,
+}
+
+/// Reject a request that would exceed the record or heap limits, walking only the decoded
+/// protobuf: no JSON is built for the resource, scope or records until this has passed.
+fn check_request_limits(req: &ExportLogsServiceRequest) -> Result<(), OtlpLimitError> {
+    let total = req
+        .resource_logs
+        .iter()
+        .flat_map(|rl| &rl.scope_logs)
+        .fold(0usize, |acc, sl| acc.saturating_add(sl.log_records.len()));
+    if total > MAX_OTLP_RECORDS_PER_REQUEST {
+        return Err(OtlpLimitError::TooManyRecords);
+    }
+    let mut est: usize = 0;
+    for rl in &req.resource_logs {
+        // The resource JSON is built once, then cloned into every record.
+        let resource_bound = rl.resource.as_ref().map_or(0, |r| {
+            kvs_heap_bound(&r.attributes).saturating_add(promoted_len_bound(&r.attributes))
+        });
+        est = est.saturating_add(resource_bound);
+        for sl in &rl.scope_logs {
+            let scope_bound = sl.scope.as_ref().map_or(0, |s| {
+                kvs_heap_bound(&s.attributes)
+                    .saturating_add(s.name.len())
+                    .saturating_add(s.version.len())
+            });
+            // Scope JSON built once, then (with the resource) cloned into every record.
+            est = est.saturating_add(scope_bound);
+            est = est.saturating_add(
+                resource_bound
+                    .saturating_add(scope_bound)
+                    .saturating_mul(sl.log_records.len()),
+            );
+            for lr in &sl.log_records {
+                est = est.saturating_add(record_heap_bound(lr));
+            }
+            if est > MAX_OTLP_MAPPED_BYTES {
+                return Err(OtlpLimitError::TooLarge);
+            }
+        }
+        if est > MAX_OTLP_MAPPED_BYTES {
+            return Err(OtlpLimitError::TooLarge);
+        }
+    }
+    Ok(())
+}
+
+/// Length of the string values promoted to per-record columns (each record clones them).
+fn promoted_len_bound(kvs: &[KeyValue]) -> usize {
+    kvs.iter()
+        .filter(|kv| {
+            matches!(
+                kv.key.as_str(),
+                "service.name" | "service.namespace" | "service.instance.id" | "host.name"
+            )
+        })
+        .fold(0usize, |acc, kv| {
+            match kv.value.as_ref().and_then(|v| v.value.as_ref()) {
+                Some(AnyVal::StringValue(s)) => acc.saturating_add(s.len()),
+                _ => acc,
+            }
+        })
+}
+
+/// Upper bound on the heap a decoded `AnyValue` occupies once converted to JSON.
+fn any_value_heap_bound(av: &AnyValue) -> usize {
+    match &av.value {
+        Some(AnyVal::StringValue(s)) => s.capacity(),
+        Some(AnyVal::BytesValue(b)) => b.len().saturating_mul(2),
+        Some(AnyVal::ArrayValue(a)) => a
+            .values
+            .len()
+            .saturating_mul(size_of::<Value>())
+            .saturating_add(
+                a.values
+                    .iter()
+                    .fold(0usize, |acc, v| acc.saturating_add(any_value_heap_bound(v))),
+            ),
+        Some(AnyVal::KvlistValue(kl)) => kvs_heap_bound(&kl.values),
+        _ => 0,
+    }
+}
+
+/// Upper bound on the heap of a `Map<String, Value>` built from `kvs` (B-tree nodes dominate).
+fn kvs_heap_bound(kvs: &[KeyValue]) -> usize {
+    kvs.iter().fold(btreemap_node_bytes(kvs.len()), |acc, kv| {
+        acc.saturating_add(kv.key.capacity())
+            .saturating_add(kv.value.as_ref().map_or(0, any_value_heap_bound))
+    })
+}
+
+/// Heap bound for the per-record allocations that are NOT clones of the resource or scope.
+fn record_heap_bound(lr: &LogRecord) -> usize {
+    size_of::<OtlpRecord>()
+        .saturating_add(kvs_heap_bound(&lr.attributes).saturating_mul(2))
+        .saturating_add(lr.body.as_ref().map_or(0, any_value_heap_bound))
+        .saturating_add(lr.trace_id.len().saturating_mul(2))
+        .saturating_add(lr.span_id.len().saturating_mul(2))
+        .saturating_add(lr.severity_text.len())
+        .saturating_add(lr.event_name.len())
+}
 
 fn non_empty(s: String) -> Option<String> {
     Some(s).filter(|s| !s.is_empty())
@@ -44,7 +165,19 @@ fn body_to_string(av: AnyValue) -> Option<String> {
 /// verbatim, any other AnyValue as JSON text, absent -> `None`. OTLP "unset" defaults (zero
 /// timestamps, severity 0, empty ids/strings, flags 0) map to `None`. `peer_addr` is the TCP
 /// peer IP. `event_uuid` is NOT assigned here (see `crate::ingest::assign_event_uuids`).
-pub fn map_otlp_request(req: ExportLogsServiceRequest, peer_addr: String) -> Vec<OtlpRecord> {
+///
+/// # Errors
+///
+/// Returns [`OtlpLimitError`] (before any JSON or record is built; the check walks only the
+/// decoded protobuf) when the request holds more than
+/// [`MAX_OTLP_RECORDS_PER_REQUEST`] records or its estimated mapped heap size exceeds
+/// [`MAX_OTLP_MAPPED_BYTES`]. Mapping clones the resource and scope attributes into every
+/// record, so a small body can otherwise expand into many times its wire size.
+pub fn map_otlp_request(
+    req: ExportLogsServiceRequest,
+    peer_addr: String,
+) -> Result<Vec<OtlpRecord>, OtlpLimitError> {
+    check_request_limits(&req)?;
     let received_at = Utc::now();
     let mut records = Vec::new();
 
@@ -69,8 +202,13 @@ pub fn map_otlp_request(req: ExportLogsServiceRequest, peer_addr: String) -> Vec
                 None => (None, None, Map::new()),
             };
 
+            let scope_json = Value::Object(scope_attrs);
+
             for lr in scope_logs.log_records {
-                let mut attrs = scope_attrs.clone();
+                let mut attrs = match &scope_json {
+                    Value::Object(m) => m.clone(),
+                    _ => Map::new(),
+                };
                 attrs.extend(kv_list_to_map(lr.attributes));
 
                 records.push(OtlpRecord {
@@ -99,7 +237,7 @@ pub fn map_otlp_request(req: ExportLogsServiceRequest, peer_addr: String) -> Vec
         }
     }
 
-    records
+    Ok(records)
 }
 
 /// Convert an OTLP nanosecond timestamp to `DateTime<Utc>`.
@@ -291,7 +429,7 @@ mod tests {
             1_700_000_000_000_000_000,
             "hello world",
         );
-        let records = map_otlp_request(req, "10.0.0.1".to_string());
+        let records = map_otlp_request(req, "10.0.0.1".to_string()).unwrap();
         assert_eq!(records.len(), 1);
         let r = &records[0];
         assert_eq!(
@@ -327,7 +465,7 @@ mod tests {
             0,
             "collision",
         );
-        let r = &map_otlp_request(req, "h".to_string())[0];
+        let r = &map_otlp_request(req, "h".to_string()).unwrap()[0];
         assert_eq!(r.attributes["key"], "from-log");
         assert_eq!(r.attributes["s"], "2");
         assert_eq!(r.attributes["http.status_code"], 200);
@@ -351,7 +489,7 @@ mod tests {
                 schema_url: String::new(),
             }],
         };
-        let r = &map_otlp_request(req, "h".to_string())[0];
+        let r = &map_otlp_request(req, "h".to_string()).unwrap()[0];
         assert!(r.time.is_none() && r.observed_time.is_none());
         assert!(r.severity_number.is_none() && r.severity_text.is_none());
         assert!(r.body.is_none());
@@ -372,7 +510,7 @@ mod tests {
             vec![make_int_kv("service.name", 42)],
         ] {
             let req = make_request(attrs, vec![], vec![], 0, "x");
-            let r = &map_otlp_request(req, "h".to_string())[0];
+            let r = &map_otlp_request(req, "h".to_string()).unwrap()[0];
             assert!(
                 r.service_name.is_none(),
                 "unusable service.name must map to NULL"
@@ -385,7 +523,7 @@ mod tests {
             0,
             "x",
         );
-        let r = &map_otlp_request(req, "h".to_string())[0];
+        let r = &map_otlp_request(req, "h".to_string()).unwrap()[0];
         assert_eq!(
             r.resource_attributes["service.name"], 42,
             "raw value kept in the JSON"
@@ -416,7 +554,7 @@ mod tests {
                 schema_url: String::new(),
             }],
         };
-        let r = &map_otlp_request(req, "h".to_string())[0];
+        let r = &map_otlp_request(req, "h".to_string()).unwrap()[0];
         assert_eq!(
             r.trace_id.as_deref(),
             Some("abababababababababababababababab")
@@ -445,7 +583,7 @@ mod tests {
                 schema_url: String::new(),
             }],
         };
-        map_otlp_request(req, "h".to_string()).remove(0)
+        map_otlp_request(req, "h".to_string()).unwrap().remove(0)
     }
 
     /// Nest `depth` levels of array (or kvlist) around an int leaf.
@@ -535,7 +673,7 @@ mod tests {
             0,
             "x",
         );
-        let r = &map_otlp_request(req, "h".to_string())[0];
+        let r = &map_otlp_request(req, "h".to_string()).unwrap()[0];
         assert!(r.attributes["deep.kv"].is_object());
         assert!(r.resource_attributes["deep.arr"].is_array());
     }
@@ -553,7 +691,7 @@ mod tests {
             0,
             "x",
         );
-        let r = &map_otlp_request(req, "h".to_string())[0];
+        let r = &map_otlp_request(req, "h".to_string()).unwrap()[0];
         assert!(r.attributes["nan"].is_null());
         assert!(r.attributes["neg_inf"].is_null());
         assert_eq!(r.attributes["ok"], 1.5);
@@ -569,7 +707,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let r = &map_otlp_request(make_request(vec![], vec![], vec![kv], 0, "x"), "h".into())[0];
+        let r = &map_otlp_request(make_request(vec![], vec![], vec![kv], 0, "x"), "h".into())
+            .unwrap()[0];
         assert_eq!(r.attributes["raw"], "cafe");
     }
 
@@ -577,7 +716,7 @@ mod tests {
     fn map_huge_attribute_value_does_not_panic_or_truncate() {
         let big = "x".repeat(1024 * 1024);
         let req = make_request(vec![], vec![], vec![make_kv("blob", &big)], 0, "b");
-        let r = &map_otlp_request(req, "h".to_string())[0];
+        let r = &map_otlp_request(req, "h".to_string()).unwrap()[0];
         assert_eq!(r.attributes["blob"].as_str().unwrap().len(), 1024 * 1024);
     }
 
@@ -606,7 +745,7 @@ mod tests {
         let req = ExportLogsServiceRequest {
             resource_logs: vec![mk("a", &["msg1", "msg2"]), mk("b", &["msg3"])],
         };
-        let records = map_otlp_request(req, "h".to_string());
+        let records = map_otlp_request(req, "h".to_string()).unwrap();
         let got: Vec<(&str, &str)> = records
             .iter()
             .map(|r| {
@@ -648,7 +787,7 @@ mod tests {
                 rl("b", &[("msg3", 3_000)]),
             ],
         };
-        let records = map_otlp_request(req, "10.0.0.5".to_string());
+        let records = map_otlp_request(req, "10.0.0.5".to_string()).unwrap();
         assert_eq!(records.len(), 3, "3 log records across 2 resource groups");
         let bodies: Vec<&str> = records
             .iter()
@@ -780,7 +919,162 @@ mod tests {
         let req = ExportLogsServiceRequest {
             resource_logs: vec![],
         };
-        let records = map_otlp_request(req, "host".to_string());
+        let records = map_otlp_request(req, "host".to_string()).unwrap();
         assert!(records.is_empty());
+    }
+
+    fn request_with_records(n: usize, resource: Option<Resource>) -> ExportLogsServiceRequest {
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource,
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord::default(); n],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_map_otlp_request_rejects_too_many_records() {
+        let req = request_with_records(MAX_OTLP_RECORDS_PER_REQUEST + 1, None);
+        assert_eq!(
+            map_otlp_request(req, "h".to_string()).unwrap_err(),
+            OtlpLimitError::TooManyRecords
+        );
+    }
+
+    #[test]
+    fn test_map_otlp_request_rejects_amplified_resource() {
+        let resource = Resource {
+            attributes: vec![make_kv("big", &"x".repeat(64 * 1024))],
+            ..Default::default()
+        };
+        let req = request_with_records(5_000, Some(resource));
+        assert_eq!(
+            map_otlp_request(req, "h".to_string()).unwrap_err(),
+            OtlpLimitError::TooLarge
+        );
+    }
+
+    #[test]
+    fn test_map_otlp_request_accepts_normal_batch() {
+        let resource = Resource {
+            attributes: vec![make_kv("service.name", "svc")],
+            ..Default::default()
+        };
+        let req = request_with_records(3, Some(resource));
+        assert_eq!(map_otlp_request(req, "h".to_string()).unwrap().len(), 3);
+    }
+
+    /// Resource of `n` sibling kvlist attributes, each `{k: {k: "v"}}`: ~14 wire bytes per
+    /// entry but a whole B-tree node of heap per entry once converted to JSON.
+    fn sibling_kvlist_resource(n: usize) -> Resource {
+        let attributes = (0..n)
+            .map(|i| KeyValue {
+                key: format!("k{i}"),
+                value: Some(AnyValue {
+                    value: Some(AnyVal::KvlistValue(KeyValueList {
+                        values: vec![make_kv("a", "b")],
+                    })),
+                }),
+                ..Default::default()
+            })
+            .collect();
+        Resource {
+            attributes,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_map_otlp_request_rejects_sibling_kvlist_resource_wire_size_passes() {
+        use prost::Message;
+        let resource = sibling_kvlist_resource(4_700);
+        let wire = resource.encoded_len();
+        let n = MAX_OTLP_MAPPED_BYTES / wire * 9 / 10;
+        // The wire-size estimate would have accepted this request.
+        assert!(n * wire < MAX_OTLP_MAPPED_BYTES, "wire {wire}");
+        let req = request_with_records(n, Some(resource));
+        assert_eq!(
+            map_otlp_request(req, "h".to_string()).unwrap_err(),
+            OtlpLimitError::TooLarge
+        );
+    }
+
+    #[test]
+    fn test_map_otlp_request_accepts_realistic_batch() {
+        let attributes = (0..20)
+            .map(|i| make_kv(&format!("attr.key.{i}"), "some-typical-value"))
+            .collect();
+        let resource = Resource {
+            attributes,
+            ..Default::default()
+        };
+        let req = request_with_records(1_000, Some(resource));
+        assert_eq!(map_otlp_request(req, "h".to_string()).unwrap().len(), 1_000);
+    }
+
+    fn kvlist(key: &str, values: Vec<KeyValue>) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(AnyVal::KvlistValue(KeyValueList { values })),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_kvs_heap_bound_is_at_least_actual_json_heap() {
+        use crate::forwarding::channel_budget::json_heap_bytes;
+        let array = KeyValue {
+            key: "arr".to_string(),
+            value: Some(AnyValue {
+                value: Some(AnyVal::ArrayValue(ArrayValue {
+                    values: vec![
+                        AnyValue {
+                            value: Some(AnyVal::StringValue("x".repeat(50))),
+                        },
+                        AnyValue {
+                            value: Some(AnyVal::BytesValue(vec![1; 20])),
+                        },
+                    ],
+                })),
+            }),
+            ..Default::default()
+        };
+        let shapes: Vec<Vec<KeyValue>> = vec![
+            (0..20)
+                .map(|i| make_kv(&format!("k{i}"), "value"))
+                .collect(),
+            sibling_kvlist_resource(500).attributes,
+            vec![
+                kvlist(
+                    "a",
+                    vec![
+                        kvlist("b", vec![kvlist("c", vec![make_kv("d", "e")])]),
+                        array,
+                    ],
+                ),
+                make_kv("s", &"y".repeat(1000)),
+            ],
+        ];
+        for kvs in shapes {
+            let bound = kvs_heap_bound(&kvs);
+            let actual = json_heap_bytes(&Value::Object(kv_list_to_map(kvs)));
+            assert!(bound >= actual, "bound {bound} < actual {actual}");
+        }
+    }
+
+    #[test]
+    fn test_check_request_limits_rejects_huge_resource_from_protobuf_alone() {
+        // One record, one resource whose bounded heap cost alone exceeds the budget. The
+        // check is a pure walk of the decoded protobuf (it takes `&req` and returns before
+        // any JSON exists), so this rejection happens without building resource JSON.
+        let req = request_with_records(1, Some(sibling_kvlist_resource(400_000)));
+        assert_eq!(check_request_limits(&req), Err(OtlpLimitError::TooLarge));
     }
 }

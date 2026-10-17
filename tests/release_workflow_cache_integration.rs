@@ -328,3 +328,42 @@ fn both_jobs_can_write_to_the_registry() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tag / Cargo.toml agreement
+// ---------------------------------------------------------------------------
+
+/// Tags come from the git tag while the binary's version comes from Cargo.toml.
+/// A tag pushed without a version bump publishes a mislabelled image, so the
+/// build job must fail before any build or push step runs.
+#[test]
+fn build_job_verifies_tag_matches_cargo_version_before_building() {
+    let steps = steps_of("build");
+    let verify = steps
+        .iter()
+        .position(|s| {
+            s.get("run").and_then(|r| r.as_str()).is_some_and(|r| {
+                r.contains("GITHUB_REF_NAME#v") && r.contains("Cargo.toml") && r.contains("exit 1")
+            })
+        })
+        .expect("build job has a step comparing ${GITHUB_REF_NAME#v} with Cargo.toml");
+    let script = steps[verify]["run"].as_str().unwrap();
+    assert!(
+        script.contains("[package]"),
+        "the version must be read from the [package] section, not the first `version =` line"
+    );
+
+    let first_building = steps
+        .iter()
+        .position(|s| {
+            s.get("uses")
+                .and_then(|u| u.as_str())
+                .is_some_and(|u| u.starts_with("docker/"))
+        })
+        .expect("build job has docker steps");
+    assert!(
+        verify < first_building,
+        "the tag/Cargo.toml check (step {verify}) must run before the first docker step \
+         (step {first_building}) so a mismatched tag never builds or pushes"
+    );
+}

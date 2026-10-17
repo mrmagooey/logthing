@@ -41,6 +41,8 @@ Per-source ingest counters:
   count twice), plus the records of a request never offered after the first full
   channel. A full channel is answered with HTTP 503. `otlp_logs_received` counts
   only records that were enqueued
+- `otlp_requests_rejected_too_large` - OTLP requests answered `413` for too many log records or an
+  estimated mapped size over the per-request cap (see [otlp.md](otlp.md))
 - Decode/parse failures: `ipfix_decode_errors`, `sflow_decode_errors`,
   `suricata_parse_errors`, `hec_parse_errors`, `wef_xml_parse_errors` - a WEF
   batch's XML failed to parse past a given event; that event is kept as its
@@ -59,6 +61,8 @@ WEF requests (counted in the request handler, not per event):
   that is normal for the Kerberos 401 challenge handshake and is not an attack signal on its own.
   `reason="missing_identity"` is an authenticated-topology request that reached the handler with no
   verified client identity; its bookmark is skipped. It should never fire, so investigate if it does
+- `wef_plaintext_on_kerberos_rejected` - non-empty, non-encrypted `/wsman/**` bodies refused
+  (`400`) on a connection whose Kerberos context is complete (a protocol downgrade)
 
 Parquet persistence (labelled `source="wef"|"syslog"|"ipfix"|"zeek"|"suricata"|"sflow"|"hec"|"otlp"`):
 
@@ -67,6 +71,8 @@ Parquet persistence (labelled `source="wef"|"syslog"|"ipfix"|"zeek"|"suricata"|"
   the spool (disposition `Spooled`, not yet in S3); `parquet_s3_uploads` counts direct
   deliveries only, so with `[spool]` it stops tracking flushes (see `spool_uploaded`)
 - `parquet_s3_dropped`, `parquet_s3_buffer_dropped` - backpressure drops
+- `parquet_s3_flush_panics` - buffer flush tasks that panicked; their rows were restored and
+  retried
 - `local_sink_dir_fsync_errors` - the local-disk sink wrote and renamed a file but the
   directory fsync failed (the file is present; crash durability is not guaranteed)
 - `parquet_s3_records_skipped` - a record the writer could not convert into a
@@ -88,6 +94,9 @@ Durable spool (only when `[spool]` is configured):
 - `spool_uploaded{sink}` - entries delivered (Parquet then descriptor) and removed
 - `spool_upload_errors{sink}` - failed background upload attempts; the entry stays and is
   retried with exponential backoff (1 s doubling to 60 s)
+- `spool_descriptor_sink_missing{sink}` - upload attempts blocked because the entry carries an
+  Iceberg descriptor but no descriptor sink is configured; the entry is kept and retried. Alert on
+  any increase
 - `spool_corrupt` - entries quarantined to `<spool dir>/corrupt/` (missing file, size or
   sha256 mismatch, unknown meta version), either at the startup scan or at upload time
   (a file damaged while the process was running)
@@ -121,6 +130,8 @@ Syslog:
 - `syslog_payload_parsed{type}` - payloads recognised by a structured sub-parser
   (`parse_payloads`)
 - `syslog_oversized_lines` - TCP lines over the maximum length (the connection is closed)
+- `syslog_partial_lines_dropped_at_shutdown` - TCP connections that still held an unterminated
+  line when shutdown ended them (the partial line is dropped)
 - `syslog_tcp_connections_rejected` - TCP connections refused at the concurrent-connection limit
 - `syslog_tcp_idle_timeouts` - TCP connections closed after the 300 s idle timeout
 - `syslog_recv_task_failed` - UDP receive tasks that exited with an error
@@ -135,7 +146,13 @@ IPFIX and sFlow:
   (exporter, observation domain, set id)
 - `ipfix_templates_dropped` - templates not cached because the cache was at its maximum size
 - `ipfix_templates_evicted` - templates evicted after going unused past their TTL
+- `ipfix_options_records_skipped` - options-template data records skipped (exporter metadata,
+  not flows); a variable-length options data set counts once
+- `ipfix_records_capped` - messages whose flow records beyond the per-message cap (8192) were not
+  decoded; counted once per message
 - `ipfix_recv_task_failed`, `sflow_recv_task_failed` - UDP receive tasks that exited with an error
+- `sflow_counter_records_skipped` - generic_if_counters records skipped for being shorter than
+  88 bytes (the rest of the sample still decodes)
 - `sflow_unknown_records_dropped` - records discarded because the per-datagram unknown-record
   budget was exhausted
 
@@ -149,6 +166,9 @@ Zeek and Suricata:
   event type
 - `zeek_oversized_lines`, `suricata_oversized_lines` - TCP lines over the maximum length (the
   connection is closed)
+- `zeek_partial_lines_dropped_at_shutdown`, `suricata_partial_lines_dropped_at_shutdown` - TCP
+  connections that still held an unterminated line when shutdown ended them (the partial line is
+  dropped)
 - `zeek_tcp_budget_exhausted`, `suricata_tcp_budget_exhausted` - TCP connections closed because
   the aggregate line-buffer memory budget was exhausted
 - `zeek_tcp_connections_rejected`, `suricata_tcp_connections_rejected` - TCP connections refused

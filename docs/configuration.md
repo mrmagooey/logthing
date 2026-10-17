@@ -31,6 +31,8 @@ require_client_cert = false           # Set to true to enforce mTLS
 # process restart, and there is no LOGTHING__SECURITY__ALLOWED_IPS
 # equivalent — this is a list, and the env loader sets no list separator.
 # See "Live vs. restart-required config changes" below.
+# IPv4 clients of a dual-stack ("[::]") bind match plain IPv4 entries (and, as before,
+# "::ffff:a.b.c.d/N" entries).
 allowed_ips = ["192.168.1.0/24", "10.0.0.0/8"]
 max_connections = 10000
 connection_timeout_secs = 300
@@ -106,7 +108,27 @@ Every top-level section of the configuration, with the page that documents its k
 `[hec] enabled = true` needs `[hec.s3]` or `[hec.local]`, and `[otlp] enabled = true` needs
 `[otlp.s3]` or `[otlp.local]`. Without one, startup fails with a message naming the missing
 table. Environment overrides are validated the same way: `LOGTHING__HEC__ENABLED=true` with no
-HEC sink configured also fails startup. See [hec.md](hec.md) and [otlp.md](otlp.md).
+HEC sink configured also fails startup. `hec.max_sourcetype_partitions = 0` (with HEC enabled)
+and `otlp.max_service_partitions = 0` (with OTLP enabled) are rejected too: 0 would not mean
+"none", it would remove the cap on partitions. See [hec.md](hec.md) and [otlp.md](otlp.md).
+
+## Process settings and shutdown
+
+`WEF_WORKER_THREADS` (environment only) sets the number of async worker threads; unset means one
+per CPU. It must be a positive integer: `0` or a non-number fails startup with an error naming
+the variable, rather than being ignored.
+
+On `SIGTERM`/Ctrl-C the HTTP server stops accepting and closes idle keep-alive connections
+(up to 10 s for in-flight requests) while listeners stop and drain their open connections (one
+shared 6 s deadline), and only then are the buffered writers flushed. If the HTTP server or any
+wire-protocol listener (syslog, IPFIX, Zeek, Suricata, sFlow) stops on its own, for example
+because its port could not be bound, the same shutdown sequence runs and the process then exits
+with a non-zero status so a supervisor restarts it. Allow at least 30 s for a stop (Docker
+`--stop-timeout`/Compose `stop_grace_period`, Kubernetes `terminationGracePeriodSeconds`);
+Docker's 10 s default is shorter than the worst-case drain. If an HTTP request is still in
+flight 10 s after the signal, the server is aborted without ending that connection's task; the
+writers then time out without end-of-stream and rows received since the last periodic flush
+can be lost. See [delivery-semantics.md](delivery-semantics.md).
 
 ## Shared S3 connection keys
 
@@ -143,8 +165,8 @@ erasure procedure are in [redaction.md](redaction.md).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `drop_fields` | list of paths | `[]` | Remove these paths (OTLP also `@body`, `@host_name`, `@peer_addr`). |
-| `hash_fields` | list of paths | `[]` | Replace with lowercase-hex HMAC-SHA256. Needs `hash_key_env`. |
+| `drop_fields` | list of paths | `[]` | Remove these paths (`@` targets: HEC `@host`, `@source`; OTLP `@body`, `@host_name`, `@peer_addr`). Keys match case-insensitively. |
+| `hash_fields` | list of paths | `[]` | Replace with lowercase-hex HMAC-SHA256 (same `@` targets). Needs `hash_key_env`. |
 | `hash_key_env` | string | unset | NAME of the environment variable holding the HMAC key (16+ bytes). |
 | `mask_patterns` | list of regexes | `[]` | Matches inside string values become `[REDACTED]`. |
 

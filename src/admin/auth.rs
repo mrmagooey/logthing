@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
@@ -6,7 +8,7 @@ use axum_extra::extract::TypedHeader;
 use headers::{Authorization, authorization::Basic};
 use subtle::ConstantTimeEq;
 
-use crate::admin::state::{AdminState, TrustedIdentity};
+use crate::admin::state::{AdminState, PasswordHash, TrustedIdentity};
 
 /// Constant-time string equality to prevent timing side-channels.
 ///
@@ -17,6 +19,32 @@ use crate::admin::state::{AdminState, TrustedIdentity};
 /// here: usernames are not secret-length-sensitive).
 fn ct_str_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+/// Hash verified in place of the real one when the username is wrong, so a
+/// wrong-user attempt costs the same Argon2 work as a wrong-password one.
+static DUMMY_HASH: LazyLock<PasswordHash> = LazyLock::new(|| {
+    PasswordHash::hash("logthing-dummy-password").expect("hashing a constant cannot fail")
+});
+
+/// Check Basic Auth credentials in constant work: Argon2 always runs (against
+/// [`DUMMY_HASH`] for an unknown user) on the blocking pool, and the two
+/// outcomes are combined without short-circuiting.
+async fn credentials_valid(state: &AdminState, username: &str, password: &str) -> bool {
+    let user_ok = ct_str_eq(username, &state.server_config.username);
+    let hash = if user_ok {
+        state.server_config.password_hash.clone()
+    } else {
+        DUMMY_HASH.clone()
+    };
+    let password = password.to_string();
+    let pass_ok = tokio::task::spawn_blocking(move || hash.verify(&password))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("admin password verification task failed: {e}");
+            false
+        });
+    user_ok & pass_ok
 }
 
 /// Returns `true` iff trusted-header auth is configured AND the request
@@ -50,10 +78,13 @@ fn secret_header_matches(state: &AdminState, headers: &HeaderMap) -> bool {
 /// missing, or wrong), `X-Forwarded-For` is never even inspected — the raw
 /// `ConnectInfo` peer address is returned unconditionally.
 ///
-/// When trusted, takes the leftmost (client-facing) hop of `X-Forwarded-For`
-/// — the standard single-proxy convention — trimmed and parsed as an
-/// `IpAddr`. Falls back to the peer address if the header is absent, empty,
-/// or fails to parse.
+/// When trusted, takes the RIGHTMOST hop of `X-Forwarded-For` — the address
+/// the trusted proxy itself appended — trimmed and parsed as an `IpAddr`.
+/// Earlier hops are client-supplied and can be forged, so they are never
+/// believed. This assumes exactly one trusted proxy in front of the admin
+/// server. Falls back to the peer address if the header is absent, empty, or
+/// fails to parse. If the header appears on several lines, only the last line
+/// (the one nearest the proxy) is read.
 pub fn resolve_client_ip(
     state: &AdminState,
     addr: std::net::SocketAddr,
@@ -63,12 +94,19 @@ pub fn resolve_client_ip(
         return addr.ip();
     }
 
-    let xff = match headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+    // A proxy may append its hop as a separate header line rather than extending
+    // the first one, so the first line is client-controlled: read the LAST line.
+    let xff = match headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .next_back()
+        .and_then(|v| v.to_str().ok())
+    {
         Some(v) => v,
         None => return addr.ip(),
     };
-    let first_hop = xff.split(',').next().unwrap_or("").trim();
-    first_hop
+    let last_hop = xff.rsplit(',').next().unwrap_or("").trim();
+    last_hop
         .parse::<std::net::IpAddr>()
         .unwrap_or_else(|_| addr.ip())
 }
@@ -139,9 +177,7 @@ pub async fn ensure_authorized(
     let username = creds.username();
     let password = creds.password();
 
-    if ct_str_eq(username, &state.server_config.username)
-        && state.server_config.password_hash.verify(password)
-    {
+    if credentials_valid(state, username, password).await {
         Ok(username.to_string())
     } else {
         state
@@ -343,6 +379,65 @@ mod tests {
         }
     }
 
+    mod credential_work_tests {
+        use super::super::credentials_valid;
+        use crate::admin::state::{AdminServerConfig, AdminState, AuditLogger, PasswordHash};
+        use std::sync::Arc;
+        use std::time::Instant;
+        use tokio::sync::RwLock;
+
+        async fn state() -> AdminState {
+            AdminState {
+                config: Arc::new(RwLock::new(crate::config::Config::default())),
+                server_config: AdminServerConfig {
+                    bind_address: "127.0.0.1:8080".parse().unwrap(),
+                    username: "admin".to_string(),
+                    password_hash: PasswordHash::hash("correct-horse").unwrap(),
+                    allowed_ips: vec![],
+                    tls_config: None,
+                    enable_rate_limiting: false,
+                    trusted_header: None,
+                },
+                audit_logger: AuditLogger::new(10).await,
+                request_counts: Arc::new(RwLock::new(std::collections::HashMap::new())),
+                source_stats: Arc::new(crate::stats::SourceHourlyStats::new()),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_credentials_valid_accepts_only_exact_pair() {
+            let st = state().await;
+            assert!(credentials_valid(&st, "admin", "correct-horse").await);
+            assert!(!credentials_valid(&st, "admin", "wrong").await);
+            assert!(!credentials_valid(&st, "nobody", "correct-horse").await);
+        }
+
+        /// An unknown username must cost the same Argon2 work as a wrong
+        /// password; otherwise response time reveals which usernames exist.
+        #[tokio::test]
+        async fn test_verify_runs_argon2_for_unknown_user() {
+            let st = state().await;
+            // Warm the dummy-hash LazyLock so its one-time cost is not measured.
+            let _ = credentials_valid(&st, "nobody", "x").await;
+
+            let mut wrong_pass = std::time::Duration::MAX;
+            let mut wrong_user = std::time::Duration::MAX;
+            for _ in 0..3 {
+                let t = Instant::now();
+                assert!(!credentials_valid(&st, "admin", "wrong").await);
+                wrong_pass = wrong_pass.min(t.elapsed());
+                let t = Instant::now();
+                assert!(!credentials_valid(&st, "nobody", "wrong").await);
+                wrong_user = wrong_user.min(t.elapsed());
+            }
+
+            assert!(
+                wrong_user * 5 > wrong_pass,
+                "unknown-user attempt took {wrong_user:?} vs {wrong_pass:?} for wrong password"
+            );
+        }
+    }
+
     mod resolve_client_ip_tests {
         use super::super::resolve_client_ip;
         use crate::admin::state::{
@@ -428,12 +523,31 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn secret_matches_multi_hop_xff_takes_first_hop() {
+        async fn test_resolve_client_ip_uses_rightmost_xff_hop() {
             let state = state_with(Some(trusted_cfg())).await;
+            let h = headers(&[
+                ("x-admin-proxy-secret", "shhh"),
+                ("x-forwarded-for", "10.0.0.5, 198.51.100.7"),
+            ]);
+            let ip = resolve_client_ip(&state, peer_addr(), &h);
+            assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+
             let h = headers(&[
                 ("x-admin-proxy-secret", "shhh"),
                 ("x-forwarded-for", "198.51.100.7, 10.0.0.1, 10.0.0.2"),
             ]);
+            let ip = resolve_client_ip(&state, peer_addr(), &h);
+            assert_eq!(ip, "10.0.0.2".parse::<IpAddr>().unwrap());
+        }
+
+        /// A proxy that appends its hop as a second header line: the first
+        /// line is client-forged and must be ignored.
+        #[tokio::test]
+        async fn test_resolve_client_ip_uses_last_xff_header_line() {
+            let state = state_with(Some(trusted_cfg())).await;
+            let mut h = headers(&[("x-admin-proxy-secret", "shhh")]);
+            h.append("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+            h.append("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
             let ip = resolve_client_ip(&state, peer_addr(), &h);
             assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
         }

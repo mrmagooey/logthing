@@ -1124,7 +1124,9 @@ impl Server {
     }
 }
 
-async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
+/// Returns true when the event was enqueued to every configured sink.
+async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) -> bool {
+    let mut enqueued = true;
     let event = Arc::new(event);
 
     if let (Some(event_parser), Some(parsed)) = (&state.event_parser, &event.parsed)
@@ -1180,6 +1182,7 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
     if let Some(ref sender) = state.parquet_s3_sender
         && let Err(e) = sender.try_send(event.clone())
     {
+        enqueued = false;
         let kind = DropKind::from(&e);
         if let Some(dropped_total) = sender.drop_log_due(DropSite::Wef, kind) {
             match kind {
@@ -1195,6 +1198,7 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
     if let Some(ref sender) = state.parquet_local_sender
         && let Err(e) = sender.try_send(event.clone())
     {
+        enqueued = false;
         let kind = DropKind::from(&e);
         if let Some(dropped_total) = sender.drop_log_due(DropSite::Wef, kind) {
             match kind {
@@ -1210,16 +1214,39 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) {
             }
         }
     }
+    enqueued
 }
 
-async fn process_events(state: &Arc<AppState>, events: Vec<WindowsEvent>) {
+/// Result of handing one batch of events to the sinks.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessOutcome {
+    /// Events enqueued to every configured sink.
+    pub accepted: usize,
+    /// Events a sink refused (channel full or closed).
+    pub dropped: usize,
+}
+
+async fn process_events(state: &Arc<AppState>, events: Vec<WindowsEvent>) -> ProcessOutcome {
     // Process events concurrently with a limit of 16 concurrent tasks
     // This leverages multi-core CPUs for better throughput
+    let accepted = std::sync::atomic::AtomicUsize::new(0);
+    let total = events.len();
     stream::iter(events)
-        .for_each_concurrent(MAX_CONCURRENT_EVENT_PROCESSING, |event| async move {
-            process_single_event(state, event).await;
+        .for_each_concurrent(MAX_CONCURRENT_EVENT_PROCESSING, |event| {
+            let accepted = &accepted;
+            async move {
+                if process_single_event(state, event).await {
+                    accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
         })
         .await;
+    let accepted = accepted.into_inner();
+    ProcessOutcome {
+        accepted,
+        dropped: total - accepted,
+    }
 }
 
 fn describe_event_type(event: &WindowsEvent) -> String {
@@ -1347,7 +1374,14 @@ mod tests {
         let event =
             WindowsEvent::new("host".into(), "<Event/>".into()).with_parsed(sample_parsed_event());
 
-        process_events(&state, vec![event]).await;
+        let outcome = process_events(&state, vec![event]).await;
+        assert_eq!(
+            outcome,
+            ProcessOutcome {
+                accepted: 1,
+                dropped: 0
+            }
+        );
 
         let summary = state.throughput.snapshot().await;
         assert_eq!(summary.len(), 1);
@@ -3683,7 +3717,14 @@ event_parsers:
                 ..Default::default()
             };
             let app_state = super::build_state_with_config(config).await;
-            let ingest_state = IngestState::default();
+            // A sink whose receiver is drained: exports are acknowledged only when a writer
+            // accepts them.
+            let (h, mut rx) = stalled_otlp_handle(1024);
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            let ingest_state = IngestState {
+                otlp_local: Some(h),
+                ..Default::default()
+            };
 
             axum::Router::new()
                 .route("/v1/logs", post(handle_otlp_logs))
@@ -3845,6 +3886,14 @@ event_parsers:
             req.encode_to_vec()
         }
 
+        /// `n` empty log records (2 wire bytes each), small enough for the extractor's default
+        /// body limit so the handler's own record cap is what rejects it.
+        fn empty_otlp_request(n: usize) -> Vec<u8> {
+            let mut req = make_proto_request();
+            req.resource_logs[0].scope_logs[0].log_records = vec![Default::default(); n];
+            req.encode_to_vec()
+        }
+
         fn otlp_post(body: Vec<u8>) -> HttpRequest<Body> {
             super::with_connect_info(
                 HttpRequest::builder()
@@ -3901,7 +3950,7 @@ event_parsers:
         }
 
         #[tokio::test]
-        async fn handle_otlp_logs_closed_channel_still_200() {
+        async fn handle_otlp_logs_closed_channel_is_503() {
             let (h, rx) = stalled_otlp_handle(1);
             drop(rx);
             let app = build_otlp_app_with_ingest(IngestState {
@@ -3913,7 +3962,62 @@ event_parsers:
                 .oneshot(otlp_post(otlp_request_with_records(1)))
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        #[tokio::test]
+        async fn handle_otlp_logs_no_sink_configured_is_503() {
+            let app = build_otlp_app_with_ingest(IngestState::default()).await;
+            let resp = app
+                .oneshot(otlp_post(otlp_request_with_records(2)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        #[tokio::test]
+        async fn handle_otlp_logs_over_record_cap_is_413_and_enqueues_nothing() {
+            let (h, mut rx) = stalled_otlp_handle(16);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                ..Default::default()
+            })
+            .await;
+            let n = crate::server::otlp::MAX_OTLP_RECORDS_PER_REQUEST + 1;
+            let resp = app.oneshot(otlp_post(empty_otlp_request(n))).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert!(rx.try_recv().is_err());
+        }
+
+        fn otlp_records_for_dispatch(n: usize) -> Vec<crate::forwarding::otlp_s3::OtlpRecord> {
+            use prost::Message as _;
+            let req =
+                opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest::decode(
+                    otlp_request_with_records(n).as_slice(),
+                )
+                .unwrap();
+            crate::server::otlp::map_otlp_request(req, "h".to_string()).unwrap()
+        }
+
+        #[test]
+        fn test_dispatch_otlp_records_no_sinks_is_err() {
+            let records = otlp_records_for_dispatch(3);
+            assert_eq!(
+                dispatch_otlp_records(&IngestState::default(), records),
+                Err(3)
+            );
+        }
+
+        #[test]
+        fn test_dispatch_otlp_records_closed_channel_is_err() {
+            let (h, rx) = stalled_otlp_handle(4);
+            drop(rx);
+            let ingest = IngestState {
+                otlp_local: Some(h),
+                ..Default::default()
+            };
+            let records = otlp_records_for_dispatch(2);
+            assert_eq!(dispatch_otlp_records(&ingest, records), Err(2));
         }
 
         #[tokio::test]
@@ -3974,6 +4078,47 @@ event_parsers:
             assert_eq!(counter_value(&snapshotter, "otlp_logs_received"), 2);
             // record 3 hit Full, records 4 and 5 were never offered
             assert_eq!(counter_value(&snapshotter, "otlp_events_dropped"), 3);
+        }
+
+        #[tokio::test]
+        async fn otlp_413_counts_rejection_and_no_received_records() {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let (h, _rx) = stalled_otlp_handle(8);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                ..Default::default()
+            })
+            .await;
+            let n = crate::server::otlp::MAX_OTLP_RECORDS_PER_REQUEST + 1;
+            let resp = app.oneshot(otlp_post(empty_otlp_request(n))).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(
+                counter_value(&snapshotter, "otlp_requests_rejected_too_large"),
+                1
+            );
+            assert_eq!(counter_value(&snapshotter, "otlp_logs_received"), 0);
+        }
+
+        #[tokio::test]
+        async fn otlp_closed_channel_counts_no_received_records() {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let (h, rx) = stalled_otlp_handle(8);
+            drop(rx);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                ..Default::default()
+            })
+            .await;
+            let resp = app
+                .oneshot(otlp_post(otlp_request_with_records(3)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(counter_value(&snapshotter, "otlp_logs_received"), 0);
         }
 
         #[tokio::test]
@@ -4276,8 +4421,8 @@ event_parsers:
             let resp = router.oneshot(req).await.unwrap();
             assert_eq!(
                 resp.status(),
-                StatusCode::OK,
-                "/v1/logs must return 200 when otlp.enabled is true and no token required"
+                StatusCode::SERVICE_UNAVAILABLE,
+                "/v1/logs must be mounted (503, no sink configured) when otlp.enabled is true"
             );
         }
     }
@@ -4793,7 +4938,9 @@ async fn handle_syslog_examples() -> Json<serde_json::Value> {
 /// Error codes:
 ///   400 — malformed protobuf or JSON body
 ///   401 — bearer token required but absent or incorrect
+///   413 — request holds too many records or would expand beyond the mapped-size cap
 ///   415 — unknown or missing Content-Type
+///   503 — a sink channel is full or closed, or no OTLP sink is configured
 #[cfg(feature = "otlp")]
 pub async fn handle_otlp_logs(
     State(app_state): State<Arc<AppState>>,
@@ -4865,7 +5012,21 @@ pub async fn handle_otlp_logs(
 
     // ── Map, assign ids, route to the OTLP sinks ─────────────────────────
     let source_host = addr.ip().to_string();
-    let mut records = crate::server::otlp::map_otlp_request(req, source_host);
+    let mut records = match crate::server::otlp::map_otlp_request(req, source_host) {
+        Ok(records) => records,
+        Err(e) => {
+            metrics::counter!("otlp_requests_rejected_too_large").increment(1);
+            warn!("OTLP request from {} rejected: {e}", addr.ip());
+            return Ok(Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .header(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8",
+                )
+                .body(axum::body::Body::from(e.to_string()))
+                .unwrap());
+        }
+    };
     // ORDERING: redaction runs after mapping and BEFORE identity assignment, so unredacted
     // values never reach a channel, the spool, or disk and the id never depends on them.
     if let Some(r) = &ingest.otlp_redactor {
@@ -4906,7 +5067,8 @@ pub async fn handle_otlp_logs(
         .unwrap())
 }
 
-/// Offer one record to an OTLP sink. Returns `true` when the channel was full.
+/// Offer one record to an OTLP sink. Returns `true` when it was NOT accepted (channel full or
+/// closed).
 #[cfg(feature = "otlp")]
 fn offer_otlp(
     handler: &crate::forwarding::otlp_s3::OtlpHandler,
@@ -4928,16 +5090,16 @@ fn offer_otlp(
                     }
                 }
             }
-            matches!(kind, DropKind::Full)
+            true
         }
     }
 }
 
-/// Try-send every record to every configured OTLP sink, STOPPING at the first record that hits
-/// a full channel ("full" = `Full` on ANY configured sink, instantaneous). `Err(n)` = `n`
-/// records (the full one plus those never offered) were not accepted: answer 503. Records
-/// already enqueued stay enqueued (a retry duplicates them with new `event_uuid`s). Closed
-/// channels are logged/counted but do not cause an `Err` (retrying a dead writer cannot help).
+/// Try-send every record to every configured OTLP sink, STOPPING at the first record that is
+/// not accepted by ANY configured sink (channel `Full` or `Closed`). `Err(n)` = `n` records
+/// (the failed one plus those never offered) were not accepted: answer 503. Records already
+/// enqueued stay enqueued (a retry duplicates them with new `event_uuid`s). No configured sink
+/// at all is also `Err` for every record, so an export is never acknowledged without a writer.
 #[cfg(feature = "otlp")]
 fn dispatch_otlp_records(
     ingest: &IngestState,
@@ -4945,7 +5107,7 @@ fn dispatch_otlp_records(
 ) -> Result<(), u64> {
     let total = records.len() as u64;
     for (i, record) in records.into_iter().enumerate() {
-        let full = match (&ingest.otlp_s3, &ingest.otlp_local) {
+        let failed = match (&ingest.otlp_s3, &ingest.otlp_local) {
             (Some(s3), Some(local)) => {
                 let a = offer_otlp(s3, record.clone(), "s3");
                 let b = offer_otlp(local, record, "local");
@@ -4953,9 +5115,21 @@ fn dispatch_otlp_records(
             }
             (Some(h), None) => offer_otlp(h, record, "s3"),
             (None, Some(h)) => offer_otlp(h, record, "local"),
-            (None, None) => false,
+            (None, None) => {
+                metrics::counter!("otlp_events_dropped").increment(total);
+                static NO_SINK_LOG: std::sync::LazyLock<
+                    crate::forwarding::drop_log::DropLogThrottles,
+                > = std::sync::LazyLock::new(Default::default);
+                if let Some(dropped_total) = NO_SINK_LOG.check(DropSite::Otlp, DropKind::Closed) {
+                    error!(
+                        dropped_total,
+                        "OTLP export received but no OTLP sink is configured"
+                    );
+                }
+                return Err(total);
+            }
         };
-        if full {
+        if failed {
             let never_offered = total - i as u64 - 1;
             if never_offered > 0 {
                 metrics::counter!("otlp_events_dropped").increment(never_offered);

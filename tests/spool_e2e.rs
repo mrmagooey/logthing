@@ -304,6 +304,107 @@ async fn test_spool_full_does_not_lose_data_when_s3_is_healthy() {
     );
 }
 
+/// `cfg` with the `[iceberg.s3]` descriptor section removed (descriptors disabled).
+fn without_descriptors(cfg: &str) -> String {
+    let start = cfg.find("[iceberg.s3]").expect("iceberg section");
+    let end = cfg.find("[spool]").expect("spool section");
+    format!("{}{}", &cfg[..start], &cfg[end..])
+}
+
+#[tokio::test]
+async fn test_restart_with_descriptors_disabled_keeps_spooled_descriptor_until_re_enabled() {
+    let fake = FakeS3::start().await;
+    fake.set_failing(true);
+    let cfg = toml(&Opts {
+        endpoint: &fake.endpoint(),
+        metrics_port: common::free_port(),
+        spool_max_bytes: 104_857_600,
+        hec_s3_extra: FLUSH_EACH,
+        desc_s3_extra: "",
+    });
+
+    // Run 1: descriptors on, S3 down; the flush spools a Parquet + descriptor entry.
+    let mut p = common::Proc::spawn(BIN, &cfg, &ENVS);
+    p.wait_healthy().await;
+    post_event(&p, 1).await;
+    assert!(
+        common::wait_until(WAIT, || !spool_files(p.dir(), "meta").is_empty()).await,
+        "nothing reached the spool:\n{}",
+        p.logs()
+    );
+    let st = p.terminate(Duration::from_secs(15));
+    assert!(st.success(), "graceful shutdown expected, got {st}");
+    assert_eq!(fake.put_count(), 0);
+    let dir = p.into_dir();
+    assert_eq!(
+        spool_files(dir.path(), "json").len(),
+        1,
+        "descriptor spooled"
+    );
+
+    // Run 2: S3 healthy, descriptors off. The Parquet lands; the entry must stay.
+    fake.set_failing(false);
+    let off = without_descriptors(&toml(&Opts {
+        endpoint: &fake.endpoint(),
+        metrics_port: common::free_port(),
+        spool_max_bytes: 104_857_600,
+        hec_s3_extra: FLUSH_EACH,
+        desc_s3_extra: "",
+    }));
+    let mut p2 = common::Proc::spawn_in(BIN, &off, &ENVS, dir, common::free_port());
+    p2.wait_healthy().await;
+    assert!(
+        common::wait_until(WAIT, || delivered_rows(&fake) == 1).await,
+        "parquet not replayed; keys={:?}\n{}",
+        fake.put_keys(),
+        p2.logs()
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await; // several 1 s backoff retries
+    assert_eq!(
+        spool_files(p2.dir(), "meta").len(),
+        1,
+        "entry deleted:\n{}",
+        p2.logs()
+    );
+    assert_eq!(spool_files(p2.dir(), "json").len(), 1, "descriptor deleted");
+    assert!(
+        keys_with(&fake, "desc/", ".json").is_empty(),
+        "descriptor written"
+    );
+    assert_eq!(
+        keys_with(&fake, "hec/", ".parquet").len(),
+        1,
+        "parquet re-PUT"
+    );
+    let st = p2.terminate(Duration::from_secs(15));
+    assert!(st.success(), "graceful shutdown expected, got {st}");
+    let dir = p2.into_dir();
+
+    // Run 3: descriptors back on; the descriptor is written and the spool empties.
+    let on = toml(&Opts {
+        endpoint: &fake.endpoint(),
+        metrics_port: common::free_port(),
+        spool_max_bytes: 104_857_600,
+        hec_s3_extra: FLUSH_EACH,
+        desc_s3_extra: "",
+    });
+    let mut p3 = common::Proc::spawn_in(BIN, &on, &ENVS, dir, common::free_port());
+    p3.wait_healthy().await;
+    assert!(
+        common::wait_until(WAIT, || {
+            keys_with(&fake, "desc/", ".json").len() == 1
+                && spool_files(p3.dir(), "meta").is_empty()
+        })
+        .await,
+        "descriptor not delivered; keys={:?}\n{}",
+        fake.put_keys(),
+        p3.logs()
+    );
+    for ext in ["meta", "parquet", "json"] {
+        assert!(spool_files(p3.dir(), ext).is_empty(), "left .{ext} behind");
+    }
+}
+
 #[test]
 fn test_startup_fails_on_invalid_spool_config() {
     let cfg = toml(&Opts {

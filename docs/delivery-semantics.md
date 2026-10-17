@@ -32,18 +32,38 @@ Flushes fire on `flush_interval_secs`, `max_buffer_rows` or `flush_threshold_byt
 comes first. Only one flush per partition is in flight at a time: rows that cross
 `max_buffer_rows` / `flush_threshold_bytes` while a flush is running are flushed as soon as
 that flush completes, while rows below the thresholds wait for the next trigger, up to one
-flush interval (checked on the periodic tick and on each arriving record). A
-crash, `SIGKILL` or power loss loses everything in that window; the spool does not change
-this, because it sits **after** the flush. To shrink the window, lower `flush_interval_secs`
-and `flush_threshold_bytes`. The trade-off is more, smaller Parquet files and more work for the
-Iceberg committer.
+flush interval (checked on each arriving record and on a periodic tick of a quarter of the
+flush interval, between 1 and 30 seconds, so an idle buffer is flushed within one interval
+plus one tick). A crash, `SIGKILL` or power loss loses everything in that window; the spool
+does not change this, because it sits **after** the flush. To shrink the window, lower
+`flush_interval_secs` and `flush_threshold_bytes`. The trade-off is more, smaller Parquet files
+and more work for the Iceberg committer.
 
-A graceful stop (`SIGTERM`/Ctrl-C) flushes every buffer first, with one exception. A writer
-only finishes once every sender of its channel is gone. Zeek and Suricata connections run in
-detached tasks that keep a sender, so while a sensor is still connected at shutdown those
-writers do not finish: the 10 s writer deadline expires (`S3 writer flush timed out`), the
-process exits, and rows buffered since the last periodic flush are lost (they never reach the
-spool). Other sources release their senders when their listeners are aborted.
+A graceful stop (`SIGTERM`/Ctrl-C) flushes every buffer first. A writer only finishes once
+every sender of its channel is gone, so on shutdown each listener also stops its per-connection
+tasks (Zeek, Suricata and syslog TCP) and waits up to 5 s for them. A connection that is still
+open and idle at that moment is not an obstacle: the lines it has already received, including
+any the client has sent that are still queued on the socket, are dispatched and flushed. An
+unterminated final line (a client that was mid-write) cannot be completed and is dropped; it
+is counted in `zeek_partial_lines_dropped_at_shutdown`,
+`suricata_partial_lines_dropped_at_shutdown` or `syslog_partial_lines_dropped_at_shutdown`.
+A dropped shutdown channel is treated the same as a shutdown signal, so a listener can never
+keep running (or spin) after the rest of the process has stopped.
+
+The order is: the HTTP server and the listeners drain concurrently (HTTP up to 10 s; listeners
+share one 6 s deadline, the 5 s connection drain plus 1 s margin, after which stragglers are
+aborted), then the writers (shared 10 s deadline), then the spool. If the HTTP server or a
+listener stops on its own, or the HTTP server task panics during the drain, the same sequence
+runs and the process exits non-zero. A drain timeout alone still exits 0 with a warning.
+
+When the HTTP drain times out and the server task is aborted, axum's per-connection tasks may
+still hold the application state and so the writers' senders. The writers then reach their
+own 10 s deadline without seeing end-of-stream, and rows received since the last periodic
+flush can be lost. Only requests still in flight 10 s after the shutdown signal trigger this.
+
+UDP listeners (syslog, IPFIX, sFlow) that hit a persistent receive error pause 10 ms, doubling
+to at most 1 s, between attempts instead of spinning, and log the error at most once every
+10 s with a count of the repeats suppressed.
 
 ## Local sink
 
@@ -58,6 +78,22 @@ files, content readable) rather than the syscalls.
 Without `[spool]`, a failed S3 upload is retried from memory: the rows go back into the
 writer's buffer, capped at `max_buffer_rows * 4`; beyond the cap the oldest rows are dropped
 (`parquet_s3_buffer_dropped`). A long outage or a restart loses them.
+
+A failed flush is retried with exponential backoff: 1 s, 2 s, 4 s and so on, capped at 60 s and
+at `flush_interval_secs`. No flush starts inside the backoff window, whatever the row and byte
+thresholds say; the hard cap above still applies. A successful flush resets the backoff. If a
+flush task panics (a bug in a sink), its rows are put back and retried the same way, and
+`parquet_s3_flush_panics` is incremented. A task that panics after its
+upload succeeded is retried too, so that object can be written twice (at-least-once). At
+shutdown the final flush makes a single descriptor attempt per partition, so a descriptor
+outage cannot delay the Parquet uploads of later partitions.
+
+When `[iceberg]` descriptors are enabled and the Parquet object was uploaded directly (not
+spooled), a failed descriptor upload is retried three more times, after 200 ms, 1 s and 5 s.
+Only then is `iceberg_descriptor_upload_errors` incremented. Without `[spool]` the Parquet
+object is uploaded either way, but if the descriptor still fails (including the single attempt
+made at shutdown) the Parquet is never committed to Iceberg; `iceberg_descriptor_upload_errors`
+is the only sign. With `[spool]` the descriptor is retried until it is delivered (see Spool).
 
 With `[spool]`, every S3 flush is first written to local disk and acknowledged to the writer,
 then uploaded in the background:
@@ -84,6 +120,25 @@ outage does not re-PUT the Parquet each time; this is remembered in memory only,
 in the middle of retries may PUT the Parquet once more. Failures retry with exponential
 backoff, 1 s doubling to 60 s (`spool_upload_errors`).
 
+An entry that carries a descriptor is never deleted without delivering it. If the descriptor
+sink is not configured (for example `[iceberg]` was removed from the config), the Parquet is
+still uploaded once, but the entry stays on disk and is retried with the normal backoff
+(`spool_descriptor_sink_missing`, `spool_upload_errors`) until the descriptor sink is
+configured again; then the descriptor is uploaded and the entry removed. Entries written by
+earlier releases follow the same rule. Alert on any increase of
+`spool_descriptor_sink_missing`: the spool then grows until `max_bytes`, after which flushes
+fall back to direct upload.
+
+*Discarding entries stuck on a missing descriptor sink.* If the descriptor sink is gone for
+good, stop logthing, then for each stuck entry delete `<id>.meta` first and then
+`<id>.parquet` and `<id>.json` (an entry is `<id>.parquet`, `<id>.json` and `<id>.meta`;
+stuck entries are the ones that have a `.json`). Start logthing again; the spool rescans on
+open. Deleting the `.meta` un-commits the entry, so a half-finished deletion is cleaned up as
+an orphan at the next start. The consequence: the Parquet objects were already uploaded to the
+data bucket but are never committed to Iceberg, so those rows will not appear in the tables
+until you register the objects yourself. Leave entries that have no `.json` alone; they do
+not depend on the descriptor sink.
+
 **Concurrency.** Up to 4 entries upload at the same time, in the steady-state uploader and in
 the shutdown drain. Entries are started oldest first; one entry is never attempted twice at
 once; within an entry the Parquet always precedes the descriptor. Backoff is per entry. A
@@ -109,7 +164,12 @@ in-memory requeue described above. `spool_rejected{reason="full"|"io"}` counts t
 **Shutdown.** The final flush of every writer lands in the spool (a local write, fast even
 with S3 down). The uploader is then given whatever remains of the 10 s writer deadline, but
 at least 2 s, to drain; anything left replays on the next start. The real worst-case shutdown
-time is therefore about the writer deadline plus the 2 s drain floor (about 12 s), not 10 s.
+time is therefore bounded by 10 s (HTTP and listeners, concurrently) + 10 s (writers) + 2 s
+(spool floor) = about 22 s; normally the first stage takes well under a second. **Give the
+container at least that long to stop**: Docker's default stop timeout is 10 s, which is shorter,
+so set `stop_grace_period: 30s` (Compose) or `--stop-timeout 30`; in Kubernetes keep
+`terminationGracePeriodSeconds` at 30 (the default) or higher. A SIGKILL before the writers
+finish loses whatever they had not yet flushed.
 A drain that is cut short logs `spool not fully drained at shutdown`.
 
 **An upload cancelled after its PUT** (shutdown, timeout) leaves the entry on disk; the next

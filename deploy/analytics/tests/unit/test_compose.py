@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from conftest import ANALYTICS, generated_env
+from conftest import ANALYTICS, cargo_version, generated_env
 
 if shutil.which("docker") is None:
     pytest.skip("docker not on PATH", allow_module_level=True)
@@ -54,8 +54,8 @@ def test_all_services_present(cfg):
 
 def test_pinned_default_images(cfg):
     img = {k: v["image"] for k, v in cfg["services"].items()}
-    assert img["logthing"] == "ghcr.io/mrmagooey/logthing:0.23.0"
-    assert img["committer"] == "ghcr.io/mrmagooey/logthing-committer:0.23.0"
+    assert img["logthing"] == f"ghcr.io/mrmagooey/logthing:{cargo_version()}"
+    assert img["committer"] == f"ghcr.io/mrmagooey/logthing-committer:{cargo_version()}"
     assert img["garage"] == "dxflrs/garage:v2.4.1"
     assert img["trino"] == "trinodb/trino:483"
     assert img["certgen"] == "alpine/openssl:3.5.9"

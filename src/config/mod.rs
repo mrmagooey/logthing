@@ -1016,8 +1016,8 @@ pub struct GenericLocalConfig {
 /// See `docs/redaction.md` for exact semantics.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct RedactionConfig {
-    /// Dotted paths removed from the record (OTLP: `@body`, `@host_name`, `@peer_addr` address
-    /// typed columns).
+    /// Dotted paths removed from the record (`@` paths address typed columns: HEC `@host`,
+    /// `@source`; OTLP `@body`, `@host_name`, `@peer_addr`).
     #[serde(default)]
     pub drop_fields: Vec<String>,
     /// Dotted paths replaced by the lowercase-hex HMAC-SHA256 of the value.
@@ -2120,6 +2120,14 @@ pub fn validate_config_invariants(cfg: &Config) -> Result<(), String> {
                     .to_string(),
             );
         }
+    }
+
+    if cfg.hec.enabled && cfg.hec.max_sourcetype_partitions == 0 {
+        errors.push(
+            "[hec] max_sourcetype_partitions must be greater than 0 (0 would let any client \
+             mint unbounded sourcetype partitions)"
+                .to_string(),
+        );
     }
 
     if cfg.hec.enabled
@@ -3894,6 +3902,22 @@ directory = "/tmp/otlp"
             ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_hec_sourcetype_partitions() {
+        let mut cfg = valid_base();
+        cfg.hec.enabled = true;
+        cfg.hec.local = sink_dir();
+        assert_eq!(validate_config_invariants(&cfg), Ok(()));
+        cfg.hec.max_sourcetype_partitions = 0;
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert!(
+            err.contains("[hec] max_sourcetype_partitions must be greater than 0"),
+            "{err}"
+        );
+        cfg.hec.enabled = false;
+        assert_eq!(validate_config_invariants(&cfg), Ok(()));
     }
 
     #[test]

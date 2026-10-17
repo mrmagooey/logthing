@@ -207,6 +207,18 @@ fn reject(reason: AuthFailure) -> Response {
     wsman_unauthorized()
 }
 
+/// Marker error: the completed context lacks confidentiality, integrity or mutual auth.
+#[derive(Debug)]
+struct MissingFlagsError;
+
+impl std::fmt::Display for MissingFlagsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GSS context lacks confidentiality, integrity or mutual authentication")
+    }
+}
+
+impl std::error::Error for MissingFlagsError {}
+
 /// Result of a completed handshake.
 struct Handshake {
     acceptor: Box<dyn GssAcceptor>,
@@ -228,6 +240,9 @@ async fn handshake(
                 return Ok(None);
             }
             let principal = acceptor.principal()?;
+            if !acceptor.has_conf_integ_mutual()? {
+                return Err(anyhow::Error::new(MissingFlagsError));
+            }
             Ok(Some(Handshake {
                 acceptor,
                 out_token,
@@ -240,6 +255,7 @@ async fn handshake(
         // Multi-leg negotiation would need state carried across requests; Windows Kerberos
         // is single-leg, so an incomplete context is just a bad token.
         Ok(Ok(None)) => Err(AuthFailure::BadToken),
+        Ok(Err(e)) if e.is::<MissingFlagsError>() => Err(AuthFailure::MissingFlags),
         Ok(Err(e)) => {
             warn!(
                 "WEF Kerberos handshake failed: {}",
@@ -399,6 +415,12 @@ pub async fn wsman_auth_middleware(
             .and_then(|v| v.to_str().ok()),
     );
     let body = match enc {
+        // A completed context promises confidentiality: a plaintext SOAP body here is a
+        // downgrade (or an injection past the session's integrity protection).
+        None if !bytes.is_empty() => {
+            metrics::counter!("wef_plaintext_on_kerberos_rejected").increment(1);
+            return empty(StatusCode::BAD_REQUEST);
+        }
         None => Body::from(bytes),
         Some(_) if is_h2 => {
             record_failure(AuthFailure::H2Encrypted);
@@ -1076,7 +1098,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_identity_attached_on_token_request_with_plain_body() {
+    async fn test_plain_body_on_token_request_rejected() {
         let h = Harness::new();
         let resp = h
             .send(auth_req(
@@ -1086,15 +1108,16 @@ mod tests {
                 b"<soap/>".to_vec(),
             ))
             .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(body_bytes(resp).await, b"krb:bob");
+        // The handshake completed, so the plaintext body that rides with it is a downgrade.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(h.seen.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn test_identity_attached_on_absent_authorization_after_handshake() {
         let h = Harness::new();
         login(&h, "bob").await;
-        let resp = h.send(plain_req("/wsman/identity", b"<soap/>")).await;
+        let resp = h.send(plain_req("/wsman/identity", b"")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_bytes(resp).await, b"krb:bob");
     }
@@ -1146,9 +1169,9 @@ mod tests {
     async fn test_authenticated_connection_headerless_request_passes() {
         let h = Harness::new();
         login(&h, "alice").await;
-        let resp = h.send(plain_req("/wsman", b"hello")).await;
+        let resp = h.send(plain_req("/wsman", b"")).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(body_bytes(resp).await, b"echo:hello");
+        assert_eq!(body_bytes(resp).await, b"echo:");
     }
 
     #[tokio::test]
@@ -1221,7 +1244,7 @@ mod tests {
         login(&h, "alice").await;
         for _ in 0..3 {
             assert_eq!(
-                h.send(plain_req("/wsman", b"x")).await.status(),
+                h.send(plain_req("/wsman", b"")).await.status(),
                 StatusCode::OK
             );
         }
@@ -1273,7 +1296,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert!(h.seen.lock().unwrap().is_empty());
         // Nothing was decrypted, so the connection stays authenticated.
-        let ok = h.send(plain_req("/wsman", b"x")).await;
+        let ok = h.send(plain_req("/wsman", b"")).await;
         assert_eq!(ok.status(), StatusCode::OK);
     }
 
@@ -1323,20 +1346,42 @@ mod tests {
         assert_eq!(next.status(), StatusCode::UNAUTHORIZED);
     }
 
-    #[tokio::test]
-    async fn test_encrypted_body_without_conf_flags_401() {
-        let h = Harness::new();
-        h.factory.flags_missing.store(true, Ordering::SeqCst);
-        let id = login(&h, "alice").await;
-        let resp = h.send(enc_req("/wsman", id, b"abcd", 4)).await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(h.seen.lock().unwrap().is_empty());
-        let next = h.send(plain_req("/wsman", b"x")).await;
-        assert_eq!(next.status(), StatusCode::UNAUTHORIZED);
+    #[test]
+    fn test_decrypt_body_without_conf_flags_is_missing_flags() {
+        let ctx = Box::new(FakeAcceptor {
+            id: 1,
+            complete: true,
+            principal: "alice".into(),
+            flags_ok: false,
+            violated: Arc::new(AtomicBool::new(false)),
+        });
+        let (h, d) = fake_wrap(1, b"abcd");
+        let body = multipart::build(EncProtocol::Kerberos, 4, &h, &d);
+        let (_, result) = decrypt_body(ctx, &body);
+        assert!(matches!(result, Err(DecryptError::MissingFlags)));
     }
 
     #[tokio::test]
-    async fn test_plaintext_body_on_authenticated_connection_accepted() {
+    async fn test_handshake_without_conf_flags_401_and_no_session() {
+        let h = Harness::new();
+        h.factory.flags_missing.store(true, Ordering::SeqCst);
+        let resp = h
+            .send(auth_req("Kerberos", "principal:alice", "/wsman", vec![]))
+            .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get(header::WWW_AUTHENTICATE).is_some());
+        // No session was established: a header-less request is challenged again.
+        let next = h.send(plain_req("/wsman", b"")).await;
+        assert_eq!(next.status(), StatusCode::UNAUTHORIZED);
+        assert!(h.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_plaintext_body_on_authenticated_connection_rejected() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let h = Harness::new();
         login(&h, "alice").await;
         let req = HttpRequest::builder()
@@ -1346,14 +1391,32 @@ mod tests {
             .body(Body::from("plain"))
             .unwrap();
         let resp = h.send(req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(h.seen.lock().unwrap().is_empty(), "handler must not run");
+        let counted: u64 = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == "wef_plaintext_on_kerberos_rejected")
+            .map(|(_, _, _, v)| match v {
+                metrics_util::debugging::DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(counted, 1);
+        // The context survives: an encrypted request on the same connection still works.
+        let id = h.factory.created.load(Ordering::SeqCst) as u64;
+        let ok = h.send(enc_req("/wsman", id, b"abcd", 4)).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_empty_body_on_authenticated_connection_allowed() {
+        let h = Harness::new();
+        login(&h, "alice").await;
+        let resp = h.send(plain_req("/wsman", b"")).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        // Responses to plaintext requests stay plaintext.
-        assert_eq!(resp.headers()[header::CONTENT_TYPE], SOAP_UTF16);
-        assert_eq!(body_bytes(resp).await, b"echo:plain");
-        assert_eq!(
-            h.seen.lock().unwrap()[0].0.as_deref(),
-            Some("application/soap+xml;charset=UTF-8")
-        );
+        assert_eq!(h.seen.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

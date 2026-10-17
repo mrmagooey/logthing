@@ -110,8 +110,13 @@ impl IpWhitelist {
             return true;
         }
 
-        let ip = addr.ip();
-        networks.iter().any(|net| net.contains(&ip))
+        // A `[::]` dual-stack socket reports IPv4 peers as `::ffff:a.b.c.d`; also try the
+        // canonical IPv4 form so IPv4 entries match, while `::ffff:` entries keep working.
+        let raw = addr.ip();
+        let ip = raw.to_canonical();
+        networks
+            .iter()
+            .any(|net| net.contains(&ip) || net.contains(&raw))
     }
 }
 
@@ -146,6 +151,20 @@ mod tests {
         assert!(whitelist.is_allowed(&addr_in_range));
         assert!(whitelist.is_allowed(&addr_ip));
         assert!(!whitelist.is_allowed(&addr_outside));
+    }
+
+    #[test]
+    fn test_is_allowed_matches_ipv4_mapped_ipv6_peer() {
+        let whitelist = IpWhitelist::new(vec!["10.0.0.0/24".into()]).unwrap();
+        let mapped_in: SocketAddr = "[::ffff:10.0.0.5]:1234".parse().unwrap();
+        let mapped_out: SocketAddr = "[::ffff:10.0.1.5]:1".parse().unwrap();
+        assert!(whitelist.is_allowed(&mapped_in));
+        assert!(!whitelist.is_allowed(&mapped_out));
+
+        // Entries written in mapped form keep matching the raw peer address.
+        let mapped_entry = IpWhitelist::new(vec!["::ffff:10.0.0.0/120".into()]).unwrap();
+        assert!(mapped_entry.is_allowed(&mapped_in));
+        assert!(!mapped_entry.is_allowed(&mapped_out));
     }
 
     #[test]

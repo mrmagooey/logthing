@@ -205,3 +205,121 @@ async fn more_than_builder_batch_rows_per_service_keep_exact_counts_and_bodies()
         assert_eq!(bodies, want, "{dir}");
     }
 }
+
+#[cfg(feature = "otlp")]
+mod oversized_request {
+    use super::common;
+    use axum::{Extension, Router, routing::post};
+    use logthing::config::{Config, OtlpConfig, OtlpLocalConfig};
+    use logthing::forwarding::local_sink::LocalDiskSink;
+    use logthing::forwarding::otlp_s3::otlp_local_start;
+    use logthing::ingest::IngestState;
+    use logthing::server::otlp::MAX_OTLP_RECORDS_PER_REQUEST;
+    use logthing::server::{AppState, handle_otlp_logs};
+    use logthing::stats::ThroughputStats;
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use prost::Message;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::RwLock;
+
+    fn request(n: usize) -> Vec<u8> {
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord::default(); n],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec()
+    }
+
+    async fn post_body(base: &str, body: Vec<u8>) -> u16 {
+        reqwest::Client::new()
+            .post(format!("{base}/v1/logs"))
+            .header("content-type", "application/x-protobuf")
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    #[tokio::test]
+    async fn test_otlp_oversized_request_returns_413_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = Arc::new(LocalDiskSink::new(tmp.path().to_path_buf()).await.unwrap());
+        let cfg = OtlpLocalConfig {
+            directory: tmp.path().to_path_buf(),
+            prefix: "otlp".to_string(),
+            flush_threshold_bytes: 1,
+            flush_interval_secs: 1,
+            channel_capacity: 256,
+            max_buffer_rows: 100_000,
+        };
+        let (handler, _join) = otlp_local_start(
+            &cfg,
+            sink,
+            64,
+            Arc::new(logthing::stats::SourceHourlyStats::new()),
+            None,
+        );
+        let config = Config {
+            otlp: OtlpConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let app_state = Arc::new(AppState {
+            config: Arc::new(RwLock::new(config)),
+            throughput: Arc::new(ThroughputStats::new()),
+            wef_cardinality_watchers: Vec::new(),
+            wef: None,
+            bookmarks: Arc::new(logthing::wef::bookmarks::BookmarkStore::new(16)),
+            event_parser: None,
+            parquet_s3_sender: None,
+            parquet_local_sender: None,
+        });
+        let router = Router::new()
+            .route("/v1/logs", post(handle_otlp_logs))
+            .layer(Extension(IngestState {
+                otlp_local: Some(handler),
+                ..Default::default()
+            }))
+            .with_state(app_state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        assert_eq!(
+            post_body(&base, request(MAX_OTLP_RECORDS_PER_REQUEST + 1)).await,
+            413
+        );
+        // A valid request after the rejection proves the sink works and flushes: if the
+        // rejected request had leaked any records, they would show up beside this one.
+        assert_eq!(post_body(&base, request(1)).await, 200);
+        common::wait_for_rows(tmp.path(), 1, Duration::from_secs(20)).await;
+        // Let any further (wrongly) enqueued rows flush before counting.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let rows: usize = common::read_all(tmp.path())
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 1);
+    }
+}

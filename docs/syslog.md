@@ -21,6 +21,21 @@ tasks help only with many distinct senders (or source ports); `recv_batch_size` 
 helps a single high-rate sender. `0` is treated as `1` for both. Values above the built-in maximum for
 `recv_tasks` or `recv_batch_size` are rejected at config load.
 
+**TCP framing:** the TCP listener accepts both RFC 6587 framings, chosen per frame, so
+they may be mixed on one connection:
+
+- *Octet-counting* (§3.4.1): `LEN SP MSG`, e.g. `57 <34>1 2024-01-15T10:30:45Z ...`. The
+  message is exactly `LEN` bytes, so it may contain newlines. A frame is treated as
+  octet-counted only when it starts with 1-7 digits (first digit 1-9), one space, and `<` (the
+  message's PRI).
+- *Newline-terminated* (§3.4.2): everything else. A line that merely begins with a digit
+  (for example `2026-10-16 12:00 host app: msg` or `12 apples`) stays newline-framed.
+
+A length above 256 KiB, like a newline-framed line above 256 KiB, is counted in
+`syslog_oversized_lines` and the connection is closed. An octet-counted frame still incomplete
+at idle timeout or shutdown is dropped (at shutdown it counts in
+`syslog_partial_lines_dropped_at_shutdown`).
+
 **TCP idle timeout:** a TCP connection to the syslog listener (and, the same
 way, to the Zeek TCP listener — see [zeek.md](zeek.md) — and the Suricata TCP
 listener) is closed if it goes 300 seconds (5 minutes) without delivering a
@@ -36,6 +51,21 @@ well-behaved forwarder simply reconnects and resumes sending.
 **Supported Formats**:
 - **RFC 3164** (BSD syslog): `<priority>timestamp hostname tag[pid]: message`
 - **RFC 5424**: `<priority>version timestamp hostname app-name procid msgid [structured-data] message`
+
+Header parsing details:
+- RFC 5424 structured data is either `-` (none; the message is the text after `- `) or one or
+  more *adjacent* `[id name="value"]` elements. Inside a quoted value `\"`, `\\` and `\]` are
+  unescaped. Brackets in the message text after the elements (`... ] user [admin] logged in`)
+  stay in the message. Malformed or unterminated structured data is not dropped: the whole
+  remainder becomes the message.
+- In an RFC 3164 line the tag is a single token before the first `:` (no spaces, `=` or `(`).
+  Text such as `Failed password for root port 22: x` or an auditd `type=SYSCALL ...` line has
+  no tag and is kept whole as the message. A CEF/LEEF payload directly after the hostname is
+  likewise never treated as a tag, so it reaches the CEF/LEEF parser.
+- A line with a `<PRI>` that matches neither header format is kept, not dropped. A valid PRI
+  (0-191) is honoured and removed from the message (`<34>free text` -> priority 34, message
+  `free text`). A PRI above 191 is not valid: the whole raw line, prefix included, becomes the
+  message with the RFC 3164 default priority (facility user, severity notice).
 
 **HTTP Endpoints**:
 - `POST /syslog` - Submit syslog messages via HTTP
@@ -70,6 +100,12 @@ RADIUS, web access log, then DNS, and the first match becomes a structured recor
 is configured (same keys as `[syslog.s3]`); without it the parse result is discarded. This works
 alongside `[syslog.s3]`/`[syslog.local]`: the raw message goes to those targets, the structured
 record to `structured_s3`.
+
+Parser edge cases: a LEEF 2.0 header whose delimiter field is a literal tab keeps any `|` in the
+attribute data; a CEF extension key is recognised only at the start or after a space, so
+`msg=a=b src=1.2.3.4` yields `msg` = `a=b`; auditd bare tokens without `=` are skipped; a web
+access request line of `"-"` (e.g. a 408) parses with no method/path, and `\"` inside the user
+agent is kept as-is.
 
 ## Syslog S3 Persistence
 

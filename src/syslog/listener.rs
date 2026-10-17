@@ -402,15 +402,18 @@ impl SyslogListener {
             // runs per process (recv_batch_size <= 1 returns early), so one
             // instance is enough to cover the TCP accept arm in either.
             let mut accept_backoff = crate::net::AcceptBackoff::new("syslog_tcp");
+            let mut conns = crate::net::ConnectionTasks::new();
 
             if self.config.recv_batch_size <= 1 {
                 let mut buf = vec![0u8; 65535];
+                let mut backoff = crate::net::RecvErrorBackoff::new("syslog");
                 loop {
                     tokio::select! {
                         // UDP receive arm
                         result = udp_socket.recv_from(&mut buf) => {
                             match result {
                                 Ok((len, src)) => {
+                                    backoff.reset();
                                     // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
                                     if !self.allowed_ips.is_allowed(&src) {
                                         metrics::counter!("listener_source_rejected", "protocol" => "syslog_udp").increment(1);
@@ -432,7 +435,7 @@ impl SyslogListener {
                                     }
                                 }
                                 Err(e) => {
-                                    error!("UDP receive error: {}", e);
+                                    backoff.on_error(&e).await;
                                 }
                             }
                         }
@@ -450,9 +453,10 @@ impl SyslogListener {
                                         Ok(permit) => {
                                             let handler = handler_tcp.clone();
                                             let cardinality = cardinality_tcp.clone();
-                                            tokio::spawn(async move {
+                                            let conn_shutdown = shutdown_rx.clone();
+                                            conns.spawn(async move {
                                                 let _permit = permit; // held for connection lifetime
-                                                if let Err(e) = Self::handle_tcp_connection(stream, src, handler, tcp_idle_timeout, cardinality).await {
+                                                if let Err(e) = Self::handle_tcp_connection(stream, src, handler, tcp_idle_timeout, cardinality, conn_shutdown).await {
                                                     error!("TCP connection error from {}: {}", src, e);
                                                 }
                                             });
@@ -477,8 +481,8 @@ impl SyslogListener {
                             socket_stats.poll().await;
                         }
                         // Shutdown arm
-                        _ = shutdown_rx.changed() => {
-                            if *shutdown_rx.borrow() {
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
                                 info!("Syslog listener: shutdown signal received");
                                 break;
                             }
@@ -486,6 +490,7 @@ impl SyslogListener {
                     }
                 }
 
+                conns.drain(crate::net::CONNECTION_DRAIN_GRACE).await;
                 return Ok(());
             }
 
@@ -493,12 +498,14 @@ impl SyslogListener {
             // accept arm, stats arm and shutdown arm are byte-for-byte the
             // same as the recv_batch_size <= 1 loop above.
             let mut batch = crate::net::RecvMmsgBatch::new(self.config.recv_batch_size);
+            let mut backoff = crate::net::RecvErrorBackoff::new("syslog");
             loop {
                 tokio::select! {
                     // UDP receive arm (batched)
                     result = batch.recv(&udp_socket) => {
                         match result {
                             Ok(n) => {
+                                backoff.reset();
                                 for i in 0..n {
                                     let Some(src) = batch.src(i) else {
                                         warn!("syslog: batch message with unparseable source address, skipping");
@@ -537,7 +544,7 @@ impl SyslogListener {
                                 // sits beside (this file's `Err(e) => {
                                 // error!("UDP receive error: {}", e); }`
                                 // above) -- not a gap introduced by batching.
-                                error!("Syslog UDP batched receive error: {}", e);
+                                backoff.on_error(&e).await;
                             }
                         }
                     }
@@ -555,7 +562,8 @@ impl SyslogListener {
                                     Ok(permit) => {
                                         let handler = handler_tcp.clone();
                                         let cardinality = cardinality_tcp.clone();
-                                        tokio::spawn(async move {
+                                        let conn_shutdown = shutdown_rx.clone();
+                                        conns.spawn(async move {
                                             let _permit = permit; // held for connection lifetime
                                             if let Err(e) = Self::handle_tcp_connection(
                                                 stream,
@@ -563,6 +571,7 @@ impl SyslogListener {
                                                 handler,
                                                 tcp_idle_timeout,
                                                 cardinality,
+                                                conn_shutdown,
                                             )
                                             .await
                                             {
@@ -590,8 +599,8 @@ impl SyslogListener {
                         socket_stats.poll().await;
                     }
                     // Shutdown arm
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
                             info!("Syslog listener: shutdown signal received");
                             break;
                         }
@@ -599,6 +608,7 @@ impl SyslogListener {
                 }
             }
 
+            conns.drain(crate::net::CONNECTION_DRAIN_GRACE).await;
             return Ok(());
         }
 
@@ -698,11 +708,13 @@ impl SyslogListener {
         let mut socket_stats = crate::net::SocketDropStats::new(&socket, "syslog_udp");
         let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
+        let mut backoff = crate::net::RecvErrorBackoff::new("syslog");
         loop {
             tokio::select! {
                 result = socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, src)) => {
+                            backoff.reset();
                             if !self.allowed_ips.is_allowed(&src) {
                                 metrics::counter!("listener_source_rejected", "protocol" => "syslog_udp")
                                     .increment(1);
@@ -728,7 +740,7 @@ impl SyslogListener {
                             }
                         }
                         Err(e) => {
-                            error!("UDP receive error: {}", e);
+                            backoff.on_error(&e).await;
                         }
                     }
                 }
@@ -739,10 +751,11 @@ impl SyslogListener {
         }
     }
 
-    /// Start TCP syslog listener (newline framing only).
+    /// Start TCP syslog listener (newline and octet-counting framing).
     ///
-    /// Each message is terminated by a `\n` byte (RFC 6587 §3.4.2 non-transparent
-    /// framing).  RFC 6587 octet-counting framing (§3.4.1) is **not** implemented.
+    /// Each frame is either newline-terminated (RFC 6587 §3.4.2 non-transparent
+    /// framing) or octet-counted (§3.4.1, `LEN SP MSG`); see [`read_tcp_frame`] for how
+    /// the two are told apart.
     async fn start_tcp_listener(&self) -> anyhow::Result<()> {
         let addr: SocketAddr =
             format!("{}:{}", self.config.bind_address, self.config.tcp_port).parse()?;
@@ -758,6 +771,8 @@ impl SyslogListener {
         info!("Syslog TCP listener started on {}", bound);
 
         let semaphore = Arc::new(Semaphore::new(MAX_SYSLOG_TCP_CONNECTIONS));
+        // Never fires: this entry point has no shutdown signal.
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let mut accept_backoff = crate::net::AcceptBackoff::new("syslog_tcp");
 
         loop {
@@ -777,6 +792,7 @@ impl SyslogListener {
                             let handler = self.handler.clone();
                             let tcp_idle_timeout = self.config.tcp_idle_timeout;
                             let cardinality = self.cardinality.clone();
+                            let conn_shutdown = shutdown_rx.clone();
                             tokio::spawn(async move {
                                 let _permit = permit; // held for connection lifetime
                                 if let Err(e) = Self::handle_tcp_connection(
@@ -785,6 +801,7 @@ impl SyslogListener {
                                     handler,
                                     tcp_idle_timeout,
                                     cardinality,
+                                    conn_shutdown,
                                 )
                                 .await
                                 {
@@ -808,11 +825,12 @@ impl SyslogListener {
         }
     }
 
-    /// Handle a TCP connection for syslog: bounded read_until loop, one message per line.
+    /// Handle a TCP connection for syslog: one message per newline-terminated line or
+    /// octet-counted frame (see [`read_tcp_frame`]).
     ///
-    /// Each iteration reads at most `SYSLOG_MAX_LINE_BYTES + 1` bytes via a
-    /// `take` adapter, so heap growth per connection is provably bounded by that
-    /// constant regardless of client behaviour.  If the cap is hit without a
+    /// Each frame read buffers at most `SYSLOG_MAX_LINE_BYTES + 1` bytes (a `take`
+    /// adapter for lines, the checked count for octet frames), so heap growth per
+    /// connection is provably bounded by that constant regardless of client behaviour.  If the cap is hit without a
     /// terminating `\n` the connection is closed immediately; resyncing would
     /// itself require unbounded buffering.
     async fn handle_tcp_connection(
@@ -821,48 +839,97 @@ impl SyslogListener {
         handler: Arc<dyn SyslogHandler>,
         idle_timeout: Duration,
         cardinality: Vec<Arc<CardinalityWatcher>>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let mut reader = BufReader::new(stream);
         let mut buf: Vec<u8> = Vec::new();
+        let mut mode = FrameMode::Undecided;
+        // Set once shutdown is signalled: the connection then reads only what is already
+        // available (zero-length read timeout), dispatching every complete frame, and ends.
+        let mut draining = false;
+        // The previous read was cancelled by shutdown: keep its partial frame in `buf`/`mode`.
+        let mut resume = false;
 
         loop {
-            buf.clear();
-            let mut limited = (&mut reader).take((SYSLOG_MAX_LINE_BYTES as u64) + 1);
-            let n = match tokio::time::timeout(idle_timeout, limited.read_until(b'\n', &mut buf))
-                .await
-            {
+            if !resume {
+                buf.clear();
+                mode = FrameMode::Undecided;
+            }
+            resume = false;
+            let read = read_tcp_frame(&mut reader, &mut buf, &mut mode);
+            let timed = if draining {
+                tokio::time::timeout(Duration::ZERO, read).await
+            } else {
+                let cancelled = tokio::select! {
+                    o = tokio::time::timeout(idle_timeout, read) => Ok(o),
+                    changed = shutdown_rx.changed() => {
+                        Err(changed.is_err() || *shutdown_rx.borrow())
+                    }
+                };
+                match cancelled {
+                    Ok(o) => o,
+                    Err(shutdown) => {
+                        draining = shutdown;
+                        resume = true;
+                        continue;
+                    }
+                }
+            };
+            let frame = match timed {
+                Err(_elapsed) if draining => {
+                    if !buf.is_empty() {
+                        metrics::counter!("syslog_partial_lines_dropped_at_shutdown").increment(1);
+                        warn!(
+                            "Syslog: dropped partial line ({} bytes) from {} at shutdown",
+                            buf.len(),
+                            src
+                        );
+                    }
+                    break;
+                }
                 Err(_elapsed) => {
                     metrics::counter!("syslog_tcp_idle_timeouts").increment(1);
                     debug!("TCP connection from {} idle past timeout; closing", src);
                     break;
                 }
-                Ok(Ok(n)) => n,
+                Ok(Ok(frame)) => frame,
                 Ok(Err(e)) => {
                     error!("TCP read error from {}: {}", src, e);
                     break;
                 }
             };
-            if n == 0 {
-                // Connection closed cleanly.
-                debug!("TCP connection from {} closed", src);
-                break;
-            }
-            // If we read SYSLOG_MAX_LINE_BYTES+1 bytes and the last byte is NOT
-            // a newline, the line exceeded the cap — close immediately.
-            if buf.len() > SYSLOG_MAX_LINE_BYTES && buf.last() != Some(&b'\n') {
-                metrics::counter!("syslog_oversized_lines").increment(1);
-                warn!(
-                    "Syslog: line from {} exceeded {} bytes; closing connection",
-                    src, SYSLOG_MAX_LINE_BYTES
-                );
-                break;
-            }
-            // Trim trailing \r\n / \n.
-            if buf.last() == Some(&b'\n') {
-                buf.pop();
-            }
-            if buf.last() == Some(&b'\r') {
-                buf.pop();
+            match frame {
+                TcpFrame::Closed => {
+                    debug!("TCP connection from {} closed", src);
+                    break;
+                }
+                TcpFrame::Oversize => {
+                    metrics::counter!("syslog_oversized_lines").increment(1);
+                    warn!(
+                        "Syslog: frame from {} exceeded {} bytes; closing connection",
+                        src, SYSLOG_MAX_LINE_BYTES
+                    );
+                    break;
+                }
+                TcpFrame::Truncated => {
+                    warn!(
+                        "Syslog: octet-counted frame from {} cut short ({} bytes read); closing",
+                        src,
+                        buf.len()
+                    );
+                    break;
+                }
+                TcpFrame::Line => {
+                    // Trim trailing \r\n / \n.
+                    if buf.last() == Some(&b'\n') {
+                        buf.pop();
+                    }
+                    if buf.last() == Some(&b'\r') {
+                        buf.pop();
+                    }
+                }
+                // The count defines the message: embedded newlines are content.
+                TcpFrame::Octets => {}
             }
             if buf.is_empty() {
                 continue;
@@ -896,6 +963,139 @@ impl SyslogListener {
     }
 }
 
+/// Framing state of the TCP syslog frame currently being read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameMode {
+    /// Not enough bytes seen yet to choose a framing.
+    Undecided,
+    /// Newline-terminated line.
+    Newline,
+    /// RFC 6587 octet-counted frame: the body is exactly this many bytes.
+    Octets(usize),
+}
+
+/// Outcome of one [`read_tcp_frame`] call.
+#[derive(Debug, PartialEq, Eq)]
+enum TcpFrame {
+    /// Peer closed cleanly between frames.
+    Closed,
+    /// A newline-framed line is in the buffer (terminator possibly still attached).
+    Line,
+    /// An octet-counted message body is in the buffer.
+    Octets,
+    /// The peer closed in the middle of an octet-counted frame.
+    Truncated,
+    /// The line, or the declared octet count, exceeds `SYSLOG_MAX_LINE_BYTES`.
+    Oversize,
+}
+
+/// Decide the framing from the bytes of a frame seen so far (all of them leading
+/// digits-and-space candidates). `None` means more bytes are needed.
+///
+/// Octet-counting is chosen only for `1-7 digits (first 1-9), one space, '<'`: a
+/// newline-framed line without a PRI can legitimately start with a digit (a
+/// timestamp, `12 apples`), and must not be mistaken for a length.
+fn classify_frame_prefix(prefix: &[u8]) -> Option<FrameMode> {
+    let &first = prefix.first()?;
+    if !(b'1'..=b'9').contains(&first) {
+        return Some(FrameMode::Newline);
+    }
+    let digits = prefix.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits > 7 {
+        return Some(FrameMode::Newline);
+    }
+    match prefix.get(digits) {
+        None => None,
+        Some(b' ') => match prefix.get(digits + 1) {
+            None => None,
+            Some(b'<') => {
+                let len = std::str::from_utf8(&prefix[..digits]).ok()?.parse().ok()?;
+                Some(FrameMode::Octets(len))
+            }
+            Some(_) => Some(FrameMode::Newline),
+        },
+        Some(_) => Some(FrameMode::Newline),
+    }
+}
+
+/// Read one TCP syslog frame into `buf`, choosing between newline and octet-counting
+/// framing (see [`classify_frame_prefix`]).
+///
+/// Cancel-safe: progress lives in `buf` and `mode`, so a cancelled call can be
+/// re-issued with the same arguments and continues where it stopped. For an
+/// octet-counted frame `buf` holds only the message body. Memory per connection is
+/// bounded by `SYSLOG_MAX_LINE_BYTES + 1`.
+async fn read_tcp_frame(
+    reader: &mut BufReader<TcpStream>,
+    buf: &mut Vec<u8>,
+    mode: &mut FrameMode,
+) -> std::io::Result<TcpFrame> {
+    // Choose the framing. Bytes are consumed one at a time and only while the prefix is
+    // still ambiguous (at most 9 bytes), so a newline-framed line simply continues.
+    while *mode == FrameMode::Undecided {
+        if let Some(decided) = classify_frame_prefix(buf) {
+            *mode = decided;
+            if let FrameMode::Octets(len) = decided {
+                if len > SYSLOG_MAX_LINE_BYTES {
+                    return Ok(TcpFrame::Oversize);
+                }
+                // Drop the "LEN SP" header; keep the '<' that starts the message.
+                buf.clear();
+                buf.push(b'<');
+            }
+            break;
+        }
+        let avail = reader.fill_buf().await?;
+        let Some(&next) = avail.first() else {
+            if buf.is_empty() {
+                return Ok(TcpFrame::Closed);
+            }
+            *mode = FrameMode::Newline;
+            break;
+        };
+        if buf.is_empty() && !(b'1'..=b'9').contains(&next) {
+            *mode = FrameMode::Newline;
+            break;
+        }
+        buf.push(next);
+        reader.consume(1);
+    }
+    match *mode {
+        FrameMode::Octets(len) => {
+            while buf.len() < len {
+                let avail = reader.fill_buf().await?;
+                if avail.is_empty() {
+                    return Ok(TcpFrame::Truncated);
+                }
+                let take = avail.len().min(len - buf.len());
+                buf.extend_from_slice(&avail[..take]);
+                reader.consume(take);
+            }
+            Ok(TcpFrame::Octets)
+        }
+        _ => {
+            // The byte that decided the framing may itself be the line's `\n`: the line is
+            // then complete, and reading on would merge it with the next one.
+            if buf.last() != Some(&b'\n') {
+                let remaining = (SYSLOG_MAX_LINE_BYTES + 1).saturating_sub(buf.len()) as u64;
+                (&mut *reader)
+                    .take(remaining)
+                    .read_until(b'\n', buf)
+                    .await?;
+            }
+            // Hitting the cap without a terminating newline means the line is too long;
+            // resyncing would itself need unbounded buffering.
+            if buf.len() > SYSLOG_MAX_LINE_BYTES && buf.last() != Some(&b'\n') {
+                Ok(TcpFrame::Oversize)
+            } else if buf.is_empty() {
+                Ok(TcpFrame::Closed)
+            } else {
+                Ok(TcpFrame::Line)
+            }
+        }
+    }
+}
+
 /// The UDP recv loop run by each task in the `recv_tasks > 1` fan-out. Same
 /// body as the `recv_tasks <= 1` UDP arm in `start_with_shutdown`,
 /// parameterized so it can be spawned once per `SO_REUSEPORT` socket.
@@ -914,11 +1114,13 @@ async fn syslog_udp_recv_loop(
 
     if recv_batch_size <= 1 {
         let mut buf = vec![0u8; 65535];
+        let mut backoff = crate::net::RecvErrorBackoff::new("syslog");
         loop {
             tokio::select! {
                 result = socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, src)) => {
+                            backoff.reset();
                             // ponytail: any new recv/accept arm in this module needs this same is_allowed check.
                             if !allowed_ips.is_allowed(&src) {
                                 metrics::counter!("listener_source_rejected", "protocol" => "syslog_udp").increment(1);
@@ -940,7 +1142,7 @@ async fn syslog_udp_recv_loop(
                             }
                         }
                         Err(e) => {
-                            error!("UDP receive error: {}", e);
+                            backoff.on_error(&e).await;
                         }
                     }
                 }
@@ -949,8 +1151,8 @@ async fn syslog_udp_recv_loop(
                         stats.poll().await;
                     }
                 }
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
                         info!("Syslog UDP listener: shutdown signal received");
                         break;
                     }
@@ -961,11 +1163,13 @@ async fn syslog_udp_recv_loop(
     }
 
     let mut batch = crate::net::RecvMmsgBatch::new(recv_batch_size);
+    let mut backoff = crate::net::RecvErrorBackoff::new("syslog");
     loop {
         tokio::select! {
             result = batch.recv(&socket) => {
                 match result {
                     Ok(n) => {
+                        backoff.reset();
                         for i in 0..n {
                             let Some(src) = batch.src(i) else {
                                 warn!("syslog: batch message with unparseable source address, skipping");
@@ -998,7 +1202,7 @@ async fn syslog_udp_recv_loop(
                         // same parity note as the inline loop's batched arm
                         // in start_with_shutdown. Retried on the next loop
                         // iteration via batch.recv()'s own readable() await.
-                        error!("Syslog UDP batched receive error: {}", e);
+                        backoff.on_error(&e).await;
                     }
                 }
             }
@@ -1007,8 +1211,8 @@ async fn syslog_udp_recv_loop(
                     stats.poll().await;
                 }
             }
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
                     info!("Syslog UDP listener: shutdown signal received");
                     break;
                 }
@@ -1032,6 +1236,7 @@ async fn syslog_tcp_accept_loop(
     cardinality: Vec<Arc<CardinalityWatcher>>,
 ) {
     let mut accept_backoff = crate::net::AcceptBackoff::new("syslog_tcp");
+    let mut conns = crate::net::ConnectionTasks::new();
     loop {
         tokio::select! {
             result = accept_backoff.accept(&listener) => {
@@ -1047,7 +1252,8 @@ async fn syslog_tcp_accept_loop(
                             Ok(permit) => {
                                 let handler = handler.clone();
                                 let cardinality = cardinality.clone();
-                                tokio::spawn(async move {
+                                let conn_shutdown = shutdown_rx.clone();
+                                conns.spawn(async move {
                                     let _permit = permit; // held for connection lifetime
                                     if let Err(e) = SyslogListener::handle_tcp_connection(
                                         stream,
@@ -1055,6 +1261,7 @@ async fn syslog_tcp_accept_loop(
                                         handler,
                                         idle_timeout,
                                         cardinality,
+                                        conn_shutdown,
                                     )
                                     .await
                                     {
@@ -1077,14 +1284,15 @@ async fn syslog_tcp_accept_loop(
                     }
                 }
             }
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
                     info!("Syslog TCP listener: shutdown signal received");
                     break;
                 }
             }
         }
     }
+    conns.drain(crate::net::CONNECTION_DRAIN_GRACE).await;
 }
 
 /// Example DNS syslog records for testing
@@ -1137,6 +1345,14 @@ pub mod examples {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shutdown receiver that never fires (its sender is leaked, not dropped).
+    fn never_shutdown() -> tokio::sync::watch::Receiver<bool> {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        std::mem::forget(tx);
+        rx
+    }
+
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
@@ -2073,6 +2289,7 @@ mod tests {
             handler,
             Duration::from_secs(5),
             Vec::new(),
+            never_shutdown(),
         )
         .await
         .unwrap();
@@ -2325,5 +2542,313 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// Open a TCP pair and run one `handle_tcp_connection` server task on it.
+    async fn shutdown_conn_setup() -> (
+        tokio::net::TcpStream,
+        tokio::task::JoinHandle<()>,
+        tokio::sync::watch::Sender<bool>,
+        Arc<CapturingHandler>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, src) = listener.accept().await.unwrap();
+        let handler = CapturingHandler::new();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let h: Arc<dyn SyslogHandler> = handler.clone();
+        let task = tokio::spawn(async move {
+            SyslogListener::handle_tcp_connection(
+                stream,
+                src,
+                h,
+                Duration::from_secs(60),
+                Vec::new(),
+                rx,
+            )
+            .await
+            .unwrap();
+        });
+        (client, task, tx, handler)
+    }
+
+    /// An idle-but-open connection holding one complete line plus half a line: on
+    /// shutdown the task ends promptly, the complete line was dispatched, and the
+    /// partial line is counted as dropped.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn test_connection_task_exits_on_shutdown() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::{CompositeKey, MetricKind};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let (mut client, task, tx, handler) = shutdown_conn_setup().await;
+        client
+            .write_all(b"<134>Jan 15 10:30:45 host app: test message\n")
+            .await
+            .unwrap();
+        client.write_all(b"<134>Jan 15 10:30:4").await.unwrap();
+        client.flush().await.unwrap();
+        // Let the task read both writes, then stay idle (connection open).
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "connection task must still be idle-open"
+        );
+
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("connection task must end within 1 s of shutdown")
+            .unwrap();
+
+        assert_eq!(
+            handler.take_messages().len(),
+            1,
+            "the complete line must be dispatched"
+        );
+        let map = snapshotter.snapshot().into_hashmap();
+        let partial = map
+            .get(&CompositeKey::new(
+                MetricKind::Counter,
+                metrics::Key::from_name("syslog_partial_lines_dropped_at_shutdown"),
+            ))
+            .map(|(_, _, v)| match v {
+                DebugValue::Counter(c) => *c,
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert_eq!(partial, 1, "the half line must be counted as dropped");
+        drop(client);
+    }
+
+    /// A dropped shutdown sender means shutdown (it must not spin or hang the task).
+    #[tokio::test]
+    async fn test_connection_task_exits_when_shutdown_sender_dropped() {
+        let (mut client, task, tx, handler) = shutdown_conn_setup().await;
+        client
+            .write_all(b"<134>Jan 15 10:30:45 host app: test message\n")
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("connection task must end within 1 s of the sender dropping")
+            .unwrap();
+        assert_eq!(handler.take_messages().len(), 1);
+        drop(client);
+    }
+
+    /// Lines already queued when shutdown fires are still dispatched, not discarded.
+    #[tokio::test]
+    async fn test_connection_task_dispatches_queued_lines_on_shutdown() {
+        let (mut client, task, tx, handler) = shutdown_conn_setup().await;
+        let mut payload = Vec::new();
+        for _ in 0..5 {
+            payload.extend_from_slice(b"<134>Jan 15 10:30:45 host app: test message\n");
+        }
+        client.write_all(&payload).await.unwrap();
+        client.flush().await.unwrap();
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("connection task must end within 1 s of shutdown")
+            .unwrap();
+        assert_eq!(handler.take_messages().len(), 5);
+        drop(client);
+    }
+
+    /// A dropped shutdown sender means shutdown, in every receive-loop shape
+    /// (single/fan-out sockets, single/batched receive). It used to busy-loop.
+    #[tokio::test]
+    async fn test_syslog_exits_when_shutdown_sender_dropped() {
+        for (recv_tasks, recv_batch_size) in [(1, 1), (1, 4), (2, 1), (2, 4)] {
+            let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let udp_port = tmp.local_addr().unwrap().port();
+            drop(tmp);
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let tcp_port = tcp.local_addr().unwrap().port();
+            drop(tcp);
+            let config = SyslogListenerConfig {
+                udp_port,
+                tcp_port,
+                bind_address: "127.0.0.1".to_string(),
+                recv_tasks,
+                recv_batch_size,
+                ..SyslogListenerConfig::default()
+            };
+            let handler: Arc<dyn SyslogHandler> =
+                Arc::new(DefaultSyslogHandler::new(false, false, None));
+            let listener = SyslogListener::new(config, handler);
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let task = tokio::spawn(async move {
+                listener.start_with_shutdown(rx).await.ok();
+            });
+            sleep(Duration::from_millis(100)).await;
+            drop(tx);
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("recv_tasks={recv_tasks} batch={recv_batch_size}: no exit")
+                })
+                .unwrap();
+        }
+    }
+
+    /// Send `payload`, close the write side, wait for the connection task to end (it must,
+    /// on EOF), and return what it dispatched.
+    async fn run_frames(payload: &[u8]) -> Vec<SyslogMessage> {
+        let (mut client, task, _tx, handler) = shutdown_conn_setup().await;
+        client.write_all(payload).await.unwrap();
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("connection task must end on EOF")
+            .unwrap();
+        handler.take_messages()
+    }
+
+    fn octet_frame(body: &str) -> Vec<u8> {
+        format!("{} {}", body.len(), body).into_bytes()
+    }
+
+    #[tokio::test]
+    async fn test_octet_counted_frame_with_embedded_newline() {
+        let body = "<134>Jan 15 10:30:45 host app: first\nsecond line";
+        let msgs = run_frames(&octet_frame(body)).await;
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            msgs[0].message.contains("first\nsecond line"),
+            "embedded newline must be preserved: {:?}",
+            msgs[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_octet_counted_then_newline_frame_same_conn() {
+        let mut payload = octet_frame("<134>Jan 15 10:30:45 host app: counted");
+        payload.extend_from_slice(b"<134>Jan 15 10:30:46 host app: lined\n");
+        payload.extend(octet_frame("<134>Jan 15 10:30:47 host app: counted again"));
+        let msgs = run_frames(&payload).await;
+        let texts: Vec<_> = msgs.iter().map(|m| m.message.as_str()).collect();
+        assert_eq!(texts, ["counted", "lined", "counted again"]);
+    }
+
+    #[tokio::test]
+    async fn test_octet_count_over_limit_closes() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let payload = format!(
+            "{} <134>Jan 15 10:30:45 host app: x\n",
+            SYSLOG_MAX_LINE_BYTES + 1
+        );
+        let valid = "<134>Jan 15 10:30:45 host app: after\n";
+        let msgs = run_frames(format!("{payload}{valid}").as_bytes()).await;
+        assert!(msgs.is_empty(), "connection must close, nothing dispatched");
+        let oversized = snapshotter
+            .snapshot()
+            .into_vec()
+            .iter()
+            .any(|(k, _, _, _)| k.key().name() == "syslog_oversized_lines");
+        assert!(oversized, "syslog_oversized_lines must be counted");
+    }
+
+    /// A line that merely starts with digits is newline-framed, not an octet count: only
+    /// `DIGITS SP '<'` is a length prefix.
+    #[tokio::test]
+    async fn test_digit_leading_newline_lines_stay_newline_framed() {
+        for lead in [
+            "2026-10-16 12:00 host app: dated",
+            "12 apples and a very long tail",
+        ] {
+            let payload = format!("{lead}\n<134>Jan 15 10:30:45 host app: after\n");
+            let msgs = run_frames(payload.as_bytes()).await;
+            // The lead line may or may not parse as syslog; it must never absorb the next.
+            let texts: Vec<_> = msgs.iter().map(|m| m.message.as_str()).collect();
+            assert!(
+                texts == ["after"] || (texts.len() == 2 && texts[1] == "after"),
+                "lead {lead:?} produced {texts:?}"
+            );
+        }
+    }
+
+    /// A newline that is itself the byte deciding "not octet-counted" ends its line; the
+    /// next line must not be merged into it.
+    #[tokio::test]
+    async fn test_newline_deciding_byte_does_not_merge_lines() {
+        for lead in ["12", "5 "] {
+            let payload = format!("{lead}\n<134>Jan 15 10:30:45 host app: after\n");
+            let (mut client, task, _tx, handler) = shutdown_conn_setup().await;
+            client.write_all(payload.as_bytes()).await.unwrap();
+            client.shutdown().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            let msgs = handler.take_messages();
+            assert!(
+                msgs.last().is_some_and(|m| m.message == "after"),
+                "lead {lead:?}: next line merged: {:?}",
+                msgs.iter().map(|m| &m.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_frame_prefix_requires_digits_space_pri() {
+        use FrameMode::*;
+        assert_eq!(classify_frame_prefix(b""), None);
+        assert_eq!(classify_frame_prefix(b"57"), None);
+        assert_eq!(classify_frame_prefix(b"57 "), None);
+        assert_eq!(classify_frame_prefix(b"57 <"), Some(Octets(57)));
+        assert_eq!(classify_frame_prefix(b"2026-10-16 12:00"), Some(Newline));
+        assert_eq!(classify_frame_prefix(b"12 apples"), Some(Newline));
+        assert_eq!(classify_frame_prefix(b"12x"), Some(Newline));
+        assert_eq!(classify_frame_prefix(b"0 <1>"), Some(Newline));
+        assert_eq!(classify_frame_prefix(b"<34>1"), Some(Newline));
+        assert_eq!(classify_frame_prefix(b"12345678 <"), Some(Newline));
+        assert_eq!(classify_frame_prefix(b"1234567 <"), Some(Octets(1234567)));
+    }
+
+    /// An octet frame cut short by shutdown is counted as a partial line.
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn test_partial_octet_frame_counted_at_shutdown() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let (mut client, task, tx, handler) = shutdown_conn_setup().await;
+        client
+            .write_all(b"100 <134>Jan 15 10:30:45 host app: cut")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("task must end within 1 s of shutdown")
+            .unwrap();
+        assert!(handler.take_messages().is_empty());
+        let counted = snapshotter
+            .snapshot()
+            .into_vec()
+            .iter()
+            .any(|(k, _, _, _)| k.key().name() == "syslog_partial_lines_dropped_at_shutdown");
+        assert!(counted, "partial octet frame must be counted");
+        drop(client);
     }
 }

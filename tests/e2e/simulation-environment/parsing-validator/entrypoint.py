@@ -114,7 +114,11 @@ def wait_for_parquet_files() -> List[str]:
             resp = client.list_objects_v2(Bucket=BUCKET)
             contents = resp.get("Contents", [])
             parquet_files = [
-                obj["Key"] for obj in contents if obj["Key"].endswith(".parquet")
+                obj["Key"]
+                for obj in contents
+                # Only WEF objects (event_type=<id>/...) carry the event_data schema;
+                # the bucket also holds syslog/ and other sinks' Parquet.
+                if obj["Key"].endswith(".parquet") and obj["Key"].startswith("event_type=")
             ]
 
             if parquet_files:

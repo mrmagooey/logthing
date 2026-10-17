@@ -17,8 +17,16 @@ bind_address = "0.0.0.0"
 **Template Model**:
 Each exporter maintains a stateful template cache keyed on `(exporter IP, observation domain ID, template ID)`. Data records are decoded only once the matching template has been received; data sets referencing an uncached template are silently skipped (counter `ipfix_templates_missing` is incremented). The cache is bounded at 100,000 entries to guard against template floods from spoofed UDP sources.
 
+Template withdrawals (RFC 7011 §8.1) are honoured: a template record with zero fields removes that template, and template ID 2 (in a Template Set) or 3 (in an Options Template Set) with zero fields removes all templates or all options templates for that exporter and observation domain. Withdrawals are accepted from any source address (UDP, so spoofable), the same trust model as templates.
+
+**Options data**: data sets described by an Options Template carry exporter metadata (scope and option values), not flows, so they produce no rows. They are counted in `ipfix_options_records_skipped`.
+
+**Partial datagrams**: if a later set in a datagram is malformed, the flow records already decoded from earlier sets are kept and the error is counted in `ipfix_decode_errors`. A datagram with a malformed set before any record decoded is dropped whole.
+
+**Per-message cap**: at most 8192 flow records are decoded from one message; the rest are dropped and `ipfix_records_capped` is incremented once per capped message. The rest of a capped message is skipped, including any template sets after the cap point; those templates are learned from the exporter's next re-send.
+
 **Information Elements**:
-A curated set of IANA IEs (source/destination address/port, protocol, byte/packet counts, flow start/end, TCP flags, interfaces, etc.) is mapped directly to `FlowRecord` fields. Unknown or enterprise IEs are hex-encoded and stored in the `extra` JSON column.
+A curated set of IANA IEs (source/destination address/port, protocol, byte/packet counts, flow start/end, TCP flags, interfaces, etc.) is mapped directly to `FlowRecord` fields. Unknown or enterprise IEs are hex-encoded and stored in the `extra` JSON column. The post-NAT elements (`postNATSourceIPv4Address`, `postNATDestinationIPv4Address`, `postNAPTSourceTransportPort`, `postNAPTDestinationTransportPort`) are stored in `extra` under those names and never overwrite the original `src_addr`/`dst_addr`/`src_port`/`dst_port`. Unsigned elements sent wider than their usual width (for example `tcpControlBits` as two bytes) use the low-order bytes.
 
 ## IPFIX S3 Persistence
 
@@ -101,3 +109,12 @@ max_buffer_rows       = 100000      # default 100 000
 ```
 
 Without `[sflow.s3]`/`[sflow.local]` each datagram is decoded and logged only; nothing is persisted.
+
+Decoding notes: ports are left empty for IPv4 non-first fragments and IPv6 fragments with a
+non-zero offset. For IPv6, hop-by-hop, routing, fragment, authentication and destination-options
+headers (up to 8) are skipped, and `ip_protocol` is the final upper-layer protocol (on a truncated
+or over-long chain, the last extension-header number reached). A flow sample
+(compact or expanded) whose interface is a discard or "multiple interfaces" marker gets a null
+`input_ifindex`/`output_ifindex`. A generic_if_counters record shorter than 88 bytes is skipped
+(`sflow_counter_records_skipped`) without losing the other records in the sample. Unrecognised
+standard counter records in `extra` carry no `enterprise` key.

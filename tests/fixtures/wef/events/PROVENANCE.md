@@ -76,3 +76,6 @@ Command per file: `evtx_dump -o xml <sample>` then first `<Event>` with the want
 
 `evtx_dump` prints "Invalid EVTX chunk header magic" warnings on stderr for some samples
 (trailing garbage chunks); the script shows stderr only if `evtx_dump` exits non-zero.
+
+`security_4689_hex_pid.xml` is hand-written (derived from `security_4688.xml`): a 4689
+process-exit event with a hex `ProcessId` (`0x1a4` = 420) and an XML-escaped `ProcessName`.

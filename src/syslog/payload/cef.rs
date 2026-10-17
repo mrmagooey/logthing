@@ -131,19 +131,22 @@ fn parse_extensions(ext: &str) -> HashMap<String, String> {
             break;
         }
         let key_start = i;
-        // Read key characters: alpha, digit, underscore.
-        while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        // Read key characters: `[A-Za-z0-9_.\[\]-]`.
+        while i < len
+            && (bytes[i].is_ascii_alphanumeric()
+                || matches!(bytes[i], b'_' | b'.' | b'[' | b']' | b'-'))
+        {
             i += 1;
         }
         let key_end = i;
         if key_end > key_start && i < len && bytes[i] == b'=' {
             key_spans.push((key_start, i)); // i points at '='
             i += 1; // skip '='
-        } else {
-            // Not a valid key=; skip to next space.
-            while i < len && bytes[i] != b' ' {
-                i += 1;
-            }
+        }
+        // A key is only recognised at the start of the extension or right after a
+        // space, so skip the rest of this token (an `=` inside a value is data).
+        while i < len && bytes[i] != b' ' {
+            i += 1;
         }
     }
 
@@ -290,5 +293,65 @@ mod tests {
         let no_ext = "CEF:0|Vendor|Product|1.0|100|Login|5|";
         let rec = try_parse(&msg(no_ext)).expect("must parse");
         assert!(rec.extensions.is_empty());
+    }
+
+    #[test]
+    fn test_extension_value_containing_equals_is_not_split() {
+        let line = "CEF:0|V|P|1|100|N|5|msg=a=b src=1.2.3.4";
+        let rec = try_parse(&msg(line)).expect("must parse");
+        assert_eq!(rec.extensions.get("msg").map(String::as_str), Some("a=b"));
+        assert_eq!(
+            rec.extensions.get("src").map(String::as_str),
+            Some("1.2.3.4")
+        );
+        assert!(!rec.extensions.contains_key("a"));
+    }
+
+    #[test]
+    fn test_extension_keys_may_contain_dot_bracket_and_hyphen() {
+        let line = "CEF:0|V|P|1|100|N|5|x.y[0]-z=v1 src=1.2.3.4";
+        let rec = try_parse(&msg(line)).expect("must parse");
+        assert_eq!(
+            rec.extensions.get("x.y[0]-z").map(String::as_str),
+            Some("v1")
+        );
+        assert_eq!(
+            rec.extensions.get("src").map(String::as_str),
+            Some("1.2.3.4")
+        );
+    }
+
+    #[test]
+    fn test_extension_value_with_spaces_is_kept_whole() {
+        let rec =
+            try_parse(&msg("CEF:0|V|P|1|100|N|5|msg=hello world src=1.2.3.4")).expect("must parse");
+        assert_eq!(
+            rec.extensions.get("msg").map(String::as_str),
+            Some("hello world")
+        );
+        assert_eq!(
+            rec.extensions.get("src").map(String::as_str),
+            Some("1.2.3.4")
+        );
+    }
+
+    #[test]
+    fn test_extension_escaped_equals_and_backslash_unescape() {
+        let rec = try_parse(&msg(
+            r"CEF:0|V|P|1|100|N|5|cs1=foo\=bar fname=C:\\x src=1.2.3.4",
+        ))
+        .expect("must parse");
+        assert_eq!(
+            rec.extensions.get("cs1").map(String::as_str),
+            Some("foo=bar")
+        );
+        assert_eq!(
+            rec.extensions.get("fname").map(String::as_str),
+            Some(r"C:\x")
+        );
+        assert_eq!(
+            rec.extensions.get("src").map(String::as_str),
+            Some("1.2.3.4")
+        );
     }
 }

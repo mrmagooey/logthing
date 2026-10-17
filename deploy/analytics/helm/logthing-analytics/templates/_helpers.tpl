@@ -155,3 +155,17 @@ is a public demo literal shipped by the pre-B1 chart. Space-separated, empty whe
 {{- end -}}
 {{- join " " (sortAlpha $bad) -}}
 {{- end -}}
+
+{{/*
+Whether the generated Trino TLS Secret may be reused: prints "true" only when its
+logthing.io/not-after annotation (RFC3339 UTC) is present, parses, and lies more than 30 days
+after "now". Input: dict "annotations" <Secret annotations or nil> "now" <time>. A Secret without
+the annotation (written by an older chart) is therefore regenerated once.
+*/}}
+{{- define "la.tlsReusable" -}}
+{{- $a := .annotations | default dict -}}
+{{- if hasKey $a "logthing.io/not-after" -}}
+{{- $exp := toDate "2006-01-02T15:04:05Z07:00" (get $a "logthing.io/not-after") -}}
+{{- if gt (sub $exp.Unix .now.Unix) 2592000 -}}true{{- end -}}
+{{- end -}}
+{{- end -}}

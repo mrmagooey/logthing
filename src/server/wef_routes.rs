@@ -280,7 +280,15 @@ async fn delivery(
             if req.message_id.is_none() {
                 return status(StatusCode::BAD_REQUEST);
             }
-            ingest(state, addr, sub, req, key).await;
+            if !ingest(state, addr, sub, req, key).await {
+                // A sink refused part of the batch: the bookmark stays put and the client
+                // re-sends from it.
+                return Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header(header::RETRY_AFTER, "1")
+                    .body(Body::empty())
+                    .expect("static response");
+            }
             ack(req)
         }
         WefAction::SubscriptionEnd | WefAction::End => empty_ok(),
@@ -294,7 +302,7 @@ async fn ingest(
     sub: &Subscription,
     req: &SoapRequest,
     key: Option<&str>,
-) {
+) -> bool {
     let events = event::extract_events(&req.events, &addr.ip().to_string(), &sub.cfg.name);
     debug!(
         "WEF: {} events from {} for subscription {}",
@@ -302,7 +310,17 @@ async fn ingest(
         crate::sanitize_for_log(req.machine_id.as_deref().unwrap_or("-"), 128),
         crate::sanitize_for_log(&sub.cfg.name, 128)
     );
-    process_events(state, events).await;
+    let outcome = process_events(state, events).await;
+    if outcome.dropped > 0 {
+        // debug, not warn: this fires once per retried request during an outage; the per-sink
+        // drop in `process_single_event` already logs through the throttled `drop_log_due`.
+        debug!(
+            dropped = outcome.dropped,
+            accepted = outcome.accepted,
+            "WEF batch not fully handed to the sinks; bookmark kept, answering 503"
+        );
+        return false;
+    }
     if let (Some(bookmark), Some(k)) = (&req.bookmark, key)
         && !state.bookmarks.put(k, sub.cfg.uuid, bookmark.clone())
     {
@@ -311,6 +329,7 @@ async fn ingest(
             crate::sanitize_for_log(req.machine_id.as_deref().unwrap_or("-"), 128)
         );
     }
+    true
 }
 
 fn ack(req: &SoapRequest) -> Response {
@@ -577,6 +596,50 @@ mod tests {
             ),
             "{s}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_events_with_sink_drop_returns_503_and_keeps_old_bookmark() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let handle = ParquetWriterHandle::for_test(tx, "wef", "s3");
+        let state = state_with(true, Some(handle));
+        let uuid: Uuid = SUB_UUID.parse().unwrap();
+        let key = "machine:win10.example.com";
+        assert!(state.bookmarks.put(
+            key,
+            uuid,
+            "<BookmarkList><Bookmark Channel=\"Security\" RecordId=\"7\"/></BookmarkList>".into()
+        ));
+        let app = app(&state);
+        // Two events into a capacity-1 channel: the second is dropped.
+        let (st, headers, _) = post(&app, &delivery_path(), &[], utf16(EVENTS)).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            headers
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "a 503 must tell the client when to retry"
+        );
+        let kept = state.bookmarks.get(key, uuid).unwrap();
+        assert!(kept.contains("RecordId=\"7\""), "{kept}");
+    }
+
+    #[tokio::test]
+    async fn test_events_parse_failure_still_advances_bookmark() {
+        let state = state_with(true, None);
+        let app = app(&state);
+        let broken = EVENTS.replacen("<![CDATA[<Event ", "<![CDATA[<Nope ", 1);
+        assert_ne!(
+            broken, EVENTS,
+            "fixture drifted; the replacement did not apply"
+        );
+        let (st, _, body) = post(&app, &delivery_path(), &[], utf16(&broken)).await;
+        assert_eq!(st, StatusCode::OK, "{}", text(&body));
+        assert_eq!(ingested_total(&state).await, 1);
+        let uuid: Uuid = SUB_UUID.parse().unwrap();
+        let stored = state.bookmarks.get("machine:win10.example.com", uuid);
+        assert!(stored.unwrap().contains("RecordId=\"1042\""));
     }
 
     #[tokio::test]
@@ -863,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn test_delivery_events_dropped_when_sink_full_still_acks_and_counts() {
+    fn test_delivery_events_dropped_when_sink_full_returns_503_and_counts() {
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snap = recorder.snapshotter();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -875,11 +938,11 @@ mod tests {
                 let handle = ParquetWriterHandle::for_test(tx, "wef", "s3");
                 let app = app(&state_with(true, Some(handle)));
                 let (st, _, body) = post(&app, &delivery_path(), &[], utf16(EVENTS)).await;
-                assert!(text(&body).contains(soap::ACTION_ACK));
+                assert!(!text(&body).contains(soap::ACTION_ACK));
                 st
             })
         });
-        assert_eq!(st, StatusCode::OK);
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
         assert!(rx.try_recv().is_ok());
         let dropped = counter(snap, "parquet_s3_dropped");
         assert!(

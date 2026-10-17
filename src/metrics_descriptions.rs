@@ -50,6 +50,11 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     ),
     (
         Kind::Counter,
+        "syslog_partial_lines_dropped_at_shutdown",
+        "Syslog TCP connections that still held an unterminated line when shutdown ended them; the partial line is dropped.",
+    ),
+    (
+        Kind::Counter,
         "syslog_recv_task_failed",
         "Syslog UDP receive tasks that exited with an error.",
     ),
@@ -109,7 +114,22 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
         "ipfix_templates_evicted",
         "IPFIX templates evicted from the cache after going unused past their TTL.",
     ),
+    (
+        Kind::Counter,
+        "ipfix_options_records_skipped",
+        "Options-template data records skipped (exporter metadata, not flows); a variable-length options data set counts once.",
+    ),
+    (
+        Kind::Counter,
+        "ipfix_records_capped",
+        "IPFIX/NetFlow v9 messages whose flow records beyond the per-message cap (8192) were not decoded; counted once per message.",
+    ),
     // ── sflow ─────────────────────────────────────────────────────────────
+    (
+        Kind::Counter,
+        "sflow_counter_records_skipped",
+        "sFlow generic_if_counters records skipped because they were shorter than 88 bytes.",
+    ),
     (
         Kind::Counter,
         "sflow_datagrams_received",
@@ -158,6 +178,11 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     ),
     (
         Kind::Counter,
+        "zeek_partial_lines_dropped_at_shutdown",
+        "Zeek TCP connections that still held an unterminated line when shutdown ended them; the partial line is dropped.",
+    ),
+    (
+        Kind::Counter,
         "zeek_tcp_budget_exhausted",
         "Zeek TCP connections closed because the aggregate line-buffer memory budget was exhausted.",
     ),
@@ -196,6 +221,11 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
         Kind::Counter,
         "suricata_oversized_lines",
         "Suricata TCP lines that exceeded the maximum line length; the connection is closed.",
+    ),
+    (
+        Kind::Counter,
+        "suricata_partial_lines_dropped_at_shutdown",
+        "Suricata TCP connections that still held an unterminated line when shutdown ended them; the partial line is dropped.",
     ),
     (
         Kind::Counter,
@@ -248,6 +278,14 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
             "OTLP records not enqueued: one per failed per-sink send (full or closed; with two ",
             "sinks one record can count twice) plus records never offered after the first full ",
             "channel (request answered 503)."
+        ),
+    ),
+    (
+        Kind::Counter,
+        "otlp_requests_rejected_too_large",
+        concat!(
+            "OTLP requests answered 413 because they held too many log records or would expand ",
+            "beyond the per-request mapped-size cap."
         ),
     ),
     (
@@ -357,6 +395,11 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     ),
     (
         Kind::Counter,
+        "parquet_s3_flush_panics",
+        "Buffer flush tasks that panicked; their rows were restored and retried.",
+    ),
+    (
+        Kind::Counter,
         "iceberg_descriptor_uploads",
         "Iceberg descriptor objects uploaded alongside a Parquet object.",
     ),
@@ -419,6 +462,12 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
          reason (missing|bad_scheme|bad_token|gss_error|missing_flags|decrypt_error|\
          h2_encrypted|missing_identity).",
     ),
+    (
+        Kind::Counter,
+        "wef_plaintext_on_kerberos_rejected",
+        "Non-empty, non-encrypted /wsman/** bodies refused (400) on a connection whose Kerberos \
+         context is complete. Such bodies are a protocol downgrade; legitimate clients encrypt.",
+    ),
     // ── spool ─────────────────────────────────────────────────────────────
     (
         Kind::Gauge,
@@ -451,6 +500,12 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
         "spool_upload_errors",
         "Failed background uploads of spool entries, labelled by sink; the entry stays and is \
          retried with exponential backoff.",
+    ),
+    (
+        Kind::Counter,
+        "spool_descriptor_sink_missing",
+        "Spool upload attempts blocked because the entry carries an Iceberg descriptor but no \
+         descriptor sink is configured, labelled by sink; the entry is kept and retried.",
     ),
     (
         Kind::Counter,

@@ -1265,3 +1265,97 @@ fn test_supported_events_list() {
         "Should not have parser for undefined event"
     );
 }
+
+// ---------------------------------------------------------------------------
+// hex integers, XML entities, single-quoted names, tags with attributes
+// ---------------------------------------------------------------------------
+
+const ONE_STR_FIELD: &str = "  - name: \"V\"\n    source: eventdata\n    xpath: \"Data[@Name='V']\"\n    required: true\n    type: string\n";
+
+#[test]
+fn test_integer_field_accepts_hex() {
+    let (_f, parser) = make_single_file_parser(
+        9100,
+        "Hex",
+        "Test",
+        "  - name: \"V\"\n    source: eventdata\n    xpath: \"Data[@Name='V']\"\n    required: true\n    type: integer\n",
+        None,
+        None,
+    );
+    for (raw, want) in [("0x1a4", 420), ("0X1A4", 420), ("420", 420), ("0x0", 0)] {
+        let xml = format!("<Event><EventData><Data Name=\"V\">{raw}</Data></EventData></Event>");
+        let got = parser.parse_event(9100, &xml).unwrap();
+        assert_eq!(got.fields["V"], serde_json::json!(want), "input {raw}");
+    }
+    let bad = "<Event><EventData><Data Name=\"V\">0xZZ</Data></EventData></Event>";
+    assert!(parser.parse_event(9100, bad).is_none());
+}
+
+#[test]
+fn test_event_data_entities_decoded() {
+    let (_f, parser) = make_single_file_parser(9101, "Ent", "Test", ONE_STR_FIELD, None, None);
+    let cases = [
+        ("AT&amp;T", "AT&T"),
+        ("&#x41;&lt;b&gt;", "A<b>"),
+        ("bad &bogus; entity", "bad &bogus; entity"),
+    ];
+    for (raw, want) in cases {
+        let xml = format!("<Event><EventData><Data Name=\"V\">{raw}</Data></EventData></Event>");
+        let got = parser.parse_event(9101, &xml).unwrap();
+        assert_eq!(got.fields["V"], serde_json::json!(want), "input {raw}");
+    }
+}
+
+#[test]
+fn test_event_data_single_quoted_name() {
+    let (_f, parser) = make_single_file_parser(9102, "SQ", "Test", ONE_STR_FIELD, None, None);
+    let xml = "<Event><EventData><Data Name='V'>x</Data></EventData></Event>";
+    let got = parser.parse_event(9102, xml).unwrap();
+    assert_eq!(got.fields["V"], serde_json::json!("x"));
+    let empty = "<Event><EventData><Data Name='V'/></EventData></Event>";
+    assert_eq!(
+        parser.parse_event(9102, empty).unwrap().fields["V"],
+        serde_json::json!("")
+    );
+}
+
+#[test]
+fn test_system_tag_with_attributes() {
+    let (_f, parser) = make_single_file_parser(
+        9103,
+        "Sys",
+        "Test",
+        "  - name: \"EventID\"\n    source: system\n    xpath: \"EventID\"\n    required: true\n    type: integer\n  - name: \"Computer\"\n    source: system\n    xpath: \"Computer\"\n    required: true\n    type: string\n",
+        None,
+        None,
+    );
+    let xml = "<Event><System><EventIDX>1</EventIDX><EventID Qualifiers=\"16384\">7045</EventID>\
+               <Computer>a&amp;b</Computer></System></Event>";
+    let got = parser.parse_event(9103, xml).unwrap();
+    assert_eq!(got.fields["EventID"], serde_json::json!(7045));
+    assert_eq!(got.fields["Computer"], serde_json::json!("a&b"));
+}
+
+#[test]
+fn test_shipped_4689_parser_accepts_hex_pid() {
+    let parser = GenericEventParser::from_file(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/event_parsers"),
+    )
+    .unwrap();
+    let xml = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/wef/events/security_4689_hex_pid.xml"),
+    )
+    .unwrap();
+    let got = parser.parse_event(4689, &xml).expect("4689 must parse");
+    assert_eq!(got.fields["ProcessId"], serde_json::json!(420));
+    assert_eq!(
+        got.fields["ProcessName"],
+        serde_json::json!("C:\\Windows\\System32\\AT&T.exe")
+    );
+    assert!(
+        got.formatted_message
+            .unwrap()
+            .contains("(PID 420) terminated")
+    );
+}

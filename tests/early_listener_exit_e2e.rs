@@ -18,6 +18,8 @@
 //! not the test — or CI — runs as root), the syslog listener task returns
 //! early, and the H-3 arm fires.
 
+mod common;
+
 use std::fs::File;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, Stdio};
@@ -98,7 +100,7 @@ tcp_port = {syslog_tcp_port}
     // reachable, so there is nothing to poll for readiness on. That failure
     // makes the syslog listener task return early, the H-3 supervision arm
     // in `main.rs` fires, and the graceful-shutdown sequence begins on its
-    // own — no signal needed. The process should exit cleanly rather than
+    // own — no signal needed. The process should exit non-zero rather than
     // panicking.
     let exit_deadline = Instant::now() + EXIT_TIMEOUT;
     let exit_status = loop {
@@ -144,8 +146,36 @@ tcp_port = {syslog_tcp_port}
         "child was terminated by signal {:?} instead of shutting down on its own",
         exit_status.signal()
     );
-    assert!(
-        exit_status.success(),
-        "child exited uncleanly: {exit_status:?}\nstderr:\n{stderr}"
+    // The listener failure is a startup/runtime fault: the shutdown sequence runs, then the
+    // process must exit non-zero (via `Err`, i.e. status 1, not a panic's 101) so a
+    // supervisor restarts it instead of treating it as a clean stop.
+    assert_eq!(
+        exit_status.code(),
+        Some(1),
+        "listener failure must exit with status 1: {exit_status:?}\nstderr:\n{stderr}"
     );
+    assert!(
+        stderr.contains("listener exited unexpectedly"),
+        "stderr must name the failure:\n{stderr}"
+    );
+}
+
+/// The HTTP server failing on its own (here: its port is already held) is a fault too: the
+/// shutdown sequence runs and the process exits with status 1, not 0 and not via a hard exit.
+#[tokio::test]
+async fn http_server_failure_exits_nonzero_after_graceful_shutdown() {
+    let held = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = held.local_addr().unwrap().port();
+    let toml = format!(
+        "bind_address = \"127.0.0.1:{port}\"\n[tls]\nenabled = false\n\
+         [syslog]\nenabled = false\n[metrics]\nenabled = false\n"
+    );
+    let bin = env!("CARGO_BIN_EXE_logthing").to_string();
+    let (status, stderr) =
+        tokio::task::spawn_blocking(move || common::run_to_exit(&bin, &toml, &[]))
+            .await
+            .unwrap();
+    drop(held);
+    assert_eq!(status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(stderr.contains("HTTP server failed"), "stderr:\n{stderr}");
 }

@@ -630,3 +630,86 @@ def test_otlp_files_for_different_services_share_one_table(cfg, s3, catalog, pa_
     assert commit.run(cfg, s3, catalog, pa_fs) == 0
     assert catalog.list_tables("logs") == [("logs", "otlp")]
     assert catalog.load_table(("logs", "otlp")).scan().to_arrow().num_rows == 2
+
+
+# ---------------------------------------------------------------------------
+# New non-nullable columns + relocation failures
+# ---------------------------------------------------------------------------
+
+
+def test_new_non_nullable_column_evolves_table_instead_of_quarantining(cfg, s3, catalog, pa_fs):
+    ts = pa.scalar(0, PARTITION_TIME).as_py()
+
+    def put_file(key, fields, columns):
+        schema = pa.schema(fields)
+        buf = io.BytesIO()
+        pq.write_table(pa.table(columns, schema=schema), buf)
+        s3.put_object(Bucket=cfg.bucket, Key=key, Body=buf.getvalue())
+
+    # Table created from the exact legacy HEC shape, REQUIRED columns included (as logthing
+    # writes them); the follow-up file must carry all of them plus the new non-nullable one.
+    legacy_fields = [
+        pa.field("sourcetype", pa.string(), nullable=False),
+        pa.field("host", pa.string(), nullable=True),
+        pa.field("time", PARTITION_TIME, nullable=True),
+        pa.field("received_at", PARTITION_TIME, nullable=False),
+        pa.field("fields", pa.string(), nullable=False),
+        pa.field("partition_time", PARTITION_TIME, nullable=False),
+    ]
+    base = {
+        "sourcetype": ["legacy"],
+        "host": pa.array([None], pa.string()),
+        "time": pa.array([None], PARTITION_TIME),
+        "received_at": pa.array([ts], PARTITION_TIME),
+        "fields": ["{}"],
+        "partition_time": pa.array([ts], PARTITION_TIME),
+    }
+    old_key = "hec/legacy/year=2026/month=01/day=01/old.parquet"
+    put_file(old_key, legacy_fields, base)
+    put_descriptor(s3, cfg, "old.json", source="hec", data_key=old_key, record_count=1)
+    assert commit.run(cfg, s3, catalog, pa_fs) == 0
+
+    new_key = "hec/app/year=2026/month=01/day=02/new.parquet"
+    put_file(
+        new_key,
+        legacy_fields + [pa.field("event_uuid", pa.string(), nullable=False)],
+        {**base, "sourcetype": ["fresh"], "event_uuid": ["u-1"]},
+    )
+    put_descriptor(s3, cfg, "new.json", source="hec", data_key=new_key, record_count=1)
+
+    assert commit.run(cfg, s3, catalog, pa_fs) == 0
+
+    tbl = catalog.load_table(("logs", "hec"))
+    assert tbl.schema().find_field("event_uuid").required is False
+    assert tbl.schema().find_field("received_at").required is True
+    assert list_keys(s3, cfg, cfg.quarantine_prefix) == []
+    assert tbl.scan().to_arrow().num_rows == 2
+
+
+def test_relocation_failure_after_commit_leaves_descriptor_and_rerun_dedupes(
+    cfg, s3, catalog, pa_fs, monkeypatch
+):
+    key = "syslog/day=2026-01-01/a.parquet"
+    write_parquet(s3, cfg.bucket, key, {"message": ["m1"]}, "2026-01-01")
+    put_descriptor(s3, cfg, "a.json", source="syslog", data_key=key, record_count=1)
+
+    real_relocate = commit._relocate
+
+    def failing(s3_, cfg_, dkey, dest):
+        raise ClientError(
+            {"Error": {"Code": "InvalidRequest"}, "ResponseMetadata": {"HTTPStatusCode": 400}},
+            "CopyObject",
+        )
+
+    monkeypatch.setattr(commit, "_relocate", failing)
+    assert commit.run(cfg, s3, catalog, pa_fs) == 0
+    # Committed once, NOT quarantined, descriptor still queued.
+    assert catalog.load_table(("logs", "syslog")).scan().to_arrow().num_rows == 1
+    assert list_keys(s3, cfg, cfg.quarantine_prefix) == []
+    assert list_keys(s3, cfg, cfg.desc_prefix) == [cfg.desc_prefix + "a.json"]
+
+    monkeypatch.setattr(commit, "_relocate", real_relocate)
+    assert commit.run(cfg, s3, catalog, pa_fs) == 0
+    assert catalog.load_table(("logs", "syslog")).scan().to_arrow().num_rows == 1
+    assert list_keys(s3, cfg, cfg.desc_prefix) == []
+    assert list_keys(s3, cfg, cfg.done_prefix) == [cfg.done_prefix + "a.json"]

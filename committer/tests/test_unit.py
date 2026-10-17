@@ -7,7 +7,15 @@ from pathlib import Path
 
 import pyarrow as pa
 import pytest
-from botocore.exceptions import ClientError, ConnectionClosedError, EndpointConnectionError
+from botocore.exceptions import (
+    ClientError,
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    IncompleteReadError,
+    ReadTimeoutError,
+    ResponseStreamingError,
+)
 from pyiceberg.exceptions import (
     AuthorizationExpiredError,
     BadRequestError,
@@ -20,6 +28,7 @@ from pyiceberg.exceptions import (
     UnauthorizedError,
     ValidationError,
 )
+from requests.exceptions import ChunkedEncodingError
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import Timeout as RequestsTimeout
 
@@ -191,6 +200,21 @@ def test_should_abort_requests_connection_error():
 
 def test_should_abort_requests_timeout():
     assert commit.should_abort(RequestsTimeout("timed out")) is True
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ReadTimeoutError(endpoint_url="http://x"),
+        ConnectTimeoutError(endpoint_url="http://x"),
+        IncompleteReadError(actual_bytes=1, expected_bytes=2),
+        ResponseStreamingError(error="stream broke"),
+        ChunkedEncodingError("chunk"),
+    ],
+    ids=lambda e: type(e).__name__,
+)
+def test_should_abort_transient_errors(exc):
+    assert commit.should_abort(exc) is True
 
 
 @pytest.mark.parametrize("status", [500, 502, 503, 504])
@@ -558,3 +582,96 @@ def test_is_already_referenced_matches_only_that_value_error():
     )
     assert not commit._is_already_referenced(ValueError("schema mismatch"))
     assert not commit._is_already_referenced(RuntimeError("already referenced"))
+
+
+# ---------------------------------------------------------------------------
+# New non-nullable columns evolve as optional; relocation errors are isolated
+# ---------------------------------------------------------------------------
+
+
+def test_evolve_schema_new_required_column_becomes_optional(evolve_env, monkeypatch):
+    schemas, _ = evolve_env
+    schemas["s3://b/new"] = pa.schema(
+        [
+            pa.field("sourcetype", pa.string(), nullable=False),
+            pa.field("fields", pa.string(), nullable=False),
+            pa.field("event_uuid", pa.string(), nullable=False),
+        ]
+    )
+    tbl = _FakeTable(["sourcetype", "fields"])
+    seen = []
+    orig = _FakeUpdate.union_by_name
+
+    def spy(self, schema):
+        seen.append(schema)
+        orig(self, schema)
+
+    monkeypatch.setattr(_FakeUpdate, "union_by_name", spy)
+    _, fits, _, conflicted = _evolve(tbl, [("d1", "s3://b/new")])
+    assert fits == [("d1", "s3://b/new")] and conflicted == []
+    by_name = {f.name: f for f in seen[0]}
+    assert by_name["event_uuid"].nullable is True
+    assert by_name["sourcetype"].nullable is False, "existing columns keep their nullability"
+
+
+def _client_error(code, status):
+    return ClientError(
+        {"Error": {"Code": code}, "ResponseMetadata": {"HTTPStatusCode": status}}, "CopyObject"
+    )
+
+
+class _RelocS3:
+    def __init__(self, copy_error=None):
+        self.copy_error = copy_error
+        self.copies = []
+        self.deletes = []
+
+    def copy_object(self, **kw):
+        if self.copy_error is not None:
+            raise self.copy_error
+        self.copies.append(kw["Key"])
+
+    def delete_object(self, **kw):
+        self.deletes.append(kw["Key"])
+
+
+def test_mark_done_nosuchkey_is_not_fatal():
+    s3 = _RelocS3(_client_error("NoSuchKey", 404))
+    assert commit._mark_done(s3, _ucfg(), "_iceberg_descriptors/a.json") is True
+
+
+def test_mark_done_other_error_is_skipped_not_raised():
+    s3 = _RelocS3(_client_error("InvalidRequest", 400))
+    assert commit._mark_done(s3, _ucfg(), "_iceberg_descriptors/a.json") is False
+
+
+def test_mark_done_abort_class_error_raises_abort():
+    s3 = _RelocS3(_client_error("AccessDenied", 403))
+    with pytest.raises(commit._Abort):
+        commit._mark_done(s3, _ucfg(), "_iceberg_descriptors/a.json")
+
+
+class _AddFilesTable:
+    def __init__(self):
+        self.add_calls = []
+
+    def add_files(self, uris):
+        self.add_calls.append(list(uris))
+
+
+def test_copy_error_after_add_files_does_not_retry_individually(monkeypatch):
+    tbl = _AddFilesTable()
+    monkeypatch.setattr(
+        commit, "evolve_schema", lambda cat, cfg, fs, name, t, cf, batch: (t, batch, [], [])
+    )
+    s3 = _RelocS3(_client_error("InvalidRequest", 400))
+    batch = [
+        ("_iceberg_descriptors/a.json", "s3://b/a"),
+        ("_iceberg_descriptors/b.json", "s3://b/b"),
+    ]
+    counts = commit._commit_batch(
+        _ucfg(), s3, None, None, {"hec": tbl}, {"hec": set()}, "hec", batch
+    )
+    assert tbl.add_calls == [["s3://b/a", "s3://b/b"]], "no per-file retry after a good add_files"
+    assert counts.committed == 2 and counts.quarantined == 0
+    assert s3.copies == [] and s3.deletes == []

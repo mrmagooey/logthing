@@ -87,7 +87,8 @@ New logthing releases append nullable columns (for example `event_uuid`,
 committer compares every queued file's Parquet footer with the table schema
 and, for files with extra columns, runs
 `update_schema().union_by_name(...)`. Old rows read NULL for the new columns.
-Evolution is additive only: a file whose existing column changes type (or is
+Columns the table lacks are always added as optional, even when the file declares them
+non-nullable (old rows have no value for them). Evolution is otherwise additive only: a file whose existing column changes type (or is
 otherwise rejected, e.g. a required-column error or a catalog 400 on the
 schema update) is quarantined on its own. A concurrent committer changing the
 table triggers a reload, a re-dedupe against the table's registered files and
@@ -134,10 +135,11 @@ do with any of them).
   outcome — safer to not assume it failed). `BadRequestError` (400) stays
   permanent: that's a bad request for one specific table/commit, not
   something wrong with the whole run;
-- a `requests` connection/timeout error before any response arrives;
+- a `requests` connection/timeout/chunked-encoding error before any response arrives;
 - `CommitFailedException` (a commit conflict);
 - S3 connection errors (`botocore.exceptions.EndpointConnectionError` /
-  `ConnectionClosedError`), or a `ClientError` with a 5xx status, a
+  `ConnectionClosedError`, and the other botocore connection, read/connect
+  timeout, `IncompleteReadError` and `ResponseStreamingError` errors), or a `ClientError` with a 5xx status, a
   throttling error code, an HTTP 401/403, or a code that means the
   credentials/bucket themselves are wrong (`AccessDenied`,
   `InvalidAccessKeyId`, `SignatureDoesNotMatch`, `NoSuchBucket`,
@@ -158,6 +160,13 @@ next invocation.
 Within one chunk commit, a permanent failure triggers a one-file-at-a-time
 retry of that chunk, so only the actually-broken file is quarantined and the
 rest of the chunk still commits.
+
+Moving a descriptor to `DONE_PREFIX`/`QUARANTINE_PREFIX` happens after (and
+separately from) the commit. An abort-class failure there aborts the run; a
+`NoSuchKey` on the source descriptor means it was already relocated and is
+ignored; any other failure is logged and that descriptor is left queued, to be
+deduped against the table's registered files on the next run. A failed move
+never causes a committed file to be retried or quarantined.
 
 ## Configuration (environment)
 

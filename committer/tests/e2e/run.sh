@@ -166,6 +166,75 @@ PYEOF
 run_committer
 echo "committer (legacy seed pass) exited 0"
 
+echo "== [3d/8] seed a hec file carrying a NEW NON-NULLABLE column and commit it =="
+"$PYTHON" - <<'PYEOF'
+import io
+import json
+from datetime import datetime, timezone
+
+import boto3
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+client = boto3.client(
+    "s3",
+    endpoint_url="http://localhost:9000",
+    aws_access_key_id="minioadmin",
+    aws_secret_access_key="minioadmin",
+    region_name="us-east-1",
+)
+ts = pa.timestamp("us", tz="UTC")
+now = datetime.now(timezone.utc)
+# Same columns/nullability logthing writes for HEC (src/forwarding/generic_s3.rs) minus the
+# post-0.22 optional columns, plus one brand-new NON-NULLABLE column.
+schema = pa.schema(
+    [
+        pa.field("sourcetype", pa.string(), nullable=False),
+        pa.field("host", pa.string(), nullable=True),
+        pa.field("time", ts, nullable=True),
+        pa.field("received_at", ts, nullable=False),
+        pa.field("fields", pa.string(), nullable=False),
+        pa.field("partition_time", ts, nullable=False),
+        pa.field("e2e_required_col", pa.string(), nullable=False),
+    ]
+)
+table = pa.Table.from_arrays(
+    [
+        pa.array(["required"], pa.string()),
+        pa.array([None], pa.string()),
+        pa.array([None], ts),
+        pa.array([now], ts),
+        pa.array(['{"marker":"required-col-row"}'], pa.string()),
+        pa.array([now], ts),
+        pa.array(["rc-1"], pa.string()),
+    ],
+    schema=schema,
+)
+buf = io.BytesIO()
+pq.write_table(table, buf)
+key = f"hec/required/year={now:%Y}/month={now:%m}/day={now:%d}/required-seed.parquet"
+client.put_object(Bucket="logthing-data", Key=key, Body=buf.getvalue())
+desc = {
+    "source": "hec",
+    "partition": "required",
+    "file_path": f"http://localhost:9000/logthing-data/{key}",
+    "file_format": "PARQUET",
+    "record_count": 1,
+    "file_size_in_bytes": len(buf.getvalue()),
+    "storage_target": "s3",
+    "schema_version": "required",
+    "written_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "column_stats": {},
+}
+client.put_object(
+    Bucket="logthing-data",
+    Key="_iceberg_descriptors/hec/required/required-seed.json",
+    Body=json.dumps(desc).encode(),
+)
+PYEOF
+run_committer
+echo "committer (new non-nullable column pass) exited 0"
+
 echo "== [4/8] generate logthing config + start logthing =="
 cat > "$CFG_DIR/logthing.toml" <<TOML
 bind_address = "$HEALTH_ADDR"

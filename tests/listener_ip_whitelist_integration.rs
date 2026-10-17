@@ -239,3 +239,113 @@ async fn ipfix_udp_allows_source_inside_allowed_ips() {
         "127.0.0.1 must be allowed through a whitelist that includes it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Dual-stack: IPv4 peers on a `[::]` socket arrive as `::ffff:a.b.c.d`
+// ---------------------------------------------------------------------------
+
+/// True when the host can bind an IPv6 wildcard socket; otherwise prints why the test skips.
+async fn ipv6_available() -> bool {
+    match TcpListener::bind("[::]:0").await {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("SKIP: host cannot bind [::]:0 ({e}); dual-stack test not applicable");
+            false
+        }
+    }
+}
+
+#[tokio::test]
+async fn syslog_tcp_dual_stack_allows_ipv4_peer_in_ipv4_allowlist() {
+    if !ipv6_available().await {
+        return;
+    }
+    let tcp_port = ephemeral_tcp_port().await;
+    let udp_port = ephemeral_udp_port().await;
+    let config = SyslogListenerConfig {
+        udp_port,
+        tcp_port,
+        bind_address: "[::]".to_string(),
+        parse_dns_logs: false,
+        ..SyslogListenerConfig::default()
+    };
+    let handler = CapturingSyslogHandler::new();
+    let allowed = IpWhitelist::new(vec!["127.0.0.1/32".into()]).unwrap();
+    let listener = SyslogListener::new(config, handler.clone()).with_allowed_ips(allowed);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        listener.start_with_shutdown(shutdown_rx).await.ok();
+    });
+    sleep(Duration::from_millis(100)).await;
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+        .await
+        .unwrap();
+    let _ = stream
+        .write_all(b"<134>Jan 15 10:30:45 host app: dual stack\n")
+        .await;
+    drop(stream);
+    sleep(Duration::from_millis(200)).await;
+    shutdown_tx.send(true).unwrap();
+    let _ = timeout(Duration::from_secs(2), task).await;
+
+    assert_eq!(
+        handler.count(),
+        1,
+        "an IPv4 peer on a [::] socket must match an IPv4 allowlist entry"
+    );
+}
+
+#[tokio::test]
+async fn http_dual_stack_allows_ipv4_peer_in_ipv4_allowlist() {
+    use logthing::config::{Config, MetricsConfig, TlsConfig};
+    use logthing::forwarding::flush_registry::FlushIntervalRegistry;
+    use logthing::server::Server;
+    use logthing::stats::{SourceHourlyStats, ThroughputStats};
+    use tokio::sync::RwLock;
+
+    if !ipv6_available().await {
+        return;
+    }
+    let port = ephemeral_tcp_port().await;
+    let config = Config {
+        bind_address: format!("[::]:{port}").parse().unwrap(),
+        tls: TlsConfig {
+            enabled: false,
+            ..TlsConfig::default()
+        },
+        metrics: MetricsConfig {
+            enabled: false,
+            ..MetricsConfig::default()
+        },
+        ..Config::default()
+    };
+    let shared_config = Arc::new(RwLock::new(config.clone()));
+    let server = Server::new(
+        config,
+        shared_config,
+        Arc::new(ThroughputStats::new()),
+        Arc::new(SourceHourlyStats::new()),
+        FlushIntervalRegistry::new(),
+        IpWhitelist::new(vec!["127.0.0.1/32".into()]).unwrap(),
+        Vec::new(),
+    )
+    .await
+    .expect("Server::new");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(async move { server.run(shutdown_rx).await });
+
+    let url = format!("http://127.0.0.1:{port}/health");
+    let mut status = None;
+    for _ in 0..60 {
+        if let Ok(r) = reqwest::get(&url).await {
+            status = Some(r.status());
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    shutdown_tx.send(true).unwrap();
+    let _ = timeout(Duration::from_secs(5), task).await;
+
+    assert_eq!(status, Some(reqwest::StatusCode::OK));
+}

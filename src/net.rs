@@ -507,6 +507,130 @@ impl SocketDropStats {
 }
 
 // ---------------------------------------------------------------------------
+// UDP receive-error backoff
+// ---------------------------------------------------------------------------
+
+/// First pause after a UDP receive error.
+pub const RECV_ERROR_BACKOFF_MIN: Duration = Duration::from_millis(10);
+/// Upper bound of the doubling pause after consecutive UDP receive errors.
+pub const RECV_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(1);
+/// Minimum spacing between log lines for consecutive UDP receive errors.
+pub const RECV_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Pause-and-log helper for UDP receive loops.
+///
+/// A persistent receive error (a socket in an error state, ENOBUFS, ...) leaves the
+/// socket readable, so a loop that only logs re-polls the same error immediately: a
+/// 100% CPU spin with a log line per iteration. Call [`on_error`](Self::on_error) in
+/// the `Err` arm (it logs rate-limited, then sleeps a doubling 10 ms..1 s) and
+/// [`reset`](Self::reset) after a successful receive.
+#[derive(Debug)]
+pub struct RecvErrorBackoff {
+    protocol: &'static str,
+    delay: Duration,
+    last_logged: Option<std::time::Instant>,
+    suppressed: u64,
+}
+
+impl RecvErrorBackoff {
+    /// `protocol` only labels the log line (never wire-derived).
+    pub fn new(protocol: &'static str) -> Self {
+        Self {
+            protocol,
+            delay: RECV_ERROR_BACKOFF_MIN,
+            last_logged: None,
+            suppressed: 0,
+        }
+    }
+
+    /// Forget the error streak after a successful receive.
+    pub fn reset(&mut self) {
+        self.delay = RECV_ERROR_BACKOFF_MIN;
+    }
+
+    /// Return the pause for this error and double the next one (capped).
+    fn next_delay(&mut self) -> Duration {
+        let d = self.delay;
+        self.delay = (self.delay * 2).min(RECV_ERROR_BACKOFF_MAX);
+        d
+    }
+
+    /// `Some(suppressed_count)` when this error should be logged now (first error,
+    /// then at most once per [`RECV_ERROR_LOG_INTERVAL`]); `None` when suppressed.
+    fn should_log(&mut self, now: std::time::Instant) -> Option<u64> {
+        match self.last_logged {
+            Some(t) if now.duration_since(t) < RECV_ERROR_LOG_INTERVAL => {
+                self.suppressed += 1;
+                None
+            }
+            _ => {
+                self.last_logged = Some(now);
+                Some(std::mem::take(&mut self.suppressed))
+            }
+        }
+    }
+
+    /// Log a receive error (rate-limited) and sleep before the next receive attempt.
+    pub async fn on_error(&mut self, err: &io::Error) {
+        if let Some(suppressed) = self.should_log(std::time::Instant::now()) {
+            tracing::error!(
+                "{} UDP receive error: {} ({} similar errors suppressed)",
+                self.protocol,
+                err,
+                suppressed
+            );
+        }
+        tokio::time::sleep(self.next_delay()).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-connection task tracking
+// ---------------------------------------------------------------------------
+
+/// How long a listener waits for its connection tasks to finish after shutdown.
+pub const CONNECTION_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// The per-connection tasks of one TCP listener.
+///
+/// A listener that returns on shutdown while its connection tasks still run would let
+/// a caller close the downstream writers before those tasks dispatch their last
+/// buffered lines. [`drain`](Self::drain) waits (bounded) for them instead.
+#[derive(Debug, Default)]
+pub struct ConnectionTasks {
+    set: tokio::task::JoinSet<()>,
+}
+
+impl ConnectionTasks {
+    /// An empty set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Spawn one connection task, first reaping any that already finished.
+    pub fn spawn<F>(&mut self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        while self.set.try_join_next().is_some() {}
+        self.set.spawn(fut);
+    }
+
+    /// Wait up to `grace` for every connection task to finish; abort the rest.
+    pub async fn drain(&mut self, grace: Duration) {
+        let all = async { while self.set.join_next().await.is_some() {} };
+        if tokio::time::timeout(grace, all).await.is_err() {
+            warn!(
+                "{} connection task(s) still running {:?} after shutdown; aborting",
+                self.set.len(),
+                grace
+            );
+            self.set.abort_all();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TCP accept backoff
 // ---------------------------------------------------------------------------
 //
@@ -603,6 +727,36 @@ mod tests {
         assert!(!is_connection_error(&Error::from_raw_os_error(
             libc::ENFILE
         )));
+    }
+
+    #[test]
+    fn test_recv_error_backoff_doubles_and_resets() {
+        let mut b = RecvErrorBackoff::new("test");
+        let got: Vec<u64> = (0..9).map(|_| b.next_delay().as_millis() as u64).collect();
+        assert_eq!(got, vec![10, 20, 40, 80, 160, 320, 640, 1000, 1000]);
+        b.reset();
+        assert_eq!(b.next_delay(), RECV_ERROR_BACKOFF_MIN);
+    }
+
+    #[test]
+    fn test_recv_error_backoff_logs_first_then_rate_limited_with_suppressed_count() {
+        let mut b = RecvErrorBackoff::new("test");
+        let t0 = std::time::Instant::now();
+        assert_eq!(b.should_log(t0), Some(0));
+        assert_eq!(b.should_log(t0 + Duration::from_secs(1)), None);
+        assert_eq!(b.should_log(t0 + Duration::from_secs(9)), None);
+        assert_eq!(b.should_log(t0 + Duration::from_secs(10)), Some(2));
+        assert_eq!(b.should_log(t0 + Duration::from_secs(11)), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_recv_error_backoff_on_error_sleeps() {
+        let mut b = RecvErrorBackoff::new("test");
+        let err = io::Error::from_raw_os_error(libc::ENOBUFS);
+        let start = tokio::time::Instant::now();
+        b.on_error(&err).await;
+        b.on_error(&err).await;
+        assert_eq!(start.elapsed(), Duration::from_millis(30));
     }
 
     #[tokio::test(start_paused = true)]
