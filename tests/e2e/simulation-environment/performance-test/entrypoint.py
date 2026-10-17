@@ -202,10 +202,12 @@ def verify_s3_files(expected_event_type: int, min_expected_files: int = 1) -> di
 
         # List all objects in the bucket
         print(f"  [DEBUG] Listing objects in bucket '{S3_BUCKET}'...", flush=True)
-        response = s3_client.list_objects_v2(
-            Bucket=S3_BUCKET,
-            MaxKeys=1000,  # Get more files
-        )
+        # Paginate: list_objects_v2 returns at most 1000 keys per page, and the bucket can
+        # hold more (one prefix per event type after the unthrottled run).
+        contents = []
+        for page in s3_client.get_paginator("list_objects_v2").paginate(Bucket=S3_BUCKET):
+            contents.extend(page.get("Contents", []))
+        response = {"Contents": contents} if contents else {}
 
         print(f"  [DEBUG] Response keys: {response.keys()}", flush=True)
 
