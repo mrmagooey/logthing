@@ -320,10 +320,44 @@ async fn idle_tcp_connection_sigterm_case(kind: &str, line: impl Fn(usize) -> St
     use tokio::io::AsyncWriteExt;
 
     const LINES: usize = 5;
-    let tcp_port = common::free_port();
-    let metrics_port = common::free_port();
-    let toml = tcp_listener_toml(kind, tcp_port, metrics_port);
-    let mut proc = common::Proc::spawn_healthy(env!("CARGO_BIN_EXE_logthing"), &toml, &[]).await;
+    // `spawn_healthy` only retries a clash on the HTTP port. A clash on the listener or metrics
+    // port (the probe port was taken between `free_port()` and the child's bind) leaves the
+    // child "healthy" but with that listener dead, and the connect below then reaches whatever
+    // else owns the port. So also require the metrics endpoint to answer and the child's logs
+    // to be free of bind failures, and start over on fresh ports otherwise.
+    let mut attempt = 0;
+    let (mut proc, tcp_port, metrics_port) = loop {
+        attempt += 1;
+        let tcp_port = common::free_port();
+        let mut metrics_port = common::free_port();
+        while metrics_port == tcp_port {
+            metrics_port = common::free_port();
+        }
+        let toml = tcp_listener_toml(kind, tcp_port, metrics_port);
+        let proc = common::Proc::spawn_healthy(env!("CARGO_BIN_EXE_logthing"), &toml, &[]).await;
+        let metrics_url = format!("http://127.0.0.1:{metrics_port}/metrics");
+        let up_deadline = Instant::now() + Duration::from_secs(10);
+        let mut metrics_up = false;
+        while Instant::now() < up_deadline {
+            if reqwest::get(&metrics_url)
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                metrics_up = true;
+                break;
+            }
+            sleep(POLL_INTERVAL).await;
+        }
+        let logs = proc.logs().to_lowercase();
+        if metrics_up && !logs.contains("address already in use") && !logs.contains("panicked") {
+            break (proc, tcp_port, metrics_port);
+        }
+        assert!(
+            attempt < common::START_ATTEMPTS,
+            "listener/metrics startup failed {attempt} times; last child logs:\n{}",
+            proc.logs()
+        );
+    };
 
     let mut conn = loop {
         match tokio::net::TcpStream::connect(("127.0.0.1", tcp_port)).await {
@@ -352,7 +386,11 @@ async fn idle_tcp_connection_sigterm_case(kind: &str, line: impl Fn(usize) -> St
         {
             break;
         }
-        assert!(Instant::now() < deadline, "{counter} never reached {LINES}");
+        assert!(
+            Instant::now() < deadline,
+            "{counter} never reached {LINES}; child logs:\n{}",
+            proc.logs()
+        );
         sleep(POLL_INTERVAL).await;
     }
     let out_dir = proc.dir().join("out");
