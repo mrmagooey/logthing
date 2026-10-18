@@ -16,7 +16,13 @@ use logthing::zeek::listener::ZeekHandler;
 use std::sync::Arc;
 
 fn skip_if_no_minio() -> Option<String> {
-    std::env::var("MINIO_ENDPOINT").ok()
+    let endpoint = std::env::var("MINIO_ENDPOINT").ok();
+    // CI sets this so a missing server fails the build instead of silently skipping.
+    assert!(
+        endpoint.is_some() || std::env::var("LOGTHING_REQUIRE_S3_TESTS").is_err(),
+        "MINIO_ENDPOINT not set but LOGTHING_REQUIRE_S3_TESTS is"
+    );
+    endpoint
 }
 
 fn minio_zeek_config(endpoint: &str) -> ZeekS3Config {

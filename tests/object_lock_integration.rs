@@ -48,6 +48,16 @@ async fn client(c: &S3ConnectionConfig) -> S3Client {
     )
 }
 
+fn skip_if_no_minio() -> Option<String> {
+    let endpoint = std::env::var("MINIO_ENDPOINT").ok();
+    // CI sets this so a missing server fails the build instead of silently skipping.
+    assert!(
+        endpoint.is_some() || std::env::var("LOGTHING_REQUIRE_S3_TESTS").is_err(),
+        "MINIO_ENDPOINT not set but LOGTHING_REQUIRE_S3_TESTS is"
+    );
+    endpoint
+}
+
 fn bucket_name() -> String {
     format!("lock-{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
 }
@@ -67,7 +77,7 @@ async fn create_bucket(s3: &S3Client, name: &str, lock: bool) {
 
 #[tokio::test]
 async fn upload_with_lock_sets_retention_checksum_and_blocks_delete() {
-    let Ok(endpoint) = std::env::var("MINIO_ENDPOINT") else {
+    let Some(endpoint) = skip_if_no_minio() else {
         eprintln!("MINIO_ENDPOINT not set — skipping object_lock integration test");
         return;
     };
@@ -129,7 +139,7 @@ async fn upload_with_lock_sets_retention_checksum_and_blocks_delete() {
 
 #[tokio::test]
 async fn upload_with_lock_to_non_lock_bucket_reports_object_lock_hint() {
-    let Ok(endpoint) = std::env::var("MINIO_ENDPOINT") else {
+    let Some(endpoint) = skip_if_no_minio() else {
         eprintln!("MINIO_ENDPOINT not set — skipping object_lock integration test");
         return;
     };
