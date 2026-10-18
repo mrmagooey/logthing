@@ -265,6 +265,17 @@ async fn test_full_flow_enumerate_heartbeat_events_subscription_end() {
     ] {
         assert!(data.contains(needle), "missing {needle}");
     }
+
+    // The analytics dbt view reads logon fields from `parsed.data.<Name>`: pin that contract.
+    let logon = column_strings(&batches, "event_data")
+        .iter()
+        .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap())
+        .find(|v| v["parsed"]["event_id"] == 4624)
+        .expect("a stored 4624 event");
+    let d = &logon["parsed"]["data"];
+    assert_eq!(d["TargetUserName"], "WIN-WFBHIBE5GXZ$");
+    assert_eq!(d["LogonType"], "3");
+    assert_eq!(d["IpAddress"], "fe80::4888:72d0:4f06:d1a1");
 }
 
 #[tokio::test]

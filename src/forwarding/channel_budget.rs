@@ -786,8 +786,36 @@ mod tests {
                  Logon GUID:\t\t{00000000-0000-0000-0000-000000000000}"
                     .to_string(),
             ),
-            // Always None on the real path: `parse_event_data` never sets it.
-            data: None,
+            // `parse_event` fills this with every `EventData/Data@Name` -> untrimmed text.
+            data: Some(serde_json::json!({
+                "SubjectUserSid": "S-1-5-18",
+                "SubjectUserName": "DC01$",
+                "SubjectDomainName": "CORP",
+                "SubjectLogonId": "0x3e7",
+                "TargetUserSid": "S-1-5-21-1234567890-1234567890-1234567890-1001",
+                "TargetUserName": "jdoe",
+                "TargetDomainName": "CORP",
+                "TargetLogonId": "0x1a2b3c4",
+                "LogonType": "3",
+                "LogonProcessName": "NtLmSsp ",
+                "AuthenticationPackageName": "NTLM",
+                "WorkstationName": "WS01",
+                "LogonGuid": "{00000000-0000-0000-0000-000000000000}",
+                "TransmittedServices": "-",
+                "LmPackageName": "NTLM V2",
+                "KeyLength": "128",
+                "ProcessId": "0x0",
+                "ProcessName": "-",
+                "IpAddress": "192.168.1.100",
+                "IpPort": "49234",
+                "ImpersonationLevel": "%%1833",
+                "RestrictedAdminMode": "-",
+                "TargetOutboundUserName": "-",
+                "TargetOutboundDomainName": "-",
+                "VirtualAccount": "%%1843",
+                "TargetLinkedLogonId": "0x0",
+                "ElevatedToken": "%%1842",
+            })),
         };
         let event = WindowsEvent {
             id: uuid::Uuid::new_v4(),
