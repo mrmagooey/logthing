@@ -11,6 +11,8 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 - Analytics: `ocsf_authentication` reads the WEF logon fields from `parsed.data` instead of
   regex-extracting them from `raw_xml`. Rows written before 0.23.0 (no `parsed.data`) now yield
   NULL for those fields.
+- WEF: the channel budget now counts the parsed EventData map, so per-channel capacity drops from
+  8533 to 6400 events.
 
 ## [0.23.1] - 2026-10-16
 

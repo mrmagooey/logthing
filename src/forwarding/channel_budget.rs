@@ -285,14 +285,15 @@ pub const IPFIX_DATAGRAM_BYTES: usize = 9216;
 /// 8-byte pointer in the channel slot. Each queued `Arc` is a distinct event;
 /// the `Arc` is a transfer mechanism, not sharing. WEF fan-out to `.s3` and
 /// `.local` clones the same `Arc` into both channels, so counting it once per
-/// channel overcounts, which is the safe direction. Dominated by `raw_xml`
-/// plus a populated `ParsedEvent.message` (real events are parsed on receipt,
-/// not left `None` — see `measured_wef_event_bytes_counts_the_pointee_not_the_pointer`):
-/// 12146 bytes measured for a ~5.6KB raw event with a representative parsed
-/// Security-log message, rounded up to 12288. Unaffected by the BTreeMap
-/// correction — the dominant `raw_xml`/`message` are plain `String`s and
-/// `ParsedEvent.data` is always `None` on the real path.
-pub const WEF_EVENT_BYTES: usize = 12288;
+/// channel overcounts, which is the safe direction. Dominated by `raw_xml`,
+/// a populated `ParsedEvent.message` and the `ParsedEvent.data` EventData map
+/// that `wef::event::parse_event` fills on the real path (real events are
+/// parsed on receipt — see `measured_wef_event_bytes_counts_the_pointee_not_the_pointer`).
+/// A 4624's map (27 name/value pairs) is about 3KB; it is measured with
+/// `json_heap_bytes`, which counts BTreeMap nodes. 15362 bytes measured for a
+/// ~5.6KB raw event with a representative parsed Security-log message and
+/// that map, rounded up to 16384.
+pub const WEF_EVENT_BYTES: usize = 16384;
 
 #[cfg(test)]
 mod tests {
