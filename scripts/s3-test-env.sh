@@ -46,6 +46,22 @@ JSON
         done
         [ "$ok" = 1 ] || { docker logs "$NAME" >&2; echo "cannot create bucket $b" >&2; exit 1; }
     done
+    # SeaweedFS grows volumes per bucket on first write, and the first grow fails ("Not enough
+    # data nodes") until the volume server registers with the master -- seconds after the S3
+    # port answers. Tests wait only ~3 s for their first write, so do it here: PUT (retried,
+    # bounded) then DELETE one small object per bucket.
+    deadline=$((SECONDS + 60))
+    for b in $BUCKETS; do
+        until [ "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary warmup \
+            --aws-sigv4 "aws:amz:us-east-1:s3" --user "$KEY:$KEY" "$EP/$b/.warmup")" = 200 ]; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+                docker logs "$NAME" >&2; echo "cannot write to bucket $b" >&2; exit 1
+            fi
+            sleep 1
+        done
+        curl -s -o /dev/null -X DELETE --aws-sigv4 "aws:amz:us-east-1:s3" \
+            --user "$KEY:$KEY" "$EP/$b/.warmup"
+    done
     echo "S3 test server ready at $EP" >&2
     echo "export MINIO_ENDPOINT=$EP MINIO_ACCESS_KEY=$KEY MINIO_SECRET_KEY=$KEY"
     ;;
