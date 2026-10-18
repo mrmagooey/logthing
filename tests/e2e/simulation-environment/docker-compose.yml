@@ -48,10 +48,18 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        until nc -z minio 9333 && nc -z minio 9000; do sleep 2; done
+        fail() { echo "minio-setup: $$1" >&2; exit 1; }
+        i=0
+        until nc -z minio 9333 && nc -z minio 9000; do
+          i=$$((i+1)); [ $$i -ge 60 ] && fail "SeaweedFS master/S3 not reachable after 120s"
+          sleep 2
+        done
         for b in wef-events ipfix-flows zeek-logs; do
+          i=0
           until echo "s3.bucket.list" | weed shell -master=minio:9333 2>&1 | grep -q "^ *$$b[[:space:]]"; do
-            echo "s3.bucket.create -name $$b" | weed shell -master=minio:9333 >/dev/null 2>&1; sleep 1
+            i=$$((i+1)); [ $$i -ge 60 ] && fail "bucket $$b not created after 60 attempts"
+            echo "s3.bucket.create -name $$b" | weed shell -master=minio:9333 >/dev/null 2>/tmp/weed.err || cat /tmp/weed.err >&2
+            sleep 2
           done
         done
     depends_on:
