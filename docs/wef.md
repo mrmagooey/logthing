@@ -213,8 +213,8 @@ secret_key            = "minioadmin"
 # prefix defaults to "" (empty) — preserves event_type=.../year=... layout at root
 flush_threshold_bytes = 104857600        # flush when buffer reaches 100 MiB (default)
 flush_interval_secs   = 900             # flush every N seconds regardless of size (default 900)
-channel_capacity      = 22755           # bounded channel depth
-                                        # (default: 100 MiB budget / 4608 B per record)
+channel_capacity      = 6400            # bounded channel depth
+                                        # (default: 100 MiB budget / 16384 B per record)
 max_buffer_rows       = 100000          # hard-cap rows before oldest are dropped (default 100 000)
 ```
 
