@@ -113,7 +113,10 @@ async fn test_e2e_windows_shaped_flow_lands_in_parquet() {
 
     let batches = common::wait_for_rows(&p.dir().join("out/wef"), 3, Duration::from_secs(20)).await;
     let mut ids: Vec<u32> = Vec::new();
+    let mut events: Vec<String> = Vec::new();
     for b in &batches {
+        let ed = common::str_col(b, "event_data");
+        events.extend((0..ed.len()).map(|i| ed.value(i).to_string()));
         let a = b
             .column_by_name("event_id")
             .unwrap()
@@ -126,6 +129,17 @@ async fn test_e2e_windows_shaped_flow_lands_in_parquet() {
     }
     ids.sort_unstable();
     assert_eq!(ids, vec![3, 4624, 4688]);
+
+    // The analytics dbt view reads logon fields from `parsed.data.<Name>`: pin that contract.
+    let logon = events
+        .iter()
+        .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap())
+        .find(|v| v["parsed"]["event_id"] == 4624)
+        .expect("a stored 4624 event");
+    let d = &logon["parsed"]["data"];
+    assert_eq!(d["TargetUserName"], "WIN-WFBHIBE5GXZ$");
+    assert_eq!(d["LogonType"], "3");
+    assert_eq!(d["IpAddress"], "fe80::4888:72d0:4f06:d1a1");
 }
 
 #[test]

@@ -38,13 +38,11 @@ def q(text):
 WEF_4624 = json.dumps({
     "id": "00000000-0000-0000-0000-000000000001", "received_at": "2026-10-01T12:00:05Z",
     "source_host": "ws01", "subscription_id": "sub1",
-    "raw_xml": ("<Event><System><EventID>4624</EventID></System><EventData>"
-                '<Data Name="TargetUserName">john.doe</Data>'
-                "<Data Name='TargetDomainName'>CONTOSO</Data>"
-                '<Data Name="LogonType">3</Data><Data Name="IpAddress">192.168.1.100</Data>'
-                '<Data Name="IpPort">49234</Data></EventData></Event>'),
+    "raw_xml": "<Event><System><EventID>4624</EventID></System><EventData>...</EventData></Event>",
     "parsed": {"event_id": 4624, "computer": "WS01.contoso.com",
-               "time_created": "2026-10-01T12:00:00Z", "data": None},
+               "time_created": "2026-10-01T12:00:00Z",
+               "data": {"TargetUserName": "john.doe", "TargetDomainName": "CONTOSO",
+                        "LogonType": "3", "IpAddress": "192.168.1.100", "IpPort": "49234"}},
 })
 
 CREATE = {
@@ -276,12 +274,11 @@ def lit(dt):
 
 
 def failed_logon(i, when):
-    xml = ('<Event><EventData><Data Name="TargetUserName">user%d</Data>'
-           '<Data Name="TargetDomainName">CONTOSO</Data><Data Name="LogonType">3</Data>'
-           '<Data Name="IpAddress">203.0.113.9</Data></EventData></Event>' % i)
-    blob = json.dumps({"raw_xml": xml, "parsed": {
+    data = {"TargetUserName": "user%d" % i, "TargetDomainName": "CONTOSO", "LogonType": "3",
+            "IpAddress": "203.0.113.9"}
+    blob = json.dumps({"raw_xml": "<Event/>", "parsed": {
         "event_id": 4625, "computer": "WS01.contoso.com",
-        "time_created": when.strftime("%Y-%m-%dT%H:%M:%SZ")}})
+        "time_created": when.strftime("%Y-%m-%dT%H:%M:%SZ"), "data": data}})
     return f"(4625, {lit(when)}, 'ws01', 'sub', {q(blob)}, {lit(when)})"
 
 

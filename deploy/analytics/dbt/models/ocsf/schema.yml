@@ -26,11 +26,10 @@ models:
   - name: ocsf_authentication
     description: >
       OCSF 1.3 Authentication (3002), flattened. WEF 4624/4625/4634/4648.
-      Limitation: logthing persists only the serialized WindowsEvent JSON, whose parsed fields are
-      not populated, so user_name, user_domain, actor_user_name, logon_type_id, src_endpoint_*,
-      and status_detail are extracted from the event XML (`raw_xml`) with a regular expression
-      (macros/wef_field.sql). Both attribute quote styles are handled; a field that is missing,
-      blank or "-", or an event whose JSON or XML is malformed, yields NULL rather than an error.
+      user_name, user_domain, actor_user_name, logon_type_id, src_endpoint_*, and status_detail
+      are read from `parsed.data` in the serialized event JSON (macros/wef_field.sql), which
+      logthing populates from 0.23.0; older rows yield NULL for them. A field that is missing,
+      blank or "-", or an event whose JSON is malformed, yields NULL rather than an error.
       Events other than the four logon IDs are excluded.
     columns:
       - {name: time, data_tests: [not_null]}

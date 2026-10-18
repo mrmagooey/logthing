@@ -207,7 +207,7 @@ unit_tests:
           connection_info_protocol_name: 'udp'
           metadata_correlation_uid: 'D2'
 
-  - name: authentication_maps_windows_logon_events_from_the_event_xml
+  - name: authentication_maps_windows_logon_events_from_parsed_data
     model: ocsf_authentication
     given:
       - input: ref('stg_wef')
@@ -216,19 +216,22 @@ unit_tests:
           select cast(4624 as bigint) as event_id,
                  cast('2026-10-01 12:00:05 UTC' as timestamp(6) with time zone) as received_at,
                  cast('ws01' as varchar) as source_host,
-                 cast('{"raw_xml": "<Event><EventData><Data Name=\"TargetUserName\">john.doe</Data><Data Name=''TargetDomainName''>CONTOSO</Data><Data Name=\"LogonType\">3</Data><Data Name=\"IpAddress\">192.168.1.100</Data><Data Name=\"IpPort\">49234</Data></EventData></Event>", "parsed": {"event_id": 4624, "computer": "WS01.contoso.com", "time_created": "2026-10-01T12:00:00Z", "data": null}}' as varchar) as event_data
+                 cast('{"raw_xml": "<Event/>", "parsed": {"event_id": 4624, "computer": "WS01.contoso.com", "time_created": "2026-10-01T12:00:00Z", "data": {"TargetUserName": "john.doe", "TargetDomainName": " CONTOSO ", "LogonType": "3", "IpAddress": "192.168.1.100", "IpPort": "49234", "SubjectUserName": ""}}}' as varchar) as event_data
           union all
           select 4625, cast('2026-10-01 12:01:05 UTC' as timestamp(6) with time zone), 'ws01',
-                 '{"raw_xml": "<Event><EventData><Data Name=\"TargetUserName\">admin</Data><Data Name=\"TargetDomainName\">CONTOSO</Data><Data Name=\"LogonType\">3</Data><Data Name=\"Status\">0xc000006d</Data><Data Name=\"SubStatus\">0xc0000064</Data><Data Name=\"IpAddress\">203.0.113.9</Data><Data Name=\"IpPort\">-</Data></EventData></Event>", "parsed": {"event_id": 4625, "computer": "WS01.contoso.com", "time_created": "2026-10-01T12:01:00Z", "data": null}}'
+                 '{"raw_xml": "<Event/>", "parsed": {"event_id": 4625, "computer": "WS01.contoso.com", "time_created": "2026-10-01T12:01:00Z", "data": {"TargetUserName": "admin", "TargetDomainName": "CONTOSO", "LogonType": "3", "Status": "0xc000006d", "SubStatus": "0xc0000064", "IpAddress": "203.0.113.9", "IpPort": "-"}}}'
           union all
           select 4634, cast('2026-10-01 12:02:05 UTC' as timestamp(6) with time zone), 'ws01',
-                 '{"raw_xml": "<Event><EventData><Data Name=\"TargetUserName\">john.doe</Data><Data Name=\"TargetDomainName\">CONTOSO</Data></EventData></Event>", "parsed": {"event_id": 4634, "computer": "WS01.contoso.com", "time_created": "2026-10-01T12:02:00Z", "data": null}}'
+                 '{"raw_xml": "<Event/>", "parsed": {"event_id": 4634, "computer": "WS01.contoso.com", "time_created": "2026-10-01T12:02:00Z", "data": {"TargetUserName": "john.doe", "TargetDomainName": "CONTOSO"}}}'
           union all
           select 4648, cast('2026-10-01 12:03:05 UTC' as timestamp(6) with time zone), 'ws01',
-                 '{"raw_xml": "<Event><EventData><Data Name=\"SubjectUserName\">svc-backup</Data><Data Name=\"TargetUserName\">admin</Data><Data Name=\"TargetDomainName\">CONTOSO</Data><Data Name=\"IpAddress\">-</Data></EventData></Event>", "parsed": {"event_id": 4648, "computer": "WS01.contoso.com", "time_created": "2026-10-01T12:03:00Z", "data": null}}'
+                 '{"raw_xml": "<Event/>", "parsed": {"event_id": 4648, "computer": "WS01.contoso.com", "time_created": "2026-10-01T12:03:00Z", "data": {"SubjectUserName": "svc-backup", "TargetUserName": "admin", "TargetDomainName": "CONTOSO", "IpAddress": "-"}}}'
           union all
           select 4688, cast('2026-10-01 12:04:05 UTC' as timestamp(6) with time zone), 'ws01',
-                 '{"raw_xml": "<Event/>", "parsed": {"event_id": 4688, "computer": "WS01.contoso.com", "time_created": "2026-10-01T12:04:00Z", "data": null}}'
+                 '{"raw_xml": "<Event/>", "parsed": {"event_id": 4688, "computer": "WS01.contoso.com", "time_created": "2026-10-01T12:04:00Z", "data": {}}}'
+          union all
+          select 4624, cast('2026-10-01 12:05:05 UTC' as timestamp(6) with time zone), 'ws05',
+                 '{"raw_xml": "<Event><EventData><Data Name=\"TargetUserName\">from_xml</Data></EventData></Event>", "parsed": {"event_id": 4624, "computer": "WS01.contoso.com", "time_created": "2026-10-01T12:05:00Z", "data": null}}'
           union all
           select 4624, cast('2026-10-01 12:09:00 UTC' as timestamp(6) with time zone), 'ws09',
                  'not json at all'
@@ -291,6 +294,20 @@ unit_tests:
           status_detail: null
           dst_endpoint_hostname: 'WS01.contoso.com'
           time: '2026-10-01 12:03:00 UTC'
+        - metadata_event_code: '4624'
+          user_name: null
+          user_domain: null
+          actor_user_name: null
+          logon_type_id: null
+          src_endpoint_ip: null
+          src_endpoint_port: null
+          status_id: 1
+          severity_id: 1
+          activity_id: 1
+          type_uid: 300201
+          status_detail: null
+          dst_endpoint_hostname: 'WS01.contoso.com'
+          time: '2026-10-01 12:05:00 UTC'
         - metadata_event_code: '4624'
           user_name: null
           user_domain: null
