@@ -76,7 +76,9 @@ async fn cef_record_appears_as_parquet_under_cef_partition() {
     let src: SocketAddr = "127.0.0.1:5514".parse().unwrap();
     handler.handle_message(syslog_msg, src).await;
 
-    // Drop the handle so the channel closes and the writer flushes.
+    // Drop the handle and the handler (it holds a sender clone) so the channel closes and the
+    // writer flushes.
+    drop(handler);
     drop(structured_handle);
 
     // Wait for the writer task to complete.
@@ -175,6 +177,8 @@ async fn multiple_payload_types_land_in_separate_partitions() {
         .handle_message(SyslogMessage::parse(dhcp_raw).unwrap(), src)
         .await;
 
+    // The handler holds a sender clone; drop it too or the channel never closes.
+    drop(handler);
     drop(structured_handle);
     tokio::time::timeout(std::time::Duration::from_secs(30), writer_task)
         .await
