@@ -9,7 +9,7 @@ sources:
     schema: logs
     tables:
       - name: wef
-        description: Windows Event Forwarding events; `event_data` is the serialized WindowsEvent JSON (raw_xml + parsed).
+        description: Windows Event Forwarding events; `event_data` is the serialized WindowsEvent JSON (raw_xml + parsed, with the EventData fields in parsed.data).
       - name: syslog
         description: Syslog messages. No natural OCSF class, so no OCSF model.
       - name: structured_syslog

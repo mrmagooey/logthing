@@ -6,6 +6,12 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
+### Fixed
+
+- Analytics: `ocsf_authentication` reads the WEF logon fields from `parsed.data` instead of
+  regex-extracting them from `raw_xml`. Rows written before 0.23.0 (no `parsed.data`) now yield
+  NULL for those fields.
+
 ## [0.23.1] - 2026-10-16
 
 ### Fixed

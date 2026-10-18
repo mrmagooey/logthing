@@ -64,10 +64,10 @@ select json_extract_scalar(attributes, '$["http.route"]') from stg_otlp;
 select json_extract_scalar(fields, '$.user') from stg_hec;
 ```
 
-**WEF fields come from `raw_xml`.** The `wef.event_data` column is the serialized event JSON; its
-`parsed.data` is always null, so TargetUserName, IpAddress, LogonType... are read from the XML in
-`raw_xml` with a regexp (`macros/wef_field.sql`). Absent, empty and `-` values become NULL, and
-malformed JSON/XML yields NULLs (the row's `time` falls back to the receipt time).
+**WEF fields come from `parsed.data`.** The `wef.event_data` column is the serialized event JSON;
+TargetUserName, IpAddress, LogonType... are read from `parsed.data.<Name>` (`macros/wef_field.sql`),
+which logthing populates from 0.23.0 (older rows yield NULL). Absent, empty and `-` values become
+NULL, and malformed JSON yields NULLs (the row's `time` falls back to the receipt time).
 
 ## Detections (`analyses/`)
 

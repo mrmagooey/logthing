@@ -156,36 +156,21 @@ def test_every_ocsf_model_has_a_unit_test_and_wef_covers_a_4624_blob(manifest):
     assert {m for m in by_model if m.startswith("ocsf_")} == set(OCSF)
     auth = by_model["ocsf_authentication"]
     blobs = " ".join(str(g.get("rows")) for t in auth for g in t["given"])
-    assert "4624" in blobs and "TargetUserName" in blobs and "raw_xml" in blobs
+    assert "4624" in blobs and "TargetUserName" in blobs and "parsed" in blobs
+    assert '"data": {' in blobs  # fields live in parsed.data
     assert "not json at all" in blobs  # malformed JSON row
-    assert "''TargetDomainName''" in blobs  # single-quoted attribute style
+    assert "from_xml" in blobs  # raw_xml is not read: parsed.data null -> NULL user
 
 
-def test_ocsf_models_document_the_wef_extraction_limit(manifest):
+def test_ocsf_models_document_the_wef_parsed_data_source(manifest):
     desc = nodes(manifest, "model")["ocsf_authentication"]["description"]
-    assert "raw_xml" in desc and "NULL" in desc
+    assert "parsed.data" in desc and "NULL" in desc and "raw_xml" not in desc
 
 
-def _wef_regex(name):
+def test_wef_field_reads_parsed_data_not_raw_xml():
     text = (DBT_DIR / "macros" / "wef_field.sql").read_text()
-    sql = re.search(r"regexp_extract\(\{\{ xml_col \}\}, '((?:[^']|'')*)', 1\)", text).group(1)
-    return re.compile(sql.replace("''", "'").replace("{{ name }}", name))
-
-
-@pytest.mark.parametrize("xml,want", [
-    ('<Data Name="TargetUserName">john.doe</Data>', "john.doe"),
-    ("<Data Name='TargetUserName'>john.doe</Data>", "john.doe"),
-    ('<Data Name="TargetUserName" Foo="1">x y</Data>', "x y"),
-    ('<Data Name="TargetUserName"></Data>', ""),
-    ('<Data Name="Other">v</Data>', None),
-    ('<Data Name="TargetUserName"/><Data Name="X">v</Data>', None),
-    ('<Data Name="TargetUserName" />\n<Data Name="X">v</Data>', None),
-    ('<Data Name="XTargetUserName">v</Data>', None),
-    ("not xml at all", None),
-])
-def test_wef_field_regex_handles_quote_styles_and_absence(xml, want):
-    m = _wef_regex("TargetUserName").search(xml)
-    assert (m.group(1) if m else None) == want
+    assert "json_extract_scalar(" in text and "'$.parsed.data.{{ name }}'" in text
+    assert "regexp_extract" not in text
 
 
 def test_wef_field_turns_blank_and_dash_into_null():
@@ -224,7 +209,7 @@ def test_detections_take_their_reference_time_from_one_pinned_macro_never_the_wa
 
 def test_readme_documents_scope_decisions():
     text = (DBT_DIR / "README.md").read_text()
-    for needle in ("pySigma", "syslog", "raw_xml", "dbt run", "CronJob", "stg_otlp",
+    for needle in ("pySigma", "syslog", "parsed.data", "dbt run", "CronJob", "stg_otlp",
                    "detection_as_of", "TextQueryBackend", "2026-10-06"):
         assert needle in text, needle
 
