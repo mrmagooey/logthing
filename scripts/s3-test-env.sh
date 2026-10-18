@@ -15,9 +15,16 @@ KEY=minioadmin
 BUCKETS="hec-logs ipfix-flows otlp-test sflow-samples suricata-logs syslog-structured-test
     syslog-test wef-events zeek-logs"
 
+# Print only the HTTP status of a signed S3 request ("000" on a transport error, never fails).
+s3curl() {
+    curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 \
+        --aws-sigv4 "aws:amz:us-east-1:s3" --user "$KEY:$KEY" "$@" || true
+}
+
 case "${1:-}" in
 up)
     docker rm -fv "$NAME" >/dev/null 2>&1 || true
+    trap 'docker rm -fv "$NAME" >/dev/null 2>&1 || true' EXIT # cleared once up succeeds
     mkdir -p "$OUT"
     cat > "$OUT/s3.json" <<JSON
 {"identities":[{"name":"admin","credentials":[{"accessKey":"$KEY","secretKey":"$KEY"}],
@@ -31,16 +38,15 @@ JSON
     EP="http://127.0.0.1:$PORT"
     ready=0
     for _ in $(seq 1 60); do
-        # Any HTTP answer (even 403) means the S3 gateway is up; curl exits 7/52/56 until then.
-        if curl -s -o /dev/null "$EP/"; then ready=1; break; fi
+        # Any HTTP answer (even 403) means the S3 gateway is up; "000" is a transport error.
+        [ "$(s3curl "$EP/")" != 000 ] && { ready=1; break; }
         sleep 1
     done
     [ "$ready" = 1 ] || { docker logs "$NAME" >&2; echo "S3 did not become ready" >&2; exit 1; }
     for b in $BUCKETS; do
         ok=0
         for _ in $(seq 1 30); do # the first PUTs can race volume growth
-            code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT --aws-sigv4 \
-                "aws:amz:us-east-1:s3" --user "$KEY:$KEY" "$EP/$b")"
+            code="$(s3curl -X PUT "$EP/$b")"
             if [ "$code" = 200 ] || [ "$code" = 409 ]; then ok=1; break; fi
             sleep 1
         done
@@ -52,16 +58,15 @@ JSON
     # bounded) then DELETE one small object per bucket.
     deadline=$((SECONDS + 60))
     for b in $BUCKETS; do
-        until [ "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary warmup \
-            --aws-sigv4 "aws:amz:us-east-1:s3" --user "$KEY:$KEY" "$EP/$b/.warmup")" = 200 ]; do
+        until [ "$(s3curl -X PUT --data-binary warmup "$EP/$b/.warmup")" = 200 ]; do
             if [ "$SECONDS" -ge "$deadline" ]; then
                 docker logs "$NAME" >&2; echo "cannot write to bucket $b" >&2; exit 1
             fi
             sleep 1
         done
-        curl -s -o /dev/null -X DELETE --aws-sigv4 "aws:amz:us-east-1:s3" \
-            --user "$KEY:$KEY" "$EP/$b/.warmup"
+        s3curl -X DELETE "$EP/$b/.warmup" >/dev/null
     done
+    trap - EXIT
     echo "S3 test server ready at $EP" >&2
     echo "export MINIO_ENDPOINT=$EP MINIO_ACCESS_KEY=$KEY MINIO_SECRET_KEY=$KEY"
     ;;
