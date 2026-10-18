@@ -16,7 +16,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 fn skip_if_no_minio() -> Option<String> {
-    std::env::var("MINIO_ENDPOINT").ok()
+    let endpoint = std::env::var("MINIO_ENDPOINT").ok();
+    // CI sets this so a missing server fails the build instead of silently skipping.
+    assert!(
+        endpoint.is_some() || std::env::var("LOGTHING_REQUIRE_S3_TESTS").is_err(),
+        "MINIO_ENDPOINT not set but LOGTHING_REQUIRE_S3_TESTS is"
+    );
+    endpoint
 }
 
 fn s3_cfg(endpoint: &str, prefix: &str) -> SyslogS3Config {
