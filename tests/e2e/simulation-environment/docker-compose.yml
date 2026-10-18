@@ -25,32 +25,35 @@ services:
       - e2e
 
   minio:
-    # minio/minio on Docker Hub now returns "repository does not exist"; MinIO
-    # publishes to quay.io. Pinned to a digest-free tag deliberately: a prior
-    # pin to a specific release tag stopped resolving entirely, and a pin to
-    # a registry path that no longer exists is worse than no pin.
-    image: quay.io/minio/minio:latest
-    environment:
-      - MINIO_ROOT_USER=miniouser
-      - MINIO_ROOT_PASSWORD=miniopassword
-    command: server /data --console-address ':9001'
+    # S3 store for the suite, run as SeaweedFS (Apache-2.0). The service keeps
+    # the name `minio` so every config/verifier endpoint (http://minio:9000)
+    # stays unchanged. MinIO's images moved to quay.io, which has answered 401
+    # to anonymous pulls since Sept 2026. The two volume flags are required:
+    # with many buckets, uploads otherwise fail with "no writable volumes ...
+    # volume growth in progress". Credentials are test-only (seaweedfs-s3.json).
+    image: chrislusf/seaweedfs:4.48
+    command: >
+      server -dir=/data -s3 -s3.port=9000 -s3.config=/etc/seaweedfs/s3.json
+      -master.volumeSizeLimitMB=64 -volume.max=500
+    volumes:
+      - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
     expose:
       - "9000"
-      - "9001"
     networks:
       - e2e
 
   minio-setup:
-    image: quay.io/minio/mc:latest
-    environment:
-      - MINIO_ROOT_USER=miniouser
-      - MINIO_ROOT_PASSWORD=miniopassword
+    # One-shot bucket creation via `weed shell`; waits for master and S3 port.
+    image: chrislusf/seaweedfs:4.48
     entrypoint: ["/bin/sh", "-c"]
-    command: >
-      "until mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; do sleep 2; done &&
-       mc mb --ignore-existing local/wef-events &&
-       mc mb --ignore-existing local/ipfix-flows &&
-       mc mb --ignore-existing local/zeek-logs"
+    command:
+      - |
+        until nc -z minio 9333 && nc -z minio 9000; do sleep 2; done
+        for b in wef-events ipfix-flows zeek-logs; do
+          until echo "s3.bucket.list" | weed shell -master=minio:9333 2>&1 | grep -q "^ *$$b[[:space:]]"; do
+            echo "s3.bucket.create -name $$b" | weed shell -master=minio:9333 >/dev/null 2>&1; sleep 1
+          done
+        done
     depends_on:
       - minio
     networks:
