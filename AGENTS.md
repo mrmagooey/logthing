@@ -29,7 +29,8 @@ This document explains how automated or semi-automated agents should interact wi
 | Test KDC (real Kerberos) | `eval "$(scripts/kdc-test-env.sh up)"` ... `scripts/kdc-test-env.sh down` (requires Docker; exports `LOGTHING_TEST_KRB5_*`) |
 | WEF client emulator tests | `tests/e2e/simulation-environment/wef-client-emulator/.venv/bin/pytest tests/e2e/simulation-environment/wef-client-emulator/tests` |
 | WEF Kerberos integration test | `eval "$(scripts/kdc-test-env.sh up)" && cargo test --features kerberos-auth --test wef_kerberos_integration` (requires Docker) |
-| Object Lock integration test | `MINIO_ENDPOINT=http://host:9000 [MINIO_ACCESS_KEY=.. MINIO_SECRET_KEY=..] cargo test --test object_lock_integration` (skips when `MINIO_ENDPOINT` is unset) |
+| S3 integration tests (real S3) | `eval "$(scripts/s3-test-env.sh up)" && cargo test --test hec_s3_integration --test object_lock_integration ...` then `scripts/s3-test-env.sh down` (requires Docker; SeaweedFS, exports `MINIO_*`; CI sets `LOGTHING_REQUIRE_S3_TESTS=1` so a missing server fails instead of skipping) |
+| Object Lock integration test | `eval "$(scripts/s3-test-env.sh up)" && cargo test --test object_lock_integration`, or point `MINIO_ENDPOINT=http://host:9000 [MINIO_ACCESS_KEY=.. MINIO_SECRET_KEY=..]` at your own server (skips when `MINIO_ENDPOINT` is unset) |
 | Analytics unit tests | `deploy/analytics/.venv/bin/pytest -c deploy/analytics/tests/pytest.ini deploy/analytics/tests/unit` |
 | Analytics integration test | `deploy/analytics/.venv/bin/pytest -c deploy/analytics/tests/pytest.ini deploy/analytics/tests/integration -m integration` (requires Docker; Trino tests need AVX2 or `TRINO_IMAGE`) |
 | Analytics E2E (compose) | `deploy/analytics/tests/e2e/compose.sh` (requires Docker + AVX2 CPU, or `TRINO_IMAGE=trinodb/trino:470`) |
