@@ -45,8 +45,8 @@ Per-source ingest counters:
   estimated mapped size over the per-request cap (see [otlp.md](otlp.md))
 - Decode/parse failures: `ipfix_decode_errors`, `sflow_decode_errors`,
   `suricata_parse_errors`, `hec_parse_errors`, `wef_xml_parse_errors` - a WEF
-  batch's XML failed to parse past a given event; that event is kept as its
-  own raw event and parsing resumes at the next one, so it doesn't cost the
+  batch's XML failed to parse past a given event; that event is skipped and
+  counted, and parsing resumes at the next one, so it doesn't cost the
   rest of the batch
 
 WEF requests (counted in the request handler, not per event):
@@ -64,7 +64,8 @@ WEF requests (counted in the request handler, not per event):
 - `wef_plaintext_on_kerberos_rejected` - non-empty, non-encrypted `/wsman/**` bodies refused
   (`400`) on a connection whose Kerberos context is complete (a protocol downgrade)
 
-Parquet persistence (labelled `source="wef"|"syslog"|"ipfix"|"zeek"|"suricata"|"sflow"|"hec"|"otlp"`):
+Parquet persistence (labelled
+`source="wef"|"syslog"|"ipfix"|"zeek"|"suricata"|"sflow"|"hec"|"otlp"|"structured_syslog"|"aggregate"`):
 
 - `parquet_s3_records_written`, `parquet_s3_uploads`, `parquet_s3_upload_errors`.
   `parquet_s3_records_written` counts rows that are durable, including rows only committed to
@@ -102,8 +103,8 @@ Durable spool (only when `[spool]` is configured):
   (a file damaged while the process was running)
 
 Suggested alerts: `spool_entries > 0` for 15 minutes (S3 or the descriptor destination is
-unreachable), `increase(spool_rejected_total[5m]) > 0` (spool full or disk problem),
-`increase(spool_corrupt_total[1h]) > 0`.
+unreachable), `increase(spool_rejected[5m]) > 0` (spool full or disk problem),
+`increase(spool_corrupt[1h]) > 0`.
 
 Listener health: `listener_accept_errors` (labelled `protocol="syslog_tcp"|"zeek"|"suricata"`)
 - TCP accept errors on that listener; a persistent condition (e.g. fd
@@ -162,8 +163,8 @@ Zeek and Suricata:
   forwarding handlers / counted per Zeek log path (label set is capped)
 - `suricata_records_by_event_type{event_type}` - records counted per EVE event type (label set is capped)
 - `zeek_parse_errors` - lines that failed to parse as a record
-- `zeek_missing_path`, `suricata_missing_event_type` - records dropped for lack of a log path /
-  event type
+- `zeek_missing_path`, `suricata_missing_event_type` - records with no log path / event type
+  (they are stored in the `unknown` stream, not dropped)
 - `zeek_oversized_lines`, `suricata_oversized_lines` - TCP lines over the maximum length (the
   connection is closed)
 - `zeek_partial_lines_dropped_at_shutdown`, `suricata_partial_lines_dropped_at_shutdown` - TCP
@@ -184,14 +185,13 @@ Parquet and Iceberg descriptors:
 - `iceberg_descriptor_uploads{source}`, `iceberg_descriptor_upload_errors{source}` - descriptor objects uploaded
   alongside a Parquet object / uploads that returned an error
 
-Cardinality watch (`metrics.cardinality_watch`; see [configuration.md](configuration.md)):
+Cardinality watch (`metrics.cardinality_watch`; see
+[configuration.md](configuration.md#cardinality-watch)):
 
 - `field_distinct_values{source,stream,field}` (gauge) - distinct values of a watched field in
   the most recently completed window; a count of wire values, not a host identity
 - `field_distinct_values_capped{source,stream,field}` - values discarded because
   `cardinality_max_values` was reached; non-zero means the gauge undercounts
-
-Counters are exported with a `_total` suffix by the Prometheus exporter.
 
 ## API Endpoints
 
