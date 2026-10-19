@@ -215,7 +215,7 @@ flush_threshold_bytes = 104857600        # flush when buffer reaches 100 MiB (de
 flush_interval_secs   = 900             # flush every N seconds regardless of size (default 900)
 channel_capacity      = 6400            # bounded channel depth
                                         # (default: 100 MiB budget / 16384 B per record)
-max_buffer_rows       = 100000          # flush at this many rows; 4x is the drop cap in an outage (default 100 000)
+max_buffer_rows       = 100000          # flush trigger; drop cap is 4x (default 100 000)
 ```
 
 The `[wef.s3]` block is optional; when absent, WEF events are not persisted to S3.
