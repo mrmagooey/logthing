@@ -172,7 +172,7 @@ bind_address = "0.0.0.0"   # env: LOGTHING__ZEEK__BIND_ADDRESS
 # flush_threshold_bytes = 104857600               # flush at 100 MiB (default)
 # flush_interval_secs   = 900                     # flush after N seconds (default 900)
 # channel_capacity      = 40960                   # channel depth (default: 100 MiB budget / 2560 B per record)
-# max_buffer_rows       = 100000                  # hard-cap before oldest rows dropped (default 100 000)
+# max_buffer_rows       = 100000                  # flush after this many rows; 4x is the drop cap (default 100 000)
 
 # IPFIX / NetFlow flow ingestion listener.
 # Disabled by default — set enabled = true to activate.
@@ -223,7 +223,7 @@ bind_address = "0.0.0.0"   # env: LOGTHING__IPFIX__BIND_ADDRESS
 # flush_threshold_bytes = 104857600               # flush at 100 MiB (default)
 # flush_interval_secs   = 900                     # flush after N seconds (default 900)
 # channel_capacity      = 11377                   # channel depth (default: 100 MiB budget / 9216 B per datagram)
-# max_buffer_rows       = 100000                  # hard-cap before oldest rows dropped (default 100 000)
+# max_buffer_rows       = 100000                  # flush after this many rows; 4x is the drop cap (default 100 000)
 
 # sFlow v5 UDP listener.
 # Disabled by default — set enabled = true to activate.
@@ -276,7 +276,7 @@ bind_address = "0.0.0.0"   # env: LOGTHING__SFLOW__BIND_ADDRESS
 # flush_threshold_bytes = 104857600               # flush at 100 MiB (default)
 # flush_interval_secs   = 900                     # flush after N seconds (default 900)
 # channel_capacity      = 11702                   # channel depth (default: 100 MiB budget / 8960 B per record)
-# max_buffer_rows       = 100000                  # hard-cap before oldest rows dropped (default 100 000)
+# max_buffer_rows       = 100000                  # flush after this many rows; 4x is the drop cap (default 100 000)
 
 # Optional: emit a small JSON "descriptor" alongside every Parquet file,
 # for an external Apache Iceberg committer process. logthing has no
