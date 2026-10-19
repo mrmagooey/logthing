@@ -12,7 +12,7 @@ run several independent copies.
 |---|---|---|---|
 | HEC (`/services/collector/*`, `/ingest`) | HTTP | any L4 or L7 balancer, round robin | Stateless per request. A full writer channel answers `503` with `Retry-After: 1`; that is a retryable signal for the client, so pass it through. A balancer that retries a `503` on another instance re-sends the whole body, and events that were already enqueued are duplicated (see [hec.md](hec.md#backpressure)). |
 | OTLP/HTTP (`/v1/logs`) | HTTP | same | Stateless per request; same `503` + `Retry-After` behavior (see [otlp.md](otlp.md#backpressure)). |
-| WEF | HTTP(S), Kerberos | L4 or L7 | logthing stores no subscription state (the subscription id is generated per request and not kept). With Kerberos enabled every instance needs the keytab for the SPN clients connect to; see below. |
+| WEF | HTTP(S), Kerberos | sticky, connection-preserving (L4 / TCP passthrough) | Kerberos is per TCP connection with message encryption, so do not terminate or re-balance connections mid-stream. Bookmarks are kept in memory per instance, keyed by client identity; a client moved to another instance resumes without its bookmark, which can cause gaps or duplicates. With Kerberos enabled every instance needs the keytab for the SPN clients connect to; see below. |
 | Zeek, Suricata, syslog TCP | TCP | L4, least connections | A connection lives on one instance for its whole life. Connections idle for 300 s are closed by logthing; a reconnect may land on a different instance. |
 | syslog UDP | UDP | L4 UDP balancer, preferably hashing on source IP | Each datagram is handled independently, so any instance can take any datagram. Hashing on source IP keeps one host's messages in one writer's files. |
 | syslog over HTTP (`POST /syslog`) | HTTP | same as HEC | Stateless per request. |
@@ -133,10 +133,11 @@ See [iceberg.md](iceberg.md).
   unless `metrics.bind_address` is set.
 - **Shutdown.** On `SIGTERM` or Ctrl-C logthing stops accepting, flushes every writer buffer
   (the writer deadline is 10 s) and exits. With `[spool]` the final flush lands in the spool.
-  Zeek and Suricata connections keep a sender alive, so if a sensor is still connected at
-  shutdown the writer does not finish before the deadline and rows buffered since the last
-  periodic flush are lost ([delivery-semantics.md](delivery-semantics.md)). Drain first: take
-  the instance out of the balancer, let sensors disconnect or reconnect elsewhere, then stop it.
+  The Zeek, Suricata and syslog TCP listeners stop their connection tasks and wait up to 5 s
+  for them, so lines already received from a still-connected sensor are flushed; only an
+  unterminated final line is dropped ([delivery-semantics.md](delivery-semantics.md)). Draining
+  first is still cleaner: take the instance out of the balancer, let sensors disconnect or
+  reconnect elsewhere, then stop it.
 - **Volumes.** A spooled instance needs a stable volume per instance. On Kubernetes that is a
   StatefulSet with a `volumeClaimTemplate` (not a Deployment sharing one PVC, not `emptyDir`).
 

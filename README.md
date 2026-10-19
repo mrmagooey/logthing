@@ -125,7 +125,9 @@ docker pull ghcr.io/mrmagooey/logthing:latest  # most recent non-prerelease rele
 
 **Platforms**: linux/amd64, linux/arm64 (multi-arch manifest).
 
-**Exposed ports** (Dockerfile `EXPOSE`): 5985 (HTTP/WEF), 5986 (HTTPS/TLS), 9090 (Prometheus metrics).
+**Exposed ports** (Dockerfile `EXPOSE`): 5986 (HTTPS/TLS; the main server with
+`[tls] enabled = true`, the default) or 5985 (plain HTTP, only when TLS is disabled), 9090
+(Prometheus metrics).
 
 The runtime listeners (syslog UDP 514/TCP 601, IPFIX UDP 4739) must be published separately via `-p` or the compose `ports:` mapping if they need to be reachable from outside the container.
 
@@ -137,11 +139,11 @@ cargo test              # unit + integration tests
 ```
 
 **End-to-end suite** (requires Docker with Compose v2) — builds the helper
-images, launches `tests/e2e/docker-compose.yml`, replays Windows event
+images, launches `tests/e2e/simulation-environment/docker-compose.yml`, replays Windows event
 fixtures, emits syslog traffic, sends IPFIX flows, emits Zeek NDJSON logs,
-verifies throughput counters, and confirms Parquet files arrive in the MinIO
-bucket for each protocol. Containers shut down automatically once the
-generators and verifiers exit:
+verifies throughput counters, and confirms Parquet files arrive in the SeaweedFS
+bucket (the compose service is still named `minio`) for each protocol. Containers shut down
+automatically once the generators and verifiers exit:
 
 ```bash
 bash tests/e2e/simulation-environment/run.sh

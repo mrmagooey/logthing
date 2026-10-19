@@ -180,8 +180,8 @@ attempt re-uploads the same keys, which is an idempotent overwrite.
 
 **Sizing and alerting.** Set `max_bytes` to at least (flush rate x bytes per flush) x the
 longest outage you want to ride out. Alert on `spool_entries > 0` for 15 minutes,
-`increase(spool_upload_errors_total[10m])`, `increase(spool_rejected_total[5m]) > 0` and
-`increase(spool_corrupt_total[1h]) > 0`.
+`increase(spool_upload_errors[10m])`, `increase(spool_rejected[5m]) > 0` and
+`increase(spool_corrupt[1h]) > 0`.
 
 ## At-least-once and duplicates
 

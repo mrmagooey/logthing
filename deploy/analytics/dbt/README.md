@@ -19,10 +19,13 @@ dbt compile          # compiles analyses/ to target/compiled/logthing_analytics/
 Helm: `kubectl port-forward svc/<release>-logthing-analytics-trino 8443` and read the CA with
 `kubectl get secret <release>-logthing-analytics-trino-tls -o jsonpath='{.data.ca\.pem}' | base64 -d`.
 
-**Tables appear only after data arrives.** The committer creates `zeek_conn`, `wef`, `suricata`, ...
-on first data. `stg_*` views use the `source_or_empty` macro, so `dbt build` works on an empty lake
-(empty views), but a view built while its table was missing stays empty: run `dbt run` again once
-the table exists.
+**Tables appear only after data arrives.** The committer creates `zeek_conn`, `ipfix`, ...
+on first data. The shipped stack (compose and Helm `logthing.toml`) never enables `[wef]` or
+`[suricata]`, so the `wef` and `suricata` tables are never created until you add that logthing
+configuration yourself (WEF also needs `[wef.s3]`, subscriptions and Kerberos or mTLS).
+`stg_*` views use the `source_or_empty` macro, so `dbt build` works on an empty lake (empty
+views), but a view built while its table was missing stays empty: run `dbt run` again once the
+table exists.
 
 ## Models
 
@@ -33,6 +36,9 @@ the table exists.
 | `ocsf_dns_activity` (4003) | zeek_dns | Query (1) without rcode, Response (2) with |
 | `ocsf_authentication` (3002) | wef 4624, 4625, 4634, 4648 | Logon (1) / Logoff (2); 4625 = status Failure, severity Low |
 | `ocsf_detection_finding` (2004) | suricata `event_type = 'alert'` | Suricata severity 1/2/3 -> OCSF 4/3/2; timestamps keep microseconds |
+
+`stg_wef`, `stg_suricata`, `ocsf_authentication`, `ocsf_detection_finding` and the detections over
+them stay empty until that configuration is added.
 
 OCSF dotted attributes are flattened with underscores (`src_endpoint.ip` -> `src_endpoint_ip`,
 `metadata.product.name` -> `metadata_product_name`). Required columns carry `not_null` tests.

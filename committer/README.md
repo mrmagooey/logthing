@@ -1,9 +1,10 @@
 # committer — Iceberg descriptor committer
 
 logthing writes Parquet files to S3-compatible object storage and, for every
-file, drops a small JSON *descriptor* next to it under a descriptor prefix
-(default `_iceberg_descriptors/`), describing what it wrote: source,
-optional partition, the file's location, row/byte counts, and per-column
+file, drops a small JSON *descriptor* under the prefix set by logthing's
+`[iceberg.s3].prefix` (empty by default, so beside the Parquet; it must match the
+committer's `DESC_PREFIX`, default `_iceberg_descriptors/`), describing what it wrote:
+source, optional partition, the file's location, row/byte counts, and per-column
 Parquet statistics (see logthing's `src/forwarding/iceberg_descriptor.rs`).
 
 `commit.py` drains that prefix as a work queue: for every descriptor it
@@ -180,7 +181,7 @@ never causes a committed file to be retried or quarantined.
 | `S3_REGION` | no | `us-east-1` | |
 | `WAREHOUSE` | no | `warehouse` | Catalog warehouse name |
 | `ICEBERG_NAMESPACE` | no | `logs` | Target namespace, created if absent |
-| `DESC_PREFIX` | no | `_iceberg_descriptors/` | Work queue |
+| `DESC_PREFIX` | no | `_iceberg_descriptors/` | Work queue; logthing's `[iceberg.s3].prefix` must be set to match (its own default is empty, which the committer never sees) |
 | `DONE_PREFIX` | no | `_committed/` | Successfully committed descriptors |
 | `QUARANTINE_PREFIX` | no | `_quarantine/` | Descriptors needing manual triage |
 | `BATCH_SIZE` | no | `500` | Max descriptors per `add_files` commit, per table |

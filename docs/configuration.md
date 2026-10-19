@@ -57,6 +57,10 @@ tcp_port = 601
 parse_dns = true
 ```
 
+With `[tls] enabled = true` (the default), the main server listens only on `tls.port` (5986, on
+the `bind_address` interface); the port in `bind_address` (5985) is not served. Port 5985 is
+served, as plain HTTP, only when `[tls] enabled = false`.
+
 ## Configuration Sources
 
 Configuration is loaded from multiple sources (in order of precedence, later wins):
@@ -72,12 +76,14 @@ read-only — it shows the effective config and the `LOGTHING__*` variable
 names currently set, but does not accept writes. Change configuration by
 editing `logthing.toml`/`/etc/logthing/config.toml` or setting `LOGTHING__*`
 environment variables, then restart the process; nothing here applies live.
-**Two settings have no environment-variable equivalent and must be set in a
-file**: `security.allowed_ips` (a list; the env loader sets no list
-separator) and `aggregate.rules` (a list of tables; the env loader has no
-syntax for that shape either).
+**List-valued settings have no environment-variable equivalent and must be set in a
+file.** The env loader sets no list separator, so a scalar string cannot become a list, and it
+has no syntax for a list of tables. Setting one of these variables makes startup fail with
+`invalid type: string "...", expected a sequence`. The affected keys are `security.allowed_ips`,
+`aggregate.rules`, `wef.subscriptions`, `metrics.cardinality_watch`, and
+`hec.redaction` / `otlp.redaction` `drop_fields`, `hash_fields` and `mask_patterns`.
 
-Every config field is reachable this way, including each listener's bind
+Every other config field is reachable this way, including each listener's bind
 port: `LOGTHING__SYSLOG__UDP_PORT`, `LOGTHING__SYSLOG__TCP_PORT`,
 `LOGTHING__IPFIX__UDP_PORT`, `LOGTHING__ZEEK__TCP_PORT`, `LOGTHING__SURICATA__TCP_PORT`,
 `LOGTHING__SFLOW__UDP_PORT`. Ipfix, Zeek, Suricata, and sFlow additionally accept
@@ -91,7 +97,7 @@ Every top-level section of the configuration, with the page that documents its k
 | Section | Purpose | Documented in |
 |---|---|---|
 | `bind_address`, `[tls]`, `[security]`, `[logging]` | Main HTTP/WEF server, TLS, allowlist, log format | this page; Kerberos (`[security.kerberos]`) in [wef.md](wef.md) |
-| `[metrics]` | Prometheus listener (`enabled`, `port`, `bind_address`) and `[[metrics.cardinality_watch]]` with `cardinality_window_secs` / `cardinality_max_values` | this page; [metrics.md](metrics.md) |
+| `[metrics]` | Prometheus listener (`enabled`, `port`, `bind_address`) and `[[metrics.cardinality_watch]]` with `cardinality_window_secs` / `cardinality_max_values` | "Cardinality watch" below; [metrics.md](metrics.md) |
 | `[syslog]`, `[syslog.s3]`, `[syslog.structured_s3]`, `[syslog.local]` | Syslog UDP/TCP/HTTP and its persistence | [syslog.md](syslog.md) |
 | `[ipfix]`, `[sflow]` | IPFIX/NetFlow and sFlow UDP listeners (+ `.s3`/`.local` sinks) | [ipfix.md](ipfix.md) (sFlow in its last section) |
 | `[zeek]`, `[suricata]` | Zeek and Suricata TCP listeners (+ `.s3`/`.local` sinks) | [zeek.md](zeek.md) (Suricata in its last section) |
@@ -172,6 +178,45 @@ erasure procedure are in [redaction.md](redaction.md).
 
 Invalid rules fail startup, but only for sections that are enabled.
 
+## Cardinality watch
+
+`[[metrics.cardinality_watch]]` publishes the number of distinct values of one field on one
+stream as the `field_distinct_values` gauge (see [metrics.md](metrics.md)), to check that
+ingestion is reporting as many hosts as you expect. It is off when no entry is given.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `source` | string | required | One of `zeek`, `wef`, `suricata`, `syslog`, `ipfix`, `sflow`. A watch on a disabled source fails startup. |
+| `stream` | string | required | Stream the field is counted on: Zeek log path (`conn`), WEF `Channel` (`Security`), Suricata `event_type`, syslog `app_name`, IPFIX `flows`, sFlow `flow` or `counter`. |
+| `field` | string | required | Field whose distinct values are counted (for example Zeek `id.orig_h`, WEF `computer`). |
+
+Two shared knobs sit in the `[metrics]` table and apply to every entry:
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `cardinality_window_secs` | integer | `3600` | Values are counted, published, then cleared every this many seconds; the gauge shows the last completed window. Must be > 0. |
+| `cardinality_max_values` | integer | `100000` | Cap on distinct values tracked per window; extra values are counted in `field_distinct_values_capped`. Must be > 0. |
+
+```toml
+# each watched source must be enabled ([zeek] here; WEF is always on)
+[metrics]
+cardinality_window_secs = 3600
+cardinality_max_values = 100000
+
+[[metrics.cardinality_watch]]
+source = "wef"
+stream = "Security"
+field = "computer"
+
+[[metrics.cardinality_watch]]
+source = "zeek"
+stream = "conn"
+field = "id.orig_h"
+```
+
+Each `(source, stream, field)` triple may appear once. Watches are a list of tables, so they
+cannot be set through environment variables.
+
 ## Running
 
 ```bash
@@ -223,5 +268,5 @@ All five now require a restart, same as everything else. Operators who
 relied on rotating `hec.token`/`syslog.http_token`/`otlp.bearer_token` or
 updating `security.allowed_ips` without a restart need to change their
 process to restart after the config change. `security.allowed_ips` and
-`aggregate.rules` additionally have no `LOGTHING__*` equivalent at all and
+the other list-valued settings additionally have no `LOGTHING__*` equivalent at all and
 must be set in a file — see "Configuration Sources" above.

@@ -169,7 +169,8 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     (
         Kind::Counter,
         "zeek_missing_path",
-        "Zeek records dropped because the JSON carried no usable log path.",
+        "Zeek records with no usable log path in the JSON; they are stored in the `unknown` \
+         stream.",
     ),
     (
         Kind::Counter,
@@ -215,7 +216,8 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     (
         Kind::Counter,
         "suricata_missing_event_type",
-        "Suricata records dropped because the JSON carried no event type.",
+        "Suricata records with no event type in the JSON; they are stored in the `unknown` \
+         stream.",
     ),
     (
         Kind::Counter,
@@ -311,7 +313,7 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
     (
         Kind::Counter,
         "wef_xml_parse_errors",
-        "WEF events whose XML failed to parse; each is kept as its own raw event and parsing \
+        "WEF events whose XML failed to parse; each is skipped and counted, and parsing \
          resumes at the next event, so the well-formed events around it are not lost too.",
     ),
     // ── listener access control ───────────────────────────────────────────

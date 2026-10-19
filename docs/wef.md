@@ -11,8 +11,8 @@ spn = "HTTP/wef.contoso.com@CONTOSO.COM"
 keytab = "/etc/logthing/krb5.keytab"
 ```
 
-- Build the binary or container with `--features kerberos-auth` so the Kerberos middleware is compiled in. (Without the feature the server will log a warning and continue without enforcing Negotiate.)
-- When `enabled = true`, the main server's protected routes (`/wsman/**`, `/syslog`) enforce Kerberos authentication before any route logic runs. `/health` and `/stats/throughput` stay public. The **admin API is a separate server on its own port and is NOT covered by Kerberos** — it has its own Basic-auth/trusted-header authentication and its own IP allowlist.
+- Build the binary or container with `--features kerberos-auth` so the Kerberos middleware is compiled in. (Without the feature the server will log a warning and continue without enforcing Negotiate. However, with `[[wef.subscriptions]]` configured and TLS off, startup then fails unless `allow_unauthenticated = true`.)
+- When `enabled = true`, the main server's protected routes (`/wsman/**`, `/syslog` and, when enabled, `/services/collector/*`, `/ingest` and `/v1/logs`) enforce Kerberos authentication before any route logic runs. `/health` and `/stats/throughput` stay public. The **admin API is a separate server on its own port and is NOT covered by Kerberos** — it has its own Basic-auth/trusted-header authentication and its own IP allowlist.
 - `spn` must match the service principal registered in Active Directory (format `HTTP/hostname@REALM`).
 - `keytab` (optional) points to the keytab that contains the service principal’s keys. If provided, logthing sets `KRB5_KTNAME` automatically so `libgssapi` can decrypt tickets.
 - The middleware logs the authenticated client principal at `debug` level; there is no extractor exposing it to handlers.
@@ -215,7 +215,7 @@ flush_threshold_bytes = 104857600        # flush when buffer reaches 100 MiB (de
 flush_interval_secs   = 900             # flush every N seconds regardless of size (default 900)
 channel_capacity      = 6400            # bounded channel depth
                                         # (default: 100 MiB budget / 16384 B per record)
-max_buffer_rows       = 100000          # hard-cap rows before oldest are dropped (default 100 000)
+max_buffer_rows       = 100000          # flush trigger; drop cap is 4x (default 100 000)
 ```
 
 The `[wef.s3]` block is optional; when absent, WEF events are not persisted to S3.
