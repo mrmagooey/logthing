@@ -29,8 +29,8 @@ directory = "/var/lib/logthing/otlp"
 
 | Exporter | Configuration |
 |---|---|
-| OpenTelemetry Collector | `otlphttp` exporter, `endpoint: http://logthing:5985`, `compression: gzip` (logs path `/v1/logs` is appended automatically) |
-| OTel SDKs | `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, `OTEL_EXPORTER_OTLP_ENDPOINT=http://logthing:5985`; set `OTEL_EXPORTER_OTLP_COMPRESSION=gzip` to compress |
+| OpenTelemetry Collector | `otlphttp` exporter, `endpoint: https://logthing:5986` (or `http://logthing:5985` only when `[tls] enabled = false`), `compression: gzip` (logs path `/v1/logs` is appended automatically) |
+| OTel SDKs | `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, `OTEL_EXPORTER_OTLP_ENDPOINT=https://logthing:5986` (plain `http://logthing:5985` only when `[tls] enabled = false`); set `OTEL_EXPORTER_OTLP_COMPRESSION=gzip` to compress |
 | JSON | `Content-Type: application/json` (OTLP/JSON, camelCase) is accepted |
 | gRPC (port 4317) | **Not supported yet.** Use `otlphttp`. |
 
@@ -52,8 +52,9 @@ or a server with no OTLP sink configured is also answered `503`: an export is ne
 acknowledged unless every configured sink accepted it. Consequently, if one of two sinks is
 permanently closed, every request is answered `503` while the healthy sink keeps accepting the
 records that precede the failure, so client retries re-deliver them there (at-least-once
-duplicates), exactly as for a full channel. WEF is unchanged (200 and a counted
-drop).
+duplicates), exactly as for a full channel. WEF is answered the same way: a batch
+a sink refuses gets `503` with `Retry-After`, and the bookmark is not stored, so the client
+re-sends from it.
 
 ## Request size limits
 

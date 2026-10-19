@@ -125,7 +125,7 @@ docker pull ghcr.io/mrmagooey/logthing:latest  # most recent non-prerelease rele
 
 **Platforms**: linux/amd64, linux/arm64 (multi-arch manifest).
 
-**Exposed ports** (Dockerfile `EXPOSE`): 5985 (HTTP/WEF), 5986 (HTTPS/TLS), 9090 (Prometheus metrics).
+**Exposed ports** (Dockerfile `EXPOSE`): 5986 (HTTPS/TLS; the main server with `[tls] enabled = true`, the default) or 5985 (plain HTTP, only when TLS is disabled), 9090 (Prometheus metrics).
 
 The runtime listeners (syslog UDP 514/TCP 601, IPFIX UDP 4739) must be published separately via `-p` or the compose `ports:` mapping if they need to be reachable from outside the container.
 

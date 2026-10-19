@@ -171,10 +171,13 @@ have been **removed** — they return `405`/`404` now. Configuration is
 changed by editing `logthing.toml` (or an `/etc/logthing/config` drop-in) or
 setting `LOGTHING__*` environment variables, layered over the file, with
 environment variables winning; both require a restart to take effect.
-`security.allowed_ips` and `aggregate.rules` have **no environment-variable
-equivalent** and remain file-only — the first is a list and the loader sets
-no list separator, the second is a list of tables. Setting
-`LOGTHING__SECURITY__ALLOWED_IPS` does nothing.
+List-valued settings (`security.allowed_ips`, `aggregate.rules`,
+`wef.subscriptions`, `metrics.cardinality_watch`, and the redaction
+`drop_fields`, `hash_fields` and `mask_patterns`) have **no environment-variable
+equivalent** and remain file-only — the loader sets no list separator and has
+no syntax for a list of tables. Setting one, for example
+`LOGTHING__SECURITY__ALLOWED_IPS`, makes startup fail with
+`invalid type: string "...", expected a sequence`.
 
 Because there are no state-changing routes left, there is nothing left to
 protect against a forged form submission, so the token-based protection for
