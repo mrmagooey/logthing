@@ -6,6 +6,8 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-10-18
+
 ### Fixed
 
 - Analytics: `ocsf_authentication` reads the WEF logon fields from `parsed.data` instead of
@@ -13,6 +15,17 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   NULL for those fields.
 - WEF: the channel budget now counts the parsed EventData map, so per-channel capacity drops from
   8533 to 6400 events.
+- Metrics: the `/metrics` HELP text for `wef_xml_parse_errors`, `zeek_missing_path` and
+  `suricata_missing_event_type` now describes what each counter counts.
+
+### Changed
+
+- Docs: corrected metric names in the example alerts (no `_total` suffix), the Iceberg
+  `[iceberg.s3]` example and its `prefix`/`DESC_PREFIX` pairing, WEF `503` and load-balancing
+  guidance, `max_buffer_rows` semantics, and list-valued settings, which cannot be set through
+  `LOGTHING__*` environment variables.
+- Analytics stack default image pins move to 0.24.0 for both logthing and the committer (still in
+  lockstep); Helm chart version 0.2.4.
 
 ## [0.23.1] - 2026-10-16
 
