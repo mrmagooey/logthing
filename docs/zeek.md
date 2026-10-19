@@ -33,7 +33,7 @@ Records with a `_path` value that does not match one of the six curated stream n
 **Robustness**:
 - Lines longer than 16 MiB are rejected and the connection is closed; the `zeek_oversized_lines` counter is incremented.
 - Non-UTF-8 and invalid JSON lines are skipped (per-line, not per-connection); `zeek_parse_errors` is incremented.
-- The per-process stream map is bounded at 256 distinct `_path` values (`MAX_ZEEK_STREAMS`). Records whose sanitised path would create a 257th stream are routed to the `"unknown"` envelope stream and counted by `parquet_s3_partitions_capped{source="zeek"}`.
+- The per-process stream map is bounded at 256 distinct `_path` values. Records whose sanitised path would create a 257th stream are routed to the `_overflow` stream and counted by `parquet_s3_partitions_capped{source="zeek"}`.
 - `_path` values are sanitised before use in S3 keys (lowercased, `[a-z0-9_]` only, truncated to 64 characters; empty result → `"unknown"`).
 - **TCP idle timeout**: same 300-second (5 minute) idle timeout as syslog's TCP listener — see "TCP idle timeout" in [syslog.md](syslog.md). Applies to the Suricata TCP listener too.
 
@@ -56,7 +56,7 @@ flush_threshold_bytes = 104857600        # flush when buffer reaches 100 MiB (de
 flush_interval_secs   = 900             # flush every N seconds regardless of size (default 900)
 channel_capacity      = 40960           # bounded channel between listener and writer
                                         # (default: 100 MiB budget / 2560 B per record)
-max_buffer_rows       = 100000          # hard-cap rows before oldest are dropped (default 100 000)
+max_buffer_rows       = 100000          # flush when this many rows are buffered (default 100 000)
 ```
 
 The `[zeek.s3]` block is optional; when absent, records are handled by the default handler (logged only) and no S3 writes occur.
@@ -88,7 +88,9 @@ Each stream produces a separate Parquet file series using its own typed schema (
 
 Suricata is configured the same way as Zeek: a TCP NDJSON listener (default port 47761, disabled by
 default) with optional `[suricata.s3]` / `[suricata.local]` sinks (prefix defaults to `"suricata"`,
-other keys and defaults as for `[zeek.s3]`). One EVE record per line; the `event_type` field
+other keys and defaults as for `[zeek.s3]`, except `channel_capacity`, which defaults to 22755:
+the 100 MiB channel budget divided by Suricata's larger per-record estimate, versus 40960 for
+Zeek). One EVE record per line; the `event_type` field
 selects the output stream. The 300-second TCP idle timeout described above applies.
 
 ```toml
