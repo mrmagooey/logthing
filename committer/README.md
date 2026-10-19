@@ -3,8 +3,8 @@
 logthing writes Parquet files to S3-compatible object storage and, for every
 file, drops a small JSON *descriptor* under the prefix set by logthing's
 `[iceberg.s3].prefix` (empty by default, so beside the Parquet; it must match the
-committer's `DESC_PREFIX`, default `_iceberg_descriptors/`), describing what it wrote: source,
-optional partition, the file's location, row/byte counts, and per-column
+committer's `DESC_PREFIX`, default `_iceberg_descriptors/`), describing what it wrote:
+source, optional partition, the file's location, row/byte counts, and per-column
 Parquet statistics (see logthing's `src/forwarding/iceberg_descriptor.rs`).
 
 `commit.py` drains that prefix as a work queue: for every descriptor it

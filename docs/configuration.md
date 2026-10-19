@@ -198,6 +198,7 @@ Two shared knobs sit in the `[metrics]` table and apply to every entry:
 | `cardinality_max_values` | integer | `100000` | Cap on distinct values tracked per window; extra values are counted in `field_distinct_values_capped`. Must be > 0. |
 
 ```toml
+# each watched source must be enabled ([zeek] here; WEF is always on)
 [metrics]
 cardinality_window_secs = 3600
 cardinality_max_values = 100000

@@ -13,9 +13,12 @@ destination.
 
 ```toml
 [iceberg.s3]
-bucket = "logthing-data"
-region = "us-east-1"
-prefix = "_iceberg_descriptors"
+endpoint   = "http://localhost:9000"   # S3-compatible endpoint
+bucket     = "logthing-data"
+region     = "us-east-1"
+access_key = "minioadmin"
+secret_key = "minioadmin"
+prefix     = "_iceberg_descriptors"
 ```
 
 `prefix` defaults to `""`, which writes descriptors beside the Parquet files. The bundled

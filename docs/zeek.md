@@ -90,8 +90,8 @@ Suricata is configured the same way as Zeek: a TCP NDJSON listener (default port
 default) with optional `[suricata.s3]` / `[suricata.local]` sinks (prefix defaults to `"suricata"`,
 other keys and defaults as for `[zeek.s3]`, except `channel_capacity`, which defaults to 22755:
 the 100 MiB channel budget divided by Suricata's larger per-record estimate, versus 40960 for
-Zeek). One EVE record per line; the `event_type` field
-selects the output stream. The 300-second TCP idle timeout described above applies.
+Zeek). One EVE record per line; the `event_type` field selects the output stream. The
+300-second TCP idle timeout described above applies.
 
 ```toml
 [suricata]

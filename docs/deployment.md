@@ -61,8 +61,8 @@ Running more than one instance: see [scaling.md](scaling.md).
 3. **Client Certificates**: Configure mTLS for additional security
 4. **Firewall**: Open only the listener ports you actually use between hosts.
    Defaults: `5986` (HTTPS/TLS, the main server with `[tls] enabled = true`, the default) or
-   `5985` (plain HTTP, only when TLS is disabled), `9090` (Prometheus metrics), `514`/`601` (syslog UDP/TCP), `4739` (IPFIX UDP), `47760` (Zeek
-   TCP), `47761` (Suricata TCP), `6343` (sFlow UDP), and `8080` (admin
-   interface, see [admin.md](admin.md); it binds loopback only by default,
+   `5985` (plain HTTP, only when TLS is disabled), `9090` (Prometheus metrics), `514`/`601`
+   (syslog UDP/TCP), `4739` (IPFIX UDP), `47760` (Zeek TCP), `47761` (Suricata TCP), `6343`
+   (sFlow UDP), and `8080` (admin interface, see [admin.md](admin.md); it binds loopback only by default,
    so keep it off the public network unless you set `LOGTHING_ADMIN_BIND`).
 5. **Least Privilege**: Run server with minimal permissions

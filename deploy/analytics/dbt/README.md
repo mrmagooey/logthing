@@ -23,8 +23,9 @@ Helm: `kubectl port-forward svc/<release>-logthing-analytics-trino 8443` and rea
 on first data. The shipped stack (compose and Helm `logthing.toml`) never enables `[wef]` or
 `[suricata]`, so the `wef` and `suricata` tables are never created until you add that logthing
 configuration yourself (WEF also needs `[wef.s3]`, subscriptions and Kerberos or mTLS).
-`stg_*` views use the `source_or_empty` macro, so `dbt build` works on an empty lake (empty views), but a view built while its table was missing stays empty: run `dbt run` again once
-the table exists.
+`stg_*` views use the `source_or_empty` macro, so `dbt build` works on an empty lake (empty
+views), but a view built while its table was missing stays empty: run `dbt run` again once the
+table exists.
 
 ## Models
 
