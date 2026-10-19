@@ -11,6 +11,18 @@ both `iceberg.s3` and `iceberg.local` simultaneously is a startup error —
 unlike other sources, the descriptor sink supports exactly one
 destination.
 
+```toml
+[iceberg.s3]
+bucket = "logthing-data"
+region = "us-east-1"
+prefix = "_iceberg_descriptors"
+```
+
+`prefix` defaults to `""`, which writes descriptors beside the Parquet files. The bundled
+committer reads descriptors only under its `DESC_PREFIX` (default `_iceberg_descriptors/`), so
+`prefix` must equal the committer's `DESC_PREFIX` (ignoring the trailing slash). With both
+defaults left in place no tables are created and no error is raised.
+
 The descriptor carries `sha256`, the lowercase-hex SHA-256 of the exact Parquet bytes
 that were uploaded, next to `file_size_in_bytes`. It is a corruption / consistency check
 only: it is stored beside the data it describes, so it is NOT tamper evidence. The bundled
