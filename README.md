@@ -137,10 +137,10 @@ cargo test              # unit + integration tests
 ```
 
 **End-to-end suite** (requires Docker with Compose v2) — builds the helper
-images, launches `tests/e2e/docker-compose.yml`, replays Windows event
+images, launches `tests/e2e/simulation-environment/docker-compose.yml`, replays Windows event
 fixtures, emits syslog traffic, sends IPFIX flows, emits Zeek NDJSON logs,
-verifies throughput counters, and confirms Parquet files arrive in the MinIO
-bucket for each protocol. Containers shut down automatically once the
+verifies throughput counters, and confirms Parquet files arrive in the SeaweedFS
+bucket (the compose service is still named `minio`) for each protocol. Containers shut down automatically once the
 generators and verifiers exit:
 
 ```bash

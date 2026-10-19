@@ -152,9 +152,12 @@ src/
   middleware/   # HTTP middleware
   models/       # Data structures
   parser/       # Event parsing logic
+  profiling/    # CPU profiling instrumentation (sampler behind the off-by-default `pprof` feature)
   redaction/    # HEC/OTLP drop/hash/mask rules
-  server/       # HTTP server implementation (OTLP handler + mapper in otlp.rs)
+  server/       # HTTP server implementation (`handle_otlp_logs` in mod.rs; OTLP mapper in otlp.rs)
+  sflow/        # sFlow flow ingestion
   stats/        # Metrics and statistics
+  suricata/     # Suricata EVE JSON ingestion
   syslog/       # Syslog listener
   wef/          # WEF wire protocol: SOAP, SLDC, Kerberos multipart, subscriptions, bookmarks
   zeek/         # Zeek NDJSON ingestion
