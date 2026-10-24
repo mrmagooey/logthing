@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file, newest
 first, loosely following [Keep a Changelog](https://keepachangelog.com/).
 This file starts at 0.15.0; earlier releases are not backfilled.
 
-## [Unreleased]
+## [0.25.0] - 2026-10-24
 
 ### Added
 
@@ -12,6 +12,13 @@ This file starts at 0.15.0; earlier releases are not backfilled.
   or regex, ANDed within a rule) on all eight sources before they are enqueued, redacted or
   aggregated. Filtered events are acknowledged; `events_filtered{source,rule}` counts them. See
   `docs/filter.md`.
+
+### Changed
+
+- Analytics stack default image pins move to 0.25.0 for both logthing and the committer (still in
+  lockstep); Helm chart version 0.2.5.
+- CI now builds, tests and lints `tools/loadgen`, whose OTLP tests had stopped compiling after
+  0.23.1's OTLP limits and no-sink 503; those tests are repaired.
 
 ## [0.24.0] - 2026-10-18
 
