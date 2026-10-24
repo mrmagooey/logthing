@@ -410,6 +410,12 @@ pub(crate) const DESCRIPTIONS: &[(Kind, &str, &str)] = &[
         "iceberg_descriptor_upload_errors",
         "Iceberg descriptor uploads that returned an error.",
     ),
+    // ── filter ────────────────────────────────────────────────────────────
+    (
+        Kind::Counter,
+        "events_filtered",
+        "Events dropped by a `[[filter.rules]]` entry before being enqueued, by source and rule.",
+    ),
     // ── aggregation ───────────────────────────────────────────────────────
     (
         Kind::Counter,

@@ -313,6 +313,21 @@ bind_address = "0.0.0.0"   # env: LOGTHING__SFLOW__BIND_ADDRESS
 # stream = "dns"
 # group_by = ["query", "id.orig_h"]
 
+# Optional event filter: drop whole events that match a rule, on any source, before they are
+# stored. A rule's conditions are ANDed; any matching rule drops the event. A condition is a
+# value, a list of values (any-of) or { regex = "..." }. The named source must be enabled.
+# FILE-ONLY: no environment variable equivalent (filter.rules is a list of tables).
+# See docs/filter.md.
+# [[filter.rules]]
+# name = "systemd-started"
+# source = "syslog"
+# match = { app_name = "systemd", message = { regex = "^Started " } }
+#
+# [[filter.rules]]
+# name = "wef-wfp-noise"
+# source = "wef"
+# match = { event_id = [5156, 5158] }
+
 # HEC (Splunk HTTP Event Collector) and NDJSON ingest. Disabled by default.
 # Enabling it REQUIRES a sink ([hec.s3] and/or [hec.local]); otherwise startup fails.
 # See docs/hec.md.

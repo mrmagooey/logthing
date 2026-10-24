@@ -19,6 +19,7 @@ A log ingestion server written in Rust (single-node ceilings measured in [docs/p
 - **Durable Spool**: Optional on-disk spool in front of S3 uploads that survives outages and restarts, with documented per-source delivery guarantees — see [docs/delivery-semantics.md](docs/delivery-semantics.md)
 - **S3 Object Lock**: Write-once retention (GOVERNANCE/COMPLIANCE) for uploaded Parquet and descriptors — see [docs/object-lock.md](docs/object-lock.md)
 - **Iceberg Descriptor Output**: Optional per-file JSON descriptors (row count, stats, location) for an external Apache Iceberg committer
+- **Event Filter**: Drop whole events that match configured field/value rules (exact, any-of or regex) on every source, before they are stored — see [docs/filter.md](docs/filter.md)
 - **Log Aggregation**: Optionally count records as they arrive, grouped by configured columns, writing an SQL `GROUP BY`-style table to Parquet instead of the raw rows — cuts noisy streams down to their useful summary
 - **TLS/SSL Encryption**: Secure connections with certificate support
 - **IP Whitelisting**: Control which hosts can connect

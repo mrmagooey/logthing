@@ -28,6 +28,9 @@ Per-source ingest counters:
 - `syslog_messages_received`, `ipfix_datagrams_received`, `ipfix_flows_decoded`,
   `sflow_datagrams_received`, `suricata_records_received`, `hec_events_received`,
   `otlp_logs_received`
+- `events_filtered{source,rule}` - events dropped by a `[[filter.rules]]` entry; `rule` is the
+  rule `name`. Listener `*_received` counters and WEF throughput include these events;
+  `hec_events_received` and `otlp_logs_received` do not. See [filter.md](filter.md)
 - `redactions_applied{source,rule}` - values changed by `[hec.redaction]` /
   `[otlp.redaction]`; `source` is `hec` or `otlp`, `rule` is `drop`, `hash`, `mask` or
   `body_unparseable` (a JSON-looking OTLP body that could not be parsed was replaced

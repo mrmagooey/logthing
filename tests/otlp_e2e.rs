@@ -99,6 +99,7 @@ mod otlp_e2e {
             event_parser: None,
             parquet_s3_sender: None,
             parquet_local_sender: None,
+            wef_filter: None,
         })
     }
 
@@ -304,6 +305,7 @@ mod otlp_e2e {
             event_parser: None,
             parquet_s3_sender: None,
             parquet_local_sender: None,
+            wef_filter: None,
         });
         let router = Router::new()
             .route("/v1/logs", post(handle_otlp_logs))

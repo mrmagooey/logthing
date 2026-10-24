@@ -1,5 +1,6 @@
 //! Zeek TCP NDJSON listener.
 
+use crate::filter::SourceFilter;
 use crate::middleware::IpWhitelist;
 use crate::stats::cardinality::CardinalityWatcher;
 use crate::zeek::ZeekRecord;
@@ -172,6 +173,7 @@ pub struct ZeekListener {
     handler: Arc<dyn ZeekHandler>,
     allowed_ips: IpWhitelist,
     cardinality: Vec<Arc<CardinalityWatcher>>,
+    filter: Option<Arc<SourceFilter>>,
 }
 
 impl ZeekListener {
@@ -181,6 +183,7 @@ impl ZeekListener {
             handler,
             allowed_ips: IpWhitelist::empty(),
             cardinality: Vec::new(),
+            filter: None,
         }
     }
 
@@ -198,6 +201,14 @@ impl ZeekListener {
     /// ever sees its own zeek watches, never wef's.
     pub fn with_cardinality_watchers(mut self, cardinality: Vec<Arc<CardinalityWatcher>>) -> Self {
         self.cardinality = cardinality;
+        self
+    }
+
+    /// Attach the compiled `[[filter.rules]]` for `source = "zeek"`. Matching records are
+    /// dropped before cardinality observation and before the handler chain (including
+    /// aggregation); arrival counters still count them. Defaults to `None` (no filtering).
+    pub fn with_filter(mut self, filter: Option<Arc<SourceFilter>>) -> Self {
+        self.filter = filter;
         self
     }
 
@@ -245,10 +256,11 @@ impl ZeekListener {
                                     let idle_timeout = TCP_IDLE_TIMEOUT;
                                     let byte_budget = byte_budget.clone();
                                     let cardinality = self.cardinality.clone();
+                                    let filter = self.filter.clone();
                                     let conn_shutdown = shutdown_rx.clone();
                                     conns.spawn(async move {
                                         let _permit = permit; // held for connection lifetime
-                                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler, idle_timeout, byte_budget, cardinality, conn_shutdown).await {
+                                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler, idle_timeout, byte_budget, cardinality, filter, conn_shutdown).await {
                                             error!("Zeek TCP connection error from {}: {}", src, e);
                                         }
                                     });
@@ -307,6 +319,7 @@ impl ZeekListener {
                             let idle_timeout = TCP_IDLE_TIMEOUT;
                             let byte_budget = byte_budget.clone();
                             let cardinality = self.cardinality.clone();
+                            let filter = self.filter.clone();
                             let conn_shutdown = shutdown_rx.clone();
                             tokio::spawn(async move {
                                 let _permit = permit; // held for connection lifetime
@@ -317,6 +330,7 @@ impl ZeekListener {
                                     idle_timeout,
                                     byte_budget,
                                     cardinality,
+                                    filter,
                                     conn_shutdown,
                                 )
                                 .await
@@ -348,6 +362,7 @@ impl ZeekListener {
     /// past each `ZEEK_BUDGET_CHUNK_BYTES` boundary and released when the buffer is cleared or
     /// the connection ends, so `ZEEK_MAX_LINE_BYTES` can stay generous per line without letting
     /// `MAX_ZEEK_TCP_CONNECTIONS` concurrent maxed-out lines multiply into unbounded memory.
+    #[allow(clippy::too_many_arguments)] // ponytail: plain params beat a one-use struct
     async fn handle_tcp_connection(
         stream: TcpStream,
         src: SocketAddr,
@@ -355,6 +370,7 @@ impl ZeekListener {
         idle_timeout: Duration,
         byte_budget: Arc<Semaphore>,
         cardinality: Vec<Arc<CardinalityWatcher>>,
+        filter: Option<Arc<SourceFilter>>,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let mut reader = BufReader::new(stream);
@@ -549,6 +565,11 @@ impl ZeekListener {
                 "log_path" => crate::zeek::schema::metric_log_path(&record.log_path)
             )
             .increment(1);
+            // Filtered records are neither observed by cardinality watchers nor forwarded;
+            // the arrival counters above keep counting them.
+            if crate::filter::should_drop(filter.as_deref(), &record) {
+                continue;
+            }
             // Cardinality watching observes here for the same reason as the
             // counters above: every handler routes through this one point,
             // so a configured watch fires regardless of which forwarding
@@ -704,6 +725,7 @@ mod tests {
             TCP_IDLE_TIMEOUT,
             full_byte_budget(),
             Vec::new(),
+            None,
             never_shutdown(),
         )
         .await
@@ -775,6 +797,7 @@ mod tests {
             TCP_IDLE_TIMEOUT,
             full_byte_budget(),
             Vec::new(),
+            None,
             never_shutdown(),
         )
         .await
@@ -870,6 +893,7 @@ mod tests {
             TCP_IDLE_TIMEOUT,
             full_byte_budget(),
             vec![watcher.clone()],
+            None,
             never_shutdown(),
         )
         .await
@@ -1361,6 +1385,7 @@ mod tests {
             Duration::from_millis(100),
             full_byte_budget(),
             Vec::new(),
+            None,
             never_shutdown(),
         )
         .await
@@ -1491,6 +1516,7 @@ mod tests {
             Duration::from_secs(5),
             full_byte_budget(),
             Vec::new(),
+            None,
             never_shutdown(),
         )
         .await
@@ -1575,6 +1601,7 @@ mod tests {
                     TCP_IDLE_TIMEOUT,
                     budget,
                     Vec::new(),
+                    None,
                     never_shutdown(),
                 )
                 .await
@@ -1770,6 +1797,7 @@ mod tests {
                 Duration::from_secs(60),
                 full_byte_budget(),
                 Vec::new(),
+                None,
                 rx,
             )
             .await
@@ -1891,5 +1919,53 @@ mod tests {
             .await
             .expect("listener must exit within 1 s of the sender dropping")
             .unwrap();
+    }
+    // -- Event filter: matching records never reach the handler --
+
+    #[tokio::test]
+    async fn test_filter_drops_matching_zeek_records() {
+        let mut config = crate::config::Config::default();
+        config.zeek.enabled = true;
+        config.filter.rules = vec![crate::config::FilterRule {
+            name: "drop-noise".to_string(),
+            source: "zeek".to_string(),
+            r#match: [
+                ("log_path", serde_json::json!("dns")),
+                ("query", serde_json::json!("wpad")),
+            ]
+            .into_iter()
+            .map(|(k, v): (&str, serde_json::Value)| (k.to_string(), v))
+            .collect(),
+        }];
+        let filters = crate::filter::compile_filters(&config).unwrap();
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+        let handler = CapturingHandler::new();
+        let listener = ZeekListener::new(ZeekListenerConfig::default(), handler.clone())
+            .with_filter(filters.for_source("zeek"));
+        let task = tokio::spawn(async move {
+            listener.run_with_listener(tcp_listener).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                concat!(
+                    "{\"_path\":\"dns\",\"query\":\"wpad\"}\n",
+                    "{\"_path\":\"dns\",\"query\":\"example.com\"}\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        drop(stream);
+        sleep(Duration::from_millis(200)).await;
+        task.abort();
+
+        let records = handler.take_records();
+        assert_eq!(records.len(), 1, "got {records:?}");
+        assert_eq!(records[0].fields["query"], "example.com");
     }
 }

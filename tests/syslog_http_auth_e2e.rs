@@ -30,6 +30,7 @@ async fn build_app_state(token: &str) -> Arc<AppState> {
         event_parser: None,
         parquet_s3_sender: None,
         parquet_local_sender: None,
+        wef_filter: None,
     })
 }
 

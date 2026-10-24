@@ -323,6 +323,9 @@ pub struct AppState {
             crate::forwarding::parquet_s3::WefSink,
         >,
     >,
+    /// Compiled `[[filter.rules]]` for `source = "wef"`; matching events are dropped in
+    /// `process_single_event` (counted as accepted so the bookmark advances).
+    pub wef_filter: Option<Arc<crate::filter::SourceFilter>>,
 }
 
 pub struct Server {
@@ -569,6 +572,10 @@ impl Server {
             }
         }
 
+        // `[[filter.rules]]`; `main` already compiled them once, so this cannot fail on a
+        // config that reached here, but propagate rather than unwrap.
+        let filters = crate::filter::compile_filters(&config)?;
+
         let state = Arc::new(AppState {
             config: Arc::clone(&shared_config),
             throughput,
@@ -580,6 +587,7 @@ impl Server {
             event_parser,
             parquet_s3_sender,
             parquet_local_sender,
+            wef_filter: filters.for_source("wef"),
         });
 
         // --- Build IngestState for HEC / NDJSON and OTLP ingest routes ---
@@ -713,6 +721,8 @@ impl Server {
             otlp_local: otlp_local_handler,
             hec_redactor,
             otlp_redactor,
+            hec_filter: filters.for_source("hec"),
+            otlp_filter: filters.for_source("otlp"),
         };
 
         Ok(Self {
@@ -1156,6 +1166,12 @@ async fn process_single_event(state: &Arc<AppState>, event: WindowsEvent) -> boo
     let event_type = describe_event_type(&event);
     state.throughput.record_event(event_type).await;
 
+    // Filtered events count as accepted (return true) so the bookmark advances; they are
+    // still in throughput stats (arrivals) but never observed or forwarded.
+    if crate::filter::should_drop(state.wef_filter.as_deref(), event.as_ref()) {
+        return true;
+    }
+
     // Cardinality watching observes here for the same reason
     // `zeek::listener` observes beside `zeek_records_received`: this is
     // WEF's per-record chokepoint, upstream of every forwarding
@@ -1318,6 +1334,7 @@ mod tests {
             event_parser: None,
             parquet_s3_sender: None,
             parquet_local_sender: None,
+            wef_filter: None,
         })
     }
 
@@ -1502,6 +1519,7 @@ event_parsers:
             event_parser: Some(event_parser),
             parquet_s3_sender: None,
             parquet_local_sender: None,
+            wef_filter: None,
         });
 
         let mut parsed = sample_parsed_event();
@@ -1708,6 +1726,96 @@ event_parsers:
             2.0,
             "2 distinct computer values from Security events; the System event's computer \
              must have been excluded by the stream filter"
+        );
+    }
+
+    fn filter_for(
+        source: &str,
+        field: &str,
+        value: serde_json::Value,
+    ) -> Option<Arc<crate::filter::SourceFilter>> {
+        let mut config = Config::default();
+        config.hec.enabled = true;
+        config.otlp.enabled = true;
+        config.filter.rules = vec![crate::config::FilterRule {
+            name: "drop-it".to_string(),
+            source: source.to_string(),
+            r#match: [(field.to_string(), value)].into_iter().collect(),
+        }];
+        crate::filter::compile_filters(&config)
+            .unwrap()
+            .for_source(source)
+    }
+
+    fn wef_event(event_id: u32, computer: &str) -> WindowsEvent {
+        let mut parsed = sample_parsed_event();
+        parsed.event_id = event_id;
+        parsed.computer = computer.to_string();
+        WindowsEvent::new("collector".into(), "<Event/>".into()).with_parsed(parsed)
+    }
+
+    #[tokio::test]
+    async fn wef_filtered_event_counts_as_accepted() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut state = default_state().await;
+        {
+            let st = Arc::get_mut(&mut state).unwrap();
+            st.wef_filter = filter_for("wef", "event_id", serde_json::json!(4624));
+            st.parquet_s3_sender = Some(crate::forwarding::buffered_writer::ParquetWriterHandle::<
+                crate::forwarding::parquet_s3::WefSink,
+            >::for_test(tx, "wef", "test"));
+        }
+        assert!(process_single_event(&state, wef_event(4624, "HOST")).await);
+        assert!(
+            rx.try_recv().is_err(),
+            "filtered event must not be enqueued"
+        );
+        assert!(process_single_event(&state, wef_event(4625, "HOST")).await);
+        assert!(rx.try_recv().is_ok(), "unfiltered event must be enqueued");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::mutable_key_type)] // false positive: CompositeKey AtomicBool is never hashed
+    async fn wef_filter_runs_before_cardinality_watch() {
+        use crate::stats::cardinality::{CardinalityWatcher, CompiledWatch};
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+        let watcher = Arc::new(CardinalityWatcher::new(
+            CompiledWatch {
+                source: "wef".to_string(),
+                stream: "Security".to_string(),
+                field: "computer".to_string(),
+            },
+            1000,
+        ));
+        let mut state =
+            build_state_with_config_and_wef_watchers(Config::default(), vec![watcher.clone()])
+                .await;
+        Arc::get_mut(&mut state).unwrap().wef_filter =
+            filter_for("wef", "computer", serde_json::json!("HOST-FILTERED"));
+
+        assert!(process_single_event(&state, wef_event(4624, "HOST-FILTERED")).await);
+        assert!(process_single_event(&state, wef_event(4624, "HOST-KEPT")).await);
+        watcher.tick();
+
+        let distinct = snapshotter
+            .snapshot()
+            .into_hashmap()
+            .iter()
+            .find_map(|(k, (_, _, v))| match v {
+                DebugValue::Gauge(g) if k.key().name() == "field_distinct_values" => {
+                    Some(g.into_inner())
+                }
+                _ => None,
+            })
+            .unwrap_or(0.0);
+        assert_eq!(
+            distinct, 1.0,
+            "the filtered computer must never be observed"
         );
     }
 
@@ -4059,6 +4167,147 @@ event_parsers:
                 .sum()
         }
 
+        /// Two-record export: one with `http.route=/healthz`, one with `/api`, both carrying
+        /// the body "secret-body" so a mask pattern can prove ordering.
+        fn otlp_request_with_routes() -> Vec<u8> {
+            let mut req = make_proto_request();
+            let mut healthz = req.resource_logs[0].scope_logs[0].log_records[0].clone();
+            let mut api = healthz.clone();
+            for (rec, route) in [(&mut healthz, "/healthz"), (&mut api, "/api")] {
+                rec.attributes = vec![KeyValue {
+                    key: "http.route".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(AnyVal::StringValue(route.to_string())),
+                    }),
+                    ..Default::default()
+                }];
+            }
+            req.resource_logs[0].scope_logs[0].log_records = vec![healthz, api];
+            req.encode_to_vec()
+        }
+
+        fn otlp_filter(value: &str) -> Option<Arc<crate::filter::SourceFilter>> {
+            super::filter_for("otlp", "attributes.http.route", serde_json::json!(value))
+        }
+
+        #[tokio::test]
+        async fn otlp_filter_drops_matching_records() {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let (h, mut rx) = stalled_otlp_handle(8);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                otlp_filter: otlp_filter("/healthz"),
+                ..Default::default()
+            })
+            .await;
+            let resp = app
+                .oneshot(otlp_post(otlp_request_with_routes()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let rec = rx.try_recv().expect("unfiltered record reaches the sink");
+            assert!(
+                rx.try_recv().is_err(),
+                "filtered record must not be enqueued"
+            );
+            assert!(format!("{:?}", rec.attributes).contains("/api"), "{rec:?}");
+            assert_eq!(counter_value(&snapshotter, "otlp_logs_received"), 1);
+            assert_eq!(counter_value(&snapshotter, "events_filtered"), 1);
+        }
+
+        #[tokio::test]
+        async fn otlp_all_filtered_batch_is_success() {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            // No sink at all: an unfiltered export would be the "no sink" 503.
+            let filter = super::filter_for(
+                "otlp",
+                "attributes.http.route",
+                serde_json::json!(["/healthz", "/api"]),
+            );
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_filter: filter,
+                ..Default::default()
+            })
+            .await;
+            let resp = app
+                .clone()
+                .oneshot(otlp_post(otlp_request_with_routes()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get("content-type").unwrap(),
+                "application/x-protobuf"
+            );
+            assert_eq!(counter_value(&snapshotter, "otlp_logs_received"), 0);
+            assert_eq!(counter_value(&snapshotter, "otlp_events_dropped"), 0);
+            assert_eq!(counter_value(&snapshotter, "events_filtered"), 2);
+            // JSON requests get the JSON success body.
+            let json_req = super::with_connect_info(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/logs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&{
+                            let mut r = make_proto_request();
+                            r.resource_logs[0].scope_logs[0].log_records[0].attributes =
+                                vec![KeyValue {
+                                    key: "http.route".to_string(),
+                                    value: Some(AnyValue {
+                                        value: Some(AnyVal::StringValue("/api".to_string())),
+                                    }),
+                                    ..Default::default()
+                                }];
+                            r
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            );
+            let resp = app.oneshot(json_req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get("content-type").unwrap(),
+                "application/json"
+            );
+        }
+
+        #[tokio::test]
+        async fn otlp_filter_sees_pre_redaction_values() {
+            let redactor = crate::redaction::Redactor::compile_with_env(
+                &crate::config::RedactionConfig {
+                    drop_fields: vec!["http.route".to_string()],
+                    ..Default::default()
+                },
+                crate::redaction::RedactorKind::Otlp,
+                &|_| None,
+            )
+            .unwrap();
+            let (h, mut rx) = stalled_otlp_handle(8);
+            let app = build_otlp_app_with_ingest(IngestState {
+                otlp_local: Some(h),
+                otlp_redactor: Some(Arc::new(redactor)),
+                otlp_filter: otlp_filter("/healthz"),
+                ..Default::default()
+            })
+            .await;
+            let resp = app
+                .oneshot(otlp_post(otlp_request_with_routes()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(rx.try_recv().is_ok(), "the /api record survives");
+            assert!(
+                rx.try_recv().is_err(),
+                "/healthz matched on its raw value even though redaction would drop the attribute"
+            );
+        }
+
         #[tokio::test]
         async fn otlp_logs_received_counts_only_enqueued_records_on_503() {
             let recorder = metrics_util::debugging::DebuggingRecorder::new();
@@ -5027,26 +5276,35 @@ pub async fn handle_otlp_logs(
                 .unwrap());
         }
     };
-    // ORDERING: redaction runs after mapping and BEFORE identity assignment, so unredacted
-    // values never reach a channel, the spool, or disk and the id never depends on them.
-    if let Some(r) = &ingest.otlp_redactor {
-        for rec in records.iter_mut() {
-            r.redact_otlp(rec);
-        }
+    // ORDERING: the filter runs first (rules see raw values), then redaction, and both
+    // run BEFORE identity assignment, so unredacted values never reach a channel, the spool,
+    // or disk and the id never depends on them.
+    let mapped = records.len();
+    if let Some(f) = &ingest.otlp_filter {
+        f.retain_unmatched(&mut records);
     }
-    crate::ingest::assign_event_uuids(&mut records);
-    let count = records.len() as u64;
-    match dispatch_otlp_records(&ingest, records) {
-        Ok(()) => {
-            metrics::counter!("otlp_logs_received").increment(count);
+    // Everything filtered: accepted, nothing to dispatch (and no "no sink" error).
+    let all_filtered = mapped > 0 && records.is_empty();
+    if !all_filtered {
+        if let Some(r) = &ingest.otlp_redactor {
+            for rec in records.iter_mut() {
+                r.redact_otlp(rec);
+            }
         }
-        Err(rejected) => {
-            metrics::counter!("otlp_logs_received").increment(count - rejected);
-            return Ok(Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .header(axum::http::header::RETRY_AFTER, "1")
-                .body(axum::body::Body::empty())
-                .unwrap());
+        crate::ingest::assign_event_uuids(&mut records);
+        let count = records.len() as u64;
+        match dispatch_otlp_records(&ingest, records) {
+            Ok(()) => {
+                metrics::counter!("otlp_logs_received").increment(count);
+            }
+            Err(rejected) => {
+                metrics::counter!("otlp_logs_received").increment(count - rejected);
+                return Ok(Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header(axum::http::header::RETRY_AFTER, "1")
+                    .body(axum::body::Body::empty())
+                    .unwrap());
+            }
         }
     }
 

@@ -116,6 +116,10 @@ pub struct IngestState {
     pub hec_redactor: Option<std::sync::Arc<crate::redaction::Redactor>>,
     /// Compiled `[otlp.redaction]`; `None` when no rule is configured.
     pub otlp_redactor: Option<std::sync::Arc<crate::redaction::Redactor>>,
+    /// Compiled `[[filter.rules]]` for `source = "hec"`; applied before redaction.
+    pub hec_filter: Option<std::sync::Arc<crate::filter::SourceFilter>>,
+    /// Compiled `[[filter.rules]]` for `source = "otlp"`; applied before redaction.
+    pub otlp_filter: Option<std::sync::Arc<crate::filter::SourceFilter>>,
 }
 
 /// Validate an `Authorization` header value against the configured HEC token.
