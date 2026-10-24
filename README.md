@@ -154,16 +154,18 @@ Performance tests are part of that same suite; see
 [tests/e2e/simulation-environment/performance-test/README.md](tests/e2e/simulation-environment/performance-test/README.md)
 for how to run and interpret them.
 
-**Coverage** with [cargo-tarpaulin](https://github.com/xd009642/tarpaulin):
+**Coverage** with [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov):
 
 ```bash
-cargo install cargo-tarpaulin        # one-time tool install
-scripts/run_coverage.sh              # runs tests with instrumentation
+rustup component add llvm-tools-preview    # one-time tool install
+cargo install cargo-llvm-cov --locked
+scripts/run_coverage.sh                    # runs tests with instrumentation
 ```
 
-Writes HTML and XML reports to `target/coverage/` — open
-`target/coverage/tarpaulin-report.html` locally or feed the LCOV/XML data
-into CI.
+Prints a per-file summary and writes it to `target/coverage/summary.txt`, plus an HTML report
+(`target/coverage/html/index.html`), `lcov.info` and `cobertura.xml` for CI. Line counts include
+inline `#[cfg(test)]` modules, and tests that need Docker (real S3, the test KDC) are skipped unless
+their environments are up.
 
 See [AGENTS.md](AGENTS.md) for the full build/test/lint command reference and
 repository conventions.
