@@ -401,7 +401,8 @@ mod tests {
     #[test]
     fn records_map_through_logthings_own_mapper() {
         let req = build_request(0, 6, 1, true);
-        let recs = logthing::server::otlp::map_otlp_request(req, "127.0.0.1:1".into());
+        let recs = logthing::server::otlp::map_otlp_request(req, "127.0.0.1:1".into())
+            .expect("synthetic request is within OTLP limits");
         assert_eq!(recs.len(), 6);
         for r in &recs {
             assert_eq!(r.service_name.as_deref(), Some("loadgen-svc-0"));
@@ -440,6 +441,8 @@ mod tests {
     use axum::http::Request;
     use axum::{Extension, Router};
     use logthing::config::{Config, OtlpConfig};
+    use logthing::forwarding::buffered_writer::ParquetWriterHandle;
+    use logthing::forwarding::otlp_s3::OtlpRecord;
     use logthing::ingest::IngestState;
     use logthing::ingest::decompress::post_gzip;
     use logthing::server::{AppState, handle_otlp_logs};
@@ -470,6 +473,23 @@ mod tests {
         })
     }
 
+    /// An `IngestState` whose OTLP sink is a plain channel. Without a sink `/v1/logs`
+    /// answers 503 (no undeliverable export is acked), so the receiver is returned for the
+    /// test to hold and inspect.
+    fn ingest_with_sink() -> (IngestState, tokio::sync::mpsc::Receiver<OtlpRecord>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(1024);
+        let handle = ParquetWriterHandle::for_test(tx, "otlp", "test");
+        let ingest = IngestState {
+            otlp_local: Some(handle),
+            ..Default::default()
+        };
+        (ingest, rx)
+    }
+
+    fn drain(rx: &mut tokio::sync::mpsc::Receiver<OtlpRecord>) -> usize {
+        std::iter::from_fn(|| rx.try_recv().ok()).count()
+    }
+
     fn router(token: &str, ingest: IngestState) -> Router {
         Router::new()
             .route("/v1/logs", post_gzip(handle_otlp_logs))
@@ -498,15 +518,27 @@ mod tests {
     #[tokio::test]
     async fn generated_gzip_protobuf_is_accepted_by_the_real_otlp_handler() {
         let body = gzip(&build_request(0, 10, 3, true).encode_to_vec()).unwrap();
-        let r = router("it-token", IngestState::default());
+        let (ingest, mut rx) = ingest_with_sink();
+        let r = router("it-token", ingest);
         assert_eq!(post(r, body, true, "it-token").await, 200);
+        assert_eq!(
+            drain(&mut rx),
+            10,
+            "every record in the request reaches the sink"
+        );
     }
 
     #[tokio::test]
     async fn generated_plain_protobuf_is_accepted_by_the_real_otlp_handler() {
         let body = build_request(0, 10, 3, false).encode_to_vec();
-        let r = router("it-token", IngestState::default());
+        let (ingest, mut rx) = ingest_with_sink();
+        let r = router("it-token", ingest);
         assert_eq!(post(r, body, false, "it-token").await, 200);
+        assert_eq!(
+            drain(&mut rx),
+            10,
+            "every record in the request reaches the sink"
+        );
     }
 
     #[tokio::test]

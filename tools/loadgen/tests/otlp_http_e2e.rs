@@ -10,6 +10,8 @@ use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Extension, Router};
 use logthing::config::{Config, OtlpConfig};
+use logthing::forwarding::buffered_writer::ParquetWriterHandle;
+use logthing::forwarding::otlp_s3::OtlpRecord;
 use logthing::ingest::IngestState;
 use logthing::ingest::decompress::post_gzip;
 use logthing::server::{AppState, handle_otlp_logs};
@@ -161,9 +163,22 @@ async fn otlp_http_gzip_run_against_real_logthing_router_succeeds() {
         parquet_local_sender: None,
         wef_filter: None,
     });
+    // Without a sink `/v1/logs` answers 503, so give it a channel drained by a counter.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<OtlpRecord>(1024);
+    let received = Arc::new(AtomicUsize::new(0));
+    let counter = received.clone();
+    tokio::spawn(async move {
+        while rx.recv().await.is_some() {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let ingest = IngestState {
+        otlp_local: Some(ParquetWriterHandle::for_test(tx, "otlp", "test")),
+        ..Default::default()
+    };
     let app = Router::new()
         .route("/v1/logs", post_gzip(handle_otlp_logs))
-        .layer(Extension(IngestState::default()))
+        .layer(Extension(ingest))
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))))
         .with_state(state);
     let port = serve(app).await.to_string();
@@ -198,6 +213,16 @@ async fn otlp_http_gzip_run_against_real_logthing_router_succeeds() {
     assert!(
         n > 0 && n.is_multiple_of(10),
         "sent {n}\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    // Every acked record was enqueued before its 200; wait for the drain task to count it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while received.load(Ordering::SeqCst) as u64 != n && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        received.load(Ordering::SeqCst) as u64,
+        n,
+        "stdout:\n{out}\nstderr:\n{err}"
     );
 }
 
