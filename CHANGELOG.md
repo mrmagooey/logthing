@@ -6,6 +6,13 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
+### Added
+
+- Event filter: `[[filter.rules]]` drops whole events that match field rules (equals, any-of list
+  or regex, ANDed within a rule) on all eight sources before they are enqueued, redacted or
+  aggregated. Filtered events are acknowledged; `events_filtered{source,rule}` counts them. See
+  `docs/filter.md`.
+
 ## [0.24.0] - 2026-10-18
 
 ### Fixed

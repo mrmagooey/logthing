@@ -18,6 +18,10 @@ metric shows loss:
 | Syslog TCP | Record dropped when the channel is full (non-blocking enqueue) | Nothing; the connection stays open | `parquet_s3_dropped{source="syslog"}` |
 | Zeek, Suricata (TCP) | The connection task waits up to 5 s for channel space, so the sensor sees TCP backpressure; after the wait the record is dropped | Slow socket, then silence | `parquet_s3_dropped{source="zeek"\|"suricata"}` |
 
+An event dropped by a `[[filter.rules]]` entry is acknowledged like an accepted one (WEF bookmark
+advances, HEC and OTLP answer success) but is never enqueued, spooled or written; see
+[filter.md](filter.md).
+
 Retried HTTP requests get fresh `event_uuid`s, so a client retry after a `503` that accepted
 part of a batch produces duplicate rows (see [At-least-once](#at-least-once-and-duplicates)).
 

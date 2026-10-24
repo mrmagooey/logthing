@@ -80,7 +80,7 @@ environment variables, then restart the process; nothing here applies live.
 file.** The env loader sets no list separator, so a scalar string cannot become a list, and it
 has no syntax for a list of tables. Setting one of these variables makes startup fail with
 `invalid type: string "...", expected a sequence`. The affected keys are `security.allowed_ips`,
-`aggregate.rules`, `wef.subscriptions`, `metrics.cardinality_watch`, and
+`aggregate.rules`, `filter.rules`, `wef.subscriptions`, `metrics.cardinality_watch`, and
 `hec.redaction` / `otlp.redaction` `drop_fields`, `hash_fields` and `mask_patterns`.
 
 Every other config field is reachable this way, including each listener's bind
@@ -107,6 +107,7 @@ Every top-level section of the configuration, with the page that documents its k
 | `[iceberg.s3]`, `[iceberg.local]` | Descriptor files for the Iceberg committer | [iceberg.md](iceberg.md) |
 | `[spool]` | Durable local spool in front of S3 uploads | "Spool" below; [delivery-semantics.md](delivery-semantics.md) |
 | `[aggregate]`, `[[aggregate.rules]]`, `[aggregate.s3]`, `[aggregate.local]` | Group-by counting instead of raw rows | [aggregation.md](aggregation.md) |
+| `[[filter.rules]]` | Drop whole events that match field/value rules, on every source | [filter.md](filter.md) |
 | `object_lock_mode`, `object_lock_retain_days` (in any `.s3` table) | S3 Object Lock | "Shared S3 connection keys" below; [object-lock.md](object-lock.md) |
 
 ## HEC and OTLP require a sink

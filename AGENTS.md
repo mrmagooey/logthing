@@ -146,6 +146,7 @@ use crate::models::WindowsEvent;
 src/
   admin/        # Read-only admin UI and effective-config API (config is restart-only)
   config/       # Configuration loading
+  filter/       # [[filter.rules]] event filter (drops whole records before enqueue)
   forwarding/   # Parquet/S3 and local-disk sinks (incl. otlp_s3.rs typed OTLP sink)
   ingest/       # HEC / NDJSON ingest, event_uuid assignment, gzip request decoding
   ipfix/        # IPFIX / NetFlow flow ingestion
