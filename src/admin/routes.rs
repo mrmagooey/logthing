@@ -1261,6 +1261,20 @@ mod tests {
     #[tokio::test]
     async fn admin_page_renders_config_read_only() {
         let state = test_state().await;
+        state
+            .config
+            .write()
+            .await
+            .filter
+            .rules
+            .push(crate::config::FilterRule {
+                name: "f-admin-visible".to_string(),
+                source: "syslog".to_string(),
+                r#match: std::collections::BTreeMap::from([(
+                    "app_name".to_string(),
+                    serde_json::json!("noisy"),
+                )]),
+            });
         let mut request = create_request_with_auth(Method::GET, "/", "admin", "admin", None);
         inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
 
@@ -1291,6 +1305,18 @@ mod tests {
         assert!(
             body.contains("bind_address"),
             "the effective config must be rendered"
+        );
+        assert!(
+            body.contains("f-admin-visible") && body.contains("noisy"),
+            "the effective config must show the filter rule's name and match:\n{body}"
+        );
+        let rule = body
+            .split("[[filter.rules]]")
+            .nth(1)
+            .expect("the effective config must render a [[filter.rules]] table");
+        assert!(
+            rule.contains("f-admin-visible") && rule.contains("syslog"),
+            "the rule's name and source must follow its table header:\n{rule}"
         );
     }
 
