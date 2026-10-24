@@ -130,7 +130,15 @@ impl AggFields for crate::zeek::ZeekRecord {
         &self.log_path
     }
     fn field(&self, name: &str) -> Option<FieldValue<'_>> {
-        json_field(&self.fields, name)
+        match name {
+            "log_path" => Some(FieldValue::Str(Cow::Borrowed(self.log_path.as_str()))),
+            // Stored Arrow columns flatten Zeek's dotted `id.*` keys to underscores.
+            "id_orig_h" => json_field(&self.fields, "id.orig_h"),
+            "id_orig_p" => json_field(&self.fields, "id.orig_p"),
+            "id_resp_h" => json_field(&self.fields, "id.resp_h"),
+            "id_resp_p" => json_field(&self.fields, "id.resp_p"),
+            other => json_field(&self.fields, other),
+        }
     }
 }
 
@@ -156,6 +164,11 @@ fn opt_str<T: std::fmt::Display>(v: &Option<T>) -> Option<FieldValue<'static>> {
 /// Helper: `Option<T: Into<f64>>` → `FieldValue::Num`.
 fn opt_num<T: Copy + Into<f64>>(v: &Option<T>) -> Option<FieldValue<'static>> {
     v.map(|x| FieldValue::Num(x.into()))
+}
+
+/// Helper: `Option<String>` → borrowed `FieldValue::Str`.
+fn opt_borrowed(v: &Option<String>) -> Option<FieldValue<'_>> {
+    v.as_deref().map(|s| FieldValue::Str(Cow::Borrowed(s)))
 }
 
 impl AggFields for crate::ipfix::FlowRecord {
@@ -205,6 +218,7 @@ impl AggFields for crate::sflow::SflowRecord {
             "dst_port" => opt_num(&self.dst_port),
             "ip_protocol" => opt_num(&self.ip_protocol),
             "sampling_rate" => opt_num(&self.sampling_rate),
+            "sample_type" => Some(FieldValue::Str(Cow::Borrowed(self.stream()))),
             "input_ifindex" => opt_num(&self.input_ifindex),
             "output_ifindex" => opt_num(&self.output_ifindex),
             "if_index" => opt_num(&self.if_index),
@@ -249,6 +263,8 @@ impl AggFields for crate::syslog::SyslogMessage {
                 .as_deref()
                 .map(|s| FieldValue::Str(Cow::Borrowed(s))),
             "message" => Some(FieldValue::Str(Cow::Borrowed(self.message.as_str()))),
+            // Same string `forwarding::syslog_s3` stores in its `protocol` column.
+            "protocol" => Some(FieldValue::Str(Cow::Owned(format!("{:?}", self.protocol)))),
             // RFC 5424 structured data: "sdid.param" addresses one parameter.
             other => {
                 let sd = self.structured_data.as_ref()?;
@@ -262,17 +278,18 @@ impl AggFields for crate::syslog::SyslogMessage {
 }
 
 // ---------------------------------------------------------------------------
-// WEF: cardinality-watcher-only impl, NOT an aggregate source
+// WEF: cardinality-watcher and event-filter impl, NOT an aggregate source
 // ---------------------------------------------------------------------------
 
 /// `AggFields` for `WindowsEvent`, added so `stats::cardinality`'s watcher
 /// can count distinct WEF field values (e.g. `computer`) the same way it
-/// already counts zeek fields.
+/// already counts zeek fields, and so the event filter can name any stored
+/// WEF column (`data.<Name>` addresses one EventData entry).
 ///
-/// This impl exists ONLY for the cardinality watcher. WEF is deliberately
-/// absent from `aggregate::mod::KNOWN_SOURCES` — wiring it into
-/// `[[aggregate.rules]]` is a separate, out-of-scope change; don't read this
-/// impl's presence as WEF having become a supported aggregate source.
+/// This impl serves the cardinality watcher and the event filter. WEF is
+/// still deliberately absent from `aggregate::mod::KNOWN_SOURCES` — wiring it
+/// into `[[aggregate.rules]]` is a separate, out-of-scope change; don't read
+/// this impl's presence as WEF having become a supported aggregate source.
 impl AggFields for crate::models::WindowsEvent {
     /// The parsed event's `Channel` (e.g. `"Security"`, `"System"`,
     /// `"Application"`). An unparsed event (`parsed` is `None` — malformed
@@ -299,6 +316,9 @@ impl AggFields for crate::models::WindowsEvent {
         if name == "source_host" {
             return Some(FieldValue::Str(Cow::Borrowed(self.source_host.as_str())));
         }
+        if name == "subscription_id" {
+            return opt_borrowed(&self.subscription_id);
+        }
         let parsed = self.parsed.as_ref()?;
         match name {
             "computer" => Some(FieldValue::Str(Cow::Borrowed(parsed.computer.as_str()))),
@@ -309,7 +329,78 @@ impl AggFields for crate::models::WindowsEvent {
                 .security_user_id
                 .as_deref()
                 .map(|s| FieldValue::Str(Cow::Borrowed(s))),
-            _ => None,
+            // Windows numeric level: Critical=1 .. Verbose=5.
+            "level" => Some(FieldValue::Num(f64::from(parsed.level.clone() as u8))),
+            "message" => opt_borrowed(&parsed.message),
+            "task" => Some(FieldValue::Num(f64::from(parsed.task))),
+            "opcode" => Some(FieldValue::Num(f64::from(parsed.opcode))),
+            "keywords" => Some(FieldValue::Num(parsed.keywords as f64)),
+            "event_record_id" => Some(FieldValue::Num(parsed.event_record_id as f64)),
+            "process_id" => opt_num(&parsed.process_id),
+            "thread_id" => opt_num(&parsed.thread_id),
+            other => json_field(parsed.data.as_ref()?, other.strip_prefix("data.")?),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HEC and OTLP: event-filter sources
+// ---------------------------------------------------------------------------
+
+impl AggFields for crate::ingest::GenericRecord {
+    fn stream(&self) -> &str {
+        &self.sourcetype
+    }
+    fn field(&self, name: &str) -> Option<FieldValue<'_>> {
+        match name {
+            "sourcetype" => Some(FieldValue::Str(Cow::Borrowed(self.sourcetype.as_str()))),
+            "host" => opt_borrowed(&self.host),
+            "source" => opt_borrowed(&self.source),
+            "index" => opt_borrowed(&self.index),
+            // Matches when the event is a scalar (e.g. raw text).
+            "fields" => scalar(&self.fields),
+            _ => {
+                if let Some(path) = name.strip_prefix("fields.") {
+                    json_field(&self.fields, path)
+                } else if let Some(path) = name.strip_prefix("indexed_fields.") {
+                    json_field(self.indexed_fields.as_ref()?, path)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+impl AggFields for crate::forwarding::otlp_s3::OtlpRecord {
+    fn stream(&self) -> &str {
+        self.service_name.as_deref().unwrap_or("")
+    }
+    fn field(&self, name: &str) -> Option<FieldValue<'_>> {
+        match name {
+            "severity_number" => opt_num(&self.severity_number),
+            "severity_text" => opt_borrowed(&self.severity_text),
+            "body" => opt_borrowed(&self.body),
+            "service_name" => opt_borrowed(&self.service_name),
+            "service_namespace" => opt_borrowed(&self.service_namespace),
+            "service_instance_id" => opt_borrowed(&self.service_instance_id),
+            "host_name" => opt_borrowed(&self.host_name),
+            "peer_addr" => opt_borrowed(&self.peer_addr),
+            "trace_id" => opt_borrowed(&self.trace_id),
+            "span_id" => opt_borrowed(&self.span_id),
+            "flags" => opt_num(&self.flags),
+            "event_name" => opt_borrowed(&self.event_name),
+            "scope_name" => opt_borrowed(&self.scope_name),
+            "scope_version" => opt_borrowed(&self.scope_version),
+            _ => {
+                if let Some(key) = name.strip_prefix("attributes.") {
+                    json_field(&self.attributes, key)
+                } else if let Some(key) = name.strip_prefix("resource_attributes.") {
+                    json_field(&self.resource_attributes, key)
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -664,8 +755,10 @@ mod tests {
     fn windows_event_unmapped_field_names_return_none() {
         let ev = windows_event_parsed("Security", "WORKSTATION-01");
         assert!(ev.field("raw_xml").is_none());
-        assert!(ev.field("subscription_id").is_none());
-        assert!(ev.field("level").is_none());
+        assert!(
+            ev.field("subscription_id").is_none(),
+            "unset subscription is a miss"
+        );
         assert!(ev.field("nonexistent").is_none());
     }
 
@@ -729,5 +822,246 @@ mod tests {
             protocol: crate::syslog::SyslogProtocol::Rfc3164,
         };
         assert_eq!(msg.stream(), "");
+    }
+
+    // -- filter coverage: every stored column resolves --
+
+    fn s<'a>(v: Option<FieldValue<'a>>) -> Option<String> {
+        v.map(|v| match v {
+            FieldValue::Str(s) => s.into_owned(),
+            FieldValue::Num(n) => format!("{n}"),
+            FieldValue::Bool(b) => b.to_string(),
+        })
+    }
+
+    fn wef_fixture() -> crate::models::WindowsEvent {
+        let parsed = crate::models::ParsedEvent {
+            provider: "prov".to_string(),
+            event_id: 4625,
+            level: crate::models::EventLevel::Error,
+            task: 12544,
+            opcode: 0,
+            keywords: 16,
+            time_created: chrono::Utc::now(),
+            event_record_id: 99,
+            process_id: Some(4),
+            thread_id: Some(8),
+            channel: "Security".to_string(),
+            computer: "pc1".to_string(),
+            security_user_id: Some("S-1-5-18".to_string()),
+            message: Some("msg".to_string()),
+            data: Some(serde_json::json!({"TargetUserName": "bob"})),
+        };
+        let mut ev = crate::models::WindowsEvent::new("host1".to_string(), "<Event/>".to_string())
+            .with_parsed(parsed);
+        ev.subscription_id = Some("sub-1".to_string());
+        ev
+    }
+
+    fn sflow_fixtures() -> (crate::sflow::SflowRecord, crate::sflow::SflowRecord) {
+        use std::net::{IpAddr, Ipv4Addr};
+        let flow = crate::sflow::SflowRecord {
+            sample_type: crate::sflow::SampleType::Flow,
+            exporter: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            received_at: chrono::Utc::now(),
+            src_addr: None,
+            dst_addr: None,
+            src_port: None,
+            dst_port: None,
+            ip_protocol: None,
+            sampling_rate: None,
+            input_ifindex: None,
+            output_ifindex: None,
+            if_index: None,
+            if_type: None,
+            if_speed: None,
+            if_direction: None,
+            if_in_octets: None,
+            if_out_octets: None,
+            if_in_ucast_pkts: None,
+            if_out_ucast_pkts: None,
+            if_in_errors: None,
+            if_out_errors: None,
+            extra: serde_json::json!({}),
+        };
+        let mut counter = flow.clone();
+        counter.sample_type = crate::sflow::SampleType::Counter;
+        (flow, counter)
+    }
+
+    fn otlp_fixture() -> crate::forwarding::otlp_s3::OtlpRecord {
+        crate::forwarding::otlp_s3::OtlpRecord {
+            event_uuid: None,
+            time: None,
+            observed_time: None,
+            received_at: chrono::Utc::now(),
+            severity_number: Some(9),
+            severity_text: Some("INFO".into()),
+            body: Some("hello".into()),
+            service_name: Some("api".into()),
+            service_namespace: Some("ns".into()),
+            service_instance_id: Some("i1".into()),
+            host_name: Some("h1".into()),
+            peer_addr: Some("10.0.0.9".into()),
+            trace_id: Some("ab".into()),
+            span_id: Some("cd".into()),
+            flags: Some(1),
+            event_name: Some("ev".into()),
+            scope_name: Some("sc".into()),
+            scope_version: Some("1.0".into()),
+            resource_attributes: serde_json::json!({"k8s.pod.name": "p1"}),
+            attributes: serde_json::json!({"http.route": "/healthz"}),
+        }
+    }
+
+    #[test]
+    fn syslog_protocol_resolves_as_stored() {
+        let m = crate::syslog::SyslogMessage {
+            priority: 13,
+            severity: 5,
+            facility: 1,
+            timestamp: None,
+            hostname: None,
+            app_name: None,
+            proc_id: None,
+            msg_id: None,
+            message: "x".to_string(),
+            structured_data: None,
+            protocol: crate::syslog::SyslogProtocol::Rfc5424,
+        };
+        assert_eq!(s(m.field("protocol")), Some("Rfc5424".into()));
+    }
+
+    #[test]
+    fn zeek_log_path_and_underscore_id_columns_resolve() {
+        let r = crate::zeek::ZeekRecord {
+            log_path: "dns".into(),
+            fields: serde_json::json!({"_path": "dns.04:00:00-05:00:00", "id.orig_h": "10.0.0.1",
+                "id.orig_p": 5353, "id.resp_h": "10.0.0.2", "id.resp_p": 53, "query": "wpad",
+                "answers": ["a", "b"]}),
+            received_at: chrono::Utc::now(),
+        };
+        assert_eq!(s(r.field("log_path")), Some("dns".into()));
+        assert_eq!(
+            s(r.field("_path")),
+            Some("dns.04:00:00-05:00:00".into()),
+            "raw, not aliased"
+        );
+        assert_eq!(s(r.field("id_orig_h")), Some("10.0.0.1".into()));
+        assert_eq!(s(r.field("id.orig_h")), Some("10.0.0.1".into()));
+        assert_eq!(s(r.field("id_orig_p")), Some("5353".into()));
+        assert_eq!(s(r.field("id_resp_h")), Some("10.0.0.2".into()));
+        assert_eq!(s(r.field("id_resp_p")), Some("53".into()));
+        assert_eq!(s(r.field("query")), Some("wpad".into()));
+    }
+
+    #[test]
+    fn array_valued_field_is_not_matchable() {
+        let r = crate::zeek::ZeekRecord {
+            log_path: "dns".into(),
+            fields: serde_json::json!({"answers": ["a"]}),
+            received_at: chrono::Utc::now(),
+        };
+        assert_eq!(r.field("answers"), None);
+    }
+
+    #[test]
+    fn wef_every_documented_field_resolves() {
+        let ev = wef_fixture();
+        for (name, want) in [
+            ("source_host", "host1"),
+            ("subscription_id", "sub-1"),
+            ("computer", "pc1"),
+            ("provider", "prov"),
+            ("channel", "Security"),
+            ("event_id", "4625"),
+            ("security_user_id", "S-1-5-18"),
+            ("level", "2"),
+            ("message", "msg"),
+            ("task", "12544"),
+            ("opcode", "0"),
+            ("keywords", "16"),
+            ("event_record_id", "99"),
+            ("process_id", "4"),
+            ("thread_id", "8"),
+            ("data.TargetUserName", "bob"),
+        ] {
+            assert_eq!(s(ev.field(name)), Some(want.to_string()), "{name}");
+        }
+        assert_eq!(ev.field("data.Missing"), None);
+    }
+
+    #[test]
+    fn wef_unparsed_event_still_exposes_source_host_and_subscription() {
+        let mut ev = wef_fixture();
+        ev.parsed = None;
+        assert_eq!(s(ev.field("source_host")), Some("host1".into()));
+        assert_eq!(s(ev.field("subscription_id")), Some("sub-1".into()));
+        assert_eq!(ev.field("event_id"), None);
+    }
+
+    #[test]
+    fn sflow_sample_type_resolves_as_stored() {
+        let (flow, counter) = sflow_fixtures();
+        assert_eq!(s(flow.field("sample_type")), Some("flow".into()));
+        assert_eq!(s(counter.field("sample_type")), Some("counter".into()));
+    }
+
+    #[test]
+    fn hec_columns_and_json_paths_resolve() {
+        let r = crate::ingest::GenericRecord {
+            sourcetype: "access".into(),
+            host: Some("web1".into()),
+            time: None,
+            fields: serde_json::json!({"user": {"name": "ann"}, "a.b": 1}),
+            received_at: chrono::Utc::now(),
+            event_uuid: None,
+            source: Some("nginx".into()),
+            index: Some("main".into()),
+            indexed_fields: Some(serde_json::json!({"env": "prod"})),
+        };
+        for (name, want) in [
+            ("sourcetype", "access"),
+            ("host", "web1"),
+            ("source", "nginx"),
+            ("index", "main"),
+            ("fields.user.name", "ann"),
+            ("fields.a.b", "1"),
+            ("indexed_fields.env", "prod"),
+        ] {
+            assert_eq!(s(r.field(name)), Some(want.to_string()), "{name}");
+        }
+        assert_eq!(r.stream(), "access");
+        let raw = crate::ingest::GenericRecord {
+            fields: serde_json::json!("a raw line"),
+            ..r
+        };
+        assert_eq!(s(raw.field("fields")), Some("a raw line".into()));
+    }
+
+    #[test]
+    fn otlp_columns_and_attribute_keys_resolve() {
+        let r = otlp_fixture();
+        for (name, want) in [
+            ("severity_number", "9"),
+            ("severity_text", "INFO"),
+            ("body", "hello"),
+            ("service_name", "api"),
+            ("service_namespace", "ns"),
+            ("service_instance_id", "i1"),
+            ("host_name", "h1"),
+            ("peer_addr", "10.0.0.9"),
+            ("trace_id", "ab"),
+            ("span_id", "cd"),
+            ("flags", "1"),
+            ("event_name", "ev"),
+            ("scope_name", "sc"),
+            ("scope_version", "1.0"),
+            ("attributes.http.route", "/healthz"),
+            ("resource_attributes.k8s.pod.name", "p1"),
+        ] {
+            assert_eq!(s(r.field(name)), Some(want.to_string()), "{name}");
+        }
+        assert_eq!(r.stream(), "api");
     }
 }
