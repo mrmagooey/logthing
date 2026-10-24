@@ -240,6 +240,8 @@ async fn async_main() -> anyhow::Result<()> {
     // `process_single_event` inside `Server`) only ever sees its own
     // watches — no per-record source filtering at the observation site.
     // -----------------------------------------------------------------------
+    // `[[filter.rules]]`: compiled once, partitioned per source; a bad rule stops startup.
+    let _filters = logthing::filter::compile_filters(&config)?;
     let compiled_watches = stats::cardinality::compile_watches(&config)?;
     let mut zeek_cardinality_watchers: Vec<Arc<stats::cardinality::CardinalityWatcher>> =
         Vec::new();

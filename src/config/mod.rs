@@ -123,6 +123,10 @@ pub struct Config {
 
     #[serde(default)]
     pub aggregate: AggregateConfig,
+
+    /// Event filter rules (`[[filter.rules]]`).
+    #[serde(default)]
+    pub filter: FilterConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1776,6 +1780,28 @@ pub struct AggregateLocalConfig {
     pub prefix: String,
 }
 
+/// `[filter]`: drop whole events that match a rule, before they are enqueued.
+/// See `docs/filter.md`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FilterConfig {
+    /// `[[filter.rules]]`; an event is dropped when ANY rule matches.
+    #[serde(default)]
+    pub rules: Vec<FilterRule>,
+}
+
+/// One `[[filter.rules]]` entry. Every condition in `match` must hold (AND).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilterRule {
+    /// Unique rule name; the `rule` label on `events_filtered`.
+    pub name: String,
+    /// One of `wef`, `syslog`, `zeek`, `suricata`, `ipfix`, `sflow`, `hec`, `otlp`.
+    pub source: String,
+    /// Field name -> condition: a scalar (equals), an array of scalars (any of), or
+    /// `{ regex = "..." }`. Parsed by `filter::compile_filters`, not serde.
+    #[serde(rename = "match", default)]
+    pub r#match: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
 /// One `GROUP BY` rule.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AggregateRule {
@@ -1816,6 +1842,7 @@ impl Default for Config {
             iceberg: IcebergConfig::default(),
             spool: None,
             aggregate: AggregateConfig::default(),
+            filter: FilterConfig::default(),
         }
     }
 }

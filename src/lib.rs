@@ -7,6 +7,7 @@
 #[allow(clippy::result_large_err)]
 pub mod admin;
 pub mod config;
+pub mod filter;
 pub mod forwarding;
 #[doc(hidden)]
 pub mod fuzz_harness;
