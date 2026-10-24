@@ -74,8 +74,8 @@ nested objects; it is case-sensitive.
 | syslog | `priority`, `severity`, `facility`, `timestamp` (RFC 3339), `hostname`, `app_name`, `proc_id`, `msg_id`, `message`, `protocol` (exactly `Rfc3164`, `Rfc5424` or `Unknown`) | structured data as `<sdid>.<param>` |
 | Zeek | `log_path` (the normalized stream name, e.g. `dns`, `conn`) and every other stored column by its Zeek JSON key; `id_orig_h`, `id_orig_p`, `id_resp_h`, `id_resp_p` and the dotted JSON names `id.orig_h` etc. both work | any key of the record |
 | Suricata | any EVE key: `event_type`, `src_ip`, `dest_ip`, `dest_port`, `proto`, and nested keys as `alert.signature_id`, `dns.rrname` | any key of the EVE record |
-| IPFIX | the stored typed columns: `observation_domain_id`, `template_id`, `protocol_version`, `exporter`, `src_addr`, `dst_addr`, `src_port`, `dst_port`, `ip_protocol`, `octet_delta_count`, `packet_delta_count`, `tcp_flags`, `input_interface`, `output_interface` | other information elements by name or `ie<id>` |
-| sFlow | the stored typed columns: `exporter`, `src_addr`, `dst_addr`, `src_port`, `dst_port`, `ip_protocol`, `sampling_rate`, `input_ifindex`, `output_ifindex`, the `if_*` counters, and `sample_type` (`flow` or `counter`) | other elements by name |
+| IPFIX | the stored typed columns: `observation_domain_id`, `template_id`, `protocol_version`, `exporter`, `export_time`, `src_addr`, `dst_addr`, `src_port`, `dst_port`, `ip_protocol`, `octet_delta_count`, `packet_delta_count`, `flow_start`, `flow_end`, `tcp_flags`, `input_interface`, `output_interface` | other information elements by name or `ie<id>` |
+| sFlow | the stored typed columns: `exporter`, `received_at`, `src_addr`, `dst_addr`, `src_port`, `dst_port`, `ip_protocol`, `sampling_rate`, `input_ifindex`, `output_ifindex`, the `if_*` counters, and `sample_type` (`flow` or `counter`) | other elements by name |
 | WEF | `source_host`, `subscription_id`, `computer`, `provider`, `channel`, `event_id`, `security_user_id`, `level`, `message`, `task`, `opcode`, `keywords`, `event_record_id`, `process_id`, `thread_id` | `data.<Name>` (EventData) |
 | HEC | `sourcetype`, `host`, `source`, `index`; `fields` alone matches only when the event itself is a scalar | `fields.<path>`, `indexed_fields.<path>` |
 | OTLP | `severity_number`, `severity_text`, `body`, `service_name`, `service_namespace`, `service_instance_id`, `host_name`, `peer_addr`, `trace_id`, `span_id`, `flags`, `event_name`, `scope_name`, `scope_version` | `attributes.<key>`, `resource_attributes.<key>` |
@@ -90,9 +90,12 @@ Notes:
 - **HEC:** the raw route (`/services/collector/raw`) stores the text as `{"raw": "<text>"}`, so
   address it as `fields.raw`. Bare `fields` only matches when the event value is a scalar.
 - **OTLP:** the body is matched as a whole text, so use a regex for a substring.
-- **Not addressable:** `event_uuid` (it is assigned after filtering) and every timestamp except
-  syslog `timestamp` (`received_at`, `time`, `observed_time`, `partition_time`, `flow_start`,
-  `flow_end`, `export_time`).
+- **Timestamps** that are exposed compare as RFC 3339 text, so a regex is the practical way to
+  match them: syslog `timestamp`, IPFIX `export_time`, `flow_start` and `flow_end`, and sFlow
+  `received_at`. Zeek `ts` and Suricata `timestamp` are ordinary JSON keys of the record.
+- **Not addressable:** `event_uuid` (HEC and OTLP assign it after filtering), HEC and OTLP
+  `time`, OTLP `observed_time`, `partition_time`, and `received_at` on every source except
+  sFlow.
 
 ## Where it runs
 
