@@ -1,5 +1,6 @@
 //! Suricata TCP EVE JSON listener.
 
+use crate::filter::SourceFilter;
 use crate::middleware::IpWhitelist;
 use crate::stats::cardinality::CardinalityWatcher;
 use crate::suricata::SuricataRecord;
@@ -181,11 +182,16 @@ impl SuricataHandler for DefaultSuricataHandler {
 /// one source, hoist the value-extraction out of the loop for watches sharing
 /// a `field`. Same disclosure as `zeek::listener`'s dispatch point.
 async fn observe_and_dispatch(
+    filter: Option<&SourceFilter>,
     cardinality: &[Arc<CardinalityWatcher>],
     record: SuricataRecord,
     src: SocketAddr,
     handler: &Arc<dyn SuricataHandler>,
 ) {
+    // Filtered records are neither observed nor forwarded.
+    if crate::filter::should_drop(filter, &record) {
+        return;
+    }
     for watcher in cardinality {
         watcher.observe(&record);
     }
@@ -198,6 +204,7 @@ pub struct SuricataListener {
     handler: Arc<dyn SuricataHandler>,
     allowed_ips: IpWhitelist,
     cardinality: Vec<Arc<CardinalityWatcher>>,
+    filter: Option<Arc<SourceFilter>>,
 }
 
 impl SuricataListener {
@@ -207,6 +214,7 @@ impl SuricataListener {
             handler,
             allowed_ips: IpWhitelist::empty(),
             cardinality: Vec::new(),
+            filter: None,
         }
     }
 
@@ -225,6 +233,14 @@ impl SuricataListener {
     /// watches.
     pub fn with_cardinality_watchers(mut self, cardinality: Vec<Arc<CardinalityWatcher>>) -> Self {
         self.cardinality = cardinality;
+        self
+    }
+
+    /// Attach the compiled `[[filter.rules]]` for `source = "suricata"`. Matching records are
+    /// dropped before cardinality observation and before the handler chain (including
+    /// aggregation); arrival counters still count them. Defaults to `None` (no filtering).
+    pub fn with_filter(mut self, filter: Option<Arc<SourceFilter>>) -> Self {
+        self.filter = filter;
         self
     }
 
@@ -272,10 +288,11 @@ impl SuricataListener {
                                     let idle_timeout = TCP_IDLE_TIMEOUT;
                                     let byte_budget = byte_budget.clone();
                                     let cardinality = self.cardinality.clone();
+                                    let filter = self.filter.clone();
                                     let conn_shutdown = shutdown_rx.clone();
                                     conns.spawn(async move {
                                         let _permit = permit; // held for connection lifetime
-                                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler, idle_timeout, byte_budget, cardinality, conn_shutdown).await {
+                                        if let Err(e) = Self::handle_tcp_connection(stream, src, handler, idle_timeout, byte_budget, cardinality, filter, conn_shutdown).await {
                                             error!("Suricata TCP connection error from {}: {}", src, e);
                                         }
                                     });
@@ -337,6 +354,7 @@ impl SuricataListener {
                             let idle_timeout = TCP_IDLE_TIMEOUT;
                             let byte_budget = byte_budget.clone();
                             let cardinality = self.cardinality.clone();
+                            let filter = self.filter.clone();
                             let conn_shutdown = shutdown_rx.clone();
                             tokio::spawn(async move {
                                 let _permit = permit; // held for connection lifetime
@@ -347,6 +365,7 @@ impl SuricataListener {
                                     idle_timeout,
                                     byte_budget,
                                     cardinality,
+                                    filter,
                                     conn_shutdown,
                                 )
                                 .await
@@ -379,6 +398,7 @@ impl SuricataListener {
     /// or the connection ends, so `SURICATA_MAX_LINE_BYTES` can stay generous per line without
     /// letting `MAX_SURICATA_TCP_CONNECTIONS` concurrent maxed-out lines multiply into unbounded
     /// memory.
+    #[allow(clippy::too_many_arguments)] // ponytail: plain params beat a one-use struct
     async fn handle_tcp_connection(
         stream: TcpStream,
         src: SocketAddr,
@@ -386,6 +406,7 @@ impl SuricataListener {
         idle_timeout: Duration,
         byte_budget: Arc<Semaphore>,
         cardinality: Vec<Arc<CardinalityWatcher>>,
+        filter: Option<Arc<SourceFilter>>,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let mut reader = BufReader::new(stream);
@@ -576,7 +597,14 @@ impl SuricataListener {
                 "event_type" => crate::suricata::schema::metric_event_type(&parsed.record.event_type)
             )
             .increment(1);
-            observe_and_dispatch(&cardinality, parsed.record, src, &handler).await;
+            observe_and_dispatch(
+                filter.as_deref(),
+                &cardinality,
+                parsed.record,
+                src,
+                &handler,
+            )
+            .await;
         }
         Ok(())
     }
@@ -1025,6 +1053,7 @@ mod tests {
             TCP_IDLE_TIMEOUT,
             full_byte_budget(),
             Vec::new(),
+            None,
             never_shutdown(),
         )
         .await
@@ -1099,6 +1128,7 @@ mod tests {
             TCP_IDLE_TIMEOUT,
             full_byte_budget(),
             Vec::new(),
+            None,
             never_shutdown(),
         )
         .await
@@ -1217,6 +1247,7 @@ mod tests {
             Duration::from_millis(100),
             full_byte_budget(),
             Vec::new(),
+            None,
             never_shutdown(),
         )
         .await
@@ -1349,6 +1380,7 @@ mod tests {
             Duration::from_secs(5),
             full_byte_budget(),
             Vec::new(),
+            None,
             never_shutdown(),
         )
         .await
@@ -1434,6 +1466,7 @@ mod tests {
                     TCP_IDLE_TIMEOUT,
                     budget,
                     Vec::new(),
+                    None,
                     never_shutdown(),
                 )
                 .await
@@ -1663,6 +1696,7 @@ mod tests {
             TCP_IDLE_TIMEOUT,
             full_byte_budget(),
             vec![watcher.clone()],
+            None,
             never_shutdown(),
         )
         .await
@@ -1727,6 +1761,7 @@ mod tests {
                 Duration::from_secs(60),
                 full_byte_budget(),
                 Vec::new(),
+                None,
                 rx,
             )
             .await
@@ -1848,5 +1883,50 @@ mod tests {
             .await
             .expect("listener must exit within 1 s of the sender dropping")
             .unwrap();
+    }
+    // -- Event filter: matching records never reach the handler --
+
+    #[tokio::test]
+    async fn test_filter_drops_matching_suricata_records() {
+        let mut config = crate::config::Config::default();
+        config.suricata.enabled = true;
+        config.filter.rules = vec![crate::config::FilterRule {
+            name: "drop-noise".to_string(),
+            source: "suricata".to_string(),
+            r#match: [("event_type", serde_json::json!("stats"))]
+                .into_iter()
+                .map(|(k, v): (&str, serde_json::Value)| (k.to_string(), v))
+                .collect(),
+        }];
+        let filters = crate::filter::compile_filters(&config).unwrap();
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+        let handler = CapturingHandler::new();
+        let listener = SuricataListener::new(SuricataListenerConfig::default(), handler.clone())
+            .with_filter(filters.for_source("suricata"));
+        let task = tokio::spawn(async move {
+            listener.run_with_listener(tcp_listener).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                concat!(
+                    "{\"event_type\":\"stats\"}\n",
+                    "{\"event_type\":\"alert\"}\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        drop(stream);
+        sleep(Duration::from_millis(200)).await;
+        task.abort();
+
+        let records = handler.take_records();
+        assert_eq!(records.len(), 1, "got {records:?}");
+        assert_eq!(records[0].event_type, "alert");
     }
 }

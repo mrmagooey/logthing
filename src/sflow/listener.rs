@@ -1,6 +1,7 @@
 //! sFlow v5 UDP listener — mirrors src/ipfix/listener.rs; sFlow is stateless
 //! (no template cache), so decode_datagram takes only the buffer + exporter IP.
 
+use crate::filter::SourceFilter;
 use crate::middleware::IpWhitelist;
 use crate::sflow::SflowRecord;
 use crate::sflow::decoder::decode_datagram;
@@ -87,11 +88,18 @@ impl SflowHandler for DefaultSflowHandler {
 /// the inner loop for watches sharing a `field`. Same disclosure as
 /// `zeek::listener`'s dispatch point.
 async fn observe_and_dispatch(
+    filter: Option<&SourceFilter>,
     cardinality: &[Arc<CardinalityWatcher>],
-    samples: Vec<SflowRecord>,
+    mut samples: Vec<SflowRecord>,
     src: SocketAddr,
     handler: &Arc<dyn SflowHandler>,
 ) {
+    if let Some(f) = filter {
+        f.retain_unmatched(&mut samples);
+        if samples.is_empty() {
+            return;
+        }
+    }
     for sample in &samples {
         for watcher in cardinality {
             watcher.observe(sample);
@@ -106,6 +114,7 @@ pub struct SflowListener {
     handler: Arc<dyn SflowHandler>,
     allowed_ips: IpWhitelist,
     cardinality: Vec<Arc<CardinalityWatcher>>,
+    filter: Option<Arc<SourceFilter>>,
 }
 
 impl SflowListener {
@@ -115,6 +124,7 @@ impl SflowListener {
             handler,
             allowed_ips: IpWhitelist::empty(),
             cardinality: Vec::new(),
+            filter: None,
         }
     }
 
@@ -132,6 +142,14 @@ impl SflowListener {
     /// ever sees its own sflow watches.
     pub fn with_cardinality_watchers(mut self, cardinality: Vec<Arc<CardinalityWatcher>>) -> Self {
         self.cardinality = cardinality;
+        self
+    }
+
+    /// Attach the compiled `[[filter.rules]]` for `source = "sflow"`. Matching records are
+    /// dropped before cardinality observation and before the handler chain (including
+    /// aggregation); arrival counters still count them. Defaults to `None` (no filtering).
+    pub fn with_filter(mut self, filter: Option<Arc<SourceFilter>>) -> Self {
+        self.filter = filter;
         self
     }
 
@@ -199,7 +217,7 @@ impl SflowListener {
                                             debug!("sFlow datagram from {} produced no samples", src);
                                         }
                                         Ok(samples) => {
-                                            observe_and_dispatch(&self.cardinality, samples, src, &self.handler).await;
+                                            observe_and_dispatch(self.filter.as_deref(), &self.cardinality, samples, src, &self.handler).await;
                                         }
                                         Err(e) => {
                                             metrics::counter!("sflow_decode_errors").increment(1);
@@ -253,7 +271,7 @@ impl SflowListener {
                                             debug!("sFlow datagram from {} produced no samples", src);
                                         }
                                         Ok(samples) => {
-                                            observe_and_dispatch(&self.cardinality, samples, src, &self.handler).await;
+                                            observe_and_dispatch(self.filter.as_deref(), &self.cardinality, samples, src, &self.handler).await;
                                         }
                                         Err(e) => {
                                             metrics::counter!("sflow_decode_errors").increment(1);
@@ -323,6 +341,7 @@ impl SflowListener {
             let allowed_ips = self.allowed_ips.clone();
             let shutdown_rx = shutdown_rx.clone();
             let cardinality = self.cardinality.clone();
+            let filter = self.filter.clone();
             // Only the first task takes the shared drop-stats tracker, so it
             // is polled exactly once per SO_REUSEPORT group.
             let stats = if i == 0 { socket_stats.take() } else { None };
@@ -334,6 +353,7 @@ impl SflowListener {
                 stats,
                 self.config.recv_batch_size,
                 cardinality,
+                filter,
             )));
         }
 
@@ -383,7 +403,7 @@ impl SflowListener {
                                     debug!("sFlow datagram from {} produced no samples", src);
                                 }
                                 Ok(samples) => {
-                                    observe_and_dispatch(&self.cardinality, samples, src, &self.handler).await;
+                                    observe_and_dispatch(self.filter.as_deref(), &self.cardinality, samples, src, &self.handler).await;
                                 }
                                 Err(e) => {
                                     metrics::counter!("sflow_decode_errors").increment(1);
@@ -409,6 +429,7 @@ impl SflowListener {
 /// so it can be spawned once per `SO_REUSEPORT` socket. `socket_stats` is
 /// `Some` for exactly one task per group (see the call site) so the shared
 /// drop counter is polled once, not once per task.
+#[allow(clippy::too_many_arguments)] // ponytail: plain params beat a one-use struct
 async fn sflow_recv_loop(
     socket: UdpSocket,
     handler: Arc<dyn SflowHandler>,
@@ -417,6 +438,7 @@ async fn sflow_recv_loop(
     mut socket_stats: Option<crate::net::SocketDropStats>,
     recv_batch_size: usize,
     cardinality: Vec<Arc<CardinalityWatcher>>,
+    filter: Option<Arc<SourceFilter>>,
 ) {
     let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
@@ -441,7 +463,7 @@ async fn sflow_recv_loop(
                                     debug!("sFlow datagram from {} produced no samples", src);
                                 }
                                 Ok(samples) => {
-                                    observe_and_dispatch(&cardinality, samples, src, &handler).await;
+                                    observe_and_dispatch(filter.as_deref(), &cardinality, samples, src, &handler).await;
                                 }
                                 Err(e) => {
                                     metrics::counter!("sflow_decode_errors").increment(1);
@@ -496,7 +518,7 @@ async fn sflow_recv_loop(
                                     debug!("sFlow datagram from {} produced no samples", src);
                                 }
                                 Ok(samples) => {
-                                    observe_and_dispatch(&cardinality, samples, src, &handler).await;
+                                    observe_and_dispatch(filter.as_deref(), &cardinality, samples, src, &handler).await;
                                 }
                                 Err(e) => {
                                     metrics::counter!("sflow_decode_errors").increment(1);
@@ -1578,5 +1600,66 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+    // -- Event filter: matching samples never reach the handler --
+
+    fn sflow_filter(m: serde_json::Value) -> Option<Arc<crate::filter::SourceFilter>> {
+        let mut config = crate::config::Config::default();
+        config.sflow.enabled = true;
+        config.filter.rules = vec![crate::config::FilterRule {
+            name: "drop-sample-type".to_string(),
+            source: "sflow".to_string(),
+            r#match: [("sample_type".to_string(), m)].into_iter().collect(),
+        }];
+        crate::filter::compile_filters(&config)
+            .unwrap()
+            .for_source("sflow")
+    }
+
+    async fn filtered_sflow_handler(
+        filter: Option<Arc<crate::filter::SourceFilter>>,
+    ) -> (
+        Arc<CapturingHandler>,
+        tokio::task::JoinHandle<()>,
+        SocketAddr,
+    ) {
+        let listener_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener_socket.local_addr().unwrap();
+        let handler = CapturingHandler::new();
+        let listener =
+            SflowListener::new(SflowListenerConfig::default(), handler.clone()).with_filter(filter);
+        let task = tokio::spawn(async move {
+            listener.run_with_socket(listener_socket).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+        (handler, task, listener_addr)
+    }
+
+    #[tokio::test]
+    async fn test_filter_drops_matching_sflow_records() {
+        let (handler, task, addr) =
+            filtered_sflow_handler(sflow_filter(serde_json::json!("counter"))).await;
+        // One datagram: one flow sample and one counter sample.
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(&build_datagram(1, 1), addr).await.unwrap();
+        sleep(Duration::from_millis(200)).await;
+        task.abort();
+
+        let batches = handler.batches();
+        assert_eq!(batches.len(), 1, "got {batches:?}");
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(batches[0][0].sample_type, crate::sflow::SampleType::Flow);
+    }
+
+    #[tokio::test]
+    async fn test_filter_skips_handler_when_whole_sflow_batch_filtered() {
+        let (handler, task, addr) =
+            filtered_sflow_handler(sflow_filter(serde_json::json!(["flow", "counter"]))).await;
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(&build_datagram(1, 1), addr).await.unwrap();
+        sleep(Duration::from_millis(200)).await;
+        task.abort();
+
+        assert!(handler.batches().is_empty(), "handler must not be called");
     }
 }

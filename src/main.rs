@@ -232,6 +232,9 @@ async fn async_main() -> anyhow::Result<()> {
         }
     };
 
+    // `[[filter.rules]]`: compiled once, partitioned per source; a bad rule stops startup.
+    let filters = logthing::filter::compile_filters(&config)?;
+
     // -----------------------------------------------------------------------
     // Build the field-cardinality watchers (optional, any number). Same
     // fatal-on-bad-config stance as the aggregator above: see
@@ -240,8 +243,6 @@ async fn async_main() -> anyhow::Result<()> {
     // `process_single_event` inside `Server`) only ever sees its own
     // watches — no per-record source filtering at the observation site.
     // -----------------------------------------------------------------------
-    // `[[filter.rules]]`: compiled once, partitioned per source; a bad rule stops startup.
-    let _filters = logthing::filter::compile_filters(&config)?;
     let compiled_watches = stats::cardinality::compile_watches(&config)?;
     let mut zeek_cardinality_watchers: Vec<Arc<stats::cardinality::CardinalityWatcher>> =
         Vec::new();
@@ -465,10 +466,12 @@ async fn async_main() -> anyhow::Result<()> {
         };
         let syslog_ip_whitelist = ip_whitelist.clone();
         let syslog_watchers_for_listener = syslog_cardinality_watchers.clone();
+        let syslog_filter_for_listener = filters.for_source("syslog");
         let handle = tokio::spawn(async move {
             let listener = syslog::listener::SyslogListener::new(syslog_config, syslog_handler)
                 .with_allowed_ips(syslog_ip_whitelist)
-                .with_cardinality_watchers(syslog_watchers_for_listener);
+                .with_cardinality_watchers(syslog_watchers_for_listener)
+                .with_filter(syslog_filter_for_listener);
             if let Err(e) = listener.start_with_shutdown(syslog_shutdown_rx).await {
                 error!("Syslog listener error: {}", e);
             }
@@ -558,10 +561,12 @@ async fn async_main() -> anyhow::Result<()> {
         };
         let ipfix_ip_whitelist = ip_whitelist.clone();
         let ipfix_watchers_for_listener = ipfix_cardinality_watchers.clone();
+        let ipfix_filter_for_listener = filters.for_source("ipfix");
         let handle = tokio::spawn(async move {
             let listener = ipfix::listener::IpfixListener::new(listener_config, ipfix_handler)
                 .with_allowed_ips(ipfix_ip_whitelist)
-                .with_cardinality_watchers(ipfix_watchers_for_listener);
+                .with_cardinality_watchers(ipfix_watchers_for_listener)
+                .with_filter(ipfix_filter_for_listener);
             if let Err(e) = listener.start_with_shutdown(ipfix_shutdown_rx).await {
                 error!("IPFIX listener error: {}", e);
             }
@@ -648,10 +653,12 @@ async fn async_main() -> anyhow::Result<()> {
         };
         let zeek_ip_whitelist = ip_whitelist.clone();
         let zeek_watchers_for_listener = zeek_cardinality_watchers.clone();
+        let zeek_filter_for_listener = filters.for_source("zeek");
         let handle = tokio::spawn(async move {
             let listener = zeek::listener::ZeekListener::new(listener_config, zeek_handler)
                 .with_allowed_ips(zeek_ip_whitelist)
-                .with_cardinality_watchers(zeek_watchers_for_listener);
+                .with_cardinality_watchers(zeek_watchers_for_listener)
+                .with_filter(zeek_filter_for_listener);
             if let Err(e) = listener.start_with_shutdown(zeek_shutdown_rx).await {
                 error!("Zeek listener error: {}", e);
             }
@@ -741,11 +748,13 @@ async fn async_main() -> anyhow::Result<()> {
         };
         let suricata_ip_whitelist = ip_whitelist.clone();
         let suricata_watchers_for_listener = suricata_cardinality_watchers.clone();
+        let suricata_filter_for_listener = filters.for_source("suricata");
         let handle = tokio::spawn(async move {
             let listener =
                 suricata::listener::SuricataListener::new(listener_config, suricata_handler)
                     .with_allowed_ips(suricata_ip_whitelist)
-                    .with_cardinality_watchers(suricata_watchers_for_listener);
+                    .with_cardinality_watchers(suricata_watchers_for_listener)
+                    .with_filter(suricata_filter_for_listener);
             if let Err(e) = listener.start_with_shutdown(suricata_shutdown_rx).await {
                 error!("Suricata listener error: {}", e);
             }
@@ -835,10 +844,12 @@ async fn async_main() -> anyhow::Result<()> {
         };
         let sflow_ip_whitelist = ip_whitelist.clone();
         let sflow_watchers_for_listener = sflow_cardinality_watchers.clone();
+        let sflow_filter_for_listener = filters.for_source("sflow");
         let handle = tokio::spawn(async move {
             let listener = sflow::listener::SflowListener::new(listener_config, sflow_handler)
                 .with_allowed_ips(sflow_ip_whitelist)
-                .with_cardinality_watchers(sflow_watchers_for_listener);
+                .with_cardinality_watchers(sflow_watchers_for_listener)
+                .with_filter(sflow_filter_for_listener);
             if let Err(e) = listener.start_with_shutdown(sflow_shutdown_rx).await {
                 error!("sFlow listener error: {}", e);
             }

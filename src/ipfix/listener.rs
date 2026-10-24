@@ -1,5 +1,6 @@
 //! IPFIX / NetFlow UDP listener.
 
+use crate::filter::SourceFilter;
 use crate::ipfix::FlowRecord;
 use crate::ipfix::decoder::{IpfixDecoder, decode_datagram};
 use crate::middleware::IpWhitelist;
@@ -94,11 +95,18 @@ impl IpfixHandler for DefaultIpfixHandler {
 /// the inner loop for watches sharing a `field`. Same disclosure as
 /// `zeek::listener`'s dispatch point.
 async fn observe_and_dispatch(
+    filter: Option<&SourceFilter>,
     cardinality: &[Arc<CardinalityWatcher>],
-    flows: Vec<FlowRecord>,
+    mut flows: Vec<FlowRecord>,
     src: SocketAddr,
     handler: &Arc<dyn IpfixHandler>,
 ) {
+    if let Some(f) = filter {
+        f.retain_unmatched(&mut flows);
+        if flows.is_empty() {
+            return;
+        }
+    }
     for flow in &flows {
         for watcher in cardinality {
             watcher.observe(flow);
@@ -113,6 +121,7 @@ pub struct IpfixListener {
     handler: Arc<dyn IpfixHandler>,
     allowed_ips: IpWhitelist,
     cardinality: Vec<Arc<CardinalityWatcher>>,
+    filter: Option<Arc<SourceFilter>>,
 }
 
 impl IpfixListener {
@@ -122,6 +131,7 @@ impl IpfixListener {
             handler,
             allowed_ips: IpWhitelist::empty(),
             cardinality: Vec::new(),
+            filter: None,
         }
     }
 
@@ -139,6 +149,14 @@ impl IpfixListener {
     /// ever sees its own ipfix watches.
     pub fn with_cardinality_watchers(mut self, cardinality: Vec<Arc<CardinalityWatcher>>) -> Self {
         self.cardinality = cardinality;
+        self
+    }
+
+    /// Attach the compiled `[[filter.rules]]` for `source = "ipfix"`. Matching records are
+    /// dropped before cardinality observation and before the handler chain (including
+    /// aggregation); arrival counters still count them. Defaults to `None` (no filtering).
+    pub fn with_filter(mut self, filter: Option<Arc<SourceFilter>>) -> Self {
+        self.filter = filter;
         self
     }
 
@@ -208,7 +226,7 @@ impl IpfixListener {
                                             );
                                         }
                                         Ok(flows) => {
-                                            observe_and_dispatch(&self.cardinality, flows, src, &self.handler).await;
+                                            observe_and_dispatch(self.filter.as_deref(), &self.cardinality, flows, src, &self.handler).await;
                                         }
                                         Err(e) => {
                                             metrics::counter!("ipfix_decode_errors").increment(1);
@@ -262,7 +280,7 @@ impl IpfixListener {
                                             debug!("IPFIX datagram from {} produced no flows (template-only or empty)", src);
                                         }
                                         Ok(flows) => {
-                                            observe_and_dispatch(&self.cardinality, flows, src, &self.handler).await;
+                                            observe_and_dispatch(self.filter.as_deref(), &self.cardinality, flows, src, &self.handler).await;
                                         }
                                         Err(e) => {
                                             metrics::counter!("ipfix_decode_errors").increment(1);
@@ -338,6 +356,7 @@ impl IpfixListener {
             let allowed_ips = self.allowed_ips.clone();
             let shutdown_rx = shutdown_rx.clone();
             let cardinality = self.cardinality.clone();
+            let filter = self.filter.clone();
             // Only the first task takes the shared drop-stats tracker, so it
             // is polled exactly once per SO_REUSEPORT group.
             let stats = if i == 0 { socket_stats.take() } else { None };
@@ -350,6 +369,7 @@ impl IpfixListener {
                 stats,
                 self.config.recv_batch_size,
                 cardinality,
+                filter,
             )));
         }
 
@@ -403,7 +423,7 @@ impl IpfixListener {
                                     );
                                 }
                                 Ok(flows) => {
-                                    observe_and_dispatch(&self.cardinality, flows, src, &self.handler).await;
+                                    observe_and_dispatch(self.filter.as_deref(), &self.cardinality, flows, src, &self.handler).await;
                                 }
                                 Err(e) => {
                                     metrics::counter!("ipfix_decode_errors").increment(1);
@@ -443,6 +463,7 @@ async fn ipfix_recv_loop(
     mut socket_stats: Option<crate::net::SocketDropStats>,
     recv_batch_size: usize,
     cardinality: Vec<Arc<CardinalityWatcher>>,
+    filter: Option<Arc<SourceFilter>>,
 ) {
     let mut socket_stats_ticker = tokio::time::interval(crate::net::SOCKET_DROP_POLL_INTERVAL);
 
@@ -470,7 +491,7 @@ async fn ipfix_recv_loop(
                                     );
                                 }
                                 Ok(flows) => {
-                                    observe_and_dispatch(&cardinality, flows, src, &handler).await;
+                                    observe_and_dispatch(filter.as_deref(), &cardinality, flows, src, &handler).await;
                                 }
                                 Err(e) => {
                                     metrics::counter!("ipfix_decode_errors").increment(1);
@@ -525,7 +546,7 @@ async fn ipfix_recv_loop(
                                     debug!("IPFIX datagram from {} produced no flows (template-only or empty)", src);
                                 }
                                 Ok(flows) => {
-                                    observe_and_dispatch(&cardinality, flows, src, &handler).await;
+                                    observe_and_dispatch(filter.as_deref(), &cardinality, flows, src, &handler).await;
                                 }
                                 Err(e) => {
                                     metrics::counter!("ipfix_decode_errors").increment(1);
@@ -1618,5 +1639,101 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+    // -- Event filter: matching flows never reach the handler --
+
+    /// One IPFIX datagram: a template (src ip, dst ip, dst port) plus a data set with one
+    /// flow per entry of `ports`.
+    fn port_datagram(seq: u32, template_id: u16, ports: &[u16]) -> Vec<u8> {
+        let data_len = 4 + ports.len() * 10;
+        let total = 16 + 20 + data_len;
+        let mut buf = Vec::with_capacity(total);
+        buf.extend_from_slice(&10u16.to_be_bytes());
+        buf.extend_from_slice(&(total as u16).to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes()); // export time
+        buf.extend_from_slice(&seq.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes()); // observation domain
+        buf.extend_from_slice(&2u16.to_be_bytes()); // template set
+        buf.extend_from_slice(&20u16.to_be_bytes());
+        buf.extend_from_slice(&template_id.to_be_bytes());
+        buf.extend_from_slice(&3u16.to_be_bytes());
+        for (ie, len) in [(8u16, 4u16), (12, 4), (11, 2)] {
+            buf.extend_from_slice(&ie.to_be_bytes());
+            buf.extend_from_slice(&len.to_be_bytes());
+        }
+        buf.extend_from_slice(&template_id.to_be_bytes()); // data set id
+        buf.extend_from_slice(&(data_len as u16).to_be_bytes());
+        for port in ports {
+            buf.extend_from_slice(&[10, 0, 0, 1]);
+            buf.extend_from_slice(&[192, 168, 0, 1]);
+            buf.extend_from_slice(&port.to_be_bytes());
+        }
+        buf
+    }
+
+    async fn filtered_ipfix_handler(
+        ports: serde_json::Value,
+    ) -> (
+        Arc<CapturingHandler>,
+        tokio::task::JoinHandle<()>,
+        SocketAddr,
+    ) {
+        let mut config = crate::config::Config::default();
+        config.ipfix.enabled = true;
+        config.filter.rules = vec![crate::config::FilterRule {
+            name: "drop-dns".to_string(),
+            source: "ipfix".to_string(),
+            r#match: [("dst_port".to_string(), ports)].into_iter().collect(),
+        }];
+        let filters = crate::filter::compile_filters(&config).unwrap();
+
+        let listener_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener_socket.local_addr().unwrap();
+        let handler = CapturingHandler::new();
+        let listener = IpfixListener::new(IpfixListenerConfig::default(), handler.clone())
+            .with_filter(filters.for_source("ipfix"));
+        let task = tokio::spawn(async move {
+            listener.run_with_socket(listener_socket).await.ok();
+        });
+        sleep(Duration::from_millis(20)).await;
+        (handler, task, listener_addr)
+    }
+
+    #[tokio::test]
+    async fn test_filter_drops_matching_ipfix_records() {
+        let (handler, task, addr) = filtered_ipfix_handler(serde_json::json!(53)).await;
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(&port_datagram(1, 300, &[53, 443]), addr)
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(200)).await;
+        task.abort();
+
+        let batches = handler.batches();
+        assert_eq!(batches.len(), 1, "got {batches:?}");
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(batches[0][0].dst_port, Some(443));
+    }
+
+    #[tokio::test]
+    async fn test_filter_skips_handler_when_whole_ipfix_batch_filtered() {
+        let (handler, task, addr) = filtered_ipfix_handler(serde_json::json!(53)).await;
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(&port_datagram(1, 300, &[53, 53]), addr)
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(200)).await;
+        assert!(handler.batches().is_empty(), "handler must not be called");
+
+        // Control: the listener is alive and a non-matching flow still gets through.
+        sender
+            .send_to(&port_datagram(2, 300, &[80]), addr)
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(200)).await;
+        task.abort();
+        assert_eq!(handler.batches().len(), 1);
     }
 }
