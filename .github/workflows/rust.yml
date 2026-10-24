@@ -43,6 +43,11 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
+    - name: Run loadgen tests
+      # tools/loadgen is outside the workspace default-members, so plain `cargo test` never
+      # builds it; its tests drive logthing's real handlers and break when those change.
+      run: cargo test -p loadgen --verbose
+
     - name: Compile-check criterion benchmarks (no execution)
       # Full sampled criterion runs are deliberately NOT run on every push --
       # measured cost: an uncached bench-profile compile of the full
@@ -58,6 +63,9 @@ jobs:
 
     - name: Clippy (default features)
       run: cargo clippy --all-targets -- -D warnings
+
+    - name: Clippy (loadgen)
+      run: cargo clippy -p loadgen --all-targets -- -D warnings
 
     - name: Security audit
       # Non-fatal: advisory DB entries can fire on transitive deps we don't
