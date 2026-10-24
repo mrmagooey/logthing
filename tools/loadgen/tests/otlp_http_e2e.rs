@@ -159,6 +159,7 @@ async fn otlp_http_gzip_run_against_real_logthing_router_succeeds() {
         event_parser: None,
         parquet_s3_sender: None,
         parquet_local_sender: None,
+        wef_filter: None,
     });
     let app = Router::new()
         .route("/v1/logs", post_gzip(handle_otlp_logs))
