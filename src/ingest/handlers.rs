@@ -230,7 +230,11 @@ pub async fn handle_hec_event(
         Ok(r) => r,
         Err(e) => return hec_parse_error(&e),
     };
-    // Identity is assigned after parse and after redaction.
+    // Filter first so rules match raw (pre-redaction) values; identity is assigned after
+    // parse and after redaction.
+    if let Some(f) = &ingest.hec_filter {
+        f.retain_unmatched(&mut records);
+    }
     redact_generic_records(&ingest, &mut records);
     assign_event_uuids(&mut records);
 
@@ -275,6 +279,9 @@ pub async fn handle_hec_raw(
         Ok(r) => r,
         Err(e) => return hec_parse_error(&e),
     };
+    if ingest.hec_filter.as_ref().is_some_and(|f| f.drops(&record)) {
+        return hec_success();
+    }
     redact_generic_records(&ingest, std::slice::from_mut(&mut record));
     assign_event_uuids(std::slice::from_mut(&mut record));
 
@@ -319,6 +326,9 @@ pub async fn handle_ndjson(
         Ok(r) => r,
         Err(e) => return hec_parse_error(&e),
     };
+    if let Some(f) = &ingest.hec_filter {
+        f.retain_unmatched(&mut records);
+    }
     redact_generic_records(&ingest, &mut records);
     assign_event_uuids(&mut records);
 
@@ -1048,6 +1058,172 @@ mod tests {
             assert_eq!(rec.fields, serde_json::json!({"keep": keep}));
             assert!(rec.event_uuid.is_some());
         }
+    }
+
+    fn hec_filter(field: &str, value: serde_json::Value) -> Arc<crate::filter::SourceFilter> {
+        let mut config = Config::default();
+        config.hec.enabled = true;
+        config.filter.rules = vec![crate::config::FilterRule {
+            name: "drop-it".to_string(),
+            source: "hec".to_string(),
+            r#match: [(field.to_string(), value)].into_iter().collect(),
+        }];
+        crate::filter::compile_filters(&config)
+            .unwrap()
+            .for_source("hec")
+            .unwrap()
+    }
+
+    fn filtering_ingest(
+        field: &str,
+        value: serde_json::Value,
+    ) -> (
+        IngestState,
+        tokio::sync::mpsc::Receiver<crate::ingest::GenericRecord>,
+    ) {
+        let (mut ingest, rx) = stalled_ingest(16);
+        ingest.hec_filter = Some(hec_filter(field, value));
+        (ingest, rx)
+    }
+
+    #[tokio::test]
+    async fn hec_filter_drops_matching_events() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let (ingest, mut rx) = filtering_ingest("fields.level", serde_json::json!("debug"));
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .oneshot(post(
+                "/services/collector/event",
+                "{\"event\":{\"level\":\"debug\"}}\n{\"event\":{\"level\":\"info\"}}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rec = rx.try_recv().expect("unfiltered record enqueued");
+        assert_eq!(rec.fields, serde_json::json!({"level": "info"}));
+        assert!(
+            rx.try_recv().is_err(),
+            "filtered record must not be enqueued"
+        );
+        let counter = |name: &str| -> u64 {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter(|(k, ..)| k.key().name() == name)
+                .map(|(_, _, _, v)| match v {
+                    metrics_util::debugging::DebugValue::Counter(c) => c,
+                    _ => 0,
+                })
+                .sum()
+        };
+        assert_eq!(counter("hec_events_received"), 1);
+        assert_eq!(counter("events_filtered"), 1);
+    }
+
+    #[tokio::test]
+    async fn hec_all_filtered_batch_is_success() {
+        let (ingest, mut rx) = filtering_ingest("fields.level", serde_json::json!("debug"));
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .oneshot(post(
+                "/services/collector/event",
+                "{\"event\":{\"level\":\"debug\"}}\n{\"event\":{\"level\":\"debug\"}}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(resp).await,
+            serde_json::json!({"text": "Success", "code": 0})
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn hec_filter_sees_pre_redaction_values() {
+        let (mut ingest, mut rx) = filtering_ingest("fields.user", serde_json::json!("alice"));
+        ingest.hec_redactor = Some(hec_redactor(crate::config::RedactionConfig {
+            hash_fields: vec!["user".into()],
+            hash_key_env: Some("K".into()),
+            ..Default::default()
+        }));
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/services/collector/event",
+                r#"{"event":{"user":"alice"}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_err(), "matched before the user was hashed");
+        app.oneshot(post(
+            "/services/collector/event",
+            r#"{"event":{"user":"bob"}}"#,
+        ))
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_ok(), "non-matching record still arrives");
+    }
+
+    #[tokio::test]
+    async fn hec_raw_filter_drops_matching_and_sees_pre_redaction_values() {
+        let (mut ingest, mut rx) =
+            filtering_ingest("fields.raw", serde_json::json!({"regex": "secret=abc"}));
+        ingest.hec_redactor = Some(hec_redactor(crate::config::RedactionConfig {
+            mask_patterns: vec![r"secret=\w+".into()],
+            ..Default::default()
+        }));
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .clone()
+            .oneshot(post("/services/collector/raw", "login secret=abc"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(resp).await,
+            serde_json::json!({"text": "Success", "code": 0})
+        );
+        assert!(rx.try_recv().is_err(), "matched before masking");
+        app.oneshot(post("/services/collector/raw", "plain text"))
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn ndjson_filter_drops_matching_and_sees_pre_redaction_values() {
+        let (mut ingest, mut rx) = filtering_ingest("fields.user", serde_json::json!("alice"));
+        ingest.hec_redactor = Some(hec_redactor(crate::config::RedactionConfig {
+            hash_fields: vec!["user".into()],
+            hash_key_env: Some("K".into()),
+            ..Default::default()
+        }));
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/ingest",
+                "{\"user\":\"alice\"}\n{\"user\":\"bob\"}\n",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rec = rx.try_recv().expect("bob survives");
+        assert_ne!(rec.fields["user"], "alice");
+        assert!(rx.try_recv().is_err(), "alice dropped before hashing");
+        // All filtered: normal success.
+        let resp = app
+            .oneshot(post("/ingest", "{\"user\":\"alice\"}\n"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

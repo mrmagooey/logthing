@@ -397,6 +397,7 @@ mod tests {
             event_parser: None,
             parquet_s3_sender: s3,
             parquet_local_sender: None,
+            wef_filter: None,
         })
     }
 
@@ -413,6 +414,7 @@ mod tests {
             event_parser: None,
             parquet_s3_sender: None,
             parquet_local_sender: None,
+            wef_filter: None,
         })
     }
 
