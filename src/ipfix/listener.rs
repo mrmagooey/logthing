@@ -936,31 +936,7 @@ mod tests {
         tokio::sync::watch::Sender<bool>,
         Arc<CountingHandler>,
     ) {
-        // Bind briefly to obtain an ephemeral port, then drop so the
-        // listener (and, for recv_tasks > 1, its SO_REUSEPORT group) can
-        // bind the same address — same pattern as the other tests here.
-        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let udp_port = tmp.local_addr().unwrap().port();
-        drop(tmp);
-        let bound: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
-
-        let config = IpfixListenerConfig {
-            udp_port,
-            bind_address: "127.0.0.1".to_string(),
-            recv_tasks,
-            recv_batch_size,
-            ..IpfixListenerConfig::default()
-        };
-        let handler = CountingHandler::new();
-        let listener = IpfixListener::new(config, handler.clone());
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let task = tokio::spawn(async move { listener.start_with_shutdown(shutdown_rx).await });
-
-        // Give every recv task time to bind and enter its recv loop.
-        sleep(Duration::from_millis(50)).await;
-
-        (task, bound, shutdown_tx, handler)
+        start_shape(recv_tasks, recv_batch_size, None).await
     }
 
     /// Sends the template from one source port and data from EIGHT distinct
@@ -1735,5 +1711,257 @@ mod tests {
         sleep(Duration::from_millis(200)).await;
         task.abort();
         assert_eq!(handler.batches().len(), 1);
+    }
+
+    // ---- coverage: start(), every receive-loop shape, rejection / error / signal arms ----
+
+    /// The four `start_with_shutdown` receive-loop shapes: inline single, inline batched,
+    /// fan-out single, fan-out batched.
+    const LOOP_SHAPES: [(usize, usize); 4] = [(1, 1), (1, 4), (3, 1), (3, 4)];
+
+    /// Like `start_test_listener`, with an `allowed_ips` list.
+    async fn start_shape(
+        recv_tasks: usize,
+        recv_batch_size: usize,
+        allowed: Option<IpWhitelist>,
+    ) -> (
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        Arc<CountingHandler>,
+    ) {
+        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = tmp.local_addr().unwrap().port();
+        drop(tmp);
+        let config = IpfixListenerConfig {
+            udp_port,
+            bind_address: "127.0.0.1".to_string(),
+            recv_tasks,
+            recv_batch_size,
+            ..IpfixListenerConfig::default()
+        };
+        let handler = CountingHandler::new();
+        let mut listener = IpfixListener::new(config, handler.clone());
+        if let Some(w) = allowed {
+            listener = listener.with_allowed_ips(w);
+        }
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut task = tokio::spawn(async move { listener.start_with_shutdown(rx).await });
+        sleep(Duration::from_millis(50)).await;
+        fail_if_finished(&mut task, "startup").await;
+        (
+            task,
+            format!("127.0.0.1:{udp_port}").parse().unwrap(),
+            tx,
+            handler,
+        )
+    }
+
+    fn counter_total(snapshotter: &metrics_util::debugging::Snapshotter, name: &str) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == name)
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Panics with the listener task's own result if it already finished (e.g. it lost the
+    /// bind race and returned `Err`), instead of letting the test time out later.
+    async fn fail_if_finished(task: &mut tokio::task::JoinHandle<anyhow::Result<()>>, what: &str) {
+        if task.is_finished() {
+            panic!(
+                "listener task finished early during {what}: {:?}",
+                task.await
+            );
+        }
+    }
+
+    /// Polls `cond` for up to 5 s, failing with the task's own result if it exits first.
+    async fn wait_until(
+        task: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+        what: &str,
+        cond: impl Fn() -> bool,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            fail_if_finished(task, what).await;
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_start_binds_configured_address_and_dispatches_flows() {
+        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = tmp.local_addr().unwrap().port();
+        drop(tmp);
+        let config = IpfixListenerConfig {
+            udp_port,
+            bind_address: "127.0.0.1".to_string(),
+            ..IpfixListenerConfig::default()
+        };
+        let handler = CapturingHandler::new();
+        let listener = IpfixListener::new(config, handler.clone());
+        let mut task = tokio::spawn(async move { listener.start().await });
+        sleep(Duration::from_millis(50)).await;
+        fail_if_finished(&mut task, "startup").await;
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(FIXTURE_NFV5_ONE_RECORD, ("127.0.0.1", udp_port))
+            .await
+            .unwrap();
+        wait_until(&mut task, "the flow to reach the handler", || {
+            !handler.batches().is_empty()
+        })
+        .await;
+        assert!(
+            !task.is_finished(),
+            "start() runs until the task is aborted"
+        );
+        task.abort();
+
+        let batches = handler.batches();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(batches[0][0].src_port, Some(8080));
+    }
+
+    #[tokio::test]
+    async fn test_start_rejects_unparseable_bind_address() {
+        let config = IpfixListenerConfig {
+            bind_address: "not an address".to_string(),
+            ..IpfixListenerConfig::default()
+        };
+        let listener = IpfixListener::new(config, CapturingHandler::new());
+        assert!(listener.start().await.is_err());
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        assert!(listener.start_with_shutdown(rx).await.is_err());
+    }
+
+    /// Every receive-loop shape drops datagrams from a source outside `allowed_ips` and
+    /// counts each one in `listener_source_rejected`.
+    #[tokio::test]
+    async fn test_disallowed_source_is_rejected_and_counted_in_every_loop_shape() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        for (i, (tasks, batch)) in LOOP_SHAPES.into_iter().enumerate() {
+            let expected = 3 * (i as u64 + 1);
+            let whitelist = IpWhitelist::new(vec!["10.0.0.0/8".to_string()]).unwrap();
+            let (mut task, bound, tx, handler) = start_shape(tasks, batch, Some(whitelist)).await;
+            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            for i in 0..3 {
+                sock.send_to(&template_datagram(i + 1), bound)
+                    .await
+                    .unwrap();
+            }
+            wait_until(&mut task, "three rejections", || {
+                counter_total(&snapshotter, "listener_source_rejected") == expected
+            })
+            .await;
+            assert_eq!(handler.flow_count(), 0, "tasks={tasks} batch={batch}");
+            tx.send(true).unwrap();
+            task.await.unwrap().unwrap();
+        }
+    }
+
+    /// Every receive-loop shape counts an undecodable datagram in `ipfix_decode_errors` and
+    /// keeps serving: a valid datagram sent afterwards still reaches the handler.
+    #[tokio::test]
+    async fn test_undecodable_datagram_is_counted_and_listener_keeps_serving_in_every_shape() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        for (i, (tasks, batch)) in LOOP_SHAPES.into_iter().enumerate() {
+            let expected = i as u64 + 1;
+            let (mut task, bound, tx, handler) = start_shape(tasks, batch, None).await;
+            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            // Unknown version 0xFFFF.
+            sock.send_to(&[0xFF, 0xFF, 0x00, 0x00], bound)
+                .await
+                .unwrap();
+            wait_until(&mut task, "the decode error", || {
+                counter_total(&snapshotter, "ipfix_decode_errors") == expected
+            })
+            .await;
+            assert_eq!(handler.flow_count(), 0, "tasks={tasks} batch={batch}");
+
+            sock.send_to(FIXTURE_NFV5_ONE_RECORD, bound).await.unwrap();
+            wait_until(&mut task, "the valid flow", || handler.flow_count() == 1).await;
+            tx.send(true).unwrap();
+            task.await.unwrap().unwrap();
+        }
+    }
+
+    /// A shutdown channel update that is not a shutdown request (`false`) must not stop any
+    /// receive-loop shape.
+    #[tokio::test]
+    async fn test_shutdown_channel_update_to_false_does_not_stop_any_loop_shape() {
+        for (tasks, batch) in LOOP_SHAPES {
+            let (mut task, bound, tx, handler) = start_shape(tasks, batch, None).await;
+            tx.send(false).unwrap();
+            sleep(Duration::from_millis(50)).await;
+            assert!(!task.is_finished(), "tasks={tasks} batch={batch} stopped");
+
+            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            sock.send_to(FIXTURE_NFV5_ONE_RECORD, bound).await.unwrap();
+            wait_until(&mut task, "a flow after the no-op signal", || {
+                handler.flow_count() == 1
+            })
+            .await;
+
+            tx.send(true).unwrap();
+            let done = tokio::time::timeout(Duration::from_secs(10), task).await;
+            assert!(done.is_ok(), "tasks={tasks} batch={batch}: no exit on true");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fan_out_startup_log_reports_the_number_of_recv_tasks() {
+        crate::test_support::install_and_clear();
+        let (task, _bound, tx, _handler) = start_shape(3, 1, None).await;
+        let info = crate::test_support::captured_events_at(tracing::Level::INFO);
+        assert!(
+            info.iter().any(|m| m.contains("(3 recv tasks)")),
+            "got {info:?}"
+        );
+        tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_template_only_datagram_is_logged_as_producing_no_flows() {
+        crate::test_support::install_and_clear();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let handler = CapturingHandler::new();
+        let listener = IpfixListener::new(IpfixListenerConfig::default(), handler.clone());
+        let mut task = tokio::spawn(async move { listener.run_with_socket(socket).await });
+        sleep(Duration::from_millis(20)).await;
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(&template_datagram(1), addr).await.unwrap();
+        wait_until(&mut task, "the no-flows debug line", || {
+            crate::test_support::captured_events_at(tracing::Level::DEBUG)
+                .iter()
+                .any(|m| m.contains("produced no flows"))
+        })
+        .await;
+        task.abort();
+        assert!(handler.batches().is_empty(), "no flows, no handler call");
     }
 }
