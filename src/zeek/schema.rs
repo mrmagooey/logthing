@@ -2952,4 +2952,252 @@ mod tests {
             payload.value(0)
         );
     }
+
+    // --- wrong-typed fields: typed column stays null, raw value is kept in _extra ---
+
+    /// Builds a record whose every listed field is a JSON boolean (valid for none of the typed
+    /// column kinds), maps it, and asserts each typed column is null with the raw value
+    /// preserved in `_extra`.
+    fn assert_wrong_typed_fields_fall_to_extra(
+        keys: &[&str],
+        map: fn(&serde_json::Value, chrono::DateTime<chrono::Utc>) -> anyhow::Result<RecordBatch>,
+    ) {
+        let mut obj = serde_json::Map::new();
+        for k in keys {
+            obj.insert((*k).to_string(), serde_json::json!(true));
+        }
+        let batch = map(&serde_json::Value::Object(obj), rx()).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let extra = batch
+            .column_by_name("_extra")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let extra_val: serde_json::Value = serde_json::from_str(extra.value(0)).unwrap();
+        for k in keys {
+            let col = batch.column_by_name(&k.replace('.', "_")).unwrap();
+            assert!(col.is_null(0), "wrong-typed {k} must leave its column null");
+            assert_eq!(
+                extra_val.get(*k),
+                Some(&serde_json::json!(true)),
+                "wrong-typed {k} must be preserved in _extra"
+            );
+        }
+    }
+
+    #[test]
+    fn conn_all_wrong_typed_fields_go_to_extra() {
+        assert_wrong_typed_fields_fall_to_extra(
+            &[
+                "ts",
+                "uid",
+                "id.orig_h",
+                "id.orig_p",
+                "id.resp_h",
+                "id.resp_p",
+                "proto",
+                "service",
+                "duration",
+                "orig_bytes",
+                "resp_bytes",
+                "conn_state",
+                "history",
+                "orig_pkts",
+                "resp_pkts",
+            ],
+            map_conn,
+        );
+    }
+
+    #[test]
+    fn dns_all_wrong_typed_fields_go_to_extra() {
+        assert_wrong_typed_fields_fall_to_extra(
+            &[
+                "ts",
+                "uid",
+                "id.orig_h",
+                "id.orig_p",
+                "id.resp_h",
+                "id.resp_p",
+                "proto",
+                "trans_id",
+                "query",
+                "qtype_name",
+                "qclass_name",
+                "rcode_name",
+                "answers",
+            ],
+            map_dns,
+        );
+    }
+
+    #[test]
+    fn http_all_wrong_typed_fields_go_to_extra() {
+        assert_wrong_typed_fields_fall_to_extra(
+            &[
+                "ts",
+                "uid",
+                "id.orig_h",
+                "id.orig_p",
+                "id.resp_h",
+                "id.resp_p",
+                "method",
+                "host",
+                "uri",
+                "status_code",
+                "user_agent",
+                "request_body_len",
+                "response_body_len",
+            ],
+            map_http,
+        );
+    }
+
+    #[test]
+    fn ssl_all_wrong_typed_fields_go_to_extra() {
+        assert_wrong_typed_fields_fall_to_extra(
+            &[
+                "ts",
+                "uid",
+                "id.orig_h",
+                "id.orig_p",
+                "id.resp_h",
+                "id.resp_p",
+                "version",
+                "cipher",
+                "curve",
+                "server_name",
+                "validation_status",
+            ],
+            map_ssl,
+        );
+    }
+
+    #[test]
+    fn files_all_wrong_typed_fields_go_to_extra() {
+        assert_wrong_typed_fields_fall_to_extra(
+            &[
+                "ts",
+                "fuid",
+                "tx_hosts",
+                "rx_hosts",
+                "source",
+                "mime_type",
+                "filename",
+                "total_bytes",
+            ],
+            map_files,
+        );
+    }
+
+    #[test]
+    fn notice_all_wrong_typed_fields_go_to_extra() {
+        assert_wrong_typed_fields_fall_to_extra(
+            &[
+                "ts",
+                "uid",
+                "id.orig_h",
+                "id.orig_p",
+                "id.resp_h",
+                "id.resp_p",
+                "note",
+                "msg",
+                "sub",
+                "actions",
+            ],
+            map_notice,
+        );
+    }
+
+    #[test]
+    fn json_array_str_accepts_array_and_string_and_rejects_other_types() {
+        let v = serde_json::json!({ "a": ["x", "y"], "s": "one", "n": 5, "b": true });
+        assert_eq!(json_array_str(&v, "a").as_deref(), Some("[\"x\",\"y\"]"));
+        assert_eq!(json_array_str(&v, "s").as_deref(), Some("\"one\""));
+        assert_eq!(json_array_str(&v, "n"), None);
+        assert_eq!(json_array_str(&v, "b"), None);
+        assert_eq!(json_array_str(&v, "missing"), None);
+    }
+
+    /// Each typed accumulator's `try_append` must accept a record routed to its own schema
+    /// (appending exactly one row with the record's fields) and reject every other schema's.
+    #[test]
+    fn typed_accumulators_try_append_accepts_own_schema_and_rejects_others() {
+        fn rec(path: &str, fields: serde_json::Value) -> crate::zeek::ZeekRecord {
+            crate::zeek::ZeekRecord {
+                log_path: path.to_string(),
+                fields,
+                received_at: rx(),
+            }
+        }
+        let conn = rec(
+            "conn",
+            serde_json::json!({ "ts": 1700000000.0, "uid": "C1" }),
+        );
+        let ssl = rec(
+            "ssl",
+            serde_json::json!({ "ts": 1700000000.0, "server_name": "a.test" }),
+        );
+        let files = rec(
+            "files",
+            serde_json::json!({ "ts": 1700000000.0, "fuid": "F1" }),
+        );
+        let notice = rec(
+            "notice",
+            serde_json::json!({ "ts": 1700000000.0, "note": "N::X" }),
+        );
+
+        let mut c = ConnAccumulator::new();
+        assert!(!c.try_append(&ssl, rx()).unwrap(), "conn must reject ssl");
+        assert_eq!(c.len(), 0);
+        assert!(c.try_append(&conn, rx()).unwrap());
+        assert_eq!(c.len(), 1);
+
+        let mut s = SslAccumulator::new();
+        assert!(!s.try_append(&conn, rx()).unwrap(), "ssl must reject conn");
+        assert_eq!(s.len(), 0);
+        assert!(s.try_append(&ssl, rx()).unwrap());
+        let batch = s.finish().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let sn = batch
+            .column_by_name("server_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(sn.value(0), "a.test");
+
+        let mut f = FilesAccumulator::new();
+        assert!(
+            !f.try_append(&notice, rx()).unwrap(),
+            "files must reject notice"
+        );
+        assert_eq!(f.len(), 0);
+        assert!(f.try_append(&files, rx()).unwrap());
+        let batch = f.finish().unwrap();
+        let fu = batch
+            .column_by_name("fuid")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(fu.value(0), "F1");
+
+        let mut n = NoticeAccumulator::new();
+        assert!(
+            !n.try_append(&files, rx()).unwrap(),
+            "notice must reject files"
+        );
+        assert_eq!(n.len(), 0);
+        assert!(n.try_append(&notice, rx()).unwrap());
+        let batch = n.finish().unwrap();
+        let note = batch
+            .column_by_name("note")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(note.value(0), "N::X");
+    }
 }
