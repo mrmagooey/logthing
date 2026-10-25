@@ -251,4 +251,12 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert!(s.put("b", u, "<b:BookmarkList xmlns:b=\"urn:x\"/>".into()));
     }
+
+    #[test]
+    fn test_bookmark_store_is_empty_tracks_contents() {
+        let s = BookmarkStore::new(2);
+        assert!(s.is_empty());
+        put(&s, "a", Uuid::nil(), 1);
+        assert!(!s.is_empty());
+    }
 }

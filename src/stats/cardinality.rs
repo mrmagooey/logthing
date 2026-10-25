@@ -1320,4 +1320,41 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_cardinality_source_enabled_unknown_source_is_false() {
+        let config = Config::default();
+        assert!(cardinality_source_enabled(&config, "wef"));
+        assert!(!cardinality_source_enabled(&config, "netflow"));
+        assert!(!cardinality_source_enabled(&config, ""));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_ticker_keeps_running_on_false_signal_and_publishes_on_shutdown() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // Current-thread runtime: the spawned ticker runs on this thread, so the thread-local
+        // recorder sees its gauge writes.
+        let _guard = set_default_local_recorder(&recorder);
+
+        let w = Arc::new(CardinalityWatcher::new(watch("conn", "id.orig_h"), 100));
+        w.observe(&rec("conn", "10.0.0.1"));
+        w.observe(&rec("conn", "10.0.0.2"));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = spawn_ticker(vec![w], 3600, rx);
+
+        // A `false` value is a change notification but not a shutdown request.
+        tx.send(false).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!handle.is_finished(), "ticker must survive a false signal");
+        assert_eq!(gauge_value(&snapshotter, "field_distinct_values"), 0.0);
+
+        // The shutdown signal triggers one final publish and ends the task.
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(30), handle)
+            .await
+            .expect("ticker stops on shutdown")
+            .unwrap();
+        assert_eq!(gauge_value(&snapshotter, "field_distinct_values"), 2.0);
+    }
 }

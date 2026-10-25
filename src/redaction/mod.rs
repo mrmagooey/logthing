@@ -1215,4 +1215,42 @@ mod tests {
         .to_string();
         assert!(e.contains("duplicate") && e.contains("\"email\""), "{e}");
     }
+
+    #[test]
+    fn test_hec_hash_and_mask_apply_to_indexed_fields_too() {
+        let r = hec(&[], &["user"], &["[0-9]{3}-[0-9]{2}"]);
+        let mut rec = generic(json!({"user": "u", "note": "ssn 123-45"}));
+        rec.indexed_fields = Some(json!({"user": "alice", "tag": "id 678-90"}));
+        let c = r.redact_generic(&mut rec);
+        let indexed = rec.indexed_fields.unwrap();
+        assert_eq!(indexed["user"].as_str().map(str::len), Some(64));
+        assert_eq!(indexed["tag"], json!("id [REDACTED]"));
+        assert_eq!(rec.fields["note"], json!("ssn [REDACTED]"));
+        assert_eq!((c.hashed, c.masked), (2, 2));
+    }
+
+    #[test]
+    fn test_column_rules_of_other_kind_are_noops() {
+        // A HEC redactor's `host` column has no slot on an OTLP record, and an OTLP
+        // redactor's `body` column has none on a generic record.
+        let r = hec(&["@host"], &["@source"], &[]);
+        let mut rec = otlp_rec();
+        assert_eq!(r.redact_otlp(&mut rec), RedactionCounts::default());
+        assert_eq!(rec.host_name.as_deref(), Some("host-1"));
+
+        let r = otlp(&["@body"], &["@host_name"], &[]);
+        let mut g = generic(json!({"a": 1}));
+        g.host = Some("h".into());
+        assert_eq!(r.redact_generic(&mut g), RedactionCounts::default());
+        assert_eq!(g.host.as_deref(), Some("h"));
+    }
+
+    #[test]
+    fn test_otlp_body_json_path_rule_with_absent_body_is_a_noop() {
+        let r = otlp(&["@body.card"], &[], &[]);
+        let mut rec = otlp_rec();
+        assert_eq!(rec.body, None);
+        assert_eq!(r.redact_otlp(&mut rec), RedactionCounts::default());
+        assert_eq!(rec.body, None);
+    }
 }

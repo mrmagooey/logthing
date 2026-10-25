@@ -543,4 +543,47 @@ mod tests {
         assert_eq!(buckets.buckets[1].hour, 101);
         assert_eq!(buckets.buckets[1].count, 5);
     }
+
+    #[test]
+    fn test_event_stats_drops_buckets_older_than_retention() {
+        let mut s = EventStats::default();
+        s.record(11);
+        s.record(12);
+        s.record(12 + RETENTION_MINUTES);
+        // minute 11 is older than the retention window; minute 12 is exactly at its edge.
+        let minutes: Vec<i64> = s.buckets.iter().map(|b| b.minute).collect();
+        assert_eq!(minutes, vec![12, 12 + RETENTION_MINUTES]);
+        assert_eq!(s.total, 3);
+    }
+
+    #[test]
+    fn test_event_stats_snapshot_of_idle_type_has_zero_rate() {
+        let mut s = EventStats::default();
+        s.record(5);
+        let snap = s.to_snapshot("idle".into(), 500);
+        assert_eq!(snap.total_events, 1);
+        assert_eq!(snap.last_minute, 0);
+        assert_eq!(snap.last_five_minutes, 0);
+        assert_eq!(snap.average_per_second_last_minute, 0.0);
+    }
+
+    #[test]
+    fn test_event_stats_non_positive_window_sums_to_zero() {
+        let mut s = EventStats::default();
+        s.record(5);
+        assert_eq!(s.sum_for_window(0, 5), 0);
+        assert_eq!(s.sum_for_window(-3, 5), 0);
+        assert_eq!(s.sum_for_window(1, 5), 1);
+    }
+
+    #[test]
+    fn test_source_buckets_drops_hours_older_than_retention() {
+        let mut s = SourceBuckets::default();
+        s.record(100, 4);
+        s.record(101, 1);
+        s.record(100 + HOUR_RETENTION, 2);
+        // hour 100 fell out of the 24-hour window; hour 101 is exactly at its edge.
+        let hours: Vec<(i64, u64)> = s.buckets.iter().map(|b| (b.hour, b.count)).collect();
+        assert_eq!(hours, vec![(101, 1), (100 + HOUR_RETENTION, 2)]);
+    }
 }
