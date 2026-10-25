@@ -1237,4 +1237,85 @@ mod tests {
         let rec = rx.recv().await.unwrap();
         assert_eq!(rec.fields, serde_json::json!({"pw": "x"}));
     }
+
+    #[test]
+    fn test_sanitized_parse_error_utf8_failure_is_generic() {
+        let bytes = std::hint::black_box([0xFFu8, 0xFE, b'x']);
+        let bad = std::str::from_utf8(&bytes).unwrap_err();
+        let err = anyhow::Error::new(bad).context("NDJSON parse error");
+        assert_eq!(sanitized_parse_error(&err), "body is not valid UTF-8");
+    }
+
+    #[test]
+    fn test_sanitized_parse_error_fixed_string_passes_through() {
+        let err = anyhow::anyhow!("missing required 'event' key");
+        assert_eq!(sanitized_parse_error(&err), "missing required 'event' key");
+    }
+
+    #[tokio::test]
+    async fn hec_local_channel_closed_is_logged_at_error_level() {
+        use crate::forwarding::buffered_writer::ParquetWriterHandle;
+        use crate::forwarding::generic_s3::GenericSink;
+        crate::test_support::install_and_clear();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        drop(rx); // writer gone
+        let ingest = IngestState {
+            generic_local: Some(ParquetWriterHandle::<GenericSink>::for_test(
+                tx, "hec", "local",
+            )),
+            ..Default::default()
+        };
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let resp = app
+            .oneshot(post("/services/collector/event", r#"{"event":"x"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let errors = crate::test_support::captured_events_at(tracing::Level::ERROR);
+        assert!(
+            errors
+                .iter()
+                .any(|m| m.contains("HEC local channel closed")),
+            "{errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hec_full_channel_drop_logs_are_throttled_per_target() {
+        use crate::forwarding::buffered_writer::ParquetWriterHandle;
+        use crate::forwarding::generic_s3::GenericSink;
+        crate::test_support::install_and_clear();
+        let (s3_tx, _s3_rx) = tokio::sync::mpsc::channel(1);
+        let (local_tx, _local_rx) = tokio::sync::mpsc::channel(1);
+        let ingest = IngestState {
+            generic_s3: Some(ParquetWriterHandle::<GenericSink>::for_test(
+                s3_tx, "hec", "s3",
+            )),
+            generic_local: Some(ParquetWriterHandle::<GenericSink>::for_test(
+                local_tx, "hec", "local",
+            )),
+            ..Default::default()
+        };
+        let app = make_router_with_ingest(Arc::new(RwLock::new(Config::default())), ingest);
+        let uri = "/services/collector/event";
+        let mut statuses = Vec::new();
+        for i in 0..4 {
+            let resp = app
+                .clone()
+                .oneshot(post(uri, &format!("{{\"event\":{i}}}")))
+                .await
+                .unwrap();
+            statuses.push(resp.status());
+        }
+        assert_eq!(statuses[0], StatusCode::OK);
+        assert!(
+            statuses[1..]
+                .iter()
+                .all(|s| *s == StatusCode::SERVICE_UNAVAILABLE)
+        );
+        let warns = crate::test_support::captured_events_at(tracing::Level::WARN);
+        let count = |needle: &str| warns.iter().filter(|m| m.contains(needle)).count();
+        assert_eq!(count("HEC S3 channel full"), 1, "{warns:?}");
+        assert_eq!(count("HEC local channel full"), 1, "{warns:?}");
+    }
 }

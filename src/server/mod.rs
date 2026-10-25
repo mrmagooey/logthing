@@ -1837,6 +1837,320 @@ event_parsers:
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    // ------------------------------------------------------------------ //
+    // Coverage: body-budget trait delegation, sink failure logging,       //
+    // Server::new target wiring, WEF auth topology selection              //
+    // ------------------------------------------------------------------ //
+
+    /// The handler sees the request body through `BudgetedBody`; its `size_hint` and
+    /// `is_end_stream` must reflect the real body, not a default.
+    #[tokio::test]
+    async fn budgeted_body_delegates_size_hint_and_end_of_stream() {
+        use tower::ServiceExt;
+        let budget = Arc::new(Semaphore::new(1024));
+        let router = Router::new()
+            .route(
+                "/probe",
+                axum::routing::post(|body: Body| async move {
+                    let hint = HttpBody::size_hint(&body);
+                    format!("{:?}/{}", hint.exact(), HttpBody::is_end_stream(&body))
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                budget,
+                body_budget_middleware,
+            ));
+        let send = |payload: &'static [u8]| {
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/probe")
+                .body(Body::from(payload))
+                .unwrap();
+            router.clone().oneshot(req)
+        };
+        let body_text = |resp: Response| async move {
+            let b = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+            String::from_utf8(b.to_vec()).unwrap()
+        };
+        assert_eq!(
+            body_text(send(b"hello").await.unwrap()).await,
+            "Some(5)/false"
+        );
+        assert_eq!(body_text(send(b"").await.unwrap()).await, "Some(0)/true");
+    }
+
+    fn wef_state_with_senders(
+        s3: Option<tokio::sync::mpsc::Sender<Arc<WindowsEvent>>>,
+        local: Option<tokio::sync::mpsc::Sender<Arc<WindowsEvent>>>,
+    ) -> Arc<AppState> {
+        type Handle = crate::forwarding::buffered_writer::ParquetWriterHandle<
+            crate::forwarding::parquet_s3::WefSink,
+        >;
+        Arc::new(AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            throughput: Arc::new(ThroughputStats::new()),
+            wef_cardinality_watchers: Vec::new(),
+            wef: None,
+            bookmarks: Arc::new(crate::wef::bookmarks::BookmarkStore::new(16)),
+            event_parser: None,
+            parquet_s3_sender: s3.map(|tx| Handle::for_test(tx, "wef", "s3")),
+            parquet_local_sender: local.map(|tx| Handle::for_test(tx, "wef", "local")),
+            wef_filter: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn wef_closed_s3_and_full_local_sinks_refuse_events_and_log_once_each() {
+        crate::test_support::install_and_clear();
+        let (s3_tx, s3_rx) = tokio::sync::mpsc::channel(4);
+        drop(s3_rx);
+        let (local_tx, _local_rx) = tokio::sync::mpsc::channel(1);
+        let state = wef_state_with_senders(Some(s3_tx), Some(local_tx));
+        for i in 0..3 {
+            assert!(
+                !process_single_event(&state, wef_event(4624, &format!("H{i}"))).await,
+                "event {i} must be reported as not fully enqueued"
+            );
+        }
+        let errors = crate::test_support::captured_events_at(tracing::Level::ERROR);
+        let warns = crate::test_support::captured_events_at(tracing::Level::WARN);
+        // Throttled: three drops on each sink, one log line per sink and kind.
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|m| m.contains("WEF Parquet S3 channel closed"))
+                .count(),
+            1,
+            "{errors:?}"
+        );
+        assert_eq!(
+            warns
+                .iter()
+                .filter(|m| m.contains("WEF Parquet local channel full"))
+                .count(),
+            1,
+            "{warns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wef_closed_local_sink_refuses_event_and_logs_error() {
+        crate::test_support::install_and_clear();
+        let (local_tx, local_rx) = tokio::sync::mpsc::channel(4);
+        drop(local_rx);
+        let state = wef_state_with_senders(None, Some(local_tx));
+        assert!(!process_single_event(&state, wef_event(4624, "HOST")).await);
+        let errors = crate::test_support::captured_events_at(tracing::Level::ERROR);
+        assert!(
+            errors
+                .iter()
+                .any(|m| m.contains("WEF Parquet local channel closed")),
+            "{errors:?}"
+        );
+    }
+
+    async fn try_build_server(config: Config) -> anyhow::Result<Server> {
+        let shared = Arc::new(RwLock::new(config.clone()));
+        Server::new(
+            config,
+            shared,
+            Arc::new(ThroughputStats::new()),
+            Arc::new(crate::stats::SourceHourlyStats::new()),
+            crate::forwarding::flush_registry::FlushIntervalRegistry::new(),
+            IpWhitelist::empty(),
+            Vec::new(),
+        )
+        .await
+    }
+
+    fn s3_json(bucket: &str) -> serde_json::Value {
+        serde_json::json!({
+            "endpoint": "http://127.0.0.1:1",
+            "bucket": bucket,
+            "region": "us-east-1",
+            "access_key": "ak",
+            "secret_key": "sk",
+        })
+    }
+
+    #[tokio::test]
+    async fn server_new_builds_wef_hec_and_otlp_s3_forwarders() {
+        crate::test_support::install_and_clear();
+        let mut config = Config::default();
+        config.wef.s3 = Some(serde_json::from_value(s3_json("wef")).unwrap());
+        config.hec.enabled = true;
+        config.hec.s3 = Some(serde_json::from_value(s3_json("hec")).unwrap());
+        config.otlp.enabled = true;
+        config.otlp.s3 = Some(serde_json::from_value(s3_json("otlp")).unwrap());
+        let mut server = try_build_server(config).await.expect("server builds");
+
+        assert!(server.state.parquet_s3_sender.is_some());
+        assert!(server.state.parquet_local_sender.is_none());
+        assert!(server.ingest_state.generic_s3.is_some());
+        assert!(server.ingest_state.otlp_s3.is_some());
+        let wef_workers = server.take_wef_worker_handles();
+        let hec_workers = server.take_hec_worker_handles();
+        assert_eq!(wef_workers.len(), 1);
+        assert_eq!(hec_workers.len(), 2, "one HEC and one OTLP worker");
+        let infos = crate::test_support::captured_events_at(tracing::Level::INFO);
+        for needle in [
+            "Initialized WEF Parquet S3 forwarder",
+            "Initialized HEC Parquet S3 forwarder",
+            "Initialized OTLP Parquet S3 forwarder",
+        ] {
+            assert!(
+                infos.iter().any(|m| m.contains(needle)),
+                "{needle}: {infos:?}"
+            );
+        }
+        for h in wef_workers.into_iter().chain(hec_workers) {
+            h.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn server_new_skips_local_targets_whose_directory_cannot_be_created() {
+        crate::test_support::install_and_clear();
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, b"file").unwrap();
+        let bad = blocker.join("sub");
+        let dir = |d: &std::path::Path| serde_json::json!({ "directory": d });
+        let mut config = Config::default();
+        config.wef.local = Some(serde_json::from_value(dir(&bad)).unwrap());
+        config.hec.enabled = true;
+        config.hec.local = Some(serde_json::from_value(dir(&bad)).unwrap());
+        config.otlp.enabled = true;
+        config.otlp.local = Some(serde_json::from_value(dir(&bad)).unwrap());
+        config.iceberg.local = Some(serde_json::from_value(dir(&bad)).unwrap());
+        let mut server = try_build_server(config)
+            .await
+            .expect("sink failures are not fatal");
+
+        assert!(server.state.parquet_local_sender.is_none());
+        assert!(server.ingest_state.generic_local.is_none());
+        assert!(server.ingest_state.otlp_local.is_none());
+        assert!(server.take_wef_worker_handles().is_empty());
+        assert!(server.take_hec_worker_handles().is_empty());
+        let errors = crate::test_support::captured_events_at(tracing::Level::ERROR);
+        for needle in [
+            "Failed to construct Iceberg descriptor sink",
+            "Failed to create LocalDiskSink for WEF",
+            "Failed to create LocalDiskSink for HEC",
+            "Failed to create LocalDiskSink for OTLP",
+        ] {
+            assert!(
+                errors.iter().any(|m| m.contains(needle)),
+                "{needle}: {errors:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn server_new_rejects_invalid_hec_redaction_rules() {
+        let mut config = Config::default();
+        config.hec.enabled = true;
+        config.hec.redaction.mask_patterns = vec!["(".to_string()];
+        let err = try_build_server(config).await.map(drop).unwrap_err();
+        assert!(format!("{err:#}").contains("hec.redaction"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn server_new_rejects_invalid_otlp_redaction_rules() {
+        let mut config = Config::default();
+        config.otlp.enabled = true;
+        config.otlp.redaction.mask_patterns = vec!["(".to_string()];
+        let err = try_build_server(config).await.map(drop).unwrap_err();
+        assert!(format!("{err:#}").contains("otlp.redaction"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn server_new_warns_when_wef_is_configured_without_subscriptions() {
+        crate::test_support::install_and_clear();
+        let mut config = Config::default();
+        config.wef.allow_unauthenticated = true;
+        let server = try_build_server(config).await.expect("server builds");
+        assert!(server.state.wef.is_none());
+        let warns = crate::test_support::captured_events_at(tracing::Level::WARN);
+        assert!(
+            warns
+                .iter()
+                .any(|m| m.contains("no [[wef.subscriptions]] are declared")),
+            "{warns:?}"
+        );
+    }
+
+    #[cfg(not(feature = "kerberos-auth"))]
+    #[tokio::test]
+    async fn server_new_warns_when_kerberos_requested_without_the_feature() {
+        crate::test_support::install_and_clear();
+        let mut config = Config::default();
+        config.security.kerberos.enabled = true;
+        let server = try_build_server(config).await.expect("server builds");
+        let warns = crate::test_support::captured_events_at(tracing::Level::WARN);
+        assert!(
+            warns
+                .iter()
+                .any(|m| m.contains("'kerberos-auth' feature is not enabled")),
+            "{warns:?}"
+        );
+        // The per-request layer path warns again and leaves the router unauthenticated.
+        crate::test_support::install_and_clear();
+        let _router = server
+            .apply_wsman_auth(Router::new())
+            .expect("router passes through");
+        let warns = crate::test_support::captured_events_at(tracing::Level::WARN);
+        assert!(
+            warns
+                .iter()
+                .any(|m| m.contains("requests will NOT be authenticated")),
+            "{warns:?}"
+        );
+    }
+
+    #[derive(Debug)]
+    struct UnusedGssFactory;
+
+    impl kerberos::GssAcceptorFactory for UnusedGssFactory {
+        fn new_acceptor(&self) -> anyhow::Result<Box<dyn kerberos::GssAcceptor>> {
+            anyhow::bail!("unused in this test")
+        }
+    }
+
+    fn kerberos_runtime() -> Arc<crate::wef::subscription::WefRuntime> {
+        Arc::new(crate::wef::subscription::WefRuntime {
+            topology: crate::wef::subscription::WefTopology::PlainKerberos,
+            collector_url: "http://logthing.example.com:5985".to_string(),
+            subscriptions: Vec::new(),
+            issuer_thumbprints: Vec::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn apply_wsman_auth_uses_injected_gss_factory_for_kerberos_topology() {
+        let mut server = build_server(Config::default())
+            .await
+            .with_gss_factory(Arc::new(UnusedGssFactory));
+        Arc::get_mut(&mut server.state).unwrap().wef = Some(kerberos_runtime());
+        assert!(server.apply_wsman_auth(Router::new()).is_ok());
+    }
+
+    #[cfg(not(feature = "kerberos-auth"))]
+    #[tokio::test]
+    async fn apply_wsman_auth_kerberos_topology_without_feature_or_factory_fails() {
+        let mut server = build_server(Config::default()).await;
+        Arc::get_mut(&mut server.state).unwrap().wef = Some(kerberos_runtime());
+        let err = server
+            .apply_wsman_auth(Router::new())
+            .map(drop)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires the 'kerberos-auth' feature"),
+            "{err}"
+        );
+    }
+
     /// H-4: `build_tls_config` must fail with a clear error when
     /// `require_client_cert` is `true` but no `ca_file` is supplied.
     #[test]

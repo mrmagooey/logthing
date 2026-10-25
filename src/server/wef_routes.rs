@@ -1034,6 +1034,49 @@ mod tests {
         assert_eq!(got, data);
     }
 
+    fn without_message_id(xml: &str) -> String {
+        let mid = soap::parse(xml).unwrap().message_id.unwrap();
+        let stripped = xml.replace(&format!("<a:MessageID>{mid}</a:MessageID>"), "");
+        assert_ne!(stripped, xml);
+        stripped
+    }
+
+    #[tokio::test]
+    async fn test_wsman_undecodable_charset_returns_400_and_logs() {
+        crate::test_support::install_and_clear();
+        let app = app(&state_with(true, None));
+        // UTF-16LE BOM followed by an odd number of bytes.
+        let (st, _, _) = post(&app, "/wsman", &[], vec![0xFF, 0xFE, b'<']).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let events = crate::test_support::captured_events();
+        assert!(
+            events.iter().any(|m| m.contains("undecodable charset")),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wsman_enumerate_without_message_id_returns_400() {
+        let app = app(&state_with(true, None));
+        let (st, _, body) = post(&app, "/wsman", &[], utf16(&without_message_id(ENUMERATE))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delivery_heartbeat_without_message_id_cannot_be_acked_400() {
+        let app = app(&state_with(true, None));
+        let (st, _, body) = post(
+            &app,
+            &delivery_path(),
+            &[],
+            utf16(&without_message_id(HEARTBEAT)),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(body.is_empty());
+    }
+
     #[test]
     fn test_route_target_classification() {
         assert_eq!(route_target("/wsman"), Target::Manager);

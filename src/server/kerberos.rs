@@ -1080,6 +1080,252 @@ mod tests {
         h.factory.created.load(Ordering::SeqCst) as u64
     }
 
+    // ---- fault injection (coverage of worker-failure and logging paths) ----------------
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Fault {
+        PanicStep,
+        FlagsLostOnSecondCall,
+        PanicOnSecondFlagsCall,
+        WrapFails,
+    }
+
+    #[derive(Debug)]
+    struct FaultAcceptor {
+        fault: Fault,
+        flag_calls: usize,
+    }
+
+    impl GssAcceptor for FaultAcceptor {
+        fn step(&mut self, _token: &[u8]) -> anyhow::Result<(bool, Option<Vec<u8>>)> {
+            if self.fault == Fault::PanicStep {
+                panic!("fault: step panics");
+            }
+            Ok((true, None))
+        }
+        fn principal(&mut self) -> anyhow::Result<String> {
+            Ok("fault@EXAMPLE.COM".into())
+        }
+        fn has_conf_integ_mutual(&mut self) -> anyhow::Result<bool> {
+            self.flag_calls += 1;
+            match self.fault {
+                Fault::FlagsLostOnSecondCall => Ok(self.flag_calls == 1),
+                Fault::PanicOnSecondFlagsCall if self.flag_calls >= 2 => {
+                    panic!("fault: flags check panics")
+                }
+                _ => Ok(true),
+            }
+        }
+        fn unwrap_iov(&mut self, header: &[u8], data: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+            fake_unwrap(1, header, &data)
+        }
+        fn wrap_iov(&mut self, plaintext: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+            if self.fault == Fault::WrapFails {
+                anyhow::bail!("fault: wrap failed");
+            }
+            Ok(fake_wrap(1, plaintext))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FaultFactory(Fault);
+
+    impl GssAcceptorFactory for FaultFactory {
+        fn new_acceptor(&self) -> anyhow::Result<Box<dyn GssAcceptor>> {
+            Ok(Box::new(FaultAcceptor {
+                fault: self.0,
+                flag_calls: 0,
+            }))
+        }
+    }
+
+    fn fault_router(fault: Fault) -> Router {
+        Router::new()
+            .route(
+                "/wsman",
+                post(|body: Bytes| async move {
+                    Response::builder()
+                        .status(200)
+                        .header(header::CONTENT_TYPE, SOAP_UTF16)
+                        .body(Body::from(body))
+                        .unwrap()
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                Arc::new(WsmanAuth::new(Arc::new(FaultFactory(fault)))),
+                wsman_auth_middleware,
+            ))
+    }
+
+    async fn send_fault(router: &Router, slot: &ConnSlot, mut req: HttpRequest<Body>) -> Response {
+        req.extensions_mut().insert(slot.clone());
+        let addr: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+        router.clone().oneshot(req).await.unwrap()
+    }
+
+    #[test]
+    fn test_missing_flags_error_display_names_the_missing_properties() {
+        assert_eq!(
+            MissingFlagsError.to_string(),
+            "GSS context lacks confidentiality, integrity or mutual authentication"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_body_stream_error_returns_400() {
+        let h = Harness::new();
+        let failing = futures::stream::once(async {
+            Err::<Bytes, std::io::Error>(std::io::Error::other("client reset"))
+        });
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/wsman")
+            .header(
+                "Authorization",
+                format!("Kerberos {}", b64("principal:eve")),
+            )
+            .body(Body::from_stream(failing))
+            .unwrap();
+        let resp = h.send(req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(h.seen.lock().unwrap().is_empty(), "handler must not run");
+    }
+
+    #[tokio::test]
+    async fn test_handshake_error_is_logged_sanitized_and_returns_401() {
+        crate::test_support::install_and_clear();
+        let h = Harness::new();
+        let resp = h
+            .send(auth_req("Kerberos", "bogus\u{1b}[31m", "/wsman", vec![]))
+            .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let events = crate::test_support::captured_events();
+        let line = events
+            .iter()
+            .find(|m| m.starts_with("WEF Kerberos handshake failed"))
+            .unwrap_or_else(|| panic!("no handshake warning: {events:?}"));
+        assert!(line.contains("fake: rejected token"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn test_successful_handshake_logs_scheme_and_principal() {
+        crate::test_support::install_and_clear();
+        let h = Harness::new();
+        login(&h, "carol@EXAMPLE.COM").await;
+        let events = crate::test_support::captured_events();
+        assert!(
+            events
+                .iter()
+                .any(|m| m.contains("carol@EXAMPLE.COM")
+                    && m.ends_with("authenticated via Kerberos")),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handshake_worker_panic_returns_401() {
+        crate::test_support::install_and_clear();
+        let router = fault_router(Fault::PanicStep);
+        let slot = ConnSlot::default();
+        let resp = send_fault(
+            &router,
+            &slot,
+            auth_req("Kerberos", "tok", "/wsman", vec![]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let events = crate::test_support::captured_events_at(tracing::Level::ERROR);
+        assert!(
+            events.iter().any(|m| m.contains("worker task panicked")),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_worker_panic_returns_401() {
+        let router = fault_router(Fault::PanicOnSecondFlagsCall);
+        let slot = ConnSlot::default();
+        let login = send_fault(
+            &router,
+            &slot,
+            auth_req("Kerberos", "tok", "/wsman", vec![]),
+        )
+        .await;
+        assert_eq!(login.status(), StatusCode::OK);
+        let resp = send_fault(&router, &slot, enc_req("/wsman", 1, b"<soap/>", 7)).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_context_losing_flags_before_decrypt_returns_401() {
+        let router = fault_router(Fault::FlagsLostOnSecondCall);
+        let slot = ConnSlot::default();
+        let login = send_fault(
+            &router,
+            &slot,
+            auth_req("Kerberos", "tok", "/wsman", vec![]),
+        )
+        .await;
+        assert_eq!(login.status(), StatusCode::OK);
+        let resp = send_fault(&router, &slot, enc_req("/wsman", 1, b"<soap/>", 7)).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // The context was dropped: the next header-less request must re-authenticate.
+        let again = send_fault(&router, &slot, plain_req("/wsman", b"")).await;
+        assert_eq!(again.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_token_request_carrying_encrypted_body_returns_mutual_token() {
+        let h = Harness::new();
+        let plain = b"<soap/>";
+        let (hdr, data) = fake_wrap(1, plain);
+        let body = multipart::build(EncProtocol::Kerberos, plain.len(), &hdr, &data);
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/wsman")
+            .header(
+                "Authorization",
+                format!("Kerberos {}", b64("principal:dave")),
+            )
+            .header(header::CONTENT_TYPE, EncProtocol::Kerberos.content_type())
+            .body(Body::from(body))
+            .unwrap();
+        let resp = h.send(req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            www_auth(&resp),
+            vec![format!("Kerberos {}", b64("aprep-1"))]
+        );
+        assert_eq!(h.seen.lock().unwrap().len(), 1, "handler saw the plaintext");
+    }
+
+    #[tokio::test]
+    async fn test_response_wrap_failure_returns_500_and_resets_slot() {
+        crate::test_support::install_and_clear();
+        let router = fault_router(Fault::WrapFails);
+        let slot = ConnSlot::default();
+        let login = send_fault(
+            &router,
+            &slot,
+            auth_req("Kerberos", "tok", "/wsman", vec![]),
+        )
+        .await;
+        assert_eq!(login.status(), StatusCode::OK);
+        let resp = send_fault(&router, &slot, enc_req("/wsman", 1, b"<soap/>", 7)).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body_bytes(resp).await.is_empty(), "plaintext must not leak");
+        let events = crate::test_support::captured_events();
+        assert!(
+            events
+                .iter()
+                .any(|m| m.contains("response encryption failed")),
+            "{events:?}"
+        );
+        let again = send_fault(&router, &slot, plain_req("/wsman", b"")).await;
+        assert_eq!(again.status(), StatusCode::UNAUTHORIZED);
+    }
+
     // ---- tests -------------------------------------------------------------------------
 
     #[tokio::test]
