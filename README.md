@@ -182,11 +182,17 @@ scripts/profile-ingest.sh --list         # format names; --print-config <fmt> sh
 
 Results go to `profiling-results/` (gitignored): `index.html` plus, per format,
 `flamegraph.svg`, `profile.pb`, `profile-metadata.json`, `loadgen.txt` and `summary.json`
-(PASS/FAIL verdict: representative profile, no loadgen errors, records written / offered >= 0.9).
+(PASS/FAIL verdict: representative profile, no loadgen errors, loadgen achieved >= 0.9 x offered,
+and records written / records loadgen reports sent >= 0.9; `written_ratio` in `summary.json`).
 Knobs: `OUT`, `BIN`, `LOADGEN`, `DURATION` (25), `DELAY` (5), `HZ` (99) and `RATE_<FMT>`
 (e.g. `RATE_ZEEK=40000`). Logging is forced to `error` and the WEF run is unauthenticated
 HTTP (no Kerberos/TLS), so neither cost appears in the profile. Run `scripts/profile-ingest.sh`
 with no arguments for usage.
+
+Default rates were tuned on a 12-vCPU shared host with loadgen on the same machine; on a smaller
+host a FAIL usually means the offered rate is too high, so lower `RATE_<FMT>`. A full `all` run
+takes about 9 x 50 s. A few percent syslog loss (written/sent below 1.0) is expected on a loaded
+host and is real UDP loss, not measurement error. Linux only.
 
 See [AGENTS.md](AGENTS.md) for the full build/test/lint command reference and
 repository conventions.
