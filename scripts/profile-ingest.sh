@@ -276,8 +276,12 @@ cleanup() {
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT TERM
 
-metric_sum() {   # metric_sum <metrics_port> <name>: sum over all label sets, 0 when absent
-    curl -sf "http://127.0.0.1:$1/metrics" 2>/dev/null | awk -v m="$2" '
+# metric_sum <metrics_port> <name>: sum over all label sets, 0 when the series is absent, EMPTY
+# when /metrics is unreachable (so a crashed server is not mistaken for a zero counter).
+metric_sum() {
+    local body
+    body=$(curl -sf -m 5 --connect-timeout 2 "http://127.0.0.1:$1/metrics" 2>/dev/null) || return 0
+    printf '%s\n' "$body" | awk -v m="$2" '
         { n = $1; sub(/\{.*/, "", n); if (n == m) s += $NF } END { printf "%d\n", s + 0 }'
 }
 
@@ -294,8 +298,9 @@ start_server() {
     ) >"$work/server.log" 2>&1 &
     SRV_PID=$!
     for _ in $(seq 1 60); do
-        curl -sf "http://127.0.0.1:$METRICS_PORT/metrics" >/dev/null 2>&1 \
-            && curl -sf "http://127.0.0.1:$HTTP_PORT/health" >/dev/null 2>&1 && return 0
+        curl -sf -m 5 --connect-timeout 2 "http://127.0.0.1:$METRICS_PORT/metrics" >/dev/null 2>&1 \
+            && curl -sf -m 5 --connect-timeout 2 "http://127.0.0.1:$HTTP_PORT/health" \
+                >/dev/null 2>&1 && return 0
         if ! kill -0 "$SRV_PID" 2>/dev/null; then
             wait "$SRV_PID" 2>/dev/null
             SRV_PID=""
@@ -313,13 +318,23 @@ run_format() {
     var="RATE_${fmt^^}"
     rate="${!var:-${RATE_DEFAULT[$fmt]}}"
     lgsecs=$((DELAY + DURATION + 5))
-    work="$(mktemp -d)" || { echo "FATAL: mktemp -d failed"; return 1; }
+    # Start from an empty result dir so a failure never presents a previous run's artifacts.
+    rm -rf "$outdir"; mkdir -p "$outdir"
+    work="$(mktemp -d)" || {
+        echo "FAIL $fmt: mktemp -d failed"
+        write_summary "$fmt" "$rate" "$lgsecs" skip skip 0 "" "mktemp -d failed"
+        return 1
+    }
     WORKS+=("$work")
     echo "== $fmt: offered $rate rec/s for ${lgsecs}s (sampling ${DURATION}s after ${DELAY}s)"
 
     rc=1
     for attempt in 1 2; do
-        alloc_ports "$fmt" || { echo "FATAL: could not allocate ports"; return 1; }
+        alloc_ports "$fmt" || {
+            echo "FAIL $fmt: could not allocate ports"
+            write_summary "$fmt" "$rate" "$lgsecs" skip skip 0 "$work" "could not allocate ports"
+            return 1
+        }
         started=$SECONDS
         start_server "$fmt" "$work"
         rc=$?
@@ -329,7 +344,8 @@ run_format() {
     if [ "$rc" -ne 0 ]; then
         echo "FAIL $fmt: server did not come up"; tail -20 "$work/server.log"
         stop_pid "$SRV_PID"; SRV_PID=""
-        write_summary "$fmt" "$rate" "$lgsecs" "" "" 0 "$work" "server did not come up"
+        cp "$work/server.log" "$outdir/server.log" 2>/dev/null
+        write_summary "$fmt" "$rate" "$lgsecs" skip skip 0 "$work" "server did not come up"
         return 1
     fi
     sleep 1   # let the non-HTTP listener finish binding
@@ -338,12 +354,18 @@ run_format() {
     before=$(metric_sum "$METRICS_PORT" parquet_s3_records_written)
     local argv
     read -ra argv <<<"$(loadgen_argv "$fmt" 127.0.0.1 "$LISTEN_PORT" "$rate" "$lgsecs")"
-    "$LOADGEN" "${argv[@]}" >"$work/loadgen.txt" 2>&1 &
+    # timeout is PID-based; exit 124 (hung loadgen) takes the normal loadgen-failure path
+    timeout --foreground $((lgsecs + 60)) "$LOADGEN" "${argv[@]}" >"$work/loadgen.txt" 2>&1 &
     LG_PID=$!
     wait "$LG_PID"; lg_rc=$?
     LG_PID=""
     # the last partial buffer lands on the next flush tick
     sleep $((FLUSH_SECS + 2))
+    local died=""
+    if ! kill -0 "$SRV_PID" 2>/dev/null; then
+        died="server exited during run"
+        echo "FAIL $fmt: $died"; tail -20 "$work/server.log"
+    fi
     after=$(metric_sum "$METRICS_PORT" parquet_s3_records_written)
 
     meta="$work/prof/profile-metadata.json"
@@ -354,15 +376,16 @@ run_format() {
     [ -f "$meta" ] && sleep 1   # artifacts are written just before/with the metadata file
     stop_pid "$SRV_PID"; SRV_PID=""
 
-    rm -rf "$outdir"; mkdir -p "$outdir"
     local f
     for f in flamegraph.svg profile.pb profile-metadata.json; do
         [ -f "$work/prof/$f" ] && cp "$work/prof/$f" "$outdir/$f"
     done
     cp "$work/loadgen.txt" "$outdir/loadgen.txt"
-    local extra=""
+    cp "$work/server.log" "$outdir/server.log" 2>/dev/null
+    local extra="$died"
     if [ ! -f "$meta" ]; then
-        extra="profile-metadata.json missing (binary built without pprof, or sampler failed)"
+        extra="${extra:+$extra; }profile-metadata.json missing"
+        extra="$extra (binary built without pprof, or sampler failed)"
     fi
     LG_RC=$lg_rc write_summary "$fmt" "$rate" "$lgsecs" "$before" "$after" "$envvars" \
         "$work" "$extra"
@@ -414,7 +437,11 @@ if achieved is None and lg_rc == 0 and text:
 
 records = None
 ratio = None
-if before != "" and after != "":
+if before == "skip":
+    pass  # run never started; nothing was measured
+elif before == "" or after == "":
+    reasons.append("metrics unreachable")
+else:
     records = int(after) - int(before)
     ratio = records / (offered * lg_secs) if offered * lg_secs else None
     if ratio is not None and ratio < 0.9:
