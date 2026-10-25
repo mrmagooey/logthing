@@ -856,4 +856,46 @@ mod tests {
             assert_eq!(day, old_day);
         }
     }
+
+    #[tokio::test]
+    async fn test_otlp_start_wires_handler_to_a_writer_that_exits_on_drop() {
+        use crate::config::S3ConnectionConfig;
+        let conn = S3ConnectionConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key: "AKIATEST".to_string(),
+            secret_key: "SECRETTEST".to_string(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
+        };
+        let s3 = Arc::new(
+            crate::forwarding::s3_sink::S3Sink::from_connection(&conn)
+                .await
+                .expect("constructs"),
+        );
+        let cfg = OtlpS3Config {
+            connection: conn,
+            prefix: "otlp".to_string(),
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 16,
+            max_buffer_rows: 100_000,
+        };
+        let stats = Arc::new(crate::stats::SourceHourlyStats::new());
+        let (handler, join) = otlp_start(&cfg, s3, 8, stats.clone(), None);
+        handler.try_send(sample()).expect("channel has room");
+        drop(handler);
+        tokio::time::timeout(std::time::Duration::from_secs(10), join)
+            .await
+            .expect("writer task must exit within 10s")
+            .expect("writer task must not panic");
+
+        let snapshot = stats.snapshot();
+        let row = snapshot
+            .iter()
+            .find(|r| r.source == "otlp")
+            .expect("otlp row");
+        assert_eq!(row.hours.iter().map(|h| h.count).sum::<u64>(), 1);
+    }
 }

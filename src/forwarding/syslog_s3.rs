@@ -1439,4 +1439,9 @@ mod tests {
         let total: u64 = row.hours.iter().map(|h| h.count).sum();
         assert_eq!(total, 1);
     }
+
+    #[test]
+    fn test_encode_batches_to_parquet_of_no_batches_is_empty() {
+        assert!(encode_batches_to_parquet(&[]).unwrap().is_empty());
+    }
 }
