@@ -1999,12 +1999,20 @@ mod tests {
     }
 
     /// Connects to `addr`, retrying while the listener under test is still binding.
-    async fn cov_connect(addr: SocketAddr) -> tokio::net::TcpStream {
+    async fn cov_connect<T>(
+        addr: SocketAddr,
+        task: &tokio::task::JoinHandle<T>,
+    ) -> tokio::net::TcpStream {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             match tokio::net::TcpStream::connect(addr).await {
                 Ok(s) => return s,
                 Err(e) => {
+                    assert!(
+                        !task.is_finished(),
+                        "listener task exited before accepting (lost the free-port race \
+                         or bind failed?); connect error: {e}"
+                    );
                     assert!(
                         tokio::time::Instant::now() < deadline,
                         "could not connect to {addr}: {e}"
@@ -2159,7 +2167,7 @@ mod tests {
         });
 
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let mut client = cov_connect(addr).await;
+        let mut client = cov_connect(addr, &task).await;
         client
             .write_all(b"{\"_path\":\"conn\",\"uid\":\"C1\"}\r\n")
             .await
@@ -2211,7 +2219,7 @@ mod tests {
         let task = tokio::spawn(async move { listener.start_with_shutdown(rx).await });
 
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let mut client = cov_connect(addr).await;
+        let mut client = cov_connect(addr, &task).await;
         let _ = client
             .write_all(b"{\"_path\":\"conn\",\"uid\":\"C1\"}\r\n")
             .await;
@@ -2262,9 +2270,9 @@ mod tests {
         let task = tokio::spawn(async move { listener.start_with_shutdown(rx).await });
 
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let first = cov_connect(addr).await;
+        let first = cov_connect(addr, &task).await;
         tx.send(false).unwrap();
-        let mut second = cov_connect(addr).await;
+        let mut second = cov_connect(addr, &task).await;
         second
             .write_all(b"{\"_path\":\"dns\",\"uid\":\"C2\"}\n")
             .await
