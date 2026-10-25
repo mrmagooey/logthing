@@ -1,6 +1,10 @@
 //! Server::new loads event parsers from paths relative to the working directory
-//! (`config/event_parsers/` or `config/event_parsers.yaml`). The process cwd is global, so every
-//! scenario runs sequentially inside one test of this dedicated binary.
+//! (`config/event_parsers/` or `config/event_parsers.yaml`).
+//!
+//! !!! THIS FILE MUST CONTAIN EXACTLY ONE TEST. !!!
+//! It changes the PROCESS-WIDE current directory, so a second `#[test]` in this binary would
+//! race on cwd. Do not add tests here: add scenarios inside the single test, sequentially, or
+//! create another test binary.
 
 use logthing::config::Config;
 use logthing::middleware::IpWhitelist;
@@ -70,6 +74,15 @@ fn drain() -> Vec<String> {
     std::mem::take(&mut *EVENTS.lock().unwrap())
 }
 
+/// Restores the original working directory on drop, even when an assert fails.
+struct CwdGuard(std::path::PathBuf);
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.0);
+    }
+}
+
 const GOOD_YAML: &str = r#"
 event_parsers:
   9999:
@@ -85,7 +98,7 @@ event_parsers:
 #[tokio::test]
 async fn parser_config_is_loaded_from_cwd_relative_paths() {
     install();
-    let original = std::env::current_dir().unwrap();
+    let _restore = CwdGuard(std::env::current_dir().unwrap());
 
     // 1. Only config/event_parsers.yaml exists: it is loaded.
     let tmp = tempfile::tempdir().unwrap();
@@ -130,6 +143,4 @@ async fn parser_config_is_loaded_from_cwd_relative_paths() {
             .any(|m| m.starts_with("Failed to load event parser configuration from directory")),
         "{events:?}"
     );
-
-    std::env::set_current_dir(original).unwrap();
 }
