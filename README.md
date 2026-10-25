@@ -167,6 +167,27 @@ Prints a per-file summary and writes it to `target/coverage/summary.txt`, plus a
 inline `#[cfg(test)]` modules, and tests that need Docker (real S3, the test KDC) are skipped unless
 their environments are up.
 
+**Profiling** (per-format CPU flame graphs of the ingest path). The sampler is behind the
+off-by-default `pprof` cargo feature, so build a profiling binary and the load generator, then
+drive each ingest source (syslog, zeek, suricata, ipfix, sflow, hec, generic, otlp, wef) at a
+fixed rate into a local-disk Parquet sink:
+
+```bash
+export CC=/usr/bin/gcc CXX=/usr/bin/g++
+cargo build --profile profiling --features pprof
+cargo build --release -p loadgen
+scripts/profile-ingest.sh all            # or one or more formats, e.g. zeek ipfix
+scripts/profile-ingest.sh --list         # format names; --print-config <fmt> shows the config
+```
+
+Results go to `profiling-results/` (gitignored): `index.html` plus, per format,
+`flamegraph.svg`, `profile.pb`, `profile-metadata.json`, `loadgen.txt` and `summary.json`
+(PASS/FAIL verdict: representative profile, no loadgen errors, records written / offered >= 0.9).
+Knobs: `OUT`, `BIN`, `LOADGEN`, `DURATION` (25), `DELAY` (5), `HZ` (99) and `RATE_<FMT>`
+(e.g. `RATE_ZEEK=40000`). Logging is forced to `error` and the WEF run is unauthenticated
+HTTP (no Kerberos/TLS), so neither cost appears in the profile. Run `scripts/profile-ingest.sh`
+with no arguments for usage.
+
 See [AGENTS.md](AGENTS.md) for the full build/test/lint command reference and
 repository conventions.
 
