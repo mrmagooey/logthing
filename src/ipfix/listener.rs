@@ -1746,8 +1746,9 @@ mod tests {
             listener = listener.with_allowed_ips(w);
         }
         let (tx, rx) = tokio::sync::watch::channel(false);
-        let task = tokio::spawn(async move { listener.start_with_shutdown(rx).await });
+        let mut task = tokio::spawn(async move { listener.start_with_shutdown(rx).await });
         sleep(Duration::from_millis(50)).await;
+        fail_if_finished(&mut task, "startup").await;
         (
             task,
             format!("127.0.0.1:{udp_port}").parse().unwrap(),
