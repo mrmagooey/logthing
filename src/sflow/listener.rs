@@ -1662,4 +1662,236 @@ mod tests {
 
         assert!(handler.batches().is_empty(), "handler must not be called");
     }
+
+    // -- Coverage: every receive arm (inline/fan-out x single/batched) --
+
+    const ALL_RECV_SHAPES: [(usize, usize); 4] = [(1, 1), (1, 8), (2, 1), (2, 8)];
+
+    fn metric_total(snapshotter: &metrics_util::debugging::Snapshotter, name: &str) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == name)
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    fn logged(needle: &str) -> bool {
+        crate::test_support::captured_events()
+            .iter()
+            .any(|m| m.contains(needle))
+    }
+
+    /// Poll `cond` every 10 ms until it holds or 5 s elapse.
+    async fn wait_for(what: &str, cond: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    type ShutdownListener = (
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        Arc<CapturingHandler>,
+    );
+
+    /// Start `start_with_shutdown` on an ephemeral port and wait (via the
+    /// "started" log line) until the sockets are bound.
+    async fn spawn_shutdown_listener(
+        recv_tasks: usize,
+        recv_batch_size: usize,
+        whitelist: Option<IpWhitelist>,
+    ) -> ShutdownListener {
+        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = tmp.local_addr().unwrap().port();
+        drop(tmp);
+        let config = SflowListenerConfig {
+            udp_port,
+            bind_address: "127.0.0.1".to_string(),
+            recv_tasks,
+            recv_batch_size,
+            ..SflowListenerConfig::default()
+        };
+        let handler = CapturingHandler::new();
+        let mut listener = SflowListener::new(config, handler.clone());
+        if let Some(w) = whitelist {
+            listener = listener.with_allowed_ips(w);
+        }
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { listener.start_with_shutdown(rx).await });
+        wait_for("listener start", || logged("sFlow UDP listener started")).await;
+        let bound: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
+        (task, bound, tx, handler)
+    }
+
+    async fn stop(
+        task: tokio::task::JoinHandle<anyhow::Result<()>>,
+        tx: &tokio::sync::watch::Sender<bool>,
+    ) {
+        tx.send(true).unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("listener must exit after the shutdown signal")
+            .expect("listener task must not panic");
+        assert!(res.is_ok(), "{res:?}");
+    }
+
+    fn header_only_datagram() -> Vec<u8> {
+        let mut d = Vec::new();
+        for w in [5u32, 1, 0x0A00_0001, 0, 1, 1000, 0] {
+            d.extend_from_slice(&w.to_be_bytes());
+        }
+        d
+    }
+
+    #[tokio::test]
+    async fn test_empty_and_malformed_datagrams_are_handled_in_every_recv_shape() {
+        use metrics_util::debugging::DebuggingRecorder;
+        for (recv_tasks, batch) in ALL_RECV_SHAPES {
+            crate::test_support::install_and_clear();
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+
+            let (task, bound, tx, handler) = spawn_shutdown_listener(recv_tasks, batch, None).await;
+            let shape = format!("recv_tasks={recv_tasks} batch={batch}");
+            if recv_tasks > 1 {
+                assert!(logged(&format!("({recv_tasks} recv tasks)")), "{shape}");
+            }
+            // A `false` value is a change notification, not a shutdown.
+            tx.send(false).unwrap();
+
+            let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            sender
+                .send_to(&header_only_datagram(), bound)
+                .await
+                .unwrap();
+            sender.send_to(b"\xFF\xFF\xFF\xFF", bound).await.unwrap();
+            sender
+                .send_to(FIXTURE_SFLOW_FLOW_RAW_HEADER, bound)
+                .await
+                .unwrap();
+            wait_for(&shape, || handler.batches().len() == 1).await;
+            stop(task, &tx).await;
+
+            assert_eq!(handler.batches()[0].len(), 1, "{shape}");
+            assert_eq!(
+                metric_total(&snapshotter, "sflow_decode_errors"),
+                1,
+                "{shape}"
+            );
+            assert!(logged("produced no samples"), "{shape}");
+            assert!(logged("sFlow decode error from"), "{shape}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disallowed_sources_are_rejected_and_counted_in_every_recv_shape() {
+        use metrics_util::debugging::DebuggingRecorder;
+        for (recv_tasks, batch) in ALL_RECV_SHAPES {
+            crate::test_support::install_and_clear();
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+
+            let whitelist = IpWhitelist::new(vec!["10.0.0.0/8".to_string()]).unwrap();
+            let (task, bound, tx, handler) =
+                spawn_shutdown_listener(recv_tasks, batch, Some(whitelist)).await;
+            let shape = format!("recv_tasks={recv_tasks} batch={batch}");
+
+            let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            for _ in 0..3 {
+                sender
+                    .send_to(FIXTURE_SFLOW_FLOW_RAW_HEADER, bound)
+                    .await
+                    .unwrap();
+            }
+            wait_for(&shape, || {
+                metric_total(&snapshotter, "listener_source_rejected") == 3
+            })
+            .await;
+            stop(task, &tx).await;
+
+            assert!(handler.batches().is_empty(), "{shape}");
+            assert!(logged("Rejected sflow datagram from"), "{shape}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_start_binds_configured_address_and_dispatches_datagrams() {
+        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = tmp.local_addr().unwrap().port();
+        drop(tmp);
+        let config = SflowListenerConfig {
+            udp_port,
+            bind_address: "127.0.0.1".to_string(),
+            ..SflowListenerConfig::default()
+        };
+        let handler = CapturingHandler::new();
+        let listener = SflowListener::new(config, handler.clone());
+        let task = tokio::spawn(async move { listener.start().await });
+
+        // The socket is bound asynchronously; resend until the first lands.
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while handler.batches().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no datagram dispatched"
+            );
+            sender
+                .send_to(FIXTURE_SFLOW_COUNTER, ("127.0.0.1", udp_port))
+                .await
+                .unwrap();
+            sleep(Duration::from_millis(20)).await;
+        }
+        task.abort();
+        assert_eq!(
+            handler.batches()[0][0].sample_type,
+            crate::sflow::SampleType::Counter
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_rejects_unparseable_bind_address() {
+        let config = SflowListenerConfig {
+            bind_address: "not an address".to_string(),
+            ..SflowListenerConfig::default()
+        };
+        let listener = SflowListener::new(config, Arc::new(DefaultSflowHandler));
+        assert!(listener.start().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_run_with_socket_skips_empty_datagram_and_keeps_serving() {
+        crate::test_support::install_and_clear();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let handler = CapturingHandler::new();
+        let listener = SflowListener::new(SflowListenerConfig::default(), handler.clone());
+        let task = tokio::spawn(async move { listener.run_with_socket(socket).await });
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(&header_only_datagram(), addr).await.unwrap();
+        sender.send_to(FIXTURE_SFLOW_COUNTER, addr).await.unwrap();
+        wait_for("counter batch", || handler.batches().len() == 1).await;
+        task.abort();
+
+        assert_eq!(
+            handler.batches()[0][0].sample_type,
+            crate::sflow::SampleType::Counter
+        );
+        assert!(logged("produced no samples"));
+    }
 }
