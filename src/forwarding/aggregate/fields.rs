@@ -1064,4 +1064,77 @@ mod tests {
         }
         assert_eq!(r.stream(), "api");
     }
+
+    #[test]
+    fn test_sflow_unknown_column_falls_back_to_extra() {
+        let (mut flow, _) = sflow_fixtures();
+        flow.extra = serde_json::json!({"vendorField": "v1"});
+        assert_eq!(s(flow.field("vendorField")), Some("v1".into()));
+        assert!(flow.field("absent").is_none());
+    }
+
+    fn syslog_with_sd(
+        sd: Option<std::collections::HashMap<String, std::collections::HashMap<String, String>>>,
+    ) -> crate::syslog::SyslogMessage {
+        crate::syslog::SyslogMessage {
+            priority: 13,
+            severity: 5,
+            facility: 1,
+            timestamp: None,
+            hostname: None,
+            app_name: None,
+            proc_id: None,
+            msg_id: Some("ID47".to_string()),
+            message: "x".to_string(),
+            structured_data: sd,
+            protocol: crate::syslog::SyslogProtocol::Rfc5424,
+        }
+    }
+
+    #[test]
+    fn test_syslog_msg_id_and_structured_data_params_resolve() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("iut".to_string(), "3".to_string());
+        let mut sd = std::collections::HashMap::new();
+        sd.insert("exampleSDID@32473".to_string(), params);
+        let m = syslog_with_sd(Some(sd));
+        assert_eq!(s(m.field("msg_id")), Some("ID47".into()));
+        let named = crate::syslog::SyslogMessage {
+            app_name: Some("sshd".to_string()),
+            ..m.clone()
+        };
+        assert_eq!(s(named.field("app_name")), Some("sshd".into()));
+        assert_eq!(s(m.field("app_name")), None);
+        assert_eq!(s(m.field("exampleSDID@32473.iut")), Some("3".into()));
+        // Unknown SDID, unknown param, and a name without a '.' all resolve to nothing.
+        assert!(m.field("other.iut").is_none());
+        assert!(m.field("exampleSDID@32473.nope").is_none());
+        assert!(m.field("nodot").is_none());
+    }
+
+    #[test]
+    fn test_syslog_structured_data_name_without_sd_is_none() {
+        let m = syslog_with_sd(None);
+        assert!(m.field("sdid.param").is_none());
+    }
+
+    #[test]
+    fn test_hec_and_otlp_unknown_names_resolve_to_none() {
+        let r = crate::ingest::GenericRecord {
+            sourcetype: "access".into(),
+            host: None,
+            time: None,
+            fields: serde_json::json!({"a": 1}),
+            received_at: chrono::Utc::now(),
+            event_uuid: None,
+            source: None,
+            index: None,
+            indexed_fields: None,
+        };
+        assert!(r.field("bogus").is_none());
+        // `indexed_fields.` against a record with no indexed fields is also nothing.
+        assert!(r.field("indexed_fields.env").is_none());
+        let o = otlp_fixture();
+        assert!(o.field("bogus").is_none());
+    }
 }

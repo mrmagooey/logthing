@@ -495,4 +495,64 @@ mod tests {
         let key = build_descriptor_key("", "some/weird/key");
         assert_eq!(key, "some/weird/key.json");
     }
+
+    #[test]
+    fn test_canonical_type_maps_every_scalar_to_stable_name() {
+        use arrow_schema::DataType as D;
+        let cases = [
+            (D::Null, "null"),
+            (D::Boolean, "bool"),
+            (D::Int8, "i8"),
+            (D::Int16, "i16"),
+            (D::Int32, "i32"),
+            (D::Int64, "i64"),
+            (D::UInt8, "u8"),
+            (D::UInt16, "u16"),
+            (D::UInt32, "u32"),
+            (D::UInt64, "u64"),
+            (D::Float16, "f16"),
+            (D::Float32, "f32"),
+            (D::Float64, "f64"),
+            (D::Utf8, "utf8"),
+            (D::LargeUtf8, "large_utf8"),
+            (D::Binary, "binary"),
+            (D::LargeBinary, "large_binary"),
+            (D::Date32, "date32"),
+            (D::Date64, "date64"),
+        ];
+        for (dt, want) in cases {
+            assert_eq!(canonical_type(&dt).as_deref(), Some(want), "{dt:?}");
+        }
+    }
+
+    #[test]
+    fn test_canonical_type_timestamp_units_and_nested_types() {
+        use arrow_schema::DataType as D;
+        let ts = |u, tz: Option<&str>| canonical_type(&D::Timestamp(u, tz.map(Into::into)));
+        assert_eq!(ts(TimeUnit::Second, None).as_deref(), Some("ts(s,)"));
+        assert_eq!(ts(TimeUnit::Millisecond, None).as_deref(), Some("ts(ms,)"));
+        assert_eq!(
+            ts(TimeUnit::Microsecond, Some("UTC")).as_deref(),
+            Some("ts(us,UTC)")
+        );
+        assert_eq!(ts(TimeUnit::Nanosecond, None).as_deref(), Some("ts(ns,)"));
+        let item = Arc::new(Field::new("item", D::Int32, true));
+        assert_eq!(
+            canonical_type(&D::LargeList(item.clone())).as_deref(),
+            Some("large_list<item:i32:1>")
+        );
+        assert_eq!(
+            canonical_type(&D::List(item)).as_deref(),
+            Some("list<item:i32:1>")
+        );
+    }
+
+    #[test]
+    fn test_canonical_type_unmapped_type_is_none_and_schema_still_hashes() {
+        use arrow_schema::DataType as D;
+        assert_eq!(canonical_type(&D::Utf8View), None);
+        let schema = Schema::new(vec![Field::new("v", D::Utf8View, true)]);
+        assert!(canonical_schema(&schema).contains("unmapped:"));
+        assert_eq!(schema_version(&schema).len(), 16);
+    }
 }

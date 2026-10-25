@@ -337,4 +337,46 @@ mod tests {
         assert_eq!(DropKind::from(&timeout), DropKind::Full);
         assert_eq!(DropKind::from(&closed), DropKind::Closed);
     }
+
+    #[test]
+    fn test_default_throttle_is_fresh_and_logs_first_drop() {
+        let t = DropLogThrottle::default();
+        assert_eq!(t.total(), 0);
+        assert_eq!(t.check_at(5), Some(1));
+    }
+
+    #[test]
+    fn test_concurrent_callers_in_one_window_yield_at_most_one_winner() {
+        // Many threads race for the single emission slot at the same instant: the CAS losers
+        // must stay silent (`None`) yet still be counted in the running total.
+        for _ in 0..50 {
+            let t = std::sync::Arc::new(DropLogThrottle::new());
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let (t, b) = (t.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        b.wait();
+                        t.check_at(42)
+                    })
+                })
+                .collect();
+            let results: Vec<Option<u64>> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert_eq!(results.iter().filter(|r| r.is_some()).count(), 1);
+            assert_eq!(t.total(), 8);
+        }
+    }
+
+    #[test]
+    fn test_default_throttle_set_starts_every_slot_unlogged() {
+        let ts = DropLogThrottles::default();
+        assert_eq!(ts.check_at(DropSite::Aggregate, DropKind::Full, 0), Some(1));
+        assert_eq!(ts.check_at(DropSite::Aggregate, DropKind::Full, 1), None);
+        // A different kind of the same site has its own, still-unlogged slot.
+        assert_eq!(
+            ts.check_at(DropSite::Aggregate, DropKind::Closed, 1),
+            Some(1)
+        );
+    }
 }

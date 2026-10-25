@@ -1941,4 +1941,301 @@ mod tests {
         assert!(matches!(reject, SpoolReject::Full));
         assert_eq!(body.as_deref(), Some(&b"too large"[..]));
     }
+
+    // ---- coverage: validation, quarantine and load error paths ----
+
+    fn only_id(spool: &Spool) -> String {
+        spool
+            .shared
+            .lock()
+            .keys()
+            .next()
+            .cloned()
+            .expect("one pending entry")
+    }
+
+    fn rewrite_meta(path: &Path, id: &str, edit: impl FnOnce(&mut serde_json::Value)) {
+        let mp = path.join(format!("{id}.meta"));
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&mp).unwrap()).unwrap();
+        edit(&mut v);
+        std::fs::write(&mp, serde_json::to_vec(&v).unwrap()).unwrap();
+    }
+
+    /// Make `path` a symlink pointing at itself: `stat`/`open` fail with ELOOP, which is a
+    /// non-NotFound I/O error and so classified as transient.
+    fn make_symlink_loop(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        std::os::unix::fs::symlink(path, path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_validate_entry_flags_parquet_length_mismatch_as_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = seed_entry(dir.path(), false).await;
+        rewrite_meta(dir.path(), &id, |v| {
+            v["parquet_bytes"] = serde_json::json!(99)
+        });
+        match validate_entry(dir.path(), &id) {
+            Err(Invalid::Corrupt(r)) => assert_eq!(r, "parquet length 4 != 99"),
+            other => panic!("expected Corrupt, got {}", other.is_ok()),
+        }
+        assert_quarantined_on_open(dir.path(), &id).await;
+    }
+
+    #[tokio::test]
+    async fn test_validate_entry_flags_descriptor_length_mismatch_as_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = seed_entry(dir.path(), true).await;
+        rewrite_meta(dir.path(), &id, |v| {
+            v["descriptor_bytes"] = serde_json::json!(77)
+        });
+        match validate_entry(dir.path(), &id) {
+            Err(Invalid::Corrupt(r)) => assert_eq!(r, "descriptor length 2 != 77"),
+            other => panic!("expected Corrupt, got {}", other.is_ok()),
+        }
+        assert_quarantined_on_open(dir.path(), &id).await;
+    }
+
+    #[tokio::test]
+    async fn test_validate_entry_treats_an_unstatable_descriptor_as_transient() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = seed_entry(dir.path(), true).await;
+        make_symlink_loop(&dir.path().join(format!("{id}.json")));
+        match validate_entry(dir.path(), &id) {
+            Err(Invalid::Transient(r)) => assert!(r.starts_with("descriptor unreadable"), "{r}"),
+            other => panic!("expected Transient, got ok={}", other.is_ok()),
+        }
+        // Left in place (not quarantined) and not loaded.
+        let s = Spool::open(&cfg(dir.path(), 1 << 20)).unwrap();
+        assert_eq!(s.pending_entries(), 0);
+        assert!(corrupt_names(dir.path()).is_empty());
+        assert!(dir.path().join(format!("{id}.meta")).exists());
+    }
+
+    #[tokio::test]
+    async fn test_open_ignores_subdirectories_and_non_utf8_file_names() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("somedir")).unwrap();
+        let odd = dir
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"bad-\xff\xfe.parquet"));
+        std::fs::write(&odd, b"keep me").unwrap();
+        let s = Spool::open(&cfg(dir.path(), 1 << 20)).unwrap();
+        assert_eq!(s.pending_entries(), 0);
+        assert!(
+            dir.path().join("somedir").is_dir(),
+            "subdirectory is left alone"
+        );
+        assert_eq!(
+            std::fs::read(&odd).unwrap(),
+            b"keep me",
+            "non-UTF-8 name is not swept"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_gives_up_when_corrupt_dir_cannot_be_created() {
+        let dir = tempfile::tempdir().unwrap();
+        // `corrupt` is a regular file, so create_dir_all("corrupt") fails.
+        std::fs::write(dir.path().join(CORRUPT_DIR), b"in the way").unwrap();
+        std::fs::write(dir.path().join("e1.parquet"), b"data").unwrap();
+        quarantine(dir.path(), "e1", "test reason");
+        assert!(
+            dir.path().join("e1.parquet").exists(),
+            "file must stay in place"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CORRUPT_DIR)).unwrap(),
+            b"in the way"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_leaves_file_in_place_when_rename_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // A non-empty directory squats on the destination name, so rename(file, dir) fails.
+        let squat = dir.path().join(CORRUPT_DIR).join("e1.meta");
+        std::fs::create_dir_all(squat.join("inner")).unwrap();
+        std::fs::write(dir.path().join("e1.meta"), b"m").unwrap();
+        std::fs::write(dir.path().join("e1.parquet"), b"p").unwrap();
+        quarantine(dir.path(), "e1", "rename failure");
+        assert!(
+            dir.path().join("e1.meta").exists(),
+            "failed move leaves the source"
+        );
+        // The other files of the entry are still moved.
+        assert!(!dir.path().join("e1.parquet").exists());
+        assert!(dir.path().join(CORRUPT_DIR).join("e1.parquet").exists());
+    }
+
+    // ---- coverage: attempt() / load_for_upload() paths ----
+
+    #[tokio::test]
+    async fn test_attempt_returns_quietly_when_the_claimed_entry_vanished() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = fast_spool(dir.path());
+        let s3 = Mem::build("s3", "p", Events::default());
+        spool.register("s", s3.sink.clone(), None).unwrap();
+        spool
+            .commit("s", "k", b"PAR1".to_vec(), None)
+            .await
+            .unwrap();
+        let id = only_id(&spool);
+        let claim = spool.shared.claim(&id).expect("claimable");
+        spool.shared.forget(&id);
+        spool.attempt(claim, Duration::from_secs(5)).await;
+        assert!(
+            s3.calls.lock().unwrap().is_empty(),
+            "nothing is uploaded for a gone entry"
+        );
+        assert_eq!(spool.pending_entries(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_unreadable_parquet_is_retried_not_quarantined() {
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let dir = tempfile::tempdir().unwrap();
+        let spool = fast_spool(dir.path());
+        let s3 = Mem::build("s3", "p", Events::default());
+        spool.register("s", s3.sink.clone(), None).unwrap();
+        spool
+            .commit("s", "k", b"PAR1".to_vec(), None)
+            .await
+            .unwrap();
+        let id = only_id(&spool);
+        make_symlink_loop(&dir.path().join(format!("{id}.parquet")));
+        assert_eq!(spool.drain(Duration::from_secs(5)).await, 1);
+        assert_eq!(counter(&snap, "spool_upload_errors", Some("s")), 1);
+        assert_eq!(counter(&snap, "spool_corrupt", None), 0);
+        assert!(s3.calls.lock().unwrap().is_empty());
+        assert!(dir.path().join(format!("{id}.meta")).exists());
+    }
+
+    #[tokio::test]
+    async fn test_unreadable_descriptor_is_retried_not_quarantined() {
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let dir = tempfile::tempdir().unwrap();
+        let spool = fast_spool(dir.path());
+        let s3 = Mem::build("s3", "p", Events::default());
+        let ds = Mem::build("s3", "d", Events::default());
+        spool
+            .register("s", s3.sink.clone(), Some(ds.sink.clone()))
+            .unwrap();
+        spool
+            .commit("s", "k", b"PAR1".to_vec(), Some(&desc("d.json")))
+            .await
+            .unwrap();
+        let id = only_id(&spool);
+        make_symlink_loop(&dir.path().join(format!("{id}.json")));
+        assert_eq!(spool.drain(Duration::from_secs(5)).await, 1);
+        assert_eq!(counter(&snap, "spool_upload_errors", Some("s")), 1);
+        assert_eq!(counter(&snap, "spool_corrupt", None), 0);
+        assert!(
+            s3.calls.lock().unwrap().is_empty(),
+            "no PUT before the descriptor is readable"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parquet_deleted_after_open_is_quarantined_at_upload_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = fast_spool(dir.path());
+        let s3 = Mem::build("s3", "p", Events::default());
+        spool.register("s", s3.sink.clone(), None).unwrap();
+        spool
+            .commit("s", "k", b"PAR1".to_vec(), None)
+            .await
+            .unwrap();
+        let id = only_id(&spool);
+        std::fs::remove_file(dir.path().join(format!("{id}.parquet"))).unwrap();
+        assert_eq!(spool.drain(Duration::from_secs(5)).await, 0);
+        assert!(s3.calls.lock().unwrap().is_empty());
+        assert_eq!(corrupt_names(dir.path()), vec![format!("{id}.meta")]);
+    }
+
+    #[tokio::test]
+    async fn test_descriptor_deleted_after_open_is_quarantined_at_upload_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = fast_spool(dir.path());
+        let s3 = Mem::build("s3", "p", Events::default());
+        let ds = Mem::build("s3", "d", Events::default());
+        spool
+            .register("s", s3.sink.clone(), Some(ds.sink.clone()))
+            .unwrap();
+        spool
+            .commit("s", "k", b"PAR1".to_vec(), Some(&desc("d.json")))
+            .await
+            .unwrap();
+        let id = only_id(&spool);
+        std::fs::remove_file(dir.path().join(format!("{id}.json"))).unwrap();
+        assert_eq!(spool.drain(Duration::from_secs(5)).await, 0);
+        assert!(s3.calls.lock().unwrap().is_empty());
+        assert!(corrupt_names(dir.path()).contains(&format!("{id}.meta")));
+    }
+
+    #[tokio::test]
+    async fn test_descriptor_with_wrong_length_after_open_is_quarantined_at_upload_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = fast_spool(dir.path());
+        let s3 = Mem::build("s3", "p", Events::default());
+        let ds = Mem::build("s3", "d", Events::default());
+        spool
+            .register("s", s3.sink.clone(), Some(ds.sink.clone()))
+            .unwrap();
+        spool
+            .commit("s", "k", b"PAR1".to_vec(), Some(&desc("d.json")))
+            .await
+            .unwrap();
+        let id = only_id(&spool);
+        std::fs::write(
+            dir.path().join(format!("{id}.json")),
+            b"{\"d\":1,\"extra\":true}",
+        )
+        .unwrap();
+        assert_eq!(spool.drain(Duration::from_secs(5)).await, 0);
+        assert!(s3.calls.lock().unwrap().is_empty());
+        assert!(corrupt_names(dir.path()).contains(&format!("{id}.json")));
+    }
+
+    #[tokio::test]
+    async fn test_debug_output_names_the_spool_dir_and_sink_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Spool::open(&cfg(dir.path(), 1 << 20)).unwrap();
+        let shown = format!("{spool:?}");
+        assert!(
+            shown.starts_with("Spool {") && shown.contains("dir:"),
+            "{shown}"
+        );
+        let (inner, _uploads) = MemSink::new("s3");
+        let sink = SpoolingUploadSink::new(inner, spool, "hec.s3");
+        let shown = format!("{sink:?}");
+        assert!(
+            shown.contains("SpoolingUploadSink") && shown.contains("\"hec.s3\""),
+            "{shown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spooling_sink_plain_upload_goes_straight_to_the_inner_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Spool::open(&cfg(dir.path(), 1 << 20)).unwrap();
+        let (inner, uploads) = MemSink::new("s3");
+        let sink = SpoolingUploadSink::new(inner, spool.clone(), "hec.s3");
+        sink.upload("a/b.json", b"raw".to_vec()).await.unwrap();
+        assert_eq!(
+            *uploads.lock().unwrap(),
+            vec![("a/b.json".to_string(), b"raw".to_vec())]
+        );
+        assert_eq!(
+            spool.pending_entries(),
+            0,
+            "a plain upload bypasses the spool"
+        );
+    }
 }

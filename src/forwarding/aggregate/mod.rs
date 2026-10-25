@@ -1584,4 +1584,149 @@ mod tests {
             col
         );
     }
+
+    #[test]
+    fn test_rules_accessor_returns_the_compiled_rules_in_order() {
+        let agg = Aggregator::new(
+            vec![
+                rule("a", "zeek", None, &["x"]),
+                rule("b", "syslog", None, &["y"]),
+            ],
+            10,
+        );
+        let names: Vec<&str> = agg.rules().iter().map(|r| r.name.as_ref()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_source_enabled_follows_each_sources_config_flag() {
+        let mut cfg = crate::config::Config::default();
+        macro_rules! check {
+            ($src:literal, $($field:tt)+) => {
+                cfg.$($field)+.enabled = true;
+                assert!(source_enabled(&cfg, $src), "{} enabled", $src);
+                cfg.$($field)+.enabled = false;
+                assert!(!source_enabled(&cfg, $src), "{} disabled", $src);
+            };
+        }
+        check!("zeek", zeek);
+        check!("suricata", suricata);
+        check!("syslog", syslog);
+        check!("ipfix", ipfix);
+        check!("sflow", sflow);
+        assert!(!source_enabled(&cfg, "unknown"));
+    }
+
+    #[test]
+    fn test_to_record_batch_rejects_a_row_whose_shape_mismatches_the_schema() {
+        let mut r = rule("dns", "zeek", Some("dns"), &["query"]);
+        r.schema = rule_schema(&r.group_by, &r.aggs);
+        let sink = AggregateSink::new(std::slice::from_ref(&r));
+        let now = Utc::now();
+        let row = AggregateRow {
+            rule: Arc::from("dns"),
+            keys: vec![Some("a".to_string()), Some("extra".to_string())],
+            count: 1,
+            aggs: Vec::new(),
+            window_start: now,
+            window_end: now,
+        };
+        let err = sink
+            .to_record_batch(&row, &r.schema)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rule 'dns'"), "{err}");
+        assert!(err.contains("has 6 columns but its schema has 5"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_emit_to_a_closed_writer_channel_counts_the_drop_and_still_advances() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let mut r = rule("r", "zeek", Some("dns"), &["query"]);
+        r.schema = rule_schema(&r.group_by, &r.aggs);
+        let agg = Aggregator::new(vec![r], 1000);
+        agg.consume("zeek", &zeek("dns", serde_json::json!({"query": "a"})));
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<AggregateRow>(4);
+        drop(rx);
+        let handle = Arc::new(crate::forwarding::buffered_writer::ParquetWriterHandle::<
+            AggregateSink,
+        >::for_test(tx, "aggregate", "local"));
+
+        // A subscriber must be installed for the throttled `warn!` to be evaluated.
+        let logs = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || LogWriter(sink.clone()))
+            .with_ansi(false)
+            .finish();
+        let _log_guard = tracing::subscriber::set_default(subscriber);
+
+        let start = Utc::now();
+        let next = agg.emit(start, &[handle]).await;
+        assert!(next >= start, "emit still returns the next window start");
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains("aggregate writer channel unavailable; dropped 1 aggregated row")
+                && text.contains("dropped_total=1")
+                && text.contains("rule=r"),
+            "{text}"
+        );
+
+        let snap = snapshotter.snapshot().into_vec();
+        let counter = |name: &str| {
+            snap.iter()
+                .find(|(k, ..)| k.key().name() == name)
+                .map(|(_, _, _, v)| match v {
+                    DebugValue::Counter(c) => *c,
+                    _ => u64::MAX,
+                })
+        };
+        assert_eq!(counter("parquet_s3_dropped"), Some(1));
+        assert_eq!(
+            counter("aggregate_rows_emitted"),
+            None,
+            "a dropped row must not be counted as emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_emit_task_ignores_a_false_shutdown_value_and_keeps_running() {
+        let mut r = rule("r", "zeek", Some("dns"), &["query"]);
+        r.schema = rule_schema(&r.group_by, &r.aggs);
+        let agg = Arc::new(Aggregator::new(vec![r], 1000));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = agg.clone().spawn_emit_task(
+            Vec::new(),
+            std::time::Duration::from_secs(3600),
+            shutdown_rx,
+        );
+
+        // A change that does not request shutdown must not end the task.
+        shutdown_tx.send(false).expect("send false");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "a false shutdown value must not stop the task"
+        );
+
+        shutdown_tx.send(true).expect("signal shutdown");
+        task.await.expect("emit task joins");
+    }
 }

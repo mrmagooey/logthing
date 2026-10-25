@@ -333,4 +333,116 @@ mod tests {
             "both flow samples were offered to consume() and counted"
         );
     }
+
+    fn src() -> std::net::SocketAddr {
+        "127.0.0.1:47761".parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_suricata_handler_swallows_matched_and_forwards_unmatched() {
+        use crate::suricata::SuricataRecord;
+        use crate::suricata::listener::SuricataHandler;
+
+        struct Counting(AtomicUsize);
+        #[async_trait::async_trait]
+        impl SuricataHandler for Counting {
+            async fn handle_record(&self, _r: SuricataRecord, _s: std::net::SocketAddr) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let rec = |t: &str| SuricataRecord {
+            event_type: t.to_string(),
+            fields: serde_json::json!({"alert": "x"}),
+            received_at: chrono::Utc::now(),
+        };
+        let group_by = vec!["alert".to_string()];
+        let rule = CompiledRule {
+            name: std::sync::Arc::from("alerts"),
+            source: "suricata".to_string(),
+            stream: Some("alert".to_string()),
+            group_by: group_by.clone(),
+            aggs: Vec::new(),
+            schema: rule_schema(&group_by, &[]),
+        };
+        let agg = Arc::new(Aggregator::new(vec![rule], 1000));
+        let inner = Arc::new(Counting(AtomicUsize::new(0)));
+        let h = AggregatingSuricataHandler {
+            agg: agg.clone(),
+            inner: inner.clone(),
+        };
+        h.handle_record(rec("alert"), src()).await;
+        assert_eq!(
+            inner.0.load(Ordering::SeqCst),
+            0,
+            "matched record is swallowed"
+        );
+        h.handle_record(rec("dns"), src()).await;
+        assert_eq!(
+            inner.0.load(Ordering::SeqCst),
+            1,
+            "unmatched record passes through"
+        );
+        let now = chrono::Utc::now();
+        let rows = agg.drain(now, now);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_syslog_handler_swallows_matched_and_forwards_unmatched() {
+        use crate::syslog::listener::SyslogHandler;
+        use crate::syslog::{SyslogMessage, SyslogProtocol};
+
+        struct Counting(AtomicUsize);
+        #[async_trait::async_trait]
+        impl SyslogHandler for Counting {
+            async fn handle_message(&self, _m: SyslogMessage, _s: std::net::SocketAddr) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let msg = |app: &str| SyslogMessage {
+            priority: 34,
+            severity: 2,
+            facility: 4,
+            timestamp: None,
+            hostname: Some("h".to_string()),
+            app_name: Some(app.to_string()),
+            proc_id: None,
+            msg_id: None,
+            message: "m".to_string(),
+            structured_data: None,
+            protocol: SyslogProtocol::Rfc5424,
+        };
+        let group_by = vec!["hostname".to_string()];
+        let rule = CompiledRule {
+            name: std::sync::Arc::from("sshd_by_host"),
+            source: "syslog".to_string(),
+            stream: Some("sshd".to_string()),
+            group_by: group_by.clone(),
+            aggs: Vec::new(),
+            schema: rule_schema(&group_by, &[]),
+        };
+        let agg = Arc::new(Aggregator::new(vec![rule], 1000));
+        let inner = Arc::new(Counting(AtomicUsize::new(0)));
+        let h = AggregatingSyslogHandler {
+            agg: agg.clone(),
+            inner: inner.clone(),
+        };
+        h.handle_message(msg("sshd"), src()).await;
+        assert_eq!(
+            inner.0.load(Ordering::SeqCst),
+            0,
+            "matched message is swallowed"
+        );
+        h.handle_message(msg("cron"), src()).await;
+        assert_eq!(
+            inner.0.load(Ordering::SeqCst),
+            1,
+            "unmatched message passes through"
+        );
+        let now = chrono::Utc::now();
+        let rows = agg.drain(now, now);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].count, 1);
+    }
 }
