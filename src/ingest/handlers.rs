@@ -1238,6 +1238,19 @@ mod tests {
         assert_eq!(rec.fields, serde_json::json!({"pw": "x"}));
     }
 
+    fn hec_events_dropped_total(snapshotter: &metrics_util::debugging::Snapshotter) -> u64 {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == "hec_events_dropped")
+            .map(|(_, _, _, v)| match v {
+                metrics_util::debugging::DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum()
+    }
+
     #[test]
     fn test_sanitized_parse_error_utf8_failure_is_generic() {
         let bytes = std::hint::black_box([0xFFu8, 0xFE, b'x']);
@@ -1257,6 +1270,9 @@ mod tests {
         use crate::forwarding::buffered_writer::ParquetWriterHandle;
         use crate::forwarding::generic_s3::GenericSink;
         crate::test_support::install_and_clear();
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         drop(rx); // writer gone
         let ingest = IngestState {
@@ -1271,6 +1287,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hec_events_dropped_total(&snapshotter), 1);
         let errors = crate::test_support::captured_events_at(tracing::Level::ERROR);
         assert!(
             errors
@@ -1285,6 +1302,9 @@ mod tests {
         use crate::forwarding::buffered_writer::ParquetWriterHandle;
         use crate::forwarding::generic_s3::GenericSink;
         crate::test_support::install_and_clear();
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let (s3_tx, _s3_rx) = tokio::sync::mpsc::channel(1);
         let (local_tx, _local_rx) = tokio::sync::mpsc::channel(1);
         let ingest = IngestState {
@@ -1313,6 +1333,8 @@ mod tests {
                 .iter()
                 .all(|s| *s == StatusCode::SERVICE_UNAVAILABLE)
         );
+        // Requests 2-4 each find both capacity-1 channels full.
+        assert_eq!(hec_events_dropped_total(&snapshotter), 6);
         let warns = crate::test_support::captured_events_at(tracing::Level::WARN);
         let count = |needle: &str| warns.iter().filter(|m| m.contains(needle)).count();
         assert_eq!(count("HEC S3 channel full"), 1, "{warns:?}");

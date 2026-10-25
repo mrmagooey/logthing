@@ -1164,6 +1164,26 @@ mod tests {
         router.clone().oneshot(req).await.unwrap()
     }
 
+    /// Plaintext carried by the encrypted request in the fault tests, and its announced length.
+    const FAULT_PLAIN: &[u8] = b"<soap/>";
+
+    /// Logs in on a fresh connection (asserting 200), then sends one encrypted request for
+    /// context id 1 and returns the router, the connection slot and that request's response.
+    async fn fault_login_then_encrypted(fault: Fault) -> (Router, ConnSlot, Response) {
+        let router = fault_router(fault);
+        let slot = ConnSlot::default();
+        let login = send_fault(
+            &router,
+            &slot,
+            auth_req("Kerberos", "tok", "/wsman", vec![]),
+        )
+        .await;
+        assert_eq!(login.status(), StatusCode::OK);
+        let req = enc_req("/wsman", 1, FAULT_PLAIN, FAULT_PLAIN.len());
+        let resp = send_fault(&router, &slot, req).await;
+        (router, slot, resp)
+    }
+
     #[test]
     fn test_missing_flags_error_display_names_the_missing_properties() {
         assert_eq!(
@@ -1244,31 +1264,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_decrypt_worker_panic_returns_401() {
-        let router = fault_router(Fault::PanicOnSecondFlagsCall);
-        let slot = ConnSlot::default();
-        let login = send_fault(
-            &router,
-            &slot,
-            auth_req("Kerberos", "tok", "/wsman", vec![]),
-        )
-        .await;
-        assert_eq!(login.status(), StatusCode::OK);
-        let resp = send_fault(&router, &slot, enc_req("/wsman", 1, b"<soap/>", 7)).await;
+        let (_router, _slot, resp) =
+            fault_login_then_encrypted(Fault::PanicOnSecondFlagsCall).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn test_context_losing_flags_before_decrypt_returns_401() {
-        let router = fault_router(Fault::FlagsLostOnSecondCall);
-        let slot = ConnSlot::default();
-        let login = send_fault(
-            &router,
-            &slot,
-            auth_req("Kerberos", "tok", "/wsman", vec![]),
-        )
-        .await;
-        assert_eq!(login.status(), StatusCode::OK);
-        let resp = send_fault(&router, &slot, enc_req("/wsman", 1, b"<soap/>", 7)).await;
+        let (router, slot, resp) = fault_login_then_encrypted(Fault::FlagsLostOnSecondCall).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         // The context was dropped: the next header-less request must re-authenticate.
         let again = send_fault(&router, &slot, plain_req("/wsman", b"")).await;
@@ -1303,16 +1306,7 @@ mod tests {
     #[tokio::test]
     async fn test_response_wrap_failure_returns_500_and_resets_slot() {
         crate::test_support::install_and_clear();
-        let router = fault_router(Fault::WrapFails);
-        let slot = ConnSlot::default();
-        let login = send_fault(
-            &router,
-            &slot,
-            auth_req("Kerberos", "tok", "/wsman", vec![]),
-        )
-        .await;
-        assert_eq!(login.status(), StatusCode::OK);
-        let resp = send_fault(&router, &slot, enc_req("/wsman", 1, b"<soap/>", 7)).await;
+        let (router, slot, resp) = fault_login_then_encrypted(Fault::WrapFails).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(body_bytes(resp).await.is_empty(), "plaintext must not leak");
         let events = crate::test_support::captured_events();

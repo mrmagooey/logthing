@@ -1046,8 +1046,9 @@ mod tests {
         crate::test_support::install_and_clear();
         let app = app(&state_with(true, None));
         // UTF-16LE BOM followed by an odd number of bytes.
-        let (st, _, _) = post(&app, "/wsman", &[], vec![0xFF, 0xFE, b'<']).await;
+        let (st, _, body) = post(&app, "/wsman", &[], vec![0xFF, 0xFE, b'<']).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(body.is_empty());
         let events = crate::test_support::captured_events();
         assert!(
             events.iter().any(|m| m.contains("undecodable charset")),
