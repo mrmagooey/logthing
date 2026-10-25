@@ -1977,6 +1977,11 @@ pub(crate) mod tests {
 
     // ── coverage: truncation, envelope and error-path behaviour ──
 
+    fn decode_one_flow_record(record: Vec<u8>) -> SflowRecord {
+        let d = datagram(&[flow_sample(1, 2, &[record])]);
+        decode_datagram(&d, exporter()).unwrap().remove(0)
+    }
+
     fn base_flow_rec() -> SflowRecord {
         let d = datagram(&[flow_sample(1, 2, &[])]);
         decode_datagram(&d, exporter()).unwrap().remove(0)
@@ -1984,6 +1989,7 @@ pub(crate) mod tests {
 
     fn sampled_ipv4_body() -> Vec<u8> {
         let mut b = Vec::new();
+        // length, protocol (17 = UDP), then src ip, dst ip, src/dst port, tcp_flags, tos
         for w in [60u32, 17] {
             b.extend_from_slice(&be(w));
         }
@@ -1997,6 +2003,7 @@ pub(crate) mod tests {
     /// A flow-sample body (no envelope) declaring `claimed` records.
     fn flow_body(claimed: u32, records: &[Vec<u8>]) -> Vec<u8> {
         let mut b = Vec::new();
+        // seq, source_id, rate, pool, drops, in_if, out_if, n_records
         for w in [1, 1, 512, 512, 0, 1, 2, claimed] {
             b.extend_from_slice(&be(w));
         }
@@ -2008,6 +2015,7 @@ pub(crate) mod tests {
 
     fn counter_body(claimed: u32, records: &[Vec<u8>]) -> Vec<u8> {
         let mut b = Vec::new();
+        // seq, source_id, n_records
         for w in [1, 1, claimed] {
             b.extend_from_slice(&be(w));
         }
@@ -2072,6 +2080,7 @@ pub(crate) mod tests {
         }
         let agent: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
         d.extend_from_slice(&agent.octets());
+        // sub_agent_id, sequence, uptime_ms, num_samples
         for w in [0, 1, 1000, 1] {
             d.extend_from_slice(&be(w));
         }
@@ -2085,6 +2094,7 @@ pub(crate) mod tests {
     #[test]
     fn test_unknown_agent_addr_type_is_a_datagram_error() {
         let mut d = Vec::new();
+        // version, agent_addr_type (3 = invalid), then zero padding
         for w in [5, 3, 0, 0, 0, 0, 0] {
             d.extend_from_slice(&be(w));
         }
@@ -2096,7 +2106,8 @@ pub(crate) mod tests {
     fn test_missing_sample_envelope_stops_and_keeps_earlier_samples() {
         crate::test_support::install_and_clear();
         let mut d = datagram(&[counter_sample(&[generic_if_record(4)])]);
-        d[24..28].copy_from_slice(&be(2)); // claims a second sample that is absent
+        const NUM_SAMPLES_OFFSET: usize = 24; // 28-byte v4-agent header, last word
+        d[NUM_SAMPLES_OFFSET..NUM_SAMPLES_OFFSET + 4].copy_from_slice(&be(2)); // claims a second sample that is absent
         let recs = decode_datagram(&d, exporter()).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].if_index, Some(4));
@@ -2233,11 +2244,6 @@ pub(crate) mod tests {
             (r.ip_protocol, r.src_port, r.dst_port),
             (Some(6), Some(8080), Some(80))
         );
-    }
-
-    fn decode_one_flow_record(record: Vec<u8>) -> SflowRecord {
-        let d = datagram(&[flow_sample(1, 2, &[record])]);
-        decode_datagram(&d, exporter()).unwrap().remove(0)
     }
 
     #[test]

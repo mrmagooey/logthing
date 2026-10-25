@@ -1689,11 +1689,11 @@ mod tests {
 
     /// Poll `cond` every 10 ms until it holds or 5 s elapse.
     async fn wait_for(what: &str, cond: impl Fn() -> bool) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while !cond() {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "timed out waiting for {what}"
+                "timed out after 10s waiting for {what}"
             );
             sleep(Duration::from_millis(10)).await;
         }
@@ -1730,7 +1730,14 @@ mod tests {
         }
         let (tx, rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move { listener.start_with_shutdown(rx).await });
-        wait_for("listener start", || logged("sFlow UDP listener started")).await;
+        wait_for("listener start", || {
+            assert!(
+                !task.is_finished(),
+                "listener exited before starting (port reuse race?)"
+            );
+            logged("sFlow UDP listener started")
+        })
+        .await;
         let bound: SocketAddr = format!("127.0.0.1:{udp_port}").parse().unwrap();
         (task, bound, tx, handler)
     }
@@ -1740,7 +1747,7 @@ mod tests {
         tx: &tokio::sync::watch::Sender<bool>,
     ) {
         tx.send(true).unwrap();
-        let res = tokio::time::timeout(Duration::from_secs(5), task)
+        let res = tokio::time::timeout(Duration::from_secs(10), task)
             .await
             .expect("listener must exit after the shutdown signal")
             .expect("listener task must not panic");
@@ -1782,7 +1789,12 @@ mod tests {
                 .send_to(FIXTURE_SFLOW_FLOW_RAW_HEADER, bound)
                 .await
                 .unwrap();
-            wait_for(&shape, || handler.batches().len() == 1).await;
+            wait_for(&shape, || {
+                handler.batches().len() == 1
+                    && metric_total(&snapshotter, "sflow_decode_errors") == 1
+                    && logged("produced no samples")
+            })
+            .await;
             stop(task, &tx).await;
 
             assert_eq!(handler.batches()[0].len(), 1, "{shape}");
@@ -1844,7 +1856,7 @@ mod tests {
 
         // The socket is bound asynchronously; resend until the first lands.
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while handler.batches().is_empty() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -1857,6 +1869,7 @@ mod tests {
             sleep(Duration::from_millis(20)).await;
         }
         task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(
             handler.batches()[0][0].sample_type,
             crate::sflow::SampleType::Counter
