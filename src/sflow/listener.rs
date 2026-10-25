@@ -1687,7 +1687,7 @@ mod tests {
             .any(|m| m.contains(needle))
     }
 
-    /// Poll `cond` every 10 ms until it holds or 5 s elapse.
+    /// Poll `cond` every 10 ms until it holds or 10 s elapse.
     async fn wait_for(what: &str, cond: impl Fn() -> bool) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while !cond() {
