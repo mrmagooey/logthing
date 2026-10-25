@@ -6216,4 +6216,428 @@ secret_key  = "SECRET"
         );
         assert_eq!(accepted.lock().unwrap().len(), 1);
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage-gap tests: error and defensive paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_live_interval_debug_shows_current_seconds() {
+        let li = LiveInterval::new(std::time::Duration::from_secs(42));
+        assert_eq!(format!("{li:?}"), "LiveInterval { secs: 42 }");
+    }
+
+    /// Upload sink that always fails; its label is not "s3" so the global spool never wraps it.
+    struct FailingUploadSink;
+    #[async_trait::async_trait]
+    impl UploadSink for FailingUploadSink {
+        async fn upload(&self, _key: &str, _body: Vec<u8>) -> anyhow::Result<()> {
+            anyhow::bail!("injected upload failure")
+        }
+        fn target_label(&self) -> &'static str {
+            "failing"
+        }
+        fn location_hint(&self) -> String {
+            "failing://test".to_string()
+        }
+    }
+
+    /// Accumulator whose `try_append` always errors.
+    struct AppendErrAccumulator;
+    impl RecordBatchAccumulator<String> for AppendErrAccumulator {
+        fn try_append(
+            &mut self,
+            _record: &String,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<bool> {
+            anyhow::bail!("append exploded")
+        }
+        fn len(&self) -> usize {
+            0
+        }
+        fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+            unreachable!("nothing was appended")
+        }
+    }
+
+    #[derive(Clone)]
+    struct AppendErrSink;
+    impl ParquetSink for AppendErrSink {
+        type Record = String;
+        fn source(&self) -> &'static str {
+            "test"
+        }
+        fn partition(&self, _r: &String) -> Option<String> {
+            None
+        }
+        fn schema(&self, _p: Option<&str>) -> Arc<Schema> {
+            test_schema()
+        }
+        fn to_record_batch(
+            &self,
+            _record: &String,
+            _schema: &Arc<Schema>,
+        ) -> anyhow::Result<RecordBatch> {
+            unreachable!("the live builder owns the append")
+        }
+        fn day_and_batch(
+            &self,
+            _record: &String,
+            _schema: &Arc<Schema>,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<(chrono::NaiveDate, Option<RecordBatch>)> {
+            Ok((now.date_naive(), None))
+        }
+        fn new_batch(
+            &self,
+            _schema: &Arc<Schema>,
+        ) -> Option<Box<dyn RecordBatchAccumulator<String>>> {
+            Some(Box::new(AppendErrAccumulator))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_push_skips_record_when_live_builder_append_fails() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(1_000_000);
+        let mut w = PartitionedParquetWriter::new(AppendErrSink, s3, cfg, policy);
+
+        w.push("boom".to_string()).await.unwrap();
+
+        let buf = w.buffer_by_partition("").expect("buffer exists");
+        assert_eq!((buf.row_count, buf.buffer.len()), (0, 0));
+        assert_eq!(skipped_counter(&snapshotter, "test", "s3"), 1);
+    }
+
+    /// Accumulator holding `n` phantom rows whose `finish` always fails.
+    struct FinishErrAccumulator(usize);
+    impl RecordBatchAccumulator<String> for FinishErrAccumulator {
+        fn try_append(
+            &mut self,
+            _record: &String,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<bool> {
+            self.0 += 1;
+            Ok(true)
+        }
+        fn len(&self) -> usize {
+            self.0
+        }
+        fn finish(&mut self) -> anyhow::Result<RecordBatch> {
+            anyhow::bail!("finish exploded")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_materialize_live_builder_keeps_builder_and_logs_when_finish_fails() {
+        let capture = TestTracingCapture::install();
+        let mut buf = PartitionBuffer::<String>::new(test_schema());
+        buf.live_builder = Some(Box::new(FinishErrAccumulator(3)));
+
+        PartitionedParquetWriter::<MockSink>::materialize_live_builder(&mut buf);
+
+        assert!(
+            buf.buffer.is_empty(),
+            "no batch is stored when finish fails"
+        );
+        assert_eq!(
+            buf.live_builder.as_ref().map(|b| b.len()),
+            Some(3),
+            "the builder is left as-is so the next materialize attempt retries"
+        );
+        let events = capture.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.message.contains("live builder finish() failed")
+                    && e.message.contains("finish exploded")),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn test_drop_oldest_to_cap_stops_when_buffer_is_empty_but_row_count_is_stale() {
+        let mut buf = PartitionBuffer::<String>::new(test_schema());
+        buf.row_count = 10; // inconsistent on purpose: nothing left to pop
+        PartitionedParquetWriter::<MockSink>::drop_oldest_to_cap(&mut buf, 5, "test", "test");
+        assert_eq!(
+            buf.row_count, 10,
+            "nothing was dropped, so the count is untouched"
+        );
+        assert!(buf.last_drop_warn.is_none(), "no drop, no warning");
+    }
+
+    fn key_for_today(partition: &str) -> BufKey {
+        BufKey {
+            partition: partition.to_string(),
+            day: chrono::Utc::now().date_naive(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_try_flush_partition_async_ignores_an_unknown_key() {
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(1);
+        let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
+        w.try_flush_partition_async(&key_for_today("nope"));
+        assert!(w.flush_tasks.is_empty(), "no flush may be spawned");
+        assert_eq!(w.total_buffered_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_try_flush_partition_async_skips_an_empty_idle_buffer() {
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(1_000_000);
+        let mut w = PartitionedParquetWriter::new(AppendErrSink, s3, cfg, policy);
+        // A failed mapping leaves an empty buffer behind.
+        w.push("x".to_string()).await.unwrap();
+        let key = w
+            .buffers
+            .keys()
+            .next()
+            .cloned()
+            .expect("orphan buffer exists");
+        w.try_flush_partition_async(&key);
+        assert!(
+            w.flush_tasks.is_empty(),
+            "an empty buffer must not spawn a flush"
+        );
+        assert!(!w.buffers[&key].in_flight);
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_flush_materializes_a_full_live_builder() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let sink: Arc<dyn UploadSink> = Arc::new(BlockingSink { gate: gate.clone() });
+        let (cfg, mut policy) = test_config(1_000_000);
+        policy.max_rows = 1;
+        let mut w = PartitionedParquetWriter::new(AmortizingMockSink, sink, cfg, policy);
+
+        w.push("r0".to_string()).await.unwrap(); // starts the (blocked) flush
+        let key = w.buffers.keys().next().cloned().unwrap();
+        assert!(w.buffers[&key].in_flight);
+
+        // Fill the live builder to the materialize threshold behind push()'s back.
+        {
+            let buf = w.buffers.get_mut(&key).unwrap();
+            let mut acc: Box<dyn RecordBatchAccumulator<String>> = Box::new(MockAccumulator::new());
+            for i in 0..BUILDER_BATCH_ROWS {
+                assert!(
+                    acc.try_append(&format!("b{i}"), chrono::Utc::now())
+                        .unwrap()
+                );
+            }
+            buf.live_builder = Some(acc);
+            buf.row_count += BUILDER_BATCH_ROWS;
+        }
+        w.try_flush_partition_async(&key);
+
+        let buf = &w.buffers[&key];
+        assert_eq!(
+            buf.buffer.len(),
+            1,
+            "the full builder became a stored batch"
+        );
+        assert_eq!(buf.buffer[0].0.num_rows(), BUILDER_BATCH_ROWS);
+        assert_eq!(buf.live_builder.as_ref().map(|b| b.len()), Some(0));
+
+        gate.add_permits(16);
+        w.drain_pending_flushes().await;
+    }
+
+    #[tokio::test]
+    async fn test_reap_flush_of_an_unregistered_cancelled_task_decrements_the_gauge() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let capture = TestTracingCapture::install();
+
+        let s3 = unreachable_s3().await;
+        let (cfg, policy) = test_config(10);
+        let mut w = PartitionedParquetWriter::new(MockSink, s3, cfg, policy);
+
+        // A task that is aborted before completing yields a cancelled JoinError whose id is
+        // not in `in_flight_flushes`.
+        let h = tokio::spawn(std::future::pending::<()>());
+        h.abort();
+        let join_err = h.await.expect_err("aborted task");
+        assert!(join_err.is_cancelled());
+
+        w.reap_flush(Err(join_err));
+
+        assert_eq!(
+            metric_total(&snapshotter, "parquet_s3_flushes_in_flight"),
+            -1.0,
+            "an unknown task still releases its in-flight gauge slot"
+        );
+        assert_eq!(metric_total(&snapshotter, "parquet_s3_flush_panics"), 0.0);
+        let events = capture.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.message.contains("flush task cancelled")
+                    && e.fields.get("source").map(String::as_str) == Some("test")),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encode_and_upload_reports_failure_when_batches_do_not_fit_the_schema() {
+        let buf_schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            test_schema(), // Utf8 column
+            vec![Arc::new(StringArray::from(vec!["a", "b"])) as _],
+        )
+        .unwrap();
+        let mut batches = VecDeque::new();
+        batches.push_back((batch, 10usize));
+        let uploads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: Arc<dyn UploadSink> = Arc::new(RecordingSink {
+            uploads: uploads.clone(),
+        });
+
+        let outcome = encode_and_upload(
+            key_for_today("p"),
+            batches,
+            2,
+            10,
+            buf_schema,
+            sink,
+            None,
+            "pre".to_string(),
+            "test",
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            false,
+        )
+        .await;
+
+        match outcome {
+            FlushOutcome::Failure {
+                key,
+                batches,
+                row_count,
+                byte_count,
+                error,
+            } => {
+                assert_eq!(key.partition, "p");
+                assert_eq!((batches.len(), row_count, byte_count), (1, 2, 10));
+                assert!(!error.is_empty());
+            }
+            FlushOutcome::Success { .. } => panic!("an unencodable batch must fail the flush"),
+        }
+        assert!(
+            uploads.lock().unwrap().is_empty(),
+            "nothing is uploaded on an encode failure"
+        );
+    }
+
+    #[test]
+    fn test_build_descriptor_tolerates_missing_column_metadata_and_statistics() {
+        use arrow::array::Int32Array;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as _,
+                Arc::new(Int32Array::from(vec![3, 4])) as _,
+            ],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+        writer.write(&batch).unwrap();
+        let mut file_metadata = writer.close().unwrap();
+        // Column 0 loses its metadata entirely; column 1 loses only its statistics.
+        file_metadata.row_groups[0].columns[0].meta_data = None;
+        file_metadata.row_groups[0].columns[1]
+            .meta_data
+            .as_mut()
+            .unwrap()
+            .statistics = None;
+
+        let d = build_descriptor(
+            "test_source",
+            Some("p"),
+            "s3://bucket".to_string(),
+            "k.parquet",
+            2,
+            buf.len() as u64,
+            "abc",
+            "s3",
+            &schema,
+            &file_metadata,
+        );
+
+        assert!(
+            !d.column_stats.contains_key(&0),
+            "no metadata, no stat entry"
+        );
+        let stat = d.column_stats.get(&1).expect("column 1 still described");
+        assert_eq!(stat.physical_type, "INT32");
+        assert_eq!(
+            (stat.null_count, stat.min.clone(), stat.max.clone()),
+            (0, None, None)
+        );
+        assert_eq!(d.partition.as_deref(), Some("p"));
+        assert_eq!(d.file_path, "s3://bucket/k.parquet");
+    }
+
+    #[tokio::test]
+    async fn test_writer_task_survives_a_failing_shutdown_flush_and_logs_what_is_still_buffered() {
+        let capture = TestTracingCapture::install();
+        let (cfg, policy) = test_config(1_000_000); // no flush before shutdown
+        let (handle, join) = ParquetWriterHandle::start_with_stats(
+            MockSink,
+            Arc::new(FailingUploadSink),
+            cfg,
+            policy,
+            Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
+        );
+        handle
+            .try_send("lost".to_string())
+            .expect("channel has room");
+        drop(handle);
+        tokio::time::timeout(std::time::Duration::from_secs(10), join)
+            .await
+            .expect("writer exits")
+            .expect("writer does not panic");
+
+        let events = capture.events();
+        let warn = events
+            .iter()
+            .find(|e| e.message.contains("flush_all on shutdown"))
+            .unwrap_or_else(|| panic!("expected a shutdown flush warning: {events:?}"));
+        assert!(warn.message.contains("injected upload failure"), "{warn:?}");
+        assert_eq!(
+            warn.fields.get("rows_before_flush").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            warn.fields.get("rows_still_buffered").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prefixed_upload_sink_forwards_label_and_location_hint() {
+        let uploads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inner: Arc<dyn UploadSink> = Arc::new(RecordingSink { uploads });
+        let sink = PrefixedUploadSink {
+            inner: inner.clone(),
+            prefix: "desc".to_string(),
+        };
+        assert_eq!(sink.target_label(), inner.target_label());
+        assert_eq!(sink.location_hint(), inner.location_hint());
+    }
 }
