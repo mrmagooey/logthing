@@ -14,6 +14,7 @@ mod pii;
 mod sflow_udp;
 mod suricata_tcp;
 mod syslog_udp;
+mod wef_http;
 mod zeek_tcp;
 
 use clap::{Parser, Subcommand};
@@ -48,6 +49,9 @@ enum Command {
     GenericHttp(generic_http::GenericHttpArgs),
     /// Send OTLP/HTTP protobuf logs (`/v1/logs`) at a paced, concurrent rate.
     OtlpHttp(otlp_http::OtlpHttpArgs),
+    /// Send Windows Event Forwarding batches over HTTP (Enumerate, then UTF-16 `Events`
+    /// deliveries to the `NotifyTo` address) at a paced, concurrent rate.
+    WefHttp(wef_http::WefHttpArgs),
 }
 
 #[tokio::main]
@@ -62,5 +66,6 @@ async fn main() -> anyhow::Result<()> {
         Command::HecHttp(args) => hec_http::run(args).await,
         Command::GenericHttp(args) => generic_http::run(args).await,
         Command::OtlpHttp(args) => otlp_http::run(args).await,
+        Command::WefHttp(args) => wef_http::run(args).await,
     }
 }
