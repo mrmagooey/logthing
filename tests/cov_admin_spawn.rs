@@ -57,6 +57,22 @@ fn spawn() {
     );
 }
 
+/// Removes every `LOGTHING_ADMIN_*` variable this test set, even on panic.
+struct EnvGuard;
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        let keys: Vec<String> = std::env::vars()
+            .map(|(k, _)| k)
+            .filter(|k| k.starts_with("LOGTHING_ADMIN_"))
+            .collect();
+        for key in keys {
+            // SAFETY: see `set`.
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+}
+
 fn set(key: &str, val: &str) {
     // SAFETY: the only test in this binary; nothing else reads or writes env
     // concurrently, and the admin task only reads it inside `spawn_admin_server`.
@@ -65,6 +81,7 @@ fn set(key: &str, val: &str) {
 
 #[tokio::test]
 async fn test_spawn_admin_server_startup_failures_and_tls() {
+    let _env = EnvGuard;
     let logs = LogBuf::default();
     let writer = logs.clone();
     tracing_subscriber::fmt()
@@ -115,13 +132,17 @@ async fn test_spawn_admin_server_startup_failures_and_tls() {
     spawn();
 
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .add_root_certificate(reqwest::Certificate::from_pem(cert.cert.pem().as_bytes()).unwrap())
+        .resolve("localhost", addr)
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
     let body = loop {
-        let attempt = client.get(format!("https://{addr}/health")).send().await;
+        let attempt = client
+            .get(format!("https://localhost:{}/health", addr.port()))
+            .send()
+            .await;
         match attempt {
             Ok(resp) => {
                 assert_eq!(resp.status(), 200);
