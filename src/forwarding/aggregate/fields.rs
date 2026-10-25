@@ -1099,6 +1099,12 @@ mod tests {
         sd.insert("exampleSDID@32473".to_string(), params);
         let m = syslog_with_sd(Some(sd));
         assert_eq!(s(m.field("msg_id")), Some("ID47".into()));
+        let named = crate::syslog::SyslogMessage {
+            app_name: Some("sshd".to_string()),
+            ..m.clone()
+        };
+        assert_eq!(s(named.field("app_name")), Some("sshd".into()));
+        assert_eq!(s(m.field("app_name")), None);
         assert_eq!(s(m.field("exampleSDID@32473.iut")), Some("3".into()));
         // Unknown SDID, unknown param, and a name without a '.' all resolve to nothing.
         assert!(m.field("other.iut").is_none());

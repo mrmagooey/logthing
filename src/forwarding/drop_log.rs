@@ -367,4 +367,16 @@ mod tests {
             assert_eq!(t.total(), 8);
         }
     }
+
+    #[test]
+    fn test_default_throttle_set_starts_every_slot_unlogged() {
+        let ts = DropLogThrottles::default();
+        assert_eq!(ts.check_at(DropSite::Aggregate, DropKind::Full, 0), Some(1));
+        assert_eq!(ts.check_at(DropSite::Aggregate, DropKind::Full, 1), None);
+        // A different kind of the same site has its own, still-unlogged slot.
+        assert_eq!(
+            ts.check_at(DropSite::Aggregate, DropKind::Closed, 1),
+            Some(1)
+        );
+    }
 }

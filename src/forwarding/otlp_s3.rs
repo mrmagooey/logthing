@@ -898,4 +898,51 @@ mod tests {
             .expect("otlp row");
         assert_eq!(row.hours.iter().map(|h| h.count).sum::<u64>(), 1);
     }
+
+    #[tokio::test]
+    async fn test_otlp_local_start_writes_parquet_under_the_configured_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(
+            crate::forwarding::local_sink::LocalDiskSink::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let cfg = OtlpLocalConfig {
+            directory: dir.path().to_path_buf(),
+            prefix: "otlp".to_string(),
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 16,
+            max_buffer_rows: 100_000,
+        };
+        let (handler, join) = otlp_local_start(
+            &cfg,
+            sink,
+            8,
+            Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
+        );
+        handler.try_send(sample()).expect("channel has room");
+        drop(handler); // closing the channel flushes the buffered row
+        tokio::time::timeout(std::time::Duration::from_secs(10), join)
+            .await
+            .expect("writer exits")
+            .expect("writer does not panic");
+
+        let mut found = Vec::new();
+        let mut stack = vec![dir.path().to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    found.push(p);
+                }
+            }
+        }
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].extension().is_some_and(|e| e == "parquet"));
+        assert!(found[0].starts_with(dir.path().join("otlp")));
+    }
 }

@@ -1659,15 +1659,41 @@ mod tests {
             AggregateSink,
         >::for_test(tx, "aggregate", "local"));
 
+        // A subscriber must be installed for the throttled `warn!` to be evaluated.
+        let logs = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || LogWriter(sink.clone()))
+            .with_ansi(false)
+            .finish();
+        let _log_guard = tracing::subscriber::set_default(subscriber);
+
         let start = Utc::now();
         let next = agg.emit(start, &[handle]).await;
         assert!(next >= start, "emit still returns the next window start");
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains("aggregate writer channel unavailable; dropped 1 aggregated row")
+                && text.contains("dropped_total=1")
+                && text.contains("rule=r"),
+            "{text}"
+        );
 
-        let snap = snapshotter.snapshot().into_hashmap();
+        let snap = snapshotter.snapshot().into_vec();
         let counter = |name: &str| {
             snap.iter()
-                .find(|(k, _)| k.key().name() == name)
-                .map(|(_, (_, _, v))| match v {
+                .find(|(k, ..)| k.key().name() == name)
+                .map(|(_, _, _, v)| match v {
                     DebugValue::Counter(c) => *c,
                     _ => u64::MAX,
                 })

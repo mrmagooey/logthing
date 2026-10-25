@@ -386,12 +386,15 @@ mod tests {
 
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let seen_h = seen.clone();
-        let app = axum::Router::new().fallback(move |uri: Uri| {
+        let app = axum::Router::new().fallback(move |method: axum::http::Method, uri: Uri| {
             let seen = seen_h.clone();
             async move {
                 seen.lock()
                     .unwrap()
-                    .push(uri.query().unwrap_or("").to_string());
+                    .push(format!("{method} {}", uri.query().unwrap_or("")));
+                if method == axum::http::Method::PUT {
+                    return ([(header::ETAG, "\"abc\"")], "").into_response();
+                }
                 let path = uri.path().trim_start_matches('/').to_string();
                 match path.split_once('/') {
                     Some((_bucket, "missing.bin")) => (StatusCode::NOT_FOUND, "").into_response(),
@@ -472,5 +475,16 @@ mod tests {
         let sink = S3Sink::from_connection(&c).await.unwrap();
         assert_eq!(sink.bucket, "test-bucket");
         assert_eq!(sink.endpoint, "http://127.0.0.1:1");
+    }
+
+    #[tokio::test]
+    async fn test_upload_succeeds_against_a_fake_s3_put() {
+        let (endpoint, seen) = fake_s3().await;
+        let sink = sink_for(endpoint).await;
+        sink.upload("zeek/conn/x.parquet", b"data".to_vec())
+            .await
+            .expect("PUT answered 200");
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|q| q.starts_with("PUT ")), "{seen:?}");
     }
 }
