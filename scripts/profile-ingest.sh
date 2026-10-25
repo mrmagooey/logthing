@@ -73,10 +73,16 @@ declare -A SINK=(
     [syslog]=syslog [zeek]=zeek [suricata]=suricata [ipfix]=ipfix [sflow]=sflow
     [hec]=hec [generic]=hec [otlp]=otlp [wef]=wef
 )
-# Offered records/s (events/s for the HTTP formats). Starting values; calibrated per host.
+# Offered records/s (events/s for the HTTP formats; ipfix = flows, sflow = datagrams of 2 samples).
+# Calibrated 2026-10-25 on host dev-bo (12 vCPU QEMU Virtual CPU 2.5+, no AVX2, shared host,
+# loadavg 5-20 during probes), loadgen on the same host. Defaults sit at roughly 50-70% of the
+# highest rate that passed, favouring a reliable PASS over a high rate. Highest passing probes:
+# syslog 30000 (60000 FAIL), zeek/hec/generic >=80000, suricata ~38000 achieved at 40000,
+# ipfix 40000 (80000 FAIL), sflow >=80000, otlp 12000 (20000 FAIL: achieved only ~17000),
+# wef 20000 (25000 FAIL: achieved ~14000).
 declare -A RATE_DEFAULT=(
-    [syslog]=20000 [zeek]=20000 [suricata]=20000 [ipfix]=20000 [sflow]=20000
-    [hec]=20000 [generic]=20000 [otlp]=20000 [wef]=5000
+    [syslog]=20000 [zeek]=40000 [suricata]=25000 [ipfix]=25000 [sflow]=40000
+    [hec]=40000 [generic]=40000 [otlp]=12000 [wef]=14000
 )
 # Transport of the format's own listener port: udp, tcp, or http (shares the HTTP bind).
 declare -A PROTO=(
