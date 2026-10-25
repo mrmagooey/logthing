@@ -667,6 +667,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_stats_renders_hourly_table_and_audits() {
+        let state = test_state().await;
+        state.source_stats.record("syslog", 5);
+        state.source_stats.record("syslog", 2);
+        state.source_stats.record("zeek", 3);
+        let audit = state.audit_logger.clone();
+        let mut request = create_request_with_auth(Method::GET, "/stats", "admin", "admin", None);
+        inject_connect_info(&mut request, "127.0.0.1:12345".parse().unwrap());
+        let app = axum::Router::new()
+            .route("/stats", axum::routing::get(get_stats))
+            .with_state(state);
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("<tr><td>syslog</td><td>7</td></tr>"),
+            "{body}"
+        );
+        assert!(body.contains("<tr><td>zeek</td><td>3</td></tr>"), "{body}");
+        assert!(body.contains(":00</th>"), "hour header missing:\n{body}");
+        assert!(!body.contains("{{"), "unreplaced placeholder:\n{body}");
+        let entries = audit.get_entries(10).await;
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.action == "STATS_PAGE_ACCESS" && e.username == "admin")
+        );
+    }
+
+    #[tokio::test]
     async fn get_stats_json_requires_auth() {
         let state = test_state().await;
         let mut request = create_request_without_auth(Method::GET, "/stats.json");

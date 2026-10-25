@@ -895,6 +895,34 @@ mod tests {
         }
     }
 
+    /// A failing file append is logged and swallowed: the entry must still reach
+    /// the in-memory ring that `/audit-log` serves.
+    #[tokio::test]
+    async fn test_audit_log_keeps_entry_in_memory_when_file_write_fails() {
+        // An empty path has no parent and cannot be opened for append.
+        let logger = AuditLogger::with_log_file(10, PathBuf::new()).await;
+        assert!(
+            logger
+                .append_to_file(&AuditEntry {
+                    timestamp: Utc::now().to_rfc3339(),
+                    action: "X".into(),
+                    username: "u".into(),
+                    client_ip: "127.0.0.1".into(),
+                    details: None,
+                })
+                .await
+                .is_err()
+        );
+
+        logger.log("PROBE", "tester", "10.1.2.3", Some("why")).await;
+        logger.log("PROBE2", "tester", "10.1.2.3", None).await;
+
+        let entries = logger.get_entries(10).await;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].action, "PROBE2");
+        assert_eq!(entries[1].details.as_deref(), Some("why"));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_audit_rotation_concurrent_logs_lose_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -1689,6 +1717,33 @@ mod tests {
                 load_admin_config().expect("rate limit disabled should succeed")
             });
             assert!(!cfg.enable_rate_limiting);
+        }
+
+        // ── Scenario 12: malformed LOGTHING_ADMIN_ENABLE_RATE_LIMIT aborts the load ───────
+        {
+            let err = with_env("LOGTHING_ADMIN_ENABLE_RATE_LIMIT", "sometimes", || {
+                load_admin_config()
+                    .err()
+                    .expect("a non-boolean must be rejected")
+            });
+            assert!(
+                err.to_string().contains("LOGTHING_ADMIN_ENABLE_RATE_LIMIT"),
+                "{err}"
+            );
+        }
+
+        // ── Scenario 13: malformed LOGTHING_ADMIN_TRUST_PROXY_HEADERS aborts the load ─────
+        {
+            let err = with_env("LOGTHING_ADMIN_TRUST_PROXY_HEADERS", "maybe", || {
+                load_admin_config()
+                    .err()
+                    .expect("a non-boolean must be rejected")
+            });
+            assert!(
+                err.to_string()
+                    .contains("LOGTHING_ADMIN_TRUST_PROXY_HEADERS"),
+                "{err}"
+            );
         }
     }
 }

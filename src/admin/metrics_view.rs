@@ -381,4 +381,20 @@ field_distinct_values_capped{field=\"id.orig_h\",source=\"zeek\",stream=\"conn\"
             "field=\"host\" must not match field=\"my_host\":\n{html}"
         );
     }
+
+    /// Lines that look nothing like a sample are skipped, not misparsed.
+    #[test]
+    fn test_parse_exposition_skips_valueless_and_nameless_lines() {
+        let rendered = "novalue\n\
+                        {orphan=\"x\"} 5\n\
+                        two words{a=\"b\"} 9\n\
+                        good_metric 1\n";
+        let groups = parse_exposition(rendered);
+        assert_eq!(
+            groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+            vec!["good_metric"],
+            "only the well-formed sample may survive"
+        );
+        assert_eq!(series_count(&groups), 1);
+    }
 }
