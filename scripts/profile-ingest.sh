@@ -1,5 +1,6 @@
 #!/bin/bash
 # Per-format CPU flame graphs of logthing's ingest path, one fixed load point per format.
+# Linux only (reads /proc); needs bash 4+, python3, curl, coreutils timeout.
 #
 # Usage:
 #   scripts/profile-ingest.sh <fmt>... | all     profile the named formats (or all nine)
@@ -48,7 +49,8 @@
 # - Representativeness is anchored to a known figure: the sampler's own activity counter
 #   (parquet_s3_records_written, which every local sink increments on flush) plus this script's
 #   before/after read of the same counter and loadgen's achieved rate. A format FAILS when the
-#   profile is not representative, loadgen reported errors, or written/offered < 0.9.
+#   profile is not representative, loadgen reported errors, or written/sent < 0.9
+#   (sent = records loadgen reports having sent) or loadgen achieved < 0.9 x offered.
 # - The old scripts rewrote the repo's logthing.toml and deleted logthing.admin.toml (the
 #   tracked admin override wins over logthing.toml, commit 87b1d5e). This script never touches
 #   the repo: the server runs with cwd = a temp work dir holding its own logthing.toml, and
@@ -61,6 +63,10 @@ set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${OUT:-$REPO/profiling-results}"
 DURATION="${DURATION:-25}"
+if [ "$DURATION" -lt 10 ] 2>/dev/null; then
+    echo "WARN: DURATION=$DURATION < 2x the 5 s flush interval; clamping to 10" >&2
+    DURATION=10
+fi
 DELAY="${DELAY:-5}"
 HZ="${HZ:-99}"
 BIN="${BIN:-$REPO/target/profiling/logthing}"
@@ -73,9 +79,12 @@ declare -A SINK=(
     [syslog]=syslog [zeek]=zeek [suricata]=suricata [ipfix]=ipfix [sflow]=sflow
     [hec]=hec [generic]=hec [otlp]=otlp [wef]=wef
 )
-# Offered records/s (events/s for the HTTP formats; ipfix = flows, sflow = datagrams of 2 samples).
+# Offered rate: records/s (events/s for the HTTP formats; ipfix = flows; sflow = DATAGRAMS/s, each
+# carrying 2 samples, so sflow records written are ~2x the offered rate; the verdict compares
+# written records with loadgen's own sent count, so that does not distort the ratio).
 # Calibrated 2026-10-25 on host dev-bo (12 vCPU QEMU Virtual CPU 2.5+, no AVX2, shared host,
-# loadavg 5-20 during probes), loadgen on the same host. Defaults sit at roughly 50-70% of the
+# loadavg 70+ during the first batch of probes; the defaults were set from the later probes at
+# loadavg 5-20), loadgen on the same host. Defaults sit at roughly 50-70% of the
 # highest rate that passed, favouring a reliable PASS over a high rate. Highest passing probes:
 # syslog 30000 (60000 FAIL), zeek/hec/generic >=80000, suricata ~38000 achieved at 40000,
 # ipfix 40000 (80000 FAIL), sflow >=80000, otlp 12000 (20000 FAIL: achieved only ~17000),
@@ -251,6 +260,7 @@ if [ "${SKIP_PPROF_CHECK:-0}" != 1 ] && command -v strings >/dev/null 2>&1 \
 fi
 command -v python3 >/dev/null 2>&1 || { echo "FATAL: python3 is required"; exit 1; }
 command -v curl >/dev/null 2>&1 || { echo "FATAL: curl is required"; exit 1; }
+command -v timeout >/dev/null 2>&1 || { echo "FATAL: timeout (coreutils) is required"; exit 1; }
 
 # ambient LOGTHING__* variables would override the generated config
 for v in $(compgen -e | grep '^LOGTHING__'); do unset "$v"; done
@@ -430,6 +440,10 @@ except OSError:
     pass
 m = re.search(r"achieved rate: ([0-9.]+)", text)
 achieved = float(m.group(1)) if m else None
+# Records loadgen itself reports sending. sflow prints datagrams AND samples; only the samples
+# (2 per datagram) are comparable to the sink's record count. Other modes: "sent N <unit> in".
+m = re.search(r"; (\d+) samples", text) or re.search(r"sent (\d+) \w+ in ", text)
+sent = int(m.group(1)) if m else None
 errors = sum(int(x) for x in re.findall(r"(\d+) requests rejected", text))
 errors += sum(int(x) for x in re.findall(r"(\d+) requests abandoned", text))
 lg_rc = int(os.environ.get("LG_RC", "0"))
@@ -438,8 +452,10 @@ if lg_rc != 0:
     reasons.append(f"loadgen exited with status {lg_rc}")
 if errors:
     reasons.append(f"loadgen reported {errors} error(s)")
-if achieved is None and lg_rc == 0 and text:
+if (achieved is None or sent is None) and lg_rc == 0 and before != "skip":
     reasons.append("loadgen summary line not found")
+if achieved is not None and achieved < 0.9 * offered:
+    reasons.append(f"loadgen achieved {achieved:,.0f} of {offered:,.0f} offered (< 0.9)")
 
 records = None
 ratio = None
@@ -449,9 +465,9 @@ elif before == "" or after == "":
     reasons.append("metrics unreachable")
 else:
     records = int(after) - int(before)
-    ratio = records / (offered * lg_secs) if offered * lg_secs else None
+    ratio = records / sent if sent else None
     if ratio is not None and ratio < 0.9:
-        reasons.append(f"written/offered {ratio:.2f} < 0.9")
+        reasons.append(f"written/sent {ratio:.2f} < 0.9")
 if meta and not meta.get("representative", False):
     reasons.append("profile not representative")
 leak = int(envvars)
@@ -465,6 +481,7 @@ summary = {
     "offered_rate": offered,
     "achieved_rate": achieved,
     "loadgen_errors": errors,
+    "loadgen_sent_records": sent,
     "records_written": records,
     "written_ratio": None if ratio is None else round(ratio, 4),
     "sample_count": meta.get("sample_count"),
@@ -485,36 +502,45 @@ PY
 # write_index: self-contained $OUT/index.html from every $OUT/*/summary.json.
 write_index() {
     OUT_DIR="$OUT" python3 - "${FORMATS[@]}" <<'PY'
-import html, json, os, sys
+import datetime, html, json, os, sys
 
 out = os.environ["OUT_DIR"]
-rows, host = [], None
+rows = []
+def num(v, spec="{:,.0f}"):
+    return "-" if v is None else spec.format(v)
+
+
+def render(fmt, s):
+    svg = os.path.join(fmt, "flamegraph.svg")
+    has_svg = os.path.exists(os.path.join(out, svg))
+    link = (f'<a href="{svg}">flamegraph</a><br><img src="{svg}" alt="{fmt} flame graph" '
+            'width="320">') if has_svg else "no flame graph"
+    why = "; ".join(s.get("reasons", []))
+    return (
+        f'<tr class="{html.escape(str(s["verdict"]).lower())}"><td>{html.escape(fmt)}</td>'
+        f'<td>{html.escape(str(s["verdict"]))}</td><td class="n">{num(s.get("offered_rate"))}</td>'
+        f'<td class="n">{num(s.get("achieved_rate"))}</td>'
+        f'<td class="n">{num(s.get("records_written"))}</td>'
+        f'<td class="n">{num(s.get("written_ratio"), "{:.3f}")}</td>'
+        f'<td class="n">{num(s.get("sample_count"))}</td>'
+        f'<td>{link}</td><td>{html.escape(why)}</td>'
+        f'<td>{html.escape(str(s.get("host", "")))}<br>{html.escape(str(s.get("date", "")))}</td>'
+        '</tr>')
+
+
 for fmt in sys.argv[1:]:
     try:
         with open(os.path.join(out, fmt, "summary.json")) as fh:
             s = json.load(fh)
     except (OSError, ValueError):
         continue
-    host = host or s
-    svg = os.path.join(fmt, "flamegraph.svg")
-    has_svg = os.path.exists(os.path.join(out, svg))
-    def num(v, spec="{:,.0f}"):
-        return "-" if v is None else spec.format(v)
-    link = (f'<a href="{svg}">flamegraph</a><br><img src="{svg}" alt="{fmt} flame graph" '
-            'width="320">') if has_svg else "no flame graph"
-    why = "; ".join(s.get("reasons", []))
-    rows.append(
-        f'<tr class="{s["verdict"].lower()}"><td>{html.escape(fmt)}</td>'
-        f'<td>{s["verdict"]}</td><td class="n">{num(s.get("offered_rate"))}</td>'
-        f'<td class="n">{num(s.get("achieved_rate"))}</td>'
-        f'<td class="n">{num(s.get("records_written"))}</td>'
-        f'<td class="n">{num(s.get("written_ratio"), "{:.2f}")}</td>'
-        f'<td class="n">{num(s.get("sample_count"))}</td>'
-        f'<td>{link}</td><td>{html.escape(why)}</td></tr>')
-head = ""
-if host:
-    head = (f'<p>Host {html.escape(host.get("host", ""))} &middot; CPU '
-            f'{html.escape(host.get("cpu", ""))} &middot; {html.escape(host.get("date", ""))}</p>')
+    try:
+        rows.append(render(fmt, s))
+    except Exception as e:  # one malformed summary must not take the whole index down
+        rows.append(f'<tr class="fail"><td>{html.escape(fmt)}</td><td colspan="9">'
+                    f'unreadable summary.json: {html.escape(repr(e))}</td></tr>')
+head = f'<p>Index generated {datetime.datetime.now(datetime.timezone.utc):%Y-%m-%dT%H:%M:%SZ}'
+head += ' (per-row host and date show when each format was measured)</p>'
 page = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>logthing ingest flame graphs</title>
 <style>
@@ -526,7 +552,7 @@ tr.fail td:nth-child(2){{color:#b00;font-weight:bold}} img{{border:1px solid #dd
 <h1>logthing ingest flame graphs</h1>
 {head}
 <table><tr><th>format</th><th>verdict</th><th>offered/s</th><th>achieved/s</th><th>written</th>
-<th>written/offered</th><th>samples</th><th>flame graph</th><th>notes</th></tr>
+<th>written/sent</th><th>samples</th><th>flame graph</th><th>notes</th><th>host / date</th></tr>
 {"".join(rows)}
 </table>
 <h2>Out of scope</h2>
