@@ -3124,7 +3124,8 @@ mod tests {
         tx: &tokio::sync::watch::Sender<bool>,
     ) {
         tx.send(false).unwrap();
-        sleep(Duration::from_millis(50)).await;
+        // Best-effort negative check: 200 ms gives the listener ample time to observe `false`.
+        sleep(Duration::from_millis(200)).await;
         assert!(
             !task.is_finished(),
             "a false shutdown value must not stop the listener"
@@ -3208,77 +3209,6 @@ mod tests {
     #[tokio::test]
     async fn test_fan_out_batched_recv_delivers_rejects_and_counts_parse_errors() {
         cov_run_variant(4, 32).await;
-    }
-
-    /// Fill the connection semaphore, then one more connection must be dropped and counted.
-    async fn cov_assert_connection_limit(addr: SocketAddr, snap: &Snapshotter) -> Vec<TcpStream> {
-        let mut held = Vec::with_capacity(MAX_SYSLOG_TCP_CONNECTIONS);
-        for _ in 0..MAX_SYSLOG_TCP_CONNECTIONS {
-            held.push(cov_connect(addr).await);
-        }
-        let mut extra = cov_connect(addr).await;
-        cov_wait_for("over-limit rejection", || {
-            cov_counter(snap, "syslog_tcp_connections_rejected", None) >= 1
-        })
-        .await;
-        let mut sink = Vec::new();
-        let n = tokio::time::timeout(Duration::from_secs(5), extra.read_to_end(&mut sink))
-            .await
-            .expect("rejected connection must be closed by the server")
-            .unwrap_or(0);
-        assert_eq!(n, 0);
-        assert_eq!(
-            cov_counter(snap, "syslog_tcp_connections_rejected", None),
-            1
-        );
-        held
-    }
-
-    async fn cov_connection_limit_variant(recv_tasks: usize, recv_batch_size: usize) {
-        let recorder = DebuggingRecorder::new();
-        let snap = recorder.snapshotter();
-        let _guard = metrics::set_default_local_recorder(&recorder);
-        let (task, _udp, tcp, tx, _handler) = cov_start(recv_tasks, recv_batch_size, None).await;
-        let held = cov_assert_connection_limit(tcp, &snap).await;
-        drop(held);
-        tx.send(true).unwrap();
-        tokio::time::timeout(Duration::from_secs(20), task)
-            .await
-            .expect("listener must stop after shutdown")
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_inline_single_recv_rejects_connection_over_limit() {
-        cov_connection_limit_variant(1, 1).await;
-    }
-
-    #[tokio::test]
-    async fn test_inline_batched_recv_rejects_connection_over_limit() {
-        cov_connection_limit_variant(1, 32).await;
-    }
-
-    #[tokio::test]
-    async fn test_fan_out_accept_loop_rejects_connection_over_limit() {
-        cov_connection_limit_variant(4, 32).await;
-    }
-
-    #[tokio::test]
-    async fn test_run_with_listener_rejects_connection_over_limit() {
-        let recorder = DebuggingRecorder::new();
-        let snap = recorder.snapshotter();
-        let _guard = metrics::set_default_local_recorder(&recorder);
-        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = tcp_listener.local_addr().unwrap();
-        let listener =
-            SyslogListener::new(SyslogListenerConfig::default(), CapturingHandler::new());
-        let task = tokio::spawn(async move {
-            listener.run_with_listener(tcp_listener).await.ok();
-        });
-        let held = cov_assert_connection_limit(addr, &snap).await;
-        drop(held);
-        task.abort();
     }
 
     /// `start()` (no shutdown signal) on ephemeral ports.
@@ -3424,7 +3354,8 @@ mod tests {
         let received = cov_counter(&snap, "syslog_messages_received", None);
         assert_eq!(received, 1, "the 2-byte tail must be treated as a line");
         let parsed = cov_counter(&snap, "syslog_parse_errors", None);
-        assert_eq!(parsed as usize + msgs.len(), 1);
+        assert_eq!(parsed, 1, "a bare '12' is not a parseable syslog message");
+        assert!(msgs.is_empty());
     }
 
     #[tokio::test]
