@@ -283,7 +283,8 @@ fn enumerate_body(machine_id: &str) -> Vec<u8> {
         "{ENV_OPEN}<s:Header><a:To>http://logthing.example.com:5985/wsman/SubscriptionManager/WEC\
          </a:To><w:ResourceURI s:mustUnderstand=\"true\">\
          http://schemas.microsoft.com/wbem/wsman/1/SubscriptionManager/Subscription\
-         </w:ResourceURI><m:MachineID xmlns:m=\"http://schemas.microsoft.com/wbem/wsman/1/machineid\" \
+         </w:ResourceURI><m:MachineID \
+         xmlns:m=\"http://schemas.microsoft.com/wbem/wsman/1/machineid\" \
          s:mustUnderstand=\"false\">{machine_id}</m:MachineID><a:ReplyTo><a:Address \
          s:mustUnderstand=\"true\">http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous\
          </a:Address></a:ReplyTo><a:Action s:mustUnderstand=\"true\">\
@@ -327,7 +328,8 @@ fn events_body(seq: u64, machine_id: &str, sub_uuid: &str, n: usize) -> Vec<u8> 
         })
         .collect();
     let xml = format!(
-        "{ENV_OPEN}<s:Header><a:To>http://logthing.example.com:5985/wsman/subscriptions/{sub_uuid}/1\
+        "{ENV_OPEN}<s:Header><a:To>http://logthing.example.com:5985/wsman/subscriptions/\
+         {sub_uuid}/1\
          </a:To><m:MachineID xmlns:m=\"http://schemas.microsoft.com/wbem/wsman/1/machineid\" \
          s:mustUnderstand=\"false\">{machine_id}</m:MachineID><a:ReplyTo><a:Address \
          s:mustUnderstand=\"true\">http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous\
