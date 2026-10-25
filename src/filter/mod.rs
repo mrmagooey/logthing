@@ -563,4 +563,11 @@ mod tests {
         ok.insert("data.Application", serde_json::json!("C:\\svchost.exe"));
         assert_eq!(f.matching_rule(&Rec(ok)), Some("wfp"));
     }
+
+    #[test]
+    fn test_source_enabled_unknown_source_is_false() {
+        let config = Config::default();
+        assert!(source_enabled(&config, "wef"));
+        assert!(!source_enabled(&config, "carrier-pigeon"));
+    }
 }

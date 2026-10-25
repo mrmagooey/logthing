@@ -744,4 +744,22 @@ mod tests {
         assert!(matches!(xml_escape("plain"), Cow::Borrowed(_)));
         assert_eq!(xml_escape("a'\"b"), "a&apos;&quot;b");
     }
+
+    #[test]
+    fn test_parse_empty_bookmark_element_yields_empty_bookmark() {
+        let xml = format!(
+            "<s:Envelope {MINI_NS} xmlns:w=\"{NS_WSMAN}\"><s:Header>\
+             <a:MessageID>uuid:1</a:MessageID><w:Bookmark/></s:Header><s:Body/></s:Envelope>"
+        );
+        assert_eq!(parse(&xml).unwrap().bookmark.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_parse_ignores_comments_and_declaration() {
+        let xml = format!(
+            "<?xml version=\"1.0\"?><s:Envelope {MINI_NS}><!-- note --><s:Header>\
+             <a:MessageID>uuid:7</a:MessageID></s:Header><s:Body/></s:Envelope>"
+        );
+        assert_eq!(parse(&xml).unwrap().message_id.as_deref(), Some("uuid:7"));
+    }
 }

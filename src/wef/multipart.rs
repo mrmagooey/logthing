@@ -286,4 +286,69 @@ mod tests {
         expected.extend_from_slice(post.as_bytes());
         assert_eq!(build(EncProtocol::Kerberos, 42, b"HDR", b"DD"), expected);
     }
+
+    const KRB: &str = "application/HTTP-Kerberos-session-encrypted";
+
+    #[test]
+    fn test_parse_accepts_bare_lf_line_breaks() {
+        let mut body = format!(
+            "--Encrypted Boundary\nContent-Type: {KRB}\nOriginalContent: Length=9\n\
+             --Encrypted Boundary\nContent-Type: application/octet-stream\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(&1i32.to_le_bytes());
+        body.extend_from_slice(b"hdd--Encrypted Boundary--\r\n");
+        let got = parse(&body).unwrap();
+        assert_eq!(got.original_length, 9);
+        assert_eq!((got.header, got.data), (b"h".to_vec(), b"dd".to_vec()));
+    }
+
+    #[test]
+    fn test_parse_rejects_missing_line_break_after_boundary() {
+        let err = parse(b"--Encrypted Boundary garbage").unwrap_err();
+        assert_eq!(err.to_string(), "expected line break after boundary");
+    }
+
+    #[test]
+    fn test_parse_skips_unknown_and_colonless_part_headers() {
+        let mut body = format!(
+            "--Encrypted Boundary\r\nno colon here\r\nX-Other: ignored\r\nContent-Type: {KRB}\r\n\
+             OriginalContent: Length=5\r\n--Encrypted Boundary\r\n\
+             Content-Type: application/octet-stream\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(&0i32.to_le_bytes());
+        body.extend_from_slice(b"d--Encrypted Boundary--\r\n");
+        let got = parse(&body).unwrap();
+        assert_eq!(got.protocol, EncProtocol::Kerberos);
+        assert_eq!(got.original_length, 5);
+        assert_eq!(got.data, b"d");
+    }
+
+    #[test]
+    fn test_parse_rejects_second_part_not_octet_stream() {
+        let body = format!(
+            "--Encrypted Boundary\r\nContent-Type: {KRB}\r\nOriginalContent: Length=5\r\n\
+             --Encrypted Boundary\r\nContent-Type: text/plain\r\nabcd--Encrypted Boundary--\r\n"
+        );
+        let err = parse(body.as_bytes()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "second part is not application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_octet_stream_shorter_than_header_length_field() {
+        let body = format!(
+            "--Encrypted Boundary\r\nContent-Type: {KRB}\r\nOriginalContent: Length=5\r\n\
+             --Encrypted Boundary\r\nContent-Type: application/octet-stream\r\n\
+             abc--Encrypted Boundary--\r\n"
+        );
+        let err = parse(body.as_bytes()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "octet-stream part too short for header length"
+        );
+    }
 }

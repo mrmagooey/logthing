@@ -173,4 +173,11 @@ mod tests {
         let addr: SocketAddr = "192.0.2.1:80".parse().unwrap();
         assert!(whitelist.is_allowed(&addr));
     }
+
+    #[test]
+    fn test_parse_allowed_ips_rejects_invalid_entry_with_its_text() {
+        let err = parse_allowed_ips(&["10.0.0.0/8".to_string(), "bogus".to_string()])
+            .expect_err("invalid entry");
+        assert_eq!(err.to_string(), "Invalid IP or CIDR: bogus");
+    }
 }

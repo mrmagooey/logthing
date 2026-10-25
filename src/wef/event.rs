@@ -559,4 +559,39 @@ mod tests {
         let xml = include_str!("../../tests/fixtures/wef/events/synth_illegal_char.xml");
         assert!(matches!(sanitize_xml_chars(xml), Cow::Owned(_)));
     }
+
+    #[test]
+    fn test_parse_event_unparsable_numbers_default_to_zero() {
+        let xml = "<Event><System><EventID>abc</EventID><Task>x</Task></System></Event>";
+        let p = parse_event(xml).unwrap();
+        assert_eq!(p.event_id, 0);
+        assert_eq!(p.task, 0);
+    }
+
+    #[test]
+    fn test_parse_event_level_values_map_to_event_levels() {
+        for (n, want) in [
+            (1, EventLevel::Critical),
+            (2, EventLevel::Error),
+            (3, EventLevel::Warning),
+            (4, EventLevel::Information),
+            (5, EventLevel::Verbose),
+        ] {
+            let xml = format!("<Event><System><Level>{n}</Level></System></Event>");
+            assert_eq!(parse_event(&xml).unwrap().level, want, "Level {n}");
+        }
+    }
+
+    #[test]
+    fn test_parse_event_ignores_comments_and_declaration() {
+        let xml = "<?xml version=\"1.0\"?><!-- c --><Event><System><EventID>7</EventID>\
+                   <!-- inner --></System></Event>";
+        assert_eq!(parse_event(xml).unwrap().event_id, 7);
+    }
+
+    #[test]
+    fn test_parse_event_without_event_root_errors() {
+        let err = parse_event("<Other><System/></Other>").unwrap_err();
+        assert_eq!(err.to_string(), "no <Event> root element");
+    }
 }

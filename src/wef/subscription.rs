@@ -916,4 +916,63 @@ mod tests {
         let f = tempfile::NamedTempFile::new().unwrap();
         assert!(ca_thumbprints(f.path()).is_err());
     }
+
+    #[test]
+    fn test_validate_kerberos_with_tls_warns_it_is_not_applied() {
+        crate::test_support::install_and_clear();
+        let c = tls_cfg();
+        assert_eq!(rt(&c, true).topology, WefTopology::HttpsMutual);
+        let warned = crate::test_support::captured_events_at(tracing::Level::WARN)
+            .iter()
+            .any(|m| m.contains("Kerberos is not applied to /wsman when TLS is enabled"));
+        assert!(warned);
+    }
+
+    #[test]
+    fn test_validate_empty_channel_name_rejected() {
+        let mut c = base_cfg();
+        c.wef.subscriptions[0].channels = vec!["Security".into(), "  ".into()];
+        assert_eq!(
+            err(&c, true),
+            "wef.subscriptions 'security': empty channel name"
+        );
+    }
+
+    #[test]
+    fn test_validate_xml_fragment_accepts_inner_comment_and_surrounding_whitespace() {
+        validate_xml_fragment(
+            "\n <QueryList><!-- note --><Query/></QueryList>\n",
+            "QueryList",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_validate_xml_fragment_rejects_declaration_doctype_and_pi() {
+        let want = "XML must not contain an XML declaration, DOCTYPE or processing instruction";
+        for bad in [
+            "<?xml version=\"1.0\"?><QueryList/>",
+            "<!DOCTYPE QueryList><QueryList/>",
+            "<QueryList><?pi x?></QueryList>",
+        ] {
+            let e = validate_xml_fragment(bad, "QueryList").unwrap_err();
+            assert_eq!(e.to_string(), want, "{bad}");
+        }
+    }
+
+    #[test]
+    fn test_validate_xml_fragment_rejects_comment_or_cdata_outside_root() {
+        for bad in [
+            "<!-- c --><QueryList/>",
+            "<QueryList/><![CDATA[x]]>",
+            "<QueryList/><!-- c -->",
+        ] {
+            let e = validate_xml_fragment(bad, "QueryList").unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                "XML has a comment or CDATA outside <QueryList>",
+                "{bad}"
+            );
+        }
+    }
 }
