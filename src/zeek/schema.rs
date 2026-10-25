@@ -3200,4 +3200,14 @@ mod tests {
             .unwrap();
         assert_eq!(note.value(0), "N::X");
     }
+
+    #[test]
+    fn build_extra_of_non_object_value_is_empty_object() {
+        assert_eq!(build_extra(&serde_json::json!(5), &[], &[]), "{}");
+        assert_eq!(build_extra(&serde_json::json!(["a"]), &["a"], &["a"]), "{}");
+        let obj = serde_json::json!({ "keep": 1, "promoted": 2, "bad": 3 });
+        let extra: serde_json::Value =
+            serde_json::from_str(&build_extra(&obj, &["promoted", "bad"], &["bad"])).unwrap();
+        assert_eq!(extra, serde_json::json!({ "keep": 1, "bad": 3 }));
+    }
 }
