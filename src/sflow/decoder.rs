@@ -1974,4 +1974,419 @@ pub(crate) mod tests {
             .sum();
         assert_eq!(total, 2);
     }
+
+    // ── coverage: truncation, envelope and error-path behaviour ──
+
+    fn decode_one_flow_record(record: Vec<u8>) -> SflowRecord {
+        let d = datagram(&[flow_sample(1, 2, &[record])]);
+        decode_datagram(&d, exporter()).unwrap().remove(0)
+    }
+
+    fn base_flow_rec() -> SflowRecord {
+        let d = datagram(&[flow_sample(1, 2, &[])]);
+        decode_datagram(&d, exporter()).unwrap().remove(0)
+    }
+
+    fn sampled_ipv4_body() -> Vec<u8> {
+        let mut b = Vec::new();
+        // length, protocol (17 = UDP), then src ip, dst ip, src/dst port, tcp_flags, tos
+        for w in [60u32, 17] {
+            b.extend_from_slice(&be(w));
+        }
+        b.extend_from_slice(&[172, 16, 0, 1, 8, 8, 8, 8]);
+        for w in [49210u32, 53, 0, 0] {
+            b.extend_from_slice(&be(w));
+        }
+        b
+    }
+
+    /// A flow-sample body (no envelope) declaring `claimed` records.
+    fn flow_body(claimed: u32, records: &[Vec<u8>]) -> Vec<u8> {
+        let mut b = Vec::new();
+        // seq, source_id, rate, pool, drops, in_if, out_if, n_records
+        for w in [1, 1, 512, 512, 0, 1, 2, claimed] {
+            b.extend_from_slice(&be(w));
+        }
+        for r in records {
+            b.extend_from_slice(r);
+        }
+        b
+    }
+
+    fn counter_body(claimed: u32, records: &[Vec<u8>]) -> Vec<u8> {
+        let mut b = Vec::new();
+        // seq, source_id, n_records
+        for w in [1, 1, claimed] {
+            b.extend_from_slice(&be(w));
+        }
+        for r in records {
+            b.extend_from_slice(r);
+        }
+        b
+    }
+
+    fn ipv4_tcp() -> Vec<u8> {
+        let mut f = vec![
+            0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0, 10, 1, 1, 1, 10, 2, 2, 2,
+        ];
+        f.extend_from_slice(&TCP_PORTS);
+        f
+    }
+
+    fn raw_header_proto(proto: u32, frame: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for w in [proto, frame.len() as u32 + 4, 0, frame.len() as u32] {
+            body.extend_from_slice(&be(w));
+        }
+        // Callers pass 4-byte-aligned frames, so no XDR padding is needed.
+        assert_eq!(frame.len() % 4, 0);
+        body.extend_from_slice(frame);
+        envelope(1, &body)
+    }
+
+    fn counter_total(snapshotter: &metrics_util::debugging::Snapshotter, name: &str) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        let counters = snapshotter.snapshot().into_vec().into_iter();
+        counters
+            .filter(|(k, ..)| k.key().name() == name)
+            .filter_map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => Some(c),
+                _ => None,
+            })
+            .sum()
+    }
+
+    fn logged(needle: &str) -> bool {
+        crate::test_support::captured_events()
+            .iter()
+            .any(|m| m.contains(needle))
+    }
+
+    #[test]
+    fn test_read_helpers_report_truncation_with_offsets() {
+        let e = read_u64(&[0u8; 4], 0).unwrap_err().to_string();
+        assert!(e.contains("need u64, have 4 bytes"), "{e}");
+        let e = read_u64(&[0u8; 4], 9).unwrap_err().to_string();
+        assert!(e.contains("offset 9") && e.contains("have 0 bytes"), "{e}");
+        let e = read_bytes(&[1, 2, 3], 1, 8).unwrap_err().to_string();
+        assert!(e.contains("need 8 bytes, have 2"), "{e}");
+    }
+
+    #[test]
+    fn test_ipv6_agent_address_is_decoded_as_exporter() {
+        let mut d = Vec::new();
+        for w in [5, 2] {
+            d.extend_from_slice(&be(w));
+        }
+        let agent: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        d.extend_from_slice(&agent.octets());
+        // sub_agent_id, sequence, uptime_ms, num_samples
+        for w in [0, 1, 1000, 1] {
+            d.extend_from_slice(&be(w));
+        }
+        d.extend_from_slice(&counter_sample(&[generic_if_record(3)]));
+        let recs = decode_datagram(&d, exporter()).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].exporter, IpAddr::V6(agent));
+        assert_eq!(recs[0].if_index, Some(3));
+    }
+
+    #[test]
+    fn test_unknown_agent_addr_type_is_a_datagram_error() {
+        let mut d = Vec::new();
+        // version, agent_addr_type (3 = invalid), then zero padding
+        for w in [5, 3, 0, 0, 0, 0, 0] {
+            d.extend_from_slice(&be(w));
+        }
+        let e = decode_datagram(&d, exporter()).unwrap_err().to_string();
+        assert!(e.contains("unknown agent_addr_type 3"), "{e}");
+    }
+
+    #[test]
+    fn test_missing_sample_envelope_stops_and_keeps_earlier_samples() {
+        crate::test_support::install_and_clear();
+        let mut d = datagram(&[counter_sample(&[generic_if_record(4)])]);
+        const NUM_SAMPLES_OFFSET: usize = 24; // 28-byte v4-agent header, last word
+        d[NUM_SAMPLES_OFFSET..NUM_SAMPLES_OFFSET + 4].copy_from_slice(&be(2)); // claims a second sample that is absent
+        let recs = decode_datagram(&d, exporter()).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].if_index, Some(4));
+        assert!(logged("sample envelope truncated"));
+    }
+
+    #[test]
+    fn test_overclaiming_sample_body_stops_without_error() {
+        crate::test_support::install_and_clear();
+        let mut bad = be(1).to_vec();
+        bad.extend_from_slice(&be(1000));
+        bad.extend_from_slice(&[0u8; 8]);
+        let d = datagram(&[bad]);
+        let recs = decode_datagram(&d, exporter()).unwrap();
+        assert!(recs.is_empty());
+        assert!(logged("sample body claims 1000 bytes but only 8 remain"));
+    }
+
+    #[test]
+    fn test_enterprise_sample_is_skipped_and_next_sample_decoded() {
+        let vendor = envelope((9 << 12) | 1, &[0u8; 40]);
+        let d = datagram(&[vendor, counter_sample(&[generic_if_record(5)])]);
+        let recs = decode_datagram(&d, exporter()).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].sample_type, SampleType::Counter);
+        assert_eq!(recs[0].if_index, Some(5));
+    }
+
+    #[test]
+    fn test_undecodable_samples_are_counted_and_skipped() {
+        use metrics_util::debugging::DebuggingRecorder;
+        crate::test_support::install_and_clear();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let d = datagram(&[
+            envelope(1, &[0u8; 8]),
+            envelope(3, &[0u8; 20]),
+            envelope(2, &[0u8; 4]),
+            envelope(4, &[0u8; 8]),
+            envelope(9, &[0u8; 8]),
+            counter_sample(&[generic_if_record(6)]),
+        ]);
+        let recs = decode_datagram(&d, exporter()).expect("sample errors are not fatal");
+        assert_eq!(recs.len(), 1, "only the valid counter sample survives");
+        assert_eq!(recs[0].if_index, Some(6));
+        assert_eq!(counter_total(&snapshotter, "sflow_decode_errors"), 4);
+        assert!(logged("flow sample decode error"));
+        assert!(logged("counter sample decode error"));
+        assert!(logged("unknown sample format 9; skipping"));
+    }
+
+    #[test]
+    fn test_sample_decoders_report_minimum_body_sizes() {
+        let now = chrono::Utc::now();
+        let mut budget = DatagramUnknownBudget::new();
+        let e = decode_flow_sample(&[0u8; 8], 1, exporter(), now, &mut budget).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("flow_sample body too short (8 < 32)")
+        );
+        let e = decode_flow_sample(&[0u8; 20], 3, exporter(), now, &mut budget).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("expanded_flow_sample body too short (20 < 44)")
+        );
+        let e = decode_counter_sample(&[0u8; 4], 2, exporter(), now, &mut budget).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("counter_sample body too short (4 < 12)")
+        );
+        let e = decode_counter_sample(&[0u8; 8], 4, exporter(), now, &mut budget).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("expanded_counter_sample body too short (8 < 16)")
+        );
+    }
+
+    #[test]
+    fn test_expanded_counter_sample_decodes_generic_counters() {
+        let mut b = Vec::new();
+        for w in [1, 0, 1, 1] {
+            b.extend_from_slice(&be(w));
+        }
+        b.extend_from_slice(&generic_if_record(9));
+        let d = datagram(&[envelope(4, &b)]);
+        let recs = decode_datagram(&d, exporter()).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].sample_type, SampleType::Counter);
+        assert_eq!(recs[0].if_index, Some(9));
+        assert_eq!(recs[0].if_type, Some(6));
+    }
+
+    #[test]
+    fn test_flow_record_count_exceeding_body_keeps_decoded_records() {
+        crate::test_support::install_and_clear();
+        let rec = envelope(3, &sampled_ipv4_body());
+        let d = datagram(&[envelope(1, &flow_body(2, &[rec]))]);
+        let r = decode_datagram(&d, exporter()).unwrap().remove(0);
+        assert_eq!(r.src_addr, Some(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert_eq!((r.src_port, r.dst_port), (Some(49210), Some(53)));
+        assert!(logged("flow record envelope truncated"));
+    }
+
+    #[test]
+    fn test_overclaiming_flow_record_keeps_sample_metadata() {
+        crate::test_support::install_and_clear();
+        let mut bad = be(3).to_vec();
+        bad.extend_from_slice(&be(100));
+        bad.extend_from_slice(&[0u8; 4]);
+        let d = datagram(&[envelope(1, &flow_body(1, &[bad]))]);
+        let r = decode_datagram(&d, exporter()).unwrap().remove(0);
+        assert_eq!(r.sampling_rate, Some(512));
+        assert_eq!(r.src_addr, None);
+        assert!(logged(
+            "flow record body claims 100 bytes but only 4 remain"
+        ));
+    }
+
+    #[test]
+    fn test_raw_header_ipv4_and_ipv6_protocols_extract_5tuple() {
+        let r = decode_one_flow_record(raw_header_proto(11, &ipv4_tcp()));
+        assert_eq!(r.src_addr, Some(IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1))));
+        assert_eq!(r.dst_addr, Some(IpAddr::V4(Ipv4Addr::new(10, 2, 2, 2))));
+        assert_eq!(
+            (r.ip_protocol, r.src_port, r.dst_port),
+            (Some(6), Some(8080), Some(80))
+        );
+
+        let v6 = eth_ipv6(&TCP_PORTS, 6)[14..].to_vec();
+        let r = decode_one_flow_record(raw_header_proto(12, &v6));
+        assert_eq!(r.src_addr, Some("2001:db08::1".parse().unwrap()));
+        assert_eq!(
+            (r.ip_protocol, r.src_port, r.dst_port),
+            (Some(6), Some(8080), Some(80))
+        );
+    }
+
+    #[test]
+    fn test_raw_header_unsupported_protocol_is_ignored() {
+        crate::test_support::install_and_clear();
+        let r = decode_one_flow_record(raw_header_proto(99, &[0u8; 32]));
+        assert_eq!(r.src_addr, None);
+        assert_eq!(r.sampling_rate, Some(512));
+        assert!(logged("unsupported protocol 99"));
+    }
+
+    #[test]
+    fn test_raw_header_parse_errors_are_soft_and_logged() {
+        crate::test_support::install_and_clear();
+        let r = decode_one_flow_record(envelope(1, &[0u8; 8]));
+        assert_eq!((r.src_addr, r.sampling_rate), (None, Some(512)));
+        assert!(logged(
+            "raw_packet_header parse error: raw_packet_header body too short"
+        ));
+    }
+
+    #[test]
+    fn test_header_parsers_reject_short_or_malformed_headers() {
+        let mut rec = base_flow_rec();
+        let msg = |r: anyhow::Result<()>| r.unwrap_err().to_string();
+        assert!(msg(decode_raw_packet_header(&[0u8; 8], &mut rec)).contains("too short (8 < 16)"));
+        assert!(msg(parse_ethernet(&[0u8; 5], &mut rec)).contains("ethernet: too short (5 bytes)"));
+        let mut vlan = vec![0u8; 12];
+        vlan.extend_from_slice(&[0x81, 0x00]);
+        assert!(msg(parse_ethernet(&vlan, &mut rec)).contains("802.1Q too short"));
+        assert!(msg(parse_ipv4(&[0x45; 10], &mut rec)).contains("ipv4: too short (10 bytes)"));
+        let mut bad_ihl = ipv4_tcp();
+        bad_ihl[0] = 0x42;
+        assert!(msg(parse_ipv4(&bad_ihl, &mut rec)).contains("invalid IHL 8"));
+        bad_ihl[0] = 0x4F;
+        assert!(msg(parse_ipv4(&bad_ihl[..20], &mut rec)).contains("invalid IHL 60"));
+        assert!(msg(parse_ipv6(&[0x60; 30], &mut rec)).contains("ipv6: too short (30 bytes)"));
+        assert_eq!(
+            rec.src_addr, None,
+            "failed parses must not populate the record"
+        );
+    }
+
+    #[test]
+    fn test_ethernet_vlan_tag_is_skipped_and_non_ip_ignored() {
+        let mut frame = vec![0u8; 12];
+        frame.extend_from_slice(&[0x81, 0x00, 0x00, 0x64, 0x08, 0x00]);
+        frame.extend_from_slice(&ipv4_tcp());
+        let r = decode_one_flow(&frame);
+        assert_eq!(r.src_addr, Some(IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1))));
+        assert_eq!((r.src_port, r.dst_port), (Some(8080), Some(80)));
+
+        let mut arp = vec![0u8; 12];
+        arp.extend_from_slice(&[0x08, 0x06]);
+        arp.extend_from_slice(&[0u8; 28]);
+        let r = decode_one_flow(&arp);
+        assert_eq!((r.src_addr, r.dst_addr, r.ip_protocol), (None, None, None));
+    }
+
+    #[test]
+    fn test_sampled_ipv6_record_extracts_5tuple() {
+        let mut b = Vec::new();
+        for w in [80u32, 6] {
+            b.extend_from_slice(&be(w));
+        }
+        let src: std::net::Ipv6Addr = "2001:db8::a".parse().unwrap();
+        let dst: std::net::Ipv6Addr = "2001:db8::b".parse().unwrap();
+        b.extend_from_slice(&src.octets());
+        b.extend_from_slice(&dst.octets());
+        for w in [1234u32, 443, 0, 0] {
+            b.extend_from_slice(&be(w));
+        }
+        let r = decode_one_flow_record(envelope(4, &b));
+        assert_eq!(r.src_addr, Some(IpAddr::V6(src)));
+        assert_eq!(r.dst_addr, Some(IpAddr::V6(dst)));
+        assert_eq!(
+            (r.ip_protocol, r.src_port, r.dst_port),
+            (Some(6), Some(1234), Some(443))
+        );
+    }
+
+    #[test]
+    fn test_truncated_sampled_ipv6_is_soft_and_reports_sizes() {
+        crate::test_support::install_and_clear();
+        let r = decode_one_flow_record(envelope(4, &[0u8; 40]));
+        assert_eq!((r.src_addr, r.sampling_rate), (None, Some(512)));
+        assert!(logged(
+            "sampled_ipv6 parse error: sampled_ipv6: too short (40 < 52)"
+        ));
+    }
+
+    #[test]
+    fn test_counter_record_count_exceeding_body_keeps_decoded_records() {
+        crate::test_support::install_and_clear();
+        let d = datagram(&[envelope(2, &counter_body(2, &[generic_if_record(4)]))]);
+        let r = decode_datagram(&d, exporter()).unwrap().remove(0);
+        assert_eq!(r.if_index, Some(4));
+        assert!(logged("counter record envelope truncated"));
+    }
+
+    #[test]
+    fn test_overclaiming_counter_record_is_dropped() {
+        crate::test_support::install_and_clear();
+        let mut bad = be(1).to_vec();
+        bad.extend_from_slice(&be(500));
+        bad.extend_from_slice(&[0u8; 4]);
+        let d = datagram(&[envelope(2, &counter_body(1, &[bad]))]);
+        let r = decode_datagram(&d, exporter()).unwrap().remove(0);
+        assert_eq!(r.if_index, None);
+        assert!(logged(
+            "counter record body claims 500 bytes but only 4 remain"
+        ));
+    }
+
+    #[test]
+    fn test_short_generic_if_counters_logs_actual_length() {
+        crate::test_support::install_and_clear();
+        let d = datagram(&[counter_sample(&[envelope(1, &[0u8; 40])])]);
+        let r = decode_datagram(&d, exporter()).unwrap().remove(0);
+        assert_eq!(r.if_index, None);
+        assert!(logged("generic_if_counters too short (40 < 88), skipped"));
+    }
+
+    #[test]
+    fn test_enterprise_flow_record_is_kept_in_extra_with_enterprise_key() {
+        let rec = envelope((7 << 12) | 5, &[0xAB; 8]);
+        let r = decode_one_flow_record(rec);
+        let extra = r.extra.as_array().unwrap();
+        assert_eq!(extra.len(), 1, "{extra:?}");
+        assert_eq!(extra[0]["enterprise"], 7);
+        assert_eq!(extra[0]["format"], 5);
+        assert_eq!(extra[0]["data_hex"], "abababababababab");
+        assert!(extra[0].get("body_truncated").is_none());
+    }
+
+    #[test]
+    fn test_oversized_unknown_record_body_is_hex_capped_and_flagged() {
+        let rec = envelope(77, &[0xCD; MAX_UNKNOWN_RECORD_BODY_BYTES + 4]);
+        let r = decode_one_flow_record(rec);
+        let extra = r.extra.as_array().unwrap();
+        assert_eq!(extra[0]["body_truncated"], true);
+        assert_eq!(extra[0]["length"], MAX_UNKNOWN_RECORD_BODY_BYTES + 4);
+        let hex = extra[0]["data_hex"].as_str().unwrap();
+        assert_eq!(hex.len(), MAX_UNKNOWN_RECORD_BODY_BYTES * 2);
+    }
 }

@@ -1077,4 +1077,25 @@ mod tests {
         let req = request_with_records(1, Some(sibling_kvlist_resource(400_000)));
         assert_eq!(check_request_limits(&req), Err(OtlpLimitError::TooLarge));
     }
+
+    #[test]
+    fn test_check_request_limits_rejects_huge_resource_with_no_scope_logs() {
+        // No scope loop runs, so only the post-loop check can reject the resource's own cost.
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(sibling_kvlist_resource(400_000)),
+                scope_logs: Vec::new(),
+                schema_url: String::new(),
+            }],
+        };
+        assert_eq!(check_request_limits(&req), Err(OtlpLimitError::TooLarge));
+    }
+
+    #[test]
+    fn test_any_value_to_json_strindex_variant_maps_to_null() {
+        let av = AnyValue {
+            value: Some(AnyVal::StringValueStrindex(7)),
+        };
+        assert_eq!(any_value_to_json(av), Value::Null);
+    }
 }

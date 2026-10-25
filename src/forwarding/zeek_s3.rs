@@ -1403,4 +1403,27 @@ mod tests {
         let total: u64 = row.hours.iter().map(|h| h.count).sum();
         assert_eq!(total, 1);
     }
+
+    #[test]
+    fn test_new_batch_builds_an_accumulator_for_every_zeek_schema_and_none_otherwise() {
+        use crate::zeek::schema as zs;
+        let schemas = [
+            zs::conn_schema(),
+            zs::dns_schema(),
+            zs::http_schema(),
+            zs::ssl_schema(),
+            zs::files_schema(),
+            zs::notice_schema(),
+            zs::envelope_schema(),
+        ];
+        for schema in &schemas {
+            let acc = ZeekSink
+                .new_batch(schema)
+                .unwrap_or_else(|| panic!("no accumulator for {:?}", schema.fields().len()));
+            assert_eq!(acc.len(), 0, "a fresh accumulator is empty");
+        }
+        // A schema Arc that is not one of the registered singletons has no accumulator.
+        let foreign = Arc::new(arrow_schema::Schema::empty());
+        assert!(ZeekSink.new_batch(&foreign).is_none());
+    }
 }

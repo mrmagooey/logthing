@@ -497,4 +497,41 @@ mod tests {
         )
         .unwrap();
     }
+
+    #[test]
+    fn test_wef_envelope_undecodable_body_returns_zero() {
+        // Invalid UTF-8, and a UTF-16LE BOM followed by an odd number of bytes.
+        assert_eq!(wef_envelope(&[0xC3, 0x28]), 0);
+        assert_eq!(wef_envelope(&[0xFF, 0xFE, b'<']), 0);
+    }
+
+    #[test]
+    fn test_hec_empty_input_and_unparsable_bodies_return_zero() {
+        assert_eq!(hec(&[]), 0);
+        // Route 1 (raw body) accepts any bytes, so only the JSON routes can fail.
+        for route in [0u8, 2] {
+            let mut input = vec![route];
+            input.extend_from_slice(b"{ not json \xff");
+            assert_eq!(hec(&input), 0, "route {route}");
+        }
+    }
+
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_otlp_empty_undecodable_and_over_limit_inputs_return_zero() {
+        assert_eq!(otlp(&[]), 0);
+        // Even byte selects protobuf: a truncated length-delimited field fails to decode.
+        assert_eq!(otlp(&[0, 0x0a, 0x05, 0x01]), 0);
+        // Odd byte selects JSON.
+        assert_eq!(otlp(b"\x01not json"), 0);
+        // Over the per-request record limit: mapping is refused.
+        let n = crate::server::otlp::MAX_OTLP_RECORDS_PER_REQUEST + 1;
+        let mut json = String::from("\x01{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":[");
+        json.push_str(&vec!["{}"; n].join(","));
+        json.push_str("]}]}]}");
+        assert_eq!(otlp(json.as_bytes()), 0);
+        // The same shape within the limit maps every record.
+        let ok = "\x01{\"resourceLogs\":[{\"scopeLogs\":[{\"logRecords\":[{},{}]}]}]}";
+        assert_eq!(otlp(ok.as_bytes()), 2);
+    }
 }

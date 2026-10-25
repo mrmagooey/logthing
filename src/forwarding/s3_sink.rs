@@ -376,4 +376,115 @@ mod tests {
         let err = plain.upload("some/key", b"x".to_vec()).await.unwrap_err();
         assert!(!err.to_string().contains("Object Lock"), "{err}");
     }
+
+    /// Minimal in-process S3 answering `ListObjectsV2` (bucket GET) and object GET, so the
+    /// read-side helpers can run against a real SDK client with no Docker. Returns the
+    /// endpoint URL and the query strings the server saw.
+    async fn fake_s3() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::http::{StatusCode, Uri, header};
+        use axum::response::IntoResponse;
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_h = seen.clone();
+        let app = axum::Router::new().fallback(move |method: axum::http::Method, uri: Uri| {
+            let seen = seen_h.clone();
+            async move {
+                seen.lock()
+                    .unwrap()
+                    .push(format!("{method} {}", uri.query().unwrap_or("")));
+                if method == axum::http::Method::PUT {
+                    return ([(header::ETAG, "\"abc\"")], "").into_response();
+                }
+                let path = uri.path().trim_start_matches('/').to_string();
+                match path.split_once('/') {
+                    Some((_bucket, "missing.bin")) => (StatusCode::NOT_FOUND, "").into_response(),
+                    Some((_bucket, key)) if !key.is_empty() => (
+                        [(header::CONTENT_TYPE, "application/octet-stream")],
+                        "payload-bytes",
+                    )
+                        .into_response(),
+                    _ => (
+                        [(header::CONTENT_TYPE, "application/xml")],
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                         <Name>b</Name><Prefix>zeek/</Prefix><KeyCount>2</KeyCount>\
+                         <MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>\
+                         <Contents><Key>zeek/a.parquet</Key></Contents>\
+                         <Contents><Key>zeek/b.parquet</Key></Contents>\
+                         </ListBucketResult>",
+                    )
+                        .into_response(),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    async fn sink_for(endpoint: String) -> S3Sink {
+        let mut c = conn(None, None);
+        c.endpoint = endpoint;
+        c.bucket = "b".to_string();
+        S3Sink::from_connection(&c).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_returns_the_keys_under_the_prefix() {
+        let (endpoint, seen) = fake_s3().await;
+        let sink = sink_for(endpoint).await;
+        let keys = sink.list_objects("zeek/").await.unwrap();
+        assert_eq!(keys, vec!["zeek/a.parquet", "zeek/b.parquet"]);
+        let queries = seen.lock().unwrap().join("&");
+        assert!(queries.contains("list-type=2"), "{queries}");
+        assert!(queries.contains("prefix=zeek%2F"), "{queries}");
+    }
+
+    #[tokio::test]
+    async fn test_get_object_returns_the_body_bytes() {
+        let (endpoint, _seen) = fake_s3().await;
+        let sink = sink_for(endpoint).await;
+        assert_eq!(
+            sink.get_object("zeek/a.parquet").await.unwrap(),
+            b"payload-bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_object_propagates_a_service_error() {
+        let (endpoint, _seen) = fake_s3().await;
+        let sink = sink_for(endpoint).await;
+        assert!(sink.get_object("missing.bin").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_against_an_unreachable_endpoint_is_an_error() {
+        let sink = sink_for("http://127.0.0.1:1".to_string()).await;
+        assert!(sink.list_objects("p/").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_from_connection_with_empty_credentials_still_constructs() {
+        // Empty keys mean "use the SDK default credential chain" rather than static creds.
+        let mut c = conn(None, None);
+        c.access_key = String::new();
+        c.secret_key = String::new();
+        let sink = S3Sink::from_connection(&c).await.unwrap();
+        assert_eq!(sink.bucket, "test-bucket");
+        assert_eq!(sink.endpoint, "http://127.0.0.1:1");
+    }
+
+    #[tokio::test]
+    async fn test_upload_succeeds_against_a_fake_s3_put() {
+        let (endpoint, seen) = fake_s3().await;
+        let sink = sink_for(endpoint).await;
+        sink.upload("zeek/conn/x.parquet", b"data".to_vec())
+            .await
+            .expect("PUT answered 200");
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|q| q.starts_with("PUT ")), "{seen:?}");
+    }
 }

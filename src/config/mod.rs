@@ -4162,4 +4162,86 @@ directory = "/tmp/otlp"
             assert!(toml::from_str::<Config>(&toml).is_err(), "{bad}");
         }
     }
+
+    #[test]
+    fn test_de_u32_or_string_null_is_none() {
+        assert_eq!(de_u32_or_string(serde_json::Value::Null).unwrap(), None);
+        assert_eq!(de_u32_or_string(serde_json::json!(7)).unwrap(), Some(7));
+        assert_eq!(de_u32_or_string(serde_json::json!(" 9 ")).unwrap(), Some(9));
+    }
+
+    #[test]
+    fn test_s3_connections_lists_all_eleven_sections_in_order() {
+        let conn = "endpoint=\"http://x\"\nbucket=\"b\"\nregion=\"r\"\n\
+                    access_key=\"a\"\nsecret_key=\"s\"\n";
+        let mut doc = String::new();
+        for section in [
+            "syslog.s3",
+            "syslog.structured_s3",
+            "ipfix.s3",
+            "zeek.s3",
+            "suricata.s3",
+            "wef.s3",
+            "hec.s3",
+            "otlp.s3",
+            "sflow.s3",
+            "aggregate.s3",
+            "iceberg.s3",
+        ] {
+            doc.push_str(&format!("[{section}]\n{conn}"));
+        }
+        let cfg: Config = toml::from_str(&doc).unwrap();
+        let names: Vec<&str> = cfg.s3_connections().iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            vec![
+                "syslog.s3",
+                "syslog.structured_s3",
+                "ipfix.s3",
+                "zeek.s3",
+                "suricata.s3",
+                "wef.s3",
+                "hec.s3",
+                "otlp.s3",
+                "sflow.s3",
+                "aggregate.s3",
+                "iceberg.s3",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_validate_config_invariants_rejects_zero_connection_limits() {
+        let mut cfg = valid_base();
+        cfg.security.max_connections = 0;
+        cfg.security.connection_timeout_secs = 0;
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert!(
+            err.contains("security.max_connections must be greater than 0"),
+            "{err}"
+        );
+        assert!(
+            err.contains("security.connection_timeout_secs must be greater than 0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_config_invariants_rejects_bad_allowed_ips() {
+        let mut cfg = valid_base();
+        cfg.security.allowed_ips = vec!["10.0.0.0/8".to_string(), "not-an-ip".to_string()];
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert_eq!(err, "security.allowed_ips: Invalid IP or CIDR: not-an-ip");
+    }
+
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn test_validate_config_invariants_rejects_bad_otlp_redaction_regex() {
+        let mut cfg = valid_base();
+        cfg.otlp.enabled = true;
+        cfg.otlp.local = otlp_sink_dir();
+        cfg.otlp.redaction.mask_patterns = vec!["(".to_string()];
+        let err = validate_config_invariants(&cfg).expect_err("must reject");
+        assert!(err.contains("otlp.redaction"), "got: {err}");
+    }
 }

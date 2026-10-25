@@ -1193,4 +1193,79 @@ mod tests {
         let debug_str = format!("{:?}", f);
         assert_eq!(debug_str, "System");
     }
+
+    #[test]
+    fn test_severity_from_u8_and_as_str_cover_every_level() {
+        let expected = [
+            "EMERGENCY",
+            "ALERT",
+            "CRITICAL",
+            "ERROR",
+            "WARNING",
+            "NOTICE",
+            "INFO",
+            "DEBUG",
+        ];
+        for (n, name) in expected.iter().enumerate() {
+            let sev = Severity::from_u8(n as u8).expect("0..=7 are valid severities");
+            assert_eq!(sev.as_str(), *name);
+            assert_eq!(sev as usize, n);
+        }
+        assert!(Severity::from_u8(8).is_none());
+        assert!(Severity::from_u8(255).is_none());
+    }
+
+    #[test]
+    fn test_facility_from_u8_and_as_str_cover_every_facility() {
+        let expected = [
+            "kernel", "user", "mail", "system", "security", "syslog", "lp", "news", "uucp",
+            "clock", "authpriv", "ftp", "ntp", "audit", "alert", "clock2", "local0", "local1",
+            "local2", "local3", "local4", "local5", "local6", "local7",
+        ];
+        for (n, name) in expected.iter().enumerate() {
+            let fac = Facility::from_u8(n as u8).expect("0..=23 are valid facilities");
+            assert_eq!(fac.as_str(), *name);
+            assert_eq!(fac as usize, n);
+        }
+        assert!(Facility::from_u8(24).is_none());
+        assert!(Facility::from_u8(255).is_none());
+    }
+
+    #[test]
+    fn test_rfc3164_timestamp_parses_nov_dec_and_rejects_unknown_month() {
+        use chrono::{Datelike, Timelike};
+        let nov = SyslogMessage::parse_rfc3164_timestamp("Nov 5 01:02:03").unwrap();
+        assert_eq!((nov.month(), nov.day()), (11, 5));
+        assert_eq!((nov.hour(), nov.minute(), nov.second()), (1, 2, 3));
+        let dec = SyslogMessage::parse_rfc3164_timestamp("DEC 31 23:59:58").unwrap();
+        assert_eq!((dec.month(), dec.day()), (12, 31));
+        // Matches the shape regex but is not a month name.
+        assert!(SyslogMessage::parse_rfc3164_timestamp("Foo 11 22:14:15").is_none());
+    }
+
+    #[test]
+    fn test_rfc5424_sd_param_name_containing_space_leaves_message_unparsed() {
+        let m = SyslogMessage::parse(r#"<1>1 - h a - - [a@1 bad name="1"] text"#).unwrap();
+        assert!(m.structured_data.is_none());
+        assert_eq!(m.message, r#"[a@1 bad name="1"] text"#);
+    }
+
+    #[test]
+    fn test_dns_from_syslog_detects_unbound_and_powerdns() {
+        let mut m = SyslogMessage::parse("<30>Oct 11 22:14:15 dns unbound: x").unwrap();
+        m.message = "info: 192.168.1.100 example.com. A IN".to_string();
+        let unbound = dns::DnsLogEntry::from_syslog(&m).expect("unbound line must parse");
+        assert_eq!(unbound.client_ip, "192.168.1.100");
+        assert_eq!(unbound.query_name, "example.com");
+        assert_eq!(unbound.query_type, "A");
+
+        m.message = "Remote 10.1.2.3 wants 'host.example|AAAA', do = 0, bufsize = 512".to_string();
+        let pdns = dns::DnsLogEntry::from_syslog(&m).expect("powerdns line must parse");
+        assert_eq!(pdns.client_ip, "10.1.2.3");
+        assert_eq!(pdns.query_name, "host.example");
+        assert_eq!(pdns.query_type, "AAAA");
+
+        m.message = "nothing dns related".to_string();
+        assert!(dns::DnsLogEntry::from_syslog(&m).is_none());
+    }
 }

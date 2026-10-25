@@ -1929,4 +1929,336 @@ mod tests {
         assert_eq!(records.len(), 1, "got {records:?}");
         assert_eq!(records[0].event_type, "alert");
     }
+
+    // --- coverage: line framing, read errors, and the start()/start_with_shutdown() paths ---
+
+    /// Sum of every counter named `name` (across label sets) in the recorder's snapshot.
+    fn cov_counter(snapshotter: &metrics_util::debugging::Snapshotter, name: &str) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, _, _, _)| k.key().name() == name)
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Polls `cond` until it holds or 15 s pass.
+    async fn cov_wait_until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !cond() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Connects to `addr`, retrying while the listener under test is still binding.
+    async fn cov_connect<T>(
+        addr: SocketAddr,
+        task: &tokio::task::JoinHandle<T>,
+    ) -> tokio::net::TcpStream {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(s) => return s,
+                Err(e) => {
+                    assert!(
+                        !task.is_finished(),
+                        "listener task exited before accepting (lost the free-port race \
+                         or bind failed?); connect error: {e}"
+                    );
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "could not connect to {addr}: {e}"
+                    );
+                    sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    }
+
+    /// An ephemeral loopback port that `start*()` can re-bind (they take a port, not a socket).
+    async fn cov_free_port() -> u16 {
+        let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        tmp.local_addr().unwrap().port()
+    }
+
+    fn cov_config(tcp_port: u16) -> SuricataListenerConfig {
+        SuricataListenerConfig {
+            tcp_port,
+            bind_address: "127.0.0.1".to_string(),
+        }
+    }
+
+    /// CRLF line endings are stripped, blank lines are skipped silently, and a non-UTF-8 line
+    /// is counted as a parse error and skipped without ending the connection.
+    #[tokio::test]
+    async fn test_suricata_crlf_blank_and_non_utf8_lines_are_handled() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::DebuggingRecorder;
+
+        crate::test_support::install_and_clear();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, src) = tcp_listener.accept().await.unwrap();
+
+        client
+            .write_all(b"{\"event_type\":\"alert\",\"uid\":\"C1\"}\r\n")
+            .await
+            .unwrap();
+        client.write_all(b"\r\n\n").await.unwrap();
+        client.write_all(b"\xff\xfe\n").await.unwrap();
+        client
+            .write_all(b"{\"event_type\":\"dns\",\"uid\":\"C2\"}\n")
+            .await
+            .unwrap();
+        drop(client);
+
+        let handler = CapturingHandler::new();
+        SuricataListener::handle_tcp_connection(
+            stream,
+            src,
+            handler.clone(),
+            Duration::from_secs(5),
+            full_byte_budget(),
+            Vec::new(),
+            None,
+            never_shutdown(),
+        )
+        .await
+        .unwrap();
+
+        let records = handler.take_records();
+        let uids: Vec<_> = records.iter().map(|r| r.fields["uid"].clone()).collect();
+        assert_eq!(uids, vec![serde_json::json!("C1"), serde_json::json!("C2")]);
+        assert_eq!(
+            cov_counter(&snapshotter, "suricata_parse_errors"),
+            1,
+            "only the non-UTF-8 line is an error: CRLF must be trimmed and blank lines skipped"
+        );
+        let events = crate::test_support::captured_events();
+        assert!(
+            events.iter().any(|m| m.contains("non-UTF-8 line")),
+            "expected a non-UTF-8 warning, got: {events:?}"
+        );
+    }
+
+    /// A connection reset mid-read is logged as a read error and ends the connection cleanly.
+    #[tokio::test]
+    async fn test_suricata_connection_reset_is_logged_and_ends_connection() {
+        crate::test_support::install_and_clear();
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, src) = tcp_listener.accept().await.unwrap();
+        // SO_LINGER 0 turns the close into an RST, so the server's read fails with ECONNRESET.
+        socket2::SockRef::from(&client)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(client);
+
+        let handler = CapturingHandler::new();
+        SuricataListener::handle_tcp_connection(
+            stream,
+            src,
+            handler.clone(),
+            Duration::from_secs(5),
+            full_byte_budget(),
+            Vec::new(),
+            None,
+            never_shutdown(),
+        )
+        .await
+        .unwrap();
+
+        assert!(handler.take_records().is_empty());
+        let events = crate::test_support::captured_events();
+        assert!(
+            events.iter().any(|m| m.contains("TCP read error from")),
+            "expected a read-error log, got: {events:?}"
+        );
+    }
+
+    /// The partial-line-at-shutdown warning reports how many bytes were dropped.
+    #[tokio::test]
+    async fn test_suricata_shutdown_partial_line_warning_reports_byte_count() {
+        crate::test_support::install_and_clear();
+
+        let (mut client, task, tx, _handler) = shutdown_conn_setup().await;
+        let partial: &[u8] = b"{\"event_type\":\"al";
+        client.write_all(partial).await.unwrap();
+        client.flush().await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .expect("connection task must end after shutdown")
+            .unwrap();
+
+        let events = crate::test_support::captured_events();
+        let want = format!("dropped partial line ({} bytes)", partial.len());
+        assert!(
+            events.iter().any(|m| m.contains(&want)),
+            "expected {want:?} in logs, got: {events:?}"
+        );
+        drop(client);
+    }
+
+    /// `start()` binds the configured address and serves the accept loop.
+    #[tokio::test]
+    async fn test_suricata_start_binds_configured_port_and_dispatches() {
+        let port = cov_free_port().await;
+        let handler = CapturingHandler::new();
+        let listener = SuricataListener::new(cov_config(port), handler.clone());
+        let task = tokio::spawn(async move {
+            let _ = listener.start().await;
+        });
+
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut client = cov_connect(addr, &task).await;
+        client
+            .write_all(b"{\"event_type\":\"alert\",\"uid\":\"C1\"}\r\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        let h = handler.clone();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        cov_wait_until("record via start()", move || {
+            seen2.lock().unwrap().extend(h.take_records());
+            !seen2.lock().unwrap().is_empty()
+        })
+        .await;
+        assert_eq!(
+            seen.lock().unwrap()[0].fields["uid"],
+            serde_json::json!("C1")
+        );
+        task.abort();
+    }
+
+    /// `start()` surfaces an unparsable bind address as an error.
+    #[tokio::test]
+    async fn test_suricata_start_rejects_invalid_bind_address() {
+        let config = SuricataListenerConfig {
+            tcp_port: 1,
+            bind_address: "not-an-ip".to_string(),
+        };
+        let listener = SuricataListener::new(config, CapturingHandler::new());
+        assert!(listener.start().await.is_err());
+    }
+
+    /// `start_with_shutdown` drops sources outside `allowed_ips` (and counts them), keeps
+    /// serving after a `false` watch value, and still exits on `true`.
+    #[tokio::test]
+    async fn test_suricata_start_with_shutdown_rejects_disallowed_source_and_ignores_false() {
+        use metrics::set_default_local_recorder;
+        use metrics_util::debugging::DebuggingRecorder;
+
+        crate::test_support::install_and_clear();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = set_default_local_recorder(&recorder);
+
+        let port = cov_free_port().await;
+        let handler = CapturingHandler::new();
+        let listener = SuricataListener::new(cov_config(port), handler.clone())
+            .with_allowed_ips(IpWhitelist::new(vec!["10.99.99.0/24".into()]).unwrap());
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { listener.start_with_shutdown(rx).await });
+
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut client = cov_connect(addr, &task).await;
+        let _ = client
+            .write_all(b"{\"event_type\":\"alert\",\"uid\":\"C1\"}\r\n")
+            .await;
+        let snap = &snapshotter;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while cov_counter(snap, "listener_source_rejected") < 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no rejection counted"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            handler.take_records().is_empty(),
+            "rejected source must not dispatch"
+        );
+        let events = crate::test_support::captured_events();
+        assert!(
+            events.iter().any(|m| m.contains("not in allowed_ips")),
+            "expected a rejection warning, got: {events:?}"
+        );
+
+        // A `false` value is not a shutdown request: the accept loop must keep running.
+        tx.send(false).unwrap();
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            !task.is_finished(),
+            "a false watch value must not stop the listener"
+        );
+
+        tx.send(true).unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .expect("listener must stop on shutdown")
+            .unwrap();
+        assert!(res.is_ok());
+        drop(client);
+    }
+
+    /// `start_with_shutdown` dispatches records from an allowed source, and a `false` watch
+    /// value does not stop the loop from accepting later connections.
+    #[tokio::test]
+    async fn test_suricata_start_with_shutdown_serves_after_false_signal() {
+        let port = cov_free_port().await;
+        let handler = CapturingHandler::new();
+        let listener = SuricataListener::new(cov_config(port), handler.clone());
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { listener.start_with_shutdown(rx).await });
+
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let first = cov_connect(addr, &task).await;
+        tx.send(false).unwrap();
+        let mut second = cov_connect(addr, &task).await;
+        second
+            .write_all(b"{\"event_type\":\"dns\",\"uid\":\"C2\"}\n")
+            .await
+            .unwrap();
+        second.flush().await.unwrap();
+
+        let h = handler.clone();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        cov_wait_until("record after false signal", move || {
+            seen2.lock().unwrap().extend(h.take_records());
+            !seen2.lock().unwrap().is_empty()
+        })
+        .await;
+        assert_eq!(
+            seen.lock().unwrap()[0].fields["uid"],
+            serde_json::json!("C2")
+        );
+
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .expect("listener must stop on shutdown")
+            .unwrap()
+            .unwrap();
+        drop((first, second));
+    }
 }

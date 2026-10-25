@@ -651,4 +651,36 @@ other_metric 999
         // must not spawn, must not require a tokio runtime.
         maybe_start(None);
     }
+
+    #[test]
+    fn parse_counter_skips_lines_without_a_value_separator() {
+        let text = "orphan_line\nrecords_total 3\n";
+        assert_eq!(parse_counter(text, "records_total"), Some(3));
+        assert_eq!(parse_counter(text, "orphan_line"), None);
+    }
+
+    #[cfg(not(feature = "pprof"))]
+    #[test]
+    fn maybe_start_warns_when_requested_without_pprof_feature() {
+        crate::test_support::install_and_clear();
+        // Process env is shared: this is the only test that sets this variable, and it is
+        // removed again before the assertions.
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("LOGTHING_PROFILE_SECS") };
+            }
+        }
+        unsafe { std::env::set_var("LOGTHING_PROFILE_SECS", "7") };
+        let guard = EnvGuard;
+        maybe_start(Some(Box::new(|| Some(1))));
+        drop(guard);
+        let warnings = crate::test_support::captured_events_at(tracing::Level::WARN);
+        assert!(
+            warnings
+                .iter()
+                .any(|m| m.contains("built without the `pprof` feature")),
+            "{warnings:?}"
+        );
+    }
 }

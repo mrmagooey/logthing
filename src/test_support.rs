@@ -114,3 +114,26 @@ pub(crate) fn captured_events_at(level: tracing::Level) -> Vec<String> {
             .collect()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_span_record_and_follows_from_do_not_capture_events() {
+        install_and_clear();
+        let a = tracing::info_span!("a", field = tracing::field::Empty);
+        let b = tracing::info_span!("b");
+        let entered = a.enter();
+        a.record("field", 1);
+        a.follows_from(&b);
+        tracing::warn!("only event");
+        drop(entered);
+        assert_eq!(captured_events(), vec!["only event".to_string()]);
+        assert_eq!(
+            captured_events_at(tracing::Level::WARN),
+            vec!["only event".to_string()]
+        );
+        assert!(captured_events_at(tracing::Level::ERROR).is_empty());
+    }
+}

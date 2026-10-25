@@ -456,4 +456,37 @@ pub(crate) mod tests {
     fn test_decode_or_raw_empty_input() {
         assert!(decode_or_raw(&[], MAX).is_empty());
     }
+
+    #[test]
+    fn test_decompress_flush_in_scheme1_aligns_and_continues() {
+        let mut w = BitWriter::default();
+        ctl(&mut w, CTL_RESET1);
+        w.push(u32::from(b'A'), 9);
+        ctl(&mut w, CTL_FLUSH);
+        w.pad32();
+        w.push(u32::from(b'B'), 9);
+        ctl(&mut w, CTL_EOR);
+        w.pad32();
+        assert_eq!(decompress(&w.finish(), MAX).unwrap(), b"AB");
+    }
+
+    #[test]
+    fn test_decompress_scheme_switch_controls_change_scheme() {
+        let mut w = BitWriter::default();
+        ctl(&mut w, CTL_RESET1);
+        w.push(u32::from(b'A'), 9);
+        ctl(&mut w, CTL_SCHEME2);
+        w.push(u32::from(b'B'), 8); // raw byte in scheme 2
+        w.push(0xFF, 8); // FF + 1 + code: scheme-2 control symbol
+        w.push(1, 1);
+        w.push(u32::from(CTL_FLUSH), 4);
+        w.pad32();
+        w.push(0xFF, 8);
+        w.push(1, 1);
+        w.push(u32::from(CTL_SCHEME1), 4);
+        w.push(u32::from(b'C'), 9); // literal in scheme 1 again
+        ctl(&mut w, CTL_EOR);
+        w.pad32();
+        assert_eq!(decompress(&w.finish(), MAX).unwrap(), b"ABC");
+    }
 }

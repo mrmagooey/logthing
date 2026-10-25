@@ -3701,9 +3701,15 @@ mod tests {
         (out, total)
     }
 
-    fn cap_message_v9(records: usize) -> Vec<u8> {
+    /// A 20-byte NetFlow v9 header (2 flowsets, source id 5).
+    fn v9_header() -> Vec<u8> {
         let mut v = vec![0x00, 0x09, 0x00, 0x02, 0, 0, 0, 0, 0x67, 0x5C, 0xB0, 0x20];
         v.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 5]);
+        v
+    }
+
+    fn cap_message_v9(records: usize) -> Vec<u8> {
+        let mut v = v9_header();
         v.extend_from_slice(&set_bytes(0, &tmpl_record(256, &[(4, 1)])));
         v.extend_from_slice(&set_bytes(256, &vec![6u8; records]));
         v
@@ -4047,6 +4053,297 @@ mod tests {
             records.len(),
             0,
             "v9 (allow_varlen=false) must not decode 0xFFFF as variable-length"
+        );
+    }
+
+    // ---- coverage: remaining IEs, edge cases and error paths ----
+
+    /// Every curated IE that no other test decodes: packetDeltaCount lands in its column,
+    /// the rest land in `extra` under their IANA names with their declared value types.
+    #[test]
+    fn test_curated_ies_decode_into_columns_and_named_extra_fields() {
+        let v6 = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+        // One table drives both the template and the data bytes: (ie, len, name, value).
+        let table: Vec<(u16, u16, &str, Vec<u8>)> = vec![
+            (2, 8, "packetDeltaCount", 258u64.to_be_bytes().to_vec()),
+            (21, 4, "flowEndSysUpTime", 42u32.to_be_bytes().to_vec()),
+            (
+                28,
+                16,
+                "destinationIPv6Address",
+                v6("::1").octets().to_vec(),
+            ),
+            (32, 2, "icmpTypeCodeIPv4", 0x0800u16.to_be_bytes().to_vec()),
+            (
+                56,
+                8,
+                "sourceMacAddress",
+                0x0000_AABB_CCDD_EEFFu64.to_be_bytes().to_vec(),
+            ),
+            (61, 1, "flowDirection", vec![1]),
+            (
+                62,
+                16,
+                "ipNextHopIPv6Address",
+                v6("fe80::1").octets().to_vec(),
+            ),
+            (
+                64,
+                16,
+                "bgpNextHopIPv6Address",
+                v6("2001:db8::2").octets().to_vec(),
+            ),
+            (70, 1, "mplsTopLabelType", vec![3]),
+            (89, 1, "forwardingStatus", vec![64]),
+            (
+                96,
+                8,
+                "mpls_vpn_rd",
+                0x1122_3344_5566_7788u64.to_be_bytes().to_vec(),
+            ),
+            (
+                131,
+                16,
+                "exporterIPv6Address",
+                v6("2001:db8::131").octets().to_vec(),
+            ),
+            (136, 1, "flowEndReason", vec![2]),
+            (176, 1, "icmpTypeIPv4", vec![8]),
+            (177, 1, "icmpCodeIPv4", vec![0]),
+        ];
+        for (ie, len, name, bytes) in &table {
+            assert_eq!(bytes.len(), *len as usize, "{name}");
+            assert_eq!(ie_info(*ie).map(|(n, _)| n), Some(*name));
+        }
+        let fields: Vec<(u16, u16)> = table.iter().map(|(ie, len, ..)| (*ie, *len)).collect();
+        let data: Vec<u8> = table.iter().flat_map(|(.., b)| b.clone()).collect();
+
+        let mut dec = IpfixDecoder::new();
+        let buf = ipfix_msg(
+            0,
+            &[
+                set_bytes(2, &tmpl_record(256, &fields)),
+                set_bytes(256, &data),
+            ],
+        );
+        let records = decode_ipfix(&mut dec, &buf, test_exporter()).expect("decode");
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert_eq!(r.packet_delta_count, Some(258));
+        let want = serde_json::json!({
+            "flowEndSysUpTime": 42,
+            "destinationIPv6Address": "::1",
+            "icmpTypeCodeIPv4": 2048,
+            "sourceMacAddress": 0x0000_AABB_CCDD_EEFFu64,
+            "flowDirection": 1,
+            "ipNextHopIPv6Address": "fe80::1",
+            "bgpNextHopIPv6Address": "2001:db8::2",
+            "mplsTopLabelType": 3,
+            "forwardingStatus": 64,
+            "mpls_vpn_rd": 0x1122_3344_5566_7788u64,
+            "exporterIPv6Address": "2001:db8::131",
+            "flowEndReason": 2,
+            "icmpTypeIPv4": 8,
+            "icmpCodeIPv4": 0,
+        });
+        assert_eq!(r.extra, want);
+    }
+
+    /// A millisecond timestamp too large for `DateTime<Utc>` is dropped, not stored wrong.
+    #[test]
+    fn test_out_of_range_millisecond_timestamp_leaves_flow_start_unset() {
+        let mut dec = IpfixDecoder::new();
+        let buf = ipfix_msg(
+            0,
+            &[
+                set_bytes(2, &tmpl_record(256, &[(152, 8), (153, 8)])),
+                set_bytes(
+                    256,
+                    &[u64::MAX.to_be_bytes(), 1_700_000_000_000u64.to_be_bytes()].concat(),
+                ),
+            ],
+        );
+        let records = decode_ipfix(&mut dec, &buf, test_exporter()).expect("decode");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].flow_start, None, "u64::MAX ms is out of range");
+        assert_eq!(
+            records[0].flow_end.map(|t| t.timestamp()),
+            Some(1_700_000_000),
+            "an in-range timestamp in the same record still decodes"
+        );
+        assert_eq!(records[0].extra, serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_decode_error_after_records_logs_how_many_were_kept() {
+        crate::test_support::install_and_clear();
+        let mut dec = IpfixDecoder::new();
+        let mut buf = ipfix_msg(
+            0,
+            &[
+                set_bytes(2, &tmpl_record(256, &[(8, 4)])),
+                set_bytes(256, &[10, 0, 0, 1]),
+            ],
+        );
+        // A trailing set whose length (2) is below the 4-byte set header.
+        buf.extend_from_slice(&[0x01, 0x00, 0x00, 0x02]);
+        let total = buf.len() as u16;
+        buf[2..4].copy_from_slice(&total.to_be_bytes());
+
+        let (records, errors) = counter_during("ipfix_decode_errors", || {
+            decode_ipfix(&mut dec, &buf, test_exporter()).expect("partial result is Ok")
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(errors, 1, "the swallowed error is still counted");
+        let debug = crate::test_support::captured_events_at(tracing::Level::DEBUG);
+        assert!(
+            debug
+                .iter()
+                .any(|m| m.contains("keeping the 1 records decoded before it")),
+            "got {debug:?}"
+        );
+    }
+
+    /// A withdrawal-shaped record (field count 0) with a reserved id other than 0 is not
+    /// padding and not a withdrawal: it is rejected.
+    #[test]
+    fn test_template_record_with_reserved_id_and_no_fields_is_rejected() {
+        let mut dec = IpfixDecoder::new();
+        let buf = ipfix_msg(0, &[set_bytes(2, &tmpl_record(5, &[]))]);
+        let err = decode_ipfix(&mut dec, &buf, test_exporter()).unwrap_err();
+        assert!(
+            matches!(&err, DecodeError::Malformed { reason } if reason.contains("template id 5")),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn test_options_template_withdrawal_removes_only_that_template() {
+        let mut dec = IpfixDecoder::new();
+        let ex = test_exporter();
+        let define = ipfix_msg(
+            0,
+            &[
+                set_bytes(3, &options_template_set_body(300)),
+                set_bytes(3, &options_template_set_body(301)),
+            ],
+        );
+        decode_ipfix(&mut dec, &define, ex).unwrap();
+        assert!(dec.cache_contains_key(&(ex, 0, 300)));
+        assert!(dec.cache_contains_key(&(ex, 0, 301)));
+
+        // Withdrawal record: template id 300, field count 0 (no scope count follows).
+        let withdraw = ipfix_msg(0, &[set_bytes(3, &[0x01, 0x2C, 0x00, 0x00])]);
+        decode_ipfix(&mut dec, &withdraw, ex).expect("withdrawal is not an error");
+        assert!(!dec.cache_contains_key(&(ex, 0, 300)));
+        assert!(dec.cache_contains_key(&(ex, 0, 301)), "others stay");
+    }
+
+    #[test]
+    fn test_varlen_record_missing_its_length_byte_is_dropped_earlier_records_kept() {
+        let (_dec, exporter, export_time) = varlen_test_ctx();
+        let fields = vec![varlen_field(97), varlen_field(98)];
+        // Record 1: values AA and BBCC. Record 2: first value (1 byte), then no length byte.
+        let body = [0x01, 0xAA, 0x02, 0xBB, 0xCC, 0x01, 0xDD];
+        let records = parse_varlen_records(&fields, &body, 256, exporter, 0, export_time, 100);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].extra["ie97"], "aa");
+        assert_eq!(records[0].extra["ie98"], "bbcc");
+    }
+
+    #[test]
+    fn test_varlen_record_with_truncated_long_length_is_dropped_earlier_records_kept() {
+        let (_dec, exporter, export_time) = varlen_test_ctx();
+        let fields = vec![varlen_field(97)];
+        // Record 1: value AA. Record 2: 255 escape, but only one length byte follows.
+        let body = [0x01, 0xAA, 0xFF, 0x00];
+        let records = parse_varlen_records(&fields, &body, 256, exporter, 0, export_time, 100);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].extra["ie97"], "aa");
+    }
+
+    fn options_template_body_with(id: u16, scope_len: u16) -> Vec<u8> {
+        // id, field_count=1, scope_count=1, scope ie 144 of the given length
+        let mut v = id.to_be_bytes().to_vec();
+        v.extend_from_slice(&[0, 1, 0, 1, 0, 144]);
+        v.extend_from_slice(&scope_len.to_be_bytes());
+        v
+    }
+
+    /// An options data set whose template has a variable-length or zero-length record is
+    /// counted as a single skipped record (its record count cannot be derived).
+    #[test]
+    fn test_options_data_set_with_unsizable_records_counts_one_skipped() {
+        for scope_len in [0xFFFFu16, 0] {
+            let mut dec = IpfixDecoder::new();
+            let buf = ipfix_msg(
+                0,
+                &[
+                    set_bytes(3, &options_template_body_with(300, scope_len)),
+                    set_bytes(300, &[0x02, 0xAA, 0xBB, 0x00]),
+                ],
+            );
+            let (records, skipped) = counter_during("ipfix_options_records_skipped", || {
+                decode_ipfix(&mut dec, &buf, test_exporter()).expect("decode")
+            });
+            assert!(records.is_empty(), "scope_len={scope_len:#x}");
+            assert_eq!(skipped, 1, "scope_len={scope_len:#x}");
+        }
+    }
+
+    /// Zero padding after the last v9 template record ends the template flowset without
+    /// discarding the template before it or the data flowset after it.
+    #[test]
+    fn test_v9_template_flowset_stops_at_zero_padding() {
+        let mut dec = IpfixDecoder::new();
+        let mut v = v9_header();
+        let mut tmpl = tmpl_record(256, &[(8, 4)]);
+        tmpl.extend_from_slice(&[0, 0, 0, 0]); // padding
+        v.extend_from_slice(&set_bytes(0, &tmpl));
+        v.extend_from_slice(&set_bytes(256, &[10, 0, 0, 7]));
+
+        let records = decode_netflow_v9(&mut dec, &v, test_exporter()).expect("decode");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].src_addr,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)))
+        );
+        assert_eq!(dec.cache_len(), 1, "padding is not a template");
+    }
+
+    #[test]
+    fn test_netflow_v5_shorter_than_header_is_truncated() {
+        let err = decode_netflow_v5(&[0x00, 0x05, 0x00, 0x01, 0x00], test_exporter()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DecodeError::Truncated {
+                    offset: 0,
+                    need: 24,
+                    have: 5
+                }
+            ),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn test_read_helpers_report_offset_overflow_as_malformed() {
+        let overflow = |e: DecodeError| match e {
+            DecodeError::Malformed { reason } => reason,
+            other => panic!("expected Malformed, got {other}"),
+        };
+        assert_eq!(
+            overflow(read_u16_be(&[], usize::MAX).unwrap_err()),
+            "offset overflow"
+        );
+        assert_eq!(
+            overflow(read_u32_be(&[0; 4], usize::MAX - 1).unwrap_err()),
+            "offset overflow"
+        );
+        assert_eq!(
+            overflow(read_bytes(&[0; 4], usize::MAX, 2).unwrap_err()),
+            "offset overflow"
         );
     }
 }

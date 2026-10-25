@@ -856,4 +856,93 @@ mod tests {
             assert_eq!(day, old_day);
         }
     }
+
+    #[tokio::test]
+    async fn test_otlp_start_wires_handler_to_a_writer_that_exits_on_drop() {
+        use crate::config::S3ConnectionConfig;
+        let conn = S3ConnectionConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            access_key: "AKIATEST".to_string(),
+            secret_key: "SECRETTEST".to_string(),
+            object_lock_mode: None,
+            object_lock_retain_days: None,
+        };
+        let s3 = Arc::new(
+            crate::forwarding::s3_sink::S3Sink::from_connection(&conn)
+                .await
+                .expect("constructs"),
+        );
+        let cfg = OtlpS3Config {
+            connection: conn,
+            prefix: "otlp".to_string(),
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 16,
+            max_buffer_rows: 100_000,
+        };
+        let stats = Arc::new(crate::stats::SourceHourlyStats::new());
+        let (handler, join) = otlp_start(&cfg, s3, 8, stats.clone(), None);
+        handler.try_send(sample()).expect("channel has room");
+        drop(handler);
+        tokio::time::timeout(std::time::Duration::from_secs(10), join)
+            .await
+            .expect("writer task must exit within 10s")
+            .expect("writer task must not panic");
+
+        let snapshot = stats.snapshot();
+        let row = snapshot
+            .iter()
+            .find(|r| r.source == "otlp")
+            .expect("otlp row");
+        assert_eq!(row.hours.iter().map(|h| h.count).sum::<u64>(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_otlp_local_start_writes_parquet_under_the_configured_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(
+            crate::forwarding::local_sink::LocalDiskSink::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let cfg = OtlpLocalConfig {
+            directory: dir.path().to_path_buf(),
+            prefix: "otlp".to_string(),
+            flush_threshold_bytes: usize::MAX,
+            flush_interval_secs: 3600,
+            channel_capacity: 16,
+            max_buffer_rows: 100_000,
+        };
+        let (handler, join) = otlp_local_start(
+            &cfg,
+            sink,
+            8,
+            Arc::new(crate::stats::SourceHourlyStats::new()),
+            None,
+        );
+        handler.try_send(sample()).expect("channel has room");
+        drop(handler); // closing the channel flushes the buffered row
+        tokio::time::timeout(std::time::Duration::from_secs(10), join)
+            .await
+            .expect("writer exits")
+            .expect("writer does not panic");
+
+        let mut found = Vec::new();
+        let mut stack = vec![dir.path().to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    found.push(p);
+                }
+            }
+        }
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].extension().is_some_and(|e| e == "parquet"));
+        assert!(found[0].starts_with(dir.path().join("otlp")));
+    }
 }
