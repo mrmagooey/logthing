@@ -201,6 +201,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_security_middleware_rate_limit_returns_429_with_retry_after() {
+        let state = test_state_with_config(vec![], true).await;
+        // The client has already used its 30 requests for this window.
+        state
+            .request_counts
+            .write()
+            .await
+            .insert("127.0.0.1".to_string(), (std::time::Instant::now(), 30));
+        let app = axum::Router::new()
+            .route("/test", axum::routing::get(|| async { "OK" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                security_middleware,
+            ))
+            .with_state(state.clone());
+        let mut request = create_test_request(Method::GET, None);
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:4000".parse::<SocketAddr>().unwrap(),
+        ));
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "60");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "Rate limit exceeded");
+        assert_eq!(json["retry_after"], 60);
+        assert_eq!(state.request_counts.read().await["127.0.0.1"].1, 31);
+    }
+
+    #[tokio::test]
     async fn security_middleware_allows_request_with_empty_whitelist() {
         let state = test_state_with_config(vec![], false).await;
         let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
