@@ -1164,6 +1164,9 @@ mod tests {
     /// UDP socket whose peer has gone away gets an ICMP port-unreachable, which the next
     /// receive reports as `ConnectionRefused` ahead of any queued data. (A datagram is queued
     /// first so the socket is readable and tokio's readiness wait returns.)
+    ///
+    /// Relies on UDP reporting `sk_err` before queued data (Linux behaviour); if this ever
+    /// fails on a new kernel, check that ordering first.
     #[tokio::test]
     async fn recv_returns_the_socket_error_when_recvmmsg_fails() {
         let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();

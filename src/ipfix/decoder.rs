@@ -3701,9 +3701,15 @@ mod tests {
         (out, total)
     }
 
-    fn cap_message_v9(records: usize) -> Vec<u8> {
+    /// A 20-byte NetFlow v9 header (2 flowsets, source id 5).
+    fn v9_header() -> Vec<u8> {
         let mut v = vec![0x00, 0x09, 0x00, 0x02, 0, 0, 0, 0, 0x67, 0x5C, 0xB0, 0x20];
         v.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 5]);
+        v
+    }
+
+    fn cap_message_v9(records: usize) -> Vec<u8> {
+        let mut v = v9_header();
         v.extend_from_slice(&set_bytes(0, &tmpl_record(256, &[(4, 1)])));
         v.extend_from_slice(&set_bytes(256, &vec![6u8; records]));
         v
@@ -4057,45 +4063,66 @@ mod tests {
     #[test]
     fn test_curated_ies_decode_into_columns_and_named_extra_fields() {
         let v6 = |s: &str| s.parse::<Ipv6Addr>().unwrap();
-        let fields: &[(u16, u16)] = &[
-            (2, 8),
-            (21, 4),
-            (28, 16),
-            (32, 2),
-            (56, 8),
-            (61, 1),
-            (62, 16),
-            (64, 16),
-            (70, 1),
-            (89, 1),
-            (96, 8),
-            (131, 16),
-            (136, 1),
-            (176, 1),
-            (177, 1),
+        // One table drives both the template and the data bytes: (ie, len, name, value).
+        let table: Vec<(u16, u16, &str, Vec<u8>)> = vec![
+            (2, 8, "packetDeltaCount", 258u64.to_be_bytes().to_vec()),
+            (21, 4, "flowEndSysUpTime", 42u32.to_be_bytes().to_vec()),
+            (
+                28,
+                16,
+                "destinationIPv6Address",
+                v6("::1").octets().to_vec(),
+            ),
+            (32, 2, "icmpTypeCodeIPv4", 0x0800u16.to_be_bytes().to_vec()),
+            (
+                56,
+                8,
+                "sourceMacAddress",
+                0x0000_AABB_CCDD_EEFFu64.to_be_bytes().to_vec(),
+            ),
+            (61, 1, "flowDirection", vec![1]),
+            (
+                62,
+                16,
+                "ipNextHopIPv6Address",
+                v6("fe80::1").octets().to_vec(),
+            ),
+            (
+                64,
+                16,
+                "bgpNextHopIPv6Address",
+                v6("2001:db8::2").octets().to_vec(),
+            ),
+            (70, 1, "mplsTopLabelType", vec![3]),
+            (89, 1, "forwardingStatus", vec![64]),
+            (
+                96,
+                8,
+                "mpls_vpn_rd",
+                0x1122_3344_5566_7788u64.to_be_bytes().to_vec(),
+            ),
+            (
+                131,
+                16,
+                "exporterIPv6Address",
+                v6("2001:db8::131").octets().to_vec(),
+            ),
+            (136, 1, "flowEndReason", vec![2]),
+            (176, 1, "icmpTypeIPv4", vec![8]),
+            (177, 1, "icmpCodeIPv4", vec![0]),
         ];
-        let mut data: Vec<u8> = Vec::new();
-        data.extend_from_slice(&258u64.to_be_bytes()); // packetDeltaCount
-        data.extend_from_slice(&42u32.to_be_bytes()); // flowEndSysUpTime
-        data.extend_from_slice(&v6("::1").octets()); // destinationIPv6Address
-        data.extend_from_slice(&0x0800u16.to_be_bytes()); // icmpTypeCodeIPv4
-        data.extend_from_slice(&0x0000_AABB_CCDD_EEFFu64.to_be_bytes()); // sourceMacAddress
-        data.push(1); // flowDirection
-        data.extend_from_slice(&v6("fe80::1").octets()); // ipNextHopIPv6Address
-        data.extend_from_slice(&v6("2001:db8::2").octets()); // bgpNextHopIPv6Address
-        data.push(3); // mplsTopLabelType
-        data.push(64); // forwardingStatus
-        data.extend_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes()); // mpls_vpn_rd
-        data.extend_from_slice(&v6("2001:db8::131").octets()); // exporterIPv6Address
-        data.push(2); // flowEndReason
-        data.push(8); // icmpTypeIPv4
-        data.push(0); // icmpCodeIPv4
+        for (ie, len, name, bytes) in &table {
+            assert_eq!(bytes.len(), *len as usize, "{name}");
+            assert_eq!(ie_info(*ie).map(|(n, _)| n), Some(*name));
+        }
+        let fields: Vec<(u16, u16)> = table.iter().map(|(ie, len, ..)| (*ie, *len)).collect();
+        let data: Vec<u8> = table.iter().flat_map(|(.., b)| b.clone()).collect();
 
         let mut dec = IpfixDecoder::new();
         let buf = ipfix_msg(
             0,
             &[
-                set_bytes(2, &tmpl_record(256, fields)),
+                set_bytes(2, &tmpl_record(256, &fields)),
                 set_bytes(256, &data),
             ],
         );
@@ -4269,8 +4296,7 @@ mod tests {
     #[test]
     fn test_v9_template_flowset_stops_at_zero_padding() {
         let mut dec = IpfixDecoder::new();
-        let mut v = vec![0x00, 0x09, 0x00, 0x02, 0, 0, 0, 0, 0x67, 0x5C, 0xB0, 0x20];
-        v.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 5]);
+        let mut v = v9_header();
         let mut tmpl = tmpl_record(256, &[(8, 4)]);
         tmpl.extend_from_slice(&[0, 0, 0, 0]); // padding
         v.extend_from_slice(&set_bytes(0, &tmpl));
