@@ -354,4 +354,30 @@ mod tests {
             Some("1.2.3.4")
         );
     }
+
+    #[test]
+    fn test_extension_unescapes_pipe_and_keeps_unknown_escape() {
+        let line = r"CEF:0|V|P|1|100|N|5|msg=a\|b fname=C:\x";
+        let rec = try_parse(&msg(line)).expect("must parse");
+        assert_eq!(rec.extensions.get("msg").map(String::as_str), Some("a|b"));
+        assert_eq!(
+            rec.extensions.get("fname").map(String::as_str),
+            Some(r"C:\x")
+        );
+    }
+
+    #[test]
+    fn test_header_without_extension_field_yields_empty_extensions() {
+        let rec = try_parse(&msg("CEF:0|V|P|1|100|Name|5")).expect("must parse");
+        assert_eq!(rec.name, "Name");
+        assert_eq!(rec.severity, "5");
+        assert!(rec.extensions.is_empty());
+    }
+
+    #[test]
+    fn test_header_keeps_unknown_escape_sequence_verbatim() {
+        let rec = try_parse(&msg(r"CEF:0|Ven\dor|P\|q|1|100|Name|5|")).expect("must parse");
+        assert_eq!(rec.device_vendor, r"Ven\dor");
+        assert_eq!(rec.device_product, "P|q");
+    }
 }
