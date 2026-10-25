@@ -27,3 +27,5 @@ flate2 = "1"
 axum = { version = "0.7", features = ["macros"] }
 tower = { version = "0.4", features = ["util"] }
 tempfile = "3.9"
+# Counts Parquet rows in the wef-http tests; same version as the root crate.
+parquet = "53.0"

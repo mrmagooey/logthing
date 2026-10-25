@@ -20,7 +20,7 @@
 //!
 //! ```text
 //! cargo run --release --features pprof --example pprof_selftime -- \
-//!     profiling-results/profile.pb
+//!     profiling-results/<format>/profile.pb
 //! ```
 #[cfg(not(feature = "pprof"))]
 fn main() {

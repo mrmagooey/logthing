@@ -2644,6 +2644,7 @@ dependencies = [
  "flate2",
  "logthing",
  "opentelemetry-proto",
+ "parquet",
  "prost",
  "reqwest",
  "serde_json",

@@ -22,6 +22,7 @@ This document explains how automated or semi-automated agents should interact wi
 | Coverage report | `scripts/run_coverage.sh` |
 | E2E tests | `tests/e2e/simulation-environment/run.sh` (requires Docker) |
 | WEF interop E2E | `tests/e2e/simulation-environment/run.sh wef-interop` (requires Docker; MIT KDC + Windows WEF client emulator over Kerberos-HTTP and HTTPS client certs) |
+| Profile ingest (flame graphs) | `cargo build --profile profiling --features pprof && cargo build --release -p loadgen && scripts/profile-ingest.sh all` |
 | Fuzz (nightly) | `scripts/fuzz.sh <target|all> [secs]` |
 | Harness real-server test | `cargo build --release --bin logthing && cargo build --release -p loadgen && cargo test --test max_ingest_rate_harness_integration -- --ignored --test-threads=1` |
 | Committer tests | `committer/.venv/bin/pytest committer/tests --ignore=committer/tests/e2e` |

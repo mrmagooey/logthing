@@ -23,13 +23,18 @@ const DEFAULT_FREQUENCY_HZ: i32 = 99;
 /// Default output directory for profiling artifacts.
 const DEFAULT_OUTPUT_DIR: &str = "./profiling-results";
 
-/// Metric whose movement proves the sampling window overlapped real ingest.
-pub const ACTIVITY_METRIC: &str = "syslog_messages_received";
+/// Default metric whose movement proves the sampling window overlapped real
+/// ingest: records flushed by any local/S3 writer, summed over labels. It is
+/// the default because generic `/ingest` and WEF have no "received" counter
+/// and it proves records reached Parquet. Override with
+/// `LOGTHING_PROFILE_ACTIVITY_METRIC`.
+pub const DEFAULT_ACTIVITY_METRIC: &str = "parquet_s3_records_written";
 
-/// A probe returning some monotonically increasing measure of ingest activity,
-/// used only to decide whether a profile is representative. Returns `None`
-/// when the measure is unavailable (for example, metrics are disabled).
-pub type ActivityProbe = Box<dyn Fn() -> Option<u64> + Send + Sync>;
+/// A probe returning some monotonically increasing measure of ingest activity
+/// for the named metric, used only to decide whether a profile is
+/// representative. Returns `None` when the measure is unavailable (for
+/// example, metrics are disabled or the metric has not been emitted yet).
+pub type ActivityProbe = Box<dyn Fn(&str) -> Option<u64> + Send + Sync>;
 
 /// Profiling configuration, parsed from environment variables.
 ///
@@ -48,6 +53,16 @@ pub struct ProfileConfig {
     pub frequency_hz: i32,
     /// Directory the artifacts are written to.
     pub output_dir: PathBuf,
+    /// Name of the counter the activity probe reads to decide whether the
+    /// window overlapped load (`LOGTHING_PROFILE_ACTIVITY_METRIC`).
+    pub activity_metric: String,
+}
+
+/// Whether `s` is a valid Prometheus metric name (`[a-zA-Z_:][a-zA-Z0-9_:]*`).
+fn is_valid_metric_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    let ok_first = |c: char| c.is_ascii_alphabetic() || c == '_' || c == ':';
+    chars.next().is_some_and(ok_first) && chars.all(|c| ok_first(c) || c.is_ascii_digit())
 }
 
 impl ProfileConfig {
@@ -91,11 +106,25 @@ impl ProfileConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_OUTPUT_DIR));
 
+        let activity_metric = match get("LOGTHING_PROFILE_ACTIVITY_METRIC") {
+            None => DEFAULT_ACTIVITY_METRIC.to_string(),
+            Some(raw) if is_valid_metric_name(raw.trim()) => raw.trim().to_string(),
+            Some(raw) => {
+                tracing::warn!(
+                    value = %raw,
+                    default = DEFAULT_ACTIVITY_METRIC,
+                    "LOGTHING_PROFILE_ACTIVITY_METRIC is not a valid metric name; using default"
+                );
+                DEFAULT_ACTIVITY_METRIC.to_string()
+            }
+        };
+
         Some(Self {
             duration_secs,
             delay_secs,
             frequency_hz,
             output_dir,
+            activity_metric,
         })
     }
 }
@@ -188,6 +217,8 @@ pub struct ProfileMetadata {
     /// true` with `activity_probe_available: false` as a weaker signal than
     /// `representative: true` with the probe available.
     pub activity_probe_available: bool,
+    /// Name of the counter `activity_before`/`activity_after` were read from.
+    pub activity_metric: String,
 }
 
 impl ProfileMetadata {
@@ -212,6 +243,7 @@ impl ProfileMetadata {
             activity_delta,
             representative: is_representative(sample_count, activity_delta),
             activity_probe_available: activity_before.is_some(),
+            activity_metric: cfg.activity_metric.clone(),
         }
     }
 }
@@ -266,7 +298,7 @@ mod sampler {
                 tokio::time::sleep(Duration::from_secs(cfg.delay_secs)).await;
             }
 
-            let activity_before = probe.as_ref().and_then(|p| p());
+            let activity_before = probe.as_ref().and_then(|p| p(&cfg.activity_metric));
 
             let guard = match pprof::ProfilerGuardBuilder::default()
                 .frequency(cfg.frequency_hz)
@@ -290,7 +322,7 @@ mod sampler {
             // `report().build()`, which symbolicates every collected stack
             // and can take seconds -- reading activity_after afterwards
             // would widen the window this counter is meant to measure.
-            let activity_after = probe.as_ref().and_then(|p| p());
+            let activity_after = probe.as_ref().and_then(|p| p(&cfg.activity_metric));
 
             let report = match guard.report().build() {
                 Ok(report) => report,
@@ -389,6 +421,7 @@ mod sampler {
                 delay_secs: 0,
                 frequency_hz: 99,
                 output_dir,
+                activity_metric: crate::profiling::DEFAULT_ACTIVITY_METRIC.to_string(),
             }
         }
 
@@ -514,6 +547,72 @@ mod tests {
     }
 
     #[test]
+    fn test_activity_metric_defaults_to_records_written() {
+        let cfg = ProfileConfig::from_vars(|k| (k == "LOGTHING_PROFILE_SECS").then(|| "5".into()))
+            .unwrap();
+        assert_eq!(cfg.activity_metric, "parquet_s3_records_written");
+    }
+
+    #[test]
+    fn test_activity_metric_override_is_used() {
+        let cfg = ProfileConfig::from_vars(|k| match k {
+            "LOGTHING_PROFILE_SECS" => Some("5".into()),
+            "LOGTHING_PROFILE_ACTIVITY_METRIC" => Some("zeek_records_received".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(cfg.activity_metric, "zeek_records_received");
+    }
+
+    #[test]
+    fn test_activity_metric_invalid_falls_back_to_default() {
+        for bad in [
+            "",
+            "   ",
+            "has space",
+            "9starts_with_digit",
+            "dash-name",
+            "a{b}",
+        ] {
+            let cfg = ProfileConfig::from_vars(|k| match k {
+                "LOGTHING_PROFILE_SECS" => Some("5".into()),
+                "LOGTHING_PROFILE_ACTIVITY_METRIC" => Some(bad.into()),
+                _ => None,
+            })
+            .expect("an invalid metric name must not disable profiling");
+            assert_eq!(
+                cfg.activity_metric, DEFAULT_ACTIVITY_METRIC,
+                "input {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_activity_metric_is_trimmed() {
+        let cfg = ProfileConfig::from_vars(vars(&[
+            ("LOGTHING_PROFILE_SECS", "5"),
+            ("LOGTHING_PROFILE_ACTIVITY_METRIC", "  a_b:c1 "),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.activity_metric, "a_b:c1");
+    }
+
+    #[test]
+    fn test_metadata_json_includes_activity_metric() {
+        let cfg = ProfileConfig::from_vars(vars(&[
+            ("LOGTHING_PROFILE_SECS", "5"),
+            ("LOGTHING_PROFILE_ACTIVITY_METRIC", "zeek_records_received"),
+        ]))
+        .unwrap();
+        let meta = ProfileMetadata::new(&cfg, 500, Some(1), Some(9));
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(
+            json.contains("\"activity_metric\":\"zeek_records_received\""),
+            "{json}"
+        );
+    }
+
+    #[test]
     fn from_vars_falls_back_on_non_numeric_delay() {
         let cfg = ProfileConfig::from_vars(vars(&[
             ("LOGTHING_PROFILE_SECS", "10"),
@@ -591,6 +690,7 @@ other_metric 999
             delay_secs: 2,
             frequency_hz: 99,
             output_dir: PathBuf::from("/tmp"),
+            activity_metric: DEFAULT_ACTIVITY_METRIC.to_string(),
         };
         let meta = ProfileMetadata::new(&cfg, 5_000, Some(10), Some(1_010));
         assert_eq!(meta.activity_delta, Some(1_000));
@@ -607,6 +707,7 @@ other_metric 999
             delay_secs: 0,
             frequency_hz: 99,
             output_dir: PathBuf::from("/tmp"),
+            activity_metric: DEFAULT_ACTIVITY_METRIC.to_string(),
         };
         let meta = ProfileMetadata::new(&cfg, 5_000, Some(7), Some(7));
         assert_eq!(meta.activity_delta, Some(0));
@@ -621,6 +722,7 @@ other_metric 999
             delay_secs: 5,
             frequency_hz: 99,
             output_dir: PathBuf::from("/tmp"),
+            activity_metric: DEFAULT_ACTIVITY_METRIC.to_string(),
         };
         let meta = ProfileMetadata::new(&cfg, 5_000, Some(0), Some(0));
         assert!(meta.activity_probe_available);
@@ -639,6 +741,7 @@ other_metric 999
             delay_secs: 0,
             frequency_hz: 99,
             output_dir: PathBuf::from("/tmp"),
+            activity_metric: DEFAULT_ACTIVITY_METRIC.to_string(),
         };
         let meta = ProfileMetadata::new(&cfg, 5_000, None, None);
         assert!(!meta.activity_probe_available);
@@ -673,7 +776,7 @@ other_metric 999
         }
         unsafe { std::env::set_var("LOGTHING_PROFILE_SECS", "7") };
         let guard = EnvGuard;
-        maybe_start(Some(Box::new(|| Some(1))));
+        maybe_start(Some(Box::new(|_: &str| Some(1))));
         drop(guard);
         let warnings = crate::test_support::captured_events_at(tracing::Level::WARN);
         assert!(
