@@ -1123,4 +1123,265 @@ mod tests {
         assert_eq!(received, 1);
         assert_eq!(batch.payload(0), b"lonely datagram");
     }
+
+    // ---- coverage: SO_RCVBUF logging, recvmmsg errors, /proc parsing, drain ----
+
+    /// A request at or below what the kernel grants takes the `info!` arm (not the
+    /// "clamped" warning), in both bind helpers. 1024 bytes is always raised to the kernel
+    /// minimum, so the granted size is never smaller than the request.
+    #[tokio::test]
+    async fn small_recv_buffer_request_logs_the_granted_size_at_info() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        crate::test_support::install_and_clear();
+        let plain = bind_udp_with_recv_buffer(&addr, Some(1024), "cov_plain")
+            .await
+            .unwrap();
+        let info = crate::test_support::captured_events_at(tracing::Level::INFO);
+        assert!(
+            info.iter().any(|m| m
+                .starts_with("cov_plain: SO_RCVBUF requested 1024 bytes, kernel granted ")
+                && !m.contains("only")),
+            "got {info:?}"
+        );
+        assert!(recv_buffer_size(&plain) >= 1024);
+
+        crate::test_support::install_and_clear();
+        let reuse = bind_udp_reuseport_with_recv_buffer(&addr, Some(1024), "cov_reuse")
+            .await
+            .unwrap();
+        let info = crate::test_support::captured_events_at(tracing::Level::INFO);
+        assert!(
+            info.iter().any(|m| m
+                .starts_with("cov_reuse: SO_RCVBUF requested 1024 bytes, kernel granted ")
+                && !m.contains("only")),
+            "got {info:?}"
+        );
+        assert!(recv_buffer_size(&reuse) >= 1024);
+    }
+
+    /// A socket-level error that is not `WouldBlock` is returned to the caller. A connected
+    /// UDP socket whose peer has gone away gets an ICMP port-unreachable, which the next
+    /// receive reports as `ConnectionRefused` ahead of any queued data. (A datagram is queued
+    /// first so the socket is readable and tokio's readiness wait returns.)
+    #[tokio::test]
+    async fn recv_returns_the_socket_error_when_recvmmsg_fails() {
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock_addr = sock.local_addr().unwrap();
+        sock.connect(peer_addr).await.unwrap();
+        peer.send_to(b"queued", sock_addr).unwrap();
+        drop(peer);
+        sock.send(b"anyone there?").await.unwrap();
+
+        let mut batch = RecvMmsgBatch::new(4);
+        let result = tokio::time::timeout(Duration::from_secs(5), batch.recv(&sock))
+            .await
+            .expect("the queued datagram must make the socket readable");
+        let err = result.expect_err("recvmmsg must surface the pending socket error");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+    }
+
+    #[test]
+    fn parse_proc_net_udp_skips_malformed_lines_and_keeps_good_ones() {
+        let header = "  sl  local_address rem_address   st tx_queue:rx_queue tr tm->when \
+                      retrnsmt   uid  timeout inode ref pointer drops\n";
+        let good = "  1: 0100007F:1F90 00000000:0000 07 00000000:00000010 00:00000000 \
+                    00000000  0 0 1 2 0000000000000000 7\n";
+        let short = "  2: 0100007F:1F90 00000000:0000 07 00000000:00000010 00:00000000\n";
+        let no_colon = "  3: 0100007F:1F90 00000000:0000 07 0000000000000010 00:00000000 \
+                        00000000  0 0 1 2 0000000000000000 5\n";
+        let bad_hex = "  4: 0100007F:1F90 00000000:0000 07 00000000:ZZZZ 00:00000000 \
+                       00000000  0 0 1 2 0000000000000000 5\n";
+        let bad_drops = "  5: 0100007F:1F90 00000000:0000 07 00000000:00000010 00:00000000 \
+                         00000000  0 0 1 2 0000000000000000 many\n";
+        let contents = format!("{header}{short}{no_colon}{bad_hex}{bad_drops}{good}");
+
+        let entry = parse_proc_net_udp(&contents, "0100007F:1F90").expect("the good line matches");
+        assert_eq!(entry.rx_queue, 0x10);
+        assert_eq!(entry.drops, 7, "malformed lines must not contribute");
+
+        let only_bad = format!("{header}{short}{no_colon}{bad_hex}{bad_drops}");
+        assert_eq!(parse_proc_net_udp(&only_bad, "0100007F:1F90"), None);
+    }
+
+    fn drop_stats_for(
+        path: &'static str,
+        needle: &str,
+        prev_drops: Option<u64>,
+    ) -> SocketDropStats {
+        SocketDropStats {
+            protocol: "cov_proto",
+            proc_path: path,
+            needle: needle.to_string(),
+            prev_drops,
+            disabled: false,
+        }
+    }
+
+    /// Writes a one-socket `/proc/net/udp` look-alike and returns its (leaked, test-only) path.
+    fn proc_file(dir: &tempfile::TempDir, rx_queue_hex: &str, drops: u64) -> &'static str {
+        let path = dir.path().join("udp");
+        let body = format!(
+            "  sl  local_address rem_address   st tx_queue:rx_queue tr tm->when retrnsmt \
+             uid  timeout inode ref pointer drops\n   1: 0100007F:1F90 00000000:0000 07 \
+             00000000:{rx_queue_hex} 00:00000000 00000000  0 0 1 2 0000000000000000 {drops}\n"
+        );
+        std::fs::write(&path, body).unwrap();
+        Box::leak(path.to_string_lossy().into_owned().into_boxed_str())
+    }
+
+    fn snapshot_values(
+        snapshotter: &metrics_util::debugging::Snapshotter,
+    ) -> std::collections::HashMap<String, f64> {
+        use metrics_util::debugging::DebugValue;
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(k, _, _, v)| {
+                let val = match v {
+                    DebugValue::Counter(c) => c as f64,
+                    DebugValue::Gauge(g) => g.into_inner(),
+                    _ => 0.0,
+                };
+                (k.key().name().to_string(), val)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn socket_drop_stats_poll_is_a_no_op_when_disabled() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut stats = drop_stats_for("/proc/net/udp", "0100007F:1F90", None);
+        stats.disabled = true;
+        stats.poll().await;
+
+        assert!(
+            snapshot_values(&snapshotter).is_empty(),
+            "disabled emits nothing"
+        );
+        assert_eq!(stats.prev_drops, None);
+    }
+
+    #[tokio::test]
+    async fn socket_drop_stats_disables_itself_when_proc_file_is_unreadable() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        crate::test_support::install_and_clear();
+        let mut stats = drop_stats_for("/nonexistent-dir/net/udp", "0100007F:1F90", None);
+        stats.poll().await;
+
+        assert!(
+            stats.disabled,
+            "an unreadable proc file disables the tracker"
+        );
+        assert!(snapshot_values(&snapshotter).is_empty());
+        let warns = crate::test_support::captured_events_at(tracing::Level::WARN);
+        assert!(
+            warns
+                .iter()
+                .any(|m| m.contains("unreadable, disabling socket-drop metrics")),
+            "got {warns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn socket_drop_stats_keeps_polling_when_the_socket_line_is_missing() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = proc_file(&dir, "00000010", 3);
+        let mut stats = drop_stats_for(path, "DEADBEEF:0001", Some(1));
+        stats.poll().await;
+
+        assert!(
+            !stats.disabled,
+            "a transient miss must not disable the tracker"
+        );
+        assert_eq!(stats.prev_drops, Some(1), "baseline untouched");
+        assert!(snapshot_values(&snapshotter).is_empty());
+    }
+
+    #[tokio::test]
+    async fn socket_drop_stats_reports_zero_delta_when_the_counter_goes_backwards() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = proc_file(&dir, "00000020", 4);
+        let mut stats = drop_stats_for(path, "0100007F:1F90", Some(100));
+        stats.poll().await;
+
+        let values = snapshot_values(&snapshotter);
+        assert_eq!(values["cov_proto_socket_drops"], 0.0, "no bogus delta");
+        assert_eq!(values["cov_proto_socket_rx_queue_bytes"], 32.0);
+        assert_eq!(
+            stats.prev_drops,
+            Some(4),
+            "baseline resets to the new reading"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_tasks_drain_aborts_tasks_that_outlive_the_grace() {
+        let mut tasks = ConnectionTasks::new();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        // Holds the sender until aborted; dropping it on abort closes the channel.
+        tasks.spawn(async move {
+            let _keep = done_tx;
+            std::future::pending::<()>().await;
+        });
+
+        crate::test_support::install_and_clear();
+        tasks.drain(Duration::from_millis(20)).await;
+
+        assert!(
+            done_rx.await.is_err(),
+            "the stuck task must have been aborted (its sender dropped)"
+        );
+        let warns = crate::test_support::captured_events_at(tracing::Level::WARN);
+        assert!(
+            warns
+                .iter()
+                .any(|m| m.contains("1 connection task(s) still running")),
+            "got {warns:?}"
+        );
+    }
+
+    /// An IPv6 reuseport bind works and its drop tracker reads `/proc/net/udp6`. Skipped on
+    /// hosts without IPv6 loopback.
+    #[tokio::test]
+    async fn reuseport_ipv6_socket_is_tracked_via_proc_net_udp6() {
+        if UdpSocket::bind("[::1]:0").await.is_err() {
+            return;
+        }
+        let sock = bind_udp_reuseport_with_recv_buffer(&"[::1]:0".parse().unwrap(), None, "cov6")
+            .await
+            .expect("ipv6 reuseport bind");
+        let addr = sock.local_addr().unwrap();
+        assert!(addr.is_ipv6());
+
+        let stats = SocketDropStats::new(&sock, "cov6");
+        assert_eq!(stats.proc_path, "/proc/net/udp6");
+        assert_eq!(
+            stats.needle,
+            format!("{}:{:04X}", ipv6_hex(Ipv6Addr::LOCALHOST), addr.port())
+        );
+        assert!(!stats.disabled);
+    }
 }
