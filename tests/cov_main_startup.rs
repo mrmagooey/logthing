@@ -12,7 +12,6 @@
 mod common;
 
 use common::{Proc, fake_s3::FakeS3};
-use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -122,10 +121,10 @@ fn test_http_port_already_taken_fails_with_a_nonzero_exit() {
 /// Config enabling only `source` on a port that something else already holds.
 fn listener_toml(source: &str, port: u16) -> String {
     let body = match source {
-        "syslog" => format!(
-            "[syslog]\nenabled = true\nudp_port = {}\ntcp_port = {port}\n",
-            { common::free_port() }
-        ),
+        "syslog" => {
+            let udp = common::free_port();
+            format!("[syslog]\nenabled = true\nudp_port = {udp}\ntcp_port = {port}\n")
+        }
         "zeek" | "suricata" => {
             format!("[{source}]\nenabled = true\ntcp_port = {port}\nbind_address = \"127.0.0.1\"\n")
         }
@@ -146,9 +145,19 @@ fn listener_toml(source: &str, port: u16) -> String {
 
 #[test]
 fn test_listener_that_cannot_bind_fails_the_process_for_every_source() {
-    for source in ["syslog", "ipfix", "zeek", "suricata", "sflow"] {
+    let sources = [
+        ("syslog", "Syslog listener error"),
+        ("ipfix", "IPFIX listener error"),
+        ("zeek", "Zeek listener error"),
+        ("suricata", "Suricata listener error"),
+        ("sflow", "sFlow listener error"),
+    ];
+    for (source, marker) in sources {
         let tcp = matches!(source, "syslog" | "zeek" | "suricata");
-        // Hold the port on every address the listener may use (syslog binds 0.0.0.0).
+        // Hold the port on every address the listener may use (syslog binds 0.0.0.0). The UDP
+        // holder is a plain socket on purpose: the UDP listeners bind with SO_REUSEPORT, which
+        // Linux only lets sockets share when ALL of them set it, so the bind fails with
+        // EADDRINUSE. Making the holder reuseport too would silently break this test.
         let (_tcp_hold, _udp_hold, port);
         if tcp {
             let l = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
@@ -163,18 +172,8 @@ fn test_listener_that_cannot_bind_fails_the_process_for_every_source() {
         }
         let r = run_until_exit(&listener_toml(source, port), &[]);
         assert_eq!(r.status.code(), Some(1), "{source}: stdout: {}", r.stdout);
-        let marker = if source == "sflow" {
-            "sFlow listener error"
-        } else {
-            ""
-        };
-        let marker = if marker.is_empty() {
-            format!("{} listener error", capitalised(source))
-        } else {
-            marker.to_string()
-        };
         assert!(
-            r.stdout.contains(&marker),
+            r.stdout.contains(marker),
             "{source}: missing {marker:?} in:\n{}",
             r.stdout
         );
@@ -183,18 +182,6 @@ fn test_listener_that_cannot_bind_fails_the_process_for_every_source() {
             "{source}: stderr: {}",
             r.stderr
         );
-    }
-}
-
-fn capitalised(s: &str) -> String {
-    match s {
-        "ipfix" => "IPFIX".to_string(),
-        other => {
-            let mut c = other.chars();
-            c.next()
-                .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
-                .unwrap()
-        }
     }
 }
 
@@ -468,7 +455,6 @@ async fn test_writer_flush_that_hangs_hits_the_ten_second_deadline() {
         "graceful exit expected, got {st}:\n{}",
         p.logs()
     );
-    assert_ne!(st.signal(), Some(9));
     assert!(
         elapsed >= Duration::from_secs(9),
         "returned too fast: {elapsed:?}"

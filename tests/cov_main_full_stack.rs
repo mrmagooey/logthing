@@ -3,10 +3,12 @@
 //! source writing to S3 and local disk, a structured-syslog S3 sink, one cardinality watch per
 //! source, JSON logging and an IP allow-list.
 //!
-//! This drives the `main.rs` wiring that no single-purpose binary test reaches: the
+//! This executes the `main.rs` wiring that no single-purpose binary test reaches: the
 //! multi-target handler fan-out for every source, the aggregating decorators, the aggregate
-//! writers, the cardinality ticker and the JSON log format. A graceful SIGTERM then flushes
-//! everything, and the test checks what landed on both targets.
+//! writers, the cardinality ticker and the JSON log format. Asserted behaviour: zeek records
+//! sent over TCP are aggregated into counted rows on local disk and on S3, the startup log
+//! lines report 5 aggregation rules and 6 cardinality watches, logs are JSON, and SIGTERM
+//! exits cleanly. The other sources' fan-out is exercised (started) but sends no traffic.
 
 mod common;
 
@@ -178,8 +180,7 @@ async fn full_stack_fans_out_to_s3_and_local_and_aggregates_on_every_source() {
     };
     let mut p = Proc::spawn_healthy(BIN, &config_toml(&ports, &s3.endpoint()), &ENVS).await;
 
-    // Zeek is both aggregated (dns rule) and persisted raw on both targets only for records the
-    // aggregator does not consume; a non-dns record bypasses the aggregation rule.
+    // Three dns records: the `zeek_dns` rule consumes them into per-query counts.
     let mut zeek = None;
     for _ in 0..100 {
         if let Ok(s) = tokio::net::TcpStream::connect(("127.0.0.1", ports.zeek)).await {
@@ -203,9 +204,14 @@ async fn full_stack_fans_out_to_s3_and_local_and_aggregates_on_every_source() {
     // Wait for a cardinality window and an aggregate flush interval to elapse.
     let aggregated = common::wait_until(Duration::from_secs(20), || {
         !common::parquet_files(&p.dir().join("agg")).is_empty()
+            && s3.put_keys().iter().any(|k| k.starts_with("agg_s3/"))
     })
     .await;
-    assert!(aggregated, "no aggregate parquet appeared:\n{}", p.logs());
+    assert!(
+        aggregated,
+        "no aggregate parquet on local disk and S3:\n{}",
+        p.logs()
+    );
 
     let st = p.terminate(Duration::from_secs(30));
     assert!(
@@ -214,23 +220,33 @@ async fn full_stack_fans_out_to_s3_and_local_and_aggregates_on_every_source() {
         p.logs()
     );
 
-    // Aggregate rows: query a.example counted twice, b.example once, on local disk.
-    let rows = common::read_all(&p.dir().join("agg"));
-    let mut seen = Vec::new();
-    for b in &rows {
-        let q = common::str_col(b, "query");
+    // Aggregate rows: a.example counted twice, b.example once. Summed per query so a window
+    // boundary splitting the records across two flushes cannot change the result.
+    let mut counts = std::collections::BTreeMap::new();
+    for b in common::read_all(&p.dir().join("agg")) {
+        let q = common::str_col(&b, "query");
+        let n = b
+            .column_by_name("count")
+            .expect("count column")
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .expect("count is UInt64");
         for i in 0..b.num_rows() {
-            seen.push(q.value(i).to_string());
+            *counts.entry(q.value(i).to_string()).or_insert(0u64) += n.value(i);
         }
     }
-    seen.sort();
-    assert_eq!(seen, ["a.example", "b.example"], "aggregated groups");
+    let expected = std::collections::BTreeMap::from([
+        ("a.example".to_string(), 2u64),
+        ("b.example".to_string(), 1u64),
+    ]);
+    assert_eq!(counts, expected, "aggregated counts per query");
 
     // The same aggregate table went to S3 as well.
     assert!(
         s3.put_keys().iter().any(|k| k.starts_with("agg_s3/")),
-        "aggregate S3 target got nothing: {:?}",
-        s3.put_keys()
+        "aggregate S3 target got nothing: {:?}\n{}",
+        s3.put_keys(),
+        p.logs()
     );
 
     let logs = p.logs();
