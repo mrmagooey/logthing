@@ -82,10 +82,11 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // Start CPU profiling if requested. No-op unless LOGTHING_PROFILE_SECS is
-    // set; warns if set on a binary built without the `pprof` feature.
-    logthing::profiling::maybe_start(Some(Box::new(|| {
+    // set; warns if set on a binary built without the `pprof` feature. The activity
+    // counter used to judge representativeness is LOGTHING_PROFILE_ACTIVITY_METRIC.
+    logthing::profiling::maybe_start(Some(Box::new(|name: &str| {
         let handle = logthing::server::METRICS_HANDLE.get()?;
-        logthing::profiling::parse_counter(&handle.render(), logthing::profiling::ACTIVITY_METRIC)
+        logthing::profiling::parse_counter(&handle.render(), name)
     })));
 
     let shared_config = Arc::new(RwLock::new(config.clone()));

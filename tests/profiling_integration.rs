@@ -56,7 +56,7 @@ async fn sampler_attributes_cpu_burned_on_a_different_thread() {
 
     // The guard is built by the spawned sampler task. The burner runs on a
     // *different* OS thread entirely, which is the property under test.
-    logthing::profiling::maybe_start(Some(Box::new(|| Some(0))));
+    logthing::profiling::maybe_start(Some(Box::new(|_: &str| Some(0))));
 
     let keep_burning = Arc::new(AtomicBool::new(true));
     let burner_flag = Arc::clone(&keep_burning);
@@ -104,6 +104,7 @@ async fn sampler_attributes_cpu_burned_on_a_different_thread() {
     // even though real samples were collected. Pin that the artifacts still
     // get written (asserted above) alongside an honest, non-true verdict,
     // rather than the verdict silently going unchecked.
+    assert_eq!(meta["activity_metric"], "parquet_s3_records_written");
     assert_eq!(
         meta["representative"], false,
         "constant-zero probe should make this run unrepresentative"

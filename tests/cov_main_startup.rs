@@ -103,6 +103,34 @@ fn test_unusable_spool_directory_stops_startup() {
 }
 
 #[test]
+fn test_invalid_profile_activity_metric_warns_and_startup_continues() {
+    let (_guard, under) = blocker();
+    let toml = format!(
+        "bind_address = \"127.0.0.1:{}\"\n[tls]\nenabled = false\n[syslog]\nenabled = false\n\
+         [spool]\ndir = \"{under}\"\n",
+        common::free_port()
+    );
+    let prof = tempfile::tempdir().unwrap();
+    let r = run_until_exit(
+        &toml,
+        &[
+            ("LOGTHING_PROFILE_SECS", "1"),
+            ("LOGTHING_PROFILE_DIR", prof.path().to_str().unwrap()),
+            ("LOGTHING_PROFILE_ACTIVITY_METRIC", "bad-name"),
+        ],
+    );
+    let all = format!("{}{}", r.stdout, r.stderr);
+    // Startup got past the profiling hook and failed later, at the (unusable) spool.
+    assert!(all.contains("opening spool at"), "{all}");
+    assert!(
+        all.contains("LOGTHING_PROFILE_ACTIVITY_METRIC is not a valid metric name"),
+        "{all}"
+    );
+    #[cfg(not(feature = "pprof"))]
+    assert!(all.contains("built without the `pprof` feature"), "{all}");
+}
+
+#[test]
 fn test_http_port_already_taken_fails_with_a_nonzero_exit() {
     let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = held.local_addr().unwrap().port();
