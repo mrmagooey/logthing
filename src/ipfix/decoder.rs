@@ -4216,20 +4216,23 @@ mod tests {
     fn test_varlen_record_missing_its_length_byte_is_dropped_earlier_records_kept() {
         let (_dec, exporter, export_time) = varlen_test_ctx();
         let fields = vec![varlen_field(97), varlen_field(98)];
-        // Record 1: two empty values. Record 2: first value (1 byte), then no length byte.
-        let body = [0x00, 0x00, 0x01, 0xAA];
+        // Record 1: values AA and BBCC. Record 2: first value (1 byte), then no length byte.
+        let body = [0x01, 0xAA, 0x02, 0xBB, 0xCC, 0x01, 0xDD];
         let records = parse_varlen_records(&fields, &body, 256, exporter, 0, export_time, 100);
         assert_eq!(records.len(), 1);
+        assert_eq!(records[0].extra["ie97"], "aa");
+        assert_eq!(records[0].extra["ie98"], "bbcc");
     }
 
     #[test]
     fn test_varlen_record_with_truncated_long_length_is_dropped_earlier_records_kept() {
         let (_dec, exporter, export_time) = varlen_test_ctx();
         let fields = vec![varlen_field(97)];
-        // Record 1: empty value. Record 2: 255 escape, but only one length byte follows.
-        let body = [0x00, 0xFF];
+        // Record 1: value AA. Record 2: 255 escape, but only one length byte follows.
+        let body = [0x01, 0xAA, 0xFF, 0x00];
         let records = parse_varlen_records(&fields, &body, 256, exporter, 0, export_time, 100);
         assert_eq!(records.len(), 1);
+        assert_eq!(records[0].extra["ie97"], "aa");
     }
 
     fn options_template_body_with(id: u16, scope_len: u16) -> Vec<u8> {
@@ -4295,6 +4298,26 @@ mod tests {
                 }
             ),
             "got {err}"
+        );
+    }
+
+    #[test]
+    fn test_read_helpers_report_offset_overflow_as_malformed() {
+        let overflow = |e: DecodeError| match e {
+            DecodeError::Malformed { reason } => reason,
+            other => panic!("expected Malformed, got {other}"),
+        };
+        assert_eq!(
+            overflow(read_u16_be(&[], usize::MAX).unwrap_err()),
+            "offset overflow"
+        );
+        assert_eq!(
+            overflow(read_u32_be(&[0; 4], usize::MAX - 1).unwrap_err()),
+            "offset overflow"
+        );
+        assert_eq!(
+            overflow(read_bytes(&[0; 4], usize::MAX, 2).unwrap_err()),
+            "offset overflow"
         );
     }
 }

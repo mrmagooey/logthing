@@ -1367,7 +1367,8 @@ mod tests {
     /// hosts without IPv6 loopback.
     #[tokio::test]
     async fn reuseport_ipv6_socket_is_tracked_via_proc_net_udp6() {
-        if UdpSocket::bind("[::1]:0").await.is_err() {
+        if let Err(e) = UdpSocket::bind("[::1]:0").await {
+            eprintln!("skipping: ::1 not bindable: {e}");
             return;
         }
         let sock = bind_udp_reuseport_with_recv_buffer(&"[::1]:0".parse().unwrap(), None, "cov6")
