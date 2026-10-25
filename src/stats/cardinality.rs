@@ -1345,7 +1345,9 @@ mod tests {
 
         // A `false` value is a change notification but not a shutdown request.
         tx.send(false).unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
         assert!(!handle.is_finished(), "ticker must survive a false signal");
         assert_eq!(gauge_value(&snapshotter, "field_distinct_values"), 0.0);
 

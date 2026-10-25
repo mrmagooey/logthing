@@ -665,9 +665,16 @@ other_metric 999
         crate::test_support::install_and_clear();
         // Process env is shared: this is the only test that sets this variable, and it is
         // removed again before the assertions.
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("LOGTHING_PROFILE_SECS") };
+            }
+        }
         unsafe { std::env::set_var("LOGTHING_PROFILE_SECS", "7") };
+        let guard = EnvGuard;
         maybe_start(Some(Box::new(|| Some(1))));
-        unsafe { std::env::remove_var("LOGTHING_PROFILE_SECS") };
+        drop(guard);
         let warnings = crate::test_support::captured_events_at(tracing::Level::WARN);
         assert!(
             warnings
