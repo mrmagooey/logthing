@@ -245,4 +245,19 @@ mod tests {
         assert_eq!(decode_delimiter("^\r"), '^');
         assert_eq!(decode_delimiter("\t"), '\t');
     }
+
+    #[test]
+    fn test_leef_2_0_without_delimiter_field_defaults_to_tab_and_no_attributes() {
+        let rec = try_parse(&msg("LEEF:2.0|V|P|1|E")).expect("must parse");
+        assert_eq!(rec.delimiter, Some('\t'));
+        assert!(rec.attributes.is_empty());
+    }
+
+    #[test]
+    fn test_leef_2_0_literal_first_char_delimiter_without_pipe() {
+        let rec = try_parse(&msg("LEEF:2.0|V|P|1|E|^src=1^dst=2")).expect("must parse");
+        assert_eq!(rec.delimiter, Some('^'));
+        assert_eq!(rec.attributes.get("src").map(String::as_str), Some("1"));
+        assert_eq!(rec.attributes.get("dst").map(String::as_str), Some("2"));
+    }
 }

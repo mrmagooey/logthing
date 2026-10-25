@@ -182,4 +182,25 @@ mod tests {
         assert_eq!(rec.fields.get("syscall").map(String::as_str), Some("59"));
         assert!(!rec.fields.contains_key("garbage"));
     }
+
+    #[test]
+    fn test_trailing_spaces_after_last_pair_are_ignored() {
+        let rec = try_parse(&msg("type=LOGIN msg=audit(1:2): pid=7   ")).expect("must parse");
+        assert_eq!(rec.fields.len(), 1);
+        assert_eq!(rec.fields.get("pid").map(String::as_str), Some("7"));
+    }
+
+    #[test]
+    fn test_trailing_bare_token_without_equals_is_dropped() {
+        let rec = try_parse(&msg("type=LOGIN msg=audit(1:2): pid=7 dangling")).expect("must parse");
+        assert_eq!(rec.fields.len(), 1);
+        assert_eq!(rec.fields.get("pid").map(String::as_str), Some("7"));
+    }
+
+    #[test]
+    fn test_key_with_equals_at_end_of_body_gets_empty_value() {
+        let rec = try_parse(&msg("type=LOGIN msg=audit(1:2): pid=7 res=")).expect("must parse");
+        assert_eq!(rec.fields.get("pid").map(String::as_str), Some("7"));
+        assert_eq!(rec.fields.get("res").map(String::as_str), Some(""));
+    }
 }

@@ -2994,4 +2994,481 @@ mod tests {
         assert_eq!(msgs.len(), 1, "got {msgs:?}");
         assert_eq!(msgs[0].app_name.as_deref(), Some("sshd"));
     }
+
+    // -- Coverage: inline single-socket / batched / fan-out paths, start(), framing edges --
+
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+
+    /// Sum of every counter named `name` (optionally restricted to a `protocol` label).
+    fn cov_counter(snap: &Snapshotter, name: &str, protocol: Option<&str>) -> u64 {
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| {
+                let key = ck.key();
+                if key.name() != name {
+                    return None;
+                }
+                if let Some(p) = protocol
+                    && !key
+                        .labels()
+                        .any(|l| l.key() == "protocol" && l.value() == p)
+                {
+                    return None;
+                }
+                match v {
+                    DebugValue::Counter(c) => Some(c),
+                    _ => None,
+                }
+            })
+            .sum()
+    }
+
+    /// Poll `cond` every 10 ms until it holds; panic after 5 s.
+    async fn cov_wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Re-send `payload` until `cond` holds: the listener may not have bound yet, and UDP
+    /// to an unbound port is silently lost.
+    async fn cov_send_until(
+        client: &UdpSocket,
+        dest: SocketAddr,
+        payload: &[u8],
+        mut cond: impl FnMut() -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            client.send_to(payload, dest).await.unwrap();
+            for _ in 0..5 {
+                if cond() {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for UDP datagram to be processed"
+            );
+        }
+    }
+
+    fn cov_message_count(handler: &CapturingHandler) -> usize {
+        handler.messages.lock().unwrap().len()
+    }
+
+    type CovListener = (
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        SocketAddr,
+        SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        Arc<CapturingHandler>,
+    );
+
+    /// `start_with_shutdown` on ephemeral loopback ports.
+    async fn cov_start(
+        recv_tasks: usize,
+        recv_batch_size: usize,
+        allowed: Option<IpWhitelist>,
+    ) -> CovListener {
+        let (udp_port, tcp_port) = alloc_udp_tcp_ports_for_tests().await;
+        let config = SyslogListenerConfig {
+            udp_port,
+            tcp_port,
+            bind_address: "127.0.0.1".to_string(),
+            parse_dns_logs: false,
+            recv_tasks,
+            recv_batch_size,
+            ..SyslogListenerConfig::default()
+        };
+        let handler = CapturingHandler::new();
+        let mut listener = SyslogListener::new(config, handler.clone());
+        if let Some(ips) = allowed {
+            listener = listener.with_allowed_ips(ips);
+        }
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { listener.start_with_shutdown(rx).await });
+        (
+            task,
+            format!("127.0.0.1:{udp_port}").parse().unwrap(),
+            format!("127.0.0.1:{tcp_port}").parse().unwrap(),
+            tx,
+            handler,
+        )
+    }
+
+    /// Connect, retrying until the listener has bound its TCP port.
+    async fn cov_connect(addr: SocketAddr) -> tokio::net::TcpStream {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(s) => return s,
+                Err(e) => {
+                    assert!(std::time::Instant::now() < deadline, "connect failed: {e}");
+                    sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    }
+
+    /// A `false` shutdown value must be ignored; `true` must end the listener cleanly.
+    async fn cov_stop(
+        task: tokio::task::JoinHandle<anyhow::Result<()>>,
+        tx: &tokio::sync::watch::Sender<bool>,
+    ) {
+        tx.send(false).unwrap();
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            !task.is_finished(),
+            "a false shutdown value must not stop the listener"
+        );
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("listener must stop after shutdown")
+            .unwrap()
+            .unwrap();
+    }
+
+    const COV_VALID: &[u8] = b"<134>Jan 15 10:30:45 host app: hello";
+    const COV_GARBAGE: &[u8] = b"not a valid syslog message";
+
+    /// Delivery, parse errors and allowed_ips rejection (UDP and TCP) for one configuration.
+    async fn cov_run_variant(recv_tasks: usize, recv_batch_size: usize) {
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        crate::test_support::install_and_clear();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Phase 1: no allow-list. A valid datagram is delivered, garbage is a parse error.
+        let (task, udp, _tcp, tx, handler) = cov_start(recv_tasks, recv_batch_size, None).await;
+        cov_send_until(&client, udp, COV_VALID, || cov_message_count(&handler) >= 1).await;
+        cov_send_until(&client, udp, COV_GARBAGE, || {
+            cov_counter(&snap, "syslog_parse_errors", None) >= 1
+        })
+        .await;
+        {
+            let msgs = handler.messages.lock().unwrap();
+            assert_eq!(msgs[0].app_name.as_deref(), Some("app"));
+            assert_eq!(msgs[0].message, "hello");
+            assert!(
+                msgs.iter().all(|m| m.message == "hello"),
+                "garbage must not dispatch"
+            );
+        }
+        assert!(cov_counter(&snap, "syslog_messages_received", None) >= 2);
+        cov_stop(task, &tx).await;
+
+        // Phase 2: allow-list excludes loopback. Nothing is dispatched; both rejections count.
+        let allow = IpWhitelist::new(vec!["10.99.99.0/24".into()]).unwrap();
+        let (task, udp, tcp, tx, handler) =
+            cov_start(recv_tasks, recv_batch_size, Some(allow)).await;
+        cov_send_until(&client, udp, COV_VALID, || {
+            cov_counter(&snap, "listener_source_rejected", Some("syslog_udp")) >= 1
+        })
+        .await;
+        let mut stream = cov_connect(tcp).await;
+        let _ = stream.write_all(COV_VALID).await;
+        cov_wait_for("TCP rejection", || {
+            cov_counter(&snap, "listener_source_rejected", Some("syslog_tcp")) >= 1
+        })
+        .await;
+        assert_eq!(
+            cov_message_count(&handler),
+            0,
+            "rejected sources must not dispatch"
+        );
+        drop(stream);
+        cov_stop(task, &tx).await;
+    }
+
+    #[tokio::test]
+    async fn test_inline_single_recv_delivers_rejects_and_counts_parse_errors() {
+        cov_run_variant(1, 1).await;
+    }
+
+    #[tokio::test]
+    async fn test_inline_batched_recv_delivers_rejects_and_counts_parse_errors() {
+        cov_run_variant(1, 32).await;
+    }
+
+    #[tokio::test]
+    async fn test_fan_out_single_recv_delivers_rejects_and_counts_parse_errors() {
+        cov_run_variant(4, 1).await;
+    }
+
+    #[tokio::test]
+    async fn test_fan_out_batched_recv_delivers_rejects_and_counts_parse_errors() {
+        cov_run_variant(4, 32).await;
+    }
+
+    /// Fill the connection semaphore, then one more connection must be dropped and counted.
+    async fn cov_assert_connection_limit(addr: SocketAddr, snap: &Snapshotter) -> Vec<TcpStream> {
+        let mut held = Vec::with_capacity(MAX_SYSLOG_TCP_CONNECTIONS);
+        for _ in 0..MAX_SYSLOG_TCP_CONNECTIONS {
+            held.push(cov_connect(addr).await);
+        }
+        let mut extra = cov_connect(addr).await;
+        cov_wait_for("over-limit rejection", || {
+            cov_counter(snap, "syslog_tcp_connections_rejected", None) >= 1
+        })
+        .await;
+        let mut sink = Vec::new();
+        let n = tokio::time::timeout(Duration::from_secs(5), extra.read_to_end(&mut sink))
+            .await
+            .expect("rejected connection must be closed by the server")
+            .unwrap_or(0);
+        assert_eq!(n, 0);
+        assert_eq!(
+            cov_counter(snap, "syslog_tcp_connections_rejected", None),
+            1
+        );
+        held
+    }
+
+    async fn cov_connection_limit_variant(recv_tasks: usize, recv_batch_size: usize) {
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let (task, _udp, tcp, tx, _handler) = cov_start(recv_tasks, recv_batch_size, None).await;
+        let held = cov_assert_connection_limit(tcp, &snap).await;
+        drop(held);
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .expect("listener must stop after shutdown")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_inline_single_recv_rejects_connection_over_limit() {
+        cov_connection_limit_variant(1, 1).await;
+    }
+
+    #[tokio::test]
+    async fn test_inline_batched_recv_rejects_connection_over_limit() {
+        cov_connection_limit_variant(1, 32).await;
+    }
+
+    #[tokio::test]
+    async fn test_fan_out_accept_loop_rejects_connection_over_limit() {
+        cov_connection_limit_variant(4, 32).await;
+    }
+
+    #[tokio::test]
+    async fn test_run_with_listener_rejects_connection_over_limit() {
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+        let listener =
+            SyslogListener::new(SyslogListenerConfig::default(), CapturingHandler::new());
+        let task = tokio::spawn(async move {
+            listener.run_with_listener(tcp_listener).await.ok();
+        });
+        let held = cov_assert_connection_limit(addr, &snap).await;
+        drop(held);
+        task.abort();
+    }
+
+    /// `start()` (no shutdown signal) on ephemeral ports.
+    async fn cov_start_plain(
+        allowed: Option<IpWhitelist>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        SocketAddr,
+        Arc<CapturingHandler>,
+    ) {
+        let (udp_port, tcp_port) = alloc_udp_tcp_ports_for_tests().await;
+        let config = SyslogListenerConfig {
+            udp_port,
+            tcp_port,
+            bind_address: "127.0.0.1".to_string(),
+            parse_dns_logs: false,
+            ..SyslogListenerConfig::default()
+        };
+        let handler = CapturingHandler::new();
+        let mut listener = SyslogListener::new(config, handler.clone());
+        if let Some(ips) = allowed {
+            listener = listener.with_allowed_ips(ips);
+        }
+        let task = tokio::spawn(async move {
+            listener.start().await.ok();
+        });
+        (
+            task,
+            format!("127.0.0.1:{udp_port}").parse().unwrap(),
+            handler,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_start_udp_delivers_valid_and_counts_parse_errors() {
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        crate::test_support::install_and_clear();
+        let (task, udp, handler) = cov_start_plain(None).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        cov_send_until(&client, udp, COV_VALID, || cov_message_count(&handler) >= 1).await;
+        cov_send_until(&client, udp, COV_GARBAGE, || {
+            cov_counter(&snap, "syslog_parse_errors", None) >= 1
+        })
+        .await;
+        assert!(
+            handler
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|m| m.message == "hello")
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_start_udp_rejects_source_outside_allowed_ips() {
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let allow = IpWhitelist::new(vec!["10.99.99.0/24".into()]).unwrap();
+        let (task, udp, handler) = cov_start_plain(Some(allow)).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        cov_send_until(&client, udp, COV_VALID, || {
+            cov_counter(&snap, "listener_source_rejected", Some("syslog_udp")) >= 1
+        })
+        .await;
+        assert_eq!(cov_message_count(&handler), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_start_returns_ok_and_logs_when_udp_bind_fails() {
+        crate::test_support::install_and_clear();
+        let (_udp_port, tcp_port) = alloc_udp_tcp_ports_for_tests().await;
+        let blocker = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let config = SyslogListenerConfig {
+            udp_port: blocker.local_addr().unwrap().port(),
+            tcp_port,
+            bind_address: "127.0.0.1".to_string(),
+            ..SyslogListenerConfig::default()
+        };
+        let listener = SyslogListener::new(config, CapturingHandler::new());
+        tokio::time::timeout(Duration::from_secs(5), listener.start())
+            .await
+            .expect("start must return once a listener fails")
+            .expect("start swallows listener errors");
+        let events = crate::test_support::captured_events();
+        assert!(
+            events.iter().any(|e| e.contains("UDP listener error")),
+            "expected UDP listener error log, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_returns_ok_and_logs_when_tcp_bind_fails() {
+        crate::test_support::install_and_clear();
+        let (udp_port, _tcp_port) = alloc_udp_tcp_ports_for_tests().await;
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = SyslogListenerConfig {
+            udp_port,
+            tcp_port: blocker.local_addr().unwrap().port(),
+            bind_address: "127.0.0.1".to_string(),
+            ..SyslogListenerConfig::default()
+        };
+        let listener = SyslogListener::new(config, CapturingHandler::new());
+        tokio::time::timeout(Duration::from_secs(5), listener.start())
+            .await
+            .expect("start must return once a listener fails")
+            .expect("start swallows listener errors");
+        let events = crate::test_support::captured_events();
+        assert!(
+            events.iter().any(|e| e.contains("TCP listener error")),
+            "expected TCP listener error log, got {events:?}"
+        );
+    }
+
+    // -- TCP framing edge cases --
+
+    #[tokio::test]
+    async fn test_tcp_crlf_terminated_line_is_trimmed() {
+        let msgs = run_frames(b"<134>Jan 15 10:30:45 host app: crlf\r\n").await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].message, "crlf");
+    }
+
+    #[tokio::test]
+    async fn test_tcp_blank_line_is_skipped() {
+        let msgs = run_frames(b"\n\r\n<134>Jan 15 10:30:45 host app: after blank\n").await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].message, "after blank");
+    }
+
+    #[tokio::test]
+    async fn test_tcp_ambiguous_prefix_then_eof_is_one_unframed_line() {
+        crate::test_support::install_and_clear();
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let msgs = run_frames(b"12").await;
+        let received = cov_counter(&snap, "syslog_messages_received", None);
+        assert_eq!(received, 1, "the 2-byte tail must be treated as a line");
+        let parsed = cov_counter(&snap, "syslog_parse_errors", None);
+        assert_eq!(parsed as usize + msgs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_octet_frame_cut_short_closes_without_dispatch() {
+        crate::test_support::install_and_clear();
+        let msgs = run_frames(b"50 <134>Jan 15 10:30:45 host app: short").await;
+        assert!(msgs.is_empty());
+        let events = crate::test_support::captured_events();
+        assert!(
+            events.iter().any(|e| e.contains("cut short")),
+            "expected truncated-frame warning, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tcp_connection_reset_logs_read_error_and_ends() {
+        crate::test_support::install_and_clear();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, src) = listener.accept().await.unwrap();
+        // SO_LINGER=0 turns the close into a RST, so the server's read fails with ECONNRESET.
+        socket2::SockRef::from(&client)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(client);
+
+        let handler = CapturingHandler::new();
+        SyslogListener::handle_tcp_connection(
+            server,
+            src,
+            handler.clone(),
+            Duration::from_secs(5),
+            Vec::new(),
+            None,
+            never_shutdown(),
+        )
+        .await
+        .unwrap();
+        assert!(handler.take_messages().is_empty());
+        let events = crate::test_support::captured_events();
+        assert!(
+            events.iter().any(|e| e.contains("TCP read error")),
+            "expected read-error log, got {events:?}"
+        );
+    }
 }
