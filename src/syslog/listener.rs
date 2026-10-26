@@ -204,9 +204,11 @@ impl SyslogHandler for DefaultSyslogHandler {
     }
 }
 
-/// Wraps any inner `SyslogHandler` (e.g. the S3 raw-persistence handler),
-/// invokes it first, then runs payload dispatch and forwards matched records
-/// to the structured sink.  Used in `main.rs` when both raw S3 persistence
+/// Wraps any inner `SyslogHandler` (e.g. the S3 raw-persistence handler).
+///
+/// When `parse_payloads` is set, the structured record is built first while the message is still
+/// borrowed; the message is then moved (not cloned) into the inner handler, which runs before the
+/// record is forwarded to the structured sink.  Used in `main.rs` when both raw S3 persistence
 /// and structured persistence are configured.
 pub struct PayloadDispatchingHandler<H: SyslogHandler> {
     pub inner: Arc<H>,
@@ -217,30 +219,36 @@ pub struct PayloadDispatchingHandler<H: SyslogHandler> {
 #[async_trait::async_trait]
 impl<H: SyslogHandler + 'static> SyslogHandler for PayloadDispatchingHandler<H> {
     async fn handle_message(&self, message: SyslogMessage, source: SocketAddr) {
-        self.inner.handle_message(message.clone(), source).await;
-        if self.parse_payloads {
+        // Build the structured record while we still borrow `message`, then move the message
+        // into `inner` (no deep clone). `payload::dispatch` must run whenever `parse_payloads`
+        // is set -- even with no structured handle -- because it increments the
+        // `syslog_payload_parsed` metric. The inner handler still runs before the structured
+        // `try_send`; only record construction moved earlier (so `received_at` is receipt time,
+        // taken before any inner backpressure wait). A single `inner` call site is deliberate:
+        // `stats::cardinality` pins the raw inner-call count in this file.
+        let rec = if self.parse_payloads {
             let p = payload::dispatch(&message);
-            if let Some(rec) =
-                payload::StructuredSyslogRecord::from_syslog_and_payload(&message, &p)
-                && let Some(h) = &self.structured_handle
-            {
-                match h.try_send(rec) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        // Safe to share DropSite::StructuredSyslog with the
-                        // DefaultSyslogHandler call site above even though
-                        // the message text differs: main.rs wires
-                        // DefaultSyslogHandler and PayloadDispatchingHandler
-                        // as mutually exclusive, so only one of the two ever
-                        // runs against a given `structured_handle`.
-                        if let Some(dropped_total) =
-                            h.drop_log_due(DropSite::StructuredSyslog, DropKind::from(&e))
-                        {
-                            tracing::warn!(
-                                dropped_total,
-                                "structured_syslog channel full; dropped"
-                            );
-                        }
+            payload::StructuredSyslogRecord::from_syslog_and_payload(&message, &p)
+        } else {
+            None
+        };
+        self.inner.handle_message(message, source).await;
+        if let Some(rec) = rec
+            && let Some(h) = &self.structured_handle
+        {
+            match h.try_send(rec) {
+                Ok(()) => {}
+                Err(e) => {
+                    // Safe to share DropSite::StructuredSyslog with the
+                    // DefaultSyslogHandler call site above even though
+                    // the message text differs: main.rs wires
+                    // DefaultSyslogHandler and PayloadDispatchingHandler
+                    // as mutually exclusive, so only one of the two ever
+                    // runs against a given `structured_handle`.
+                    if let Some(dropped_total) =
+                        h.drop_log_due(DropSite::StructuredSyslog, DropKind::from(&e))
+                    {
+                        tracing::warn!(dropped_total, "structured_syslog channel full; dropped");
                     }
                 }
             }
@@ -3400,6 +3408,228 @@ mod tests {
         assert!(
             events.iter().any(|e| e.contains("TCP read error")),
             "expected read-error log, got {events:?}"
+        );
+    }
+
+    // -- PayloadDispatchingHandler: move-not-clone ------------------------------------------
+
+    use crate::forwarding::structured_syslog_s3::StructuredS3Handler;
+    use crate::syslog::payload::StructuredSyslogRecord;
+
+    fn cef_message() -> SyslogMessage {
+        SyslogMessage::parse(
+            "<134>Jan 15 10:30:45 loadgen-host loadgen: CEF:0|Loadgen|SyntheticFirewall|1.0|100|\
+             Synthetic Blocked Connection|5|src=10.0.0.1 dst=10.1.0.1 spt=1024 dpt=443 cnt=1",
+        )
+        .expect("cef message must parse")
+    }
+
+    fn plain_message() -> SyslogMessage {
+        SyslogMessage::parse(
+            "<134>Jan 15 10:30:45 loadgen-host loadgen[4242]: synthetic load-test message #1",
+        )
+        .expect("plain message must parse")
+    }
+
+    fn test_source() -> SocketAddr {
+        "127.0.0.1:5514".parse().unwrap()
+    }
+
+    fn as_json(m: &SyslogMessage) -> serde_json::Value {
+        serde_json::to_value(m).unwrap()
+    }
+
+    /// Inner handler that records what it was handed, and how many records were already queued on
+    /// the structured channel at the moment it ran.
+    struct Probe {
+        ptrs: Mutex<Vec<usize>>,
+        msgs: Mutex<Vec<serde_json::Value>>,
+        log: Arc<Mutex<Vec<String>>>,
+        /// A clone of the structured channel's sender, used only to read its queue depth.
+        depth_tx: Option<tokio::sync::mpsc::Sender<StructuredSyslogRecord>>,
+    }
+
+    impl Probe {
+        fn new(
+            log: Arc<Mutex<Vec<String>>>,
+            depth_tx: Option<tokio::sync::mpsc::Sender<StructuredSyslogRecord>>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                ptrs: Mutex::new(Vec::new()),
+                msgs: Mutex::new(Vec::new()),
+                log,
+                depth_tx,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SyslogHandler for Probe {
+        async fn handle_message(&self, message: SyslogMessage, _source: SocketAddr) {
+            self.ptrs
+                .lock()
+                .unwrap()
+                .push(message.message.as_ptr() as usize);
+            self.msgs.lock().unwrap().push(as_json(&message));
+            let queued = self
+                .depth_tx
+                .as_ref()
+                .map(|t| t.max_capacity() - t.capacity())
+                .unwrap_or(0);
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("inner:queued={queued}"));
+        }
+    }
+
+    type DispatchRig = (
+        PayloadDispatchingHandler<Probe>,
+        Arc<Probe>,
+        tokio::sync::mpsc::Receiver<StructuredSyslogRecord>,
+        Arc<Mutex<Vec<String>>>,
+    );
+
+    /// `(handler, probe, structured receiver, log)` wired like main.rs: Probe as `inner`.
+    fn dispatch_rig(parse_payloads: bool, with_structured: bool, capacity: usize) -> DispatchRig {
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let probe = Probe::new(log.clone(), Some(tx.clone()));
+        let structured = with_structured
+            .then(|| Arc::new(StructuredS3Handler::for_test(tx, "syslog", "structured")));
+        let handler = PayloadDispatchingHandler {
+            inner: probe.clone(),
+            parse_payloads,
+            structured_handle: structured,
+        };
+        (handler, probe, rx, log)
+    }
+
+    #[tokio::test]
+    async fn test_payload_dispatching_moves_message_to_inner() {
+        for parse in [true, false] {
+            for msg in [plain_message(), cef_message()] {
+                let (handler, probe, _rx, _log) = dispatch_rig(parse, true, 16);
+                let ptr = msg.message.as_ptr() as usize;
+                handler.handle_message(msg, test_source()).await;
+                assert_eq!(
+                    probe.ptrs.lock().unwrap().as_slice(),
+                    &[ptr],
+                    "inner must receive the original allocation (parse_payloads={parse})"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_payload_dispatching_inner_receives_unmodified_message() {
+        for parse in [true, false] {
+            for msg in [plain_message(), cef_message()] {
+                let (handler, probe, _rx, _log) = dispatch_rig(parse, true, 16);
+                let expected = as_json(&msg);
+                handler.handle_message(msg, test_source()).await;
+                let got = probe.msgs.lock().unwrap().clone();
+                assert_eq!(got, vec![expected], "parse_payloads={parse}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_payload_dispatching_structured_record_matches_from_syslog_and_payload() {
+        let (handler, _probe, mut rx, _log) = dispatch_rig(true, true, 16);
+        let msg = cef_message();
+        let expected = {
+            let p = payload::dispatch(&msg);
+            StructuredSyslogRecord::from_syslog_and_payload(&msg, &p).expect("cef yields a record")
+        };
+        let before = chrono::Utc::now();
+        handler.handle_message(msg, test_source()).await;
+        let after = chrono::Utc::now();
+
+        let got = rx.try_recv().expect("structured record must be sent");
+        assert!(rx.try_recv().is_err(), "exactly one record");
+        assert_eq!(got.priority, expected.priority);
+        assert_eq!(got.severity, expected.severity);
+        assert_eq!(got.facility, expected.facility);
+        assert_eq!(got.timestamp, expected.timestamp);
+        assert_eq!(got.hostname, expected.hostname);
+        assert_eq!(got.app_name, expected.app_name);
+        assert_eq!(got.payload_type, expected.payload_type);
+        assert_eq!(got.parsed, expected.parsed);
+        // received_at is receipt time, taken before the inner await; only bound it.
+        assert!(got.received_at >= before && got.received_at <= after);
+    }
+
+    #[tokio::test]
+    async fn test_payload_dispatching_sends_nothing_when_parse_payloads_false() {
+        let (handler, probe, mut rx, _log) = dispatch_rig(false, true, 16);
+        handler.handle_message(cef_message(), test_source()).await;
+        assert_eq!(probe.ptrs.lock().unwrap().len(), 1, "inner still runs");
+        assert!(
+            rx.try_recv().is_err(),
+            "no structured record when parse_payloads=false"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_payload_dispatching_plain_message_sends_no_record_when_parse_true() {
+        let (handler, probe, mut rx, _log) = dispatch_rig(true, true, 16);
+        handler.handle_message(plain_message(), test_source()).await;
+        assert_eq!(probe.ptrs.lock().unwrap().len(), 1);
+        assert!(rx.try_recv().is_err(), "unmatched payload yields no record");
+    }
+
+    #[tokio::test]
+    async fn test_payload_dispatching_inner_runs_before_structured_send() {
+        let (handler, _probe, mut rx, log) = dispatch_rig(true, true, 16);
+        handler.handle_message(cef_message(), test_source()).await;
+        // At the moment inner ran, nothing had been queued yet...
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &["inner:queued=0".to_string()]
+        );
+        // ...and the record arrived afterwards.
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_payload_dispatching_counts_payload_metric_without_structured_handle() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        // parse_payloads=true but no structured handle: dispatch must still run.
+        let (handler, _probe, _rx, _log) = dispatch_rig(true, false, 16);
+        handler.handle_message(cef_message(), test_source()).await;
+        let total = |snap: metrics_util::debugging::Snapshot| -> u64 {
+            snap.into_vec()
+                .into_iter()
+                .filter(|(k, ..)| k.key().name() == "syslog_payload_parsed")
+                .map(|(_, _, _, v)| match v {
+                    DebugValue::Counter(c) => c,
+                    _ => 0,
+                })
+                .sum()
+        };
+        assert_eq!(total(snapshotter.snapshot()), 1);
+
+        // parse_payloads=false: dispatch must NOT run, counter unchanged.
+        let (handler, _probe, _rx, _log) = dispatch_rig(false, false, 16);
+        handler.handle_message(cef_message(), test_source()).await;
+        assert_eq!(total(snapshotter.snapshot()), 1);
+    }
+
+    #[tokio::test]
+    async fn test_payload_dispatching_full_channel_drops_record_but_inner_still_runs() {
+        let (handler, probe, mut rx, _log) = dispatch_rig(true, true, 1);
+        handler.handle_message(cef_message(), test_source()).await;
+        handler.handle_message(cef_message(), test_source()).await; // channel full: dropped
+        assert_eq!(probe.ptrs.lock().unwrap().len(), 2, "inner ran for both");
+        assert!(rx.try_recv().is_ok());
+        assert!(
+            rx.try_recv().is_err(),
+            "second record was dropped, not queued"
         );
     }
 }

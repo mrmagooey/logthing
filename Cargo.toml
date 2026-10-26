@@ -257,3 +257,7 @@ harness = false
 [[bench]]
 name = "hec_parse_event_body"
 harness = false
+
+[[bench]]
+name = "syslog_payload_dispatch"
+harness = false
