@@ -6,10 +6,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+mod scan;
+
 type SdElements = HashMap<String, HashMap<String, String>>;
 type StructuredData = Option<SdElements>;
 
 // --- Module-level static regexes (compiled once per process) ---
+//
+// See `scan` for why the regexes remain as the non-ASCII fallback.
 
 /// RFC 5424 header: <priority>version timestamp hostname app-name procid msgid [sd] msg
 static RFC5424_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -266,18 +270,16 @@ impl SyslogMessage {
         // RFC 3164 §4.3.3 default when PRI is missing: facility=user(1), severity=notice(5).
         const DEFAULT_PRIORITY: u8 = (1 << 3) | 5;
 
-        if let Some(caps) = RFC3164_NOPRI_RE.captures(input) {
+        if let Some(header) = Self::split_header(input, false) {
             let priority = DEFAULT_PRIORITY;
             let severity = priority & 0x07;
             let facility = (priority >> 3) & 0x1f;
 
-            let timestamp_str = caps.get(1)?.as_str();
-            let timestamp = Self::parse_rfc3164_timestamp(timestamp_str);
+            let timestamp = Self::parse_rfc3164_timestamp(header.timestamp);
 
-            let hostname = Some(caps.get(2)?.as_str().to_string());
+            let hostname = Some(header.hostname.to_string());
 
-            let rest = caps.get(3)?.as_str();
-            let (app_name, proc_id, message) = Self::split_tag_or_payload(rest);
+            let (app_name, proc_id, message) = Self::split_tag_or_payload(header.rest);
 
             return Some(SyslogMessage {
                 priority,
@@ -348,6 +350,36 @@ impl SyslogMessage {
             return None;
         }
         Some((&inner[..digits], inner[digits..].strip_prefix('>')?))
+    }
+
+    /// Split an RFC 3164 line into `[<pri>] timestamp hostname rest`: byte scanner for ASCII input,
+    /// the original `RFC3164_RE` / `RFC3164_NOPRI_RE` when a non-ASCII byte is reached.
+    fn split_header(input: &str, with_pri: bool) -> Option<scan::Header<'_>> {
+        match scan::header(input, with_pri) {
+            Ok(h) => Some(h),
+            Err(scan::Miss::NoMatch) => None,
+            Err(scan::Miss::Fallback) => Self::split_header_regex(input, with_pri),
+        }
+    }
+
+    fn split_header_regex(input: &str, with_pri: bool) -> Option<scan::Header<'_>> {
+        if with_pri {
+            let caps = RFC3164_RE.captures(input)?;
+            Some(scan::Header {
+                pri: Some(caps.get(1)?.as_str()),
+                timestamp: caps.get(2)?.as_str(),
+                hostname: caps.get(3)?.as_str(),
+                rest: caps.get(4)?.as_str(),
+            })
+        } else {
+            let caps = RFC3164_NOPRI_RE.captures(input)?;
+            Some(scan::Header {
+                pri: None,
+                timestamp: caps.get(1)?.as_str(),
+                hostname: caps.get(2)?.as_str(),
+                rest: caps.get(3)?.as_str(),
+            })
+        }
     }
 
     /// Parse the `<PRI>` digits; `None` when above 191 (the maximum valid PRI, 23 * 8 + 7).
@@ -427,20 +459,17 @@ impl SyslogMessage {
         // RFC 3164 format: <priority>timestamp hostname tag[pid]: message
         // Example: <34>Oct 11 22:14:15 mymachine su: 'su root' failed
 
-        let caps = RFC3164_RE.captures(input)?;
+        let header = Self::split_header(input, true)?;
 
-        let priority = Self::parse_pri(caps.get(1)?.as_str())?;
+        let priority = Self::parse_pri(header.pri?)?;
         let severity = priority & 0x07;
         let facility = (priority >> 3) & 0x1f;
 
-        let timestamp_str = caps.get(2)?.as_str();
-        let timestamp = Self::parse_rfc3164_timestamp(timestamp_str);
+        let timestamp = Self::parse_rfc3164_timestamp(header.timestamp);
 
-        let hostname = Some(caps.get(3)?.as_str().to_string());
+        let hostname = Some(header.hostname.to_string());
 
-        let rest = caps.get(4)?.as_str();
-
-        let (app_name, proc_id, message) = Self::split_tag_or_payload(rest);
+        let (app_name, proc_id, message) = Self::split_tag_or_payload(header.rest);
 
         Some(SyslogMessage {
             priority,
@@ -475,7 +504,21 @@ impl SyslogMessage {
     /// RFC 5424 messages are unaffected: they carry a full date and explicit
     /// offset and are parsed unambiguously by `parse_rfc5424`.
     fn parse_rfc3164_timestamp(ts_str: &str) -> Option<DateTime<Utc>> {
-        // RFC 3164 uses: "Oct 11 22:14:15" format (no year)
+        match scan::timestamp(ts_str) {
+            Ok(p) => Self::timestamp_from_parts(
+                scan::month_number(p.month)?,
+                p.day,
+                p.hour,
+                p.minute,
+                p.second,
+            ),
+            Err(scan::Miss::NoMatch) => None,
+            Err(scan::Miss::Fallback) => Self::parse_rfc3164_timestamp_regex(ts_str),
+        }
+    }
+
+    /// Original regex implementation; used only when `scan` meets a non-ASCII byte.
+    fn parse_rfc3164_timestamp_regex(ts_str: &str) -> Option<DateTime<Utc>> {
         let caps = RFC3164_TS_RE.captures(ts_str)?;
 
         let month_str = caps.get(1)?.as_str();
@@ -499,18 +542,40 @@ impl SyslogMessage {
             "dec" => 12,
             _ => return None,
         };
+        Self::timestamp_from_parts(month, day, hour, minute, second)
+    }
 
-        // Assume current year
+    /// Build the UTC timestamp for a year-less RFC 3164 date (current year, see
+    /// `parse_rfc3164_timestamp`).
+    fn timestamp_from_parts(
+        month: u32,
+        day: u32,
+        hour: u32,
+        minute: u32,
+        second: u32,
+    ) -> Option<DateTime<Utc>> {
         let year = Utc::now().year();
         let naive_date = NaiveDate::from_ymd_opt(year, month, day)?;
         let naive_datetime = naive_date.and_hms_opt(hour, minute, second)?;
-
         Some(DateTime::from_naive_utc_and_offset(naive_datetime, Utc))
     }
 
     /// Parse RFC 3164 tag and extract app_name, proc_id, and message
     fn parse_rfc3164_tag(rest: &str) -> (Option<String>, Option<String>, String) {
         // Tag format: "tag[pid]: " or "tag: "
+        match scan::tag(rest) {
+            Ok(t) => (
+                Some(t.name.to_string()),
+                t.pid.map(str::to_string),
+                t.message.to_string(),
+            ),
+            Err(scan::Miss::NoMatch) => (None, None, rest.to_string()),
+            Err(scan::Miss::Fallback) => Self::parse_rfc3164_tag_regex(rest),
+        }
+    }
+
+    /// Original regex implementation; used only when `scan` meets a non-ASCII byte.
+    fn parse_rfc3164_tag_regex(rest: &str) -> (Option<String>, Option<String>, String) {
         if let Some(caps) = RFC3164_TAG_RE.captures(rest) {
             let app_name = Some(caps.get(1).unwrap().as_str().to_string());
             let proc_id = caps.get(2).map(|m| m.as_str().to_string());
@@ -730,6 +795,9 @@ pub mod dns {
         }
     }
 }
+
+#[cfg(test)]
+mod differential_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1267,5 +1335,63 @@ mod tests {
 
         m.message = "nothing dns related".to_string();
         assert!(dns::DnsLogEntry::from_syslog(&m).is_none());
+    }
+
+    #[test]
+    fn test_parse_rfc3164_unicode_digit_timestamp_keeps_message_with_no_timestamp() {
+        let m = SyslogMessage::parse("<34>Oct 1\u{663} 22:14:15 host app: hello").unwrap();
+        assert!(m.timestamp.is_none());
+        assert_eq!(m.hostname.as_deref(), Some("host"));
+        assert_eq!(m.app_name.as_deref(), Some("app"));
+        assert_eq!(m.message, "hello");
+        assert!(matches!(m.protocol, SyslogProtocol::Rfc3164));
+    }
+
+    #[test]
+    fn test_parse_rfc3164_impossible_date_keeps_message_with_no_timestamp() {
+        let m = SyslogMessage::parse("<34>Feb 30 10:30:45 host app: hi").unwrap();
+        assert!(m.timestamp.is_none());
+        assert_eq!(m.app_name.as_deref(), Some("app"));
+        assert_eq!(m.message, "hi");
+        let m = SyslogMessage::parse("<34>Oct 11 25:30:45 host app: hi").unwrap();
+        assert!(m.timestamp.is_none());
+    }
+
+    #[test]
+    fn test_parse_rfc3164_empty_pid_is_not_a_tag() {
+        let m = SyslogMessage::parse("<34>Oct 11 22:14:15 host app[]: hi").unwrap();
+        assert_eq!(m.app_name, None);
+        assert_eq!(m.proc_id, None);
+        assert_eq!(m.message, "app[]: hi");
+    }
+
+    #[test]
+    fn test_parse_rfc3164_newline_inside_separator_run_still_parses() {
+        let m = SyslogMessage::parse("<34>Oct 11 22:14:15 host \nbody").unwrap();
+        assert_eq!(m.hostname.as_deref(), Some("host"));
+        assert_eq!(m.message, "body");
+        assert!(matches!(m.protocol, SyslogProtocol::Rfc3164));
+    }
+
+    #[test]
+    fn test_parse_rfc3164_newline_in_rest_falls_back_to_pri_only() {
+        let m = SyslogMessage::parse("<34>Oct 11 22:14:15 host a\nb").unwrap();
+        assert_eq!(m.hostname, None);
+        assert_eq!(m.message, "Oct 11 22:14:15 host a\nb");
+        assert!(matches!(m.protocol, SyslogProtocol::Unknown));
+    }
+
+    #[test]
+    fn test_parse_rfc3164_cr_mid_line_is_not_special() {
+        let m = SyslogMessage::parse("<34>Oct 11 22:14:15 host app: a\rb").unwrap();
+        assert_eq!(m.app_name.as_deref(), Some("app"));
+        assert_eq!(m.message, "a\rb");
+    }
+
+    #[test]
+    fn test_parse_rfc3164_unicode_whitespace_after_hostname_is_a_separator() {
+        let m = SyslogMessage::parse("<34>Oct 11 22:14:15 host\u{A0}app: hi").unwrap();
+        assert_eq!(m.hostname.as_deref(), Some("host"));
+        assert_eq!(m.app_name.as_deref(), Some("app"));
     }
 }
