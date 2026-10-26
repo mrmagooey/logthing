@@ -514,6 +514,14 @@ mod tests {
     }
 
     #[test]
+    fn test_header_no_pri_non_ascii_hostname_falls_back() {
+        assert_eq!(
+            header("Jan 15 10:30:45 h\u{E9}st x", false).unwrap_err(),
+            Miss::Fallback
+        );
+    }
+
+    #[test]
     fn test_header_non_ascii_only_in_rest_is_matched_without_fallback() {
         let h = header("<1>Jan 15 10:30:45 host x\u{E9}\u{663}", true).unwrap();
         assert_eq!(h.rest, "x\u{E9}\u{663}");
