@@ -147,6 +147,10 @@ pub fn parse_ndjson_body(
 const MAX_PRESIZE_RECORDS: usize = 1024;
 
 /// Allocate the result Vec for a newline-delimited body: `min(newline_count + 1, 1024)` slots.
+///
+/// Trade-off: the cap bounds the reservation to ~1024 * `size_of::<GenericRecord>()` per request
+/// (itself bounded overall by the request concurrency limit). Counting only non-blank lines was
+/// rejected because it needs a slower pre-pass.
 fn presized_records(text: &str) -> Vec<GenericRecord> {
     let lines = text.bytes().filter(|&b| b == b'\n').count() + 1;
     Vec::with_capacity(lines.min(MAX_PRESIZE_RECORDS))
@@ -581,7 +585,8 @@ mod tests {
     #[test]
     fn hec_event_error_on_later_line_discards_earlier_records() {
         let body = b"{\"event\":1}\n{\"sourcetype\":\"t\"}\n";
-        assert!(parse_hec_event_body(body, "t").is_err());
+        let err = parse_hec_event_body(body, "t").unwrap_err();
+        assert_eq!(err.to_string(), "HEC envelope missing required 'event' key");
     }
 
     #[test]
@@ -590,8 +595,8 @@ mod tests {
         let records = parse_hec_event_body(body.as_bytes(), "t").unwrap();
         assert_eq!(records.len(), 100);
         assert!(
-            (100..=101).contains(&records.capacity()),
-            "capacity {} should be pre-sized to ~100 (base grows to 128)",
+            records.capacity() >= 100 && records.capacity() < 128,
+            "capacity {} should be pre-sized to ~100 (an unsized Vec grows to 128)",
             records.capacity()
         );
     }
