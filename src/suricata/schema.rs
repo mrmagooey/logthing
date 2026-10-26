@@ -50,6 +50,8 @@ pub(crate) struct EnvelopeAccumulator {
     b_src_ip: StringBuilder,
     b_payload: StringBuilder,
     b_partition_time: TimestampMicrosecondBuilder,
+    /// Payload serialization buffer, cleared per record and reused across them.
+    payload_buf: Vec<u8>,
     rows: usize,
 }
 
@@ -66,6 +68,7 @@ impl EnvelopeAccumulator {
             b_partition_time: TimestampMicrosecondBuilder::new().with_data_type(
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             ),
+            payload_buf: Vec::new(),
             rows: 0,
         }
     }
@@ -76,13 +79,16 @@ impl EnvelopeAccumulator {
     /// logic either way, so there is exactly one place that knows how a
     /// `SuricataRecord` becomes an envelope row.
     fn append_envelope_value(&mut self, record: &SuricataRecord) {
-        let src_ip = record
-            .fields
-            .get("src_ip")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        // Borrowed from the record: no per-row String for the column.
+        let src_ip = record.fields.get("src_ip").and_then(|v| v.as_str());
         let received_at = record.received_at.timestamp_micros();
-        let payload = record.fields.to_string();
+        // Same bytes as `record.fields.to_string()` (Value's Display is `to_writer`), written
+        // into a buffer reused across records.
+        self.payload_buf.clear();
+        // Infallible: a Value has only string keys and writing into a Vec cannot fail.
+        serde_json::to_writer(&mut self.payload_buf, &record.fields)
+            .expect("a JSON Value serializes into a Vec");
+        let payload = String::from_utf8_lossy(&self.payload_buf);
         // Suricata has no event-carried timestamp, so `received_at` is both the
         // event and the receipt instant. Routed through the shared helper (rather
         // than assigned directly) so every sink derives `partition_time` via one
@@ -94,7 +100,7 @@ impl EnvelopeAccumulator {
 
         self.b_event_type.append_value(&record.event_type);
         self.b_received_at.append_value(received_at);
-        self.b_src_ip.append_option(src_ip.as_deref());
+        self.b_src_ip.append_option(src_ip);
         self.b_payload.append_value(&payload);
         self.b_partition_time
             .append_value(partition_time.timestamp_micros());
@@ -110,6 +116,7 @@ impl EnvelopeAccumulator {
             Arc::new(self.b_partition_time.finish()),
         ];
         self.rows = 0;
+        self.payload_buf.clear();
         Ok(RecordBatch::try_new(envelope_schema(), columns)?)
     }
 }
@@ -517,5 +524,115 @@ mod tests {
             .unwrap();
         assert_eq!(event_types.value(0), "flow");
         assert_eq!(event_types.value(1), "dns");
+    }
+
+    /// The pre-fix extraction, verbatim: owned `src_ip`, `fields.to_string()` payload.
+    fn old_src_ip_and_payload(record: &SuricataRecord) -> (Option<String>, String) {
+        let src_ip = record
+            .fields
+            .get("src_ip")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        (src_ip, record.fields.to_string())
+    }
+
+    fn parity_records() -> Vec<SuricataRecord> {
+        let nested = serde_json::json!({
+            "event_type": "alert", "src_ip": "10.0.0.1",
+            "alert": {"sig": "q\"\\\n\t\u{e9}\u{1F600}", "n": [1, 2.5, null, {"a": []}]},
+            "big": 18_446_744_073_709_551_615_u64, "tiny": 1.0e-7, "huge": 1e300,
+            "empty": {}, "nul": null,
+        });
+        let fields = vec![
+            nested,
+            serde_json::json!({"event_type": "dns"}), // src_ip absent
+            serde_json::json!({"src_ip": null}),      // null
+            serde_json::json!({"src_ip": 5}),         // number
+            serde_json::json!({"src_ip": ""}),        // empty string
+            serde_json::json!({"src_ip": "caf\u{e9}::1\u{1F600}"}), // non-ASCII
+            serde_json::json!({"src_ip": ["10.0.0.1"]}), // array
+            serde_json::json!({}),                    // empty object
+            serde_json::json!(5),                     // non-object payloads
+            serde_json::json!("just a string"),
+            serde_json::json!([1, {"src_ip": "10.0.0.2"}]),
+            serde_json::json!(null),
+        ];
+        fields
+            .into_iter()
+            .map(|f| SuricataRecord {
+                event_type: "alert".to_string(),
+                fields: f,
+                received_at: Utc::now(),
+            })
+            .collect()
+    }
+
+    fn string_values(batch: &RecordBatch, name: &str) -> Vec<Option<String>> {
+        use arrow::array::Array;
+        let a = batch
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        (0..a.len())
+            .map(|i| (!a.is_null(i)).then(|| a.value(i).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn envelope_src_ip_and_payload_match_the_pre_fix_extraction_byte_for_byte() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+        let records = parity_records();
+        let (want_ip, want_payload): (Vec<_>, Vec<_>) =
+            records.iter().map(old_src_ip_and_payload).unzip();
+
+        // One accumulator, every record: catches a stale reused payload buffer.
+        let mut acc = EnvelopeAccumulator::new();
+        for r in &records {
+            assert!(acc.try_append(r, Utc::now()).unwrap());
+        }
+        let batch = acc.finish().unwrap();
+        assert_eq!(string_values(&batch, "src_ip"), want_ip);
+        assert_eq!(
+            string_values(&batch, "payload"),
+            want_payload.iter().cloned().map(Some).collect::<Vec<_>>()
+        );
+
+        // And the single-record wrapper, per record.
+        for (r, (ip, payload)) in records.iter().zip(want_ip.iter().zip(&want_payload)) {
+            let b = map_envelope(r).unwrap();
+            assert_eq!(
+                string_values(&b, "src_ip"),
+                vec![ip.clone()],
+                "{}",
+                r.fields
+            );
+            assert_eq!(string_values(&b, "payload"), vec![Some(payload.clone())]);
+        }
+    }
+
+    #[test]
+    fn envelope_accumulator_reuse_after_finish_does_not_leak_previous_payload() {
+        use crate::forwarding::buffered_writer::RecordBatchAccumulator;
+        let mut acc = EnvelopeAccumulator::new();
+        let big = SuricataRecord {
+            event_type: "alert".to_string(),
+            fields: serde_json::json!({"x": "a".repeat(2000)}),
+            received_at: Utc::now(),
+        };
+        acc.try_append(&big, Utc::now()).unwrap();
+        acc.finish().unwrap();
+        let small = SuricataRecord {
+            event_type: "dns".to_string(),
+            fields: serde_json::json!({"y": 1}),
+            received_at: Utc::now(),
+        };
+        acc.try_append(&small, Utc::now()).unwrap();
+        let b = acc.finish().unwrap();
+        assert_eq!(
+            string_values(&b, "payload"),
+            vec![Some("{\"y\":1}".to_string())]
+        );
     }
 }
