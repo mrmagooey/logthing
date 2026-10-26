@@ -24,20 +24,20 @@ pub fn parse_hec_event_body(
     let body = body.strip_prefix(UTF8_BOM).unwrap_or(body);
     let text = std::str::from_utf8(body)?;
     let now = Utc::now();
-    let mut records = Vec::new();
+    let mut records = presized_records(text);
 
     for line in text.split('\n') {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let obj: serde_json::Value = serde_json::from_str(line)
+        let mut obj: serde_json::Value = serde_json::from_str(line)
             .map_err(|e| anyhow::Error::new(e).context("HEC envelope JSON parse error"))?;
 
         let event = obj
-            .get("event")
+            .get_mut("event")
             .ok_or_else(|| anyhow::anyhow!("HEC envelope missing required 'event' key"))?
-            .clone();
+            .take();
 
         let sourcetype = obj
             .get("sourcetype")
@@ -60,7 +60,10 @@ pub fn parse_hec_event_body(
             .get("index")
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        let indexed_fields = obj.get("fields").filter(|v| v.is_object()).cloned();
+        let indexed_fields = obj
+            .get_mut("fields")
+            .filter(|v| v.is_object())
+            .map(serde_json::Value::take);
 
         records.push(GenericRecord {
             sourcetype,
@@ -138,6 +141,20 @@ pub fn parse_ndjson_body(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Upper bound on the records reserved up front from a body's newline count. A body of bare
+/// newlines (up to the HEC body limit) must not be able to drive a large allocation.
+const MAX_PRESIZE_RECORDS: usize = 1024;
+
+/// Allocate the result Vec for a newline-delimited body: `min(newline_count + 1, 1024)` slots.
+///
+/// Trade-off: the cap bounds the reservation to ~1024 * `size_of::<GenericRecord>()` per request
+/// (itself bounded overall by the request concurrency limit). Counting only non-blank lines was
+/// rejected because it needs a slower pre-pass.
+fn presized_records(text: &str) -> Vec<GenericRecord> {
+    let lines = text.bytes().filter(|&b| b == b'\n').count() + 1;
+    Vec::with_capacity(lines.min(MAX_PRESIZE_RECORDS))
+}
 
 /// UTF-8 byte-order mark some Windows forwarders prepend to a request body.
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
@@ -475,5 +492,125 @@ mod tests {
         assert!(raw.source.is_none() && raw.index.is_none() && raw.indexed_fields.is_none());
         let nd = parse_ndjson_body(b"{\"a\":1}\n", "t").unwrap();
         assert!(nd[0].source.is_none() && nd[0].index.is_none());
+    }
+
+    // ---- fix 1: take() instead of clone, capped pre-size ----
+
+    fn hec_lines(n: usize) -> String {
+        (0..n)
+            .map(|i| format!(r#"{{"event":{{"i":{i}}},"sourcetype":"t"}}"#))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn hec_event_full_envelope_parses_to_exact_record() {
+        let body = br#"{"event":{"action":"login","user":{"name":"alice","groups":["a","b"]},"n":null},"sourcetype":"audit","host":"srv1","time":1700000000,"source":"/var/log/app.log","index":"main","fields":{"env":"prod","nested":{"k":[1,2]}}}"#;
+        let records = parse_hec_event_body(body, "dflt").unwrap();
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert_eq!(r.sourcetype, "audit");
+        assert_eq!(r.host.as_deref(), Some("srv1"));
+        assert_eq!(r.time, Utc.timestamp_opt(1_700_000_000, 0).single());
+        assert_eq!(
+            r.fields,
+            serde_json::json!({
+                "action": "login",
+                "user": {"name": "alice", "groups": ["a", "b"]},
+                "n": null
+            })
+        );
+        assert_eq!(r.source.as_deref(), Some("/var/log/app.log"));
+        assert_eq!(r.index.as_deref(), Some("main"));
+        assert_eq!(
+            r.indexed_fields,
+            Some(serde_json::json!({"env": "prod", "nested": {"k": [1, 2]}}))
+        );
+        assert!(r.event_uuid.is_none());
+    }
+
+    #[test]
+    fn hec_event_non_object_fields_yield_none() {
+        for fields in [r#"["a"]"#, "5", r#""s""#, "null", "true"] {
+            let body = format!(r#"{{"event":{{"x":1}},"fields":{fields}}}"#);
+            let records = parse_hec_event_body(body.as_bytes(), "t").unwrap();
+            assert!(records[0].indexed_fields.is_none(), "fields={fields}");
+            assert_eq!(records[0].fields, serde_json::json!({"x": 1}));
+        }
+    }
+
+    #[test]
+    fn hec_event_empty_object_fields_is_some_empty_object() {
+        let records = parse_hec_event_body(br#"{"event":1,"fields":{}}"#, "t").unwrap();
+        assert_eq!(records[0].indexed_fields, Some(serde_json::json!({})));
+    }
+
+    #[test]
+    fn hec_event_missing_event_error_text_unchanged() {
+        let err = parse_hec_event_body(br#"{"sourcetype":"t"}"#, "t").unwrap_err();
+        assert_eq!(err.to_string(), "HEC envelope missing required 'event' key");
+    }
+
+    #[test]
+    fn hec_event_non_object_envelope_is_missing_event() {
+        for line in ["[1]", "5", r#""s""#, "true"] {
+            let err = parse_hec_event_body(line.as_bytes(), "t").unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "HEC envelope missing required 'event' key",
+                "line={line}"
+            );
+        }
+    }
+
+    #[test]
+    fn hec_event_invalid_json_error_text_unchanged() {
+        let err = parse_hec_event_body(b"not json", "t").unwrap_err();
+        assert_eq!(err.to_string(), "HEC envelope JSON parse error");
+    }
+
+    #[test]
+    fn hec_event_null_event_is_preserved() {
+        let records = parse_hec_event_body(br#"{"event":null}"#, "t").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].fields, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn hec_event_duplicate_event_key_last_wins() {
+        let records = parse_hec_event_body(br#"{"event":{"a":1},"event":{"b":2}}"#, "t").unwrap();
+        assert_eq!(records[0].fields, serde_json::json!({"b": 2}));
+    }
+
+    #[test]
+    fn hec_event_error_on_later_line_discards_earlier_records() {
+        let body = b"{\"event\":1}\n{\"sourcetype\":\"t\"}\n";
+        let err = parse_hec_event_body(body, "t").unwrap_err();
+        assert_eq!(err.to_string(), "HEC envelope missing required 'event' key");
+    }
+
+    #[test]
+    fn hec_event_presize_matches_normal_body() {
+        let body = hec_lines(100);
+        let records = parse_hec_event_body(body.as_bytes(), "t").unwrap();
+        assert_eq!(records.len(), 100);
+        assert!(
+            records.capacity() >= 100 && records.capacity() < 128,
+            "capacity {} should be pre-sized to ~100 (an unsized Vec grows to 128)",
+            records.capacity()
+        );
+    }
+
+    #[test]
+    fn hec_event_presize_is_capped_for_newline_flood() {
+        let mut body = "\n".repeat(100_000);
+        body.push_str(r#"{"event":{"x":1}}"#);
+        let records = parse_hec_event_body(body.as_bytes(), "t").unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(
+            records.capacity() <= MAX_PRESIZE_RECORDS,
+            "capacity {} must not follow the newline count",
+            records.capacity()
+        );
     }
 }
