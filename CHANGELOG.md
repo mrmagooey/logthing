@@ -6,6 +6,12 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
+### Changed
+
+- CI: `performance.yml` (full criterion run + loadgen syslog-udp baseline) now also runs on every
+  `v*` tag push, using the manual-run defaults (10000 rec/s for 60 s). Results are artifacts only;
+  the run does not gate the release.
+
 ## [0.26.0] - 2026-10-26
 
 ### Added
