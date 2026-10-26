@@ -16,6 +16,9 @@ default = ["otlp"]
 kerberos-auth = ["dep:libgssapi"]
 otlp = ["dep:opentelemetry-proto", "dep:prost"]
 pprof = ["dep:pprof"]
+# Install jemalloc as the global allocator (src/main.rs). Always on for musl targets via the
+# target dependencies below; this feature lets gnu hosts/CI build and test the same code path.
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 
 [dependencies]
 # Async runtime
@@ -149,6 +152,15 @@ pprof = { version = "0.14", default-features = false, features = [
     "flamegraph",
     "protobuf-codec",
 ], optional = true }
+tikv-jemallocator = { version = "0.6", optional = true }
+# stats feature: the allocator unit test reads stats.allocated.
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
+
+# musl's system malloc is slow under the multi-threaded ingest path; every musl build gets
+# jemalloc with no flag. (The same crates are also the optional dependencies behind `jemalloc`.)
+[target.'cfg(target_env = "musl")'.dependencies]
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 
 [dev-dependencies]
 tempfile = "3.9"

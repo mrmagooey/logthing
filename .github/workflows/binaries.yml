@@ -50,6 +50,45 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # jemalloc is linked automatically on every musl target (target dependency in Cargo.toml).
+      # aarch64 kernels use 4K or 64K pages; a 64 KiB jemalloc page size is valid on both.
+      - name: Set jemalloc page size (aarch64 only)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> "$GITHUB_ENV"
+
+      # Guard, part 1: build exactly as the action below does (same target/profile/bin; no
+      # --locked or extra env is configured for the action) and fail the job BEFORE anything is
+      # uploaded if jemalloc is not linked. The action's own build then hits cargo's cache.
+      #
+      # upload-rust-binary-action does not install zig itself: with build-tool: cargo-zigbuild it
+      # runs `pip3 install cargo-zigbuild` only if cargo-zigbuild is missing from PATH, and it
+      # adds --locked only when its `locked:` input is true (it is not set). Installing both here
+      # means the action reuses this zig. Pinned to the version this guard was tested with. The
+      # action exports CARGO_PROFILE_RELEASE_STRIP=debuginfo, so the guard build sets the same
+      # to match it and let the action hit cargo's cache; the post-action re-check below is the
+      # authoritative guard. The check scans string literals (release binaries have no symbol
+      # table).
+      - name: Install zig (guard build)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-zigbuild (guard build)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Guard - build and assert jemalloc is linked
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: debuginfo
+        run: |
+          cargo zigbuild --release --target ${{ matrix.target }} --bin logthing
+          scripts/check-jemalloc-symbols.sh target/${{ matrix.target }}/release/logthing
+
+      - name: Guard - start the x86_64 binary and assert allocator=jemalloc
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: scripts/check-jemalloc-symbols.sh target/${{ matrix.target }}/release/logthing --run
+
       - name: Build static binary and attach to release
         uses: taiki-e/upload-rust-binary-action@v1
         with:
@@ -69,3 +108,7 @@ jobs:
           # cross-compile without a release to upload to.
           dry-run: ${{ !startsWith(github.ref, 'refs/tags/') }}
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Guard, part 2: the binary the action actually built must still contain jemalloc.
+      - name: Guard - re-check the built binary
+        run: scripts/check-jemalloc-symbols.sh target/${{ matrix.target }}/release/logthing
