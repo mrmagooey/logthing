@@ -278,9 +278,23 @@ pub(super) fn header(input: &str, with_pri: bool) -> Result<Header<'_>, Miss> {
     })
 }
 
+/// Necessary condition for `RFC5424_RE` (`^<(\d{1,3})>(\d)\s+...`): `<`, 1-3 digits, `>`, one
+/// digit, then whitespace. Returns `false` only when ASCII bytes prove the regex cannot match;
+/// a non-ASCII byte in the checked prefix returns `true` so the regex decides.
+pub(super) fn may_be_rfc5424(input: &str) -> bool {
+    fn prefix(c: &mut Cursor) -> Result<(), Miss> {
+        c.expect(b'<')?;
+        c.digits(1, 3)?;
+        c.expect(b'>')?;
+        c.digits(1, 1)?;
+        c.ws(1)
+    }
+    prefix(&mut Cursor::new(input)) != Err(Miss::NoMatch)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Miss, header, month_number, tag, timestamp};
+    use super::{Miss, header, may_be_rfc5424, month_number, tag, timestamp};
 
     fn ts(s: &str) -> Result<(Option<u32>, u32, u32, u32, u32), Miss> {
         timestamp(s).map(|p| (month_number(p.month), p.day, p.hour, p.minute, p.second))
@@ -525,5 +539,37 @@ mod tests {
     fn test_header_non_ascii_only_in_rest_is_matched_without_fallback() {
         let h = header("<1>Jan 15 10:30:45 host x\u{E9}\u{663}", true).unwrap();
         assert_eq!(h.rest, "x\u{E9}\u{663}");
+    }
+
+    #[test]
+    fn test_precheck_accepts_rfc5424_prefixes() {
+        assert!(may_be_rfc5424("<34>1 2003-10-11T22:14:15.003Z h a - - - m"));
+        assert!(may_be_rfc5424("<1>1 - h a - - -"));
+        assert!(may_be_rfc5424("<165>9\t- h a - - -"));
+        assert!(may_be_rfc5424("<165>1\n- h a - - -"));
+        assert!(may_be_rfc5424("<165>1\u{0B}x"));
+    }
+
+    #[test]
+    fn test_precheck_rejects_rfc3164_and_other_lines() {
+        assert!(!may_be_rfc5424("<134>Jan 15 10:30:45 host app: msg"));
+        assert!(!may_be_rfc5424("Jan 15 10:30:45 host app: msg"));
+        assert!(!may_be_rfc5424("<1000>1 - h a - - -")); // 4-digit PRI
+        assert!(!may_be_rfc5424("<>1 - h")); // no PRI digits
+        assert!(!may_be_rfc5424("<34>12 - h")); // two-digit version
+        assert!(!may_be_rfc5424("<34>1")); // no whitespace after version
+        assert!(!may_be_rfc5424("<34>1-")); // no whitespace after version
+        assert!(!may_be_rfc5424("<34"));
+        assert!(!may_be_rfc5424(""));
+        assert!(!may_be_rfc5424("CEF:0|a|b"));
+    }
+
+    #[test]
+    fn test_precheck_never_skips_when_a_non_ascii_byte_decides() {
+        assert!(may_be_rfc5424("<\u{663}>1 - h a - - -")); // Unicode digit in PRI
+        assert!(may_be_rfc5424("<34>\u{663} - h a - - -")); // Unicode digit version
+        assert!(may_be_rfc5424("<34>1\u{A0}- h a - - -")); // Unicode whitespace after version
+        assert!(may_be_rfc5424("<34>1\u{85}x"));
+        assert!(may_be_rfc5424("\u{E9}"));
     }
 }
