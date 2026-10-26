@@ -13,10 +13,7 @@ type StructuredData = Option<SdElements>;
 
 // --- Module-level static regexes (compiled once per process) ---
 //
-// The RFC 3164 header, no-PRI header, timestamp and tag regexes are only the NON-ASCII
-// FALLBACK: `scan` handles every ASCII input exactly and returns `Miss::Fallback` when a
-// non-ASCII byte could change the Unicode `\d`/`\s`/`\S` outcome. They must stay byte-for-byte
-// what `scan` is equivalent to.
+// See `scan` for why the regexes remain as the non-ASCII fallback.
 
 /// RFC 5424 header: <priority>version timestamp hostname app-name procid msgid [sd] msg
 static RFC5424_RE: LazyLock<Regex> = LazyLock::new(|| {

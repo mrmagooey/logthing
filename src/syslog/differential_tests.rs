@@ -1,5 +1,5 @@
-//! Differential test: the RFC 3164 scanners (and the RFC 5424 pre-check) must produce exactly
-//! the same `Option<SyslogMessage>` as the original regex pipeline for every input.
+//! Differential test: the RFC 3164 scanners must produce exactly the same
+//! `Option<SyslogMessage>` as the original regex pipeline for every input.
 //!
 //! `oracle` is a verbatim copy of the pre-scanner `SyslogMessage::parse` pipeline (5424, 3164,
 //! no-PRI, CEF/LEEF, `<PRI>`-only fallback). It reuses `parse_rfc5424`, `split_pri_prefix` and
@@ -551,8 +551,9 @@ fn check_file_contents(path: &Path, bytes: &[u8]) {
     }
 }
 
-/// Committed seeds and regressions (`fuzz/seeds/syslog*`, `fuzz/regressions/syslog*`; the latter
-/// may not exist) and the local-only gitignored `fuzz/corpus/syslog` (skipped with a note when absent).
+/// Committed seeds and regressions (`fuzz/seeds/syslog*`, `fuzz/regressions/syslog*`; the
+/// latter may not exist) and the local-only gitignored `fuzz/corpus/syslog` (skipped if
+/// absent).
 fn replay_fuzz_inputs() -> usize {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz");
     let mut replayed = 0;

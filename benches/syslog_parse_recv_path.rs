@@ -49,10 +49,10 @@
 //!   matches `dispatch`'s first sub-parser via a fast prefix check.
 //!
 //! Allocation counts: before criterion runs, `main` prints `ALLOC <case> allocs_per_record=..
-//! bytes_per_record=..` lines measured by a counting `#[global_allocator]` that counts only while a flag is
-//! set (one relaxed load per allocation otherwise). Realloc counts as one allocation of the new size.
-//! Cases added for the RFC 3164 hand-rolled parser work: no-PRI 3164, RFC 5424 with structured data, a
-//! `<PRI>`-only fallback line, and a garbage line that parses to `None`.
+//! bytes_per_record=..` lines measured by a counting allocator that records only while
+//! enabled (one relaxed load per allocation otherwise). Realloc counts as one allocation
+//! of the new size.
+//! Cases: no-PRI 3164, RFC 5424 structured, `<PRI>`-only, garbage.
 //! Run with: `cargo bench --bench syslog_parse_recv_path`
 
 use criterion::{Criterion, Throughput, criterion_group};
@@ -265,7 +265,8 @@ fn print_alloc_counts() {
     let bytes = build_raw_message(1).into_bytes();
     let (allocs, b) = measure(|| recv_path(&bytes), ITERS);
     println!(
-        "ALLOC combined/utf8_lossy_parse_dispatch allocs_per_record={allocs:.2} bytes_per_record={b:.1}"
+        "ALLOC combined/utf8_lossy_parse_dispatch allocs_per_record={allocs:.2} \
+         bytes_per_record={b:.1}"
     );
 }
 
