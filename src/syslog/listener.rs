@@ -3556,7 +3556,7 @@ mod tests {
         assert_eq!(got.app_name, expected.app_name);
         assert_eq!(got.payload_type, expected.payload_type);
         assert_eq!(got.parsed, expected.parsed);
-        // received_at is receipt time; only bound it (Revision 2: taken before the inner await).
+        // received_at is receipt time, taken before the inner await; only bound it.
         assert!(got.received_at >= before && got.received_at <= after);
     }
 
