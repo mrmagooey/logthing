@@ -6,8 +6,12 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
+## [0.26.1] - 2026-10-26
+
 ### Changed
 
+- Analytics stack default image pins move to 0.26.1 for both logthing and the committer (still in
+  lockstep); Helm chart version 0.2.7.
 - CI: `performance.yml` (full criterion run + loadgen syslog-udp baseline) now also runs on every
   `v*` tag push, using the manual-run defaults (10000 rec/s for 60 s). Results are artifacts only;
   the run does not gate the release.
