@@ -253,3 +253,7 @@ strip = false
 [[bench]]
 name = "otlp_record_batch"
 harness = false
+
+[[bench]]
+name = "syslog_payload_dispatch"
+harness = false
