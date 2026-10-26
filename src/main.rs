@@ -17,6 +17,13 @@ use tracing::{error, info, warn};
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// jemalloc's compiled-in default options, read at allocator init.
+/// Measured (perf fix 3): lower and steadier peak RSS than jemalloc's defaults, CPU within noise
+/// of the untuned config. `_RJEM_MALLOC_CONF` at runtime still overrides.
+#[cfg(any(feature = "jemalloc", target_env = "musl"))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static MALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+
 /// Name of the global allocator this binary was built with, logged once at startup so a release
 /// artifact's allocator is observable (`allocator=jemalloc` on every musl build).
 const ALLOCATOR: &str = if cfg!(any(feature = "jemalloc", target_env = "musl")) {
@@ -1117,6 +1124,14 @@ mod jemalloc_tests {
             "jemalloc stats.allocated grew by {} bytes (before {before}, after {after}); \
              jemalloc is not the global allocator",
             after.saturating_sub(before)
+        );
+    }
+
+    #[test]
+    fn test_tuned_malloc_conf_is_active() {
+        assert!(
+            tikv_jemalloc_ctl::opt::background_thread::read().expect("opt.background_thread"),
+            "compiled-in malloc_conf did not enable background_thread"
         );
     }
 }
