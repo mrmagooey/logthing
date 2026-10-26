@@ -1825,6 +1825,9 @@ pub fn get_schema_entry(log_path: &str) -> Arc<SchemaEntry> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod reference;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::forwarding::buffered_writer::RecordBatchAccumulator;
