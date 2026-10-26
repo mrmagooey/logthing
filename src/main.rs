@@ -9,6 +9,22 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
+/// jemalloc replaces the system allocator on every musl build (musl's malloc is markedly slower
+/// under this multi-threaded workload) and, for gnu hosts/CI, behind `--features jemalloc`.
+/// Declared in the binary only: the library and its test binaries keep the system allocator
+/// (tests/channel_budget_allocator.rs installs its own counting allocator).
+#[cfg(any(feature = "jemalloc", target_env = "musl"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Name of the global allocator this binary was built with, logged once at startup so a release
+/// artifact's allocator is observable (`allocator=jemalloc` on every musl build).
+const ALLOCATOR: &str = if cfg!(any(feature = "jemalloc", target_env = "musl")) {
+    "jemalloc"
+} else {
+    "system"
+};
+
 fn main() -> anyhow::Result<()> {
     // Install the process-wide rustls `CryptoProvider` before anything else
     // runs. This tree links two rustls-0.23 crypto backends (`aws-lc-rs` and
@@ -72,6 +88,9 @@ async fn async_main() -> anyhow::Result<()> {
     };
 
     info!("Starting logthing v{}", env!("CARGO_PKG_VERSION"));
+    // Plain message text (not a structured field) so `allocator=jemalloc` survives ANSI
+    // colouring in the output; tests and scripts/check-jemalloc-symbols.sh grep for it.
+    info!("allocator={ALLOCATOR}");
     info!("Configuration loaded successfully");
 
     // Startup signal for configurations that are valid but insecure (e.g. HEC
@@ -1050,5 +1069,54 @@ async fn async_main() -> anyhow::Result<()> {
     match exit_error {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ALLOCATOR;
+
+    #[test]
+    fn test_allocator_name_matches_build_configuration() {
+        let expected = if cfg!(any(feature = "jemalloc", target_env = "musl")) {
+            "jemalloc"
+        } else {
+            "system"
+        };
+        assert_eq!(ALLOCATOR, expected);
+    }
+}
+
+/// Only meaningful when jemalloc is the global allocator, i.e. exactly when the
+/// `#[global_allocator]` static above exists.
+#[cfg(all(test, any(feature = "jemalloc", target_env = "musl")))]
+mod jemalloc_tests {
+    use std::hint::black_box;
+    use tikv_jemalloc_ctl::{epoch, stats};
+
+    #[test]
+    fn test_jemalloc_is_global_allocator() {
+        let advance = epoch::mib().expect("epoch mib");
+        let allocated = stats::allocated::mib().expect("stats.allocated mib");
+
+        advance.advance().expect("advance epoch");
+        let before = allocated.read().expect("read allocated");
+
+        let mut buf = vec![0u8; 1 << 20];
+        for i in (0..buf.len()).step_by(4096) {
+            buf[i] = 1; // touch every page so the allocation cannot be elided
+        }
+        let buf = black_box(buf);
+
+        advance.advance().expect("advance epoch");
+        let after = allocated.read().expect("read allocated");
+        drop(buf);
+
+        assert!(
+            after >= before + 512 * 1024,
+            "jemalloc stats.allocated grew by {} bytes (before {before}, after {after}); \
+             jemalloc is not the global allocator",
+            after.saturating_sub(before)
+        );
     }
 }
