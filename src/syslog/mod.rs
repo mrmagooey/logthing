@@ -6,10 +6,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+mod scan;
+
 type SdElements = HashMap<String, HashMap<String, String>>;
 type StructuredData = Option<SdElements>;
 
 // --- Module-level static regexes (compiled once per process) ---
+//
+// The RFC 3164 timestamp and tag regexes are only the NON-ASCII FALLBACK: `scan` handles every
+// ASCII input exactly and returns `Miss::Fallback` when a non-ASCII byte could change the
+// Unicode `\d`/`\s`/`\S` outcome. They must stay byte-for-byte what `scan` is equivalent to.
 
 /// RFC 5424 header: <priority>version timestamp hostname app-name procid msgid [sd] msg
 static RFC5424_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -475,7 +481,21 @@ impl SyslogMessage {
     /// RFC 5424 messages are unaffected: they carry a full date and explicit
     /// offset and are parsed unambiguously by `parse_rfc5424`.
     fn parse_rfc3164_timestamp(ts_str: &str) -> Option<DateTime<Utc>> {
-        // RFC 3164 uses: "Oct 11 22:14:15" format (no year)
+        match scan::timestamp(ts_str) {
+            Ok(p) => Self::timestamp_from_parts(
+                scan::month_number(p.month)?,
+                p.day,
+                p.hour,
+                p.minute,
+                p.second,
+            ),
+            Err(scan::Miss::NoMatch) => None,
+            Err(scan::Miss::Fallback) => Self::parse_rfc3164_timestamp_regex(ts_str),
+        }
+    }
+
+    /// Original regex implementation; used only when `scan` meets a non-ASCII byte.
+    fn parse_rfc3164_timestamp_regex(ts_str: &str) -> Option<DateTime<Utc>> {
         let caps = RFC3164_TS_RE.captures(ts_str)?;
 
         let month_str = caps.get(1)?.as_str();
@@ -499,18 +519,40 @@ impl SyslogMessage {
             "dec" => 12,
             _ => return None,
         };
+        Self::timestamp_from_parts(month, day, hour, minute, second)
+    }
 
-        // Assume current year
+    /// Build the UTC timestamp for a year-less RFC 3164 date (current year, see
+    /// `parse_rfc3164_timestamp`).
+    fn timestamp_from_parts(
+        month: u32,
+        day: u32,
+        hour: u32,
+        minute: u32,
+        second: u32,
+    ) -> Option<DateTime<Utc>> {
         let year = Utc::now().year();
         let naive_date = NaiveDate::from_ymd_opt(year, month, day)?;
         let naive_datetime = naive_date.and_hms_opt(hour, minute, second)?;
-
         Some(DateTime::from_naive_utc_and_offset(naive_datetime, Utc))
     }
 
     /// Parse RFC 3164 tag and extract app_name, proc_id, and message
     fn parse_rfc3164_tag(rest: &str) -> (Option<String>, Option<String>, String) {
         // Tag format: "tag[pid]: " or "tag: "
+        match scan::tag(rest) {
+            Ok(t) => (
+                Some(t.name.to_string()),
+                t.pid.map(str::to_string),
+                t.message.to_string(),
+            ),
+            Err(scan::Miss::NoMatch) => (None, None, rest.to_string()),
+            Err(scan::Miss::Fallback) => Self::parse_rfc3164_tag_regex(rest),
+        }
+    }
+
+    /// Original regex implementation; used only when `scan` meets a non-ASCII byte.
+    fn parse_rfc3164_tag_regex(rest: &str) -> (Option<String>, Option<String>, String) {
         if let Some(caps) = RFC3164_TAG_RE.captures(rest) {
             let app_name = Some(caps.get(1).unwrap().as_str().to_string());
             let proc_id = caps.get(2).map(|m| m.as_str().to_string());
