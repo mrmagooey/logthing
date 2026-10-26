@@ -177,18 +177,27 @@ fn bench_syslog_envelope_parse(c: &mut Criterion) {
 }
 
 /// Benchmark: `payload::dispatch`'s sub-parser try-chain, miss and hit reported separately.
+/// They differ by roughly 3x, so they must not be averaged together, and the direction is
+/// counterintuitive: the *miss* is the cheap case and the *hit* the expensive one. Attempt count
+/// is not what costs; committing to a payload (parsing it, allocating the struct) is.
 fn bench_payload_dispatch(c: &mut Criterion) {
     let all_miss = SyslogMessage::parse(&build_raw_message(1)).expect("must parse");
     let cef_hit = SyslogMessage::parse(&build_cef_message(1)).expect("must parse");
 
     let mut group = c.benchmark_group("payload_dispatch");
     group.throughput(Throughput::Elements(1));
+    // No sub-parser matches, so all seven are attempted and all fail. Despite being the most
+    // attempts this is the cheapest case: every parser rejects on a fast prefix check and nothing
+    // is allocated. This is the shape the default (unstructured) loadgen mode sends.
     group.bench_function("all_miss_seven_parser_attempts", |b| {
         b.iter(|| {
             let payload = payload::dispatch(black_box(&all_miss));
             black_box(payload);
         });
     });
+    // CEF matches on the very first sub-parser, so only one attempt is made, yet this is far more
+    // expensive than seven misses because a match parses the payload and allocates the result.
+    // "Early hit" describes where it matches in the chain, not that it is faster.
     group.bench_function("cef_early_hit", |b| {
         b.iter(|| {
             let payload = payload::dispatch(black_box(&cef_hit));
@@ -207,7 +216,11 @@ fn recv_path(bytes: &[u8]) {
     }
 }
 
-/// Benchmark: the full per-datagram receive-path pipeline on the all-miss wire shape.
+/// Benchmark: the full per-datagram receive-path pipeline on the all-miss wire shape, exactly as
+/// `SyslogListener`'s UDP receive arm runs it. `from_utf8_lossy` costs almost nothing, so the two
+/// component benchmarks should roughly account for this one (a consistency check on all three).
+/// See the module docs for why this figure must not be compared against the whole-process
+/// per-datagram profile number.
 fn bench_combined_recv_path(c: &mut Criterion) {
     let bytes = build_raw_message(1).into_bytes();
 
@@ -264,7 +277,9 @@ criterion_group!(
 );
 
 fn main() {
-    if !std::env::args().any(|a| a == "--list") {
+    // ALLOC lines only for a real run: not for `--list`, nor `--test` / `cargo test --benches`.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--bench") && !args.iter().any(|a| a == "--list" || a == "--test") {
         print_alloc_counts();
     }
     benches();
