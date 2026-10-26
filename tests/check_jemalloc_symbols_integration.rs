@@ -1,5 +1,5 @@
 //! Integration test for `scripts/check-jemalloc-symbols.sh`, the guard `binaries.yml` runs
-//! before and after the release build. It must fail for a binary without jemalloc symbols.
+//! before and after the release build. It must fail for a binary without jemalloc markers.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -25,11 +25,11 @@ fn write_fake(dir: &Path, name: &str, body: &[u8]) -> PathBuf {
 #[test]
 fn test_script_passes_when_jemalloc_symbols_present() {
     let dir = tempfile::tempdir().unwrap();
-    let fake = write_fake(
-        dir.path(),
-        "with",
-        b"\x7fELF\0\0_rjem_malloc_conf\0_rjem_je_malloc\0",
-    );
+    let mut body = b"\x7fELF\0\0/etc/_rjem_malloc.conf\0".to_vec();
+    for i in 0..12 {
+        body.extend_from_slice(format!("<jemalloc>: message {i}\0").as_bytes());
+    }
+    let fake = write_fake(dir.path(), "with", &body);
     let out = run(&[fake.to_str().unwrap()]);
     assert_eq!(
         out.status.code(),
@@ -45,7 +45,20 @@ fn test_script_fails_when_jemalloc_symbols_absent() {
     let fake = write_fake(dir.path(), "without", b"\x7fELF\0\0malloc\0free\0");
     let out = run(&[fake.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("_rjem_"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("_rjem_malloc.conf"));
+}
+
+#[test]
+fn test_script_fails_when_only_the_config_marker_is_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = write_fake(
+        dir.path(),
+        "partial",
+        b"\x7fELF\0\0/etc/_rjem_malloc.conf\0",
+    );
+    let out = run(&[fake.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("<jemalloc>:"));
 }
 
 #[test]
@@ -56,7 +69,7 @@ fn test_script_exits_2_for_missing_file_or_no_argument() {
 
 #[test]
 fn test_script_matches_the_real_binary_allocator() {
-    // Default gnu build: system allocator, no `_rjem_` symbols. `--features jemalloc` (or a musl
+    // Default gnu build: system allocator, no jemalloc markers. `--features jemalloc` (or a musl
     // test build): symbols present AND the binary actually starts and logs allocator=jemalloc.
     let bin = env!("CARGO_BIN_EXE_logthing");
     if cfg!(any(feature = "jemalloc", target_env = "musl")) {

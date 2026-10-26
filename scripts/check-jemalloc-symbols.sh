@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Assert that a built logthing binary embeds jemalloc (tikv-jemallocator prefixes every symbol
-# with `_rjem_`). Used by .github/workflows/binaries.yml before and after the release build so a
+# Assert that a built logthing binary embeds jemalloc. Release binaries carry no symbol table
+# (the release action strips debuginfo and zig's linker strips symbols), so this scans the
+# binary's string literals instead of using nm. Two markers must both be present:
+#   - `_rjem_malloc.conf`, the prefixed config-file path literal from jemalloc's C code
+#   - at least MIN_MSGS `<jemalloc>:` diagnostic messages embedded by jemalloc's C code
+# Measured (strings -a): musl release 1 / 37; gnu --features jemalloc release 3 / 37; default gnu
+# release 0 / 0. A binary using the system allocator has neither. Used by .github/workflows/binaries.yml before and after the release build so a
 # musl artifact without jemalloc fails the job instead of shipping.
 #
 # Usage: scripts/check-jemalloc-symbols.sh <binary> [--run]
-#   <binary>  path to the built executable (cargo's unstripped output)
+#   <binary>  path to the built executable (a release build; symbols are not needed)
 #   --run     also start the binary for up to ~5 s in a scratch directory and require the startup
 #             log line `allocator=jemalloc` (only for binaries that run on this host)
 # Exit: 0 ok, 1 check failed, 2 usage error / missing file.
@@ -18,13 +23,17 @@ if [ -z "$bin" ] || [ ! -f "$bin" ]; then
     exit 2
 fi
 
+MIN_MSGS=10
 # grep -c reads all of strings' output (grep -q would SIGPIPE strings and trip pipefail).
-count=$(strings -a "$bin" | grep -c '_rjem_' || true)
-if [ "$count" -eq 0 ]; then
-    echo "FAIL: no _rjem_ (jemalloc) symbols found in $bin" >&2
+strs=$(strings -a "$bin")
+conf=$(grep -c '_rjem_malloc\.conf' <<<"$strs" || true)
+msgs=$(grep -c '<jemalloc>:' <<<"$strs" || true)
+if [ "$conf" -eq 0 ] || [ "$msgs" -lt "$MIN_MSGS" ]; then
+    echo "FAIL: $bin lacks jemalloc markers: _rjem_malloc.conf x$conf (need >=1)," \
+        "<jemalloc>: messages x$msgs (need >=$MIN_MSGS)" >&2
     exit 1
 fi
-echo "ok: $bin contains $count _rjem_ strings"
+echo "ok: $bin embeds jemalloc (_rjem_malloc.conf x$conf, <jemalloc>: messages x$msgs)"
 
 if [ "$mode" = "--run" ]; then
     work=$(mktemp -d)

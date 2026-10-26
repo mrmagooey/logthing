@@ -59,8 +59,18 @@ jobs:
       # Guard, part 1: build exactly as the action below does (same target/profile/bin; no
       # --locked or extra env is configured for the action) and fail the job BEFORE anything is
       # uploaded if jemalloc is not linked. The action's own build then hits cargo's cache.
+      #
+      # upload-rust-binary-action does not install zig itself: with build-tool: cargo-zigbuild it
+      # runs `pip3 install cargo-zigbuild` only if cargo-zigbuild is missing from PATH, and it
+      # adds --locked only when its `locked:` input is true (it is not set). Installing both here
+      # means the action reuses this zig. Pinned to the version this guard was tested with. The
+      # action exports CARGO_PROFILE_RELEASE_STRIP=debuginfo, which this build does not, so the
+      # guard binary can differ slightly; the post-action re-check below is the authoritative
+      # guard. The check scans string literals (release binaries have no symbol table).
       - name: Install zig (guard build)
         uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
 
       - name: Install cargo-zigbuild (guard build)
         uses: taiki-e/install-action@v2
