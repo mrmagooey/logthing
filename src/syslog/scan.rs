@@ -86,6 +86,19 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// `\S+` (greedy run of non-whitespace, at least one byte); returns the byte range.
+    fn nonws(&mut self) -> Result<(usize, usize), Miss> {
+        let start = self.i;
+        while matches!(self.peek()?, Some(c) if !is_ws(c)) {
+            self.i += 1;
+        }
+        if self.i == start {
+            Err(Miss::NoMatch)
+        } else {
+            Ok((start, self.i))
+        }
+    }
+
     /// Start offset of a trailing `(.*?)$` / `(.*)$` (the unconsumed tail); the tail must
     /// contain no `\n`.
     fn tail_start(&self) -> Result<usize, Miss> {
@@ -224,9 +237,50 @@ pub(super) fn tag(rest: &str) -> Result<Tag<'_>, Miss> {
     })
 }
 
+/// A scanned RFC 3164 header: `[<pri>]timestamp hostname rest`.
+#[derive(Debug)]
+pub(super) struct Header<'a> {
+    /// The `<PRI>` digits (`None` for the no-PRI form). Range validation is the caller's job.
+    pub pri: Option<&'a str>,
+    /// The `Mon DD HH:MM:SS` timestamp text.
+    pub timestamp: &'a str,
+    /// The hostname token (maximal non-whitespace run).
+    pub hostname: &'a str,
+    /// Everything after the whitespace that follows the hostname.
+    pub rest: &'a str,
+}
+
+/// Scan `^<(\d{1,3})>(TS)\s+(\S+)\s+(.*?)$` (`with_pri`, the old `RFC3164_RE`) or
+/// `^(TS)\s+(\S+)\s+(.*?)$` (the old `RFC3164_NOPRI_RE`), where TS is
+/// `[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}`.
+pub(super) fn header(input: &str, with_pri: bool) -> Result<Header<'_>, Miss> {
+    let mut c = Cursor::new(input);
+    let pri = if with_pri {
+        c.expect(b'<')?;
+        let digits = c.digits(1, 3)?;
+        c.expect(b'>')?;
+        Some(c.slice(digits))
+    } else {
+        None
+    };
+    let ts_start = c.i;
+    timestamp_fields(&mut c)?;
+    let timestamp = c.slice((ts_start, c.i));
+    c.ws(1)?;
+    let hostname = c.nonws()?;
+    c.ws(1)?;
+    let rest = c.tail_start()?;
+    Ok(Header {
+        pri,
+        timestamp,
+        hostname: c.slice(hostname),
+        rest: &input[rest..],
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Miss, month_number, tag, timestamp};
+    use super::{Miss, header, month_number, tag, timestamp};
 
     fn ts(s: &str) -> Result<(Option<u32>, u32, u32, u32, u32), Miss> {
         timestamp(s).map(|p| (month_number(p.month), p.day, p.hour, p.minute, p.second))
@@ -345,5 +399,123 @@ mod tests {
     fn test_tag_non_ascii_only_in_message_is_matched_without_fallback() {
         let t = tag("app: h\u{E9}llo \u{663}").unwrap();
         assert_eq!(t.message, "h\u{E9}llo \u{663}");
+    }
+
+    #[test]
+    fn test_header_with_pri_splits_fields() {
+        let h = header("<134>Jan 15 10:30:45 myhost app[1]: hi there", true).unwrap();
+        assert_eq!(h.pri, Some("134"));
+        assert_eq!(h.timestamp, "Jan 15 10:30:45");
+        assert_eq!(h.hostname, "myhost");
+        assert_eq!(h.rest, "app[1]: hi there");
+    }
+
+    #[test]
+    fn test_header_without_pri_splits_fields() {
+        let h = header("Jan  5 10:30:45   fw01   CEF:0|a|b", false).unwrap();
+        assert_eq!(h.pri, None);
+        assert_eq!(h.timestamp, "Jan  5 10:30:45");
+        assert_eq!(h.hostname, "fw01");
+        assert_eq!(h.rest, "CEF:0|a|b");
+        // The no-PRI scanner does not accept a PRI prefix and vice versa.
+        assert_eq!(
+            header("<134>Jan 15 10:30:45 h x", false).unwrap_err(),
+            Miss::NoMatch
+        );
+        assert_eq!(
+            header("Jan 15 10:30:45 h x", true).unwrap_err(),
+            Miss::NoMatch
+        );
+    }
+
+    #[test]
+    fn test_header_pri_shapes() {
+        assert!(header("<1>Jan 15 10:30:45 h x", true).is_ok());
+        assert!(header("<999>Jan 15 10:30:45 h x", true).is_ok()); // range is checked by parse_pri
+        assert_eq!(
+            header("<1000>Jan 15 10:30:45 h x", true).unwrap_err(),
+            Miss::NoMatch
+        );
+        assert_eq!(
+            header("<>Jan 15 10:30:45 h x", true).unwrap_err(),
+            Miss::NoMatch
+        );
+        assert_eq!(
+            header("<13 Jan 15 10:30:45 h x", true).unwrap_err(),
+            Miss::NoMatch
+        );
+    }
+
+    #[test]
+    fn test_header_requires_whitespace_after_hostname() {
+        assert_eq!(
+            header("<1>Jan 15 10:30:45 host", true).unwrap_err(),
+            Miss::NoMatch
+        );
+        assert_eq!(
+            header("<1>Jan 15 10:30:45 ", true).unwrap_err(),
+            Miss::NoMatch
+        );
+        let h = header("<1>Jan 15 10:30:45 host ", true).unwrap();
+        assert_eq!((h.hostname, h.rest), ("host", ""));
+    }
+
+    #[test]
+    fn test_header_newline_rules() {
+        // `\s+` may consume a newline; the rest may not contain one.
+        let h = header("<1>Jan 15 10:30:45 host \nbody", true).unwrap();
+        assert_eq!((h.hostname, h.rest), ("host", "body"));
+        let h = header("<1>Jan 15 10:30:45 host \n", true).unwrap();
+        assert_eq!(h.rest, "");
+        assert_eq!(
+            header("<1>Jan 15 10:30:45 host a\nb", true).unwrap_err(),
+            Miss::NoMatch
+        );
+        assert_eq!(
+            header("<1>Jan 15 10:30:45 host \nbody\n", true).unwrap_err(),
+            Miss::NoMatch
+        );
+        let h = header("<1>Jan 15 10:30:45 host a\rb", true).unwrap();
+        assert_eq!(h.rest, "a\rb");
+    }
+
+    #[test]
+    fn test_header_hostname_is_the_maximal_non_whitespace_run() {
+        let h = header("<1>Jan 15 10:30:45 a:b[1]=(x) y", true).unwrap();
+        assert_eq!((h.hostname, h.rest), ("a:b[1]=(x)", "y"));
+    }
+
+    #[test]
+    fn test_header_non_ascii_where_class_matters_falls_back() {
+        assert_eq!(
+            header("<1>Jan 1\u{663} 10:30:45 h x", true).unwrap_err(),
+            Miss::Fallback
+        );
+        assert_eq!(
+            header("<\u{663}>Jan 15 10:30:45 h x", true).unwrap_err(),
+            Miss::Fallback
+        );
+        assert_eq!(
+            header("<1>Jan 15 10:30:45 h\u{E9}st x", true).unwrap_err(),
+            Miss::Fallback
+        );
+        assert_eq!(
+            header("<1>Jan 15 10:30:45 host\u{A0}x", true).unwrap_err(),
+            Miss::Fallback
+        );
+        assert_eq!(
+            header("<1>Jan 15 10:30:45 host \u{85}x", true).unwrap_err(),
+            Miss::Fallback
+        );
+        assert_eq!(
+            header("<1>Jan 15 10:30:45\u{3000}host x", true).unwrap_err(),
+            Miss::Fallback
+        );
+    }
+
+    #[test]
+    fn test_header_non_ascii_only_in_rest_is_matched_without_fallback() {
+        let h = header("<1>Jan 15 10:30:45 host x\u{E9}\u{663}", true).unwrap();
+        assert_eq!(h.rest, "x\u{E9}\u{663}");
     }
 }

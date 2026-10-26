@@ -13,9 +13,10 @@ type StructuredData = Option<SdElements>;
 
 // --- Module-level static regexes (compiled once per process) ---
 //
-// The RFC 3164 timestamp and tag regexes are only the NON-ASCII FALLBACK: `scan` handles every
-// ASCII input exactly and returns `Miss::Fallback` when a non-ASCII byte could change the
-// Unicode `\d`/`\s`/`\S` outcome. They must stay byte-for-byte what `scan` is equivalent to.
+// The RFC 3164 header, no-PRI header, timestamp and tag regexes are only the NON-ASCII
+// FALLBACK: `scan` handles every ASCII input exactly and returns `Miss::Fallback` when a
+// non-ASCII byte could change the Unicode `\d`/`\s`/`\S` outcome. They must stay byte-for-byte
+// what `scan` is equivalent to.
 
 /// RFC 5424 header: <priority>version timestamp hostname app-name procid msgid [sd] msg
 static RFC5424_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -272,18 +273,16 @@ impl SyslogMessage {
         // RFC 3164 §4.3.3 default when PRI is missing: facility=user(1), severity=notice(5).
         const DEFAULT_PRIORITY: u8 = (1 << 3) | 5;
 
-        if let Some(caps) = RFC3164_NOPRI_RE.captures(input) {
+        if let Some(header) = Self::split_header(input, false) {
             let priority = DEFAULT_PRIORITY;
             let severity = priority & 0x07;
             let facility = (priority >> 3) & 0x1f;
 
-            let timestamp_str = caps.get(1)?.as_str();
-            let timestamp = Self::parse_rfc3164_timestamp(timestamp_str);
+            let timestamp = Self::parse_rfc3164_timestamp(header.timestamp);
 
-            let hostname = Some(caps.get(2)?.as_str().to_string());
+            let hostname = Some(header.hostname.to_string());
 
-            let rest = caps.get(3)?.as_str();
-            let (app_name, proc_id, message) = Self::split_tag_or_payload(rest);
+            let (app_name, proc_id, message) = Self::split_tag_or_payload(header.rest);
 
             return Some(SyslogMessage {
                 priority,
@@ -354,6 +353,36 @@ impl SyslogMessage {
             return None;
         }
         Some((&inner[..digits], inner[digits..].strip_prefix('>')?))
+    }
+
+    /// Split an RFC 3164 line into `[<pri>] timestamp hostname rest`: byte scanner for ASCII input,
+    /// the original `RFC3164_RE` / `RFC3164_NOPRI_RE` when a non-ASCII byte is reached.
+    fn split_header(input: &str, with_pri: bool) -> Option<scan::Header<'_>> {
+        match scan::header(input, with_pri) {
+            Ok(h) => Some(h),
+            Err(scan::Miss::NoMatch) => None,
+            Err(scan::Miss::Fallback) => Self::split_header_regex(input, with_pri),
+        }
+    }
+
+    fn split_header_regex(input: &str, with_pri: bool) -> Option<scan::Header<'_>> {
+        if with_pri {
+            let caps = RFC3164_RE.captures(input)?;
+            Some(scan::Header {
+                pri: Some(caps.get(1)?.as_str()),
+                timestamp: caps.get(2)?.as_str(),
+                hostname: caps.get(3)?.as_str(),
+                rest: caps.get(4)?.as_str(),
+            })
+        } else {
+            let caps = RFC3164_NOPRI_RE.captures(input)?;
+            Some(scan::Header {
+                pri: None,
+                timestamp: caps.get(1)?.as_str(),
+                hostname: caps.get(2)?.as_str(),
+                rest: caps.get(3)?.as_str(),
+            })
+        }
     }
 
     /// Parse the `<PRI>` digits; `None` when above 191 (the maximum valid PRI, 23 * 8 + 7).
@@ -433,20 +462,17 @@ impl SyslogMessage {
         // RFC 3164 format: <priority>timestamp hostname tag[pid]: message
         // Example: <34>Oct 11 22:14:15 mymachine su: 'su root' failed
 
-        let caps = RFC3164_RE.captures(input)?;
+        let header = Self::split_header(input, true)?;
 
-        let priority = Self::parse_pri(caps.get(1)?.as_str())?;
+        let priority = Self::parse_pri(header.pri?)?;
         let severity = priority & 0x07;
         let facility = (priority >> 3) & 0x1f;
 
-        let timestamp_str = caps.get(2)?.as_str();
-        let timestamp = Self::parse_rfc3164_timestamp(timestamp_str);
+        let timestamp = Self::parse_rfc3164_timestamp(header.timestamp);
 
-        let hostname = Some(caps.get(3)?.as_str().to_string());
+        let hostname = Some(header.hostname.to_string());
 
-        let rest = caps.get(4)?.as_str();
-
-        let (app_name, proc_id, message) = Self::split_tag_or_payload(rest);
+        let (app_name, proc_id, message) = Self::split_tag_or_payload(header.rest);
 
         Some(SyslogMessage {
             priority,
