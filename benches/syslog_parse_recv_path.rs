@@ -38,8 +38,8 @@
 //! is a separate, non-default workspace member) to match what `loadgen
 //! syslog-udp`'s `build_message(n, structured)` sends. The one deviation is the
 //! tag's pid: loadgen uses `std::process::id()`, this file hardcodes 4242, so
-//! real traffic carries a pid of a few more digits. `RFC3164_TAG_RE` captures it
-//! with `\d+`, so the digit count does not measurably affect parse cost.
+//! real traffic carries a pid of a few more digits. The RFC 3164 tag parser captures it
+//! as a run of digits, so the digit count does not measurably affect parse cost.
 //! - `structured = false` (the default): a plain RFC 3164 line whose message
 //!   body matches NO payload sub-parser, so all seven are attempted and all
 //!   reject -- the most attempts for `dispatch`, though not the most expensive
