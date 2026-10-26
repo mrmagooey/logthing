@@ -407,18 +407,23 @@ pub fn syslog_local_start(
 
 /// Fans out each message to every configured handler. Used only when at
 /// least one of `.s3` / `.local` persistence resolves to a live handler for
-/// this run — `main.rs` always wraps the resulting `MultiSyslogHandler` (or
-/// the sole handler, if that's the only element) as the `inner` of a
-/// `PayloadDispatchingHandler`, never in place of it. Each destination keeps
-/// its own independent buffer, flush policy, backpressure, and hard cap (no
-/// shared state between destinations).
+/// this run -- `main.rs` always wraps the resulting `MultiSyslogHandler` (even with a single
+/// target) as the `inner` of a `PayloadDispatchingHandler`, never in place of it. The last
+/// target receives the message by move; earlier targets receive clones. Each destination keeps
+/// its own independent buffer, flush policy, backpressure, and hard cap (no shared state between
+/// destinations).
 pub struct MultiSyslogHandler(pub Vec<std::sync::Arc<dyn crate::syslog::listener::SyslogHandler>>);
 
 #[async_trait::async_trait]
 impl crate::syslog::listener::SyslogHandler for MultiSyslogHandler {
     async fn handle_message(&self, message: SyslogMessage, source: std::net::SocketAddr) {
-        for handler in &self.0 {
-            handler.handle_message(message.clone(), source).await;
+        // Clone for every target except the last, which takes the message by move: n-1 deep
+        // clones instead of n (zero for the common single-target wiring).
+        if let Some((last, rest)) = self.0.split_last() {
+            for handler in rest {
+                handler.handle_message(message.clone(), source).await;
+            }
+            last.handle_message(message, source).await;
         }
     }
 }
@@ -1443,5 +1448,87 @@ mod tests {
     #[test]
     fn test_encode_batches_to_parquet_of_no_batches_is_empty() {
         assert!(encode_batches_to_parquet(&[]).unwrap().is_empty());
+    }
+
+    /// Records `(target index, message heap pointer, message as JSON)` into a shared log.
+    struct IndexedProbe {
+        idx: usize,
+        log: Arc<std::sync::Mutex<Vec<(usize, usize, serde_json::Value)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::syslog::listener::SyslogHandler for IndexedProbe {
+        async fn handle_message(&self, message: SyslogMessage, _source: std::net::SocketAddr) {
+            self.log.lock().unwrap().push((
+                self.idx,
+                message.message.as_ptr() as usize,
+                serde_json::to_value(&message).unwrap(),
+            ));
+        }
+    }
+
+    fn multi_of(
+        n: usize,
+    ) -> (
+        MultiSyslogHandler,
+        Arc<std::sync::Mutex<Vec<(usize, usize, serde_json::Value)>>>,
+    ) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let targets = (0..n)
+            .map(|idx| {
+                Arc::new(IndexedProbe {
+                    idx,
+                    log: log.clone(),
+                }) as Arc<dyn crate::syslog::listener::SyslogHandler>
+            })
+            .collect();
+        (MultiSyslogHandler(targets), log)
+    }
+
+    #[tokio::test]
+    async fn test_multi_syslog_handler_moves_message_into_last_target_only() {
+        use crate::syslog::listener::SyslogHandler;
+        let src: std::net::SocketAddr = "127.0.0.1:5514".parse().unwrap();
+        for n in [1usize, 2, 3] {
+            let (multi, log) = multi_of(n);
+            let msg = dummy_msg("pointer identity");
+            let original = msg.message.as_ptr() as usize;
+            multi.handle_message(msg, src).await;
+            let entries = log.lock().unwrap().clone();
+            assert_eq!(entries.len(), n);
+            let (last_idx, last_ptr, _) = &entries[n - 1];
+            assert_eq!(*last_idx, n - 1);
+            assert_eq!(
+                *last_ptr, original,
+                "n={n}: last target gets the original allocation"
+            );
+            for (_, ptr, _) in &entries[..n - 1] {
+                assert_ne!(*ptr, original, "n={n}: non-last targets get clones");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multi_syslog_handler_delivers_equal_messages_in_order() {
+        use crate::syslog::listener::SyslogHandler;
+        let src: std::net::SocketAddr = "127.0.0.1:5514".parse().unwrap();
+        let (multi, log) = multi_of(3);
+        let msg = sample_rfc5424();
+        let expected = serde_json::to_value(&msg).unwrap();
+        multi.handle_message(msg, src).await;
+        let entries = log.lock().unwrap().clone();
+        let order: Vec<usize> = entries.iter().map(|(i, _, _)| *i).collect();
+        assert_eq!(order, vec![0, 1, 2], "delivery order unchanged");
+        for (_, _, got) in &entries {
+            assert_eq!(*got, expected, "every target sees an equal message");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multi_syslog_handler_empty_is_noop() {
+        use crate::syslog::listener::SyslogHandler;
+        let src: std::net::SocketAddr = "127.0.0.1:5514".parse().unwrap();
+        let multi = MultiSyslogHandler(Vec::new());
+        multi.handle_message(dummy_msg("nobody listens"), src).await; // must not panic
     }
 }
