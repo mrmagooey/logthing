@@ -86,13 +86,21 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    /// The end of a trailing `(.*?)$` / `(.*)$`: the remaining input must contain no `\n`.
-    fn rest(&self) -> Result<usize, Miss> {
+    /// Start offset of a trailing `(.*?)$` / `(.*)$` (the unconsumed tail); the tail must
+    /// contain no `\n`.
+    fn tail_start(&self) -> Result<usize, Miss> {
         if self.b[self.i..].contains(&b'\n') {
             Err(Miss::NoMatch)
         } else {
             Ok(self.i)
         }
+    }
+
+    /// `\d{n}` digits already scanned at `(start, end)`, as a number.
+    fn number(&self, (start, end): (usize, usize)) -> u32 {
+        self.b[start..end]
+            .iter()
+            .fold(0, |acc, d| acc * 10 + u32::from(d - b'0'))
     }
 
     fn slice(&self, (start, end): (usize, usize)) -> &'a str {
@@ -105,16 +113,14 @@ impl<'a> Cursor<'a> {
 pub(super) struct TsParts {
     /// Month abbreviation, ASCII-lowercased (`[A-Za-z]{3}` was verified).
     pub month: [u8; 3],
+    /// Day of month digits as scanned (1-2 digits; range not validated).
     pub day: u32,
+    /// Hour digits as scanned (range not validated).
     pub hour: u32,
+    /// Minute digits as scanned (range not validated).
     pub minute: u32,
+    /// Second digits as scanned (range not validated).
     pub second: u32,
-}
-
-fn number(c: &Cursor, (start, end): (usize, usize)) -> u32 {
-    c.b[start..end]
-        .iter()
-        .fold(0, |acc, d| acc * 10 + u32::from(d - b'0'))
 }
 
 /// `[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}` starting at the cursor.
@@ -139,10 +145,10 @@ fn timestamp_fields(c: &mut Cursor) -> Result<TsParts, Miss> {
     let second = c.digits(2, 2)?;
     Ok(TsParts {
         month,
-        day: number(c, day),
-        hour: number(c, hour),
-        minute: number(c, minute),
-        second: number(c, second),
+        day: c.number(day),
+        hour: c.number(hour),
+        minute: c.number(minute),
+        second: c.number(second),
     })
 }
 
@@ -179,8 +185,11 @@ pub(super) fn month_number(month: [u8; 3]) -> Option<u32> {
 /// A scanned RFC 3164 tag: `tag[pid]: message` or `tag: message`.
 #[derive(Debug)]
 pub(super) struct Tag<'a> {
+    /// The tag name (everything before `[` or `:`).
     pub name: &'a str,
+    /// The `[pid]` digits, when present.
     pub pid: Option<&'a str>,
+    /// The message after `:` and any following whitespace.
     pub message: &'a str,
 }
 
@@ -207,11 +216,11 @@ pub(super) fn tag(rest: &str) -> Result<Tag<'_>, Miss> {
     };
     c.expect(b':')?;
     c.ws(0)?;
-    let message = c.rest()?;
+    let msg_start = c.tail_start()?;
     Ok(Tag {
         name: c.slice((0, name_end)),
         pid,
-        message: &rest[message..],
+        message: &rest[msg_start..],
     })
 }
 
