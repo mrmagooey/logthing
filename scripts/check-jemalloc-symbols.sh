@@ -12,7 +12,8 @@
 # Usage: scripts/check-jemalloc-symbols.sh <binary> [--run]
 #   <binary>  path to the built executable (a release build; symbols are not needed)
 #   --run     also start the binary for up to ~5 s in a scratch directory and require the startup
-#             log line `allocator=jemalloc` (only for binaries that run on this host)
+#             log line `allocator=jemalloc` (only for binaries that run on this host); the stop
+#             after the check is SIGTERM, escalating to SIGKILL after ~10 s
 # Exit: 0 ok, 1 check failed, 2 usage error / missing file.
 # Example: scripts/check-jemalloc-symbols.sh target/x86_64-unknown-linux-musl/release/logthing --run
 set -euo pipefail
@@ -72,6 +73,16 @@ EOF
         sleep 0.1
     done
     kill -TERM "$pid" 2>/dev/null || true
+    # Bound the shutdown wait (~10 s) so a stalled graceful shutdown cannot hang CI; the verdict
+    # comes from the log line, not from how the process exits.
+    for _ in $(seq 1 100); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "note: $bin ignored SIGTERM for ~10 s; sending SIGKILL" >&2
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
     wait "$pid" 2>/dev/null || true
     if ! grep -q 'allocator=jemalloc' "$work/out.log"; then
         echo "FAIL: startup log lacks allocator=jemalloc; output was:" >&2

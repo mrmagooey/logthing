@@ -94,3 +94,70 @@ fn test_script_matches_the_real_binary_allocator() {
         assert_eq!(run(&[bin]).status.code(), Some(1));
     }
 }
+
+#[test]
+fn test_script_run_mode_kills_a_binary_that_ignores_term() {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("fake.pid");
+    let mut body = String::from("#!/usr/bin/env bash\n# /etc/_rjem_malloc.conf\n");
+    for i in 0..12 {
+        body.push_str(&format!("# <jemalloc>: message {i}\n"));
+    }
+    body.push_str(&format!(
+        "echo $$ > '{}'\necho allocator=jemalloc\ntrap '' TERM\nwhile :; do sleep 1; done\n",
+        pidfile.display()
+    ));
+    let fake = write_fake(dir.path(), "stubborn", body.as_bytes());
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut child = Command::new("bash")
+        .arg(script())
+        .arg(&fake)
+        .arg("--run")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn check-jemalloc-symbols.sh");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let fake_pid = std::fs::read_to_string(&pidfile)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok());
+    if status.is_none() {
+        // Clean up only the PIDs this test started, so a hang cannot leak processes.
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(pid) = fake_pid {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+        panic!("check-jemalloc-symbols.sh --run hung >30s on a binary that ignores SIGTERM");
+    }
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(status.unwrap().code(), Some(0), "stderr: {stderr}");
+    let pid = fake_pid.expect("fake binary recorded its pid");
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "fake binary (pid {pid}) survived the script"
+    );
+}
