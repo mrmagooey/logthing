@@ -127,7 +127,7 @@ services:
       garage-init: {condition: service_completed_successfully}
 
   logthing:
-    image: ${LOGTHING_IMAGE:-ghcr.io/mrmagooey/logthing:0.25.0}
+    image: ${LOGTHING_IMAGE:-ghcr.io/mrmagooey/logthing:0.26.0}
     # Shutdown drains HTTP/listeners then flushes writers (~22 s worst case); Docker's
     # 10 s default would SIGKILL mid-flush.
     stop_grace_period: 30s
@@ -147,7 +147,7 @@ services:
       - "${LOGTHING_HEALTH_PORT:-5985}:5985/tcp"
 
   committer:
-    image: ${COMMITTER_IMAGE:-ghcr.io/mrmagooey/logthing-committer:0.25.0}
+    image: ${COMMITTER_IMAGE:-ghcr.io/mrmagooey/logthing-committer:0.26.0}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |

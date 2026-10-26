@@ -6,8 +6,24 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-10-26
+
+### Added
+
+- `scripts/profile-ingest.sh`: per-format CPU flame graphs of the ingest path (syslog, zeek,
+  suricata, ipfix, sflow, hec, generic, otlp, wef) with a PASS/FAIL summary per format; replaces
+  `profile-syslog-udp.sh` and `profile-ipfix-udp.sh`. `loadgen wef-http` drives WEF over HTTP.
+
 ### Changed
 
+- Fewer allocations on the hot ingest paths: HEC moves `event`/`fields` out of the envelope instead
+  of cloning them, the syslog payload dispatcher moves rather than clones each message, Zeek and
+  Suricata read each field in a single pass with a reused payload buffer, and RFC 3164 syslog
+  timestamps and tags use a hand-written parser instead of a regex (about 8x faster per message).
+  Output is unchanged.
+- Coverage moves from cargo-tarpaulin to cargo-llvm-cov (`scripts/run_coverage.sh`).
+- Analytics stack default image pins move to 0.26.0 for both logthing and the committer (still in
+  lockstep); Helm chart version 0.2.6.
 - The static musl release binaries (linux/amd64, linux/arm64) now use jemalloc as the global
   allocator (`allocator=jemalloc` is logged at startup); `--features jemalloc` enables it on gnu
   self-builds. The container image (glibc) is unchanged. `binaries.yml` fails the job if a musl
