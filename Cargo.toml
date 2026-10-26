@@ -273,3 +273,7 @@ harness = false
 [[bench]]
 name = "syslog_payload_dispatch"
 harness = false
+
+[[bench]]
+name = "zeek_suricata_extract_allocs"
+harness = false
