@@ -21,9 +21,12 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// Measured (perf fix 3): lower and steadier peak RSS than jemalloc's defaults, CPU within noise
 /// of the untuned config (ipfix +2.4%, p=0.048, not significant after Holm correction).
 /// `_RJEM_MALLOC_CONF` at runtime still overrides.
+/// A thin pointer to a NUL-terminated string, matching tikv-jemalloc-sys's
+/// `Option<&'static c_char>` declaration.
 #[cfg(any(feature = "jemalloc", target_env = "musl"))]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-pub static MALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+pub static MALLOC_CONF: Option<&'static u8> =
+    Some(&c"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000".to_bytes_with_nul()[0]);
 
 /// Name of the global allocator this binary was built with, logged once at startup so a release
 /// artifact's allocator is observable (`allocator=jemalloc` on every musl build).
