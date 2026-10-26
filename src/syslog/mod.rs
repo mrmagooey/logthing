@@ -732,6 +732,9 @@ pub mod dns {
 }
 
 #[cfg(test)]
+mod differential_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1267,5 +1270,63 @@ mod tests {
 
         m.message = "nothing dns related".to_string();
         assert!(dns::DnsLogEntry::from_syslog(&m).is_none());
+    }
+
+    #[test]
+    fn test_parse_rfc3164_unicode_digit_timestamp_keeps_message_with_no_timestamp() {
+        let m = SyslogMessage::parse("<34>Oct 1\u{663} 22:14:15 host app: hello").unwrap();
+        assert!(m.timestamp.is_none());
+        assert_eq!(m.hostname.as_deref(), Some("host"));
+        assert_eq!(m.app_name.as_deref(), Some("app"));
+        assert_eq!(m.message, "hello");
+        assert!(matches!(m.protocol, SyslogProtocol::Rfc3164));
+    }
+
+    #[test]
+    fn test_parse_rfc3164_impossible_date_keeps_message_with_no_timestamp() {
+        let m = SyslogMessage::parse("<34>Feb 30 10:30:45 host app: hi").unwrap();
+        assert!(m.timestamp.is_none());
+        assert_eq!(m.app_name.as_deref(), Some("app"));
+        assert_eq!(m.message, "hi");
+        let m = SyslogMessage::parse("<34>Oct 11 25:30:45 host app: hi").unwrap();
+        assert!(m.timestamp.is_none());
+    }
+
+    #[test]
+    fn test_parse_rfc3164_empty_pid_is_not_a_tag() {
+        let m = SyslogMessage::parse("<34>Oct 11 22:14:15 host app[]: hi").unwrap();
+        assert_eq!(m.app_name, None);
+        assert_eq!(m.proc_id, None);
+        assert_eq!(m.message, "app[]: hi");
+    }
+
+    #[test]
+    fn test_parse_rfc3164_newline_inside_separator_run_still_parses() {
+        let m = SyslogMessage::parse("<34>Oct 11 22:14:15 host \nbody").unwrap();
+        assert_eq!(m.hostname.as_deref(), Some("host"));
+        assert_eq!(m.message, "body");
+        assert!(matches!(m.protocol, SyslogProtocol::Rfc3164));
+    }
+
+    #[test]
+    fn test_parse_rfc3164_newline_in_rest_falls_back_to_pri_only() {
+        let m = SyslogMessage::parse("<34>Oct 11 22:14:15 host a\nb").unwrap();
+        assert_eq!(m.hostname, None);
+        assert_eq!(m.message, "Oct 11 22:14:15 host a\nb");
+        assert!(matches!(m.protocol, SyslogProtocol::Unknown));
+    }
+
+    #[test]
+    fn test_parse_rfc3164_cr_mid_line_is_not_special() {
+        let m = SyslogMessage::parse("<34>Oct 11 22:14:15 host app: a\rb").unwrap();
+        assert_eq!(m.app_name.as_deref(), Some("app"));
+        assert_eq!(m.message, "a\rb");
+    }
+
+    #[test]
+    fn test_parse_rfc3164_unicode_whitespace_after_hostname_is_a_separator() {
+        let m = SyslogMessage::parse("<34>Oct 11 22:14:15 host\u{A0}app: hi").unwrap();
+        assert_eq!(m.hostname.as_deref(), Some("host"));
+        assert_eq!(m.app_name.as_deref(), Some("app"));
     }
 }
