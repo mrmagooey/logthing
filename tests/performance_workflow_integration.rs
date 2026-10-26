@@ -69,19 +69,34 @@ fn test_performance_workflow_runs_on_version_tags_and_on_demand() {
 fn test_performance_workflow_inputs_fall_back_to_dispatch_defaults() {
     let (raw, wf) = workflow();
     assert!(
-        !raw.contains("github.event.inputs."),
+        !raw.contains("github.event.inputs"),
         "github.event.inputs is empty on a tag push; use `inputs.<name> || '<default>'`"
     );
-    for (name, default) in dispatch_defaults(&wf) {
-        let bare = format!("inputs.{name} }}}}");
-        let with_fallback = format!("${{{{ inputs.{name} || '{default}' }}}}");
-        assert!(
-            !raw.contains(&bare),
-            "`inputs.{name}` is used without a fallback; a tag run would pass an empty value"
+    let defaults = dispatch_defaults(&wf);
+    let expr = regex::Regex::new(r"\$\{\{(.*?)\}\}").unwrap();
+    let mut used = Vec::new();
+    for cap in expr.captures_iter(&raw) {
+        let body = cap[1].trim();
+        if !body.contains("inputs.") {
+            continue;
+        }
+        let (name, default) = defaults
+            .iter()
+            .find(|(n, _)| {
+                body.starts_with(&format!("inputs.{n} ")) || body == format!("inputs.{n}")
+            })
+            .unwrap_or_else(|| panic!("`${{{{ {body} }}}}` reads an unknown input"));
+        let canonical = format!("inputs.{name} || '{default}'");
+        assert_eq!(
+            body, canonical,
+            "input use must fall back to the dispatch default (a tag run passes empty inputs)"
         );
+        used.push(name.as_str());
+    }
+    for (name, _) in &defaults {
         assert!(
-            raw.contains(&with_fallback),
-            "expected `{with_fallback}` (fallback must equal the dispatch default)"
+            used.contains(&name.as_str()),
+            "dispatch input `{name}` is never used"
         );
     }
 }
