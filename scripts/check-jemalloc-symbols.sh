@@ -5,8 +5,9 @@
 #   - `_rjem_malloc.conf`, the prefixed config-file path literal from jemalloc's C code
 #   - at least MIN_MSGS `<jemalloc>:` diagnostic messages embedded by jemalloc's C code
 # Measured (strings -a): musl release 1 / 37; gnu --features jemalloc release 3 / 37; default gnu
-# release 0 / 0. A binary using the system allocator has neither. Used by .github/workflows/binaries.yml before and after the release build so a
-# musl artifact without jemalloc fails the job instead of shipping.
+# release 0 / 0. A binary using the system allocator has neither.
+# Used by .github/workflows/binaries.yml before and after the release build so
+# a musl artifact without jemalloc fails the job instead of shipping.
 #
 # Usage: scripts/check-jemalloc-symbols.sh <binary> [--run]
 #   <binary>  path to the built executable (a release build; symbols are not needed)
@@ -20,6 +21,10 @@ bin="${1:-}"
 mode="${2:-}"
 if [ -z "$bin" ] || [ ! -f "$bin" ]; then
     echo "usage: $0 <binary> [--run]  (binary not found: '${bin}')" >&2
+    exit 2
+fi
+if [ -n "$mode" ] && [ "$mode" != "--run" ]; then
+    echo "usage: $0 <binary> [--run]  (unknown argument: '${mode}')" >&2
     exit 2
 fi
 
@@ -37,7 +42,14 @@ echo "ok: $bin embeds jemalloc (_rjem_malloc.conf x$conf, <jemalloc>: messages x
 
 if [ "$mode" = "--run" ]; then
     work=$(mktemp -d)
-    trap 'rm -rf "$work"' EXIT
+    pid=""
+    cleanup() {
+        [ -z "$pid" ] || kill -TERM "$pid" 2>/dev/null || true
+        rm -rf "$work"
+    }
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     cat >"$work/logthing.toml" <<'EOF'
 bind_address = "127.0.0.1:38475"
 

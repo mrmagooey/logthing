@@ -62,6 +62,15 @@ fn test_script_fails_when_only_the_config_marker_is_present() {
 }
 
 #[test]
+fn test_script_exits_2_for_unknown_second_argument() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = write_fake(dir.path(), "any", b"\x7fELF\0\0");
+    let out = run(&[fake.to_str().unwrap(), "--rnu"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("usage"));
+}
+
+#[test]
 fn test_script_exits_2_for_missing_file_or_no_argument() {
     assert_eq!(run(&["/nonexistent/logthing"]).status.code(), Some(2));
     assert_eq!(run(&[]).status.code(), Some(2));

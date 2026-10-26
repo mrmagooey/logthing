@@ -70,6 +70,15 @@ fn test_binaries_workflow_guard_builds_with_the_actions_invocation() {
         "guard build must match the action's invocation: {}",
         run_of(pre)
     );
+    let strip = pre
+        .get("env")
+        .and_then(|e| e.get("CARGO_PROFILE_RELEASE_STRIP"))
+        .and_then(|v| v.as_str());
+    assert_eq!(
+        strip,
+        Some("debuginfo"),
+        "guard build must match the action's strip setting"
+    );
 }
 
 #[test]

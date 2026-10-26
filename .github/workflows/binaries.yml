@@ -64,9 +64,9 @@ jobs:
       # runs `pip3 install cargo-zigbuild` only if cargo-zigbuild is missing from PATH, and it
       # adds --locked only when its `locked:` input is true (it is not set). Installing both here
       # means the action reuses this zig. Pinned to the version this guard was tested with. The
-      # action exports CARGO_PROFILE_RELEASE_STRIP=debuginfo, which this build does not, so the
-      # guard binary can differ slightly; the post-action re-check below is the authoritative
-      # guard. The check scans string literals (release binaries have no symbol table).
+      # action exports CARGO_PROFILE_RELEASE_STRIP=debuginfo, so the guard build sets the same
+      # to match it and let the action hit cargo's cache; the post-action re-check below is the
+      # authoritative guard. The check scans string literals (release binaries have no symbol table).
       - name: Install zig (guard build)
         uses: mlugg/setup-zig@v2
         with:
@@ -78,6 +78,8 @@ jobs:
           tool: cargo-zigbuild
 
       - name: Guard - build and assert jemalloc is linked
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: debuginfo
         run: |
           cargo zigbuild --release --target ${{ matrix.target }} --bin logthing
           scripts/check-jemalloc-symbols.sh target/${{ matrix.target }}/release/logthing
