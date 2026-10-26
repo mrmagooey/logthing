@@ -145,3 +145,25 @@ jobs:
       # where it is ever linted. kerberos has no feature-gated test file, so its
       # omission of the flag costs nothing; here it would be a real gap.
       run: cargo clippy --features pprof --all-targets -- -D warnings
+
+  build-jemalloc:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install stable Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+
+    # jemalloc is only linked on musl in release builds; this job exercises the same code path on
+    # gnu on every push so a break in it is not first seen on a tag push.
+    - name: Build (jemalloc)
+      run: cargo build --features jemalloc --verbose
+
+    - name: Run tests (jemalloc)
+      run: cargo test --features jemalloc --verbose
+
+    - name: Clippy (jemalloc)
+      run: cargo clippy --features jemalloc --all-targets -- -D warnings
