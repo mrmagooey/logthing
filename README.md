@@ -192,8 +192,9 @@ Results go to `profiling-results/` (gitignored): `index.html` plus, per format,
 and records written / records loadgen reports sent >= 0.9; `written_ratio` in `summary.json`).
 Knobs: `OUT`, `BIN`, `LOADGEN`, `DURATION` (25), `DELAY` (5), `HZ` (99) and `RATE_<FMT>`
 (e.g. `RATE_ZEEK=40000`). Logging is forced to `error` and the WEF run is unauthenticated
-HTTP (no Kerberos/TLS), so neither cost appears in the profile. Profiling builds (--features pprof) use the system
-allocator, not jemalloc. Run `scripts/profile-ingest.sh` with no arguments for usage.
+HTTP (no Kerberos/TLS), so neither cost appears in the profile. Profiling builds
+(--features pprof) use the system allocator, not jemalloc. Run `scripts/profile-ingest.sh` with
+no arguments for usage.
 
 Default rates were tuned on a 12-vCPU shared host with loadgen on the same machine; on a smaller
 host a FAIL usually means the offered rate is too high, so lower `RATE_<FMT>`. A full `all` run
