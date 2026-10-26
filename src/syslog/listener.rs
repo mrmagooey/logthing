@@ -219,20 +219,19 @@ pub struct PayloadDispatchingHandler<H: SyslogHandler> {
 #[async_trait::async_trait]
 impl<H: SyslogHandler + 'static> SyslogHandler for PayloadDispatchingHandler<H> {
     async fn handle_message(&self, message: SyslogMessage, source: SocketAddr) {
-        if !self.parse_payloads {
-            // No structured work: just hand the message over.
-            self.inner.handle_message(message, source).await;
-            return;
-        }
         // Build the structured record while we still borrow `message`, then move the message
         // into `inner` (no deep clone). `payload::dispatch` must run whenever `parse_payloads`
         // is set -- even with no structured handle -- because it increments the
         // `syslog_payload_parsed` metric. The inner handler still runs before the structured
         // `try_send`; only record construction moved earlier (so `received_at` is receipt time,
-        // taken before any inner backpressure wait).
-        let p = payload::dispatch(&message);
-        let rec = payload::StructuredSyslogRecord::from_syslog_and_payload(&message, &p);
-        drop(p);
+        // taken before any inner backpressure wait). A single `inner` call site is deliberate:
+        // `stats::cardinality` pins the raw inner-call count in this file.
+        let rec = if self.parse_payloads {
+            let p = payload::dispatch(&message);
+            payload::StructuredSyslogRecord::from_syslog_and_payload(&message, &p)
+        } else {
+            None
+        };
         self.inner.handle_message(message, source).await;
         if let Some(rec) = rec
             && let Some(h) = &self.structured_handle
