@@ -1467,12 +1467,9 @@ mod tests {
         }
     }
 
-    fn multi_of(
-        n: usize,
-    ) -> (
-        MultiSyslogHandler,
-        Arc<std::sync::Mutex<Vec<(usize, usize, serde_json::Value)>>>,
-    ) {
+    type ProbeLog = Arc<std::sync::Mutex<Vec<(usize, usize, serde_json::Value)>>>;
+
+    fn multi_of(n: usize) -> (MultiSyslogHandler, ProbeLog) {
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let targets = (0..n)
             .map(|idx| {

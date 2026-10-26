@@ -3484,17 +3484,15 @@ mod tests {
         }
     }
 
-    /// `(handler, probe, structured receiver, log)` wired like main.rs: Probe as `inner`.
-    fn dispatch_rig(
-        parse_payloads: bool,
-        with_structured: bool,
-        capacity: usize,
-    ) -> (
+    type DispatchRig = (
         PayloadDispatchingHandler<Probe>,
         Arc<Probe>,
         tokio::sync::mpsc::Receiver<StructuredSyslogRecord>,
         Arc<Mutex<Vec<String>>>,
-    ) {
+    );
+
+    /// `(handler, probe, structured receiver, log)` wired like main.rs: Probe as `inner`.
+    fn dispatch_rig(parse_payloads: bool, with_structured: bool, capacity: usize) -> DispatchRig {
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         let log = Arc::new(Mutex::new(Vec::new()));
         let probe = Probe::new(log.clone(), Some(tx.clone()));
