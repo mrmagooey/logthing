@@ -47,9 +47,16 @@ fn test_performance_workflow_runs_on_version_tags_and_on_demand() {
         .iter()
         .filter_map(|t| t.as_str())
         .collect();
-    assert_eq!(tags, ["v*"], "tag filter must match release.yml/binaries.yml");
+    assert_eq!(
+        tags,
+        ["v*"],
+        "tag filter must match release.yml/binaries.yml"
+    );
     assert!(
-        triggers(&wf).get("push").and_then(|p| p.get("branches")).is_none(),
+        triggers(&wf)
+            .get("push")
+            .and_then(|p| p.get("branches"))
+            .is_none(),
         "performance.yml must not run on branch pushes"
     );
     assert!(
