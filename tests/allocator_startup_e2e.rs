@@ -55,3 +55,34 @@ async fn test_startup_logs_allocator_matching_build() {
     let status = proc.terminate(Duration::from_secs(30));
     assert!(status.success(), "graceful shutdown failed: {status}");
 }
+
+/// The compiled-in `malloc_conf` (`background_thread:true`) is observable from outside the
+/// process: jemalloc names its purge threads `jemalloc_bg_thd`.
+#[cfg(any(feature = "jemalloc", target_env = "musl"))]
+#[tokio::test]
+async fn test_tuned_malloc_conf_starts_background_threads() {
+    fn comms(pid: u32) -> Vec<String> {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            return Vec::new();
+        };
+        tasks
+            .flatten()
+            .filter_map(|t| std::fs::read_to_string(t.path().join("comm")).ok())
+            .map(|c| c.trim().to_string())
+            .collect()
+    }
+
+    let mut proc = Proc::spawn_healthy(BIN, TOML, &[]).await;
+    let pid = proc.pid();
+    let found = common::wait_until(Duration::from_secs(10), || {
+        comms(pid).iter().any(|c| c.starts_with("jemalloc_bg_thd"))
+    })
+    .await;
+    assert!(
+        found,
+        "no `jemalloc_bg_thd` thread within 10s; thread comms seen: {:?}",
+        comms(pid)
+    );
+    let status = proc.terminate(Duration::from_secs(30));
+    assert!(status.success(), "graceful shutdown failed: {status}");
+}

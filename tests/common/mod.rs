@@ -264,6 +264,11 @@ impl Proc {
         }
     }
 
+    /// OS process id of the spawned child (for inspecting `/proc/<pid>`).
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// The process temp dir.
     pub fn dir(&self) -> &Path {
         self.dir.as_ref().expect("dir taken").path()
