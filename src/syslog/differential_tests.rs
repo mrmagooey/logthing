@@ -176,9 +176,9 @@ mod oracle {
 /// Adversarial alphabet: ASCII digit, Unicode digit U+0663, every ASCII whitespace kind, the
 /// Unicode whitespace that the regex `\s` accepts (U+0085, U+00A0, U+3000), the tag
 /// metacharacters, an ASCII letter and a non-ASCII letter.
-const ALPHABET: [&str; 18] = [
+const ALPHABET: [&str; 21] = [
     "7", "\u{663}", " ", "\t", "\n", "\r", "\u{0B}", "\u{0C}", "\u{A0}", "\u{85}", "\u{3000}", ":",
-    "[", "]", "=", "(", "a", "\u{E9}",
+    "[", "]", "=", "(", "a", "\u{E9}", "<", ">", "-",
 ];
 
 /// Templates: each entry is a slot; concatenating the defaults gives a valid line.
@@ -272,21 +272,99 @@ const TBARE: &[&str] = &["CEF:0|V|P|1|100|N|5|src=1.2.3.4"];
 const TFREE: &[&str] = &["<", "34", ">", "free text"];
 const TEMPLATES: [&[&str]; 6] = [T3164, TNOPRI, T5424, TCEF, TBARE, TFREE];
 
-/// Months for the random generator (the enumeration varies the slot with alphabet strings).
-const MONTHS: [&str; 6] = ["Jan", "feb", "MAR", "Foo", "Feb", "dEc"];
+/// All twelve month names; `month_variants` derives case variants and near-misses from them.
+const MONTH_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 /// Day/PRI/hour edge values for the random generator.
-const NUMBERS: [&str; 10] = [
-    "0", "00", "1", "31", "30", "99", "123", "191", "192", "1000",
+const NUMBERS: [&str; 17] = [
+    "0", "00", "1", "12", "13", "24", "29", "30", "31", "32", "59", "60", "99", "123", "191",
+    "192", "1000",
 ];
 
 /// Maximum slot-string length used by the default (debug) subset. If the default differential tests
 /// take more than 10 s in a debug build, lower this to 1.
 const SUBSET_MAX_LEN: usize = 2;
 
-fn assert_same(line: &str) {
-    let new = serde_json::to_value(SyslogMessage::parse(line)).unwrap();
-    let old = serde_json::to_value(oracle::parse(line)).unwrap();
+/// Compare two parse results field by field (through JSON; see the module docs).
+fn assert_eq_msgs(new: Option<SyslogMessage>, old: Option<SyslogMessage>, line: &str) {
+    let new = serde_json::to_value(new).unwrap();
+    let old = serde_json::to_value(old).unwrap();
     assert_eq!(new, old, "parse differs from the regex oracle for {line:?}");
+}
+
+/// Run `f`; if it panics, report the offending input (and `context`, e.g. a file path) first.
+fn with_input<T>(line: &str, context: &str, f: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(payload) => {
+            eprintln!("PANIC while parsing {context}input {line:?}");
+            std::panic::resume_unwind(payload)
+        }
+    }
+}
+
+fn assert_same_in(line: &str, context: &str) {
+    let new = with_input(line, context, || SyslogMessage::parse(line));
+    let old = with_input(line, context, || oracle::parse(line));
+    assert_eq_msgs(new, old, line);
+}
+
+fn assert_same(line: &str) {
+    assert_same_in(line, "");
+}
+
+/// Case variants and near-misses of every month name.
+fn month_variants() -> Vec<String> {
+    let mut out: Vec<String> = ["Ma", "Mayy", "Sept", "Janu", "J", "", "Ja", "Jann"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for m in MONTH_NAMES {
+        out.push(m.to_string());
+        out.push(m.to_lowercase());
+        out.push(m.to_uppercase());
+        for i in 0..3 {
+            let mut flipped = m.as_bytes().to_vec();
+            flipped[i] = if flipped[i] == b'x' { b'y' } else { b'x' };
+            out.push(String::from_utf8(flipped).unwrap());
+            out.push(format!("{}4{}", &m[..i], &m[i + 1..]));
+        }
+    }
+    out
+}
+
+/// Build a line from `template` with `slot` replaced by `s`.
+fn with_slot(template: &[&str], slot: usize, s: &str) -> String {
+    let mut line = String::new();
+    for (i, piece) in template.iter().enumerate() {
+        line.push_str(if i == slot { s } else { piece });
+    }
+    line
+}
+
+/// Every ASCII byte and every boundary number in every slot, plus every month variant in the
+/// month slot (index 3) of the templates that have one.
+fn run_byte_month_number_sweeps() -> usize {
+    let mut checked = 0;
+    let mut singles: Vec<String> = (0u8..0x80).map(|b| char::from(b).to_string()).collect();
+    singles.extend(NUMBERS.iter().map(|n| n.to_string()));
+    let months = month_variants();
+    for template in TEMPLATES {
+        for slot in 0..template.len() {
+            for s in &singles {
+                assert_same(&with_slot(template, slot, s));
+                checked += 1;
+            }
+        }
+        if template.get(3) == Some(&"Jan") {
+            for m in &months {
+                assert_same(&with_slot(template, 3, m));
+                checked += 1;
+            }
+        }
+    }
+    checked
 }
 
 /// Every string over `ALPHABET` with length `0..=max_len`.
@@ -313,11 +391,7 @@ fn run_enumeration(max_len: usize) -> usize {
     for template in TEMPLATES {
         for slot in 0..template.len() {
             for s in &strings {
-                let mut line = String::new();
-                for (i, piece) in template.iter().enumerate() {
-                    line.push_str(if i == slot { s } else { piece });
-                }
-                assert_same(&line);
+                assert_same(&with_slot(template, slot, s));
                 checked += 1;
             }
         }
@@ -349,8 +423,8 @@ impl Rng {
 }
 
 /// A random line: 10% pure noise over the alphabet plus structure characters, otherwise a random
-/// template with each slot replaced (probability 1/3) by an alphabet string, a month, or a number.
-fn random_line(rng: &mut Rng) -> String {
+/// template with 1-3 slots replaced by an alphabet string, a month variant, or a number.
+fn random_line(rng: &mut Rng, months: &[String]) -> String {
     if rng.below(10) == 0 {
         const NOISE: [&str; 12] = ["<", ">", "J", "n", "1", "-", "C", "E", "F", "o", "O", "0"];
         let len = rng.below(41);
@@ -365,12 +439,21 @@ fn random_line(rng: &mut Rng) -> String {
             .collect();
     }
     let template = TEMPLATES[rng.below(TEMPLATES.len())];
+    // Mutate exactly 1-3 distinct slots so most of each line stays valid.
+    let mutations = (1 + rng.below(3)).min(template.len());
+    let mut slots: Vec<usize> = Vec::new();
+    while slots.len() < mutations {
+        let slot = rng.below(template.len());
+        if !slots.contains(&slot) {
+            slots.push(slot);
+        }
+    }
     let mut line = String::new();
-    for piece in template {
-        if rng.below(3) == 0 {
+    for (i, piece) in template.iter().enumerate() {
+        if slots.contains(&i) {
             match rng.below(3) {
                 0 => line.push_str(&rng.alphabet_string(4)),
-                1 => line.push_str(MONTHS[rng.below(MONTHS.len())]),
+                1 => line.push_str(&months[rng.below(months.len())]),
                 _ => line.push_str(NUMBERS[rng.below(NUMBERS.len())]),
             }
         } else {
@@ -382,8 +465,9 @@ fn random_line(rng: &mut Rng) -> String {
 
 fn run_random(count: usize) {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let months = month_variants();
     for _ in 0..count {
-        assert_same(&random_line(&mut rng));
+        assert_same(&random_line(&mut rng, &months));
     }
 }
 
@@ -458,11 +542,12 @@ fn read_files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     out
 }
 
-fn check_file_contents(bytes: &[u8]) {
+fn check_file_contents(path: &Path, bytes: &[u8]) {
+    let ctx = format!("file {} ", path.display());
     let text = String::from_utf8_lossy(bytes);
-    assert_same(&text);
+    assert_same_in(&text, &ctx);
     for line in text.split('\n') {
-        assert_same(line);
+        assert_same_in(line, &ctx);
     }
 }
 
@@ -477,8 +562,8 @@ fn replay_fuzz_inputs() -> usize {
         };
         for dir in dirs.filter_map(Result::ok) {
             if dir.file_name().to_string_lossy().starts_with("syslog") {
-                for (_, bytes) in read_files(&dir.path()) {
-                    check_file_contents(&bytes);
+                for (path, bytes) in read_files(&dir.path()) {
+                    check_file_contents(&path, &bytes);
                     replayed += 1;
                 }
             }
@@ -486,8 +571,8 @@ fn replay_fuzz_inputs() -> usize {
     }
     let corpus = root.join("corpus/syslog");
     if corpus.is_dir() {
-        for (_, bytes) in read_files(&corpus) {
-            check_file_contents(&bytes);
+        for (path, bytes) in read_files(&corpus) {
+            check_file_contents(&path, &bytes);
             replayed += 1;
         }
     } else {
@@ -514,6 +599,22 @@ fn test_syslog_differential_enumerated_subset() {
 }
 
 #[test]
+fn test_syslog_differential_byte_month_number_sweeps() {
+    assert!(run_byte_month_number_sweeps() > 10_000);
+}
+
+#[test]
+#[should_panic(expected = "parse differs from the regex oracle")]
+fn test_syslog_differential_harness_detects_difference() {
+    let line = "<134>Jan 15 10:30:45 h app: m";
+    assert_eq_msgs(
+        SyslogMessage::parse(line),
+        SyslogMessage::parse("<135>x"),
+        line,
+    );
+}
+
+#[test]
 fn test_syslog_differential_random_subset() {
     run_random(20_000);
 }
@@ -523,8 +624,11 @@ fn test_syslog_differential_random_subset() {
 #[test]
 #[ignore = "full volume; run in release"]
 fn test_syslog_differential_full_volume() {
+    let swept = run_byte_month_number_sweeps();
     let enumerated = run_enumeration(4);
     run_random(200_000);
-    eprintln!("syslog_differential_full_volume: enumerated={enumerated} random=200000");
+    eprintln!(
+        "syslog_differential_full_volume: swept={swept} enumerated={enumerated} random=200000"
+    );
     assert!(enumerated >= 600_000);
 }
