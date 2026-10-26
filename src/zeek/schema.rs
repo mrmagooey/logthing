@@ -2124,7 +2124,7 @@ mod tests {
             .unwrap();
         assert!(col.is_null(0));
         // ...and the raw value survives in _extra via the existing
-        // mismatches/build_extra path.
+        // mismatches/write_extra path.
         let extra = batch
             .column_by_name("_extra")
             .unwrap()
