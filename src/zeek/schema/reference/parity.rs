@@ -259,6 +259,10 @@ fn assert_same(case: &PathCase, new_b: &RecordBatch, old_b: &RecordBatch, ctx: &
 /// Compare record-by-record (single-row accumulators) AND as one multi-row accumulator, which
 /// catches state leaking between records through a reused buffer.
 fn compare_all(case: &PathCase, records: &[Value], label: &str) {
+    assert!(
+        !records.is_empty(),
+        "{label}: empty record list would pass vacuously"
+    );
     for (i, r) in records.iter().enumerate() {
         let ctx = format!("{label} #{i}: {r}");
         assert_same(
@@ -268,10 +272,22 @@ fn compare_all(case: &PathCase, records: &[Value], label: &str) {
             &ctx,
         );
     }
+    let (new_b, old_b) = ((case.run_new)(records), (case.run_old)(records));
+    assert!(new_b.num_rows() > 0, "{label}: no rows produced");
+    assert_eq!(
+        new_b.num_rows(),
+        records.len(),
+        "{label}: row count != record count"
+    );
+    assert_eq!(
+        old_b.num_rows(),
+        records.len(),
+        "{label}: reference row count"
+    );
     assert_same(
         case,
-        &(case.run_new)(records),
-        &(case.run_old)(records),
+        &new_b,
+        &old_b,
         &format!("{label} as one batch of {}", records.len()),
     );
 }
@@ -330,5 +346,41 @@ fn non_object_and_empty_values_match_reference() {
             case.base.clone(),
         ];
         compare_all(&case, &records, &format!("{} non-object", case.name));
+    }
+}
+
+/// `ts` rounding and range-clamp boundaries (`json_ts_micros` accepts |secs * 1e6| < ~9.22e18,
+/// i.e. roughly +-9.223372036854775e12 seconds).
+#[test]
+fn ts_boundary_values_match_reference() {
+    let tss = [
+        json!(1.0000005),
+        json!(1.9999995),
+        json!(1700000000.123456789),
+        json!(1700000000.1234565),
+        json!(-1.5),
+        json!(-0.0000005),
+        json!(0.0),
+        json!(0),
+        json!(1),
+        json!(9.2e12),
+        json!(9.223372036854e12),
+        json!(9.223372036855e12),
+        json!(9.3e12),
+        json!(-9.2e12),
+        json!(-9.223372036854e12),
+        json!(-9.3e12),
+        json!(1e300),
+        json!(-1e300),
+        json!(u64::MAX),
+        json!("1.5"),
+        json!(null),
+    ];
+    for case in cases() {
+        let records: Vec<Value> = tss
+            .iter()
+            .map(|t| with_extras(set(&case.base, "ts", &Some(t.clone()))))
+            .collect();
+        compare_all(&case, &records, &format!("{} ts-boundary", case.name));
     }
 }
