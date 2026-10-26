@@ -246,11 +246,8 @@ impl SyslogMessage {
         let input = input.strip_suffix('\n').unwrap_or(input);
         let input = input.strip_suffix('\r').unwrap_or(input);
 
-        // Try RFC 5424 first (starts with version number after priority). The cheap prefix check
-        // skips the regex for RFC 3164 lines, which cannot match it.
-        if scan::may_be_rfc5424(input)
-            && let Some(msg) = Self::parse_rfc5424(input)
-        {
+        // Try RFC 5424 first (starts with version number after priority)
+        if let Some(msg) = Self::parse_rfc5424(input) {
             return Some(msg);
         }
 
