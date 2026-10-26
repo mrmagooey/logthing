@@ -126,6 +126,12 @@ docker pull ghcr.io/mrmagooey/logthing:latest  # most recent non-prerelease rele
 
 **Platforms**: linux/amd64, linux/arm64 (multi-arch manifest).
 
+**Static binaries**: each release also attaches static musl binaries (linux/amd64, linux/arm64).
+Every musl build uses jemalloc as the global allocator (musl's own malloc is much slower under
+load), and logs `allocator=jemalloc` at startup. Self-builds get it automatically with
+`cargo build --release --target x86_64-unknown-linux-musl`; on a gnu host `--features jemalloc`
+enables the same allocator. The container image is glibc and keeps the system allocator.
+
 **Exposed ports** (Dockerfile `EXPOSE`): 5986 (HTTPS/TLS; the main server with
 `[tls] enabled = true`, the default) or 5985 (plain HTTP, only when TLS is disabled), 9090
 (Prometheus metrics).
@@ -186,7 +192,7 @@ Results go to `profiling-results/` (gitignored): `index.html` plus, per format,
 and records written / records loadgen reports sent >= 0.9; `written_ratio` in `summary.json`).
 Knobs: `OUT`, `BIN`, `LOADGEN`, `DURATION` (25), `DELAY` (5), `HZ` (99) and `RATE_<FMT>`
 (e.g. `RATE_ZEEK=40000`). Logging is forced to `error` and the WEF run is unauthenticated
-HTTP (no Kerberos/TLS), so neither cost appears in the profile. Run `scripts/profile-ingest.sh`
+HTTP (no Kerberos/TLS), so neither cost appears in the profile. Profiling builds (--features pprof) use the system allocator, not jemalloc. Run `scripts/profile-ingest.sh`
 with no arguments for usage.
 
 Default rates were tuned on a 12-vCPU shared host with loadgen on the same machine; on a smaller

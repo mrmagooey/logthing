@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file, newest
 first, loosely following [Keep a Changelog](https://keepachangelog.com/).
 This file starts at 0.15.0; earlier releases are not backfilled.
 
+## [Unreleased]
+
+### Changed
+
+- The static musl release binaries (linux/amd64, linux/arm64) now use jemalloc as the global
+  allocator (`allocator=jemalloc` is logged at startup); `--features jemalloc` enables it on gnu
+  self-builds. The container image (glibc) is unchanged. `binaries.yml` fails the job if a musl
+  binary does not contain jemalloc's embedded strings.
+
 ## [0.25.0] - 2026-10-24
 
 ### Added

@@ -66,7 +66,8 @@ jobs:
       # means the action reuses this zig. Pinned to the version this guard was tested with. The
       # action exports CARGO_PROFILE_RELEASE_STRIP=debuginfo, so the guard build sets the same
       # to match it and let the action hit cargo's cache; the post-action re-check below is the
-      # authoritative guard. The check scans string literals (release binaries have no symbol table).
+      # authoritative guard. The check scans string literals (release binaries have no symbol
+      # table).
       - name: Install zig (guard build)
         uses: mlugg/setup-zig@v2
         with:
