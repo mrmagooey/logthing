@@ -130,7 +130,9 @@ docker pull ghcr.io/mrmagooey/logthing:latest  # most recent non-prerelease rele
 Every musl build uses jemalloc as the global allocator (musl's own malloc is much slower under
 load), and logs `allocator=jemalloc` at startup. Self-builds get it automatically with
 `cargo build --release --target x86_64-unknown-linux-musl`; on a gnu host `--features jemalloc`
-enables the same allocator. The container image is glibc and keeps the system allocator.
+enables the same allocator. The binary ships a tuned `malloc_conf` (`background_thread`, 1 s
+dirty/muzzy decay); set `_RJEM_MALLOC_CONF` at runtime to override it. The container image is
+glibc and keeps the system allocator.
 
 **Exposed ports** (Dockerfile `EXPOSE`): 5986 (HTTPS/TLS; the main server with
 `[tls] enabled = true`, the default) or 5985 (plain HTTP, only when TLS is disabled), 9090
