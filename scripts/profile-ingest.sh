@@ -38,6 +38,12 @@
 #   RATE_<FMT> offered rec/s override, e.g. RATE_ZEEK=40000 (table defaults below)
 #   SKIP_PPROF_CHECK=1  skip the "built without pprof" precheck (testing the script only)
 #
+# summary.json also records peak_rss_kb (VmHWM), server_cpu_secs (utime+stime) and
+# cpu_us_per_record = server_cpu_secs / records_written, read from /proc just before the server
+# is stopped (null when unreadable). They are informational, never a FAIL reason. The CPU figure
+# includes the 99 Hz sampler and the whole process lifetime (startup, the drain sleep), so it is
+# comparable build to build, not an absolute production cost.
+#
 # Design notes (carried over from the retired profile-syslog-udp.sh / profile-ipfix-udp.sh):
 # - ONE rate point per run. The profile is a single fixed window; a multi-rate sweep would blend
 #   idle and loaded regimes into one indistinguishable flamegraph. Rerun with RATE_<FMT>.
@@ -390,6 +396,7 @@ run_format() {
         sleep 1
     done
     [ -f "$meta" ] && sleep 1   # artifacts are written just before/with the metadata file
+    read_server_usage "$SRV_PID"
     stop_pid "$SRV_PID"; SRV_PID=""
 
     local f
@@ -403,11 +410,27 @@ run_format() {
         extra="${extra:+$extra; }profile-metadata.json missing"
         extra="$extra (binary built without pprof, or sampler failed)"
     fi
-    LG_RC=$lg_rc write_summary "$fmt" "$rate" "$lgsecs" "$before" "$after" "$envvars" \
+    LG_RC=$lg_rc SRV_PEAK_RSS_KB=$SRV_PEAK_RSS_KB SRV_CPU_TICKS=$SRV_CPU_TICKS \
+        write_summary "$fmt" "$rate" "$lgsecs" "$before" "$after" "$envvars" \
         "$work" "$extra"
     local srv=$?
     rm -rf "$work"
     return $srv
+}
+
+# read_server_usage <pid>: sets SRV_PEAK_RSS_KB (VmHWM, kB) and SRV_CPU_TICKS (utime + stime,
+# clock ticks) from /proc/<pid>; each is empty when unreadable. Call while the server is alive.
+read_server_usage() {
+    SRV_PEAK_RSS_KB=""; SRV_CPU_TICKS=""
+    local pid=$1 line rest
+    [ -n "$pid" ] || return 0
+    SRV_PEAK_RSS_KB=$(awk '/^VmHWM:/ {print $2; exit}' "/proc/$pid/status" 2>/dev/null)
+    line=$(cat "/proc/$pid/stat" 2>/dev/null) || return 0
+    rest=${line##*) }   # comm may contain spaces/parens; fields after it start at field 3
+    set -- $rest
+    # fields 14 (utime) and 15 (stime) are the 12th and 13th after the comm
+    [ -n "${12:-}" ] && [ -n "${13:-}" ] && SRV_CPU_TICKS=$(( ${12} + ${13} ))
+    return 0
 }
 
 # write_summary <fmt> <offered> <lg_secs> <before> <after> <envvars> <work> <extra_reason>
@@ -415,7 +438,7 @@ write_summary() {
     mkdir -p "$OUT/$1"
     local cpu
     cpu="$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//')"
-    OUT_DIR="$OUT" HOST="$(uname -n)" CPU="$cpu" \
+    OUT_DIR="$OUT" HOST="$(uname -n)" CPU="$cpu" CLK_TCK="$(getconf CLK_TCK 2>/dev/null)" \
     python3 - "$@" <<'PY'
 import datetime, json, os, re, sys
 
@@ -474,6 +497,21 @@ leak = int(envvars)
 if leak:
     reasons.append("ambient LOGTHING__ env leaked")
 
+def env_num(name):
+    try:
+        return float(os.environ.get(name, ""))
+    except ValueError:
+        return None
+
+
+# Informational only: never a FAIL reason.
+rss = env_num("SRV_PEAK_RSS_KB")
+ticks, clk = env_num("SRV_CPU_TICKS"), env_num("CLK_TCK")
+cpu_secs = round(ticks / clk, 3) if ticks is not None and clk else None
+cpu_us_rec = None
+if cpu_secs is not None and records is not None and records > 0:
+    cpu_us_rec = round(cpu_secs * 1e6 / records, 2)
+
 summary = {
     "format": fmt,
     "verdict": "FAIL" if reasons else "PASS",
@@ -484,6 +522,9 @@ summary = {
     "loadgen_sent_records": sent,
     "records_written": records,
     "written_ratio": None if ratio is None else round(ratio, 4),
+    "peak_rss_kb": None if rss is None else int(rss),
+    "server_cpu_secs": cpu_secs,
+    "cpu_us_per_record": cpu_us_rec,
     "sample_count": meta.get("sample_count"),
     "representative": meta.get("representative"),
     "activity_metric": meta.get("activity_metric"),
@@ -516,6 +557,8 @@ def render(fmt, s):
     link = (f'<a href="{svg}">flamegraph</a><br><img src="{svg}" alt="{fmt} flame graph" '
             'width="320">') if has_svg else "no flame graph"
     why = "; ".join(s.get("reasons", []))
+    rss_kb = s.get("peak_rss_kb")
+    rss_mb = num(None if rss_kb is None else rss_kb / 1024, "{:.1f}")
     return (
         f'<tr class="{html.escape(str(s["verdict"]).lower())}"><td>{html.escape(fmt)}</td>'
         f'<td>{html.escape(str(s["verdict"]))}</td><td class="n">{num(s.get("offered_rate"))}</td>'
@@ -523,6 +566,8 @@ def render(fmt, s):
         f'<td class="n">{num(s.get("records_written"))}</td>'
         f'<td class="n">{num(s.get("written_ratio"), "{:.3f}")}</td>'
         f'<td class="n">{num(s.get("sample_count"))}</td>'
+        f'<td class="n">{rss_mb}</td>'
+        f'<td class="n">{num(s.get("cpu_us_per_record"), "{:.2f}")}</td>'
         f'<td>{link}</td><td>{html.escape(why)}</td>'
         f'<td>{html.escape(str(s.get("host", "")))}<br>{html.escape(str(s.get("date", "")))}</td>'
         '</tr>')
@@ -537,7 +582,7 @@ for fmt in sys.argv[1:]:
     try:
         rows.append(render(fmt, s))
     except Exception as e:  # one malformed summary must not take the whole index down
-        rows.append(f'<tr class="fail"><td>{html.escape(fmt)}</td><td colspan="9">'
+        rows.append(f'<tr class="fail"><td>{html.escape(fmt)}</td><td colspan="11">'
                     f'unreadable summary.json: {html.escape(repr(e))}</td></tr>')
 head = f'<p>Index generated {datetime.datetime.now(datetime.timezone.utc):%Y-%m-%dT%H:%M:%SZ}'
 head += ' (per-row host and date show when each format was measured)</p>'
@@ -552,7 +597,8 @@ tr.fail td:nth-child(2){{color:#b00;font-weight:bold}} img{{border:1px solid #dd
 <h1>logthing ingest flame graphs</h1>
 {head}
 <table><tr><th>format</th><th>verdict</th><th>offered/s</th><th>achieved/s</th><th>written</th>
-<th>written/sent</th><th>samples</th><th>flame graph</th><th>notes</th><th>host / date</th></tr>
+<th>written/sent</th><th>samples</th><th>peak RSS (MB)</th><th>CPU us/record</th>
+<th>flame graph</th><th>notes</th><th>host / date</th></tr>
 {"".join(rows)}
 </table>
 <h2>Out of scope</h2>
