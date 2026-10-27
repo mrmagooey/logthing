@@ -6,6 +6,18 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
+### Changed
+
+- CI: the `performance.yml` `syslog-udp-baseline` job is replaced by `ingest-formats`, which runs
+  `scripts/profile-ingest.sh` over all nine ingest formats (flame graphs, PASS/FAIL verdicts) and
+  uploads `profiling-results/`. A failing format is a warning, not a job failure. Both jobs now
+  append a markdown results table (`scripts/perf-summary.py`) to the run summary. Dispatch inputs
+  are now `formats` (default `all`) and `duration_secs` (default `25`); `target_rate` is gone.
+  `tools/loadgen/ci/logthing-baseline.toml` is removed.
+- `scripts/profile-ingest.sh`: each format's `summary.json` (and `index.html`) now also records
+  peak RSS (`peak_rss_kb`), server CPU seconds and CPU microseconds per record, read from `/proc`.
+  Informational only; the CPU figure includes the sampler and startup, so compare build to build.
+
 ## [0.26.1] - 2026-10-26
 
 ### Changed
