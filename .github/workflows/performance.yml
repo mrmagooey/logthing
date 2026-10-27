@@ -57,7 +57,6 @@ jobs:
           path: target/criterion/
           retention-days: 30
 
-
       # cargo bench writes estimates under both new/ and ci-<sha>/; read the named one.
       - name: Summarise criterion results
         if: always()
