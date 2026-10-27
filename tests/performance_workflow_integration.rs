@@ -100,3 +100,71 @@ fn test_performance_workflow_inputs_fall_back_to_dispatch_defaults() {
         );
     }
 }
+
+fn jobs(wf: &serde_yml::Value) -> &serde_yml::Mapping {
+    wf.get("jobs")
+        .and_then(|j| j.as_mapping())
+        .expect("performance.yml has jobs")
+}
+
+#[test]
+fn test_performance_workflow_inputs_are_formats_and_duration() {
+    let (_, wf) = workflow();
+    let mut defaults = dispatch_defaults(&wf);
+    defaults.sort();
+    assert_eq!(
+        defaults,
+        [
+            ("duration_secs".to_string(), "25".to_string()),
+            ("formats".to_string(), "all".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn test_performance_workflow_has_ingest_formats_job_not_syslog_baseline() {
+    let (raw, wf) = workflow();
+    let names: Vec<&str> = jobs(&wf).keys().filter_map(|k| k.as_str()).collect();
+    assert!(names.contains(&"criterion"), "jobs: {names:?}");
+    assert!(names.contains(&"ingest-formats"), "jobs: {names:?}");
+    assert!(
+        !names.contains(&"syslog-udp-baseline"),
+        "the old syslog-only job must be gone"
+    );
+    assert!(raw.contains("scripts/profile-ingest.sh"));
+    assert!(raw.contains("--features pprof"));
+}
+
+#[test]
+fn test_performance_jobs_have_timeout_and_always_summary_step() {
+    let (_, wf) = workflow();
+    for (name, job) in jobs(&wf) {
+        let name = name.as_str().unwrap();
+        assert!(
+            job.get("timeout-minutes").is_some(),
+            "job `{name}` needs timeout-minutes"
+        );
+        let steps = job.get("steps").and_then(|s| s.as_sequence()).unwrap();
+        let has_summary = steps.iter().any(|s| {
+            s.get("if").and_then(|i| i.as_str()) == Some("always()")
+                && s.get("run").and_then(|r| r.as_str()).is_some_and(|r| {
+                    r.contains("perf-summary.py") && r.contains("GITHUB_STEP_SUMMARY")
+                })
+        });
+        assert!(
+            has_summary,
+            "job `{name}` needs an `if: always()` step running perf-summary.py into \
+             $GITHUB_STEP_SUMMARY"
+        );
+    }
+}
+
+#[test]
+fn test_performance_criterion_summary_reads_the_saved_baseline() {
+    let (raw, _) = workflow();
+    assert!(raw.contains("--save-baseline ci-${{ github.sha }}"));
+    assert!(
+        raw.contains("--baseline ci-${{ github.sha }}"),
+        "the summary must read the baseline the bench step saved"
+    );
+}

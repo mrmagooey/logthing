@@ -1,6 +1,5 @@
 # Smoke-test config for tools/loadgen's sflow-udp subcommand: sflow only,
-# local-disk persistence (not MinIO), mirroring logthing-baseline.toml's
-# shape for syslog-udp.
+# local-disk persistence (not MinIO).
 bind_address = "0.0.0.0:5986"
 
 [tls]

@@ -4,24 +4,29 @@ name: Performance
 # deliberately separate from rust.yml's per-push job -- sustained load runs
 # and full-sampled criterion benchmarks cost minutes, not seconds, and measure
 # throughput/latency/resource-usage, not pass/fail correctness -- a different
-# signal than what runs on every push. Results are informational artifacts; a
-# tag run does not gate the release (release.yml and binaries.yml run
-# independently). A tag push carries no inputs, so every input use below falls
-# back to the same default as its workflow_dispatch input.
+# signal than what runs on every push. Two jobs: `criterion` (full sampled
+# micro-benchmarks) and `ingest-formats` (scripts/profile-ingest.sh: all nine
+# ingest formats under fixed load, flame graphs plus peak RSS and CPU per
+# record). Each job appends a markdown table (scripts/perf-summary.py) to the
+# run's step summary. Results are informational; a tag run does not gate the
+# release (release.yml and binaries.yml run independently), and one format's
+# FAIL verdict is a warning, not a job failure. A tag push carries no inputs,
+# so every input use below falls back to the same default as its
+# workflow_dispatch input.
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
     inputs:
-      target_rate:
-        description: 'loadgen syslog-udp target rate (records/sec, 0 = unbounded)'
+      formats:
+        description: 'space-separated profile-ingest.sh format names, or all'
         required: false
-        default: '10000'
+        default: 'all'
       duration_secs:
-        description: 'loadgen syslog-udp run duration (seconds)'
+        description: 'sampling window per format, seconds (>= 10)'
         required: false
-        default: '60'
+        default: '25'
 
 env:
   CC: /usr/bin/gcc
@@ -31,6 +36,7 @@ jobs:
   criterion:
     name: Criterion benchmarks (full sampled run)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -42,7 +48,7 @@ jobs:
 
       # Without this the job runs the full sampled suite and then throws every
       # number away — target/ is not persisted, so a CI bench run could not be
-      # read after it finished. The sibling syslog-udp-baseline job in this
+      # read after it finished. The sibling ingest-formats job in this
       # file already uploads its artifacts; this brings criterion into line.
       - name: Upload criterion results
         uses: actions/upload-artifact@v4
@@ -51,72 +57,64 @@ jobs:
           path: target/criterion/
           retention-days: 30
 
-  syslog-udp-baseline:
-    name: loadgen syslog-udp baseline run
+      # cargo bench writes estimates under both new/ and ci-<sha>/; read the named one.
+      - name: Summarise criterion results
+        if: always()
+        run: |
+          python3 scripts/perf-summary.py --criterion target/criterion \
+            --baseline ci-${{ github.sha }} >> "$GITHUB_STEP_SUMMARY"
+
+  ingest-formats:
+    name: Ingest formats (flame graphs, RSS, CPU per record)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build logthing (profiling profile)
-        run: cargo build --profile profiling
+      - name: Build logthing (profiling profile, pprof)
+        run: cargo build --profile profiling --features pprof
 
       - name: Build loadgen (release)
-        run: cargo build -p loadgen --release
+        run: cargo build --release -p loadgen
 
-      - name: Start logthing against the baseline config
+      # Exit 1 = at least one format got a FAIL verdict: warn and continue so the
+      # artifact and summary table are still produced. Exit 2 (usage) or no
+      # summary.json at all is a real failure. FORMATS is deliberately unquoted
+      # so it word-splits into one argument per format.
+      - name: Profile ingest formats
+        env:
+          FORMATS: ${{ inputs.formats || 'all' }}
+          DURATION: ${{ inputs.duration_secs || '25' }}
+          OUT: ${{ github.workspace }}/profiling-results
         run: |
-          mkdir -p /tmp/logthing-perf-local
-          # logthing.admin.toml is git-tracked at the repo root and is loaded
-          # by Config::load() as a LATER (higher-precedence) source than
-          # logthing.toml, so its checked-in udp_port = 514 / tcp_port = 601 /
-          # bind_address = "127.0.0.1:9999" would silently override the
-          # baseline config below. Remove it so the baseline config actually
-          # takes effect.
-          rm -f logthing.admin.toml
-          cp tools/loadgen/ci/logthing-baseline.toml ./logthing.toml
-          ./target/profiling/logthing &
-          echo $! > logthing.pid
-          for i in $(seq 1 20); do
-            curl -sf http://127.0.0.1:9090/metrics > /dev/null && break
-            sleep 0.5
-          done
-          curl -sf http://127.0.0.1:9090/metrics > /dev/null || { echo "logthing did not come up"; exit 1; }
+          set +e
+          scripts/profile-ingest.sh $FORMATS 2>&1 | tee profile-ingest.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -eq 1 ]; then
+            failed=$(grep '^FAILED:' profile-ingest.log | tail -1)
+            echo "::warning::profile-ingest.sh reported failing formats: ${failed#FAILED: }"
+          elif [ "$rc" -ne 0 ]; then
+            echo "::error::profile-ingest.sh exited with status $rc"
+            exit "$rc"
+          fi
+          ls "$OUT"/*/summary.json > /dev/null 2>&1 || {
+            echo "::error::no summary.json was produced under $OUT"
+            exit 1
+          }
 
-      - name: Capture pre-run metrics
-        run: curl -s http://127.0.0.1:9090/metrics > metrics-before.txt
-
-      - name: Run loadgen syslog-udp
-        run: |
-          ./target/release/loadgen syslog-udp \
-            --host 127.0.0.1 --port 15514 \
-            --target-rate ${{ inputs.target_rate || '10000' }} \
-            --duration-secs ${{ inputs.duration_secs || '60' }}
-
-      - name: Drain and capture post-run metrics
-        run: |
-          sleep 3
-          curl -s http://127.0.0.1:9090/metrics > metrics-after.txt
-
-      - name: Assert syslog metrics were actually captured
-        run: |
-          grep -q syslog_messages_received metrics-after.txt || { echo "::error::syslog_messages_received metric absent -- baseline run captured nothing, logthing may have failed to bind the syslog listener"; exit 1; }
-
-      - name: Sample resource usage
-        run: ps -o pid,rss,pcpu,etime -p "$(cat logthing.pid)" > resource-usage.txt
-
-      - name: Stop logthing
-        if: always()
-        run: kill "$(cat logthing.pid)" || true
-
-      - name: Upload results
+      - name: Upload ingest results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: syslog-udp-baseline-results
-          path: |
-            metrics-before.txt
-            metrics-after.txt
-            resource-usage.txt
+          name: ingest-formats-${{ github.sha }}
+          path: profiling-results/
+          retention-days: 30
+
+      - name: Summarise ingest results
+        if: always()
+        run: |
+          python3 scripts/perf-summary.py --ingest profiling-results >> "$GITHUB_STEP_SUMMARY"
