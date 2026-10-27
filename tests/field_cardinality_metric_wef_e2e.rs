@@ -162,16 +162,7 @@ async fn field_distinct_values_visible_on_real_metrics_endpoint_for_wef_computer
     let client = reqwest::Client::new();
 
     // --- Wait for the real HTTP server to come up. ---
-    let mut ready = false;
-    for _ in 0..50 {
-        if let Ok(resp) = client.get(format!("{base_url}/health")).send().await
-            && resp.status() == reqwest::StatusCode::OK
-        {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let ready = common::wait_for_health(&client, &base_url, Duration::from_secs(10)).await;
     assert!(ready, "server did not become ready in time");
 
     // --- Window 1: 3 events on "Security" (2 distinct `computer`, one

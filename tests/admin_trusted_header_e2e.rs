@@ -19,6 +19,8 @@
 //! changes are needed to test trust mode through this entry point — just
 //! setting the right env vars first.
 
+mod common;
+
 use logthing::admin::spawn_admin_server;
 use logthing::config::{Config, TlsConfig};
 use logthing::stats::SourceHourlyStats;
@@ -84,16 +86,7 @@ async fn get_config_over_real_http_succeeds_with_trusted_headers_alone_no_basic_
     // ---------------------------------------------------------------------
     let client = reqwest::Client::new();
     let base_url = format!("http://127.0.0.1:{port}");
-    let mut ready = false;
-    for _ in 0..50 {
-        if let Ok(resp) = client.get(format!("{base_url}/health")).send().await
-            && resp.status() == reqwest::StatusCode::OK
-        {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(40)).await;
-    }
+    let ready = common::wait_for_health(&client, &base_url, Duration::from_secs(10)).await;
     assert!(ready, "admin server did not become ready in time");
 
     // ---------------------------------------------------------------------

@@ -91,16 +91,7 @@ async fn console_is_read_only_and_reports_the_env_var_that_configured_it() {
 
     let client = reqwest::Client::new();
     let base_url = format!("http://127.0.0.1:{port}");
-    let mut ready = false;
-    for _ in 0..50 {
-        if let Ok(resp) = client.get(format!("{base_url}/health")).send().await
-            && resp.status() == reqwest::StatusCode::OK
-        {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(40)).await;
-    }
+    let ready = common::wait_for_health(&client, &base_url, Duration::from_secs(10)).await;
     assert!(ready, "admin server did not become ready in time");
 
     // -----------------------------------------------------------------

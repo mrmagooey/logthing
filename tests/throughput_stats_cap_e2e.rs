@@ -101,16 +101,7 @@ async fn throughput_endpoint_stays_bounded_under_a_flood_of_distinct_event_types
     let base_url = format!("http://127.0.0.1:{port}");
 
     // Wait for the server to actually be listening.
-    let mut ready = false;
-    for _ in 0..50 {
-        if let Ok(resp) = client.get(format!("{base_url}/health")).send().await
-            && resp.status() == reqwest::StatusCode::OK
-        {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(40)).await;
-    }
+    let ready = common::wait_for_health(&client, &base_url, Duration::from_secs(10)).await;
     assert!(ready, "server did not become ready in time");
 
     // Post more distinct provider/event-id combinations than the cap
