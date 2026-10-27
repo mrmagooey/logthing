@@ -6,8 +6,12 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
+## [0.26.2] - 2026-10-27
+
 ### Changed
 
+- Analytics stack default image pins move to 0.26.2 for both logthing and the committer (still in
+  lockstep); Helm chart version 0.2.8.
 - CI: the `performance.yml` `syslog-udp-baseline` job is replaced by `ingest-formats`, which runs
   `scripts/profile-ingest.sh` over all nine ingest formats (flame graphs, PASS/FAIL verdicts) and
   uploads `profiling-results/`. A failing format is a warning, not a job failure. Both jobs now
@@ -17,6 +21,13 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 - `scripts/profile-ingest.sh`: each format's `summary.json` (and `index.html`) now also records
   peak RSS (`peak_rss_kb`), server CPU seconds and CPU microseconds per record, read from `/proc`.
   Informational only; the CPU figure includes the sampler and startup, so compare build to build.
+
+### Fixed
+
+- Tests: two load-sensitive tests no longer flake on a busy host. loadgen's
+  `retries_continue_until_deadline_then_stop` uses a 2 s window (was 300 ms), and five e2e tests
+  share `tests/common::wait_for_health` (10 s, 40 ms poll, each probe capped at 2 s) in place of
+  their 2 s readiness loops.
 
 ## [0.26.1] - 2026-10-26
 
