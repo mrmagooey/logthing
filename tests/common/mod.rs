@@ -79,6 +79,25 @@ pub async fn wait_until(deadline: Duration, mut f: impl FnMut() -> bool) -> bool
     }
 }
 
+/// Poll `GET {base_url}/health` every 40 ms until it answers 200 OK or `timeout` elapses.
+/// Returns whether the server became ready. A generous timeout costs nothing on the fast path
+/// and keeps readiness checks from flaking on a loaded host.
+pub async fn wait_for_health(client: &reqwest::Client, base_url: &str, timeout: Duration) -> bool {
+    let url = format!("{base_url}/health");
+    let end = Instant::now() + timeout;
+    loop {
+        if let Ok(resp) = client.get(&url).send().await
+            && resp.status() == reqwest::StatusCode::OK
+        {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+}
+
 /// Downcast a column to `StringArray`.
 pub fn str_col<'a>(batch: &'a RecordBatch, name: &str) -> &'a StringArray {
     batch

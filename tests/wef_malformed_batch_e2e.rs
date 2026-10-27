@@ -132,16 +132,7 @@ async fn malformed_batch_returns_200_counts_the_error_and_keeps_the_good_events(
     let metrics_url = format!("http://127.0.0.1:{metrics_port}/metrics");
     let client = reqwest::Client::new();
 
-    let mut ready = false;
-    for _ in 0..50 {
-        if let Ok(resp) = client.get(format!("{base_url}/health")).send().await
-            && resp.status() == reqwest::StatusCode::OK
-        {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let ready = common::wait_for_health(&client, &base_url, Duration::from_secs(10)).await;
     assert!(ready, "server did not become ready in time");
 
     let (e1, e3) = (wef_event(1), wef_event(3));
