@@ -207,3 +207,42 @@ fn test_both_sections_and_unknown_args() {
         assert!(String::from_utf8_lossy(&o.stderr).contains("usage"));
     }
 }
+
+#[test]
+fn test_ingest_wrong_typed_fields_render_without_failing() {
+    let d = tempfile::tempdir().unwrap();
+    let s = json!({"verdict": "FAIL", "host": 5, "cpu": ["a", "b"], "peak_rss_kb": "big",
+        "reasons": "abc", "offered_rate": 1.0});
+    write(d.path(), "zeek/summary.json", &s.to_string());
+    let b = json!({"verdict": "PASS", "peak_rss_kb": true, "reasons": []});
+    write(d.path(), "wef/summary.json", &b.to_string());
+    let md = ingest(d.path());
+    assert!(md.contains("formats passed (5 / ['a', 'b'])"), "{md}");
+    let z = row(&md, "zeek");
+    assert!(
+        z.ends_with("| - | - | abc |"),
+        "reasons string is one note: {z}"
+    );
+    assert!(
+        row(&md, "wef").contains("| - | - | - | - |"),
+        "bool rss renders -: {md}"
+    );
+}
+
+#[test]
+fn test_criterion_unit_boundaries_round_before_choosing_unit() {
+    let d = tempfile::tempdir().unwrap();
+    write(
+        d.path(),
+        "g/a/new/estimates.json",
+        &estimates(999.96, 999.96, 999.96),
+    );
+    write(
+        d.path(),
+        "g/b/new/estimates.json",
+        &estimates(999_999.6, 999_999.6, 999_999.6),
+    );
+    let md = stdout(&run(&["--criterion", d.path().to_str().unwrap()]));
+    assert!(md.contains("| g/a | 1.00 \u{b5}s |"), "{md}");
+    assert!(md.contains("| g/b | 1.00 ms |"), "{md}");
+}

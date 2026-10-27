@@ -46,10 +46,13 @@ def ingest_row(fmt, path):
         if not isinstance(s, dict):
             raise ValueError("summary.json is not a JSON object")
         rss = s.get("peak_rss_kb")
-        rss_mb = num(rss / 1024, "{:.1f}") if isinstance(rss, (int, float)) else "-"
+        rss_mb = num(rss / 1024 if num(rss) != "-" else None, "{:.1f}")
         written, sent = s.get("records_written"), s.get("loadgen_sent_records")
         ws = f"{num(written)}/{num(sent)}" if written is not None or sent is not None else "-"
-        notes = "; ".join(str(r) for r in s.get("reasons") or [])
+        reasons = s.get("reasons") or []
+        if not isinstance(reasons, list):
+            reasons = [reasons]
+        notes = "; ".join(str(r) for r in reasons)
         row = [
             fmt,
             str(s.get("verdict", "-")),
@@ -80,7 +83,7 @@ def ingest_section(d):
     rows = [ingest_row(f, found[f]) for f in order]
     passed = sum(1 for r, _ in rows if r[1] == "PASS")
     first = next((s for _, s in rows if s), {})
-    host = " / ".join(x for x in (first.get("host"), first.get("cpu")) if x)
+    host = " / ".join(str(x) for x in (first.get("host"), first.get("cpu")) if x)
     out.append(f"{passed}/{len(rows)} formats passed" + (f" ({host})" if host else ""))
     out.append("")
     out.append(
@@ -93,9 +96,15 @@ def ingest_section(d):
     return out
 
 
+def sig3(v):
+    """Round v > 0 to 3 significant figures."""
+    return round(v, 2 - int(math.floor(math.log10(v)))) if v > 0 else v
+
+
 def fmt_ns(ns):
-    if not isinstance(ns, (int, float)) or ns < 0 or math.isnan(ns):
+    if not isinstance(ns, (int, float)) or isinstance(ns, bool) or ns < 0 or math.isnan(ns):
         return "-"
+    ns = sig3(ns)  # round first so 999.96 ns becomes 1.00 us, not "1000 ns"
     for unit, scale in (("s", 1e9), ("ms", 1e6), ("\u00b5s", 1e3), ("ns", 1.0)):
         if ns >= scale or unit == "ns":
             v = ns / scale
@@ -149,10 +158,17 @@ def main(argv):
     if ingest is None and criterion is None:
         usage()
     lines = []
+    sections = []
     if ingest is not None:
-        lines += ingest_section(ingest)
+        sections.append(("Ingest formats", lambda: ingest_section(ingest)))
     if criterion is not None:
-        lines += criterion_section(criterion, baseline)
+        sections.append(
+            ("Criterion benchmarks", lambda: criterion_section(criterion, baseline)))
+    for title, render in sections:
+        try:
+            lines += render()
+        except Exception as e:  # a summary must never be what fails a run
+            lines += [f"### {title}", "", f"unreadable results: {e}", ""]
     sys.stdout.write("\n".join(lines) + "\n")
 
 
