@@ -224,7 +224,7 @@ mod tests {
     async fn retries_continue_until_deadline_then_stop() {
         let (addr, seen) = stub(vec![503]).await;
         let bp = Backpressure::default();
-        let deadline = Instant::now() + Duration::from_millis(300);
+        let deadline = Instant::now() + Duration::from_secs(2);
         // Retry-After: 0 means a tight retry loop; it must still end at the deadline.
         let out = send_with_retry(post(addr), &bp, 1_000_000, deadline).await;
         assert!(matches!(out, SendOutcome::Abandoned));
