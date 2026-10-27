@@ -79,14 +79,16 @@ pub async fn wait_until(deadline: Duration, mut f: impl FnMut() -> bool) -> bool
     }
 }
 
-/// Poll `GET {base_url}/health` every 40 ms until it answers 200 OK or `timeout` elapses.
-/// Returns whether the server became ready. A generous timeout costs nothing on the fast path
-/// and keeps readiness checks from flaking on a loaded host.
+/// Probe `GET {base_url}/health` until it answers 200 OK or `timeout` elapses, sleeping 40 ms
+/// between probes (plus request latency). At least one probe always happens. Each probe is
+/// capped at 2 s and never runs past the overall deadline, so a connection that never answers
+/// cannot hang the wait. Returns whether the server became ready.
 pub async fn wait_for_health(client: &reqwest::Client, base_url: &str, timeout: Duration) -> bool {
     let url = format!("{base_url}/health");
     let end = Instant::now() + timeout;
     loop {
-        if let Ok(resp) = client.get(&url).send().await
+        let budget = Duration::from_secs(2).min(end.saturating_duration_since(Instant::now()));
+        if let Ok(Ok(resp)) = tokio::time::timeout(budget, client.get(&url).send()).await
             && resp.status() == reqwest::StatusCode::OK
         {
             return true;
