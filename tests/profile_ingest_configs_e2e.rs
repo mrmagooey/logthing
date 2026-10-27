@@ -203,3 +203,25 @@ async fn test_each_print_config_starts_the_real_binary() {
         assert!(ok, "{fmt}: {last}");
     }
 }
+
+#[test]
+fn test_probe_usage_nonexistent_pid_is_empty_and_succeeds() {
+    let out = run_script(&["--probe-usage", "99999999"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "rss= ticks=");
+}
+
+#[test]
+fn test_probe_usage_live_pid_reports_numbers() {
+    let mut child = Command::new("sleep").arg("5").spawn().unwrap();
+    let out = run_script(&["--probe-usage", &child.id().to_string()]);
+    let _ = child.kill();
+    let _ = child.wait();
+    let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let (rss, ticks) = line.split_once(" ticks=").expect(&line);
+    assert!(
+        rss.strip_prefix("rss=").unwrap().parse::<u64>().unwrap() > 0,
+        "{line}"
+    );
+    assert!(ticks.parse::<u64>().is_ok(), "{line}");
+}

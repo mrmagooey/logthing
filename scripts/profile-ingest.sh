@@ -212,6 +212,21 @@ loadgen_argv() {
     esac
 }
 
+# read_server_usage <pid>: sets SRV_PEAK_RSS_KB (VmHWM, kB) and SRV_CPU_TICKS (utime + stime,
+# clock ticks) from /proc/<pid>; each is empty when unreadable. Call while the server is alive.
+read_server_usage() {
+    SRV_PEAK_RSS_KB=""; SRV_CPU_TICKS=""
+    local pid=$1 line rest
+    [ -n "$pid" ] || return 0
+    SRV_PEAK_RSS_KB=$(awk '/^VmHWM:/ {print $2; exit}' "/proc/$pid/status" 2>/dev/null)
+    line=$(cat "/proc/$pid/stat" 2>/dev/null) || return 0
+    rest=${line##*) }   # comm may contain spaces/parens; fields after it start at field 3
+    set -- $rest
+    # fields 14 (utime) and 15 (stime) are the 12th and 13th after the comm
+    [ -n "${12:-}" ] && [ -n "${13:-}" ] && SRV_CPU_TICKS=$(( ${12} + ${13} ))
+    return 0
+}
+
 # ---- argument handling (before any trap or side effect) ----
 if [ $# -eq 0 ]; then usage; exit 2; fi
 case "$1" in
@@ -224,6 +239,11 @@ case "$1" in
         alloc_ports "$2" || { echo "FATAL: could not allocate ports" >&2; exit 1; }
         WORK="$(mktemp -d)" || exit 1
         config_toml "$2" "$WORK" "$HTTP_PORT" "$METRICS_PORT" "$LISTEN_PORT"
+        exit 0
+        ;;
+    --probe-usage)   # hidden, for tests: print read_server_usage's outputs for a pid
+        read_server_usage "${2:-}"
+        echo "rss=$SRV_PEAK_RSS_KB ticks=$SRV_CPU_TICKS"
         exit 0
         ;;
     -h | --help) usage; exit 0 ;;
@@ -416,21 +436,6 @@ run_format() {
     local srv=$?
     rm -rf "$work"
     return $srv
-}
-
-# read_server_usage <pid>: sets SRV_PEAK_RSS_KB (VmHWM, kB) and SRV_CPU_TICKS (utime + stime,
-# clock ticks) from /proc/<pid>; each is empty when unreadable. Call while the server is alive.
-read_server_usage() {
-    SRV_PEAK_RSS_KB=""; SRV_CPU_TICKS=""
-    local pid=$1 line rest
-    [ -n "$pid" ] || return 0
-    SRV_PEAK_RSS_KB=$(awk '/^VmHWM:/ {print $2; exit}' "/proc/$pid/status" 2>/dev/null)
-    line=$(cat "/proc/$pid/stat" 2>/dev/null) || return 0
-    rest=${line##*) }   # comm may contain spaces/parens; fields after it start at field 3
-    set -- $rest
-    # fields 14 (utime) and 15 (stime) are the 12th and 13th after the comm
-    [ -n "${12:-}" ] && [ -n "${13:-}" ] && SRV_CPU_TICKS=$(( ${12} + ${13} ))
-    return 0
 }
 
 # write_summary <fmt> <offered> <lg_secs> <before> <after> <envvars> <work> <extra_reason>
