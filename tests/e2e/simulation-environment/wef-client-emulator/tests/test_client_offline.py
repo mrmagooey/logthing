@@ -1,3 +1,4 @@
+import http.client
 import json
 import os
 import subprocess
@@ -65,6 +66,23 @@ def test_kerberos_full_flow(events_dir):
     assert log[0]["raw_len"] == 0 and log[0]["cenc"] == "SLDC"
     # delivery path is the NotifyTo path, with lowercase scheme normalization handled
     assert log[4]["path"].startswith("/wsman/subscriptions/")
+
+
+def test_stub_conn_id_is_per_tcp_connection_and_never_reused():
+    with StubWec() as stub:
+        for _ in range(8):  # sequential, each closed first: freed handlers must not alias
+            c = http.client.HTTPConnection("127.0.0.1", stub.port, timeout=5)
+            c.request("POST", "/x", body=b"")
+            c.getresponse().read()
+            c.close()
+        c = http.client.HTTPConnection("127.0.0.1", stub.port, timeout=5)
+        for _ in range(2):  # keep-alive: same connection, same id
+            c.request("POST", "/x", body=b"")
+            c.getresponse().read()
+        c.close()
+        conns = [r["conn"] for r in stub.log]
+    assert len(conns) == 10
+    assert len(set(conns[:8])) == 8 and conns[8] == conns[9] and conns[8] not in conns[:8]
 
 
 def test_kerberos_flow_sends_expected_headers_and_bookmarks(events_dir):

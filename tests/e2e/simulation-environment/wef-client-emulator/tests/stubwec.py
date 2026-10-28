@@ -8,6 +8,7 @@ import base64
 import datetime
 import http.server
 import ipaddress
+import itertools
 import socketserver
 import ssl
 import threading
@@ -163,6 +164,7 @@ class StubWec:
         self.bookmarks: dict[str, str] = {}
         self.version = SUB_VERSION
         self.lock = threading.Lock()
+        self._conn_ids = itertools.count(1)  # unique per TCP connection; id(h) gets reused
         stub = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -171,6 +173,8 @@ class StubWec:
 
             def setup(self):
                 super().setup()
+                with stub.lock:
+                    self.conn_id = next(stub._conn_ids)
                 self.authed = False
                 self.identity = ""
 
@@ -234,7 +238,7 @@ class StubWec:
     # ----------------------------------------------------------------------------------
     def _post(self, h, body):
         f = self.faults
-        rec = {"path": h.path, "conn": id(h), "auth": h.headers.get("Authorization"),
+        rec = {"path": h.path, "conn": h.conn_id, "auth": h.headers.get("Authorization"),
                "ctype": h.headers.get("Content-Type"), "cenc": h.headers.get("Content-Encoding"),
                "raw_len": len(body), "action": None}
         with self.lock:
