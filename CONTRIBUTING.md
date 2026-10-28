@@ -2,14 +2,16 @@
 
 Build, test, coverage and profiling instructions for working on logthing.
 
-## Development
+## Build and test
 
 ```bash
 cargo build            # debug build
-cargo test              # unit + integration tests
+cargo test             # unit + integration tests
 ```
 
-**End-to-end suite** (requires Docker with Compose v2) — builds the helper
+## End-to-end suite
+
+Requires Docker with Compose v2. Builds the helper
 images, launches `tests/e2e/simulation-environment/docker-compose.yml`, replays Windows event
 fixtures, emits syslog traffic, sends IPFIX flows, emits Zeek NDJSON logs,
 verifies throughput counters, and confirms Parquet files arrive in the SeaweedFS
@@ -24,7 +26,9 @@ Performance tests are part of that same suite; see
 [tests/e2e/simulation-environment/performance-test/README.md](tests/e2e/simulation-environment/performance-test/README.md)
 for how to run and interpret them.
 
-**Coverage** with [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov):
+## Coverage
+
+Uses [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov):
 
 ```bash
 rustup component add llvm-tools-preview    # one-time tool install
@@ -37,7 +41,9 @@ Prints a per-file summary and writes it to `target/coverage/summary.txt`, plus a
 inline `#[cfg(test)]` modules, and tests that need Docker (real S3, the test KDC) are skipped unless
 their environments are up.
 
-**Profiling** (per-format CPU flame graphs of the ingest path). The sampler is behind the
+## Profiling
+
+Per-format CPU flame graphs of the ingest path. The sampler is behind the
 off-by-default `pprof` cargo feature, so build a profiling binary and the load generator, then
 drive each ingest source (syslog, zeek, suricata, ipfix, sflow, hec, generic, otlp, wef) at a
 fixed rate into a local-disk Parquet sink:

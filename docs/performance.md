@@ -3,7 +3,7 @@
 Single-node ingest ceilings measured with `scripts/max-ingest-rate.sh` and `tools/loadgen`.
 These are measurements on one machine under the stated conditions, not guarantees.
 For per-format CPU flame graphs of the ingest path, see the Profiling section of
-[CONTRIBUTING.md](../CONTRIBUTING.md).
+[CONTRIBUTING.md](../CONTRIBUTING.md#profiling).
 
 ## Results
 

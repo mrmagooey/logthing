@@ -28,7 +28,6 @@ A generic YAML-configurable event parser handles specific Windows event codes (s
 - **S3 Object Lock**: write-once retention for uploaded Parquet and descriptors — [docs/object-lock.md](docs/object-lock.md)
 - **Iceberg descriptors**: per-file JSON descriptors for an external committer — [docs/iceberg.md](docs/iceberg.md)
 - **TLS, IP allowlists, Prometheus metrics, JSON/pretty logs**: [docs/configuration.md](docs/configuration.md), [docs/metrics.md](docs/metrics.md)
-- **Performance**: async I/O with Tokio; measured single-node ceilings in [docs/performance.md](docs/performance.md)
 
 ## Quick Start
 
