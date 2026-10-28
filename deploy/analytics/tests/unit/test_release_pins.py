@@ -46,15 +46,23 @@ def test_readme_image_table_pins_the_cargo_version():
     assert f"ghcr.io/mrmagooey/logthing-committer:{v}" in t
 
 
+STALE_PIN_RE = r"ghcr\.io/mrmagooey/logthing(?:-committer)?:(\d+\.\d+\.\d+)"
+
+
 def test_root_readme_image_pins_match_the_cargo_version():
     v = cargo_version()
     t = (ROOT / "README.md").read_text()
     assert f"ghcr.io/mrmagooey/logthing:{v}" in t
+    stale = {m for m in re.findall(STALE_PIN_RE, t) if m != v}
+    assert not stale, stale
+
+
+def test_releases_doc_image_pins_match_the_cargo_version():
+    v = cargo_version()
+    t = (ROOT / "docs" / "releases.md").read_text()
+    assert f"ghcr.io/mrmagooey/logthing:{v}" in t
     assert f"for tag `v{v}`" in t and f"`:{v}`" in t
-    stale = {
-        m for m in re.findall(r"ghcr\.io/mrmagooey/logthing(?:-committer)?:(\d+\.\d+\.\d+)", t)
-        if m != v
-    }
+    stale = {m for m in re.findall(STALE_PIN_RE, t) if m != v}
     assert not stale, stale
 
 
