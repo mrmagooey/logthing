@@ -6,6 +6,23 @@ This file starts at 0.15.0; earlier releases are not backfilled.
 
 ## [Unreleased]
 
+## [0.26.3] - 2026-10-28
+
+### Changed
+
+- Analytics stack default image pins move to 0.26.3 for both logthing and the committer (still in
+  lockstep); Helm chart version 0.2.9.
+- Docs: the README is shorter: a sources table, a one-line-per-feature list and a grouped
+  documentation index. Container tags, platforms, static binaries and ports move to
+  `docs/releases.md`; build, test, end-to-end, coverage and profiling instructions move to a new
+  `CONTRIBUTING.md`. `docs/filter.md` is now listed in the index.
+
+### Fixed
+
+- Tests: the WEF client emulator's `test_kerberos_full_flow` no longer flakes. Its test server
+  identified connections by `id()` of the per-connection handler, which Python can reuse once a
+  connection closes; connections are now numbered from a counter.
+
 ## [0.26.2] - 2026-10-27
 
 ### Changed

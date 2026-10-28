@@ -47,7 +47,7 @@ Or pull the pinned container image (tags, platforms and static binaries are in
 [docs/releases.md](docs/releases.md)):
 
 ```bash
-docker pull ghcr.io/mrmagooey/logthing:0.26.2
+docker pull ghcr.io/mrmagooey/logthing:0.26.3
 ```
 
 ### Minimal Configuration
